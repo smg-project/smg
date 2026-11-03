@@ -48,18 +48,43 @@ def request_structs(monkeypatch):
         input_ids: list[int] | None = None
         dimensions: int | None = None
 
+    class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+        error_msg: str | None = None
+        error_code: int | None = None
+
     class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         max_new_tokens: int | None = 128
         custom_params: dict | None = None
         stop_strs: list[str] | None = None
+
+    class MultimodalDataItem(msgspec.Struct, kw_only=True, array_like=True):
+        modality: int | None = None
+        offsets: list[tuple[int, int]] | None = None
+
+    class MultimodalProcessorOutput(msgspec.Struct, kw_only=True, array_like=True):
+        mm_items: list[MultimodalDataItem] | None = None
+        im_token_id: int | None = None
 
     _install(
         monkeypatch,
         "sglang.srt.managers.io_struct",
         TokenizedGenerateReqInput=TokenizedGenerateReqInput,
         TokenizedEmbeddingReqInput=TokenizedEmbeddingReqInput,
+        EncoderDispatchErrorReq=EncoderDispatchErrorReq,
+    )
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.schedule_batch",
+        MultimodalProcessorOutput=MultimodalProcessorOutput,
+        MultimodalDataItem=MultimodalDataItem,
     )
     _install(monkeypatch, "sglang.srt.sampling.sampling_params", SamplingParams=SamplingParams)
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.schedule_batch",
+        MultimodalProcessorOutput=MultimodalProcessorOutput,
+        MultimodalDataItem=MultimodalDataItem,
+    )
 
 
 def _scheduler(**server_args):
@@ -126,7 +151,10 @@ def test_the_handshake_declares_the_request_structs_field_order():
     layouts = {
         "TokenizedGenerateReqInput": ["rid", "http_worker_ipc", "input_ids", "stream"],
         "TokenizedEmbeddingReqInput": ["rid", "http_worker_ipc", "input_ids", "dimensions"],
+        "EncoderDispatchErrorReq": ["rid", "http_worker_ipc", "error_msg", "error_code"],
         "SamplingParams": ["max_new_tokens", "custom_params", "stop_strs"],
+        "MultimodalProcessorOutput": ["mm_items", "im_token_id"],
+        "MultimodalDataItem": ["modality", "offsets"],
     }
     assert wire.request_layouts() == layouts
     ready = wire.ready_response_for_scheduler(_scheduler())

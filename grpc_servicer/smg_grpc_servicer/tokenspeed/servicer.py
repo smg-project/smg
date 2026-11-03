@@ -40,6 +40,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
 from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.engine_status import grpc_code_for_http_status
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -1799,9 +1800,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         chunk_token = raw_token[-n_chunk:] if len(raw_token) >= n_chunk else raw_token
         chunk_top = raw_top[-n_chunk:] if len(raw_top) >= n_chunk else raw_top
         delta_token = chunk_token[:n_keep]
-        # Pad ``delta_top`` to align with ``delta_token`` — TokenSpeed leaves
-        # ``output_top_logprobs`` empty when ``--enable-top-logprobs`` is off,
-        # but the gateway expects one ``TopLogProbs`` per emitted token.
+        # Pad ``delta_top`` to align with ``delta_token`` — a position has no
+        # ranked alternatives when the request asked for none (the usual path)
+        # or the engine reported none for it (it fills ``output_top_logprobs``
+        # for prefill-sampled tokens only), but the gateway expects one
+        # ``TopLogProbs`` per emitted token.
         delta_top = chunk_top[:n_keep] + [None] * max(0, len(delta_token) - len(chunk_top))
 
         top_proto = []
@@ -1814,9 +1817,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     )
                 )
             else:
-                # Position with no top-K data (e.g. ``--enable-top-logprobs``
-                # is not yet implemented in TokenSpeed; we still emit a
-                # placeholder per position so the gateway can align indices).
+                # Position with no top-K data (top-k not requested, or a
+                # prefill-only entry; on a decode step the engine aborts a
+                # top-k request instead); a placeholder per position keeps
+                # the gateway's indices aligned.
                 top_proto.append(tokenspeed_scheduler_pb2.TopLogProbs())
 
         return tokenspeed_scheduler_pb2.OutputLogProbs(
@@ -1827,14 +1831,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
 
 def _abort_status_code(reason: dict) -> grpc.StatusCode:
-    status_code = reason.get("status_code")
-    if status_code == 400:
-        return grpc.StatusCode.INVALID_ARGUMENT
-    if status_code in (408, 504):
-        return grpc.StatusCode.DEADLINE_EXCEEDED
-    if status_code == 429:
-        return grpc.StatusCode.RESOURCE_EXHAUSTED
-    return grpc.StatusCode.INTERNAL
+    """The gRPC code for an abort the engine reports with an HTTP-style
+    ``status_code`` (400 for the caller's input, 429 for a full queue, 408 or
+    504 for a timeout, ...): the table every engine servicer shares, so the
+    same engine condition is the same status behind every engine. An abort
+    without a status (a pause, a shutdown, a capacity abort) is ``INTERNAL``,
+    as it was."""
+    return grpc_code_for_http_status(reason.get("status_code"))
 
 
 def _version_str(version: Any) -> str | None:

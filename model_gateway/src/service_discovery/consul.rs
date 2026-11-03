@@ -936,7 +936,10 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
-    use crate::service_discovery::testing::create_test_app_context;
+    use crate::{
+        service_discovery::testing::{create_test_app_context, live_app_context},
+        test_support::RefusedAddress,
+    };
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");
     const PASSING_1_22_7: &str = include_str!("testdata/consul/health-passing-1.22.7.json");
@@ -1787,12 +1790,9 @@ mod tests {
         );
 
         // Nothing listening at all.
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let closed = RefusedAddress::reserve();
         let config = ConsulProviderConfig::with_env(
-            &discovery("smg-worker", Some(&format!("http://{closed}"))),
+            &discovery("smg-worker", Some(&closed.http_url())),
             &pd(),
             |_| None,
         )
@@ -1923,6 +1923,120 @@ mod tests {
             consul.indexes(),
             [None, Some("10".to_string()), Some("11".to_string())]
         );
+        handle.abort();
+    }
+
+    // ---- A change that lands while the instance still registers. ----
+
+    /// An engine for one instance of the scripted service: `/health` after
+    /// `delay`, then the metadata a registration reads; 404 elsewhere, as the
+    /// metadata fallbacks expect.
+    async fn fake_engine(delay: Duration) -> (u16, task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new()
+            .route(
+                "/health",
+                get(move || async move {
+                    time::sleep(delay).await;
+                    Json(serde_json::json!({"status": "ok"}))
+                }),
+            )
+            .route(
+                "/model_info",
+                get(|| async {
+                    Json(serde_json::json!({"model_path": "m", "is_generation": true}))
+                }),
+            )
+            .route(
+                "/server_info",
+                get(|| async { Json(serde_json::json!({"version": "test"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the engine lives for the duration of the test"
+        )]
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, handle)
+    }
+
+    /// An instance Consul drops while the gateway is still registering it is
+    /// not removed by the answer that drops it: that answer's pass finds no
+    /// worker of the instance yet, and the registration lands afterwards.
+    /// The next periodic pass removes it, and nothing before that does; the
+    /// e2e keeps its pass on for this reason.
+    #[tokio::test]
+    async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
+        let (a, _engine_a) = fake_engine(Duration::ZERO).await;
+        // Its registration waits on this answer twice (the classification
+        // probe, then connection detection): past Consul's second answer, a
+        // gap after the first, and the query that follows it.
+        let (b, _engine_b) = fake_engine(Duration::from_millis(1500)).await;
+        let instance = |node: &str, id: &str, port: u16, created: u64| {
+            serde_json::json!({
+                "Node": {"Node": node, "Address": "127.0.0.1", "Datacenter": "dc1"},
+                "Service": {"ID": id, "Port": port, "Meta": {}, "CreateIndex": created}
+            })
+        };
+        let both = serde_json::json!([
+            instance("node-a", "worker-a", a, 15),
+            instance("node-b", "worker-b", b, 17)
+        ])
+        .to_string();
+        let only_a = serde_json::json!([instance("node-a", "worker-a", a, 15)]).to_string();
+        let consul = FakeConsul::start(vec![
+            Reply::ok(19, &both),
+            // Woken by worker-b's check going critical, a gap after the first.
+            Reply::ok(20, &only_a).held(Duration::from_millis(250)),
+        ])
+        .await;
+        let mut config = consul.config(&regular());
+        config.check_interval = Duration::from_secs(4);
+        let client = config.client().unwrap();
+        let app_context = live_app_context();
+        let registry = Arc::clone(&app_context.worker_registry);
+        let registered = move |port: u16| {
+            registry
+                .get_all()
+                .iter()
+                .any(|worker| worker.url().ends_with(&format!(":{port}")))
+        };
+        let started = time::Instant::now();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the loop under test is aborted at the end of the test"
+        )]
+        let handle = task::spawn(ConsulDiscovery::new(config, app_context, client).run());
+
+        // worker-b registers once its engine answers, after Consul dropped it.
+        while !registered(b) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "worker-b never registered"
+            );
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            consul.requests(),
+            3,
+            "the answer that dropped worker-b was taken before it registered"
+        );
+        assert!(registered(a));
+
+        // Nothing but a pass removes it: until the next one it stays.
+        time::sleep_until(started + Duration::from_millis(3500)).await;
+        assert!(registered(b), "removed before the next pass");
+
+        // The pass at 4 s removes it.
+        while registered(b) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "worker-b not removed by the next pass"
+            );
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registered(a));
         handle.abort();
     }
 

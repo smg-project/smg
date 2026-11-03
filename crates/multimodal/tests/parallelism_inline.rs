@@ -4,8 +4,7 @@
 
 use image::{DynamicImage, Rgb, RgbImage};
 use llm_multimodal::{
-    configure_parallelism, vision::processors::Qwen2VLProcessor, Parallelism, PreProcessorConfig,
-    VisionPreProcessor,
+    configure_parallelism, vision::processors::Qwen2VLProcessor, Parallelism, VisionPreProcessor,
 };
 
 #[cfg(target_os = "linux")]
@@ -33,10 +32,7 @@ fn inline_mode_preprocesses_without_creating_threads() {
     #[cfg(target_os = "linux")]
     let before = thread_names().expect("read Linux thread names");
     let processor = Qwen2VLProcessor::new();
-    let config = PreProcessorConfig::default();
-    let out = processor
-        .preprocess(&[large_image()], &config)
-        .expect("preprocess");
+    let out = processor.preprocess(&[large_image()]).expect("preprocess");
     assert!(out.total_feature_tokens() > 0);
     // procfs can observe thread creation on Linux. Other platforms still
     // exercise preprocessing in inline mode above.

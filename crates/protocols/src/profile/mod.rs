@@ -22,7 +22,7 @@ mod zai;
 
 use std::{
     collections::HashMap,
-    sync::{OnceLock, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use crate::{
@@ -31,14 +31,69 @@ use crate::{
     ext::retain_if,
 };
 
-/// Served model ids that take a vendor's profile from an alias they are served
-/// under, recorded once at startup from the configured model aliases. An alias
-/// is resolved into the request's model id before the response side reads it,
-/// so the served name has to select the profile its vendor-named alias does,
-/// or a request that entered under the vendor name loses the profile half-way.
-fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
-    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ProviderProfile>>> = OnceLock::new();
-    ALIAS_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
+/// What the configured model aliases record for a name. An alias is resolved
+/// into the request's model id before the response side reads it, so the
+/// served name has to select the profile its vendor-named alias does, or a
+/// request that entered under the vendor name loses the profile half-way; and
+/// a profile's reading of a version from the model name (DeepSeek V4 against
+/// V4.1) goes through the same record ([`served_under`]), so a request under
+/// an opaque alias of a versioned model is read as that model.
+enum Registered {
+    /// A configured alias: the served model id it resolves to, that model's
+    /// profile, recorded so a request under the alias finds it in one step,
+    /// and whether the alias's own name names the vendor whose contract it
+    /// resolves to (such an alias is read as its own name, the way a request
+    /// naming it always was; an opaque alias, and one vendor's name for
+    /// another vendor's model, are read as the served model).
+    Alias {
+        served: Arc<str>,
+        profile: ProviderProfile,
+        own_contract: bool,
+    },
+    /// A served model whose own name selects no vendor contract and which
+    /// takes one from the vendor-named aliases it is served under: the
+    /// profile, and every alias of that vendor. A version read from the name
+    /// consults them all and holds only when they agree, so the reading does
+    /// not depend on the order the aliases were configured in, and an
+    /// ambiguous configuration (one checkpoint under the names of two
+    /// versions) leaves the opaque name the reading it had before any alias.
+    Contract {
+        profile: ProviderProfile,
+        vendor_names: Vec<Arc<str>>,
+    },
+}
+
+/// The registered names, recorded once at startup from the configured model
+/// aliases ([`ProviderProfile::register_model_aliases`]).
+fn registry() -> &'static RwLock<HashMap<String, Registered>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<String, Registered>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Whether `model` is served under a name that satisfies `names`. A name
+/// the table does not know, and an alias whose own name names the vendor it
+/// resolves to, are read as they are: a request naming them is read the way
+/// it always was. Any other alias (an opaque name, or one vendor's name for
+/// another vendor's model) is read as the served model it resolves to, and
+/// an opaque served model as the vendor-named aliases it is served under,
+/// all of which have to agree. A profile reads a version from the model name through
+/// this, so a request under an opaque alias of a versioned model is read as
+/// that model, and a served model under one version's names as that version
+/// whichever of its names the request carries.
+fn served_under(model: &str, names: impl Fn(&str) -> bool) -> bool {
+    let registry = registry().read().unwrap_or_else(|e| e.into_inner());
+    let agree = |vendor_names: &[Arc<str>]| vendor_names.iter().all(|name| names(name));
+    match registry.get(model) {
+        None
+        | Some(Registered::Alias {
+            own_contract: true, ..
+        }) => names(model),
+        Some(Registered::Alias { served, .. }) => match registry.get(served.as_ref()) {
+            Some(Registered::Contract { vendor_names, .. }) => agree(vendor_names),
+            _ => names(served),
+        },
+        Some(Registered::Contract { vendor_names, .. }) => agree(vendor_names),
+    }
 }
 
 /// Provider dialect for a request, selected from the model id.
@@ -112,11 +167,15 @@ impl ProviderProfile {
     /// `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the default.
     pub fn for_model(model: &str) -> Self {
-        let registered = alias_profiles()
+        let registered = registry()
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(model)
-            .copied();
+            .map(|registered| match registered {
+                Registered::Alias { profile, .. } | Registered::Contract { profile, .. } => {
+                    *profile
+                }
+            });
         registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
@@ -134,13 +193,6 @@ impl ProviderProfile {
         }
     }
 
-    /// Whether an explicit `reasoning_effort` outranks `thinking.type:
-    /// disabled`: under the MiniMax contract it does (an effort asks for
-    /// thinking at that depth); every other profile honours the toggle.
-    pub fn effort_outranks_thinking_disabled(self) -> bool {
-        matches!(self, ProviderProfile::Minimax)
-    }
-
     /// Record the configured model aliases (`alias -> served model id`).
     ///
     /// A served model id whose own name selects no vendor contract takes the
@@ -152,9 +204,17 @@ impl ProviderProfile {
     /// nothing, and because every alias resolves to its served model's
     /// profile, a request naming such an alias is judged as the self-hosted
     /// model it reaches, not under the public API's rules.
+    ///
+    /// The record also keeps which names carry a model's contract (the
+    /// vendor-named aliases of a served model whose own name selects none),
+    /// so a profile that reads a version from the model name reads an
+    /// opaque name as the vendor names behind it (`served_under`); an
+    /// alias named for the vendor it resolves to is read as its own name,
+    /// as it always was, and one vendor's name for another vendor's model
+    /// as that model.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
         let aliases: Vec<(&str, &str)> = aliases.into_iter().collect();
-        let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
+        let mut map = registry().write().unwrap_or_else(|e| e.into_inner());
         // First the served models' contracts, from their own names or their
         // vendor-named aliases ...
         for (alias, canonical) in &aliases {
@@ -166,27 +226,56 @@ impl ProviderProfile {
             if !profile.is_vendor_contract() {
                 continue;
             }
-            match map.get(*canonical) {
-                Some(existing) if *existing != profile => tracing::warn!(
-                    canonical,
-                    alias,
-                    kept = ?existing,
-                    ignored = ?profile,
-                    "model alias names a different vendor than an earlier alias of the same served model"
-                ),
-                Some(_) => {}
+            match map.get_mut(*canonical) {
+                Some(Registered::Contract {
+                    profile: existing,
+                    vendor_names,
+                }) => {
+                    if *existing != profile {
+                        tracing::warn!(
+                            canonical,
+                            alias,
+                            kept = ?existing,
+                            ignored = ?profile,
+                            "model alias names a different vendor than an earlier alias of the same served model"
+                        );
+                    } else if !vendor_names.iter().any(|name| name.as_ref() == *alias) {
+                        vendor_names.push(Arc::from(*alias));
+                    }
+                }
+                // An alias of an alias names no served model: it binds
+                // nothing.
+                Some(Registered::Alias { .. }) => {}
                 None => {
-                    map.insert((*canonical).to_string(), profile);
+                    map.insert(
+                        (*canonical).to_string(),
+                        Registered::Contract {
+                            profile,
+                            vendor_names: vec![Arc::from(*alias)],
+                        },
+                    );
                 }
             }
         }
         // ... then every alias resolves to its served model's profile.
         for (alias, canonical) in &aliases {
-            let profile = map
-                .get(*canonical)
-                .copied()
-                .unwrap_or_else(|| Self::from_model_segments(canonical));
-            map.insert((*alias).to_string(), profile);
+            let profile = match map.get(*canonical) {
+                Some(Registered::Alias { profile, .. } | Registered::Contract { profile, .. }) => {
+                    *profile
+                }
+                None => Self::from_model_segments(canonical),
+            };
+            // The alias's own name carries the contract only when it names
+            // the vendor the alias resolves to.
+            let own = Self::from_model_segments(alias);
+            map.insert(
+                (*alias).to_string(),
+                Registered::Alias {
+                    served: Arc::from(*canonical),
+                    profile,
+                    own_contract: own.is_vendor_contract() && own == profile,
+                },
+            );
         }
     }
 
@@ -539,6 +628,75 @@ mod tests {
             .collect();
         assert_eq!(names, ["get_weather"]);
         assert_eq!(request.callable_tools().len(), 1);
+    }
+
+    #[test]
+    fn a_registered_name_is_read_through_the_names_that_carry_its_contract() {
+        // Names unique to this test: the alias table is process-wide.
+        ProviderProfile::register_model_aliases([
+            (
+                "opaque-alias-of-a-vendor-named-model",
+                "kimi-k3-vendor-named-served-model",
+            ),
+            (
+                "MiniMax-M3-first-public-name",
+                "opaque-served-model-under-vendor-names",
+            ),
+            (
+                "MiniMax-M3-second-public-name",
+                "opaque-served-model-under-vendor-names",
+            ),
+            (
+                "opaque-alias-of-the-opaque-served-model",
+                "opaque-served-model-under-vendor-names",
+            ),
+        ]);
+        // An opaque alias of a vendor-named served model is read as that model.
+        assert!(served_under(
+            "opaque-alias-of-a-vendor-named-model",
+            |name| name == "kimi-k3-vendor-named-served-model"
+        ));
+        assert!(!served_under(
+            "opaque-alias-of-a-vendor-named-model",
+            |name| name == "opaque-alias-of-a-vendor-named-model"
+        ));
+        // An opaque served model, and an opaque alias of it, are read as the
+        // vendor names it is served under, which have to agree; a
+        // vendor-named alias is read as its own name.
+        for model in [
+            "opaque-served-model-under-vendor-names",
+            "opaque-alias-of-the-opaque-served-model",
+        ] {
+            assert_eq!(ProviderProfile::for_model(model), ProviderProfile::Minimax);
+            assert!(
+                served_under(model, |name| name.starts_with("MiniMax-M3-")),
+                "{model}"
+            );
+            assert!(
+                !served_under(model, |name| name == "MiniMax-M3-first-public-name"),
+                "{model}: the second public name disagrees"
+            );
+        }
+        for model in [
+            "MiniMax-M3-first-public-name",
+            "MiniMax-M3-second-public-name",
+        ] {
+            assert_eq!(ProviderProfile::for_model(model), ProviderProfile::Minimax);
+            assert!(served_under(model, |name| name == model), "{model}");
+        }
+        // One vendor's name for another vendor's model is read as that model.
+        ProviderProfile::register_model_aliases([(
+            "kimi-k2-name-of-a-minimax-model",
+            "MiniMax-M3-served-under-a-kimi-name",
+        )]);
+        assert_eq!(
+            ProviderProfile::for_model("kimi-k2-name-of-a-minimax-model"),
+            ProviderProfile::Minimax
+        );
+        assert!(served_under("kimi-k2-name-of-a-minimax-model", |name| name
+            == "MiniMax-M3-served-under-a-kimi-name"));
+        // A name the table does not know is read as itself.
+        assert!(served_under("unregistered-model", |name| name == "unregistered-model"));
     }
 
     #[test]

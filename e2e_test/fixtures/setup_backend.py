@@ -57,6 +57,9 @@ _GW_DEFAULTS = {
     "policy": "round_robin",
     "timeout": DEFAULT_ROUTER_TIMEOUT,
     "extra_args": None,
+    # Variables added to the gateway process's environment (a gateway-side
+    # test hook a class arms); None adds nothing.
+    "env": None,
     "log_level": None,
     "log_dir": None,
     "reuse": False,
@@ -128,6 +131,7 @@ def _start_gateway(gateway: Gateway, gateway_config: dict, **mode_kwargs) -> Non
         policy=gateway_config["policy"],
         timeout=gateway_config["timeout"],
         extra_args=gateway_config["extra_args"],
+        env=gateway_config.get("env"),
         log_level=gateway_config.get("log_level"),
         log_dir=gateway_config.get("log_dir"),
     )
@@ -509,6 +513,7 @@ def _setup_local(
             gateway,
             gateway_config,
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
         )
@@ -741,6 +746,9 @@ def _setup_pd(
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
                 raise
 
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's).
+        set_class_workers(all_workers)
         if moriio:
             _start_gateway(gateway, gateway_config, prefill_workers=[], decode_workers=[])
             _register_moriio_workers(gateway, prefill_workers, decode_workers)
@@ -755,6 +763,7 @@ def _setup_pd(
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s PD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)
@@ -929,6 +938,7 @@ def backend_router(request: pytest.FixtureRequest):
     try:
         gateway.start(
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.

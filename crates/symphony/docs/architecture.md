@@ -54,7 +54,7 @@ stopped being one, from which they are the model's bytes as written, and equal t
 when the call ends. What the engine says does not depend on how the output was cut into deltas,
 nor on empty deltas between them. With token spans, every token is counted once, in the event that
 carries its first byte. Events a caller took are final: later text starts a new event and never
-merges into one already drained. These are checked for every registry table by `tests/contract.rs`.
+merges into one already drained. These are checked for every registry table by `tests/parser/contract.rs`.
 
 **The table.** `Format::validate` holds every table to the rows the engine can run, and a table is
 checked when it is built (the registry's tables in the crate's tests, a compiled response template
@@ -87,7 +87,8 @@ reasons.
 **The assemblers.** Each turns one call syntax into call events with the same accounting: every
 byte of the call in exactly one event (the name's in the start, each tag's and value's in the
 fragment it produces, the template's whitespace between tags in the next event's source, anything
-else between tags as `Malformed` run by run so that where the chunks were cut changes nothing).
+else between tags refused run by run, a `Malformed` event of no bytes and the bytes as `Dropped {
+MalformedCall }`, so that where the chunks were cut changes nothing and no slip reads as the answer).
 Two endings: `close` for a call the model ended (its closing marker, the next call's opener or the
 block's close), which closes the object for the client; `finish` for a stream that was cut, which
 closes nothing. A value's type comes from the request's tools (`Declared`) where the syntax writes
@@ -121,9 +122,9 @@ A family of a known call syntax costs a table and evidence, and no engine change
    thought's close where the template writes other than the table's; the build script compiles
    the file into `GROUPS`). A group that names no table fails the build; the registry's tests hold the
    names unique, every table buildable and the file in the registry's form.
-3. Give it a subject in `tests/contract.rs` (the test `every_registry_table_has_a_subject` refuses a
+3. Give it a subject in `tests/parser/contract.rs` (the test `every_registry_table_has_a_subject` refuses a
    table without one): a handful of outputs in the family's syntax, which the contract then checks
-   at every chunking. `tests/robustness.rs` picks the table up on its own and scrambles its markers.
+   at every chunking. `tests/parser/robustness.rs` picks the table up on its own and scrambles its markers.
 4. Give it a corpus row in `tests/bellwether_parse_fixtures.rs` (the slug of each recorded set and
    how the template ends the generation prompt); the replay reads the table and the opener from the
    registry.
@@ -142,10 +143,11 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`), and the bytes of a call block a syntax
-  whose block is never prose could not read (`MalformedCall`, behind a `Malformed` event of no
-  bytes that counts the failure). Dropped bytes are expected on every well-formed output, the
-  last kind excepted.
+  where the request takes one call only (`LaterCall`), a call the request forbade with
+  `tool_choice: none` and the model wrote anyway (`ForbiddenCall`, every call of the output), and
+  the bytes of a call block a syntax whose block is never prose could not read (`MalformedCall`,
+  behind a `Malformed` event of no bytes that counts the failure). Dropped bytes are expected on
+  every well-formed output, the last kind excepted.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not
@@ -161,9 +163,10 @@ Three tiers, two of them at run time:
   references get wrong. Each run counts them on its diagnostic line.
 
 The adapters show malformed text as content and drop nothing, so a client never loses the bytes a
-parser hands back with the event; the keyed syntax, whose block is never prose, hands them back as
-`Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is counted and
-the format's own tags never reach the answer (`docs/assemblers.md`). The reason is for the
+parser hands back with the event; the keyed, attributed, Qwen-tagged and XML assemblers hand them
+back as `Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is
+counted and the format's own tags never reach the answer
+(`docs/assemblers.md`). The reason is for the
 operator. The set is closed and `Copy` so that a reader can count malformed
 regions by table and reason as a bounded label, log a sample with the table, the reason and the
 bytes' length, and mark the request's span; how a gateway surfaces that (metric, log, span event,
@@ -197,8 +200,8 @@ construction of a table and of an engine.
 ## How it is tested
 
 Five layers, each with a different question. Unit tests in every module ask whether one decision
-holds. `tests/contract.rs` asks whether every registry table keeps the events' promises over its
-outputs at every chunking. `tests/robustness.rs` asks whether any output a model could write, built
+holds. `tests/parser/contract.rs` asks whether every registry table keeps the events' promises over its
+outputs at every chunking. `tests/parser/robustness.rs` asks whether any output a model could write, built
 from a table's own markers and corrupted, can panic the parser or break the contract.
 `tests/bellwether_parse_fixtures.rs` asks whether the tables read the recorded corpus as the
 chat templates' own round trip does, byte for byte, at every chunking (opt-in, against a checkout

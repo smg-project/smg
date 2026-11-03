@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for lsof: no process holds the device files; and it keeps the
+# guard from installing the real one. (Exit 1 = nothing listed, as lsof does.)
+exit 1

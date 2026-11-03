@@ -24,7 +24,10 @@ use crate::{
     error,
     header_utils::{apply_provider_headers, extract_auth_header},
     known,
-    metrics::{bool_to_static_str, metrics_labels, Metrics},
+    metrics::{
+        bool_to_static_str, error_reason_for_refused_selection, error_reason_from_status,
+        metrics_labels, Metrics,
+    },
     retry::{is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor},
     sse::SSE_CHANNEL_BUFFER,
     tenant::TenantRequestMeta,
@@ -173,6 +176,7 @@ pub(super) async fn route_chat(
                 model,
                 metrics_labels::ENDPOINT_CHAT,
                 metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
             );
             return response;
         }
@@ -188,6 +192,7 @@ pub(super) async fn route_chat(
                 model,
                 metrics_labels::ENDPOINT_CHAT,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             return error::bad_request(
                 "invalid_request",
@@ -208,6 +213,7 @@ pub(super) async fn route_chat(
             model,
             metrics_labels::ENDPOINT_CHAT,
             metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
         );
         return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
     }
@@ -340,6 +346,7 @@ pub(super) async fn route_chat(
             model,
             metrics_labels::ENDPOINT_CHAT,
             metrics_labels::ERROR_BACKEND,
+            error_reason_from_status(response.status()),
         );
     }
 

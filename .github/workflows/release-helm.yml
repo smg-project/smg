@@ -1,11 +1,8 @@
 name: Release Helm Chart
 
+# Published only on a maintainer's dispatch against a release tag or branch
+# (scripts/release/README.md): no push publishes.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - bindings/python/pyproject.toml
   workflow_dispatch:
 
 permissions:

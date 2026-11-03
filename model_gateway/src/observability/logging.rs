@@ -1,7 +1,7 @@
 //! Logging infrastructure with non-blocking I/O for every sink.
 //!
 //! Each formatting layer hands its lines to a dedicated writer thread through
-//! a bounded, lossy channel ([`tracing_appender::non_blocking`]), so the tokio
+//! a bounded, lossy channel ([`tracing_appender::non_blocking`](mod@tracing_appender::non_blocking)), so the tokio
 //! runtime threads that emit the events never wait for the sink. That matters
 //! for stdout as much as for the log file: when stdout is redirected to a
 //! regular file, every `write(2)` is subject to the kernel's dirty-page
@@ -21,9 +21,9 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tracing::{warn, Level};
@@ -35,13 +35,14 @@ use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
     filter::{LevelFilter, Targets},
     layer::SubscriberExt,
+    registry::LookupSpan,
     util::SubscriberInitExt,
     EnvFilter, Layer, Registry,
 };
 
 use super::{
     log_format::{JsonLine, SpanFields, TextFields, TextLine, UtcSeconds},
-    otel_trace::get_otel_layer,
+    otel_trace::get_otel_layer_at,
 };
 use crate::{config::TraceConfig, observability::metrics::Metrics};
 
@@ -139,14 +140,54 @@ fn truthy(value: Option<&OsStr>) -> bool {
 /// [`close_logging`] flushes and stops the writers at process exit.
 pub struct LogGuard(());
 
-/// One writer thread: its handle, and the count of lines its lossy queue
-/// dropped.
+/// One writer thread: its handle, the count of lines its lossy queue
+/// dropped, and the signal its end raises.
 struct Sink {
     name: &'static str,
     counter: ErrorCounter,
     /// The count at the last report, for the delta.
     reported: usize,
+    /// Raised when the thread has dropped its `Batched`, its last act.
+    ended: Arc<Ended>,
     _guard: WorkerGuard,
+}
+
+/// Raised by a writer thread's [`Batched`] when it is dropped, which is the
+/// thread's last act after its final flush: whoever waits on it knows the
+/// thread has written everything it will ever write.
+#[derive(Default)]
+struct Ended {
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Ended {
+    fn set(&self) {
+        *self
+            .ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait until set, or until `deadline`; whether it was set.
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let mut ended = self
+            .ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*ended {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            ended = self
+                .changed
+                .wait_timeout(ended, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        *ended
+    }
 }
 
 /// The writer threads of every sink installed in this process.
@@ -178,6 +219,18 @@ const BATCH_WINDOW: Duration = Duration::from_millis(5);
 /// speed in writes of this size, and the buffer stays this small.
 const BATCH_BYTES: usize = 64 * 1024;
 
+/// How long [`close_logging`] waits for the writer threads past the moment
+/// each guard's drop gives them (about a second): a thread held in a write
+/// the kernel is throttling, or left unscheduled on a loaded host, still
+/// finishes its last batch within it. An idle writer ends inside the
+/// guard's handshake, and the wait is over the instant the last thread has.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the close waits for its own stderr line about a writer that
+/// missed [`CLOSE_WAIT`]: long enough for a terminal or a file, short enough
+/// that a stderr sharing a stuck pipe does not hold the exit.
+const STDERR_WAIT: Duration = Duration::from_millis(100);
+
 /// A sink that takes the writer thread's lines in batches.
 ///
 /// [`tracing_appender`]'s writer thread hands its sink one whole line per
@@ -193,7 +246,8 @@ const BATCH_BYTES: usize = 64 * 1024;
 /// [`BATCH_BYTES`] is written at once and the drain goes on without another
 /// wait; the flush at shutdown (the worker guard's drop in
 /// [`close_logging`]) writes whatever is buffered, so a clean exit loses
-/// nothing.
+/// nothing. The writer thread owns the adapter and drops it as its last act,
+/// which raises `ended`: [`close_logging`] waits on it.
 struct Batched<W> {
     sink: W,
     buf: Vec<u8>,
@@ -201,6 +255,7 @@ struct Batched<W> {
     cap: usize,
     /// A window is open: the next line does not wait for one again.
     open: bool,
+    ended: Arc<Ended>,
 }
 
 impl<W: Write> Batched<W> {
@@ -215,6 +270,7 @@ impl<W: Write> Batched<W> {
             window,
             cap,
             open: false,
+            ended: Arc::default(),
         }
     }
 
@@ -231,6 +287,12 @@ impl<W: Write> Batched<W> {
             self.buf.shrink_to(self.cap);
         }
         written
+    }
+}
+
+impl<W> Drop for Batched<W> {
+    fn drop(&mut self) {
+        self.ended.set();
     }
 }
 
@@ -264,16 +326,11 @@ impl<W: Write> Write for Batched<W> {
 /// batches, and return the writer for a subscriber layer. The thread is
 /// counted among the sinks whose dropped lines the reporter publishes.
 fn install<W: Write + Send + 'static>(sink: W, name: &'static str) -> NonBlocking {
-    let (writer, guard) = non_blocking(Batched::new(sink), name);
+    let (writer, sink) = start_sink(Batched::new(sink), name);
     let mut sinks = SINKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sinks.sinks.push(Sink {
-        name,
-        counter: writer.error_counter(),
-        reported: 0,
-        _guard: guard,
-    });
+    sinks.sinks.push(sink);
     if !sinks.reporter_started {
         sinks.reporter_started = std::thread::Builder::new()
             .name("smg-log-dropped".to_string())
@@ -347,7 +404,62 @@ pub fn close_logging() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sinks,
     );
+    if !close_sinks(sinks) {
+        // The writers are closed: stderr is the one channel left. Written off
+        // this thread with a short wait: a stderr that shares the stuck
+        // stdout pipe (`2>&1`, a journal stream) would block this write too,
+        // and the exit behind it; a write error (a reader gone) is not a
+        // panic on the way out.
+        let (written, wait) = mpsc::channel();
+        // `Builder::spawn`, as the reporter thread: a spawn the OS refuses
+        // (a pids limit, memory pressure) drops the closure and `written`
+        // with it, the wait ends at once and the close goes on without the
+        // line, instead of the panic `thread::spawn` would raise here.
+        let _ = std::thread::Builder::new()
+            .name("smg-log-close".to_string())
+            .spawn(move || {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[logging] a log writer was still writing {CLOSE_WAIT:?} after the close; \
+                     its last lines may be lost"
+                );
+                let _ = written.send(());
+            });
+        let _ = wait.recv_timeout(STDERR_WAIT);
+    }
+}
+
+/// Stop the writer threads of `sinks` and wait for them. Each guard's drop
+/// queues the shutdown message and waits a bounded moment for the flush
+/// that answers it; a thread that misses the moment (its write held by the
+/// kernel, or itself unscheduled on a loaded host) goes on detached and
+/// writes after the drop has returned. So the threads themselves are waited
+/// for, up to [`CLOSE_WAIT`] in all, and the lines logged before the close
+/// are in their files when this returns. Whether every thread ended in time.
+fn close_sinks(sinks: Vec<Sink>) -> bool {
+    let ended: Vec<Arc<Ended>> = sinks.iter().map(|sink| Arc::clone(&sink.ended)).collect();
     drop(sinks);
+    let deadline = Instant::now() + CLOSE_WAIT;
+    ended.iter().all(|ended| ended.wait_until(deadline))
+}
+
+/// `batched` on its own writer thread behind a bounded, lossy channel, and
+/// the record of that thread: its guard, its dropped-line counter and the
+/// signal its end raises, for [`close_sinks`].
+fn start_sink<W: Write + Send + 'static>(
+    batched: Batched<W>,
+    name: &'static str,
+) -> (NonBlocking, Sink) {
+    let ended = Arc::clone(&batched.ended);
+    let (writer, guard) = non_blocking(batched, name);
+    let sink = Sink {
+        name,
+        counter: writer.error_counter(),
+        reported: 0,
+        ended,
+        _guard: guard,
+    };
+    (writer, sink)
 }
 
 /// Move `sink` to its own thread behind a bounded, lossy channel.
@@ -470,34 +582,32 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     // RUST_LOG takes precedence (as `EnvFilter::try_from_default_env` did); an unset,
     // empty, or invalid value falls through to the configured level/targets.
-    let filter_layer = std::env::var(EnvFilter::DEFAULT_ENV)
+    let directives = std::env::var(EnvFilter::DEFAULT_ENV)
         .ok()
-        .filter(|directives| !directives.trim().is_empty())
-        .and_then(|directives| build_filter_layer(&directives))
-        .unwrap_or_else(|| {
-            let filter_string = match &config.log_targets {
-                Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
-                _ => {
-                    // Default: external deps at WARN, all workspace crates at configured level.
-                    // This ensures logs from imported crates (tool_parser, kv_index, etc.)
-                    // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
-                    build_workspace_filter(level_filter)
-                }
-            };
-            build_filter_layer(&filter_string)
-                .unwrap_or_else(|| Box::new(EnvFilter::new(filter_string)))
+        .filter(|directives| {
+            !directives.trim().is_empty() && EnvFilter::try_new(directives).is_ok()
+        })
+        .unwrap_or_else(|| match &config.log_targets {
+            Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
+            _ => {
+                // Default: external deps at WARN, all workspace crates at configured level.
+                // This ensures logs from imported crates (tool_parser, kv_index, etc.)
+                // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
+                build_workspace_filter(level_filter)
+            }
         });
+    let filter_layer =
+        build_filter_layer(&directives).unwrap_or_else(|| Box::new(EnvFilter::new(&directives)));
 
     // Cap the `log` facade at the filter's most verbose level. A bare
     // `LogTracer::init()` leaves `log::max_level()` at TRACE, so every
     // `log::trace!`/`debug!` in a dependency (the `tokenizers` normalizer and
     // pre-tokenizer emit them on each encode) builds a record and round-trips
     // through the tracing dispatcher only to be dropped there.
-    let log_max_level = filter_layer
-        .max_level_hint()
-        .unwrap_or(LevelFilter::TRACE)
-        .as_log();
-    let _ = LogTracer::builder().with_max_level(log_max_level).init();
+    let log_level = filter_layer.max_level_hint().unwrap_or(LevelFilter::TRACE);
+    let _ = LogTracer::builder()
+        .with_max_level(log_level.as_log())
+        .init();
 
     let mut layers = Vec::with_capacity(3);
 
@@ -588,35 +698,63 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         }
     }
 
-    if let Some(otel_layer_config) = &otel_layer_config {
-        if otel_layer_config.enable_trace {
-            match get_otel_layer() {
-                Ok(otel_layer) => {
-                    layers.push(otel_layer);
+    let otel_layer: Option<FilterLayer> = otel_layer_config
+        .filter(|otel_layer_config| otel_layer_config.enable_trace)
+        .and_then(|_| match get_otel_layer_at(log_level) {
+            Ok(otel_layer) => Some(otel_layer),
+            Err(e) => {
+                // Logger may not be fully initialized yet; use stderr as fallback
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("Failed to initialize OpenTelemetry: {e}");
                 }
-                Err(e) => {
-                    // Logger may not be fully initialized yet; use stderr as fallback
-                    #[expect(clippy::print_stderr)]
-                    {
-                        eprintln!("Failed to initialize OpenTelemetry: {e}");
-                    }
-                }
+                None
             }
-        }
-    }
+        });
 
-    let _ = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(layers)
-        .try_init();
+    let _ = match otel_layer {
+        // The log filter is the log layers' own, and the trace layer sits behind its own: the
+        // tracer's spans export at every log level (one global filter gated them too, and at
+        // `--log-level warn`/`error` `--enable-trace` exported nothing).
+        Some(otel_layer) => tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(filtered_by(layers, &directives))
+            .try_init(),
+        // Without tracing the one global filter, as before: nothing is filtered per layer.
+        None => tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(layers)
+            .try_init(),
+    };
 
     LogGuard(())
+}
+
+/// The log layers behind the log filter as their own: one filter over the group, read as the
+/// global one is (`Targets` when `EnvFilter` accepts the directives and they read the same both
+/// ways, else `EnvFilter`, lenient on a string it rejects, as [`init_logging`] falls back).
+fn filtered_by<S>(
+    layers: Vec<Box<dyn Layer<S> + Send + Sync + 'static>>,
+    directives: &str,
+) -> Box<dyn Layer<S> + Send + Sync + 'static>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+{
+    match EnvFilter::try_new(directives)
+        .ok()
+        .and_then(|_| targets_for(directives))
+    {
+        Some(targets) => Box::new(layers.with_filter(targets)),
+        None => Box::new(layers.with_filter(EnvFilter::new(directives))),
+    }
 }
 
 /// Logging helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use tracing::{subscriber::DefaultGuard, Dispatch};
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{subscriber::DefaultGuard, Dispatch, Level};
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     /// A test's subscriber: this thread's default until the value drops,
@@ -648,6 +786,47 @@ pub(crate) mod test_support {
         TestSubscriber {
             _guard: guard,
             _second: second,
+        }
+    }
+
+    /// Every event of the `smg::response` target, as (level, message): the
+    /// lines the response-side middleware writes, as a test reads them.
+    #[derive(Clone, Default)]
+    pub(crate) struct ResponseLines(Arc<Mutex<Vec<(Level, String)>>>);
+
+    impl ResponseLines {
+        pub(crate) fn lines(&self) -> Vec<(Level, String)> {
+            self.0.lock().expect("lines").clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for ResponseLines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "smg::response" {
+                return;
+            }
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .expect("lines")
+                .push((*event.metadata().level(), message.0));
         }
     }
 }
@@ -993,6 +1172,92 @@ mod writer_tests {
         assert!(
             ended.load(Ordering::SeqCst),
             "the writer thread ended after the guard dropped (the drop took {dropped_in:?})"
+        );
+    }
+
+    /// A sink whose first write takes `delay`: a file write the kernel holds
+    /// for longer than the guard's moment.
+    struct SlowFirstWrite {
+        delay: Option<Duration>,
+        sink: RecordingSink,
+    }
+
+    impl Write for SlowFirstWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(delay) = self.delay.take() {
+                thread::sleep(delay);
+            }
+            self.sink.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The close waits for a writer whose last write outlasts the guard's
+    /// moment (about a second): the line logged before the close is in the
+    /// sink when the close returns, not written after it.
+    #[test]
+    fn the_close_waits_for_a_writer_held_past_the_guards_moment() {
+        let recording = RecordingSink::default();
+        let (mut writer, sink) = start_sink(
+            Batched::with(
+                SlowFirstWrite {
+                    delay: Some(Duration::from_millis(1_500)),
+                    sink: recording.clone(),
+                },
+                Duration::ZERO,
+                BATCH_BYTES,
+            ),
+            "test-log-close-waits",
+        );
+        let line = b"a line logged before the close\n".to_vec();
+        writer
+            .write_all(&line)
+            .expect("a lossy writer reports every line as written");
+        // The writer thread is inside its slow write when the close begins.
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let all_ended = close_sinks(vec![sink]);
+        let took = started.elapsed();
+        assert!(
+            all_ended,
+            "the writer thread ended within the close's wait (the close took {took:?})"
+        );
+        assert_eq!(
+            recording.writes(),
+            vec![line],
+            "the line is in the sink when the close returns"
+        );
+    }
+
+    /// A writer with nothing left to write ends inside the guard's handshake:
+    /// the close costs no wait after it. The bound is half of [`CLOSE_WAIT`]:
+    /// a close that waited the whole of it for a writer already ended would
+    /// fail, while a guard handshake that runs out its own second on a busy
+    /// runner (the idle writer thread scheduled late) would not. The time is
+    /// the output, for the record (`--nocapture`).
+    #[test]
+    #[expect(clippy::print_stdout, reason = "the measurement is the output")]
+    fn the_close_returns_as_soon_as_an_idle_writer_has_ended() {
+        let recording = RecordingSink::default();
+        let (mut writer, sink) = start_sink(
+            Batched::with(recording.clone(), Duration::ZERO, BATCH_BYTES),
+            "test-log-close-idle",
+        );
+        let line = b"a line written long before the close\n".to_vec();
+        writer
+            .write_all(&line)
+            .expect("a lossy writer reports every line as written");
+        assert_eq!(recording.writes_of(line.len()), vec![line]);
+        let started = Instant::now();
+        assert!(close_sinks(vec![sink]), "an idle writer ends in time");
+        let took = started.elapsed();
+        println!("idle close took {took:?}");
+        assert!(
+            took < CLOSE_WAIT / 2,
+            "an idle writer ends inside the guard's handshake, with no wait after it: {took:?}"
         );
     }
 

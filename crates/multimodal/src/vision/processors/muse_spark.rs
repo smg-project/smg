@@ -31,7 +31,7 @@ use crate::{
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processor::VisionPreProcessor,
+        processor::{VideoClipOptions, VisionPreProcessor},
         transforms::{resize_lanczos_torch_aa_rgb_bytes, rgb_bytes, TransformError},
     },
 };
@@ -389,12 +389,36 @@ fn patchify_group(
 }
 
 /// Muse Spark image and video processor.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MuseSparkVisionProcessor;
+#[derive(Debug, Clone, Copy)]
+pub struct MuseSparkVisionProcessor {
+    image: MuseSparkVisionSettings,
+    video: MuseSparkVisionSettings,
+    do_resize: bool,
+    norm: PixelNorm,
+}
+
+impl Default for MuseSparkVisionProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MuseSparkVisionProcessor {
+    /// The processor of the default preprocessor config.
     pub fn new() -> Self {
-        Self
+        Self::from_preprocessor_config(&PreProcessorConfig::default())
+    }
+
+    /// Resolve the image and video settings, the resize switch and the
+    /// normalization of `config` once.
+    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        let image = MuseSparkVisionSettings::for_images(config);
+        Self {
+            image,
+            video: MuseSparkVisionSettings::for_video(config),
+            do_resize: config.do_resize.unwrap_or(true),
+            norm: Self::norm(config, &image),
+        }
     }
 
     fn norm(config: &PreProcessorConfig, settings: &MuseSparkVisionSettings) -> PixelNorm {
@@ -427,9 +451,9 @@ impl MuseSparkVisionProcessor {
     }
 
     fn preprocess_frames<'a, I>(
+        &self,
         frames: I,
         count: usize,
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>
     where
         I: Iterator<Item = (usize, usize, std::borrow::Cow<'a, [u8]>)>,
@@ -437,8 +461,8 @@ impl MuseSparkVisionProcessor {
         if count == 0 {
             return Err(TransformError::EmptyBatch);
         }
-        let settings = MuseSparkVisionSettings::for_video(config);
-        let do_resize = config.do_resize.unwrap_or(true);
+        let settings = self.video;
+        let do_resize = self.do_resize;
         let features = settings.patch_features();
         let temporal = settings.temporal_patch_size;
         let groups = count.div_ceil(temporal);
@@ -483,7 +507,7 @@ impl MuseSparkVisionProcessor {
             ))
         })?;
         Ok(PreprocessedEncoderInputs::new(
-            EncoderInput::bytes(encoder_input, Self::norm(config, &settings)),
+            EncoderInput::bytes(encoder_input, self.norm),
             vec![groups * plan.tokens],
             vec![original],
         )
@@ -529,13 +553,12 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-        let settings = MuseSparkVisionSettings::for_images(config);
-        let do_resize = config.do_resize.unwrap_or(true);
+        let settings = self.image;
+        let do_resize = self.do_resize;
         let features = settings.patch_features();
         let mut plans = Vec::with_capacity(images.len());
         let mut total_rows = 0;
@@ -574,7 +597,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
                 ))
             })?;
         Ok(PreprocessedEncoderInputs::new(
-            EncoderInput::bytes(encoder_input, Self::norm(config, &settings)),
+            EncoderInput::bytes(encoder_input, self.norm),
             tokens,
             sizes,
         )
@@ -588,15 +611,15 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        Self::preprocess_frames(frames.iter().map(pil_rgb_bytes), frames.len(), config)
+        self.preprocess_frames(frames.iter().map(pil_rgb_bytes), frames.len())
     }
 
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         for frame in frames {
             if frame.data.len() != frame.width as usize * frame.height as usize * CHANNELS {
@@ -608,7 +631,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
                 )));
             }
         }
-        Self::preprocess_frames(
+        self.preprocess_frames(
             frames.iter().map(|frame| {
                 (
                     frame.width as usize,
@@ -617,24 +640,18 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
                 )
             }),
             frames.len(),
-            config,
         )
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        Ok(Self::image_plan(width, height, config)?.tokens)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        Ok(self.image.plan(height as usize, width as usize)?.tokens)
     }
 
     fn model_name(&self) -> &'static str {
         "muse_spark"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -762,8 +779,8 @@ mod tests {
     #[test]
     fn image_rows_are_temporal_channel_row_column_and_normalized_in_f32() {
         let image = solid(28, 28, Rgb([255, 128, 0]));
-        let output = MuseSparkVisionProcessor::new()
-            .preprocess(&[image], &image_config())
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
+            .preprocess(&[image])
             .unwrap();
         assert_eq!(output.encoder_input.shape(), &[4, 1176]);
         assert_eq!(output.feature_token_counts, vec![1]);
@@ -799,8 +816,8 @@ mod tests {
                 image.put_pixel(x, y, Rgb([0, 0, 200]));
             }
         }
-        let output = MuseSparkVisionProcessor::new()
-            .preprocess(&[DynamicImage::ImageRgb8(image)], &image_config())
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
+            .preprocess(&[DynamicImage::ImageRgb8(image)])
             .unwrap();
         assert_eq!(output.encoder_input.shape(), &[8, 1176]);
         let values = output.encoder_input.as_f32().into_owned();
@@ -823,8 +840,8 @@ mod tests {
     #[test]
     fn alpha_is_dropped_and_sixteen_bit_grey_is_clipped_like_the_reference_loader() {
         let rgba = image::RgbaImage::from_pixel(28, 28, image::Rgba([10, 20, 30, 0]));
-        let output = MuseSparkVisionProcessor::new()
-            .preprocess(&[DynamicImage::ImageRgba8(rgba)], &image_config())
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
+            .preprocess(&[DynamicImage::ImageRgba8(rgba)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         let row = values.index_axis(ndarray::Axis(0), 0);
@@ -836,8 +853,8 @@ mod tests {
             28,
             image::Luma([300u16]),
         );
-        let output = MuseSparkVisionProcessor::new()
-            .preprocess(&[DynamicImage::ImageLuma16(grey)], &image_config())
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
+            .preprocess(&[DynamicImage::ImageLuma16(grey)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         assert_eq!(values[[0, 0]], 1.0);
@@ -846,8 +863,8 @@ mod tests {
             28,
             image::Luma([100u16]),
         );
-        let output = MuseSparkVisionProcessor::new()
-            .preprocess(&[DynamicImage::ImageLuma16(grey)], &image_config())
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
+            .preprocess(&[DynamicImage::ImageLuma16(grey)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         assert_eq!(values[[0, 0]], (100.0 - 127.5) / 127.5);
@@ -855,15 +872,12 @@ mod tests {
 
     #[test]
     fn batched_images_equal_their_single_preprocesses() {
-        let processor = MuseSparkVisionProcessor::new();
-        let config = image_config();
+        let processor = MuseSparkVisionProcessor::from_preprocessor_config(&image_config());
         let a = solid(100, 60, Rgb([1, 2, 3]));
         let b = solid(61, 99, Rgb([250, 100, 7]));
-        let batched = processor
-            .preprocess(&[a.clone(), b.clone()], &config)
-            .unwrap();
-        let single_a = processor.preprocess(&[a], &config).unwrap();
-        let single_b = processor.preprocess(&[b], &config).unwrap();
+        let batched = processor.preprocess(&[a.clone(), b.clone()]).unwrap();
+        let single_a = processor.preprocess(&[a]).unwrap();
+        let single_b = processor.preprocess(&[b]).unwrap();
         let rows_a = single_a.encoder_input.shape()[0];
         let rows_b = single_b.encoder_input.shape()[0];
         assert_eq!(batched.encoder_input.shape()[0], rows_a + rows_b);
@@ -883,19 +897,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            processor.calculate_num_tokens(100, 60, &config).unwrap(),
+            processor.calculate_num_tokens(100, 60).unwrap(),
             single_a.feature_token_counts[0]
         );
     }
 
     #[test]
     fn video_frames_pair_up_and_the_last_frame_fills_an_odd_group() {
-        let processor = MuseSparkVisionProcessor::new();
-        let config = video_config();
+        let processor = MuseSparkVisionProcessor::from_preprocessor_config(&video_config());
+        let clip = VideoClipOptions::sampled_at(2.0);
         let frames: Vec<DynamicImage> = (0..3u8)
             .map(|value| solid(56, 28, Rgb([value * 50, 0, 0])))
             .collect();
-        let output = processor.preprocess_video(&frames, &config).unwrap();
+        let output = processor.preprocess_video(&frames, &clip).unwrap();
         // 56x28 at patch 14 is a 2x4 grid: 8 rows per group, two groups.
         assert_eq!(output.encoder_input.shape(), &[16, 1176]);
         assert_eq!(output.feature_token_counts, vec![4]);
@@ -925,7 +939,7 @@ mod tests {
                 data: frame.as_raw(),
             })
             .collect();
-        let from_rgb = processor.preprocess_video_rgb(&refs, &config).unwrap();
+        let from_rgb = processor.preprocess_video_rgb(&refs, &clip).unwrap();
         assert_eq!(from_rgb.encoder_input, output.encoder_input);
         assert_eq!(from_rgb.feature_token_counts, output.feature_token_counts);
     }
@@ -944,18 +958,20 @@ mod tests {
 
     #[test]
     fn empty_and_ragged_inputs_are_errors() {
-        let processor = MuseSparkVisionProcessor::new();
+        let images = MuseSparkVisionProcessor::from_preprocessor_config(&image_config());
+        let videos = MuseSparkVisionProcessor::from_preprocessor_config(&video_config());
+        let clip = VideoClipOptions::sampled_at(2.0);
         assert!(matches!(
-            processor.preprocess(&[], &image_config()),
+            images.preprocess(&[]),
             Err(TransformError::EmptyBatch)
         ));
         assert!(matches!(
-            processor.preprocess_video(&[], &video_config()),
+            videos.preprocess_video(&[], &clip),
             Err(TransformError::EmptyBatch)
         ));
         let frames = [solid(56, 28, Rgb([0; 3])), solid(28, 28, Rgb([0; 3]))];
         assert!(matches!(
-            processor.preprocess_video(&frames, &video_config()),
+            videos.preprocess_video(&frames, &clip),
             Err(TransformError::InconsistentShapes)
         ));
     }

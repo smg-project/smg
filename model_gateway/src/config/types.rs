@@ -14,6 +14,7 @@ use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
+        endpoint::Endpoint,
         overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
         ConnectionMode, RuntimeType,
     },
@@ -24,14 +25,17 @@ use crate::{
 /// name for `--tool-call-parser` and `--reasoning-parser`, as vLLM names it.
 pub const TEMPLATE_PARSER: &str = "hf";
 
-/// The parser that reads a chat completion's output.
+/// The parser that reads a chat completion's output: Symphony unless `--parser legacy` (the
+/// config key `parser: legacy`), or a request's `X-SMG-Parser: legacy` header, asks for the
+/// older parsers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParserChoice {
-    /// The tool-call and reasoning parser crates, one parser per model family.
-    #[default]
+    /// The tool-call and reasoning parser crates, one parser per model family: the way back
+    /// from the default, for the whole gateway or for one request.
     Legacy,
-    /// Symphony's tables, by one precedence per model (`routers::grpc::regular::symphony::names::reads`):
+    /// Symphony's tables, the default, by one precedence per model
+    /// (`routers::grpc::regular::symphony::names::reads`):
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
     /// select, for a model the registry does not know. Names select a table when it answers to
@@ -40,6 +44,7 @@ pub enum ParserChoice {
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
     /// alone that no table answers to selects nothing, `passthrough` excepted; any other legacy
     /// tool-call parser's name, `passthrough`, and a model no table reads, keep the legacy parsers.
+    #[default]
     Symphony,
 }
 
@@ -101,6 +106,9 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Optional capacity thresholds for PD/EPD readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_readiness: Option<PdReadinessConfig>,
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin, worker-registry and RL routes) are served on it, with the probe
     /// routes, and the data listener answers 404 for them. `None` keeps the
@@ -167,7 +175,23 @@ pub struct RouterConfig {
     /// while the data plane is saturated. `0` is no bound.
     #[serde(default)]
     pub max_connections: usize,
+    /// Seconds a request may take: the read of its body overall (`408` past
+    /// it), and each attempt at an HTTP worker from its dispatch to its last
+    /// message (`504` `call_upstream_timeout` past it; on a stream, the error
+    /// event that ends it). That `504` is the request's answer, not replayed;
+    /// a worker's own pool `timeout_secs` takes this value's place, on an
+    /// HTTP worker and on a ZMQ worker's link, whose streams carry the same
+    /// bound. A request to a gRPC worker is bounded by
+    /// `grpc_request_timeout_secs` instead. Must be > 0.
     pub request_timeout_secs: u64,
+    /// Seconds a request to a gRPC worker may take, from its dispatch to its
+    /// last message: past it the attempt ends with `504`
+    /// `call_upstream_timeout` (on a stream, the error event that ends it),
+    /// the call to the worker is dropped, which cancels the request on the
+    /// worker, and that `504` is the request's answer, not replayed. `0` arms
+    /// no deadline, and is the default: the bound is opt-in.
+    #[serde(default)]
+    pub grpc_request_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
     /// API), so an idle-timeout proxy does not cut a stream that is waiting
@@ -215,13 +239,14 @@ pub struct RouterConfig {
     /// Seconds without a token or a completion from a worker that still
     /// answers polls, with requests in flight and a growing queue, after which
     /// new requests stop being routed to it until it makes progress. The same
-    /// bound caps how long a disaggregated prefill side may produce nothing,
-    /// with its worker answering no other side, before its request fails over
-    /// to another prefill worker (a worker whose current run of prompts has
-    /// not answered yet is given the time its backlog takes instead, two
-    /// minutes at most, the side keeping its decode admission room); on the
-    /// parallel dispatch shape it must cover the decode-side wait a side's
-    /// first response may see.
+    /// bound, with twice the prefill time the side's prompt needs behind the
+    /// worker's backlog, caps how long a disaggregated prefill side may
+    /// produce nothing, with its worker answering no other side, before its
+    /// request fails over to another prefill worker (a worker whose current
+    /// run of prompts has not answered yet is given the time its backlog
+    /// takes instead, two minutes at most, the side keeping its decode
+    /// admission room); on the parallel dispatch shape it must cover the
+    /// decode-side wait a side's first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
     /// Seconds without any contact from a worker whose KV-event stream pushes
@@ -279,7 +304,9 @@ pub struct RouterConfig {
     /// request goes to the least-loaded one (see `worker_overload_shed` for
     /// refusing instead). Unless `worker_overload_shed` is set, a
     /// cache-aware prefill pool of gRPC and HTTP prefill/decode pair
-    /// placement is not steered by them: its spill gate balances it.
+    /// placement is not steered by them: its spill gate balances it; nor is
+    /// a regular request that consistent_hashing places by its routing key,
+    /// which stays on its ring owner.
     /// Evaluated once per ingested load report, never per request. `false`
     /// switches both gateway thresholds off; per-worker `overload` blocks on
     /// a WorkerSpec still apply.
@@ -299,29 +326,13 @@ pub struct RouterConfig {
     /// Refuse a request with a 503 (`worker_overload_protection_shed`,
     /// Retry-After the poll interval) when every worker it could use is
     /// overloaded, instead of steering it to the least-loaded one (or, for a
-    /// cache-aware prefill pool, placing it by its policy). Off by
+    /// cache-aware prefill pool or a regular request that consistent_hashing
+    /// places by its routing key, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
     /// between selection and dispatch is part of the same opt-in.
     #[serde(default)]
     pub worker_overload_shed: bool,
-    /// Deprecated and ignored: the TTL prune of the positional indexer, which
-    /// the chain index replaced. The chain index holds what the engines report
-    /// and shrinks with their removals, so it has no prune. Still accepted so
-    /// that configurations written for the positional indexer load.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_indexer_ttl_secs: Option<u64>,
-    /// Deprecated and ignored: the capacity ceiling of the positional
-    /// indexer's prune; see `kv_indexer_ttl_secs`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_indexer_max_entries: Option<usize>,
-    /// Deprecated: the chain index is the only KV index behind cache-aware
-    /// routing, so the one value accepted is `chain`, which changes nothing;
-    /// `positional` names the index that was removed and is refused by
-    /// validation. Still accepted so that configurations written for the
-    /// switch load; the field goes in a later release.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_index: Option<String>,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
     /// always re-exported without an additional Engine RPC. A worker whose
@@ -383,6 +394,14 @@ pub struct RouterConfig {
     /// instead. When unset, falls back to `SMG_MM_TURBOJPEG`, then `prefer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_turbojpeg: Option<TurboJpegPolicy>,
+    /// Video download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_video_fetch_timeout_ms: Option<u64>,
+    /// Image/audio download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_fetch_timeout_ms: Option<u64>,
     /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
     /// (the workers connect to it as written, so `ConfigValidator` refuses
     /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
@@ -534,9 +553,9 @@ pub struct RouterConfig {
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
-    /// Which parser reads a chat completion's reasoning and tool calls: the per-model
-    /// parsers (`legacy`, the default) or Symphony (`symphony`) for the models its
-    /// registry knows. A request's `X-SMG-Parser` header overrides it for that request.
+    /// Which parser reads a chat completion's reasoning and tool calls: Symphony
+    /// (`symphony`, the default) for the models its registry knows, or the per-model
+    /// parsers (`legacy`). A request's `X-SMG-Parser` header overrides it for that request.
     #[serde(default)]
     pub parser: ParserChoice,
     #[serde(default = "default_history_backend")]
@@ -600,6 +619,52 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+}
+
+/// Capacity threshold for one PD role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadinessRoleConfig {
+    /// Desired fleet size used as the stable percentage denominator. Has no
+    /// effect unless `min_healthy_percent` is also set.
+    pub expected_workers: Option<usize>,
+    /// Absolute safety floor, independent of the percentage threshold.
+    pub min_healthy_workers: usize,
+    /// Minimum healthy percentage of `expected_workers`.
+    pub min_healthy_percent: Option<u8>,
+}
+
+impl Default for ReadinessRoleConfig {
+    /// Preserve the one-healthy-worker requirement without a percentage gate.
+    fn default() -> Self {
+        Self {
+            expected_workers: None,
+            min_healthy_workers: 1,
+            min_healthy_percent: None,
+        }
+    }
+}
+
+impl ReadinessRoleConfig {
+    /// Effective number of healthy workers required for this role.
+    pub fn required_workers(self) -> usize {
+        let percentage_required =
+            self.expected_workers
+                .zip(self.min_healthy_percent)
+                .map_or(0, |(expected, percent)| {
+                    let percent = usize::from(percent);
+                    (expected / 100) * percent + ((expected % 100) * percent).div_ceil(100)
+                });
+        self.min_healthy_workers.max(percentage_required)
+    }
+}
+
+/// Independent readiness thresholds for the two PD pipeline roles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdReadinessConfig {
+    pub prefill: ReadinessRoleConfig,
+    pub decode: ReadinessRoleConfig,
 }
 
 /// How a request's tenant is resolved on the serving path. The tenant scopes
@@ -898,7 +963,7 @@ fn default_history_backend() -> HistoryBackend {
 }
 
 /// Routing mode configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RoutingMode {
     #[serde(rename = "regular")]
@@ -934,6 +999,68 @@ pub enum RoutingMode {
     Anthropic { worker_urls: Vec<String> },
     #[serde(rename = "gemini")]
     Gemini { worker_urls: Vec<String> },
+}
+
+/// The derive, with every worker URL masked like [`Endpoint::redacted`]: the
+/// mode is in the gateway's start-up lines, and the derive would have written
+/// the configured URLs with their credentials.
+impl std::fmt::Debug for RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn masked(urls: &[String]) -> Vec<String> {
+            urls.iter().map(|url| Endpoint::redacted_str(url)).collect()
+        }
+        fn masked_with_ports(urls: &[(String, Option<u16>)]) -> Vec<(String, Option<u16>)> {
+            urls.iter()
+                .map(|(url, port)| (Endpoint::redacted_str(url), *port))
+                .collect()
+        }
+        match self {
+            RoutingMode::Regular { worker_urls } => f
+                .debug_struct("Regular")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => f
+                .debug_struct("PrefillDecode")
+                .field("prefill_urls", &masked_with_ports(prefill_urls))
+                .field("decode_urls", &masked(decode_urls))
+                .field("prefill_policy", prefill_policy)
+                .field("decode_policy", decode_policy)
+                .finish(),
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+            } => f
+                .debug_struct("EncodePrefillDecode")
+                .field("encode_urls", &masked_with_ports(encode_urls))
+                .field("prefill_urls", &masked_with_ports(prefill_urls))
+                .field("decode_urls", &masked(decode_urls))
+                .field("encode_policy", encode_policy)
+                .field("prefill_policy", prefill_policy)
+                .field("decode_policy", decode_policy)
+                .finish(),
+            RoutingMode::OpenAI { worker_urls } => f
+                .debug_struct("OpenAI")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::Anthropic { worker_urls } => f
+                .debug_struct("Anthropic")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::Gemini { worker_urls } => f
+                .debug_struct("Gemini")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+        }
+    }
 }
 
 impl RoutingMode {
@@ -1287,8 +1414,8 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Throughput (tokens/s) for prefill workers, and fallback when other
-        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// Throughput (tokens/s) for prefill workers, and fallback for other
+        /// workers when no candidate reports a live `gen_throughput`. Set to per-replica input
         /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
         /// `kv_pressure_weight`. The CLI shares one value across roles; use
         /// programmatically constructed `prefill_policy` / `decode_policy` for
@@ -1481,6 +1608,36 @@ impl Serialize for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// A cache-aware policy with these thresholds and every other knob at
+    /// the value a configuration file gets when it leaves the knob out.
+    pub fn cache_aware(
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+            block_size: default_block_size(),
+            balance_token_usage_threshold: default_balance_token_usage_threshold(),
+            overload_token_usage_threshold: default_balance_token_usage_threshold(),
+            overlap_decay: default_overlap_decay(),
+            selection_temperature: default_selection_temperature(),
+            cache_index: CacheIndexKind::default(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
@@ -1763,11 +1920,14 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Recover failed workers by removal: they re-enter through service
-    /// discovery once their engine returns. Off, a Failed worker stays
-    /// registered and probed, and rejoins in place when it answers again.
+    /// Recover failed workers by removal: a removed worker re-enters through
+    /// service discovery once its engine returns. Unset, removal follows
+    /// discovery and takes only the workers a provider discovered; `true`
+    /// removes any local worker that fails, `false` none, and a Failed worker
+    /// then stays registered and probed, and rejoins in place when it answers
+    /// again. See [`resolve_worker_auto_recovery`].
     #[serde(default, alias = "worker_auto_recovery")]
-    pub remove_unhealthy_workers: bool,
+    pub remove_unhealthy_workers: Option<bool>,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
     /// is submitted before the registry entry is removed. Lets in-flight
     /// requests complete naturally. Set to `0` to skip draining and
@@ -1780,17 +1940,40 @@ fn default_drain_settle_secs() -> u64 {
     5
 }
 
-/// Resolve `--worker-auto-recovery`'s conditional default: an explicit
-/// setting always wins; otherwise it follows service discovery.
+/// Which Failed workers the health checker removes. Mesh-imported workers
+/// are never removed under any scope: their owner manages them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnhealthyRemovalScope {
+    /// None: a Failed worker stays registered and probed, and rejoins in
+    /// place when its engine answers again.
+    Disabled,
+    /// The workers a discovery provider registered, which it registers again
+    /// once their engine returns. Static and API-added workers stay.
+    DiscoveryOwned,
+    /// Every local worker, static and API-added ones included, though
+    /// nothing re-adds those.
+    AllLocal,
+}
+
+/// Resolve `--worker-auto-recovery` into the removal scope. An explicit
+/// setting wins: `true` removes any local worker that fails, `false` none.
+/// Unset, it follows service discovery, and takes only what discovery can
+/// give back.
 ///
-/// The recovery mechanism is removal — a terminally failed worker is dropped
-/// from the registry so discovery re-registers and re-probes it once its
-/// engine returns. With discovery on, that loop completes and recovery is
-/// pure upside; with discovery off, nothing re-adds the worker, so removal
-/// would silently and permanently shrink a static fleet and must stay
-/// opt-in.
-pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: bool) -> bool {
-    explicit.unwrap_or(service_discovery)
+/// The recovery mechanism is removal: a terminally failed worker is dropped
+/// from the registry so its provider re-registers and re-probes it once its
+/// engine returns. A static or API-added worker has no provider to re-add
+/// it, so removing one would shrink the fleet for good: under discovery's
+/// default it stays, and recovers in place.
+pub fn resolve_worker_auto_recovery(
+    explicit: Option<bool>,
+    service_discovery: bool,
+) -> UnhealthyRemovalScope {
+    match (explicit, service_discovery) {
+        (Some(true), _) => UnhealthyRemovalScope::AllLocal,
+        (None, true) => UnhealthyRemovalScope::DiscoveryOwned,
+        (Some(false), _) | (None, false) => UnhealthyRemovalScope::Disabled,
+    }
 }
 
 impl Default for HealthCheckConfig {
@@ -1802,7 +1985,7 @@ impl Default for HealthCheckConfig {
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
             disable_health_check: false,
-            remove_unhealthy_workers: false,
+            remove_unhealthy_workers: None,
             drain_settle_secs: default_drain_settle_secs(),
         }
     }
@@ -1905,6 +2088,7 @@ impl Default for RouterConfig {
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
+            pd_readiness: None,
             health_check_port: None,
             admin_port: None,
             admin_host: None,
@@ -1916,6 +2100,7 @@ impl Default for RouterConfig {
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
+            grpc_request_timeout_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -1939,9 +2124,6 @@ impl Default for RouterConfig {
             worker_overload_waiting_requests: default_worker_overload_waiting_requests(),
             worker_overload_token_usage: default_worker_overload_token_usage(),
             worker_overload_shed: false,
-            kv_indexer_ttl_secs: None,
-            kv_indexer_max_entries: None,
-            kv_index: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
@@ -1953,6 +2135,8 @@ impl Default for RouterConfig {
             mm_allowed_media_domains: None,
             mm_allow_private_media_hosts: false,
             mm_turbojpeg: None,
+            mm_video_fetch_timeout_ms: None,
+            mm_fetch_timeout_ms: None,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -2039,6 +2223,17 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
+    /// Which Failed workers the health checker removes: the setting as
+    /// given, resolved against whether a discovery provider is selected. The
+    /// CLI, the Python binding and a configuration file all keep the setting
+    /// unresolved, so it is resolved here alone.
+    pub fn unhealthy_removal_scope(&self) -> UnhealthyRemovalScope {
+        resolve_worker_auto_recovery(
+            self.health_check.remove_unhealthy_workers,
+            self.discovery.is_some(),
+        )
+    }
+
     /// Get the routing mode type as a string
     pub fn mode_type(&self) -> &'static str {
         match self.mode {
@@ -2102,6 +2297,35 @@ impl RouterConfig {
 mod tests {
     use super::*;
 
+    /// The mode is in the gateway's start-up lines: a worker URL's secret is
+    /// never written there, the rest of the derive's form is kept.
+    #[test]
+    fn routing_mode_debug_masks_the_secret_of_a_worker_url() {
+        let regular = RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@127.0.0.1:1".to_string()],
+        };
+        assert_eq!(
+            format!("{regular:?}"),
+            r#"Regular { worker_urls: ["http://***@127.0.0.1:1"] }"#
+        );
+        let pd = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://user:secret@127.0.0.1:8000".to_string(), Some(8998))],
+            decode_urls: vec!["http://127.0.0.1:8001".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let shown = format!("{pd:?}");
+        assert!(
+            shown.contains(r#"("http://***@127.0.0.1:8000", Some(8998))"#),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(r#"decode_urls: ["http://127.0.0.1:8001"]"#),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
+    }
+
     #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();
@@ -2115,6 +2339,7 @@ mod tests {
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.max_buffered_request_bytes, 1_048_576);
         assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.grpc_request_timeout_secs, 0);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.zmq_startup_timeout_secs, 3600);
@@ -2273,6 +2498,7 @@ mod tests {
     }
 
     #[test]
+    /// Old configs preserve defaults and explicit media settings round-trip.
     fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
         // Unset by default, and the optional ones stay out of serialized output.
         let config = RouterConfig::default();
@@ -2282,6 +2508,8 @@ mod tests {
             "mm_pixel_cache_mb",
             "mm_allowed_media_domains",
             "mm_turbojpeg",
+            "mm_fetch_timeout_ms",
+            "mm_video_fetch_timeout_ms",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -2301,6 +2529,8 @@ mod tests {
         assert_eq!(without.mm_allowed_media_domains, None);
         assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.mm_turbojpeg, None);
+        assert_eq!(without.mm_fetch_timeout_ms, None);
+        assert_eq!(without.mm_video_fetch_timeout_ms, None);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -2314,6 +2544,8 @@ mod tests {
             .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
             .mm_allow_private_media_hosts(true)
             .mm_turbojpeg(Some(TurboJpegPolicy::Require))
+            .mm_fetch_timeout_ms(Some(60000))
+            .mm_video_fetch_timeout_ms(Some(120000))
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -2331,6 +2563,8 @@ mod tests {
         );
         assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.mm_turbojpeg, Some(TurboJpegPolicy::Require));
+        assert_eq!(with.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(with.mm_video_fetch_timeout_ms, Some(120000));
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
@@ -2500,6 +2734,44 @@ mod tests {
         assert_eq!(with.pd_admission_wait_secs, 0);
     }
 
+    /// Unset, removal follows discovery and takes only the workers a
+    /// provider can give back; an explicit setting wins either way.
+    #[test]
+    fn unhealthy_removal_follows_discovery_unless_set() {
+        use UnhealthyRemovalScope::{AllLocal, Disabled, DiscoveryOwned};
+        let scope = |explicit, discovery: bool| {
+            let config = RouterConfig {
+                health_check: HealthCheckConfig {
+                    remove_unhealthy_workers: explicit,
+                    ..Default::default()
+                },
+                discovery: discovery.then(|| {
+                    DiscoveryConfig::File(FileDiscoveryConfig {
+                        path: "/run/smg/workers.json".into(),
+                        check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+                    })
+                }),
+                ..Default::default()
+            };
+            config.unhealthy_removal_scope()
+        };
+        assert_eq!(scope(None, true), DiscoveryOwned);
+        assert_eq!(scope(None, false), Disabled);
+        assert_eq!(scope(Some(true), true), AllLocal);
+        assert_eq!(scope(Some(true), false), AllLocal);
+        assert_eq!(scope(Some(false), true), Disabled);
+        assert_eq!(scope(Some(false), false), Disabled);
+
+        // A configuration file that leaves it out keeps it unset.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        json["health_check"]
+            .as_object_mut()
+            .unwrap()
+            .remove("remove_unhealthy_workers");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.health_check.remove_unhealthy_workers, None);
+    }
+
     #[test]
     fn alias_field_spellings_deserialize_and_serialize_canonically() {
         // Config files may use the intent-revealing spellings; alias in,
@@ -2519,7 +2791,7 @@ mod tests {
             serde_json::Value::Bool(true),
         );
         let cfg: RouterConfig = serde_json::from_value(json).unwrap();
-        assert!(cfg.health_check.remove_unhealthy_workers);
+        assert_eq!(cfg.health_check.remove_unhealthy_workers, Some(true));
         let out = serde_json::to_string(&cfg).unwrap();
         assert!(out.contains("routing_key_override"));
         assert!(out.contains("remove_unhealthy_workers"));
@@ -2700,25 +2972,7 @@ mod tests {
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
         assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         assert_eq!(cache_aware.name(), "cache_aware");
 
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -2733,25 +2987,7 @@ mod tests {
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
@@ -2767,25 +3003,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.75, 20, 2.0, 600, 5000);
 
         match cache_aware {
             PolicyConfig::CacheAware {
@@ -2804,6 +3022,25 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    /// The constructor's policy is the one a configuration file yields when
+    /// it names the five thresholds and nothing else.
+    #[test]
+    fn cache_aware_constructor_matches_the_file_defaults() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let from_file: PolicyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            serde_json::to_value(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)).unwrap(),
+            serde_json::to_value(from_file).unwrap()
+        );
     }
 
     #[test]
@@ -3588,25 +3825,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_metric: Default::default(),
             }),
@@ -3630,25 +3849,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: None,
         };
 
@@ -3698,25 +3899,7 @@ discovery:
             decode_policy: None,
         };
 
-        let main_policy = PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 2000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let main_policy = PolicyConfig::cache_aware(0.7, 20, 1.5, 300, 2000);
 
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {
@@ -3785,5 +3968,28 @@ discovery:
         let json: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type": "power_of_two"})).unwrap();
         assert_eq!(json.name(), "power_of_two");
+    }
+
+    #[test]
+    fn symphony_is_the_default_parser_and_legacy_spells_the_way_back() {
+        assert_eq!(ParserChoice::default(), ParserChoice::Symphony);
+        assert_eq!(RouterConfig::default().parser, ParserChoice::Symphony);
+        assert_eq!(ParserChoice::parse("legacy"), Some(ParserChoice::Legacy));
+        assert_eq!(
+            ParserChoice::parse(" Symphony "),
+            Some(ParserChoice::Symphony)
+        );
+        assert_eq!(ParserChoice::parse("fast"), None);
+
+        // A config document that names no parser reads with Symphony; `parser: legacy` is
+        // the way back; the choice survives a round trip under its own name.
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(value["parser"], serde_json::json!("symphony"));
+        value.as_object_mut().unwrap().remove("parser");
+        let defaulted: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(defaulted.parser, ParserChoice::Symphony);
+        value["parser"] = serde_json::json!("legacy");
+        let legacy: RouterConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.parser, ParserChoice::Legacy);
     }
 }

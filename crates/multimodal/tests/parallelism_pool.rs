@@ -5,8 +5,7 @@ use std::num::NonZeroUsize;
 
 use image::{DynamicImage, Rgb, RgbImage};
 use llm_multimodal::{
-    configure_parallelism, vision::processors::Qwen2VLProcessor, Parallelism, PreProcessorConfig,
-    VisionPreProcessor,
+    configure_parallelism, vision::processors::Qwen2VLProcessor, Parallelism, VisionPreProcessor,
 };
 
 #[cfg(target_os = "linux")]
@@ -30,9 +29,7 @@ fn pool_mode_preprocesses_and_rejects_reconfiguration() {
     );
     let processor = Qwen2VLProcessor::new();
     let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1792, 1344, Rgb([90, 160, 30])));
-    let out = processor
-        .preprocess(&[image], &PreProcessorConfig::default())
-        .expect("preprocess");
+    let out = processor.preprocess(&[image]).expect("preprocess");
     assert!(out.total_feature_tokens() > 0);
     #[cfg(target_os = "linux")]
     assert_eq!(pool_threads().expect("read Linux pool threads"), 3);

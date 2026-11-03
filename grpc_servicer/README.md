@@ -62,9 +62,11 @@ which defines them on a gRPC launcher's parser that lacks them: `vllm serve
 --grpc` and the stock `python -m vllm.entrypoints.grpc_server` (there the
 values also reach a servicer built without the namespace, through the
 environment). A flag left out falls back to the matching `SMG_VLLM_MM_*`
-variable, which logs a deprecation line on a launcher that has the flag; a
-launcher without the flags (no plugins loaded, a servicer built on its own)
-takes the variable as its documented setting and logs nothing. The startup
+variable. Legacy variables log a deprecation line on a launcher that has the
+flag; the TurboJPEG policy and download timeout variables remain supported
+fallbacks and never log a deprecation warning. A launcher without the flags
+(no plugins loaded, a servicer built on its own) takes the variable as its
+documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
@@ -115,6 +117,34 @@ owner, which the router relays as a 400 `start_generation_failed`. With the
 defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
 that flag is the one to raise; the router's `--max-payload-size` (default
 512 MiB) must also hold the whole request body.
+
+Media URL download budgets can be set with `--mm-fetch-timeout-ms` (images
+and audio, default **10000**) and `--mm-video-fetch-timeout-ms` (video,
+default **30000**). Both take positive integer milliseconds and cover the
+fetch from connection through the last byte, not decoding or inference.
+Set them on the process that downloads the media:
+
+- **Router preprocessing** (shared by vLLM, SGLang and TokenSpeed): the Rust
+  and Python router CLIs accept both flags, with environment fallbacks
+  `SMG_MM_FETCH_TIMEOUT_MS` and `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`.
+- **vLLM Rust worker**, `--servicer-impl rust --mm-processor smg`: the same
+  flags use `SMG_VLLM_MM_FETCH_TIMEOUT_MS` and
+  `SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS` as environment fallbacks.
+
+An explicit flag takes precedence over its environment variable. Unset
+values retain the defaults above. These settings do not change downloads
+performed by vLLM's own `inprocess` or `redis` processors; configure those
+through the engine's media loader settings. SGLang and TokenSpeed currently
+use the Router's media pipeline, so set the budgets on the Router for them.
+
+A fetch that fails is answered under `media_fetch_failed` by whose fault it
+is, on the Router's pipeline and the vLLM Rust worker's alike: a reference the
+request got wrong (a URL that cannot be parsed or resolved, a host that refuses
+the connection or answers 4xx, a payload that is not the media it claims to
+be) is a 400; a host that does not deliver within the budget, answers 5xx or
+breaks the transfer is a 502, so a client knows whether to retry. Neither
+counts against the worker's circuit breaker, and the Router does not replay
+either on another worker, which would meet the same host.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
@@ -240,6 +270,32 @@ if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
 ```
 
+##### Metrics (`--metrics-port`)
+
+The Rust servicer serves Prometheus metrics on a listener of its own when
+asked: `--metrics-port <port>` (`--metrics-host` picks the interface; it
+defaults to the gRPC `--host`), or the environment form
+`SMG_VLLM_SERVICER_METRICS_PORT` / `SMG_VLLM_SERVICER_METRICS_HOST` that the
+flags override. Without either, no endpoint. The families are the same on every
+engine (`smg_servicer_*`, labels `model`, `rank`, `wire`): requests by finish
+reason, refusals, errors, in-flight requests, prompt / cached / generated
+tokens, and the time-to-first-token, inter-token, per-request-mean and
+end-to-end latency histograms (vLLM's own bucket edges), plus the servicer's
+lifecycle state and start time. The listener binds beside the gRPC one, before
+the engine connects (a scrape during the engine's start answers
+`smg_servicer_state{state="starting"} 1`; a readiness hold (admission open to
+the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
+on its own thread, and closes
+with the servicer; a port equal to `--port` is refused before the engine
+starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
+no endpoint). A planned warm-up's own requests go through the request path
+and are counted like any other, so the first scrapes include them.
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust --metrics-port 29100
+curl -s http://127.0.0.1:29100/metrics | grep smg_servicer_requests_total
+```
+
 ##### Supported vLLM releases
 
 The switch binds `serve_grpc` in the launcher module of the installed release
@@ -304,7 +360,11 @@ contract the Python servicer serves: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
-below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+below), `Embed`, `FlushCache`, `StartProfile` and `StopProfile` (the engine's own
+torch profiler as its launch configured it, started and stopped on every rank;
+a start that sets per-request options is refused, since the engine takes its
+profiler's directory and options at launch; the same on the Python servicer),
+`GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
@@ -321,12 +381,147 @@ own messages count too, so a healthy start that takes longer, a large
 checkpoint streaming in for an hour, still completes, while an engine that
 exits fails fast regardless), `SMG_VLLM_SERVICER_STARTUP_CEILING_SECS`
 (default 14400: the most a start may take however alive the engine is; 0
-lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+lifts the ceiling), `SMG_VLLM_SERVICER_SILENCE_TIMEOUT_SECS` (default 300: how
+long the connected engine may hold requests in flight, in total since its last
+output, with nothing pending prefill, before the servicer treats it as dead,
+fails them and closes the link for the launcher to restart the pair; a hard
+engine death sends nothing over the wire, so silence is the only sign of it),
+`SMG_VLLM_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000: the prompt tokens
+pending prefill, those of the requests the engine has accepted and produced
+nothing for yet, extend that bound by the time they take at this rate, 500 s
+per million tokens; a wire that says nothing until a prompt's first token is
+silent through a whole prefill, and a batch of long prompts prefills for
+longer than any fixed bound; a low rate is a bound on how slowly a healthy
+engine may prefill, not an estimate of how fast it does; 0 allows nothing),
+`SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
+
+##### Prefill/decode over NIXL on one host: restarting a leg in place
+
+A prefill and a decode leg on one host (or one NVLink domain) move KV over
+UCX's CUDA IPC: the importing side opens the peer's allocations and keeps the
+mappings in a process-wide cache that lives as long as the importer does, and
+an imported mapping keeps the exporter's allocation alive after the exporter
+died. A leg that crashes therefore cannot restart on its own GPU until its
+peers let go: its startup memory check sees the dead process's memory as still
+in use ("Free memory on device ... is less than desired GPU memory
+utilization") and the pod crash-loops until the peers restart too. Two of the
+engine's own settings bound the hold, and they work only together:
+
+- `UCX_CUDA_IPC_CACHE=n` in the engine's environment: a mapping ends with its
+  transfer instead of staying cached.
+- `kv_connector_extra_config.engine_ttl` (seconds) in `--kv-transfer-config`:
+  a peer idle longer than this is dropped the next time the connector runs
+  its sweep, which it does when it handshakes a new peer and when it sends a
+  heartbeat; an hour by the connector's default. A restarted leg counts as a
+  new peer only for the peers that do not hold its memory: the leg whose
+  memory a peer still holds fails its startup memory check before it
+  handshakes anyone, so its own restart cannot run the sweep that would
+  release it. The heartbeat goes out on a known peer's requests as well, at
+  most once per sixth of the connector's lease (five seconds at its default)
+  while any request is waiting for its KV, so a busy decode runs the sweep
+  every few seconds; the peer a request reads from is stamped active before
+  the sweep, so a pair's own traffic never drops the pair. A single pair
+  whose prefill died sends no heartbeat either; its
+  decode lets go of the dead leg's memory only when another peer turns up or
+  a live peer's requests run the sweep. Dropping the peer releases its
+  transfer state, the transfers that were in flight when it died included;
+  with the cache off their mappings go with them, with the cache on the
+  mappings outlive the peer either way.
+
+Neither is free, which is why the servicer does not set them for you. With
+the cache off, every request's transfer opens and closes each of the peer's
+allocations it touches (about one per layer, the way the engine allocates its
+KV cache). Measured on one host, two tensor-parallel-2 legs over CUDA IPC,
+prompts of about 5100 tokens, 40 sequential requests per arm: the first token
+came 2 % later at the median (885 to 903 ms) and 5 % later at the 90th
+percentile (900 to 943 ms), with one three-second outlier in forty, in the
+cache-off arm. A short TTL costs a quiet pair nothing by itself, since the
+sweep runs only when a new peer turns up or a heartbeat goes out on a
+request; when either happens, a healthy pair that had been idle longer than
+the TTL (other than the pair whose own request ran the sweep) is dropped
+with the dead ones and runs its handshake again on its next request (the
+peer's metadata plus a descriptor list over every one of its KV blocks:
+seconds on a large cache). Legs on different hosts are not
+affected: over TCP or RDMA nothing of the peer's memory is imported, and a
+restart passes the memory check at once. The repository's end-to-end harness
+runs its NIXL pairs with the cache off and a TTL of 3 s because it restarts
+legs on purpose; a production pair on one host wants a TTL of a few minutes,
+longer than any gap a busy pair leaves, shorter than the restart back-off a
+crashed leg would otherwise sit through.
+
+##### Prefill/decode over NIXL across hosts on TCP: the UCX segment size
+
+Legs on different hosts without an RDMA device move the KV over UCX's TCP
+transport, and the decode side's read of a remote block list is UCX's
+software-emulated GET: the data travels as active-message fragments of the
+TCP transport's send segment, 8 KiB by UCX's default, each one staged through
+host memory on both ends. For a hybrid checkpoint the per-request pull is
+large (the linear-attention state is moved whole; a 1,300-token prompt of a
+checkpoint with 34 linear-attention and 11 full-attention layers, TP 2 per
+leg, moves about 100 MB per rank), so the fragment count, not the link, sets
+the rate: the default moves about 2.2 Gbit/s per rank stream where a plain
+socket between the same pods moves 14 Gbit/s, pulls queue FIFO on the decode
+side, and one decode leg tops out near 2.7 requests/s with first tokens of
+30 s and more behind the queue. A 1 MiB segment on both legs removes most of
+the per-fragment cost and puts the stream at the single-socket rate, so the
+engine image ships it: `docker/ucx.conf`, copied to `/etc/ucx/ucx.conf` by
+the image build, holds
+
+```
+UCX_TCP_TX_SEG_SIZE=1m
+UCX_TCP_RX_SEG_SIZE=1m
+```
+
+(the receive segment, 64 KiB by default, must be at least the send segment;
+UCX refuses the pair otherwise). Measured on one prefill + one decode leg over TCP, text
+prompts of 1,000-1,500 tokens, 64-128 output tokens, open-loop arrivals,
+UCX 1.22 as bundled with NIXL 1.4:
+
+| offered | setting | completed req/s | first token p50 / p90 / p99 | per-rank pull, unqueued | pull wait p50 / p90 |
+|---|---|---|---|---|---|
+| 2 req/s | UCX's default (8 KiB) | 1.89 | 1.49 / 4.46 / 7.94 s | 0.36 s = 2.2 Gbit/s | 1.15 / 3.36 s |
+| 2 req/s | 1 MiB (the image's file) | 1.89 | 0.31 / 0.50 / 2.63 s | 0.073 s = 11 Gbit/s | 0.13 / 0.18 s |
+| 4 req/s | UCX's default (8 KiB) | 2.7 (the ceiling; 503 overload sheds) | 33.9 / 39.0 / 41.7 s | 0.37 s | 8.9 / 12.0 s |
+| 4 req/s | 1 MiB (the image's file) | 3.93 | 0.35 / 0.58 / 0.75 s | 0.074 s | 0.15 / 0.28 s |
+| ramp 1/2/4/8/12 req/s, 60 s each, image prompts, the router's default 3 s first-token bound | UCX's default (8 KiB) | 0.62 (181 first-token verdicts, 1,527 refusals from 4 req/s on) | - | 0.38 s | 1.13 / 3.82 s |
+| the same ramp | 1 MiB | 5.68 (steps served at 1.0 / 2.07 / 3.53 / 9.0 / 11.83; no verdict, no refusal) | 2.46 / 10.1 / 11.7 s over the whole ramp | 0.075 s | 0.76 / 2.10 s |
+
+Why a file and not an environment variable: UCX reads its settings in the
+process that creates the UCX context, that is the engine's tensor-parallel
+worker processes, and a deployment whose workers do not inherit the
+container's environment (the pair above was one: the workers saw a third of
+the container's variables, the `UCX_*` ones not among them) loses a pod-level
+`UCX_*` setting on the way. `/etc/ucx/ucx.conf` is the config directory
+compiled into the UCX that NIXL bundles, read by every process regardless of
+its environment or working directory. To override the shipped values, write
+the keys to a `ucx.conf` in a directory named by `UCX_CONFIG_DIR` or in the
+process's working directory (`/vllm-workspace` in the stock vLLM image), or
+set the variables in the workers' environment: UCX reads the files in that
+order and the environment last, each layer overriding the one before, so the
+image's file is the lowest layer and a working-directory file wins over
+`UCX_CONFIG_DIR`. `UCX_PROTO_INFO=y` in
+any of them prints UCX's protocol selection once per peer at the first
+transfer and is the quick check of what is in force. 256 KiB segments already
+give most of the gain and segments larger than 1 MiB buy nothing on one socket
+(the stream already sits at the socket's rate). The two keys configure the
+TCP transport only: a pair on one host over CUDA IPC, or over RDMA, does not
+use it and is not affected. Which engines read the file follows from their
+UCX: the pip NIXL wheels (1.0.0, 1.4.1) compile `/etc/ucx` in as the config
+directory, so vLLM's NIXL connector and SGLang's NIXL transfer backend read
+it; Mooncake (SGLang's default transport, TokenSpeed's only one) and MoRI-IO
+do not use UCX; TensorRT-LLM's release images build their own UCX under
+`/usr/local/ucx` with no system config directory, so that UCX looks in
+`/usr/local/ucx/etc/ucx` and never opens this file (a pair on that engine
+sets the keys through one of the layers above). The cost is host memory, not GPU memory: UCX
+stages TCP sends and receives through buffers of the segment size, pooled per
+process in chunks of eight (8 MiB of send and 16 MiB of receive buffers per
+chunk at 1 MiB segments, against 64 KiB and 1 MiB with the defaults), one
+send and one receive buffer in use per connected peer at a time.
 
 ##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
 
@@ -342,26 +537,47 @@ warm-up over the engine before they report SERVING: a decode staircase (as
 many concurrent requests as the running window holds, each asking for one more
 token than the last, so every running-batch size runs once), a prefill ladder
 (one request per 128-token length class up to `--max-num-batched-tokens`, the
-graph-capture sizes, lengths one above the tuners' bucket grid), and a second
-pass over the bucket grid whose timings show what the first pass paid. Every
-request carries its own token ids, so prefix caching never hides a prefill,
-and the engine's prefix cache is flushed at the end. One INFO line per shape
-with its time; readiness (the gRPC health service, so the startup and
+graph-capture sizes, lengths one above the tuners' bucket grid), a second
+pass over the bucket grid whose timings show what the first pass paid, and,
+where the engine's module asks for it (TokenSpeed, below), every remaining
+prompt length up to the step, last, in an order whose every prefix is a
+uniform spread of the range, so a budget cut leaves an even coverage. The
+longest prompt is what the engine's scheduler admits with one output token:
+the context less the positions the engine keeps back (none on vLLM, where a
+prompt and an output budget may fill the context; two on TokenSpeed, or its
+speculative draft window when wider; six on SGLang), never the context
+itself. Every request carries its own token ids, so prefix caching never
+hides a prefill, and the engine's prefix cache is flushed at the end. One INFO line per shape
+with its time (a chunk remainder's at DEBUG, with an INFO progress line every
+500 remainders and one at their end); readiness (the gRPC health service, so the startup and
 readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
 whatever the pass returned (a failed request is a logged line, never a worker
 kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 300 s) bounds the pass:
+`<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for
+TokenSpeed, whose plan holds the chunk remainders, below) bounds the pass:
 it ends between shapes, the remaining ones named in the log, and each
 request's timeout is clamped to what is left of it (one second at least), so
 a shape that hangs cannot hold readiness past the budget. On the Rust path the
 pass runs over the servicer's own gRPC port between the engine's handshake and
-SERVING; the Python servicer runs it over its in-process engine with its
-health service holding NOT_SERVING meanwhile. Under data parallelism every
+SERVING, once the KV-event relay's subscription has reached the engine's
+publisher (the warm-up's batches are the engine's first, and a subscription
+that landed after them would leave the relay's history starting late for the
+engine's life; the relay dials the publisher every second from the servicer's
+start, so the subscription is normally in place before the handshake, and the
+wait is bounded at 30 s with a logged fall-through); the Python servicer runs
+it over its in-process engine with its health service holding NOT_SERVING
+meanwhile. Under data parallelism every
 rank is a scheduler of its own: the plan runs the staircase once per rank and
 every prefill shape on every rank at once, each request pinned to its rank
-(`data_parallel_rank`), so the log's step count is per rank.
+(`data_parallel_rank`), so the log's step count is per rank. The prefill side
+of a prefill/decode pair plans one request per rank (and the media step when
+the model has one) and nothing more (its decode steps run on its peer, and
+an engine release that gave no stand-in's slots back ran the side's pool dry
+under a ladder of them): the
+first forward and the transfer path are paid before SERVING, the length
+classes by the first request of each.
 
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:
@@ -491,6 +707,17 @@ the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
 
+The Rust servicer's launcher also advertises the vocabulary of structural-tag
+nodes the engine's grammar compiler takes (`GetServerInfo.structural_tag_vocabulary`,
+the `structural_tag_vocabulary` label): `older` when the xgrammar installed
+beside the engine predates the `optional`, `plus`, `star` and `token` nodes
+(0.1.33 is the first release with them) under `xgrammar` or `auto`, read off
+the distribution's metadata at start-up without importing it; absent for a
+current xgrammar or another backend. A router spells such a worker's structural
+tags without `optional`, `plus` and `star`, the same language, instead of a
+compile-time refusal per request; a `token` node stays as derived, so a table
+that writes single-token markers still meets the older compiler's refusal.
+
 #### CUDA-graph capture cap
 
 The engine replays a captured CUDA graph for a step that fits one of its
@@ -517,8 +744,10 @@ truncates.
 | `--max-num-seqs 32 --max-num-batched-tokens 300` | 64 | 300 |
 | `--max-num-seqs 32`, step size unset | 64 | 512 |
 | `--max-num-seqs 32 --max-num-batched-tokens 48` | 48 | the engine's |
-| `--max-num-seqs 256` or more | 512 | the engine's |
-| `--max-num-seqs` unset | 512 (the engine's window defaults) | the engine's |
+| `--max-num-seqs 256` | 512 | the engine's |
+| `--max-num-seqs` above 256 | 512, or twice the window up to 1024 on one platform | the engine's |
+| `--max-num-seqs` unset | 512 or 1024 by platform (the engine's window defaults) | the engine's |
+| `--max-num-seqs` unset, `--max-num-batched-tokens 16384`, `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=2048` | 512 or 1024 by platform | 2048 |
 
 Kept as given: an explicit `--max-cudagraph-capture-size`,
 `--cudagraph-capture-sizes` or the same keys of `--compilation-config`;
@@ -529,8 +758,64 @@ explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
 `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
 (the opt-out: the engine's own default, as before this derivation), or a
 positive integer, the ceiling in place of 512, rounded down to the capture
-grid. Each captured size costs capture time at start and graph memory per
-rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024.
+grid. A ceiling applies only where it does not lower the engine's default on
+any platform (twice the window, at most 512, or at most 1024 on one newer GPU
+platform the launch cannot tell apart, each as the engine's list ends it):
+with `--max-num-seqs` left to the engine or set to 512 or more, a ceiling of
+1024 or more applies (it raises the 512 default and, on the platform whose
+default is already 1024, matches it); for a window between 257 and 511, a
+ceiling of twice the window (on the capture grid) or more applies; a smaller
+one is kept out, the line saying why. Each captured size costs capture time at start and
+graph memory per rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024,
+147 at 2048.
+
+##### Per recipe: what a ceiling above 512 buys, and what it costs
+
+The ceiling of 512 is the engine's own default ceiling, so the launch default
+never spends more on graphs than the engine does for itself at a large window,
+and it is the right cap where the admitted step stays under it. Under
+open-loop arrivals with chunked prefill and prefix caching, the step that
+decides capacity holds up to `--max-num-seqs` decode tokens plus the prefill
+chunks admitted beside them, so on a large running window that step is above
+512 and runs eagerly at every arrival. Measured on three recipes (the same
+build and recipe on both arms, one engine per arm, open-loop Poisson ramps of
+150 s per step; SLO-1 = TTFT p99 under 1 s at goodput >= 0.9, SLO-2 = TTFT
+p99 under 400 ms and TPOT p99 under 25 ms at goodput >= 0.95; capacity = the
+highest offered rate at which the SLO holds, in requests per second per
+engine; the costs are per engine against the 512 arm: KV-cache tokens,
+container memory at the ramp's end, start-up time):
+
+| recipe | 512 (the launch default) | 1024 | 2048 |
+|---|---|---|---|
+| `--max-num-seqs 32 --max-num-batched-tokens 16384`, a 1M-context model (the engine's own 64); 8k prompts, 4k shared prefix | SLO-1 12, SLO-2 11 | SLO-1 12, SLO-2 8; -0.5 % KV, +2.0 GiB, +45 s | SLO-1 12, SLO-2 10; -1.5 % KV, +6.1 GiB, +93 s |
+| `--max-num-seqs 128 --max-num-batched-tokens 16384`, a sparse-attention MoE (the engine's own 256); 4k prompts, 1k shared prefix | SLO-1 28-34, SLO-2 20-22; collapses from 36 | SLO-1 40 (the ramp's top), SLO-2 24; -0.3 % KV, +1.7 GiB, +38 s | SLO-1 38, SLO-2 28; -0.9 % KV, +4.9 GiB, +126 s |
+| `--max-num-seqs 256 --max-num-batched-tokens 16384`, a 3B-active MoE (the engine's own 512: the derivation changes nothing); 8k prompts, 4k shared prefix | SLO-1 11-12, SLO-2 5-6 | SLO-1 13-14, SLO-2 7-8; -0.15 % KV, +1.5 GiB, +27 s | SLO-1 20 (the ramp's top), SLO-2 14; -0.5 % KV, +4.7 GiB, +60 s |
+
+The rows are same-build pairs on the engine release before the shipped one.
+On the shipped release the 128-sequence recipe was run at 1024 only: SLO-1 24
+req/s (22.9 achieved, TTFT p99 394 ms, TPOT p99 38 ms), no SLO-2, a collapse
+from 28 with the running window full and the decode step near 75 ms at 127
+running. That release's step at a full window bounds the bed below the
+previous release's 512 knee, and without a 512 arm on it the ceiling's own
+effect on the shipped release is not separated from the release's step time
+(that arm is owed); the rows above are the measured basis of the rule, not a
+reading of the shipped release.
+
+The cap that captures a recipe's gain follows its running window (about eight
+times `--max-num-seqs` on these three), not one ceiling: with a window of 128,
+1024 buys the whole of 2048's gain at a third of the memory; with 256 the gain
+needs 2048; with 32 nothing above the launch default buys anything (on the
+128-window recipe, 8k prompts at a 94 % cache hit held the ramp's top on 512
+and 2048 alike: that shape's knee lay above the ramp, which is why the wide
+shape is the one in the table). The launch default therefore stays at the
+memory-neutral 512, and a recipe whose class gains sets its own cap: the
+engine's own `--max-cudagraph-capture-size N` among the recipe's flags (it
+travels with the command line to every rank of a multi-node engine), or
+`SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=N` in the environment of every rank's process,
+a ceiling the derivation still bounds by the admission step and applies where
+it raises the engine's default on every platform. Graph memory per captured size was
+0.011-0.021 GiB per rank on these three models, which is how the KV-cache
+cost above scales with the capture list.
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -623,11 +908,30 @@ decided). With `--servicer-impl rust` the same process serves the
 launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
-`FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
-prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
-implementation, as do the RL control-plane extras (the `rl.*` advertisement,
-the live `weight_version` on generate responses, `is_paused`); the Rust server
-redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
+`FlushCache` and profiling ride the wire's control call on a scheduler whose
+handshake declares its control reply (the control-wire revision) and answer
+UNIMPLEMENTED, naming the gap, on one that does not; ranked `top_logprobs` and
+prompt logprobs are refused, and the RL control-plane extras (the `rl.*`
+advertisement, the live `weight_version` on generate responses, `is_paused`)
+stay with the Python implementation; the Rust server redacts credentials from
+`server_args` the same way. Prefill/decode disaggregation is served on this
+path: a request's `kv_bootstrap_info` rides the wire in the scheduler's own
+bootstrap slots as the Python servicer forwards it, a prefill launch starts
+the engine's KV bootstrap server in the launcher process before the ranks (as
+the engine's own frontend does), and under attention data parallelism the
+servicer places a disaggregated request on the rank of its room's residue,
+the engine's own dispatch rule, and an aggregated one on its
+`data_parallel_rank` pin. The EPD prefill side is served the same way (each
+item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
+(`--disaggregation-mode encode`) is served on an engine whose handshake lists
+the encode request: the servicer mounts the encoder service next to the
+scheduler's discovery surface, hands each `Encode` to the worker over the wire
+(the worker's own rendezvous address rides in every request, as the Python
+encoder servicer fills it) and refuses `Generate` and the scheduler's control RPCs there by name; an engine whose wire
+predates the encode request is refused before anything starts (its encode rank
+never dials the handshake, so the launch would otherwise wait in silence), one
+that lists no encode request fails the start by name, and the Python servicer
+serves the role on either. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than
@@ -640,15 +944,40 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; the Python servicer runs the same plan over its own
-port after its first warm-up request, and both skip it on a disaggregation
-role; under attention data parallelism the servicer routes a request by load,
-not by rank, so each prefill shape warms one rank and the log says so),
+`--max-prefill-tokens`; at the `full` level, on an engine of more than one
+process (its parallel layout off the server arguments; a one-process engine
+plans the classes alone, like the other engines, since the hang below needs
+a collective waiting on a peer), this engine's plan also visits
+every prompt length up to the chunk size the class ladder leaves out, last,
+in an order whose every prefix is a uniform spread (`fast` plans the classes
+alone and leaves the hazard below open, which the start log says): a chunked prefill's last chunk is any count
+below the chunk size, a prefill chunk reaches two cuBLAS GEMMs here (the
+compressor's fp32 router projection above 32 tokens, the grouped output
+projection's batched GEMM) whose kernels the library picks per token count
+and loads on first use, and such a first use during serving, with the
+overlapped previous chunk's TP collective in flight, has deadlocked the
+forward; at a 4,096-token chunk that is 4,042 one-token requests after the
+ladder's 54, about 0.17 s each on a four-GPU node (692 s measured for the
+whole pass, inside this engine's 900 s default budget; with no chunk size set
+the engine's default step of 8,192 tokens gives about 8,140 remainders, about
+1,380 s, which the budget cuts about halfway, evenly: set a chunk size or a
+larger budget to cover every count); the Python servicer runs the same plan
+over its own port after its first warm-up request, and both skip it on a
+disaggregation role; under attention data parallelism the servicer routes a
+request by load, not by rank, so each prefill shape, the chunk remainders
+included, warms one rank and the log says so: there the remainder hazard
+stays open on the ranks a count did not reach until the wire can pin a rank),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
 time it polls it, so a slow but living start completes, under the ceiling, and
-0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+0 lifts the ceiling), `SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS` (default
+300) and `SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the
+connected scheduler's silence bound and its prefill allowance as for vLLM
+above: this wire carries token batches only, so a batch of long prompts is
+silent for as long as its prefill takes, and the allowance, 500 s per million
+pending prompt tokens at the default rate, is what keeps that from reading as
+a dead scheduler), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
@@ -676,6 +1005,13 @@ with a 400 that its slim wire reports as a bare `abort`, an empty answer to the
 caller), and a JSON-schema feature xgrammar drops under `xgrammar`; with no key
 it judges nothing ahead of the engine.
 
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or a backend not yet resolved; a
+router spells such a worker's structural tags without `optional`, `plus` and
+`star` (a `token` node stays as derived).
+
 Both TokenSpeed servicers also report the engine's constrained-decoding policy,
 when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
 own, not a `server_args` key): `always` for a model that takes a grammar on
@@ -688,6 +1024,23 @@ for. `always`, on an engine that starts the grammar at the first token, gives
 every turn the grammar of the model's response template table where that table
 spells whole turns; otherwise it constrains the calls a tool request allows under
 `auto`.
+
+#### Metrics (`--metrics-port`)
+
+With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
+defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
+on a listener of its own; `SMG_TOKENSPEED_SERVICER_METRICS_PORT` /
+`SMG_TOKENSPEED_SERVICER_METRICS_HOST` are the environment forms the flags
+override, and without either there is no endpoint. The families and labels are
+the ones every engine's Rust servicer exposes (see the vLLM section above):
+requests by finish reason, refusals, errors, in-flight requests, prompt /
+cached / generated tokens, the latency histograms, the lifecycle state. A port
+equal to `--port` is refused before the engine starts, and the flag is refused
+under the Python servicer, which exposes no endpoint.
+
+```bash
+python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --servicer-impl rust --metrics-port 29100
+```
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -768,6 +1121,13 @@ schemas and regular expressions only, and a JSON-schema feature xgrammar drops
 under `xgrammar`; a backend it does not know (a plugin of the scheduler's) is
 left to the engine.
 
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or an unresolved backend; a router
+spells such a worker's structural tags without `optional`, `plus` and `star` (a
+`token` node stays as derived).
+
 #### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's
@@ -784,7 +1144,11 @@ port ranges if multiple DP ranks publish events. The Rust servicer's relay
 uses the same replay endpoint (the vLLM, SGLang and TokenSpeed launchers all
 pass `replay_endpoint` from the engine's kv-events config) for gaps in flight
 and for the batches published before its subscription joined the publisher;
-without one those are counted as lost or unknown, never silently skipped.
+without one those are counted as lost or unknown, never silently skipped. The
+relay dials the publisher every second from the servicer's start, so its
+subscription lands within a second of the engine binding the socket, and the
+launcher starts its planned warm-up only after that, so the warm-up's batches
+(the engine's first) are the first the relay's history records.
 
 Without replay, or when history is expired, empty, malformed, or unavailable
 (timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or
@@ -833,10 +1197,58 @@ generation with sampled and prompt logprobs, reasoning-token counts, LoRA ids
 and custom logit processors forwarded as the Python servicer forwards them,
 `Embed`, `FlushCache` and profiling (the scheduler's own control requests,
 carried by the wire's control call) all answer as the Python servicer does.
-What the wire does not carry is reported, not emulated: multimodal inputs and
-hidden states are refused, PD/EPD disaggregation stays with the Python
-implementation (the worker refuses to start on the Rust path in those modes),
-and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
+Hidden states (`return_hidden_states`) are served on this path, and on this
+path only: the final hidden layer's vector per position a forward ran on (the
+prompt positions the prefill computed, then each generated token fed back:
+(prompt - cached prefix) + generated - 1 rows, with absolute positions anchored
+from the engine's counters), the prefill block on the first chunk, a decode
+step's rows on each later one and the whole list on the completion, within the
+scheduler's `--return-hidden-states-mode` cap, which both servicers keep ahead
+of the scheduler with the engine's own words; the Python servicer then refuses
+the request by name (`INVALID_ARGUMENT`, pointing at `--servicer-impl rust`),
+where it once accepted the flag and returned nothing.
+Prefill/decode disaggregation (`--disaggregation-mode prefill|decode`) works as
+on the Python servicer: a request's bootstrap fields (host, port, room) ride
+the scheduler's own request struct over the wire, the prefill side's bootstrap
+server starts in the servicer process before the ranks, and `GetServerInfo`
+carries the server args the Router pairs on. Multimodal inputs reach the
+scheduler as its own processor output: the preprocessed tensors the Router's
+media pipeline sends ride the wire as SGLang's own tensor encoding, and the
+scheduler hashes, pads and positions them as it does behind the Python
+servicer; `supports_vision` is advertised as SGLang's model config decides it.
+The language side of encode/prefill disaggregation (`--language-only`) works as
+behind SGLang's own frontend: the servicer process runs SGLang's own encoder
+bootstrap server and receiver (`--encoder-bootstrap-port`, `--encoder-urls`,
+the receiver's transport by `SGLANG_ENCODER_MM_RECEIVER_MODE`), a request's
+image references (`mm_inputs.image_urls`, with the prompt tokenized but not
+expanded and no tensors) go to the encoders through them before the request
+reaches the scheduler, the scheduler's request carries what the dispatch set
+(its wait flag, the per-encoder assignment, the encoder list) and the prompt
+text the scheduler rebuilds from once the embeddings arrive, and a dispatch
+that fails afterwards reaches the scheduler as its own failure notice. A
+request of references on any other worker, or on a language-only worker with
+no encoder registered, is refused (`FAILED_PRECONDITION`) rather than answered
+as text. A request the Router pins to a data-parallel rank (`--dp-size` above one
+behind a dp-aware Router) goes to that rank's scheduler, as the engine's
+data-parallel controller sends it behind SGLang's own frontend; a pin past the
+connected ranks is refused as the caller's error. On the prefill side of a disaggregated pair a request runs on
+the rank of its room's residue instead (`bootstrap_room % dp_size`: SGLang's
+prefill side follows the room and its KV sender fails a request placed
+elsewhere, and the decode side looks for the KV on that rank), the Router's pin
+yielding to it with a warning; the decode side keeps the pin. A prefill leg of
+several plain data-parallel replicas (`--dp-size N` without attention DP) is
+refused at launch with the engine's reason: every replica reports attention-DP
+rank 0 to the engine's KV sender, which fails each request whose room's residue
+is not 0; attention DP (`--tp-size N --attn-dp-size N`) is the multi-rank
+prefill shape. The planned
+warm-up pins each of its requests to a rank (on a prefill or decode leg with a
+stand-in room of that rank's residue), so every rank is warm before the Router
+sends anything. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
+that role on its own encoder server, never on a servicer), a `--language-only`
+launch on the `zmq_to_tokenizer` transfer backend is refused (the frontend
+itself receives and processes the embeddings there, which neither servicer
+runs), and LoRA loading answers UNIMPLEMENTED, as it does on the Python
+servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than
@@ -850,14 +1262,49 @@ above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-running-requests` and
 `--chunked-prefill-size` or `--max-prefill-tokens`, the engine's defaults
 where unset; the Python servicer runs the same plan over its own port after
-its first warm-up request, and both skip it on a disaggregation role; under
+its first warm-up request and skips it on a disaggregation role; the Rust
+path plans a prefill or decode leg as a single engine, its requests carrying
+the engine's stand-in bootstrap so the leg warms up without its peer, and the
+language side of an encode-disaggregated deployment (`--language-only`) plans
+as a single engine, so the first forward of its fresh scheduler is paid before
+SERVING rather than by its first request, as the engine's own frontend warms
+that role on the text path, and where its
+frontend dispatches to the encoders the plan ends its shapes with one image
+through them (the prompt the model's chat template renders around the
+engine's own minimal warm-up image; a template without an image placeholder
+leaves the leg out, a leg the encoders cannot serve yet is a logged step), so
+the scheduler's first media forward is paid before SERVING too; under
 data parallelism the servicer routes a request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
 time it polls it, so a slow but living start completes, under the ceiling, and
-0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`.
+0 lifts the ceiling), `SMG_SGLANG_SERVICER_SILENCE_TIMEOUT_SECS` (default 300)
+and `SMG_SGLANG_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the connected
+scheduler's silence bound and its prefill allowance as for TokenSpeed above:
+this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
+`SMG_SERVICER_WORKER_THREADS`.
+
+#### Metrics (`--metrics-port`)
+
+With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
+defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
+on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
+`SMG_SGLANG_SERVICER_METRICS_HOST` are the environment forms the flags
+override, and without either there is no endpoint. The flags are this package's
+(the same plugin that adds `--servicer-impl`); a `SGLANG_PLUGINS` whitelist
+without `smg-servicer` removes them, not the environment form. The families
+and labels are the ones every engine's Rust servicer exposes (see the vLLM
+section above); the scheduler matches string stops itself, so this servicer
+has no `smg_servicer_string_stops_total` series. A port equal to `--port` is
+refused before the scheduler starts, and the flag is refused under the Python
+servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
+on the Rust path either).
+
+```bash
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust --metrics-port 29100
+```
 
 #### Headless over ZMQ (no SGLang change)
 
@@ -873,6 +1320,23 @@ python -m smg_grpc_servicer.sglang.headless \
 
 `smg serve --backend sglang --connection-mode zmq` runs exactly this for each
 worker, with the handshake port SMG derives from the worker's `ipc://` URL.
+The gateway binds its `ipc://` sockets in a directory it must own: it creates
+the directory itself (mode 0700) when it is missing, and refuses an existing
+one that is not a real directory owned by its own uid (`ipc socket dir ... is
+owned by uid 0 (expected 65532); refusing to bind unauthenticated ZMQ sockets
+in a directory owned by another user`). The check is on the socket path's
+parent, so a pod that shares an `emptyDir` (created by the kubelet, owned by
+root) between the gateway and a headless scheduler has two shapes that pass
+it: point the worker's `ipc://` URL into a subdirectory of the mount that does
+not exist yet (mount at `/run/smg`, register `ipc:///run/smg/zmq/worker0`),
+which the gateway creates itself at 0700 under its own uid and which lives as
+long as the pod (this needs the mount writable by the gateway's uid, as an
+`emptyDir` is when the kubelet creates it, mode 0777); or, when the mount
+point itself is the socket directory or the mount is not writable by that uid,
+an init container that creates the socket directory if needed and `chown`s it
+to the gateway's uid (65532 in the published router image) before either
+container starts. With both, the scheduler connects to the sockets in that
+directory, so it runs as the same uid.
 SMG's wait for the scheduler's HELLO, and for the READY and the registration
 that follow it, is bounded per stage by the router's
 `--zmq-startup-timeout-secs` (default 3600 s; `--router-zmq-startup-timeout-secs`
@@ -940,6 +1404,68 @@ livenessProbe:
 ```
 
 
+### TensorRT-LLM
+
+The engine's own Python servicer lives in the TensorRT-LLM tree
+(`tensorrt_llm.grpc.smg`, what `trtllm-serve <model> --grpc --grpc-protocol smg`
+runs, in-process over the LLM API). This package adds the Rust request path
+for it, behind one switch.
+
+#### Rust request path (`SMG_TRTLLM_SERVICER_IMPL=rust`)
+
+With `SMG_TRTLLM_SERVICER_IMPL=rust`, the engine's gRPC entrypoint hands the
+process to this package's `serve_rust_from_engine` before an LLM or a Python
+gRPC server exists, and `python -m smg_grpc_servicer.trtllm --servicer-impl
+rust` reaches the same path: the `trtllm.TrtllmService` contract is served by
+`smg.servicer.TrtllmGrpcServer` (the `smg` wheel) on a Rust-owned thread, and
+the engine runs behind the wire shim beside its LLM API
+(`tensorrt_llm.grpc.smg.shim` in the engine's tree, or the same package
+installed beside it as `trtllm_smg_shim`; the launcher finds it by import),
+started from this process as a spawned child that dials the servicer's
+same-host msgpack ZMQ handshake. The shim declares the field order of the
+structs it decodes in its ready response and the Rust servicer checks the
+prefixes it encodes against it once, at connect time. Python keeps the
+lifecycle only; the Router cannot tell the two implementations apart.
+
+```bash
+# Python (default): the engine's own servicer
+trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# Rust request path, same entrypoint
+SMG_TRTLLM_SERVICER_IMPL=rust trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# This package's launcher; --llm-args carries the LLM API's keywords (JSON text, or @file)
+python -m smg_grpc_servicer.trtllm --model org/model --port 50051 --servicer-impl rust \
+    --llm-args '{"tensor_parallel_size": 2}'
+```
+
+Text generation with sampled, ranked and prompt logprobs, string and token
+stops matched by the engine (`matched_stop` from its `stop_reason`), images as
+raw bytes decoded by the engine's own loader, guided decoding (the five kinds,
+refused before the engine when its `guided_decoding_backend` cannot enforce
+them), LoRA by task id and the disaggregated parameters pass through as the
+Python servicer forwards them; `num_return_sequences > 1` fans out to one
+engine request per sample with derived seeds. What the wire does not carry is
+refused by name instead of dropped: beam search, the logits-returning flags,
+KV-cache retention, prompt-tuning and lookahead configs. `Embed` and
+`SubscribeKvEvents` answer UNIMPLEMENTED, as the Python servicer answers them;
+`GetTokenizer` serves the local tokenizer directory. The launcher's knobs are
+the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain,
+start-up and silence bounds, prefill allowance); `--metrics-port` (and
+`--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
+servicer's Prometheus metrics, the families every engine's Rust servicer
+exposes (see the vLLM section above), with `wire="trtllm"`.
+
+Its launcher also advertises the vocabulary of structural-tag nodes the
+engine's guided-decoding backend takes
+(`GetServerInfo.structural_tag_vocabulary`, the `structural_tag_vocabulary`
+label): `older` when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release with
+them) under `guided_decoding_backend: xgrammar`, read off the distribution's
+metadata at start-up; absent otherwise. A router spells such a worker's
+structural tags without `optional`, `plus` and `star` (a `token` node stays as
+derived). The engine's own servicer does not report the field.
+
 ## Architecture
 
 ```
@@ -947,12 +1473,13 @@ smg-grpc-servicer[vllm]    ──optional dep──>  vllm       (lazy import)
 smg-grpc-servicer[mlx]     ──optional dep──>  mlx-lm     (lazy import)
 smg-grpc-servicer          ──external runtime──>  tokenspeed (lazy import)
 smg-grpc-servicer[sglang]  ──optional dep──>  sglang     (lazy import)
+smg-grpc-servicer          ──external runtime──>  tensorrt_llm (the shim beside its LLM API, lazy)
 smg-grpc-servicer          ──depends on────>  smg-grpc-proto  (hard dependency)
 vllm                       ──optional──────>  smg-grpc-servicer (via vllm serve --grpc)
 sglang                     ──optional──────>  smg-grpc-servicer (via --grpc-mode)
 ```
 
-Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, and SGLang.
+Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, SGLang, and TensorRT-LLM.
 
 ## Development
 

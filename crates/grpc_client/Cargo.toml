@@ -1,6 +1,6 @@
 [package]
 name = "smg-grpc-client"
-version = "1.15.0"
+version = "1.16.0"
 edition = "2021"
 description = "gRPC clients for vLLM, TensorRT-LLM, MLX, TokenSpeed, and SGLang backends"
 license = "Apache-2.0"
@@ -36,6 +36,10 @@ futures.workspace = true
 # `tonic::Status` made of one carries in its source chain
 # (`channel::is_transport_failure`); also the raw peer of the channel tests.
 h2 = "0.4.19"
+# The HTTP layer under tonic's channel: the type of the I/O failure under a
+# call (the socket reset or closed) a `tonic::Status` carries in its source
+# chain, without an `h2::Error` (`channel::is_transport_failure`).
+hyper = { version = "1", default-features = false }
 
 # Archive validation
 sha2 = "0.11"
@@ -44,7 +48,6 @@ tempfile = "3.27"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
-prost-build = "0.14.4"
 
 [dev-dependencies]
 # The in-memory IO of the channel tests' raw HTTP/2 peer.

@@ -238,9 +238,10 @@ impl ConstraintRef<'_> {
 ///
 /// Three rules, in order. An engine whose grammar backend is disabled
 /// enforces nothing, so every constraint is refused: such an engine takes the
-/// request and aborts it after admission, and one wire reports that abort
-/// without its reason, as a bare empty completion the caller reads as an
-/// answer. A kind outside what the backend compiles ([`ConstraintKinds`]) is
+/// request and aborts it after admission, which a wire reports as the
+/// engine's reason when the engine declares its status columns and as a
+/// bare engine abort (INTERNAL) when it does not; the refusal here is the
+/// caller's error on either. A kind outside what the backend compiles ([`ConstraintKinds`]) is
 /// refused: the engine would admit the request and fail it at grammar
 /// compile. Under xgrammar (`Auto`, or pinned) a JSON schema with a feature
 /// xgrammar's converter drops is refused, as the request's own schema or

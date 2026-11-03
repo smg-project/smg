@@ -22,12 +22,16 @@ def _server_args(**overrides):
         weight_version="v3",
         revision="rev",
         reasoning_parser="qwen3",
-        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=4)),
+        mapping=SimpleNamespace(world_size=8, attn=SimpleNamespace(dp_size=4)),
         max_num_seqs=64,
+        speculative_algorithm="EAGLE",
+        speculative_num_draft_tokens=4,
         page_size=16,
         max_total_num_tokens=65536,
         kv_events_config='{"enable_kv_cache_events": true, "publisher": "zmq"}',
         disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=8998,
+        disaggregation_transfer_backend="mooncake",
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -58,9 +62,15 @@ def test_the_server_args_section_reads_every_knob():
     assert args.preferred_sampling_params == '{"temperature": 0.6}'
     assert (args.weight_version, args.revision, args.reasoning_parser) == ("v3", "rev", "qwen3")
     assert args.attention_dp_size == 4
+    assert args.world_size == 8
+    assert (args.speculative_algorithm, args.speculative_num_draft_tokens) == ("EAGLE", 4)
     assert (args.running_window, args.page_size, args.max_total_num_tokens) == (64, 16, 65536)
     assert args.kv_events_config == '{"enable_kv_cache_events": true, "publisher": "zmq"}'
     assert args.disaggregation_mode == "prefill"
+    assert (args.disaggregation_bootstrap_port, args.disaggregation_transfer_backend) == (
+        8998,
+        "mooncake",
+    )
 
 
 def test_the_model_section_reads_the_hf_config_and_the_shape():
@@ -95,8 +105,11 @@ def test_bare_server_args_read_as_the_defaults():
     assert (args.model, args.tokenizer, args.served_model_name) == ("", "", None)
     assert (args.preferred_sampling_params, args.weight_version, args.revision) == (None, "", None)
     assert args.reasoning_parser is None and args.attention_dp_size is None
+    assert args.world_size is None
+    assert (args.speculative_algorithm, args.speculative_num_draft_tokens) == (None, None)
     assert (args.running_window, args.page_size, args.max_total_num_tokens) == (0, 0, 0)
     assert args.kv_events_config is None and args.disaggregation_mode == "null"
+    assert (args.disaggregation_bootstrap_port, args.disaggregation_transfer_backend) == (0, "")
     # A dtype read without a model config (the request path's lenient read).
     assert EngineConfigView(SimpleNamespace()).model_dtype is None
 
@@ -116,6 +129,31 @@ def test_the_attention_dp_width_is_a_count_or_none(mapping, expected):
     args = _server_args()
     args.mapping = mapping
     assert EngineConfigView(args).server_args.attention_dp_size == expected
+
+
+@pytest.mark.parametrize(
+    ("mapping", "world_size", "expected"),
+    [
+        (SimpleNamespace(world_size=4), None, 4),
+        (SimpleNamespace(world_size=4), 2, 4),  # the resolved layout wins
+        (SimpleNamespace(), 2, 2),
+        (None, 2, 2),
+        (None, None, None),
+        (SimpleNamespace(world_size=0), 0, None),
+        (SimpleNamespace(world_size=True), None, None),
+    ],
+)
+def test_the_process_count_comes_off_the_layout_then_the_args(mapping, world_size, expected):
+    args = _server_args()
+    args.mapping = mapping
+    args.world_size = world_size
+    assert EngineConfigView(args).server_args.world_size == expected
+
+
+def test_the_speculative_fields_read_as_set_or_none():
+    args = _server_args(speculative_algorithm="", speculative_num_draft_tokens=0)
+    section = EngineConfigView(args).server_args
+    assert (section.speculative_algorithm, section.speculative_num_draft_tokens) == (None, None)
 
 
 def test_the_running_window_takes_either_spelling_and_reads_zero_when_unset():

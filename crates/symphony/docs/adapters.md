@@ -28,7 +28,9 @@ Policy this adapter sets, where the events say more than Chat Completions can:
   produce nothing; the markers a format consumes never reach the client.
 - `Malformed` text is content: the model wrote it, and the client sees it rather than losing
   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
-  that chunk.
+  that chunk. The bytes a call syntax refuses as the model's failed call come as `Dropped {
+  MalformedCall }` behind a `Malformed` event of no bytes (`docs/assemblers.md`), so they are
+  counted and never content.
 - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
 
 ## Responses (`adapt::responses`)

@@ -50,11 +50,17 @@ def nothing_of_the_launchers_in_the_environment():
     to every test after it the same way, whatever it stubbed. The shell's own
     exports are set aside for the same reason: a unit test is not the launcher
     the guard protects, and a test that wants a value makes it itself
-    (``monkeypatch.setenv``). The restore is by hand because
+    (``monkeypatch.setenv``); the planned warm-up's knob of each launcher is
+    among them, so a shell that turns the warm-up off for its own servers
+    does not turn it off under a test that expects a plan. The restore is by
+    hand because
     ``monkeypatch.delenv`` of a name that is absent records nothing, and a
     write-back after it would survive the test.
     """
     from smg_grpc_servicer import sglang, tokenspeed, vllm
+    from smg_grpc_servicer.sglang import warmup as sglang_warmup
+    from smg_grpc_servicer.tokenspeed import warmup as tokenspeed_warmup
+    from smg_grpc_servicer.vllm import warmup as vllm_warmup
 
     names = (
         vllm.SERVICER_IMPL_ENV,
@@ -63,6 +69,9 @@ def nothing_of_the_launchers_in_the_environment():
         sglang.HANDSHAKE_ENV,
         sglang.ENGINE_INDEX_ENV,
         vllm.MULTIPROC_METHOD_ENV,
+        vllm_warmup.WARMUP_ENV,
+        sglang_warmup.WARMUP_ENV,
+        tokenspeed_warmup.WARMUP_ENV,
     )
     before = {name: os.environ.pop(name, None) for name in names}
     try:
@@ -76,6 +85,7 @@ def nothing_of_the_launchers_in_the_environment():
 
 
 _TOKENSPEED_SERVICER = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "tokenspeed" / "servicer.py"
+_VLLM_ERRORS = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "vllm" / "errors.py"
 
 
 @pytest.fixture
@@ -107,6 +117,48 @@ def tokenspeed_servicer_mod(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     name = "smg_grpc_servicer.tokenspeed.servicer"
     spec = importlib.util.spec_from_file_location(name, _TOKENSPEED_SERVICER)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def vllm_errors_mod(monkeypatch):
+    """The vLLM servicer's error module, loaded with the engine's exception
+    hierarchy stubbed (the current one: the client/server split and the
+    admission-control ``GracefulHTTPError`` that carries an HTTP status).
+    """
+
+    class VLLMError(Exception):
+        pass
+
+    class VLLMClientError(VLLMError):
+        pass
+
+    class VLLMNotFoundError(VLLMClientError):
+        pass
+
+    class GracefulHTTPError(VLLMError):
+        def __init__(self, message, http_status):
+            super().__init__(message)
+            self.http_status = http_status
+
+    class EngineGenerateError(VLLMError):
+        pass
+
+    for name in ("vllm", "vllm.v1", "vllm.v1.engine"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    exceptions = ModuleType("vllm.exceptions")
+    exceptions.VLLMClientError = VLLMClientError
+    exceptions.VLLMNotFoundError = VLLMNotFoundError
+    exceptions.GracefulHTTPError = GracefulHTTPError
+    monkeypatch.setitem(sys.modules, "vllm.exceptions", exceptions)
+    engine_exceptions = ModuleType("vllm.v1.engine.exceptions")
+    engine_exceptions.EngineGenerateError = EngineGenerateError
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.exceptions", engine_exceptions)
+    name = "smg_grpc_servicer.vllm.errors"
+    spec = importlib.util.spec_from_file_location(name, _VLLM_ERRORS)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)

@@ -13,7 +13,7 @@ global:
   image:
     registry: docker.io
     repository: lightseekorg/smg
-    tag: "1.3.3"
+    tag: "1.13.0"
 
 huggingface:
   token: ""  # set via --set huggingface.token=hf_xxx
@@ -31,10 +31,12 @@ workers:
     model: meta-llama/Llama-3.1-8B-Instruct
     replicas: 1
     connectionMode: grpc
+    metrics:
+      enabled: true  # the engine pod serves smg_servicer_* on :29100 (the Rust servicer)
     gpu:
       count: 1
     image:
-      tag: "1.3.3-vllm-v0.18.0"
+      tag: "1.13.0-vllm-v0.31.0"
     resources:
       requests:
         cpu: "4"

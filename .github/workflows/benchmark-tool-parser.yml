@@ -10,7 +10,7 @@ on:
       - '!crates/tool_parser/**/*_test.rs'
       - '!crates/tool_parser/**/test_*.rs'
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths:
       - 'model_gateway/benches/tool_parser_benchmark.rs'
       - 'crates/tool_parser/**'
@@ -24,10 +24,6 @@ on:
 concurrency:
   group: benchmark-tool-parser-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read

@@ -62,6 +62,12 @@ pub trait WorkerRegistrationData: WorkflowData {
     /// Get the labels for policy registration.
     fn get_labels(&self) -> Option<&HashMap<String, String>>;
 
+    /// The Symphony table whose failure classes exist at zero once the
+    /// workers are registered, when the workflow resolved one.
+    fn symphony_table(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Select the semantics of the final registry write.
     ///
     /// Defaults to upsert, which is what every caller did before this method
@@ -146,6 +152,12 @@ pub struct WorkerWorkflowData {
     pub detected_runtime_type: Option<String>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
+    /// Under Symphony, the table whose failure classes the registration step
+    /// publishes at zero once the worker is in the registry (transient; the
+    /// create step resolves it from the model card and the names; none for
+    /// an HTTP worker, the legacy parsers or a model no table reads).
+    #[serde(skip, default)]
+    pub symphony_table: Option<&'static str>,
     // -- External-only fields --
     pub model_cards: Vec<ModelCard>,
     // -- Shared fields --
@@ -166,16 +178,6 @@ impl WorkflowData for WorkerWorkflowData {
 }
 
 impl WorkerWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// The worker-directed client for the resolved HTTP version, re-fetched
     /// from the cache when a deserialize dropped the transient handle.
     pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {
@@ -209,6 +211,10 @@ impl WorkerRegistrationData for WorkerWorkflowData {
         Some(&self.final_labels)
     }
 
+    fn symphony_table(&self) -> Option<&'static str> {
+        self.symphony_table
+    }
+
     fn registration_mode(&self) -> WorkerRegistrationMode {
         self.registration_mode.clone()
     }
@@ -234,21 +240,6 @@ impl WorkflowData for TokenizerWorkflowData {
     }
 }
 
-impl TokenizerWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    ///
-    /// Call this after deserializing workflow state to ensure runtime fields
-    /// have been repopulated.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Data for worker removal workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRemovalWorkflowData {
@@ -269,18 +260,6 @@ pub struct WorkerRemovalWorkflowData {
 impl WorkflowData for WorkerRemovalWorkflowData {
     fn workflow_type() -> &'static str {
         "worker_removal"
-    }
-}
-
-impl WorkerRemovalWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -308,10 +287,9 @@ pub struct WorkerUpdateWorkflowData {
     /// the update step (transient).
     #[serde(skip, default)]
     pub fresh_engine_labels: Option<HashMap<String, String>>,
-    /// For a label refresh: each worker's registry id and revision as the
-    /// find step found it, in `workers_to_update` order, captured once before
-    /// any read so the write-back targets exactly that registration whatever
-    /// happens meanwhile (transient).
+    /// Each worker's registry id and revision as the find step found it, in
+    /// `workers_to_update` order, captured once so the write-back targets
+    /// exactly that registration whatever happens meanwhile (transient).
     #[serde(skip, default)]
     pub snapshot: Option<Vec<(WorkerId, u64)>>,
 }
@@ -319,18 +297,6 @@ pub struct WorkerUpdateWorkflowData {
 impl WorkflowData for WorkerUpdateWorkflowData {
     fn workflow_type() -> &'static str {
         "worker_update"
-    }
-}
-
-impl WorkerUpdateWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -350,18 +316,6 @@ pub struct McpWorkflowData {
 impl WorkflowData for McpWorkflowData {
     fn workflow_type() -> &'static str {
         "mcp_registration"
-    }
-}
-
-impl McpWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -388,18 +342,6 @@ impl WorkflowData for WasmRegistrationWorkflowData {
     }
 }
 
-impl WasmRegistrationWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Data for WASM module removal workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmRemovalWorkflowData {
@@ -413,17 +355,5 @@ pub struct WasmRemovalWorkflowData {
 impl WorkflowData for WasmRemovalWorkflowData {
     fn workflow_type() -> &'static str {
         "wasm_module_removal"
-    }
-}
-
-impl WasmRemovalWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }

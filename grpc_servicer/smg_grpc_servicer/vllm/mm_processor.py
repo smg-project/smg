@@ -63,6 +63,8 @@ ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
 ENV_TURBOJPEG = "SMG_VLLM_MM_TURBOJPEG"
+ENV_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_FETCH_TIMEOUT_MS"
+ENV_VIDEO_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS"
 TURBOJPEG_FLAG = "--mm-turbojpeg"
 
 MODE_OFF = "off"
@@ -746,14 +748,24 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
     "sidecar_max_queue": ("--mm-sidecar-max-queue", ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
     "sidecar_namespace": ("--mm-sidecar-namespace", ENV_NAMESPACE, None),
     "turbojpeg": (TURBOJPEG_FLAG, ENV_TURBOJPEG, TURBOJPEG_PREFER),
+    "fetch_timeout_ms": ("--mm-fetch-timeout-ms", ENV_FETCH_TIMEOUT_MS, 10_000),
+    "video_fetch_timeout_ms": ("--mm-video-fetch-timeout-ms", ENV_VIDEO_FETCH_TIMEOUT_MS, 30_000),
 }
 _MM_INT_SETTINGS = frozenset(
-    {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
+    {
+        "max_inflight",
+        "max_item_bytes",
+        "max_items",
+        "sidecar_timeout_ms",
+        "sidecar_max_queue",
+        "fetch_timeout_ms",
+        "video_fetch_timeout_ms",
+    }
 )
 # The variables that are not legacy spellings of their flag: documented beside
 # it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
 # is), so no deprecation line when the launcher defines the flag.
-_ENV_NOT_LEGACY = frozenset({"turbojpeg"})
+_ENV_NOT_LEGACY = frozenset({"turbojpeg", "fetch_timeout_ms", "video_fetch_timeout_ms"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -773,6 +785,8 @@ class MmSettings:
     sidecar_max_queue: int | None = None
     sidecar_namespace: str | None = None
     turbojpeg: str | None = None
+    fetch_timeout_ms: int | None = None
+    video_fetch_timeout_ms: int | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
     # The settings whose flag the launcher defines (`from_args`), set or not.
     # For the rest the environment variable is the documented way to set them,
@@ -854,6 +868,8 @@ _MM_FLAG_HELP: dict[str, str] = {
         "Worker-side media processing: off (the router preprocesses media), inprocess or "
         "redis (vLLM's own processors on this worker), smg (smg's pipeline; Rust servicer only)."
     ),
+    "fetch_timeout_ms": "Image/audio download timeout in milliseconds (--mm-processor smg; default 10000).",
+    "video_fetch_timeout_ms": "Video download timeout in milliseconds (--mm-processor smg; default 30000).",
     "max_inflight": "Media requests this worker processes at once.",
     "max_item_bytes": "Cap on an inline (data:) media item's decoded size, in bytes.",
     "max_items": "Media items a request may carry per modality.",

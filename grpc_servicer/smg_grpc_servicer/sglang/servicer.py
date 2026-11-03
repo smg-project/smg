@@ -50,6 +50,10 @@ from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.hidden_states import (
+    refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
+)
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
     convert_loads_to_protobuf,
@@ -937,6 +941,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
 
+        # Older proto packages remain usable for text and single-modality requests.
+        extra_mm_inputs = getattr(grpc_req, "extra_mm_inputs", ())
+        if extra_mm_inputs and not (
+            grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values")
+        ):
+            raise ValueError("SGLang extra_mm_inputs requires primary preprocessed inputs")
+
         # Extract tokenized input
         if not grpc_req.HasField("tokenized"):
             raise ValueError("Tokenized input must be provided")
@@ -971,10 +982,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Parse multimodal inputs if present
         mm_inputs = None
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
-            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
+            refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -1005,38 +1021,62 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Decode a proto TensorData message into a torch.Tensor."""
         return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
-    def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
+    def _parse_mm_inputs(self, mm_proto, extra_mm_inputs, prompt_len) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
-        # Decode pixel_values from typed TensorData field
-        pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
-
-        # Decode model-specific tensors
-        model_specific_data = {}
-        for key, tensor_data in mm_proto.model_specific_tensors.items():
-            model_specific_data[key] = self._decode_tensor_data(tensor_data)
-
-        # Convert placeholder ranges to offsets: list of (start, end_inclusive)
-        offsets = [(p.offset, p.offset + p.length - 1) for p in mm_proto.mm_placeholders]
-        if not offsets:
-            logger.warning(
-                "No mm_placeholders from Rust gateway — token expansion may have "
-                "failed to find the placeholder token in input_ids. "
-                "Check that placeholder_token_id matches the tokenized image token."
+        mm_items = []
+        im_token_id = video_token_id = None
+        seen = set()
+        for batch in (mm_proto, *extra_mm_inputs):
+            labels = set(batch.modalities)
+            if not labels or labels == {"image"}:
+                modality = Modality.IMAGE
+            elif labels == {"video"}:
+                modality = Modality.VIDEO
+            else:
+                raise ValueError(f"Unsupported SGLang tensor modalities: {labels}")
+            if modality in seen:
+                raise ValueError("SGLang requires one batch per modality")
+            seen.add(modality)
+            token = batch.im_token_id if batch.HasField("im_token_id") else None
+            if modality == Modality.VIDEO:
+                if token is None:
+                    raise ValueError("SGLang video tensors require a placeholder token id")
+                video_token_id = token
+            else:
+                im_token_id = token
+            offsets = []
+            for placeholder in batch.mm_placeholders:
+                start, length = placeholder.offset, placeholder.length
+                if length == 0:
+                    raise ValueError(f"multimodal placeholder at offset {start} has zero length")
+                end = start + length - 1
+                if end >= prompt_len:
+                    raise ValueError(
+                        f"multimodal placeholder {start}..={end} lies outside the prompt "
+                        f"of {prompt_len} tokens"
+                    )
+                offsets.append((start, end))
+            if not offsets:
+                logger.warning(
+                    "No mm_placeholders from Rust gateway — token expansion may have "
+                    "failed to find the placeholder token in input_ids. "
+                    "Check that placeholder_token_id matches the tokenized image token."
+                )
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=self._decode_tensor_data(batch.pixel_values),
+                    model_specific_data={
+                        key: self._decode_tensor_data(value)
+                        for key, value in batch.model_specific_tensors.items()
+                    },
+                    offsets=offsets or None,
+                )
             )
-            offsets = None
-
-        mm_item = MultimodalDataItem(
-            modality=Modality.IMAGE,
-            feature=pixel_values,
-            model_specific_data=model_specific_data,
-            offsets=offsets,
-        )
-
-        im_token_id = mm_proto.im_token_id if mm_proto.HasField("im_token_id") else None
-
         return MultimodalProcessorOutput(
-            mm_items=[mm_item],
-            im_token_id=im_token_id,
+            mm_items=mm_items,
+            im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
+            video_token_id=video_token_id,
         )
 
     def _convert_embed_request(
@@ -1105,14 +1145,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         stop = list(grpc_params.stop) if grpc_params.stop else None
         stop_token_ids = list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
 
+        # proto3 cannot tell an unset scalar from its zero, and the zeros of
+        # these three are never meant: top_p 0.0 keeps the top token only,
+        # top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        # sends a repeated token's positive logit to infinity (the scheduler's
+        # own checks refuse all three where they run). An unset one means the
+        # neutral value: the whole distribution, every token, no penalty.
+        top_p = grpc_params.top_p if grpc_params.top_p != 0.0 else 1.0
+        top_k = grpc_params.top_k if grpc_params.top_k != 0 else -1
+        repetition_penalty = (
+            grpc_params.repetition_penalty if grpc_params.repetition_penalty != 0.0 else 1.0
+        )
+
         return SGLSamplingParams(
             temperature=grpc_params.temperature,
-            top_p=grpc_params.top_p,
-            top_k=grpc_params.top_k,
+            top_p=top_p,
+            top_k=top_k,
             min_p=grpc_params.min_p,
             frequency_penalty=grpc_params.frequency_penalty,
             presence_penalty=grpc_params.presence_penalty,
-            repetition_penalty=grpc_params.repetition_penalty,
+            repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
             min_new_tokens=grpc_params.min_new_tokens,
             stop=stop,

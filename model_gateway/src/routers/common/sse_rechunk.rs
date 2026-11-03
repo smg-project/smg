@@ -9,7 +9,12 @@
 //! quiet for `IDLE_FLUSH`, except a remainder shorter than `MIN_TAIL_CHARS`
 //! (a token or two that arrived just before the engine paused), which waits
 //! for the next text or the end of the stream: an event of its own would be
-//! exactly the tiny delta the contract forbids.
+//! exactly the tiny delta the contract forbids. Tool-call arguments keep a
+//! tail of `MIN_TAIL_CHARS` back on every cut and idle flush as well, until
+//! the stream moves on (another call opens, text of another field, the end):
+//! a call's closing punctuation is a token of one to four characters that
+//! may arrive on its own after a pause, and it rides with the held tail
+//! instead of being the only thing left when the next call opens.
 //!
 //! Only single-choice chat completion streams are re-sliced. Everything else
 //! is forwarded as it came, after any buffered text so the order never
@@ -46,7 +51,14 @@ use serde_json::value::RawValue;
 /// Slices hold at most `SLICE_CHARS` characters and are cut once at least
 /// `EMIT_THRESHOLD` are buffered. A cut never leaves a tail shorter than
 /// `MIN_TAIL_CHARS`, and an idle flush holds back a remainder shorter than
-/// it, so only a delta that is tiny in total yields a tiny event.
+/// it, so only a delta that is tiny in total yields a tiny event. A tool
+/// call's arguments keep `MIN_TAIL_CHARS` back on every cut and idle flush
+/// as well, until the stream moves on: the call's closer, which may arrive
+/// on its own after a pause, then rides with them. Their cut waits for
+/// `MIN_TAIL_CHARS` more than the threshold, so it still emits at least
+/// `EMIT_THRESHOLD` and the pieces keep their size. The held tail is a
+/// whole tail, not one short of it, because the stream may move on with
+/// nothing following and release it alone.
 const SLICE_CHARS: usize = 160;
 const EMIT_THRESHOLD: usize = 80;
 const MIN_TAIL_CHARS: usize = 5;
@@ -248,21 +260,26 @@ impl<O: DeltaObserver> SseRechunker<O> {
     }
 
     /// Whether text is waiting that an idle flush would emit: a buffer of at
-    /// least `MIN_TAIL_CHARS`. A shorter remainder waits for more text.
+    /// least `MIN_TAIL_CHARS`, or a tool call's arguments of at least that
+    /// beyond the tail they keep. A shorter remainder waits for more text.
     pub fn has_pending(&self) -> bool {
         self.fields
             .iter()
-            .chain(self.tool_args.values())
             .any(|pending| pending.chars >= MIN_TAIL_CHARS)
+            || self
+                .tool_args
+                .values()
+                .any(|pending| pending.chars >= 2 * MIN_TAIL_CHARS)
     }
 
     /// Emits the buffered text without waiting for more input, except a
-    /// remainder shorter than `MIN_TAIL_CHARS`, which stays for the next
-    /// text or [`Self::finish`]: an engine that pauses between tokens must
-    /// not turn every token into an event of its own.
+    /// remainder shorter than `MIN_TAIL_CHARS` and the tail a tool call's
+    /// arguments keep, which stay for the next text or [`Self::finish`]: an
+    /// engine that pauses between tokens must not turn every token into an
+    /// event of its own.
     pub fn flush_pending(&mut self) -> Bytes {
         let mut out = Vec::new();
-        self.flush_from(MIN_TAIL_CHARS, &mut out);
+        self.flush_from(MIN_TAIL_CHARS, MIN_TAIL_CHARS, &mut out);
         Bytes::from(out)
     }
 
@@ -536,26 +553,42 @@ impl<O: DeltaObserver> SseRechunker<O> {
             }
         }
         for (index, pending) in &mut self.tool_args {
-            while pending.chars >= EMIT_THRESHOLD {
-                emit_arguments(&self.envelope, &mut self.observer, *index, pending, out)?;
+            // The cut waits for the held tail on top of the threshold, so the
+            // pieces of a steady stream keep their size.
+            while pending.chars >= EMIT_THRESHOLD + MIN_TAIL_CHARS {
+                emit_arguments(
+                    &self.envelope,
+                    &mut self.observer,
+                    *index,
+                    pending,
+                    MIN_TAIL_CHARS,
+                    out,
+                )?;
             }
         }
         Ok(())
     }
 
-    /// Emits every buffered slice.
+    /// Emits every buffered slice: the stream moves on.
     fn flush(&mut self, out: &mut Vec<u8>) {
-        self.flush_from(1, out);
+        self.flush_from(1, 0, out);
     }
 
-    /// Emits every buffered slice of the buffers holding at least `min_chars`.
-    fn flush_from(&mut self, min_chars: usize, out: &mut Vec<u8>) {
-        if let Err(stop) = self.emit_from(min_chars, out) {
+    /// Emits the buffers holding at least `min_chars` characters, all but
+    /// the last `held` of a tool call's arguments (a buffer with fewer than
+    /// `min_chars` beyond them stays whole).
+    fn flush_from(&mut self, min_chars: usize, held: usize, out: &mut Vec<u8>) {
+        if let Err(stop) = self.emit_from(min_chars, held, out) {
             self.stop(stop, out);
         }
     }
 
-    fn emit_from(&mut self, min_chars: usize, out: &mut Vec<u8>) -> Result<(), StreamStop> {
+    fn emit_from(
+        &mut self,
+        min_chars: usize,
+        held: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), StreamStop> {
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
             if pending.chars >= min_chars {
                 while pending.chars > 0 {
@@ -564,9 +597,16 @@ impl<O: DeltaObserver> SseRechunker<O> {
             }
         }
         for (index, pending) in &mut self.tool_args {
-            if pending.chars >= min_chars {
-                while pending.chars > 0 {
-                    emit_arguments(&self.envelope, &mut self.observer, *index, pending, out)?;
+            if pending.chars >= min_chars + held {
+                while pending.chars > held {
+                    emit_arguments(
+                        &self.envelope,
+                        &mut self.observer,
+                        *index,
+                        pending,
+                        held,
+                        out,
+                    )?;
                 }
             }
         }
@@ -830,7 +870,7 @@ fn emit_text<O: DeltaObserver>(
     pending: &mut Pending,
     out: &mut Vec<u8>,
 ) -> Result<(), StreamStop> {
-    let (bytes, chars) = pending.next_slice();
+    let (bytes, chars) = pending.next_slice(0);
     observe(observer, DeltaField::Text(field), &pending.text[..bytes])?;
     out.extend_from_slice(b"data: ");
     out.extend_from_slice(envelope);
@@ -845,14 +885,16 @@ fn emit_text<O: DeltaObserver>(
 
 /// Writes one synthesized event with the next slice of `pending` as the
 /// arguments of tool call `index`, unless the observer ends the stream on it.
+/// The slice leaves `keep` characters in the buffer.
 fn emit_arguments<O: DeltaObserver>(
     envelope: &[u8],
     observer: &mut O,
     index: Option<u64>,
     pending: &mut Pending,
+    keep: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), StreamStop> {
-    let (bytes, chars) = pending.next_slice();
+    let (bytes, chars) = pending.next_slice(keep);
     observe(
         observer,
         DeltaField::ToolArguments(index),
@@ -921,12 +963,14 @@ impl Pending {
     }
 
     /// Byte and character length of the next slice: at most `SLICE_CHARS`,
-    /// never leaving a tail shorter than `MIN_TAIL_CHARS`.
-    fn next_slice(&self) -> (usize, usize) {
-        let chars = if self.chars <= SLICE_CHARS {
-            self.chars
-        } else if self.chars - SLICE_CHARS < MIN_TAIL_CHARS {
-            self.chars - MIN_TAIL_CHARS
+    /// leaving `keep` characters (fewer than are buffered) and never a tail
+    /// shorter than `MIN_TAIL_CHARS` beyond them.
+    fn next_slice(&self, keep: usize) -> (usize, usize) {
+        let free = self.chars - keep;
+        let chars = if free <= SLICE_CHARS {
+            free
+        } else if free - SLICE_CHARS < MIN_TAIL_CHARS {
+            free - MIN_TAIL_CHARS
         } else {
             SLICE_CHARS
         };
@@ -1801,6 +1845,157 @@ mod tests {
             Value::from("write_file")
         );
         assert_no_tiny_pieces_before_the_tail(&all, &tokens);
+    }
+
+    /// The identity of tool call `index`: the engine opening one of
+    /// several parallel calls.
+    fn tool_identity_event_for(index: u64) -> String {
+        format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"id\":\"call_{index}\",\"type\":\"function\",\"function\":{{\"name\":\"write_file\"}}}}]}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n"
+        )
+    }
+
+    fn arguments_event_for(index: u64, text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"function\":{{\"arguments\":{}}}}}]}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// The argument pieces of tool call `index`, in order.
+    fn argument_pieces_of(evs: &[Value], index: u64) -> Vec<String> {
+        evs.iter()
+            .filter_map(|e| {
+                let call = &e["choices"][0]["delta"]["tool_calls"][0];
+                if call["index"].as_u64() != Some(index) {
+                    return None;
+                }
+                call["function"]["arguments"].as_str().map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Where the identity of tool call `index` is written.
+    fn identity_position(evs: &[Value], index: u64) -> usize {
+        evs.iter()
+            .position(|e| {
+                let call = &e["choices"][0]["delta"]["tool_calls"][0];
+                call["index"].as_u64() == Some(index) && call["function"]["name"].is_string()
+            })
+            .expect("the call's identity")
+    }
+
+    /// A parallel tool-call stream: a call's value text in engine-sized
+    /// deltas, a pause, its closer on a delta of its own, then the next call
+    /// opens. The closer must ride with text of its own call, not leave
+    /// alone when the next call's identity flushes the buffers.
+    #[test]
+    fn a_closer_arriving_alone_rides_with_its_call_when_the_next_call_opens() {
+        let call_0 = format!("{{\"path\":\"{}\"}}", "v".repeat(231));
+        let (text, closer) = call_0.split_at(240);
+        assert_eq!(closer, "\"}");
+        let call_1 = "{\"path\":\"b.txt\"}";
+        let mut r = SseRechunker::new();
+        let mut all = Vec::new();
+        all.extend_from_slice(r.feed(bytes(tool_identity_event_for(0))).as_ref());
+        for piece in [&text[..80], &text[80..160], &text[160..]] {
+            all.extend_from_slice(r.feed(bytes(arguments_event_for(0, piece))).as_ref());
+        }
+        // The engine pauses before the closer: the idle timer fires.
+        all.extend_from_slice(r.flush_pending().as_ref());
+        all.extend_from_slice(r.feed(bytes(arguments_event_for(0, closer))).as_ref());
+        all.extend_from_slice(r.feed(bytes(tool_identity_event_for(1))).as_ref());
+        all.extend_from_slice(r.feed(bytes(arguments_event_for(1, call_1))).as_ref());
+        all.extend_from_slice(r.feed(bytes(FINISH_EVENT)).as_ref());
+        all.extend_from_slice(r.finish().as_ref());
+        let evs = events(&all);
+        let pieces = argument_pieces_of(&evs, 0);
+        let sizes: Vec<usize> = pieces.iter().map(|p| p.chars().count()).collect();
+        assert!(
+            sizes.iter().all(|&s| s >= MIN_TAIL_CHARS),
+            "call 0 pieces: {sizes:?}"
+        );
+        assert_eq!(pieces.concat(), call_0);
+        assert_eq!(argument_pieces_of(&evs, 1).concat(), call_1);
+        // Call 0 is complete before call 1 opens.
+        let last_of_0 = evs
+            .iter()
+            .rposition(|e| {
+                let call = &e["choices"][0]["delta"]["tool_calls"][0];
+                call["index"].as_u64() == Some(0) && call["function"]["arguments"].is_string()
+            })
+            .unwrap();
+        assert!(last_of_0 < identity_position(&evs, 1));
+    }
+
+    /// An idle flush of a call's arguments keeps a tail for the closer, and
+    /// the tail alone is not worth an idle flush; the end of the stream
+    /// releases it with whatever followed.
+    #[test]
+    fn an_idle_flush_keeps_a_tail_of_a_calls_arguments_for_its_closer() {
+        let mut r = SseRechunker::new();
+        assert!(!r.feed(bytes(tool_identity_event())).is_empty());
+        let text = format!("{{\"path\":\"{}", "p".repeat(59));
+        assert!(r.feed(bytes(arguments_event(&text))).is_empty());
+        assert!(r.has_pending());
+        let evs = events(&r.flush_pending());
+        assert_eq!(argument_pieces(&evs), vec![text[..63].to_owned()]);
+        assert!(!r.has_pending(), "the held tail waits for the closer");
+        assert!(r.flush_pending().is_empty());
+        assert!(r.feed(bytes(arguments_event("\"}"))).is_empty());
+        assert!(!r.has_pending());
+        let mut all = r.feed(bytes(FINISH_EVENT)).to_vec();
+        all.extend_from_slice(r.finish().as_ref());
+        let tail = format!("{}\"}}", &text[63..]);
+        assert_eq!(argument_pieces(&events(&all)), vec![tail]);
+    }
+
+    /// Content is not held back: a reader is waiting for it. Its slices are
+    /// what they were before tool-call arguments kept a tail, the same shape
+    /// included.
+    #[test]
+    fn content_before_a_tool_call_is_not_held_back() {
+        let mut r = SseRechunker::new();
+        let mut all = Vec::new();
+        for _ in 0..3 {
+            all.extend_from_slice(r.feed(bytes(content_event(&"c".repeat(80)))).as_ref());
+        }
+        all.extend_from_slice(r.flush_pending().as_ref());
+        all.extend_from_slice(r.feed(bytes(content_event("ok"))).as_ref());
+        all.extend_from_slice(r.feed(bytes(tool_identity_event())).as_ref());
+        all.extend_from_slice(
+            r.feed(bytes(arguments_event("{\"path\":\"a.txt\"}")))
+                .as_ref(),
+        );
+        all.extend_from_slice(r.feed(bytes(FINISH_EVENT)).as_ref());
+        all.extend_from_slice(r.finish().as_ref());
+        let evs = events(&all);
+        assert_eq!(content_sizes(&evs), vec![80, 80, 80, 2]);
+        assert_eq!(argument_pieces(&evs), vec!["{\"path\":\"a.txt\"}"]);
+    }
+
+    /// A call whose whole arguments are tiny still goes out, before the
+    /// next call opens: only a delta that is tiny in total is a tiny event.
+    #[test]
+    fn a_call_whose_whole_arguments_are_tiny_still_precedes_the_next_call() {
+        let frames = [
+            tool_identity_event_for(0),
+            arguments_event_for(0, "{}"),
+            tool_identity_event_for(1),
+            arguments_event_for(1, "{\"k\":1}"),
+            FINISH_EVENT.to_string(),
+        ];
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+        let evs = events(&run(&refs));
+        assert_eq!(argument_pieces_of(&evs, 0), vec!["{}"]);
+        let piece_0 = evs
+            .iter()
+            .position(|e| {
+                e["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "{}"
+            })
+            .unwrap();
+        assert!(piece_0 < identity_position(&evs, 1));
+        assert_eq!(argument_pieces_of(&evs, 1), vec!["{\"k\":1}"]);
     }
 
     #[test]

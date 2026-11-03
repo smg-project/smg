@@ -10,6 +10,14 @@ leaving included; and HTTPS with a client certificate. What a real agent does
 not do on demand
 (an index going backwards or answered as 0) is covered by the unit tests
 against a scripted Consul.
+
+Every gateway here runs with the harness's one-second periodic pass. The
+pass never reads Consul: it reconciles the list the last answer gave, so a
+change still reaches the gateway only as the answer to a blocking query. What
+the pass does is retry what an answer's own pass could not apply, such as a
+removal that arrives while the instance's registration job is still in
+flight; with the pass switched off (an hour, once), that removal waited for
+the next change and the case timed out.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from __future__ import annotations
 import time
 
 from ..common import MODEL, free_port_range, served_by
-from .harness import NO_PASS_SECS, SERVICE, consul_gateway
+from .harness import SERVICE, consul_gateway
 
 PROVIDER = "smg.ai/discovery-provider"
 ID = "smg.ai/discovery-id"
@@ -32,10 +40,11 @@ def ids(workers: list[dict]) -> dict[str, str]:
 
 
 def test_passing_instances_are_workers_as_consul_reports_them(agent, gateway, engines):
-    """With no periodic pass in the test's time, every change below arrives
-    as the answer to a blocking query."""
+    """Every change below reaches the gateway as the answer to a blocking
+    query; the periodic pass only applies what an answer's pass had to hold
+    back (see the module docstring)."""
     a, b = engines(2)
-    gateway.start(check_interval_secs=NO_PASS_SECS)
+    gateway.start()
     agent.register("node-a", "worker-a", a.port)
     agent.register("node-b", "worker-b", b.port)
     workers = gateway.wait_for_urls({a.url, b.url}, "both passing instances")
@@ -89,7 +98,7 @@ def test_metadata_configures_pd_workers_and_an_edit_updates_one(agent, gateway, 
     register_prefill(29700)
     agent.register("gpu-2", "decode-0", decode, meta={"smg_worker_type": "decode"})
     agent.register("gpu-3", "verifier-0", invalid, meta={"smg_worker_type": "verifier"})
-    gateway.start("--pd-disaggregation", check_interval_secs=NO_PASS_SECS)
+    gateway.start("--pd-disaggregation")
 
     workers = gateway.wait_for_urls({url(prefill), url(decode)}, "the PD fleet")
     by_url = {w["url"]: w for w in workers}
@@ -120,7 +129,7 @@ def test_metadata_configures_pd_workers_and_an_edit_updates_one(agent, gateway, 
 def test_a_model_id_in_the_metadata_names_the_worker_model(agent, gateway, engines):
     (a,) = engines(1)
     agent.register("node-a", "worker-a", a.port, meta={"smg_model_id": "consul-named"})
-    gateway.start(check_interval_secs=NO_PASS_SECS)
+    gateway.start()
     gateway.wait_for(
         "the worker under the model Consul names",
         lambda workers: [w.get("model_id") for w in workers] == ["consul-named"],
@@ -130,7 +139,7 @@ def test_a_model_id_in_the_metadata_names_the_worker_model(agent, gateway, engin
 def test_a_lost_consul_keeps_the_fleet_and_an_empty_one_is_read_afresh(agent, gateway, engines):
     (a,) = engines(1)
     agent.register("node-a", "worker-a", a.port)
-    gateway.start(check_interval_secs=NO_PASS_SECS)
+    gateway.start()
     gateway.wait_for_urls({a.url}, "the worker")
 
     agent.stop_container()
@@ -201,7 +210,7 @@ def test_the_agents_default_token_reads_for_a_gateway_with_none(acl_agent, engin
     acl_agent.put("/v1/agent/token/default", {"Token": reader})
     gateway = consul_gateway(acl_agent, tmp_path / "default-token.log")
     try:
-        gateway.start(check_interval_secs=NO_PASS_SECS)
+        gateway.start()
         gateway.wait_for_urls({a.url}, "the instance read through the default token")
         acl_agent.deregister("node-a", "worker-a")
         gateway.wait_for_urls(set(), "the last instance leaving")

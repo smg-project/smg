@@ -215,7 +215,7 @@ pub fn xgrammar_unsupported_json_feature(schema: &Value) -> Option<XgrammarUnsup
 
 /// [`xgrammar_unsupported_json_feature`] for a schema as its text: the text
 /// is scanned for the rules' keywords first
-/// ([`text_names_an_xgrammar_unsupported_keyword`]) and parsed only when it
+/// (`text_names_an_xgrammar_unsupported_keyword`) and parsed only when it
 /// names one, so the common schema costs the scan alone.
 pub fn xgrammar_unsupported_feature_in_schema_text(
     schema: &str,
@@ -235,7 +235,7 @@ pub fn xgrammar_unsupported_feature_in_schema_text(
 /// it by their `begin`; `None` for a tag that carries none, and for one that
 /// is not JSON, which xgrammar refuses at compile. The tag's text is scanned
 /// for the rules' keywords first
-/// ([`text_names_an_xgrammar_unsupported_keyword`]): a tag that names none
+/// (`text_names_an_xgrammar_unsupported_keyword`): a tag that names none
 /// carries none and is not parsed, so a forced call pays the scan alone for
 /// the common tag.
 pub fn xgrammar_unsupported_feature_in_structural_tag(

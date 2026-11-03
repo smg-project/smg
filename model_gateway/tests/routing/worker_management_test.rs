@@ -5,6 +5,7 @@
 //! - POST /workers - create a worker
 //! - GET /workers - list workers
 //! - PUT /workers/{worker_id} - replace a worker
+//! - PATCH /workers/{worker_id} - update a worker
 //! - DELETE /workers/{worker_id} - remove a worker
 
 use axum::{
@@ -526,5 +527,171 @@ mod worker_management_tests {
         );
 
         ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod discovery_ownership_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use openai_protocol::worker::{HealthCheckConfig, WorkerType};
+    use smg::{
+        config::RouterConfig,
+        routers::http::router::Router as HttpRouter,
+        service_discovery::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL},
+        worker::BasicWorkerBuilder,
+    };
+
+    use super::*;
+    use crate::common::{create_test_context, test_app::create_test_app_with_context};
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        }
+        .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Through the HTTP API a worker can neither be handed to discovery nor
+    /// edited behind its provider's back: a label under the reserved prefix
+    /// is a 400 on POST, PUT and PATCH; a PUT, or a PATCH of labels, of a
+    /// discovered worker is a 409 naming its provider; a PATCH of what no
+    /// provider publishes is applied, and a DELETE is taken and removes it.
+    #[tokio::test]
+    async fn the_worker_api_stays_out_of_discovery_ownership() {
+        let context = create_test_context(RouterConfig {
+            disable_load_monitoring: true,
+            ..Default::default()
+        })
+        .await;
+        let health = HealthCheckConfig {
+            disable_health_check: true,
+            drain_settle_secs: 0,
+            ..Default::default()
+        };
+        for (url, labels) in [
+            (
+                "http://discovered:30000",
+                vec![
+                    (DISCOVERY_PROVIDER_LABEL, "file"),
+                    (DISCOVERY_ID_LABEL, "engine-0"),
+                ],
+            ),
+            ("http://manual:30000", vec![]),
+        ] {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(health.clone());
+            for (key, value) in labels {
+                builder = builder.label(key, value);
+            }
+            context
+                .worker_registry
+                .register(Arc::new(builder.build()))
+                .unwrap();
+        }
+        let router = Arc::new(HttpRouter::new(&context).await.unwrap());
+        let app = create_test_app_with_context(router, Arc::clone(&context));
+        let id_of = |url: &str| {
+            context
+                .worker_registry
+                .get_id_by_url(url)
+                .unwrap()
+                .as_str()
+                .to_string()
+        };
+        let discovered = format!("/workers/{}", id_of("http://discovered:30000"));
+        let manual = format!("/workers/{}", id_of("http://manual:30000"));
+
+        let reserved = json!({ DISCOVERY_PROVIDER_LABEL: "file" });
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/workers",
+                json!({"url": "http://new:30000", "labels": reserved}),
+            ),
+            (
+                "PUT",
+                manual.as_str(),
+                json!({"url": "http://manual:30000", "labels": reserved}),
+            ),
+            ("PATCH", manual.as_str(), json!({ "labels": reserved })),
+        ] {
+            let (status, body) = send(&app, method, uri, Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+            let error = body["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("'smg.ai/discovery-provider'")
+                    && error.contains("reserved for worker discovery"),
+                "{method} {uri}: {body}"
+            );
+        }
+
+        for (method, body) in [
+            (
+                "PUT",
+                json!({"url": "http://discovered:30000", "priority": 7}),
+            ),
+            ("PATCH", json!({"labels": {"env": "prod"}})),
+        ] {
+            let (status, body) = send(&app, method, &discovered, Some(body)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method}: {body}");
+            assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED", "{method}: {body}");
+            let error = body["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("'file' discovery provider") && error.contains("discovery source"),
+                "{method}: {body}"
+            );
+        }
+
+        let (status, body) = send(&app, "PATCH", &discovered, Some(json!({"priority": 7}))).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "PATCH of the priority: {body}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context
+                .worker_registry
+                .get_by_url("http://discovered:30000")
+                .is_none_or(|worker| worker.priority() != 7)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an accepted PATCH of a discovered worker's priority applies it");
+
+        let (status, body) = send(&app, "DELETE", &discovered, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "DELETE: {body}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context
+                .worker_registry
+                .get_by_url("http://discovered:30000")
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an accepted DELETE of a discovered worker removes it");
     }
 }

@@ -1,4 +1,4 @@
-use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
@@ -687,24 +687,195 @@ fn test_tml_preserves_authored_multipart_order_openai() {
     assert_eq!(result[0]["content"], expected);
 }
 
-#[test]
-fn test_absent_assistant_content_renders_null() {
-    let messages = vec![ChatMessage::Assistant {
-        ext: Default::default(),
-        content: None,
-        name: None,
-        tool_calls: None,
-        reasoning_content: None,
-    }];
+// --- an assistant turn without content on the render path ----------------
 
-    let result = process_content_format_with_order(
-        &messages,
+/// A template of the string format that tests and splits every assistant
+/// message's content (a reasoning model's template strips the thought it
+/// wrote before its answer this way) and prints the content after the role.
+const CONTENT_TESTING_STRING_TEMPLATE: &str = "{%- for message in messages -%}\
+{%- if message.role == 'assistant' and '</think>' in message.content -%}\
+{%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+{%- else -%}{%- set content = message.content -%}{%- endif -%}\
+<|{{ message.role }}|>{{ content }}\
+{%- if message.tool_calls -%}{%- for call in message.tool_calls -%}<call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+<|end|>{%- endfor -%}\
+{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+
+/// A template of the OpenAI format: it walks a message's content parts, and
+/// tests an assistant message's content as the string template does.
+const CONTENT_TESTING_PARTS_TEMPLATE: &str = "{%- for message in messages -%}\
+{%- if message.role == 'assistant' and '</think>' in message.content -%}\
+{%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+{%- else -%}{%- set content = message.content -%}{%- endif -%}\
+<|{{ message.role }}|>\
+{%- if content is string -%}{{ content }}\
+{%- else -%}{%- for part in content -%}{%- if part.type == 'text' -%}{{ part.text }}{%- endif -%}{%- endfor -%}{%- endif -%}\
+{%- if message.tool_calls -%}{%- for call in message.tool_calls -%}<call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+<|end|>{%- endfor -%}\
+{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+
+/// A chat request whose history holds a tool-call-only assistant turn (the
+/// OpenAI shape: `content` null beside `tool_calls`) and its tool result.
+fn request_with_a_tool_call_only_turn() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "What is the weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "18 celsius"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// `request` rendered through `template`, whose detected content format
+/// must be `format`.
+fn render_through(
+    template: &str,
+    format: ChatTemplateContentFormat,
+    request: &ChatCompletionRequest,
+) -> Result<String, String> {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer.set_chat_template(template.to_string()).unwrap();
+    assert_eq!(tokenizer.chat_template_content_format(), format);
+    process_chat_messages_with_placeholders(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+        .map(|(processed, _)| processed.text)
+}
+
+const TOOL_CALL_ONLY_TURN_RENDERED: &str = "<|user|>What is the weather in Paris?<|end|>\
+<|assistant|><call:get_weather><|end|><|tool|>18 celsius<|end|><|assistant|>";
+
+/// A tool-call-only assistant turn in the history renders through a
+/// string-format template that tests, splits and prints `message.content`:
+/// the turn's content reaches the template as the empty string the engine's
+/// chat utils hand it, so the check is false and nothing is printed for it
+/// (not the text `None`, and not a render failure).
+#[test]
+fn a_tool_call_only_assistant_turn_renders_through_a_content_testing_string_template() {
+    let text = render_through(
+        CONTENT_TESTING_STRING_TEMPLATE,
+        ChatTemplateContentFormat::String,
+        &request_with_a_tool_call_only_turn(),
+    )
+    .unwrap();
+    assert_eq!(text, TOOL_CALL_ONLY_TURN_RENDERED);
+}
+
+/// The same turn through a template that takes content parts: the content
+/// reaches it as the empty parts list the engine's chat utils hand such a
+/// template, so the check is false and the parts loop writes nothing.
+#[test]
+fn a_tool_call_only_assistant_turn_renders_through_a_content_testing_parts_template() {
+    let text = render_through(
+        CONTENT_TESTING_PARTS_TEMPLATE,
         ChatTemplateContentFormat::OpenAI,
+        &request_with_a_tool_call_only_turn(),
+    )
+    .unwrap();
+    assert_eq!(text, TOOL_CALL_ONLY_TURN_RENDERED);
+}
+
+/// `skip_serializing_none` drops an assistant message's absent content; the
+/// render path restores it as the empty content the engine's chat utils
+/// hand a template: `""` under the string format, `[]` under the OpenAI
+/// format, with or without tool calls and reasoning content beside it. A
+/// message with content is left as it is.
+#[test]
+fn an_absent_assistant_content_is_the_engines_empty_content_in_the_templates_format() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "assistant", "content": null},
+        {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "a thought",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"}
+            }]
+        },
+        {"role": "assistant", "content": "hello"},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+    ]))
+    .unwrap();
+    // Text parts under the string format are joined into the text, as the
+    // engine joins them; a parts template keeps them.
+    for (format, empty, parts) in [
+        (ChatTemplateContentFormat::String, json!(""), json!("hello")),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            json!([]),
+            json!([{"type": "text", "text": "hello"}]),
+        ),
+    ] {
+        let result =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::MediaFirst)
+                .unwrap();
+        assert_eq!(result[0]["content"], empty, "{format:?}");
+        assert_eq!(result[1]["content"], empty, "{format:?}");
+        assert_eq!(
+            result[1]["reasoning_content"],
+            json!("a thought"),
+            "{format:?}"
+        );
+        assert_eq!(
+            result[1]["tool_calls"][0]["function"]["name"],
+            json!("f"),
+            "{format:?}"
+        );
+        assert_eq!(result[2]["content"], json!("hello"), "{format:?}");
+        assert_eq!(result[3]["content"], parts, "{format:?}");
+    }
+}
+
+#[test]
+fn a_content_array_without_media_renders_the_same_under_either_order() {
+    // The order places media relative to text; with no media part there is
+    // nothing to place, so the resolver asks no registry for it (an empty
+    // plan returns before the lookups) and both orders must keep rendering
+    // alike: the text parts in their own order, joined as the engine joins
+    // them, under the string format; the parts as given under the other.
+    let messages = vec![ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "first".to_string(),
+            },
+            ContentPart::Text {
+                text: "second".to_string(),
+            },
+        ]),
+        name: None,
+    }];
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        let media_first =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::MediaFirst)
+                .unwrap();
+        let authored =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::Authored)
+                .unwrap();
+        assert_eq!(media_first, authored, "{format:?}");
+    }
+    let rendered = process_content_format_with_order(
+        &messages,
+        ChatTemplateContentFormat::String,
         None,
         MediaPartOrder::MediaFirst,
     )
     .unwrap();
-    assert!(result[0]["content"].is_null());
+    assert_eq!(rendered[0]["content"], "first\nsecond");
 }
 
 #[test]
@@ -767,9 +938,8 @@ fn a_named_tool_choice_renders_every_tool() {
     };
 
     let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
-    let plain = RendererCapabilities::default();
     assert_eq!(
-        names(&request_as_rendered(&named, plain)),
+        names(&request_as_rendered(&named)),
         ["get_weather", "get_time"]
     );
     assert_eq!(
@@ -785,11 +955,11 @@ fn a_named_tool_choice_renders_every_tool() {
         "type": "allowed_tools", "mode": "auto",
         "tools": [{"type": "function", "name": "get_time"}]
     }));
-    assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
+    assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
 
     let auto = request(json!("auto"));
     assert_eq!(
-        names(&request_as_rendered(&auto, plain)),
+        names(&request_as_rendered(&auto)),
         ["get_weather", "get_time"]
     );
 }
@@ -806,36 +976,31 @@ fn tool_choice_none_request() -> ChatCompletionRequest {
         .expect("chat request")
 }
 
-/// `tool_choice: none` renders no tool: the model is not offered a call
-/// it may not make, and the request's other fields render as sent.
+/// `tool_choice: none` renders the tools as `auto` renders them: the request
+/// renders as sent (borrowed, nothing narrowed), so the prompt is the one the
+/// engine's own server renders for it and the one the session's other turns
+/// rendered; the choice itself reaches the template as a kwarg.
 #[test]
-fn tool_choice_none_renders_no_tool() {
+fn tool_choice_none_renders_the_tools_as_auto_does() {
     let request = tool_choice_none_request();
-    let rendered = request_as_rendered(&request, RendererCapabilities::default());
-    assert!(rendered.tools.is_none());
-    assert_eq!(rendered.messages.len(), request.messages.len());
-    // The request itself keeps its tools for the rest of the pipeline.
-    assert!(request.tools.is_some());
-}
-
-/// A renderer that declares the tools under `tool_choice: none` itself
-/// (and forbids the call in the prompt, as its reference does) gets them:
-/// the request renders as sent.
-#[test]
-fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
-    let request = tool_choice_none_request();
-    let rendered = request_as_rendered(
-        &request,
-        RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        },
-    );
+    let rendered = request_as_rendered(&request);
     assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
     assert_eq!(
         rendered.tools.as_deref().map(<[_]>::len),
         Some(1),
-        "the tool declaration stays for the renderer to write"
+        "the tool declaration stays for the template to write"
+    );
+    let mut auto = request.clone();
+    auto.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    let under_auto = request_as_rendered(&auto);
+    assert_eq!(
+        serde_json::to_value(&under_auto.tools).expect("tools"),
+        serde_json::to_value(&rendered.tools).expect("tools"),
+        "the same tools render under none and under auto"
+    );
+    assert_eq!(
+        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
+        json!("none")
     );
 }
 
@@ -934,9 +1099,9 @@ fn thinking_disabled_projects_params_thinking_false() {
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off and an
-/// explicit effort outranks `thinking.disabled`; the request renders the
-/// template's default (thinking on, the model's own depth).
+/// Under the MiniMax profile no effort value switches thinking off: the
+/// request renders the template's default (thinking on, the model's own
+/// depth). An explicit `thinking.disabled` wins over the effort there too.
 #[test]
 fn minimax_effort_keeps_thinking_on() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
@@ -953,8 +1118,8 @@ fn minimax_effort_keeps_thinking_on() {
         );
         assert_eq!(
             resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
-            None,
-            "{effort} outranks thinking.disabled"
+            Some(false),
+            "{effort}: thinking.disabled wins"
         );
     }
     assert_eq!(
@@ -1210,7 +1375,6 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
@@ -1218,7 +1382,6 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 
@@ -1242,6 +1405,136 @@ fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing
     assert_eq!(native["messages"][1]["content"], "Sure");
     assert_eq!(native["add_generation_prompt"], json!(false));
     assert_eq!(native["assistant_prefix"], json!(""));
+}
+
+/// `add_generation_prompt: false` renders the conversation without a
+/// generation header; absent, the header is rendered as before. A continued
+/// final message keeps its own rule: no header natively, the emulation's
+/// header and prefix otherwise, whatever the field says.
+#[test]
+fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
+    let request = |fields: Value| -> ChatCompletionRequest {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let closed = render_with(
+        Default::default(),
+        &request(json!({"add_generation_prompt": false})),
+    );
+    assert_eq!(closed["add_generation_prompt"], json!(false));
+    assert_eq!(closed["messages"].as_array().unwrap().len(), 1);
+    let open = render_with(Default::default(), &request(json!({})));
+    assert_eq!(open["add_generation_prompt"], json!(true));
+
+    let pair = request(json!({
+        "continue_final_message": true,
+        "add_generation_prompt": false,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    }));
+    let emulated = render_with(Default::default(), &pair);
+    assert_eq!(emulated["add_generation_prompt"], json!(true));
+    assert_eq!(emulated["assistant_prefix"], json!("Sure"));
+    let native = render_with(NATIVE_CONTINUATION, &pair);
+    assert_eq!(native["add_generation_prompt"], json!(false));
+    assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+}
+
+/// Through a Jinja template: without the header the prompt ends at the last
+/// turn's end marker; with it (the field absent) the assistant header follows.
+/// The rendered prompt reports which, for the reasoning decisions. A
+/// `chat_template_kwargs` entry of that name does not override the request's
+/// field (the render context keeps the field's value), so the header stays
+/// and is reported as such.
+#[test]
+fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer
+        .set_chat_template(HEADER_TEMPLATE.to_string())
+        .unwrap();
+    let render = |add_generation_prompt: Value| {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "add_generation_prompt": add_generation_prompt
+        });
+        if let Some(kwargs) = add_generation_prompt.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+            body["add_generation_prompt"] = Value::Null;
+        }
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let closed = render(json!(false));
+    assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
+    assert!(!closed.generation_prompt);
+    let open = render(Value::Null);
+    assert_eq!(
+        open.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(open.generation_prompt);
+    let by_kwargs = render(json!({"chat_template_kwargs": {"add_generation_prompt": false}}));
+    assert_eq!(
+        by_kwargs.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(by_kwargs.generation_prompt);
+}
+
+/// The rendered prompt reports whether it carries the generation header, as
+/// the reasoning decisions read it: the header the request asked for, none
+/// under `add_generation_prompt: false`, none for a natively continued
+/// message, and the emulation's header (the message's text after it)
+/// otherwise.
+#[test]
+fn the_rendered_prompt_reports_its_generation_header() {
+    let processed = |capabilities: RendererCapabilities, body: Value| -> ProcessedMessages {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    assert!(processed(Default::default(), hello.clone()).generation_prompt);
+    let mut closed = hello;
+    closed["add_generation_prompt"] = json!(false);
+    assert!(!processed(Default::default(), closed).generation_prompt);
+    let pair = json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    });
+    let native = processed(NATIVE_CONTINUATION, pair.clone());
+    assert!(native.continued_final_message);
+    assert!(!native.generation_prompt);
+    let emulated = processed(Default::default(), pair);
+    assert!(!emulated.continued_final_message);
+    assert!(emulated.generation_prompt);
 }
 
 /// A text-rendered prompt reaches the tokenizer with each rendered marker
@@ -1480,12 +1773,16 @@ fn a_template_that_writes_the_arguments_as_text_gets_them_as_the_request_sent_th
     );
 }
 
-/// An empty `arguments` string, which a call cut before it wrote any argument may carry back
-/// in history, is a call with no arguments; other text that is not JSON keeps the 400.
+/// Tool-call `arguments` reach the template as the object the engines hand
+/// theirs: a JSON text is parsed in its key order; an empty text (a call cut
+/// before it wrote any argument may carry one back in history) is a call
+/// without arguments; a text that is not JSON, or not an object, is an empty
+/// object as well instead of a refusal that would fail every later turn of
+/// the conversation; absent arguments are an empty object; an object stays.
 #[test]
-fn an_empty_arguments_string_in_history_is_no_arguments() {
-    let history = |arguments: &str| {
-        vec![json!({
+fn arguments_text_in_history_reaches_the_template_as_the_engines_hand_it() {
+    let rendered = |arguments: Value| {
+        let mut messages = vec![json!({
             "role": "assistant",
             "content": null,
             "tool_calls": [{
@@ -1493,34 +1790,74 @@ fn an_empty_arguments_string_in_history_is_no_arguments() {
                 "type": "function",
                 "function": {"name": "apply_patch", "arguments": arguments}
             }]
-        })]
+        })];
+        process_tool_call_arguments(&mut messages);
+        messages[0]["tool_calls"][0]["function"]["arguments"].take()
     };
+    let parsed = rendered(json!("{\"patch\": \"x\", \"at\": 1}"));
+    assert_eq!(parsed.to_string(), "{\"patch\":\"x\",\"at\":1}");
     for empty in ["", "  \n"] {
-        let mut messages = history(empty);
-        process_tool_call_arguments(&mut messages).expect("an empty string is no arguments");
+        assert_eq!(rendered(json!(empty)), json!({}), "{empty:?}");
+    }
+    for not_an_object in ["{", "{\"patch\": \"x\"", "[]", "42", "\"x\""] {
         assert_eq!(
-            messages[0]["tool_calls"][0]["function"]["arguments"],
+            rendered(json!(not_an_object)),
             json!({}),
-            "{empty:?}"
+            "{not_an_object:?}"
         );
     }
-    let mut messages = history("{\"patch\": \"x\"}");
-    process_tool_call_arguments(&mut messages).expect("JSON arguments");
-    assert_eq!(
-        messages[0]["tool_calls"][0]["function"]["arguments"],
-        json!({"patch": "x"})
-    );
-    for invalid in ["{", "{\"patch\": \"x\""] {
-        let err = process_tool_call_arguments(&mut history(invalid)).unwrap_err();
-        assert!(err.contains("Failed to parse tool call arguments"), "{err}");
-    }
+    assert_eq!(rendered(Value::Null), json!({}));
+    assert_eq!(rendered(json!({"patch": "y"})), json!({"patch": "y"}));
 }
 
-/// A renderer that parses `arguments` itself (K3) gets a malformed history
-/// string as written and applies its own tolerance; Transformers templates
-/// keep the 400.
+/// A history tool call whose `arguments` is the JSON object itself (a client
+/// replaying the parsed call) is accepted and renders exactly as the same
+/// call with the arguments as text, the shape the API documents: a template
+/// gets the object either way, in the request's key order, and a renderer
+/// that reads the text itself gets the object's JSON text.
 #[test]
-fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
+fn tool_call_arguments_sent_as_an_object_render_like_the_text() {
+    let request = |arguments: Value| -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": arguments}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"temperature\": 18}"}
+            ]
+        }))
+        .expect("a history tool call's arguments may be text or an object")
+    };
+    let as_object = request(json!({"unit": "celsius", "city": "Paris"}));
+    let as_text = request(json!("{\"unit\": \"celsius\", \"city\": \"Paris\"}"));
+    let arguments =
+        |rendered: Value| rendered["messages"][1]["tool_calls"][0]["function"]["arguments"].clone();
+
+    let object = arguments(render_with(Default::default(), &as_object));
+    assert_eq!(
+        object.to_string(),
+        "{\"unit\":\"celsius\",\"city\":\"Paris\"}"
+    );
+    assert_eq!(object, arguments(render_with(Default::default(), &as_text)));
+    assert_eq!(
+        arguments(render_with(RAW_ARGUMENTS, &as_object)),
+        json!("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+    );
+}
+
+/// A malformed `arguments` text in history: a renderer that parses
+/// `arguments` itself (K3) gets it as written and applies its own tolerance;
+/// a template gets the empty object the engines hand theirs.
+#[test]
+fn malformed_tool_call_arguments_render_as_the_engines_render_them() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "m",
         "messages": [
@@ -1539,14 +1876,11 @@ fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
     }))
     .unwrap();
 
-    let err = process_chat_messages_with_placeholders(
-        &request,
-        &llm_tokenizer::MockTokenizer::new(),
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap_err();
-    assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+    let template = render_with(Default::default(), &request);
+    assert_eq!(
+        template["messages"][1]["tool_calls"][0]["function"]["arguments"],
+        json!({})
+    );
 
     let raw = render_with(RAW_ARGUMENTS, &request);
     assert_eq!(
@@ -1694,7 +2028,7 @@ async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after
         "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
     );
     for (failure, autoload, reason) in [
-        (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+        (&TokenizerLoadFailure::NoSource, true, "no tokenizer source"),
         (
             &TokenizerLoadFailure::Removed,
             true,

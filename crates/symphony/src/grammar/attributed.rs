@@ -16,6 +16,8 @@
 //! schema is not consulted: any number of parameters with any name, each `string="true"` with
 //! any text or `string="false"` with any JSON value, the shape the gateway hand-wrote for
 //! DeepSeek V4.1; a schema-driven spelling is a change of its own.
+//!
+//! [`shape`]: crate::shape
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -199,24 +201,9 @@ fn any_argument(tags: &Tags, ends: &Ends<'_>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::Function;
     use serde_json::json as value;
 
-    use super::*;
-    use crate::formats;
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
+    use crate::{formats, testing::tool};
 
     #[test]
     fn minimax_m2_writes_its_block_each_invoke_and_each_pair_on_its_own_line() {

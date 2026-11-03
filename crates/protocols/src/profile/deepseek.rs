@@ -1,6 +1,6 @@
 //! Bounded DeepSeek V4 / V4.1 Chat dialect, calibrated by
 //! smg-project/deepseek-provider-verifier against deepseek-flash and deepseek-v4-pro.
-//! See https://api-docs.deepseek.com/api/create-chat-completion/.
+//! See <https://api-docs.deepseek.com/api/create-chat-completion/>.
 //!
 //! Older V3/R1 models and opaque aliases retain the baseline. This profile
 //! does not claim the vendor's context window, sampling behavior or JSON
@@ -27,12 +27,24 @@ pub(super) fn matches_model(segment: &str) -> bool {
         .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
-fn is_v41_model(model: &str) -> bool {
+/// Whether any `/`-separated segment of a model id is a V4.1 name.
+fn is_v41_name(model: &str) -> bool {
     model.split('/').any(|segment| {
         V41_MODELS
             .iter()
             .any(|v41| segment.eq_ignore_ascii_case(v41))
     })
+}
+
+/// Whether `model` is served as V4.1: an opaque alias of a V4.1 served
+/// model is, and so is an opaque served model whose vendor-named aliases
+/// are all V4.1 names, whichever name the request carries, and so is one
+/// vendor's name for a V4.1 model; an alias named for the vendor it resolves
+/// to and an unregistered name are read as they are. Every reader of the
+/// version goes through here, so normalization, the thinking toggle and
+/// validation agree with each other.
+fn is_v41_model(model: &str) -> bool {
+    super::served_under(model, is_v41_name)
 }
 
 /// The effort names the vendor's API documents as aliases of its levels:
@@ -73,7 +85,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     // Native V4 and V4.1 renderers have different defaults and effort
     // precedence. Resolve the provider contract once and pass the same
     // highest-priority toggle to rendering, parser arming and validation.
-    let enabled = thinking_enabled(req);
+    let enabled = thinking_enabled(req, is_v41);
     let kwargs = req.chat_template_kwargs.get_or_insert_default();
     if kwargs.get("thinking").is_none_or(Value::is_null) {
         kwargs.insert("thinking".into(), Value::Bool(enabled));
@@ -133,6 +145,9 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             "thinking.type must be enabled or disabled for DeepSeek V4",
         ));
     }
+    // The V4.1 native renderer restores ASCII-digit strings to 1..=100
+    // budgets. Other V4 renderers do not support that extension.
+    let is_v41 = is_v41_model(&req.model);
     // Validate both spellings, including one hidden by the other's precedence.
     for effort in [
         req.reasoning_effort.as_deref(),
@@ -143,9 +158,6 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     .into_iter()
     .flatten()
     {
-        // The V4.1 native renderer restores ASCII-digit strings to 1..=100
-        // budgets. Other V4 renderers do not support that extension.
-        let is_v41 = is_v41_model(&req.model);
         let native_budget = is_v41
             && effort.bytes().all(|byte| byte.is_ascii_digit())
             && effort
@@ -169,7 +181,8 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
 
 /// SMG template overrides stay explicit; public `thinking.type` then
 /// decides ahead of public effort, with thinking enabled by default.
-fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
+/// `is_v41` is the request's version, read once by the caller.
+fn thinking_enabled(req: &ChatCompletionRequest, is_v41: bool) -> bool {
     let kwargs = req.chat_template_kwargs.as_ref();
     kwargs
         .and_then(|kwargs| {
@@ -186,7 +199,7 @@ fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
                     "low" | "high" | "xhigh" | "max" => Some(true),
                     // A level of V4.1's own table; under V4 an alias the
                     // renderer maps, with no opinion on the mode.
-                    "medium" if is_v41_model(&req.model) => Some(true),
+                    "medium" if is_v41 => Some(true),
                     _ => None,
                 })
         })

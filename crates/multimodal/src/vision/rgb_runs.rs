@@ -12,7 +12,7 @@
 
 /// The run splitter for this machine: the vector path where the vector unit
 /// was detected, the scalar one otherwise. Only [`detect`](Self::detect)
-/// builds one (and the test-only [`scalar`](Self::scalar)), so the vector
+/// builds one (and the test-only `scalar`), so the vector
 /// call it makes rests on a detection of its own, not on a flag a caller
 /// passes; a caller detects once and splits many runs.
 #[derive(Debug, Clone, Copy)]

@@ -320,7 +320,7 @@ impl ResponseParser {
     }
 
     /// transformers: `_process`. No match that starts before `floor` is
-    /// waited for (see [`feed_into`](Self::feed_into)); transformers' is 0.
+    /// waited for (every caller passes `0` today); transformers' is 0.
     fn process(
         &mut self,
         events: &mut Vec<Event>,

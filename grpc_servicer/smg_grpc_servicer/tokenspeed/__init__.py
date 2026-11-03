@@ -6,6 +6,8 @@ or ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` serves the same contract from Rust; see
 """
 
 __all__ = [
+    "METRICS_HOST_ENV",
+    "METRICS_PORT_ENV",
     "SERVICER_IMPL_ENV",
     "TokenSpeedSchedulerServicer",
     "resolve_servicer_impl",
@@ -14,6 +16,10 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.tokenspeed.rust`.
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
+# The Rust servicer's Prometheus endpoint: the fallbacks of --metrics-port and
+# --metrics-host (see `smg_grpc_servicer.rust_lifecycle.metrics_bind_address`).
+METRICS_PORT_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_PORT"
+METRICS_HOST_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_HOST"
 
 
 def __getattr__(name: str):

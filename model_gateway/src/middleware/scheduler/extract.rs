@@ -17,7 +17,7 @@ use std::{convert::Infallible, future::Future};
 
 use axum::{
     extract::FromRequestParts,
-    http::request::Parts,
+    http::{request::Parts, Extensions},
     response::{IntoResponse, Response},
 };
 use tokio_util::sync::CancellationToken;
@@ -38,17 +38,23 @@ where
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Infallible> {
-        Ok(Self(
-            parts
-                .extensions
-                .get::<CancellationToken>()
-                .cloned()
-                .unwrap_or_default(),
-        ))
+        Ok(Self::from_extensions(&parts.extensions))
     }
 }
 
 impl PreemptionGuard {
+    /// The request's token where the admission layer put one; a default
+    /// token that never fires otherwise (legacy admission). What the
+    /// extractor reads, for a layer that holds the request itself.
+    pub fn from_extensions(extensions: &Extensions) -> Self {
+        Self(
+            extensions
+                .get::<CancellationToken>()
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
     /// Run `fut`, returning its response — unless the request is preempted
     /// first, in which case `fut` is dropped (cancelling the upstream call)
     /// and a `Preempted` response is returned.
@@ -95,6 +101,23 @@ mod tests {
         let guard = PreemptionGuard(token);
         // The work future never completes, so only the cancel arm can win.
         let resp = guard.guard(pending::<Response>()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn from_extensions_reads_the_admission_token_or_defaults_to_one_that_never_fires() {
+        let mut extensions = Extensions::new();
+        let resp = PreemptionGuard::from_extensions(&extensions)
+            .guard(async { StatusCode::OK.into_response() })
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let token = CancellationToken::new();
+        extensions.insert(token.clone());
+        token.cancel();
+        let resp = PreemptionGuard::from_extensions(&extensions)
+            .guard(pending::<Response>())
+            .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -25,7 +25,8 @@ is kept as given, and the engine's default stays where it is the better one:
 ``--enforce-eager`` (no graphs), a ``cudagraph_mode`` of NONE, speculative
 decoding (the engine's default adds the uniform-decode sizes an explicit cap
 drops), or no ``--max-num-seqs`` (the engine's own window defaults reach the
-ceiling already).
+default ceiling already; a ceiling of 1024 or more, set in the knob, still
+applies: it raises the engine's default on every platform).
 
 :data:`CAPTURE_CAP_ENV` is the knob: ``auto`` (the default), ``engine`` (the
 opt-out: the engine's default, as before this derivation), or a positive
@@ -56,11 +57,14 @@ logger = logging.getLogger(__name__)
 CAPTURE_CAP_ENV = "SMG_VLLM_CUDAGRAPH_CAPTURE_CAP"
 AUTO = "auto"
 ENGINE = "engine"
-# The ceiling of the derived cap: the engine's own default ceiling (the 1024
-# it uses on one newer GPU platform is a default this derivation never lowers,
-# see `derive_capture_cap`).
+# The ceiling of the derived cap: the engine's own default ceiling. On one
+# newer GPU platform the engine's default ceiling is 1024, which the launch
+# cannot tell apart: a derived cap raises the 512 default and never lowers the
+# 1024 one (a knob ceiling between the two is kept out where it could), see
+# `derive_capture_cap`.
 DEFAULT_CEILING = 512
 ENGINE_DEFAULT_CEILING = 512
+ENGINE_PLATFORM_CEILING = 1024
 # The engine's flags that set the cap outright, for the messages.
 CAP_FLAGS = "--max-cudagraph-capture-size / --cudagraph-capture-sizes (or --compilation-config)"
 
@@ -166,31 +170,71 @@ def derive_capture_cap(
             "the engine's own default under speculative decoding (it adds the uniform-decode "
             "sizes an explicit cap drops)",
         )
-    if max_num_seqs is None:
-        return CaptureCap(
-            None,
-            "window",
-            "the engine's own default (--max-num-seqs unset: the engine's window defaults "
-            f"reach a cap of {ENGINE_DEFAULT_CEILING} or more)",
-        )
-    engine_default = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
     cap = ceiling if max_num_batched_tokens is None else min(max_num_batched_tokens, ceiling)
     step = "unset" if max_num_batched_tokens is None else str(max_num_batched_tokens)
-    if cap <= engine_default:
+    # The engine's own default is twice the window, at most 512, or at most
+    # 1024 on one platform the launch cannot tell apart, each as the engine's
+    # list ends it (the step size where that fits under it, else the grid): a
+    # derived cap raises the former and never lowers the latter. Without a
+    # window flag the engine's window defaults reach both ceilings.
+    if max_num_seqs is None:
+        low_raw, high_raw = ENGINE_DEFAULT_CEILING, ENGINE_PLATFORM_CEILING
+        source = "window"
+        origin = "--max-num-seqs unset: the engine's window defaults reach the default ceiling"
+    else:
+        low_raw = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
+        high_raw = min(2 * max_num_seqs, ENGINE_PLATFORM_CEILING)
+        source = "default"
+        origin = f"twice --max-num-seqs {max_num_seqs}"
+    low = _engine_default(low_raw, max_num_batched_tokens)
+    high = _engine_default(high_raw, max_num_batched_tokens)
+    if max_num_batched_tokens is not None and max_num_batched_tokens <= high_raw:
+        origin += ", at most the admission step"
+    elif low != low_raw or high != high_raw:
+        origin += ", on the capture grid"
+    if low == high:
+        engine_default = f"{low} ({origin})"
+    elif max_num_seqs is None:
+        engine_default = f"{low} or {high} by platform ({origin})"
+    else:
+        engine_default = (
+            f"{low} or {high} by platform ({origin}, at most {ENGINE_DEFAULT_CEILING} or "
+            f"{ENGINE_PLATFORM_CEILING})"
+        )
+    if cap <= low:
         return CaptureCap(
             None,
-            "default",
-            f"the engine's own default {engine_default} (twice --max-num-seqs {max_num_seqs}) "
-            f"covers the admission step (--max-num-batched-tokens {step}, ceiling {ceiling})",
+            source,
+            f"the engine's own default {engine_default} covers the admission step "
+            f"(--max-num-batched-tokens {step}, ceiling {ceiling})",
+        )
+    if cap < high:
+        return CaptureCap(
+            None,
+            source,
+            f"the engine's own default {engine_default} is kept: a cap of {cap} "
+            f"(--max-num-batched-tokens {step}, ceiling {ceiling}) could lower it on the platform "
+            f"whose default ceiling is {ENGINE_PLATFORM_CEILING}",
         )
     return CaptureCap(
         cap,
         "derived",
         f"{cap}, derived from the admission step (--max-num-batched-tokens {step}, ceiling "
-        f"{ceiling}); the engine's own default was {engine_default} (twice --max-num-seqs "
-        f"{max_num_seqs}). {CAPTURE_CAP_ENV}={ENGINE} keeps the engine's default, a number is "
-        f"another ceiling, {CAP_FLAGS} set the cap outright",
+        f"{ceiling}); the engine's own default was {engine_default}. {CAPTURE_CAP_ENV}={ENGINE} "
+        f"keeps the engine's default, a number is another ceiling, {CAP_FLAGS} set the cap "
+        "outright",
     )
+
+
+def _engine_default(raw: int, step: int | None) -> int:
+    """The cap the engine's own default comes out at, for the raw default
+    ``raw`` (twice the window under a ceiling): the engine clamps it to the
+    step size and appends the step to its list where that fits, so the step
+    is the cap then; else the list ends at the grid value under ``raw`` and
+    the cap is truncated to it."""
+    if step is not None and step <= raw:
+        return step
+    return grid_floor(raw)
 
 
 def _is_none_mode(mode: Any) -> bool:

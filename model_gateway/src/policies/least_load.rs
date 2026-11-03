@@ -101,7 +101,7 @@ impl SincePollDispatch {
 ///   way to an engine that has not seen them. A report releases the credit of
 ///   the dispatches made before its sample; while those sit in transit the
 ///   report reads emptier than the worker is, and the router would keep
-///   piling on (see [`Self::unaccounted_requests`]). Each is priced at `p̄`,
+///   piling on (see `Self::unaccounted_requests`). Each is priced at `p̄`,
 ///   like a dispatch whose size is unknown.
 /// - `/ throughput` — normalizes work to *time*, comparing heterogeneous
 ///   workers by drain time rather than raw token count.
@@ -119,9 +119,14 @@ impl SincePollDispatch {
 /// - running requests are estimated
 ///   at `running_reqs · p̄`: a poll releases dispatch credit but does not mean
 ///   the request finished. This is a fallback estimate, not remaining prefill;
-/// - prefill workers, or zero/absent generation throughput: fall back to
-///   the configured `default_throughput`, so the work term stays in seconds and
-///   the KV barrier stays relevant;
+/// - prefill workers: the configured `default_throughput` (their input
+///   capacity), so the work term stays in seconds and the KV barrier stays
+///   relevant;
+/// - zero/absent generation throughput (the backend reports no rate, or
+///   reports one for a rank with nothing running, which is a stale gauge
+///   rather than a rate; see `live_throughput`): the fleet's nominal rate,
+///   the mean live rate among the candidates, or `default_throughput` when
+///   none has one;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is
 ///   converted to a drain-time estimate (`load · p̄ / fleet_nominal_throughput`)
 ///   so it is comparable to reporting workers, not scored on a raw count;
@@ -139,8 +144,8 @@ impl SincePollDispatch {
 /// - `kv_pressure_weight` (λ_t, default `0.15` s) — weight of the KV-pressure
 ///   barrier. Raise it to steer harder away from near-full KV; lower it to
 ///   weight raw drain time more.
-/// - `default_throughput` (default `2000` tok/s) — drain rate used when a
-///   backend reports no live `gen_throughput`, and always for prefill workers.
+/// - `default_throughput` (default `2000` tok/s) — drain rate used when no
+///   candidate reports a live `gen_throughput`, and always for prefill workers.
 ///   Set it to per-replica input tokens/s for prefill, output tokens/s otherwise;
 ///   it co-tunes with `kv_pressure_weight`.
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
@@ -171,8 +176,9 @@ pub struct LeastLoadPolicy {
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
     /// request's token count is unknown at routing time.
     mean_prefill_tokens: u32,
-    /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
-    /// reports no live `gen_throughput`; always used as input tokens/s for prefill.
+    /// Fallback throughput (tokens/s) for the `/throughput` term when no
+    /// candidate reports a live `gen_throughput`; always used as input
+    /// tokens/s for prefill.
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
@@ -193,6 +199,25 @@ struct ScoreInputs<'a> {
     /// The best-known reporting peer's score: what a worker without a
     /// fresh report scores before its own in-flight.
     peer_baseline: f64,
+}
+
+/// Generation rate a report can be scored against: the sum over ranks with
+/// requests running.
+///
+/// An engine never clears `gen_throughput`: it is the rate of the last decode
+/// interval, so an idle rank reports a residual (SGLang: the ~0.3 tok/s of
+/// its last one-token health generation) or nothing at all. A dispatch
+/// divided by a residual reads as thousands of seconds, so a burst followed
+/// whichever worker happened to report the larger stale number until the
+/// next poll. A rank with nothing running contributes no rate; a worker with
+/// none is scored at the fleet's nominal rate, like one that never reports a
+/// rate.
+fn live_throughput(load: &WorkerLoadResponse) -> f64 {
+    load.loads
+        .iter()
+        .filter(|rank| rank.num_running_reqs > 0)
+        .map(|rank| rank.gen_throughput)
+        .sum()
 }
 
 impl LeastLoadPolicy {
@@ -316,7 +341,8 @@ impl LeastLoadPolicy {
     ///
     /// `inflight` maps worker URL -> token-work dispatched since its last poll.
     /// `nominal_throughput` (a peer-derived mean) estimates drain rate for a
-    /// worker missing a fresh snapshot; `fleet_has_loads` is false only when no
+    /// worker missing a fresh snapshot or reporting no live rate;
+    /// `fleet_has_loads` is false only when no
     /// worker reports at all, in which case we fall back to join-shortest-queue
     /// on the live in-flight count (which, unlike the since-poll estimate,
     /// reflects completions and so suits backends that never report loads).
@@ -340,7 +366,7 @@ impl LeastLoadPolicy {
                         * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
-                    self.drain_rate(worker, load),
+                    self.drain_rate(worker, load, nominal_throughput),
                     load.effective_kv_pressure(),
                     self.kv_pressure_weight,
                 )
@@ -371,23 +397,38 @@ impl LeastLoadPolicy {
     }
 
     /// Generation throughput is a usable drain rate only for decode and regular
-    /// workers. Prefill consumes input tokens, which the output rate cannot price.
+    /// workers, and only from ranks with requests running (see
+    /// [`live_throughput`]). Prefill consumes input tokens, which the output
+    /// rate cannot price.
     fn live_drain_rate(worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> Option<f64> {
         if worker.worker_type() == &WorkerType::Prefill {
             return None;
         }
-        let live = load.total_gen_throughput();
+        let live = live_throughput(load);
         (live > 0.0).then_some(live)
     }
 
-    /// Prefill uses configured input capacity; other roles prefer live output rate.
-    fn drain_rate(&self, worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> f64 {
-        Self::live_drain_rate(worker, load).unwrap_or(self.default_throughput)
+    /// Prefill uses configured input capacity; other roles prefer live output
+    /// rate, else `nominal_throughput`. No live rate (none reported, or only
+    /// idle ranks) means the fleet's nominal rate, so an idle worker beside
+    /// busy peers reads as fast as they are, not slower; with no live rate
+    /// anywhere that is the configured default.
+    fn drain_rate(
+        &self,
+        worker: &Arc<dyn Worker>,
+        load: &WorkerLoadResponse,
+        nominal_throughput: f64,
+    ) -> f64 {
+        if worker.worker_type() == &WorkerType::Prefill {
+            return self.default_throughput;
+        }
+        Self::live_drain_rate(worker, load).unwrap_or(nominal_throughput)
     }
 
     /// The scoring inputs for one pass over `candidates`: the nominal drain
-    /// rate (mean of the positive reports) that stands in for a worker
-    /// missing a fresh snapshot; whether anyone reports at all, which
+    /// rate (mean of the live rates, see [`live_throughput`]) that stands in
+    /// for a worker missing a fresh snapshot or a live rate; whether anyone
+    /// reports at all, which
     /// separates a partial gap (estimate the missing worker at the nominal
     /// rate) from a dark fleet (join-shortest-queue on live in-flight); and
     /// the best-known reporting peer's score, which a worker without a report
@@ -610,7 +651,8 @@ impl LeastLoadPolicy {
                     "running_estimated_tokens": load.map(|load| self.running_estimated_tokens(load)),
                     "kv_pressure": load.map(WorkerLoadResponse::effective_kv_pressure),
                     "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
-                    "drain_rate": load.map(|load| self.drain_rate(&workers[idx], load)),
+                    "drain_rate": load
+                        .map(|load| self.drain_rate(&workers[idx], load, inputs.nominal_throughput)),
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
                     "unaccounted_requests": load.map(|load| {
                         let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
@@ -717,67 +759,17 @@ impl Default for LeastLoadPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot};
+    use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
-    use crate::worker::{load_state::TestFeed, BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
-
-    /// One DP rank with the given queued tokens, KV utilization, and throughput.
-    fn make_load(
-        num_waiting_uncached_tokens: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        WorkerLoadResponse {
-            timestamp: String::new(),
-            dp_rank_count: 1,
-            loads: vec![SchedulerLoadSnapshot {
-                dp_rank: 0,
-                num_running_reqs: 0,
-                num_waiting_reqs: 0,
-                num_waiting_uncached_tokens,
-                num_total_reqs: 0,
-                num_used_tokens: 0,
-                max_total_num_tokens: 0,
-                token_usage,
-                gen_throughput,
-                cache_hit_rate: 0.0,
-                utilization: 0.0,
-                max_running_requests: 0,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// One DP rank reporting a queue depth with no token count for it — the
-    /// shape produced by any backend scored from Prometheus gauges, which have
-    /// no waiting-token equivalent.
-    fn make_load_reqs_only(
-        num_waiting_reqs: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        let mut load = make_load(0, token_usage, gen_throughput);
-        load.loads[0].num_waiting_reqs = num_waiting_reqs;
-        load
-    }
-
-    fn mk(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
+    use crate::{
+        policies::test_support::{fed_pair, make_worker},
+        worker::{
+            load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+            test_support::no_health_check,
+            BasicWorkerBuilder, WorkerType,
+        },
+    };
 
     /// Prefill scores and missing-peer estimates must not track output-token rates.
     #[test]
@@ -800,13 +792,18 @@ mod tests {
         for generated in [0.0, 0.5, 10_000.0] {
             feed.publish(&HashMap::from([(
                 workers[0].url().to_string(),
-                make_load(10_000, 0.0, generated),
+                one_rank_load(10_000, 0.0, generated),
             )]));
             let snapshot = policy.snapshot().unwrap();
             let inputs = policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight);
             assert_eq!(inputs.nominal_throughput, 4_000.0);
-            assert_eq!(policy.score(&workers[0], &inputs), 2.5);
-            assert_eq!(policy.score(&workers[1], &inputs), 2.5 + 1024.0 / 4_000.0);
+            // 10,000 queued plus the fixture's one running request at p̄.
+            let prefill = (10_000.0 + 1024.0) / 4_000.0;
+            assert_eq!(policy.score(&workers[0], &inputs), prefill);
+            assert_eq!(
+                policy.score(&workers[1], &inputs),
+                prefill + 1024.0 / 4_000.0
+            );
         }
     }
 
@@ -823,32 +820,39 @@ mod tests {
                     .build(),
             )];
             for generated in [0.0, 0.5, 10_000.0] {
-                let load = make_load(10_000, 0.0, generated);
+                let load = one_rank_load(10_000, 0.0, generated);
                 let expected = if generated > 0.0 {
                     generated
                 } else {
                     DEFAULT_THROUGHPUT
                 };
-                assert_eq!(policy.drain_rate(&workers[0], &load), expected);
+                assert_eq!(
+                    policy.drain_rate(&workers[0], &load, DEFAULT_THROUGHPUT),
+                    expected
+                );
                 feed.publish(&HashMap::from([(workers[0].url().to_string(), load)]));
                 let snapshot = policy.snapshot().unwrap();
                 let inputs = policy.score_inputs(&workers, &[0], Some(&snapshot), &inflight);
                 assert_eq!(inputs.nominal_throughput, expected);
-                assert_eq!(policy.score(&workers[0], &inputs), 10_000.0 / expected);
+                // 10,000 queued plus the fixture's one running request at p̄.
+                assert_eq!(
+                    policy.score(&workers[0], &inputs),
+                    (10_000.0 + 1024.0) / expected
+                );
             }
         }
     }
 
     #[test]
     fn running_work_survives_the_poll_credit_reset() {
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut busy = make_load(0, 0.0, 0.0);
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut busy = one_rank_load(0, 0.0, 0.0);
         busy.loads[0].num_running_reqs = 1;
+        let mut idle = one_rank_load(0, 0.1, 0.0);
+        idle.loads[0].num_running_reqs = 0;
         let loads = HashMap::from([
             (workers[0].url().to_string(), busy),
-            (workers[1].url().to_string(), make_load(0, 0.1, 0.0)),
+            (workers[1].url().to_string(), idle),
         ]);
         // Dispatch credit is gone once the scheduler reports the request.
         feed.publish(&loads);
@@ -861,12 +865,10 @@ mod tests {
 
     #[test]
     fn reclaimable_prefix_cache_does_not_make_an_idle_worker_busy() {
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut idle = make_load(0, 1.0, 0.0);
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut idle = one_rank_load(0, 1.0, 0.0);
         idle.loads[0].active_token_usage = Some(0.0);
-        let mut busy = make_load(0, 0.5, 0.0);
+        let mut busy = one_rank_load(0, 0.5, 0.0);
         busy.loads[0].active_token_usage = Some(0.5);
         busy.loads[0].num_running_reqs = 1;
         feed.publish(&HashMap::from([
@@ -884,8 +886,9 @@ mod tests {
         // No report anywhere: every worker scores its live in-flight count,
         // zero for all, so the whole fleet ties on every request.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
-        let workers: Vec<Arc<dyn Worker>> =
-            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let workers: Vec<Arc<dyn Worker>> = (0..128)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
         let info = SelectWorkerInfo::default();
         let mut hits = vec![0usize; workers.len()];
         for _ in 0..1000 {
@@ -906,8 +909,9 @@ mod tests {
     #[test]
     fn a_strictly_cheaper_worker_wins_every_time() {
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
-        let workers: Vec<Arc<dyn Worker>> =
-            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let workers: Vec<Arc<dyn Worker>> = (0..128)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
         for (i, worker) in workers.iter().enumerate() {
             if i != 77 {
                 worker.increment_load();
@@ -925,13 +929,14 @@ mod tests {
         // epsilon; an exact-equality tie handed everything to the first.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
         let feed = TestFeed::attached_to(&policy);
-        let workers: Vec<Arc<dyn Worker>> =
-            (0..4).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
         let mut loads = HashMap::new();
         for (i, worker) in workers.iter().enumerate() {
             loads.insert(
                 worker.url().to_string(),
-                make_load(0, i as f64 * 1e-9, 100.0),
+                one_rank_load(0, i as f64 * 1e-9, 100.0),
             );
         }
         feed.publish(&loads);
@@ -956,10 +961,10 @@ mod tests {
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
             let feed = TestFeed::attached_to(&policy);
-            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
+            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
             for url in urls {
-                loads.insert(url.to_string(), make_load(1000, 0.2, 100.0));
+                loads.insert(url.to_string(), one_rank_load(1000, 0.2, 100.0));
             }
             feed.publish(&loads);
             let idx = policy
@@ -990,10 +995,16 @@ mod tests {
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
             let feed = TestFeed::attached_to(&policy);
-            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
+            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
-            loads.insert(urls[0].to_string(), make_load_reqs_only(1, 0.125, 100.0));
-            loads.insert(urls[1].to_string(), make_load_reqs_only(3, 0.125, 100.0));
+            loads.insert(
+                urls[0].to_string(),
+                one_rank_load_reqs_only(1, 0.125, 100.0),
+            );
+            loads.insert(
+                urls[1].to_string(),
+                one_rank_load_reqs_only(3, 0.125, 100.0),
+            );
             feed.publish(&loads);
             let idx = policy
                 .select_worker(&workers, &SelectWorkerInfo::default())
@@ -1016,8 +1027,8 @@ mod tests {
     fn cold_start_picks_lowest_in_flight() {
         // No load reports yet -> join-shortest-queue on live in-flight count.
         let policy = LeastLoadPolicy::new();
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             a.increment_load();
         }
@@ -1032,17 +1043,15 @@ mod tests {
     fn waiting_queue_veto_skips_capped_worker() {
         // a would win the argmin (655s vs 10,000s) but reports 64 waiting
         // (>= cap 48); the veto must exclude it before scoring.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.0, 100.0),
+            one_rank_load_reqs_only(64, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load(1_000_000, 0.0, 100.0),
+            one_rank_load(1_000_000, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1055,17 +1064,15 @@ mod tests {
     fn waiting_queue_veto_all_capped_returns_none() {
         // Every candidate at the cap: selection must fail so the request
         // falls to the router's admission queue instead of piling on.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(48, 0.0, 100.0),
+            one_rank_load_reqs_only(48, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(48, 0.0, 100.0),
+            one_rank_load_reqs_only(48, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1079,15 +1086,16 @@ mod tests {
         // Cap 2: a reports 1 waiting and wins the first pick; the dispatch
         // counts one since-poll request, lifting a to the cap, so the second
         // pick must go to b even though b scores far worse.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 2);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 2));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1, 0.0, 100.0),
+            one_rank_load_reqs_only(1, 0.0, 100.0),
         );
-        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(400_000, 0.0, 100.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1101,11 +1109,11 @@ mod tests {
 
     #[test]
     fn unaccounted_requests_are_the_in_flight_beyond_the_report_and_the_credit() {
-        let w = mk("http://a:8000");
+        let w = make_worker("http://a:8000");
         for _ in 0..12 {
             w.increment_load();
         }
-        let mut load = make_load(0, 0.0, 100.0);
+        let mut load = one_rank_load(0, 0.0, 100.0);
         load.loads[0].num_running_reqs = 5;
         load.loads[0].num_waiting_reqs = 2;
         assert_eq!(
@@ -1129,13 +1137,14 @@ mod tests {
         // every pick goes to `b` until its own credit has grown to the same.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0).with_tie_break_seed(1);
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..40 {
             a.increment_load();
         }
         let workers = vec![a, b];
-        let mut idle = make_load(0, 0.0, 2000.0);
+        let mut idle = one_rank_load(0, 0.0, 2000.0);
+        idle.loads[0].num_running_reqs = 0;
         idle.sampled_at = Some(Instant::now());
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), idle.clone());
@@ -1160,23 +1169,22 @@ mod tests {
         // third worker that holds nothing wins outright.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
-        let c = mk("http://c:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
+        let c = make_worker("http://c:8000");
         for _ in 0..10 {
             a.increment_load();
             b.increment_load();
         }
         let workers = vec![a, b, c];
-        let mut running = make_load(0, 0.0, 2000.0);
+        let mut running = one_rank_load(0, 0.0, 2000.0);
         running.loads[0].num_running_reqs = 10;
+        let mut waiting = one_rank_load_reqs_only(10, 0.0, 2000.0);
+        waiting.loads[0].num_running_reqs = 0;
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), running);
-        loads.insert(
-            "http://b:8000".to_string(),
-            make_load_reqs_only(10, 0.0, 2000.0),
-        );
-        loads.insert("http://c:8000".to_string(), make_load(0, 0.0, 2000.0));
+        loads.insert("http://b:8000".to_string(), waiting);
+        loads.insert("http://c:8000".to_string(), one_rank_load(0, 0.0, 2000.0));
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1207,17 +1215,20 @@ mod tests {
         // scores far worse.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 5);
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
+        let a = make_worker("http://a:8000");
         for _ in 0..6 {
             a.increment_load();
         }
-        let workers = vec![a, mk("http://b:8000")];
+        let workers = vec![a, make_worker("http://b:8000")];
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1, 0.0, 100.0),
+            one_rank_load_reqs_only(1, 0.0, 100.0),
         );
-        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(400_000, 0.0, 100.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1236,15 +1247,16 @@ mod tests {
         // backlogs, not onto a favourite.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
         let feed = TestFeed::attached_to(&policy);
-        let workers: Vec<Arc<dyn Worker>> =
-            (0..8).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
         let mut loads = HashMap::new();
         for (i, worker) in workers.iter().enumerate() {
             let hidden = i < 2;
             for _ in 0..if hidden { 16 } else { 2 } {
                 worker.increment_load();
             }
-            let mut load = make_load(0, 0.0, 2000.0);
+            let mut load = one_rank_load(0, 0.0, 2000.0);
             load.loads[0].num_running_reqs = if hidden { 0 } else { 2 };
             loads.insert(worker.url().to_string(), load);
         }
@@ -1267,10 +1279,10 @@ mod tests {
     fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000")];
+        let workers = vec![make_worker("http://a:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         // Two dispatches, then the engine is sampled, then one more.
@@ -1282,7 +1294,7 @@ mod tests {
         policy.select_min_expected_wait(&workers, &[0], &info, "test");
         assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 3072, 3));
 
-        let mut sampled = make_load(0, 0.1, 100.0);
+        let mut sampled = one_rank_load(0, 0.1, 100.0);
         sampled.sampled_at = Some(sampled_at);
         loads.insert("http://a:8000".to_string(), sampled.clone());
         feed.publish(&loads);
@@ -1299,7 +1311,7 @@ mod tests {
 
         // A report without a sample instant is taken as sampled when it is
         // published: it releases everything dispatched before then.
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
         assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
     }
@@ -1323,8 +1335,8 @@ mod tests {
         // A dark fleet with a cap configured has no queue evidence to veto
         // on; routing must continue on join-shortest-queue.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 1);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             a.increment_load();
         }
@@ -1340,11 +1352,11 @@ mod tests {
         // The one-healthy-worker shortcut must not bypass the veto.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
         let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000")];
+        let workers = vec![make_worker("http://a:8000")];
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.0, 100.0),
+            one_rank_load_reqs_only(64, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1357,17 +1369,15 @@ mod tests {
     fn waiting_queue_cap_zero_disables_veto() {
         // Cap 0 keeps the historical behavior: arbitrarily deep queues stay
         // routable.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 0);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 0));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1000, 0.0, 100.0),
+            one_rank_load_reqs_only(1000, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(1000, 0.0, 100.0),
+            one_rank_load_reqs_only(1000, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert!(policy
@@ -1383,14 +1393,21 @@ mod tests {
         // a fleet-wide mean that c's 100k tok/s would dominate (0.04s < b).
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
+        let a = make_worker("http://a:8000");
         for _ in 0..2 {
             a.increment_load();
         }
-        let workers = vec![a, mk("http://b:8000"), mk("http://c:8000")];
+        let workers = vec![
+            a,
+            make_worker("http://b:8000"),
+            make_worker("http://c:8000"),
+        ];
         let mut loads = HashMap::new();
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
-        loads.insert("http://c:8000".to_string(), make_load(0, 0.2, 100_000.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
+        loads.insert(
+            "http://c:8000".to_string(),
+            one_rank_load(0, 0.2, 100_000.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_min_expected_wait(
@@ -1408,12 +1425,10 @@ mod tests {
         // pick1 routes a 2100-token request to idle a, crediting exactly its
         // token count: a becomes 21.04s vs b's 20.52s, so pick2 goes to b.
         // The p̄ = 1024 fallback would leave a at 10.28s and herd onto a.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(2048, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(2048, 0.2, 100.0));
         feed.publish(&loads);
 
         let tokens = vec![7u32; 2100];
@@ -1431,12 +1446,10 @@ mod tests {
     #[test]
     fn routes_to_lower_queued_token_work() {
         // Equal KV/throughput; the worker with fewer queued tokens wins.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(8000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(8000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
         feed.publish(&loads);
         // a: 8000/100 = 80s ; b: 1000/100 = 10s -> pick b.
         assert_eq!(
@@ -1450,17 +1463,15 @@ mod tests {
         // Both backends report a queue but no token count for it. Reading the
         // absent count as an empty queue scores them identically, so the pick
         // is a coin flip and a badly backlogged worker keeps drawing traffic.
-        let policy = LeastLoadPolicy::new(); // p̄ = 1024
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new()); // p̄ = 1024
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.2, 100.0),
+            one_rank_load_reqs_only(64, 0.2, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(6, 0.2, 100.0),
+            one_rank_load_reqs_only(6, 0.2, 100.0),
         );
         feed.publish(&loads);
         // a: 64*1024/100 ≈ 655s ; b: 6*1024/100 ≈ 61s -> b, on every draw
@@ -1477,14 +1488,12 @@ mod tests {
     fn reported_queue_tokens_win_over_the_estimate() {
         // A backend reporting both must be scored on the real token count:
         // 200 queued short requests are less work than one long one.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut a = make_load(500, 0.2, 100.0);
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut a = one_rank_load(500, 0.2, 100.0);
         a.loads[0].num_waiting_reqs = 200;
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), a);
-        loads.insert("http://b:8000".to_string(), make_load(8000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(8000, 0.2, 100.0));
         feed.publish(&loads);
         // a: its reported 500/100 = 5s, not 200*1024 ; b: 8000/100 = 80s -> a.
         assert_eq!(
@@ -1497,17 +1506,15 @@ mod tests {
     fn empty_queue_is_not_penalized() {
         // Neither backend has a queue; the estimate must not manufacture one,
         // leaving the KV barrier to decide.
-        let policy = LeastLoadPolicy::with_kv_pressure_weight(2.0);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(0, 0.9, 100.0),
+            one_rank_load_reqs_only(0, 0.9, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(0, 0.1, 100.0),
+            one_rank_load_reqs_only(0, 0.1, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1519,12 +1526,10 @@ mod tests {
     #[test]
     fn throughput_normalization_prefers_faster_worker() {
         // Same queued tokens; the faster worker (higher throughput) drains sooner.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(5000, 0.2, 50.0));
-        loads.insert("http://b:8000".to_string(), make_load(5000, 0.2, 500.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(5000, 0.2, 50.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(5000, 0.2, 500.0));
         feed.publish(&loads);
         // a: 5000/50 = 100s ; b: 5000/500 = 10s -> pick b.
         assert_eq!(
@@ -1534,15 +1539,83 @@ mod tests {
     }
 
     #[test]
+    fn idle_rank_rate_is_not_a_live_throughput() {
+        // Only a rank with requests running has a live rate; an idle rank's
+        // gauge is whatever its last decode interval left behind.
+        let mut load = one_rank_load(0, 0.1, 0.36);
+        load.loads[0].num_running_reqs = 0;
+        assert_eq!(live_throughput(&load), 0.0);
+
+        load.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 4,
+            gen_throughput: 800.0,
+            ..Default::default()
+        });
+        assert_eq!(live_throughput(&load), 800.0);
+    }
+
+    #[test]
+    fn stale_idle_rate_does_not_herd_a_burst() {
+        // Two idle workers: a reports the ~0.36 tok/s residual of its last
+        // one-token health generation, b reports nothing. Scored against the
+        // residual, a's first dispatch would read as 1024 / 0.36 ≈ 2800 s and
+        // the rest of the burst would follow b until the next poll. Neither
+        // rate is live, so both score at the default throughput and the
+        // burst water-fills.
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut a = one_rank_load(0, 0.1, 0.36);
+        a.loads[0].num_running_reqs = 0;
+        let mut b = one_rank_load(0, 0.1, 0.0);
+        b.loads[0].num_running_reqs = 0;
+        feed.publish(&HashMap::from([
+            ("http://a:8000".to_string(), a),
+            ("http://b:8000".to_string(), b),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    #[test]
+    fn idle_worker_is_scored_at_its_busy_peers_rate() {
+        // a is busy at 8000 tok/s; b is idle, its gauge a stale residual. At a
+        // flat 2000 tok/s a dispatch to b would read as four times one to a
+        // and a would take four of every five; at its peers' nominal rate the
+        // two score alike (a's running request apart) and the burst
+        // water-fills, the ties drawn at random.
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut b = one_rank_load(0, 0.1, 0.36);
+        b.loads[0].num_running_reqs = 0;
+        feed.publish(&HashMap::from([
+            ("http://a:8000".to_string(), one_rank_load(0, 0.1, 8000.0)),
+            ("http://b:8000".to_string(), b),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert!(picks.iter().all(|&n| n >= 3), "{picks:?}");
+    }
+
+    #[test]
     fn zero_throughput_falls_back_to_default() {
         // A backend that reports no gen_throughput (0); the score must still
         // discriminate via the configured default_throughput, not collapse.
-        let policy = LeastLoadPolicy::new(); // default_throughput = 2000
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new()); // default_throughput = 2000
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(10000, 0.2, 0.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 0.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(10000, 0.2, 0.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 0.0));
         feed.publish(&loads);
         // gen_throughput=0 -> default 2000: a 10000/2000=5s ; b 1000/2000=0.5s -> pick b.
         assert_eq!(
@@ -1558,14 +1631,14 @@ mod tests {
         // scoring it as drain time (5 * p̄ / nominal ≈ 51s) keeps the lighter a.
         let policy = LeastLoadPolicy::new(); // p̄ = 1024
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             b.increment_load();
         }
         let workers = vec![a, b];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(4000, 0.0, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(4000, 0.0, 100.0));
         feed.publish(&loads);
         // a: 4000/100 = 40s ; b: 5 * 1024 / 100 ≈ 51.2s -> pick a.
         assert_eq!(
@@ -1577,12 +1650,10 @@ mod tests {
     #[test]
     fn kv_barrier_avoids_full_worker() {
         // No queued work; the convex KV barrier steers off the near-full worker.
-        let policy = LeastLoadPolicy::with_kv_pressure_weight(2.0);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.98, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.0, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.98, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.0, 100.0));
         feed.publish(&loads);
         // a: 0 + 2*0.98/0.02 = 98 ; b: 0 -> pick b.
         assert_eq!(
@@ -1596,12 +1667,10 @@ mod tests {
         // Two identical workers, no fresh poll between dispatches: the in-flight
         // token credit must push the second request to the other worker rather
         // than herding both onto the first.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default(); // tokens unknown -> mean prefill
@@ -1612,12 +1681,10 @@ mod tests {
 
     #[test]
     fn a_new_report_releases_the_credit_the_next_decision_reads() {
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default();
@@ -1641,12 +1708,13 @@ mod tests {
     fn a_credited_selection_books_the_work_the_caller_gives() {
         // a's report is the lighter: it wins both picks. Uncredited, the
         // 64-token prompt is booked whole; credited, the caller's count is.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(10_000, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(10_000, 0.1, 100.0),
+        );
         feed.publish(&loads);
         let tokens: Vec<u32> = (0..64).collect();
         let info = SelectWorkerInfo {
@@ -1676,12 +1744,10 @@ mod tests {
         // pick1 -> a; its credit tips pick2 -> b; after reset the credit is
         // gone and pick3 returns to a. The reports are the feed's, not the
         // policy's to discard.
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(1000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(2000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(2000, 0.2, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default();
@@ -1695,7 +1761,7 @@ mod tests {
     #[test]
     fn single_worker_always_selected() {
         let policy = LeastLoadPolicy::new();
-        let workers = vec![mk("http://a:8000")];
+        let workers = vec![make_worker("http://a:8000")];
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(0)
@@ -1704,12 +1770,10 @@ mod tests {
 
     #[test]
     fn remove_worker_prunes_its_tally() {
-        let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
         let info = SelectWorkerInfo::default();
         let first = policy.select_worker(&workers, &info).unwrap();

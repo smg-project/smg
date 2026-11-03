@@ -15,9 +15,9 @@ use axum::{
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
+    traits::{Encoding, PromptEncoding, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -35,6 +35,7 @@ use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+use super::prepared_tools::prepare_tools;
 use crate::{
     middleware::ReportedRefusal,
     observability::log_throttle::KeyedLogThrottle,
@@ -76,8 +77,8 @@ struct SseErrorBody<'a, M: fmt::Display> {
     #[serde(rename = "type")]
     error_type: &'a str,
     /// The code the HTTP answer to the same failure carries, for a failure
-    /// that has one (`constraint_failed`); absent otherwise, so the frames
-    /// clients have been reading do not change.
+    /// that has one (`constraint_failed`, `reader_panicked`); absent
+    /// otherwise, so the frames clients have been reading do not change.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
 }
@@ -357,48 +358,64 @@ pub(crate) async fn encode_prompt_blocking(
     }
 }
 
-/// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts. An empty
-/// `arguments` string is a call with no arguments, `{}`; any other text that is not JSON is
-/// refused.
-pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
+/// Hand the template the tool-call arguments of the assistant turns in the
+/// shape the engines hand theirs: an object (what the Transformers docs ask
+/// of a tool-use template). The arguments' JSON text is parsed; an object is
+/// kept; absent arguments are an empty object.
+pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) {
     for msg in messages {
-        let role = msg.get("role").and_then(|v| v.as_str());
-        if role != Some("assistant") {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-
-        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
+        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
-
         for call in tool_calls {
-            let Some(function) = call.get_mut("function") else {
+            let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
                 continue;
             };
-            let Some(args) = function.get_mut("arguments") else {
-                continue;
-            };
-            let Some(args_str) = args.as_str() else {
-                continue;
-            };
-            if args_str.trim().is_empty() {
-                *args = json!({});
-                continue;
-            }
-
-            // Parse JSON string to object (like Python json.loads)
-            match serde_json::from_str::<Value>(args_str) {
-                Ok(parsed) => *args = parsed,
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to parse tool call arguments as JSON: '{args_str}'. Error: {e}"
-                    ))
+            let arguments = match function.get("arguments") {
+                Some(Value::Object(_)) => continue,
+                Some(Value::String(text)) => {
+                    arguments_object(function.get("name").and_then(Value::as_str), text)
                 }
-            }
+                _ => json!({}),
+            };
+            function.insert("arguments".to_string(), arguments);
         }
     }
-    Ok(())
+}
+
+/// The object an `arguments` text holds, read as the engines read it: empty
+/// text is a call without arguments; text that is not JSON, or JSON that is
+/// not an object, is an empty object too, with a warning. A malformed
+/// `arguments` text lives in the conversation's history, so refusing it
+/// would fail every later turn of that conversation.
+fn arguments_object(tool: Option<&str>, text: &str) -> Value {
+    if text.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(object @ Value::Object(_)) => object,
+        Ok(_) => {
+            tracing::warn!(
+                tool,
+                bytes = text.len(),
+                "tool call arguments in history are JSON but not an object; rendered as an \
+                 empty object"
+            );
+            json!({})
+        }
+        Err(error) => {
+            tracing::warn!(
+                tool,
+                bytes = text.len(),
+                %error,
+                "tool call arguments in history are not valid JSON; rendered as an empty object"
+            );
+            json!({})
+        }
+    }
 }
 
 /// Process messages based on content format for ANY message type
@@ -463,8 +480,8 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
 }
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
-/// else the effective effort, both as the request's provider profile reads
-/// them (`ChatCompletionRequest::template_thinking`).
+/// else the effective effort as the request's provider profile reads it
+/// (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
     request.template_thinking()
 }
@@ -498,6 +515,19 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
     Ok(())
 }
 
+/// The content the engine's chat utils hand a template for a message without
+/// one (`null` or absent, as a tool-call-only assistant turn comes): the empty
+/// string under the string format, the empty parts list under the OpenAI
+/// format. The engine converts every message's content before it copies the
+/// tool calls or the reasoning beside it, so a turn carrying either converts
+/// the same way.
+pub(crate) fn empty_content(content_format: ChatTemplateContentFormat) -> Value {
+    match content_format {
+        ChatTemplateContentFormat::String => Value::String(String::new()),
+        ChatTemplateContentFormat::OpenAI => Value::Array(Vec::new()),
+    }
+}
+
 fn process_content_format_with_order(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
@@ -511,13 +541,15 @@ fn process_content_format_with_order(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
-                // skip_serializing_none omits content when None; restore it as
-                // `null` — the OpenAI-faithful representation for a tool-call-only
-                // assistant turn — so the chat template renders it correctly.
+                // skip_serializing_none omits content when None (a tool-call-only
+                // assistant turn, the OpenAI shape). The engine's chat utils hand
+                // such a turn to the template as empty content in the template's
+                // own format, never as none, which a template that tests, splits
+                // or concatenates every assistant message's content cannot take.
                 if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
                     && !obj.contains_key("content")
                 {
-                    obj.insert("content".to_string(), Value::Null);
+                    obj.insert("content".to_string(), empty_content(content_format));
                 }
 
                 if let Some(content_value) = obj.get_mut("content") {
@@ -703,25 +735,24 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// The request whose tools the template renders. A named `tool_choice`
 /// renders every tool, as the engine's own server renders it (the named call
 /// is forced by the tool constraint, built from `callable_tools`); an
-/// `allowed_tools` choice renders its subset; `none` renders no tool, as the
-/// Responses path renders it, so the model is not offered a call it may not
-/// make and answers in text, unless the renderer declares the tools under
-/// `none` itself and forbids the call in the prompt
-/// ([`RendererCapabilities::declares_tools_under_tool_choice_none`]); any
-/// other request renders as it is.
+/// `allowed_tools` choice renders its subset; any other request renders as
+/// it is. Under `none` the tools stay declared, as the engine's own server
+/// declares them (its prompt keeps the definitions and the choice reaches the
+/// template as a kwarg, `build_chat_template_kwargs`): the model answers the
+/// same prompt whichever way the choice is set, so a session that toggles the
+/// choice between turns keeps its prefix. A call the model writes anyway is
+/// not delivered where Symphony reads the response (the reader's forbidden
+/// calls, `regular::symphony`); the legacy parsers run no tool parser under
+/// `none`, as they never did, so there such markup stays in the content. The
+/// Responses API keeps withholding the request's function tools under `none`
+/// (`regular::responses::conversions::chat_tools`, for its replayed tool-loop
+/// histories), so the same request renders a different prompt through it: a
+/// divergence kept until that API's rule is decided on its own.
 pub fn request_as_rendered(
     request: &ChatCompletionRequest,
-    capabilities: RendererCapabilities,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-            if request.tools.is_some() && !capabilities.declares_tools_under_tool_choice_none =>
-        {
-            let mut rendered = request.clone();
-            rendered.tools = None;
-            std::borrow::Cow::Owned(rendered)
-        }
         _ => filter_chat_request_by_tool_choice(request),
     }
 }
@@ -788,8 +819,11 @@ pub(crate) fn process_chat_messages_with_placeholders(
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
-        // Get content format and transform messages accordingly
-        let content_format = tokenizer.chat_template_content_format();
+        // Get content format and transform messages accordingly: the format
+        // of the template this request renders through, which a checkpoint
+        // may pick by whether the request declares tools.
+        let content_format =
+            tokenizer.chat_template_content_format_for_request(request.tools.is_some());
         let mut transformed_messages = process_content_format_with_order(
             &request.messages,
             content_format,
@@ -803,21 +837,12 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // them as written; every other template gets the parsed object the
         // Transformers docs expect.
         if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
-            process_tool_call_arguments(&mut transformed_messages)?;
+            process_tool_call_arguments(&mut transformed_messages);
         }
 
-        // Convert tools to JSON values for template processing
-        let tools_json: Option<Vec<Value>> = request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+        // The tools as the template reads them, prepared once per distinct
+        // tool set and shared by every request that carries the same tools.
+        let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
         let combined_template_kwargs = build_chat_template_kwargs(request);
 
@@ -840,9 +865,17 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .native_assistant_continuation;
 
         let params = ChatTemplateParams {
-            add_generation_prompt: !native_continuation,
+            // A continued final message decides its header by the renderer
+            // (none natively, the emulation's otherwise); any other request's
+            // header is its own `add_generation_prompt`, `true` when absent.
+            add_generation_prompt: if continues_final_assistant {
+                !native_continuation
+            } else {
+                request.adds_generation_prompt()
+            },
             continue_final_message: native_continuation,
-            tools: tools_json.as_deref(),
+            tools: prepared_tools.as_deref().map(PreparedTools::tools),
+            prepared_tools: prepared_tools.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
             thinking: resolve_template_thinking(request),
@@ -860,6 +893,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                         text: String::new(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
+                        generation_prompt: false,
                     },
                     PromptEncoding::FromText,
                 ));
@@ -890,6 +924,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))

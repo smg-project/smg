@@ -2,7 +2,7 @@
 //!
 //! A model writes a call as a JSON object,
 //! `{"name": "get_weather", "arguments": {"city": "Paris"}}` in some order and with its own
-//! spacing, and the object arrives in pieces. [`outline`] reads the object so far and reports the
+//! spacing, and the object arrives in pieces. `outline` reads the object so far and reports the
 //! call's name once its string is complete, the byte span of the arguments value from the moment
 //! its first byte has arrived, and where the object closed, so the caller knows how many of its
 //! bytes the object took. Because the span is a range into the model's own text, an argument stream
@@ -97,7 +97,7 @@ pub fn outline(text: &str) -> Outline {
 /// The outline taken as the object arrives: it keeps its place and its state between pieces, so
 /// the text grows by appending and each byte is read once. `advance` takes the whole text so
 /// far, reads only what came after the last call, and the outline in `found` is the one
-/// [`outline`] gives for that text, unless the scanner judges the members' values too
+/// `outline` gives for that text, unless the scanner judges the members' values too
 /// ([`Self::judging_values`]).
 #[derive(Clone, Debug, Default)]
 pub struct Scanner {
@@ -267,7 +267,7 @@ impl Scanner {
     /// letter of a word that is no literal. A string's bytes are a prefix until it closes, so a
     /// string never stops the outline. The arguments are the caller's own to judge, as the
     /// assembler does with every byte of them. Without this, a value's bytes are read for their
-    /// brackets and quotes only, as [`outline`] reads them.
+    /// brackets and quotes only, as `outline` reads them.
     #[must_use]
     pub fn judging_values(mut self) -> Self {
         self.judging = true;

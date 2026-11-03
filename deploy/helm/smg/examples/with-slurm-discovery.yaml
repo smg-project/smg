@@ -1,0 +1,27 @@
+# Router with Slurm discovery: a worker on every node of each running job
+# whose name is listed, found with `squeue` and `scontrol`.
+#
+# The published gateway image has no Slurm client. Build an image from it
+# with Slurm >= 23.11 client commands and what the cluster's authentication
+# needs (its slurm.conf and MUNGE, or auth/jwt with SLURM_JWT, which
+# router.extraEnv can take from a Secret), and point global.image at it. The
+# router runs as UID 65532, so name the Slurm user whose jobs are the workers.
+#
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-slurm-discovery.yaml
+global:
+  image:
+    registry: registry.example.com
+    repository: smg-slurm
+    tag: "1.13.0"
+
+router:
+  policy: cache_aware
+  discovery:
+    provider: slurm
+    checkIntervalSecs: 15
+    slurm:
+      jobNames:
+        - llama-serve
+      port: 8000
+      user: svc-llm
+      partition: gpu

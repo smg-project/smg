@@ -68,6 +68,151 @@ Service account name
 {{- end }}
 
 {{/*
+Discovery provider -- the worker discovery provider the router runs:
+router.discovery.provider, or "kubernetes" for router.serviceDiscovery.enabled,
+its legacy spelling. Empty when workers are not discovered (mesh router
+discovery is not worker discovery; see smg.meshRouterDiscovery).
+*/}}
+{{- define "smg.discoveryProvider" -}}
+{{- if .Values.router.serviceDiscovery.enabled -}}
+kubernetes
+{{- else -}}
+{{- .Values.router.discovery.provider | default "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Mesh router discovery -- "true" when mesh is on without peerUrls, so the
+routers find each other among the release's router pods through the
+Kubernetes API. The gateway runs that only inside Kubernetes discovery.
+*/}}
+{{- define "smg.meshRouterDiscovery" -}}
+{{- if and .Values.router.mesh.enabled (not .Values.router.mesh.peerUrls) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Kubernetes API -- "true" when the router reads pods through the Kubernetes
+API: Kubernetes worker discovery, by either spelling, or mesh router
+discovery. The Role and RoleBinding are created for it; the file, Slurm and
+Consul providers never call the API, so they get none unless rbac.create.
+*/}}
+{{- define "smg.usesKubernetesApi" -}}
+{{- if or (eq (include "smg.discoveryProvider" .) "kubernetes") (include "smg.meshRouterDiscovery" .) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery cluster-wide -- "true" when Kubernetes discovery watches every
+namespace, so its RBAC is a ClusterRole and ClusterRoleBinding.
+router.serviceDiscovery.clusterWide counts on its own, as it always has.
+*/}}
+{{- define "smg.discoveryClusterWide" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- if or .Values.router.serviceDiscovery.clusterWide (and (eq ($discovery.provider | default "") "kubernetes") $discovery.kubernetes.clusterWide) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery namespace -- the namespace Kubernetes discovery watches when it is
+not cluster-wide: router.discovery.kubernetes.namespace under the provider,
+router.serviceDiscovery.namespace under the legacy spelling, the release's
+otherwise (mesh router discovery alone watches the release's). The Role and
+RoleBinding are created there, so they cover the pods the router reads.
+*/}}
+{{- define "smg.discoveryNamespace" -}}
+{{- if eq (.Values.router.discovery.provider | default "") "kubernetes" -}}
+{{- .Values.router.discovery.kubernetes.namespace | default .Release.Namespace -}}
+{{- else if .Values.router.serviceDiscovery.enabled -}}
+{{- .Values.router.serviceDiscovery.namespace | default .Release.Namespace -}}
+{{- else -}}
+{{- .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Discovery file path -- the manifest the file provider reads: file.path, else
+the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
+*/}}
+{{- define "smg.discoveryFilePath" -}}
+{{- with .Values.router.discovery.file -}}
+{{- .path | default (printf "/etc/smg/discovery/%s" (.configMap.key | default "workers.json")) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Discovery validation -- refuses at render time what the gateway would refuse
+at start-up, or run without telling: two spellings of the worker provider,
+mesh router discovery the provider cannot carry, and a provider without what
+it cannot start without. Renders nothing.
+*/}}
+{{- define "smg.validateDiscovery" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- $provider := $discovery.provider | default "" -}}
+{{- if and .Values.router.serviceDiscovery.enabled $provider -}}
+{{- fail (printf "router.serviceDiscovery.enabled is the legacy spelling of router.discovery.provider=kubernetes and cannot be combined with router.discovery.provider=%s: set one or the other (router.discovery.kubernetes takes the serviceDiscovery settings)" $provider) -}}
+{{- end -}}
+{{- if include "smg.meshRouterDiscovery" . -}}
+{{- if and $provider (ne $provider "kubernetes") -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers through Kubernetes discovery, which the gateway runs only under the kubernetes worker provider: with router.discovery.provider=%s, set router.mesh.peerUrls" $provider) -}}
+{{- end -}}
+{{- /* Router discovery watches the namespace worker discovery watches, and
+     the router pods are in the release's: another namespace finds no peer,
+     and every namespace finds the routers of other releases. */}}
+{{- if and (eq $provider "kubernetes") (or $discovery.kubernetes.clusterWide (ne ($discovery.kubernetes.namespace | default .Release.Namespace) .Release.Namespace)) -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers in the namespace Kubernetes discovery watches, so router.discovery.kubernetes must watch the release namespace %s (no clusterWide, no other namespace): otherwise set router.mesh.peerUrls" .Release.Namespace) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $provider "file" -}}
+{{- if not (or $discovery.file.configMap.name $discovery.file.path) -}}
+{{- fail "router.discovery.provider=file needs its manifest: router.discovery.file.configMap.name (an existing ConfigMap) or router.discovery.file.path" -}}
+{{- end -}}
+{{- else if eq $provider "slurm" -}}
+{{- with $discovery.slurm -}}
+{{- if not .port -}}
+{{- fail "router.discovery.provider=slurm needs router.discovery.slurm.port, the inference server's port on every node" -}}
+{{- end -}}
+{{- if not (or .jobNames .encodeJobNames .prefillJobNames .decodeJobNames) -}}
+{{- fail "router.discovery.provider=slurm needs at least one job name: router.discovery.slurm.jobNames, encodeJobNames, prefillJobNames or decodeJobNames" -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $provider "consul" -}}
+{{- with $discovery.consul -}}
+{{- if not .service -}}
+{{- fail "router.discovery.provider=consul needs router.discovery.consul.service, the Consul service whose instances are the workers" -}}
+{{- end -}}
+{{- if .tls.existingSecret -}}
+{{- $keys := .tls.secretKeys | default dict -}}
+{{- if ne (empty $keys.clientCert) (empty $keys.clientKey) -}}
+{{- fail "router.discovery.consul.tls.secretKeys.clientCert and clientKey go together: set both or neither" -}}
+{{- end -}}
+{{- if not (or $keys.caCert $keys.clientCert) -}}
+{{- fail "router.discovery.consul.tls.existingSecret is mounted for no file: set secretKeys.caCert, or clientCert and clientKey" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
+the router pod mounts under /etc/smg/consul-tls, as a JSON list for
+fromJsonArray: each with its key within the Secret (key), its file name in
+the mount (path) and the Consul variable naming it (env). Empty unless the
+consul provider has a TLS Secret.
+*/}}
+{{- define "smg.consulTlsFiles" -}}
+{{- $files := list -}}
+{{- $consul := .Values.router.discovery.consul -}}
+{{- if and (eq (.Values.router.discovery.provider | default "") "consul") $consul.tls.existingSecret -}}
+{{- $keys := $consul.tls.secretKeys | default dict -}}
+{{- range $file := list (dict "key" $keys.caCert "path" "ca.crt" "env" "CONSUL_CACERT") (dict "key" $keys.clientCert "path" "client.crt" "env" "CONSUL_CLIENT_CERT") (dict "key" $keys.clientKey "path" "client.key" "env" "CONSUL_CLIENT_KEY") -}}
+{{- if $file.key -}}
+{{- $files = append $files $file -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $files -}}
+{{- end }}
+
+{{/*
 Router CLI arguments -- builds the full args list from values.
 Called from the router Deployment template.
 */}}
@@ -94,6 +239,15 @@ Called from the router Deployment template.
 - "--mesh-peer-urls"
 - {{ . | quote }}
 {{- end }}
+{{- else if eq (.Values.router.discovery.provider | default "") "kubernetes" }}
+{{- /* The Kubernetes worker provider is on (below) and router discovery runs
+     inside it, in its namespace (the release's, smg.validateDiscovery), so
+     only the router selector is added; --service-discovery would conflict
+     with --discovery-provider. The selector names the release, so another
+     release's routers in the namespace are not taken for peers. */}}
+- "--router-selector"
+- "app.kubernetes.io/component=router"
+- "app.kubernetes.io/instance={{ .Release.Name }}"
 {{- else }}
 {{/* Use K8s service discovery to find other router pods by label.
      Each router pod is annotated with the mesh port so peers can connect.
@@ -120,7 +274,7 @@ Called from the router Deployment template.
 {{- range .Values.router.workerUrls }}
 - {{ . | quote }}
 {{- end }}
-{{- else if and .Values.workers (not .Values.router.serviceDiscovery.enabled) (not (and .Values.router.mesh.enabled (not .Values.router.mesh.peerUrls))) }}
+{{- else if and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
 - "--worker-urls"
 {{- range $i, $worker := .Values.workers }}
 {{- $defaults := index $.Values.engineDefaults $worker.engine }}
@@ -150,6 +304,90 @@ Called from the router Deployment template.
 - {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
 {{- end }}
 {{- end }}
+{{- with .Values.router.discovery }}
+{{- if .provider }}
+- "--discovery-provider"
+- {{ .provider | quote }}
+{{- if eq .provider "kubernetes" }}
+{{- with .kubernetes }}
+{{- if .selector }}
+- "--selector"
+- {{ .selector | quote }}
+{{- end }}
+- "--service-discovery-port"
+- {{ .port | quote }}
+{{- if not .clusterWide }}
+- "--service-discovery-namespace"
+- {{ .namespace | default $.Release.Namespace | quote }}
+{{- end }}
+{{- if .modelIdFrom }}
+- "--model-id-from"
+- {{ .modelIdFrom | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "file" }}
+- "--discovery-file"
+- {{ include "smg.discoveryFilePath" $ | quote }}
+{{- else if eq .provider "slurm" }}
+{{- with .slurm }}
+{{- range .jobNames }}
+- "--slurm-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .encodeJobNames }}
+- "--slurm-encode-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .prefillJobNames }}
+- "--slurm-prefill-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .decodeJobNames }}
+- "--slurm-decode-job-name"
+- {{ . | quote }}
+{{- end }}
+- "--slurm-port"
+- {{ .port | quote }}
+{{- if .bootstrapPort }}
+- "--slurm-bootstrap-port"
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- if .user }}
+- "--slurm-user"
+- {{ .user | quote }}
+{{- end }}
+{{- if .account }}
+- "--slurm-account"
+- {{ .account | quote }}
+{{- end }}
+{{- if .partition }}
+- "--slurm-partition"
+- {{ .partition | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "consul" }}
+{{- /* The ACL token and the TLS files are Consul's environment variables,
+     set on the router container from Secrets, never flags. */}}
+{{- with .consul }}
+- "--consul-service"
+- {{ .service | quote }}
+{{- if .address }}
+- "--consul-address"
+- {{ .address | quote }}
+{{- end }}
+{{- if .datacenter }}
+- "--consul-datacenter"
+- {{ .datacenter | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* Under either spelling of Kubernetes discovery, as under any provider. */}}
+{{- if and (include "smg.discoveryProvider" .) .Values.router.discovery.checkIntervalSecs }}
+- "--discovery-check-interval-secs"
+- {{ int .Values.router.discovery.checkIntervalSecs | quote }}
+{{- end }}
 {{- if .Values.router.model }}
 - "--model-path"
 - {{ .Values.router.model | quote }}
@@ -178,8 +416,16 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+{{- if .Values.router.grpcRequestTimeoutSecs }}
+- "--grpc-request-timeout-secs"
+- {{ .Values.router.grpcRequestTimeoutSecs | quote }}
+{{- end }}
 - "--shutdown-grace-period-secs"
 - {{ .Values.router.shutdownGracePeriodSeconds | quote }}
+{{- if ne .Values.router.shutdownSettleSeconds nil }}
+- "--shutdown-settle-secs"
+- {{ .Values.router.shutdownSettleSeconds | quote }}
+{{- end }}
 - "--max-concurrent-requests"
 - {{ .Values.router.maxConcurrentRequests | quote }}
 - "--queue-size"
@@ -280,6 +526,10 @@ Called from the router Deployment template.
 {{- if .Values.router.toolCallParser }}
 - "--tool-call-parser"
 - {{ .Values.router.toolCallParser | quote }}
+{{- end }}
+{{- if .Values.router.parser }}
+- "--parser"
+- {{ .Values.router.parser | quote }}
 {{- end }}
 {{- if include "smg.authSecretName" . }}
 - "--api-key-file"
@@ -449,9 +699,9 @@ Expects a dict with keys: worker, global, chart, defaults
 {{- $workerRepository = .worker.image.repository | default "" -}}
 {{- $workerTag = .worker.image.tag | default "" -}}
 {{- end -}}
-{{/* Engine images default to ghcr.io (gateway image is on docker.io) */}}
+{{/* Engine images are published under ghcr.io/smg-project/smg (the gateway image is on docker.io) */}}
 {{- $registry := $workerRegistry | default "ghcr.io" -}}
-{{- $repository := $workerRepository | default .global.image.repository -}}
+{{- $repository := $workerRepository | default "smg-project/smg" -}}
 {{- $tag := $workerTag | default (.global.image.tag | default .chart.AppVersion) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
@@ -514,6 +764,24 @@ Expects a dict with keys: worker, defaults
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+Worker metrics port -- the port the engine pod serves Prometheus metrics on,
+or empty when it serves none. A gRPC worker with `metrics.enabled` runs the
+engine behind the Rust servicer, whose own listener answers `GET /metrics`
+with the `smg_servicer_*` families (requests by finish reason, refusals,
+errors, in-flight requests, token totals, the first-token / inter-token /
+end-to-end latency histograms, the servicer's lifecycle state); the Python
+servicer has no endpoint. An HTTP worker runs the engine's own server, which
+the chart leaves as it is.
+Expects a dict with keys: worker
+*/}}
+{{- define "smg.workerMetricsPort" -}}
+{{- $mode := .worker.connectionMode | default "http" -}}
+{{- if and (eq $mode "grpc") (.worker.metrics).enabled -}}
+{{- (.worker.metrics).port | default 29100 -}}
+{{- end -}}
 {{- end }}
 
 {{/*

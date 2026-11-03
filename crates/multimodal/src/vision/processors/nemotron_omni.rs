@@ -35,8 +35,10 @@ use crate::{
     encoder_inputs::ModelSpecificValue,
     types::RgbFrameRef,
     vision::{
-        preprocessor_config::PreProcessorConfig,
-        processor::{PreprocessedEncoderInputs, VisionPreProcessor, VisionPreprocessingContext},
+        processor::{
+            PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+            VisionPreprocessingContext,
+        },
         transforms::{resize_bicubic_torch_aa_f32, rgb_bytes, TransformError},
     },
 };
@@ -371,9 +373,8 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_with_context(images, config, &VisionPreprocessingContext::default())
+        self.preprocess_with_context(images, &VisionPreprocessingContext::default())
     }
 
     #[expect(
@@ -383,7 +384,6 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess_with_context(
         &self,
         images: &[DynamicImage],
-        _config: &PreProcessorConfig,
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
@@ -436,7 +436,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        _config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
         let refs: Vec<_> = rgb
@@ -453,17 +453,12 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        _config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         Self::video_patches(frames)
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        _config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let (rows, cols) = Self::plan_grid(width, height).ok_or_else(|| {
             TransformError::ShapeError(format!(
                 "a {width}x{height} image is too thin for Nemotron-H Omni's patch grid"
@@ -499,7 +494,7 @@ mod tests {
         // The count refuses what the grid planner refuses, as the
         // preprocessing does.
         let error = NemotronOmniProcessor::new()
-            .calculate_num_tokens(300_000, 8, &PreProcessorConfig::default())
+            .calculate_num_tokens(300_000, 8)
             .unwrap_err()
             .to_string();
         assert!(error.contains("too thin"), "{error}");
@@ -547,11 +542,7 @@ mod tests {
         let images = vec![DynamicImage::new_rgb8(640, 480); 2];
         let preprocess = |images: &[DynamicImage], token_budget| {
             NemotronOmniProcessor::new()
-                .preprocess_with_context(
-                    images,
-                    &PreProcessorConfig::default(),
-                    &VisionPreprocessingContext { token_budget },
-                )
+                .preprocess_with_context(images, &VisionPreprocessingContext { token_budget })
                 .unwrap()
         };
         let grids = |out: &PreprocessedEncoderInputs| match out.model_specific.get("image_grid_hw")

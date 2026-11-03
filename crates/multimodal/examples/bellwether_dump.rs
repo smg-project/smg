@@ -286,17 +286,13 @@ fn grid(value: Option<&ModelSpecificValue>) -> Vec<i64> {
 }
 
 /// Decode and preprocess one image.
-fn process(
-    processor: &dyn VisionPreProcessor,
-    config: &PreProcessorConfig,
-    bytes: Vec<u8>,
-) -> Result<Artifacts, String> {
+fn process(processor: &dyn VisionPreProcessor, bytes: Vec<u8>) -> Result<Artifacts, String> {
     let image = decode(bytes)?;
     let alpha = image.color().has_alpha();
     let rgb = image.to_rgb8();
     let (width, height) = rgb.dimensions();
     let inputs = processor
-        .preprocess(std::slice::from_ref(&image), config)
+        .preprocess(std::slice::from_ref(&image))
         .map_err(|e| e.to_string())?;
     let u8 = match &inputs.encoder_input {
         EncoderInput::U8 { patches, .. } => {
@@ -325,13 +321,9 @@ fn process(
 }
 
 /// One image through the pipeline, with a panic in it reported as that image's error.
-fn one(
-    processor: &dyn VisionPreProcessor,
-    config: &PreProcessorConfig,
-    path: &Path,
-) -> Result<Artifacts, String> {
+fn one(processor: &dyn VisionPreProcessor, path: &Path) -> Result<Artifacts, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    match panic::catch_unwind(AssertUnwindSafe(|| process(processor, config, bytes))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| process(processor, bytes))) {
         Ok(result) => result,
         Err(payload) => {
             let message = payload
@@ -429,15 +421,14 @@ fn run() -> Result<(), Fault> {
     let (mut ok, mut failed) = (0usize, 0usize);
     for ((name, path), stem) in images.iter().zip(&stems) {
         let path_text = path.to_string_lossy();
-        let result =
-            one(processor.as_ref(), &config, path).and_then(|artifacts| match options.mode {
-                Mode::Hash => Ok(artifacts.line(name, &path_text)),
-                Mode::Raw => artifacts.write(&options.out, stem).map(|()| {
-                    let mut described = artifacts.describe(name, &path_text);
-                    described["artifact"] = json!(stem);
-                    described
-                }),
-            });
+        let result = one(processor.as_ref(), path).and_then(|artifacts| match options.mode {
+            Mode::Hash => Ok(artifacts.line(name, &path_text)),
+            Mode::Raw => artifacts.write(&options.out, stem).map(|()| {
+                let mut described = artifacts.describe(name, &path_text);
+                described["artifact"] = json!(stem);
+                described
+            }),
+        });
         let line = match result {
             Ok(line) => {
                 ok += 1;

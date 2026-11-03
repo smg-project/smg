@@ -24,7 +24,7 @@
 //!   starts that provider.
 //!
 //! SMG mesh-router peer discovery is a different concern — it discovers router
-//! peers, not inference workers — and lives in [`crate::mesh_discovery`].
+//! peers, not inference workers — and lives in [`crate::mesh::discovery`].
 
 mod consul;
 mod file;
@@ -44,6 +44,8 @@ pub use kubernetes::start_service_discovery_with_client;
 pub use kubernetes::{
     ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };
-pub use reconciler::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL};
+pub use reconciler::{
+    DISCOVERY_ID_LABEL, DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL,
+};
 pub use runtime::{start_service_discovery, RuntimeDiscoveryConfig};
 pub use slurm::SlurmProviderConfig;

@@ -1,6 +1,7 @@
-//! Socket addresses for the same-host ZMQ topology: the `ipc://` data plane
-//! SMG binds, the `tcp://` handshake the engine dials, and the owner-only
-//! socket directory they live in.
+//! Socket addresses for the ZMQ topology: the data plane SMG binds (`ipc://`
+//! for a same-host engine, `tcp://` for one on another host), the `tcp://`
+//! handshake the engine dials, and the owner-only socket directory the
+//! `ipc://` sockets live in.
 
 use std::path::Path;
 
@@ -53,6 +54,14 @@ impl<'a> Handshake<'a> {
 
 /// Derive the ZMQ socket addresses for a worker from its base URL.
 ///
+/// A `tcp://<host>:<port>` base serves engines on other hosts: the gateway
+/// binds its handshake at that address itself and its input/output sockets
+/// on ephemeral ports of the same host, which the INIT hands the engines, so
+/// the host must be one they can reach (not a wildcard). The engines dial
+/// `--data-parallel-address <host> --data-parallel-rpc-port <port>`. These
+/// sockets carry no authentication: such a worker belongs on a trusted
+/// network. The rest of this describes the same-host `ipc://` base.
+///
 /// Mirrors vLLM's headless topology: the **handshake is TCP** (the engine dials
 /// it, so it matches `vllm serve --headless --data-parallel-rpc-port`), while
 /// the **data plane is `ipc://`** for the same-host fast path (SMG chooses these
@@ -76,9 +85,12 @@ pub(crate) fn zmq_socket_addresses(
     base_url: &str,
     handshake: Handshake<'_>,
 ) -> Result<(String, String, String), String> {
-    let path = base_url
-        .strip_prefix("ipc://")
-        .ok_or_else(|| format!("ZMQ worker URL must be ipc://<path>, got '{base_url}'"))?;
+    if let Some(authority) = base_url.strip_prefix("tcp://") {
+        return tcp_socket_addresses(base_url, authority, handshake);
+    }
+    let path = base_url.strip_prefix("ipc://").ok_or_else(|| {
+        format!("ZMQ worker URL must be ipc://<path> or tcp://<host>:<port>, got '{base_url}'")
+    })?;
     let handshake = match handshake {
         Handshake::Derived => format!("tcp://{ZMQ_LOOPBACK_HOST}:{}", derive_handshake_port(path)),
         Handshake::Tcp(address) => {
@@ -104,9 +116,48 @@ pub(crate) fn zmq_socket_addresses(
     Ok((handshake, input, output))
 }
 
+/// [`zmq_socket_addresses`] for a `tcp://<host>:<port>` base (`authority` is
+/// what follows the scheme): the handshake at the base itself, the data plane
+/// on ephemeral ports of its host.
+fn tcp_socket_addresses(
+    base_url: &str,
+    authority: &str,
+    handshake: Handshake<'_>,
+) -> Result<(String, String, String), String> {
+    if !matches!(handshake, Handshake::Derived) {
+        return Err(format!(
+            "ZMQ worker {base_url} is the handshake address its engines dial; it takes no \
+             separate handshake address"
+        ));
+    }
+    let (host, _port) = authority
+        .rsplit_once(':')
+        .filter(|(host, port)| {
+            // An IPv6 literal rides in brackets: a bare one cannot be told
+            // apart from its port, since the split is at the last colon.
+            let bracketed = host.starts_with('[') && host.ends_with(']');
+            !host.is_empty()
+                && (bracketed || !host.contains(':'))
+                && port.parse::<u16>().is_ok_and(|p| p != 0)
+        })
+        .ok_or_else(|| format!("ZMQ worker URL must be tcp://<host>:<port>, got '{base_url}'"))?;
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+    {
+        return Err(format!(
+            "ZMQ worker {base_url} names a wildcard host; the gateway hands its engines the \
+             addresses it binds, so name a host they can reach"
+        ));
+    }
+    let data_plane = format!("tcp://{host}:0");
+    Ok((base_url.to_string(), data_plane.clone(), data_plane))
+}
+
 /// The TCP handshake address a ZMQ worker will bind.
 ///
-/// Carries [`zmq_socket_addresses`]'s error verbatim rather than flattening it
+/// Carries `zmq_socket_addresses`'s error verbatim rather than flattening it
 /// to "no address": an unusable `ipc://` base or a non-`tcp://` override is a
 /// misconfiguration registration must reject, not a value to skip past and
 /// rediscover at every later connect attempt.
@@ -128,7 +179,10 @@ pub fn zmq_handshake_address(
 /// its permissions are left untouched (never chmod a shared dir like `/tmp`)
 /// and it is rejected unless it is a real directory owned by the current user.
 pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> {
-    let path = base_url.strip_prefix("ipc://").unwrap_or(base_url);
+    // A `tcp://` worker binds no socket files.
+    let Some(path) = base_url.strip_prefix("ipc://") else {
+        return Ok(());
+    };
     let Some(parent) = Path::new(path).parent() else {
         return Ok(());
     };
@@ -175,7 +229,8 @@ pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> 
 
 /// Remove a stale ipc socket file left by a previous gateway process, if any.
 /// Only ever unlinks sockets (never a regular file at the path), inside the
-/// owner-verified socket dir.
+/// owner-verified socket dir. A socket that disappears between the stat and
+/// the unlink counts as removed: the step's job is a free path, and it is.
 #[cfg(unix)]
 pub(crate) async fn unlink_stale_socket(address: &str) -> Result<(), String> {
     let Some(path) = address.strip_prefix("ipc://") else {
@@ -192,9 +247,14 @@ pub(crate) async fn unlink_stale_socket(address: &str) -> Result<(), String> {
                 ));
             }
             tracing::info!("Removing stale ipc socket {path} from a previous gateway run");
-            tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| format!("failed to remove stale ipc socket {path}: {e}"))
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                // Gone between the stat and the unlink (a previous bind's
+                // teardown task, or a sweep beside this one, took it): the
+                // path is free, which is all the bind needs.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("failed to remove stale ipc socket {path}: {e}")),
+            }
         }
     }
 }
@@ -227,6 +287,56 @@ mod tests {
         let err = unlink_stale_socket(&addr).await.unwrap_err();
         assert!(err.contains("not a socket"), "{err}");
         assert!(sock_path.exists(), "regular file must survive");
+    }
+
+    /// The step's job is a free path, so a socket that vanishes between the
+    /// stat and the unlink counts as removed. A previous bind's teardown
+    /// unlinks its socket files on their own tasks, and a connect retry sweeps
+    /// the same paths while those tasks may still be running: the sweep used
+    /// to fail the whole connect with NotFound although the path was free.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unlink_stale_socket_counts_a_socket_that_vanishes_under_it_as_removed() {
+        use std::{
+            os::unix::net::UnixListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("vanishing.sock");
+        let addr = format!("ipc://{}", sock_path.display());
+        // A thread creates and unlinks the socket as fast as it can, so the
+        // helper's stat keeps finding a socket that its unlink then misses.
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = std::thread::spawn({
+            let (path, stop) = (sock_path.clone(), Arc::clone(&stop));
+            move || {
+                let mut cycles = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    // Only this thread creates the file, and it is unlinked
+                    // (here or by the helper) before the next bind, so the
+                    // bind never finds the path taken.
+                    drop(UnixListener::bind(&path).expect("bind the churned socket"));
+                    let _ = std::fs::remove_file(&path);
+                    cycles += 1;
+                }
+                cycles
+            }
+        });
+        let mut verdict = Ok(());
+        for round in 0..1_000 {
+            if let Err(e) = unlink_stale_socket(&addr).await {
+                verdict = Err(format!("round {round}: {e}"));
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let cycles = churn.join().expect("the churn thread");
+        assert!(cycles > 0, "the churn thread never cycled the socket");
+        verdict.expect("a socket that vanishes between the stat and the unlink counts as removed");
     }
 
     #[test]
@@ -307,6 +417,61 @@ mod tests {
         assert_eq!(handshake, "tcp://127.0.0.1:30500");
         assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
         assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
+    }
+
+    /// A `tcp://` worker binds its handshake at its own address and its data
+    /// plane on ephemeral ports of the same host, for engines on other hosts.
+    #[test]
+    fn a_tcp_worker_binds_its_handshake_at_its_url_and_its_data_plane_beside_it() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("tcp://10.0.0.5:31000", Handshake::Derived).unwrap();
+        assert_eq!(handshake, "tcp://10.0.0.5:31000");
+        assert_eq!(input, "tcp://10.0.0.5:0");
+        assert_eq!(output, "tcp://10.0.0.5:0");
+        let (_, input, _) =
+            zmq_socket_addresses("tcp://[fd00::5]:31000", Handshake::Derived).unwrap();
+        assert_eq!(input, "tcp://[fd00::5]:0");
+        assert_eq!(
+            zmq_handshake_address("tcp://node0:31000", None).unwrap(),
+            "tcp://node0:31000"
+        );
+    }
+
+    /// A `tcp://` worker named by hostname keeps the name on its data plane:
+    /// the engines resolve it as they resolved the handshake address.
+    #[test]
+    fn a_tcp_worker_named_by_hostname_keeps_the_name_on_its_data_plane() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("tcp://node0:31000", Handshake::Derived).unwrap();
+        assert_eq!(handshake, "tcp://node0:31000");
+        assert_eq!(input, "tcp://node0:0");
+        assert_eq!(output, "tcp://node0:0");
+    }
+
+    /// The INIT hands the engines the bound addresses, so a wildcard host (no
+    /// engine can dial it), a missing port, a bare IPv6 host without brackets
+    /// (it cannot be told apart from its port), and a second handshake address
+    /// are each refused.
+    #[test]
+    fn a_tcp_worker_refuses_a_wildcard_host_a_missing_port_and_an_override() {
+        for url in ["tcp://0.0.0.0:31000", "tcp://[::]:31000"] {
+            let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
+            assert!(err.contains("wildcard"), "{err}");
+        }
+        for url in [
+            "tcp://10.0.0.5",
+            "tcp://10.0.0.5:0",
+            "tcp://:31000",
+            "tcp://10.0.0.5:x",
+            "tcp://fd00::5",
+            "tcp://fd00::5:31000",
+        ] {
+            let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
+            assert!(err.contains("tcp://<host>:<port>"), "{url}: {err}");
+        }
+        let err = zmq_handshake_address("tcp://10.0.0.5:31000", Some("tcp://10.0.0.5:30500"))
+            .unwrap_err();
+        assert!(err.contains("takes no separate handshake address"), "{err}");
     }
 
     #[tokio::test]

@@ -3,7 +3,6 @@
 //! Each migration is a function that generates Postgres DDL from [`SchemaConfig`],
 //! so it respects custom table/column names. `IF NOT EXISTS` / `IF EXISTS`
 //! clauses ensure idempotency.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::{schema::SchemaConfig, versioning::Migration};
 

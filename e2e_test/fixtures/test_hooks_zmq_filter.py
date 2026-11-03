@@ -125,3 +125,52 @@ def test_items_without_setup_backend_are_untouched():
     kept, deselected = hooks._filter_zmq_items([item])
     assert kept == [item]
     assert deselected == []
+
+
+# ---------------------------------------------------------------------------
+# _filter_sglang_rust_items
+# ---------------------------------------------------------------------------
+
+
+def test_sglang_rust_lane_keeps_prefill_decode_topologies():
+    """The Rust servicer carries the prefill/decode bootstrap fields: the PD
+    topologies run on its lane like the local wires."""
+    pd_param = _item("t.py::test_x[pd_grpc]", setup_backend="pd_grpc")
+    pd_http = _item("t.py::test_x[pd_http]", setup_backend="pd_http")
+    # The topology suites carry the counts in a tuple behind the mode.
+    pd_topology = _item("t.py::test_x[1p2d]", setup_backend=("pd_grpc", (1, 2)))
+    pd_asymmetric = _item("t.py::test_x[1p2d-ptp2-dtp1]", setup_backend=("pd_grpc", (1, 2, 2, 1)))
+    pd_workers = _item(
+        "t.py::test_x[grpc]",
+        setup_backend="grpc",
+        workers=_workers_marker(prefill=1, decode=1),
+    )
+    plain = _item("t.py::test_x[grpc]", setup_backend="grpc")
+    items = [pd_param, pd_http, pd_topology, pd_asymmetric, pd_workers, plain]
+    kept, deselected = hooks._filter_sglang_rust_items(items)
+    assert kept == items
+    assert deselected == []
+
+
+@pytest.mark.parametrize("param", ["epd_grpc", ("epd_grpc", (1, 1, 1)), ()])
+def test_sglang_rust_lane_drops_epd_and_foreign_wires(param):
+    item = _item("t.py::test_x[p]", setup_backend=param)
+    encode_workers = _item(
+        "t.py::test_x[grpc]",
+        setup_backend="grpc",
+        workers=_workers_marker(encode=1, prefill=1, decode=1),
+    )
+    kept, deselected = hooks._filter_sglang_rust_items([item, encode_workers])
+    assert kept == []
+    assert deselected == [item, encode_workers]
+
+
+def test_sglang_rust_lane_keeps_multimodal_cases():
+    """The Rust servicer carries the preprocessed media to the scheduler: the
+    multimodal cases run on its lane over the servicer and over SGLang's own
+    server alike."""
+    grpc = _item("chat_completions/test_multimodal.py::test_x[grpc]", setup_backend="grpc")
+    http = _item("chat_completions/test_multimodal.py::test_x[http]", setup_backend="http")
+    kept, deselected = hooks._filter_sglang_rust_items([grpc, http])
+    assert kept == [grpc, http]
+    assert deselected == []

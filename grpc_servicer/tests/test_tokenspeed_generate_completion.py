@@ -277,3 +277,33 @@ def test_an_abort_of_a_constrained_request_is_the_engines_own_abort(
     code, _, trailer = asyncio.run(_aborted_with(servicer, _constrained_request(stream)))
     assert code is grpc.StatusCode.RESOURCE_EXHAUSTED
     assert trailer == ()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (400, grpc.StatusCode.INVALID_ARGUMENT),
+        (404, grpc.StatusCode.NOT_FOUND),
+        (408, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (429, grpc.StatusCode.RESOURCE_EXHAUSTED),
+        (500, grpc.StatusCode.INTERNAL),
+        (503, grpc.StatusCode.UNAVAILABLE),
+        (504, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (None, grpc.StatusCode.INTERNAL),
+    ],
+)
+@pytest.mark.parametrize("choice_list", [False, True], ids=["streamed", "choice-list"])
+def test_an_engine_abort_carries_the_status_its_http_code_means(
+    tokenspeed_servicer_mod, status_code, expected, choice_list
+):
+    # The engine's HTTP-style status goes through the table every engine
+    # servicer shares (the vLLM and SGLang servicers answer the same code for
+    # the same status), on the streamed path and on the choice-list path alike;
+    # the engine's message is the status message.
+    output = _abort_output(0, message="the engine refused the request", status_code=status_code)
+    outputs = [[output]] if choice_list else [output]
+    servicer = _servicer(tokenspeed_servicer_mod, outputs, "rid")
+    code, details, trailer = asyncio.run(_aborted_with(servicer, _request(not choice_list)))
+    assert code is expected
+    assert details == "the engine refused the request"
+    assert trailer == ()

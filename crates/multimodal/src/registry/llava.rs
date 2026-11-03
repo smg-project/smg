@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct LlavaSpec;
@@ -50,6 +53,24 @@ impl ModelProcessorSpec for LlavaSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 4)]))
+    }
+
+    fn vision_processor(
+        &self,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaProcessor::from_configs(
+                model_config,
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -99,6 +120,24 @@ impl ModelProcessorSpec for LlavaNextSpec {
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         LlavaSpec.modality_limits(metadata)
+    }
+
+    fn vision_processor(
+        &self,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaNextProcessor::from_configs(
+                model_config,
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

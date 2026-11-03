@@ -6,12 +6,12 @@ use tonic::{metadata::MetadataValue, Status};
 /// Whose fault the request's media failure is, as a worker reports it on the
 /// status of the `Generate` it refused, in the trailer [`Self::METADATA_KEY`].
 /// A router that reads the trailer answers the client for the media (a 400
-/// for either fault: an origin that does not deliver is the request's input
-/// as much as a reference it got wrong, under the code the worker names in
+/// for the request's own fault, a 502 for its host's, so the client knows
+/// whether to retry, under the code the worker names in
 /// [`MEDIA_CODE_METADATA_KEY`]) and records no circuit-breaker sample
 /// against a worker that is healthy; a status without the trailer is read
-/// as before. The fault tells the logs whether the origin or the reference
-/// failed.
+/// as before. The fault tells the client and the logs whether the origin or
+/// the reference failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerMediaFault {
     /// The request's own: a host that cannot be resolved or refuses the

@@ -414,23 +414,10 @@ impl VisionPreProcessor for Llama4VisionProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-
-        let owned_processor;
-        let processor = if config.max_image_tiles.is_some()
-            || config.image_mean.is_some()
-            || config.image_std.is_some()
-            || config.size.is_some()
-        {
-            owned_processor = Self::from_preprocessor_config(config);
-            &owned_processor
-        } else {
-            self
-        };
 
         let mut all_outputs = Vec::new();
         let mut all_aspect_ratios = Vec::new();
@@ -438,8 +425,8 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let mut feature_token_counts = Vec::new();
 
         for image in images {
-            let (output, aspect_ratio) = processor.process_single_image(image);
-            let tokens = processor.calculate_num_tokens_for_aspect_ratio(aspect_ratio);
+            let (output, aspect_ratio) = self.process_single_image(image);
+            let tokens = self.calculate_num_tokens_for_aspect_ratio(aspect_ratio);
 
             all_outputs.push(output);
             all_aspect_ratios.push(aspect_ratio);
@@ -491,44 +478,34 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        let processor = Self::from_preprocessor_config(config);
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let image_size = (height, width);
         // target_size from get_best_fit determines the canvas and tile count
-        let target_size = processor.get_best_fit(image_size);
+        let target_size = self.get_best_fit(image_size);
 
-        let tile = processor.tile_size as usize;
+        let tile = self.tile_size as usize;
         let num_tiles_h = target_size.0 as usize / tile;
         let num_tiles_w = target_size.1 as usize / tile;
 
-        Ok(processor.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w)))
+        Ok(self.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w)))
     }
 
     fn model_name(&self) -> &'static str {
         "llama4-vision"
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // For LLaMA 4, the size depends on the input image
-        let _ = config;
         None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::test_support::create_test_image;
 
     #[test]
     fn test_llama4_vision_processor_default() {
@@ -603,10 +580,9 @@ mod tests {
     #[test]
     fn test_preprocess_square_image() {
         let processor = Llama4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -621,10 +597,9 @@ mod tests {
     #[test]
     fn test_preprocess_wide_image() {
         let processor = Llama4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let image = create_test_image(1000, 300, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -641,14 +616,13 @@ mod tests {
     #[test]
     fn test_preprocess_multiple_images() {
         let processor = Llama4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let images = vec![
             create_test_image(500, 500, Rgb([100, 100, 100])),
             create_test_image(800, 400, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = processor.preprocess(&images).unwrap();
 
         // 4D output: [total_tiles, C, H, W] — tiles from both images concatenated
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -661,11 +635,10 @@ mod tests {
     #[test]
     fn test_global_tile_added_for_multiple_tiles() {
         let processor = Llama4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         // Large image that will require multiple tiles
         let image = create_test_image(1000, 1000, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         let aspect_ratios = result.model_specific.get("aspect_ratios").unwrap();
         if let ModelSpecificValue::IntTensor { data, .. } = aspect_ratios {
@@ -715,7 +688,7 @@ mod tests {
     #[test]
     fn an_empty_batch_is_refused_as_empty_batch() {
         let processor = Llama4VisionProcessor::new();
-        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

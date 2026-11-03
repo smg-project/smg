@@ -174,22 +174,10 @@ impl VisionPreProcessor for PixtralProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-
-        // Apply config overrides if present
-        let processor = if config.size.is_some()
-            || config.patch_size.is_some()
-            || config.image_mean.is_some()
-            || config.image_std.is_some()
-        {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        };
 
         let mut all_pixel_values = Vec::new();
         let mut all_image_sizes = Vec::new();
@@ -197,8 +185,8 @@ impl VisionPreProcessor for PixtralProcessor {
         let mut feature_token_counts = Vec::new();
 
         for image in images {
-            let (pixels, size) = processor.process_single_image(image)?;
-            let tokens = processor.calculate_num_tokens(image.width(), image.height(), config)?;
+            let (pixels, size) = self.process_single_image(image)?;
+            let tokens = self.calculate_num_tokens(image.width(), image.height())?;
 
             all_pixel_values.push(pixels);
             all_image_sizes.push(size);
@@ -253,15 +241,9 @@ impl VisionPreProcessor for PixtralProcessor {
         })
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        let processor = Self::from_preprocessor_config(config);
-        let (target_h, target_w) = processor.get_resize_output_size(height, width);
-        let patch_size = processor.patch_size;
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        let (target_h, target_w) = self.get_resize_output_size(height, width);
+        let patch_size = self.patch_size;
 
         // Number of tokens = num_patches_h * num_patches_w
         let num_patches_h = target_h / patch_size;
@@ -273,7 +255,7 @@ impl VisionPreProcessor for PixtralProcessor {
         "pixtral"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // Pixtral has dynamic size based on input
         None
     }
@@ -351,11 +333,10 @@ mod tests {
     #[test]
     fn test_preprocess_batch() {
         let processor = PixtralProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let images = vec![create_test_image(200, 150), create_test_image(300, 100)];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = processor.preprocess(&images).unwrap();
 
         // First image: 150x200 -> 160x208
         // Second image: 100x300 -> 112x304 (ceil(100/16)=7, ceil(300/16)=19)
@@ -405,17 +386,16 @@ mod tests {
     #[test]
     fn test_calculate_num_tokens() {
         let processor = PixtralProcessor::new();
-        let config = PreProcessorConfig::default();
 
         // 200x150 -> 208x160 -> 13*10 = 130 patches
-        let tokens = processor.calculate_num_tokens(200, 150, &config).unwrap();
+        let tokens = processor.calculate_num_tokens(200, 150).unwrap();
         assert_eq!(tokens, 130);
     }
 
     #[test]
     fn an_empty_batch_is_refused_as_empty_batch() {
         let processor = PixtralProcessor::new();
-        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

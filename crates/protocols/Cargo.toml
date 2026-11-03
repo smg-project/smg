@@ -1,6 +1,6 @@
 [package]
 name = "openai-protocol"
-version = "1.16.0"
+version = "1.17.0"
 edition = "2021"
 description = "OpenAI-compatible API protocol definitions and types"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ axum = ["dep:axum", "axum/multipart"]
 [dependencies]
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
-bytes = "1.12.0"
+bytes.workspace = true
 chrono.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 rand.workspace = true

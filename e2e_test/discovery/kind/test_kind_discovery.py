@@ -453,3 +453,194 @@ class TestKindPDDisaggregation:
 
         kubectl("delete", "pod", "prefill-0", "decode-0", "--grace-period=0", "--force")
         gateway.wait_for_count(0, "PD fleet unwound")
+
+
+@pytest.mark.kind
+@needs_mock_image
+class TestKindEPDDisaggregation:
+    """EPD encode/prefill/decode mix, each role found by its own selector.
+
+    The pods run gRPC mock-workers: EPD routing is the gRPC router's, over
+    TokenSpeed engines, and mock-worker's gRPC server is a TokenSpeed
+    scheduler, so each pod registers as the gRPC TokenSpeed worker a real EPD
+    engine would.
+
+    Registration only; no request is served through the EPD pipeline. The
+    gRPC router tokenizes every request itself and mock-worker has no
+    tokenizer to offer (GetTokenizer is unimplemented; its tokenizer path is
+    the model id), and the one leg that is EPD's own, the encode worker's
+    TokenSpeedEncoder.Encode call, is not a service mock-worker hosts. A text
+    request would not reach the encode pool anyway: only image items are
+    assigned to encode workers, so it would prove the PD path, not EPD.
+    """
+
+    def test_epd_mix_registers_each_role_into_its_own_pool(self, gateway):
+        apply_manifest(
+            mock_worker_pod(
+                "epd-encode-0",
+                [
+                    "--host",
+                    "0.0.0.0",
+                    "--grpc-base-port",
+                    "29800",
+                    "--grpc-count",
+                    "2",
+                    "--model",
+                    "kind-e2e-model",
+                ],
+                {
+                    "smg.ai/worker-ports": "29800,29801",
+                    "sglang.ai/bootstrap-port": "29900,29901",
+                    "smg.ai/kv-connector": "MooncakeConnector",
+                    "smg.ai/kv-engine-id": "encode-0,encode-1",
+                },
+                probe_port=29800,
+                probe_kind="tcp",
+                extra_labels={"role": "encode"},
+            )
+        )
+        apply_manifest(
+            mock_worker_pod(
+                "epd-prefill-0",
+                [
+                    "--host",
+                    "0.0.0.0",
+                    "--grpc-base-port",
+                    "29810",
+                    "--grpc-count",
+                    "2",
+                    "--model",
+                    "kind-e2e-model",
+                ],
+                {
+                    "smg.ai/worker-ports": "29810,29811",
+                    "sglang.ai/bootstrap-port": "29910,29911",
+                    "smg.ai/kv-connector": "MooncakeConnector",
+                    "smg.ai/kv-engine-id": "prefill-0,prefill-1",
+                },
+                probe_port=29810,
+                probe_kind="tcp",
+                extra_labels={"role": "prefill"},
+            )
+        )
+        # The decode pod carries a bootstrap annotation too, as a template
+        # shared across roles would: the gateway must drop it, since only
+        # encode and prefill workers host a rendezvous for their partners.
+        apply_manifest(
+            mock_worker_pod(
+                "epd-decode-0",
+                [
+                    "--host",
+                    "0.0.0.0",
+                    "--grpc-base-port",
+                    "29820",
+                    "--grpc-count",
+                    "2",
+                    "--model",
+                    "kind-e2e-model",
+                ],
+                {
+                    "smg.ai/worker-ports": "29820,29821",
+                    "sglang.ai/bootstrap-port": "29920",
+                    "smg.ai/kv-connector": "MooncakeConnector",
+                    "smg.ai/kv-engine-id": "decode-0,decode-1",
+                },
+                probe_port=29820,
+                probe_kind="tcp",
+                extra_labels={"role": "decode"},
+            )
+        )
+        kubectl(
+            "wait",
+            "--for=condition=Ready",
+            "pod/epd-encode-0",
+            "pod/epd-prefill-0",
+            "pod/epd-decode-0",
+            "--timeout=180s",
+        )
+
+        gateway.restart(
+            (
+                "--epd-disaggregation",
+                "--encode-selector",
+                "app=smg-kind-e2e",
+                "--encode-selector",
+                "role=encode",
+                "--prefill-selector",
+                "app=smg-kind-e2e",
+                "--prefill-selector",
+                "role=prefill",
+                "--decode-selector",
+                "app=smg-kind-e2e",
+                "--decode-selector",
+                "role=decode",
+            )
+        )
+        gateway.wait_for_count(6, "EPD fleet registered", timeout=120)
+
+        by_port = {w["url"].rsplit(":", 1)[-1]: w for w in gateway.workers()}
+        expected_types = {
+            "29800": "encode",
+            "29801": "encode",
+            "29810": "prefill",
+            "29811": "prefill",
+            "29820": "decode",
+            "29821": "decode",
+        }
+        assert {port: w["worker_type"] for port, w in by_port.items()} == expected_types
+        for worker in by_port.values():
+            assert worker.get("connection_mode") == "grpc", worker
+            assert worker.get("runtime_type") == "tokenspeed", worker
+            assert worker["kv_connector"] == "MooncakeConnector", worker
+        # Aligned bootstrap lists: each encode and prefill engine gets its own
+        # port; decode gets none, whatever its pod says.
+        assert by_port["29800"].get("bootstrap_port") == 29900
+        assert by_port["29801"].get("bootstrap_port") == 29901
+        assert by_port["29810"].get("bootstrap_port") == 29910
+        assert by_port["29811"].get("bootstrap_port") == 29911
+        assert "bootstrap_port" not in by_port["29820"]
+        assert "bootstrap_port" not in by_port["29821"]
+        assert by_port["29800"]["kv_engine_id"] == "encode-0"
+        assert by_port["29801"]["kv_engine_id"] == "encode-1"
+        assert by_port["29810"]["kv_engine_id"] == "prefill-0"
+        assert by_port["29811"]["kv_engine_id"] == "prefill-1"
+        assert by_port["29820"]["kv_engine_id"] == "decode-0"
+        assert by_port["29821"]["kv_engine_id"] == "decode-1"
+        # Prefill and decode share one pairing key, so the gateway would pair
+        # them for a request's KV handoff.
+        pairings = {
+            by_port[port].get("pd_pairing") for port in ("29810", "29811", "29820", "29821")
+        }
+        assert len(pairings) == 1 and None not in pairings, pairings
+
+        # Registration is not readiness: every role's workers must also pass the
+        # gateway's own gRPC health checks.
+        deadline = time.monotonic() + 60
+        while True:
+            workers = gateway.workers()
+            if len(workers) == 6 and all(w.get("status") == "ready" for w in workers):
+                break
+            assert time.monotonic() < deadline, f"EPD workers never became ready: {workers}"
+            time.sleep(1)
+
+        # Encode is a pool of its own: listed and in the total, but in none
+        # of the regular, prefill or decode counts. An encode pod that fell
+        # into the regular pool would show here as a regular worker.
+        listing = requests.get(f"{gateway.base_url}/workers", timeout=5).json()
+        assert listing["total"] == 6
+        assert listing["stats"] == {
+            "prefill_count": 2,
+            "decode_count": 2,
+            "regular_count": 0,
+        }
+
+        kubectl(
+            "delete",
+            "pod",
+            "epd-encode-0",
+            "epd-prefill-0",
+            "epd-decode-0",
+            "--grace-period=0",
+            "--force",
+        )
+        gateway.wait_for_count(0, "EPD fleet unwound")

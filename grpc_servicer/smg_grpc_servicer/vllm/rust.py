@@ -49,10 +49,14 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
+
 # The lifecycle's defaults and the switch's choices, re-exported: this
 # launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
+    DEFAULT_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
@@ -64,12 +68,13 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
-from smg_grpc_servicer.vllm import MULTIPROC_METHOD_ENV
+from smg_grpc_servicer.vllm import METRICS_HOST_ENV, METRICS_PORT_ENV, MULTIPROC_METHOD_ENV
 from smg_grpc_servicer.vllm.config_view import (
     EngineConfigView,
     mm_processor_kwargs,
     multimodal_config,
 )
+from smg_grpc_servicer.vllm.kv_transfer import runs_mooncake
 from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
@@ -91,6 +96,8 @@ HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
+SILENCE_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_SILENCE_TIMEOUT_SECS"
+PREFILL_TOKENS_PER_SEC_ENV = "SMG_VLLM_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep vLLM's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
@@ -126,6 +133,7 @@ def model_info_from_config(
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     events = view.kv_events
+    structured_outputs_backend = str(view.structured_outputs.backend or "auto")
     return {
         **facts,
         # The Rust servicer stops on the full set vLLM's frontend assembles
@@ -137,7 +145,7 @@ def model_info_from_config(
         "attention_backend": str(facts.get("attention_backend", "")),
         "model_dtype": str(facts.get("model_dtype", "")),
         "block_size": int(facts.get("block_size", 0) or 0),
-        "structured_outputs_backend": str(view.structured_outputs.backend or "auto"),
+        "structured_outputs_backend": structured_outputs_backend,
         "kv_events_endpoint": events.endpoint if events.relayed else "",
         "kv_events_replay_endpoint": events.replay_endpoint if events.relayed else "",
         "kv_events_topic": events.topic if events.relayed else "",
@@ -153,6 +161,15 @@ def model_info_from_config(
         ),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
+        # The vocabulary of structural-tag nodes that backend takes, when the
+        # xgrammar installed beside the engine predates the current one: the
+        # Router spells such a worker's structural tags in the older vocabulary.
+        "structural_tag_vocabulary": structural_tag_vocabulary(structured_outputs_backend),
+        # Whether a Mooncake connector runs in the engine at all, off the raw
+        # `kv_transfer_config` (the top-level connector or any child a wrapper
+        # lists): the servicer withholds a PD decode side's KV-transfer rejection
+        # notice there, whatever connector the projection above reports.
+        "runs_mooncake": runs_mooncake(vllm_config),
         "log_stats": log_stats,
     }
 
@@ -260,6 +277,8 @@ def smg_media_options(
         )
         or None,
         "max_item_bytes": settings.max_item_bytes,
+        "fetch_timeout_ms": settings.fetch_timeout_ms,
+        "video_fetch_timeout_ms": settings.video_fetch_timeout_ms,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
         # A launcher that was not given the policy sends none, so the pipeline
@@ -517,7 +536,11 @@ class VllmLauncher(RustLauncher):
     drain_secs_env = DRAIN_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
+    prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV
 

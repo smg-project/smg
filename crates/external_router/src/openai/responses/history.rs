@@ -3,7 +3,7 @@
 //! Loads conversation history and/or previous response chains into the request
 //! input before forwarding to the upstream provider.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::{
@@ -15,8 +15,8 @@ use openai_protocol::{
 };
 use serde_json::Value;
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationId, ListParams, ResponseId, ResponseStorageError,
-    SortOrder,
+    is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
+    ResponseStorageError, SortOrder, StoredResponse,
 };
 use tracing::warn;
 
@@ -57,201 +57,20 @@ pub(crate) async fn load_input_history(
     // Load items from previous response chain if specified
     let mut chain_items: Option<Vec<ResponseInputOutputItem>> = None;
     if let Some(prev_id_str) = &previous_response_id {
-        let prev_id = ResponseId::from(prev_id_str.as_str());
-        match components
-            .response_storage
-            .get_response_chain(&prev_id, None)
-            .await
-            .map(|chain| visible_chain(chain.responses, tenant))
-        {
-            // The records the caller may see (the chain ends at the first
-            // record of another tenant, as it would at a missing one); a chain
-            // ending in a record its client asked not to store (a background
-            // run's record on the shared store, kept for its polling window
-            // only) would break when it goes: no previous response, as for an
-            // unstored id.
-            Ok(responses)
-                if !responses.is_empty()
-                    && !responses
-                        .last()
-                        .is_some_and(|response| is_unstored(response)) =>
-            {
-                existing_mcp_list_tools_labels.extend(responses.iter().flat_map(|stored| {
-                    extract_mcp_list_tools_labels(
-                        stored.raw_response.get("output").unwrap_or(&Value::Null),
-                    )
-                }));
-
-                let items: Vec<ResponseInputOutputItem> = responses
-                    .iter()
-                    .flat_map(|stored| {
-                        deserialize_items_from_array(&stored.input)
-                            .into_iter()
-                            .chain(deserialize_items_from_array(
-                                stored
-                                    .raw_response
-                                    .get("output")
-                                    .unwrap_or(&Value::Array(vec![])),
-                            ))
-                    })
-                    .collect();
-                chain_items = Some(items);
-            }
-            Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                super::record_error(model, metrics_labels::ERROR_VALIDATION);
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to load previous response chain for {}: {}",
-                    prev_id_str, e
-                );
-                super::record_error(model, metrics_labels::ERROR_INTERNAL);
-                return Err(error::storage_failure(
-                    "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}"),
-                    &e,
-                ));
-            }
-        }
+        let responses = visible_previous_chain(components, prev_id_str, tenant, model).await?;
+        existing_mcp_list_tools_labels.extend(responses.iter().flat_map(|stored| {
+            extract_mcp_list_tools_labels(stored.raw_response.get("output").unwrap_or(&Value::Null))
+        }));
+        chain_items = Some(chain_input_items(&responses));
     }
 
     // Load conversation history if specified
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
-
-        // A conversation of another tenant answers as a missing one.
-        match components
-            .conversation_storage
-            .get_conversation(&conv_id)
-            .await
-        {
-            Ok(Some(conversation)) if conversation.is_visible_to(tenant) => {}
-            Ok(_) => {
-                super::record_error(model, metrics_labels::ERROR_VALIDATION);
-                return Err(error::not_found(
-                    "not_found",
-                    format!("No conversation found with id '{}'", conv_id.0),
-                ));
-            }
-            Err(e) => {
-                warn!("Failed to check conversation {}: {}", conv_id.0, e);
-                super::record_error(model, metrics_labels::ERROR_INTERNAL);
-                return Err(error::storage_failure(
-                    "check_conversation_failed",
-                    format!("Failed to check conversation {}", conv_id.0),
-                    &e,
-                ));
-            }
-        }
-
-        // The newest items, listed newest first so that the limit cuts the
-        // oldest off, then put back in the order they were stored. One more
-        // than the limit is asked for: a conversation of exactly the limit
-        // replays whole, and only one with an item past the window is cut.
-        let params = ListParams {
-            limit: MAX_CONVERSATION_HISTORY_ITEMS + 1,
-            order: SortOrder::Desc,
-            after: None,
-        };
-
-        match components
-            .conversation_item_storage
-            .list_items(&conv_id, params)
-            .await
-        {
-            Ok(mut stored_items) => {
-                stored_items.reverse();
-                let cut = stored_items.len() > MAX_CONVERSATION_HISTORY_ITEMS;
-                if cut {
-                    stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
-                }
-                let mut items: Vec<ResponseInputOutputItem> = Vec::new();
-                for item in stored_items {
-                    match item.item_type.as_str() {
-                        "message" => {
-                            // Stored content may be either the raw content array
-                            // (legacy shape) or an object `{content: [...], phase: ...}`
-                            // when the message carried a phase label (P3).
-                            let (content_value, stored_phase) =
-                                split_stored_message_content(item.content);
-                            match serde_json::from_value::<Vec<ResponseContentPart>>(content_value)
-                            {
-                                Ok(content_parts) => {
-                                    items.push(ResponseInputOutputItem::Message {
-                                        id: item.id.0.clone(),
-                                        role: item
-                                            .role
-                                            .clone()
-                                            .unwrap_or_else(|| "user".to_string()),
-                                        content: content_parts,
-                                        status: item.status.clone(),
-                                        phase: stored_phase,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize message content: {}", e);
-                                }
-                            }
-                        }
-                        ItemType::FUNCTION_CALL => {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
-                                Ok(func_call) => items.push(func_call),
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize function_call: {}", e);
-                                }
-                            }
-                        }
-                        ItemType::FUNCTION_CALL_OUTPUT => {
-                            tracing::debug!(
-                                item_id = %item.id.0,
-                                "Loading function_call_output from DB"
-                            );
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
-                                Ok(func_output) => {
-                                    tracing::debug!(
-                                        "Successfully deserialized function_call_output"
-                                    );
-                                    items.push(func_output);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to deserialize function_call_output: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        "reasoning" => {}
-                        _ => {
-                            warn!("Unknown item type in conversation: {}", item.item_type);
-                        }
-                    }
-                }
-                if cut {
-                    // The window is cut at the limit: it begins at its first
-                    // turn boundary (the tail of the turn the cut split is not
-                    // sent), and an output whose call is before it is not
-                    // either.
-                    items = without_outputs_of_missing_calls(from_turn_boundary(items));
-                }
-
-                append_current_input(&mut items, &request_body.input, conv_id_str);
-                request_body.input = ResponseInput::Items(items);
-            }
-            Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
-                super::record_error(model, metrics_labels::ERROR_INTERNAL);
-                return Err(error::storage_failure(
-                    "load_conversation_history_failed",
-                    "Failed to load conversation history",
-                    &e,
-                ));
-            }
-        }
+        check_conversation_visible(components, &conv_id, tenant, model).await?;
+        let mut items = conversation_window_items(components, &conv_id, model).await?;
+        append_current_input(&mut items, &request_body.input, conv_id_str);
+        request_body.input = ResponseInput::Items(items);
     }
 
     // Apply previous response chain items if loaded.
@@ -268,6 +87,229 @@ pub(crate) async fn load_input_history(
         previous_response_id,
         existing_mcp_list_tools_labels: existing_mcp_list_tools_labels.into_iter().collect(),
     })
+}
+
+/// The previous-response chain as the caller may see it: the records up to the
+/// first of another tenant (the chain ends there, as it would at a missing
+/// one); a chain ending in a record its client asked not to store (a
+/// background run's record on the shared store, kept for its polling window
+/// only) would break when it goes: no previous response, as for an unstored
+/// id.
+async fn visible_previous_chain(
+    components: &ResponsesComponents,
+    prev_id_str: &str,
+    tenant: Option<&str>,
+    model: &str,
+) -> Result<Vec<Arc<StoredResponse>>, Response> {
+    let prev_id = ResponseId::from(prev_id_str);
+    match components
+        .response_storage
+        .get_response_chain(&prev_id, None)
+        .await
+        .map(|chain| visible_chain(chain.responses, tenant))
+    {
+        Ok(responses)
+            if !responses.is_empty()
+                && !responses
+                    .last()
+                    .is_some_and(|response| is_unstored(response)) =>
+        {
+            Ok(responses)
+        }
+        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
+            super::record_error(
+                model,
+                metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
+            );
+            Err(error::bad_request(
+                "previous_response_not_found",
+                format!("Previous response with id '{prev_id_str}' not found."),
+            ))
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load previous response chain for {}: {}",
+                prev_id_str, e
+            );
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
+            Err(error::storage_failure(
+                "load_previous_response_chain_failed",
+                format!("Failed to load previous response chain for {prev_id_str}"),
+                &e,
+            ))
+        }
+    }
+}
+
+/// Every record's input items followed by its output items, in chain order.
+fn chain_input_items(responses: &[Arc<StoredResponse>]) -> Vec<ResponseInputOutputItem> {
+    responses
+        .iter()
+        .flat_map(|stored| {
+            deserialize_items_from_array(&stored.input)
+                .into_iter()
+                .chain(deserialize_items_from_array(
+                    stored
+                        .raw_response
+                        .get("output")
+                        .unwrap_or(&Value::Array(vec![])),
+                ))
+        })
+        .collect()
+}
+
+/// A conversation of another tenant answers as a missing one.
+async fn check_conversation_visible(
+    components: &ResponsesComponents,
+    conv_id: &ConversationId,
+    tenant: Option<&str>,
+    model: &str,
+) -> Result<(), Response> {
+    match components
+        .conversation_storage
+        .get_conversation(conv_id)
+        .await
+    {
+        Ok(Some(conversation)) if conversation.is_visible_to(tenant) => Ok(()),
+        Ok(_) => {
+            super::record_error(
+                model,
+                metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
+            );
+            Err(error::not_found(
+                "not_found",
+                format!("No conversation found with id '{}'", conv_id.0),
+            ))
+        }
+        Err(e) => {
+            warn!("Failed to check conversation {}: {}", conv_id.0, e);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
+            Err(error::storage_failure(
+                "check_conversation_failed",
+                format!("Failed to check conversation {}", conv_id.0),
+                &e,
+            ))
+        }
+    }
+}
+
+/// The conversation's newest items as request input: listed newest first so
+/// that the limit cuts the oldest off, then put back in the order they were
+/// stored. One more than the limit is asked for: a conversation of exactly
+/// the limit replays whole, and only one with an item past the window is cut.
+/// A window cut at the limit begins at its first turn boundary (the tail of
+/// the turn the cut split is not sent), and an output whose call is before it
+/// is not either.
+async fn conversation_window_items(
+    components: &ResponsesComponents,
+    conv_id: &ConversationId,
+    model: &str,
+) -> Result<Vec<ResponseInputOutputItem>, Response> {
+    let params = ListParams {
+        limit: MAX_CONVERSATION_HISTORY_ITEMS + 1,
+        order: SortOrder::Desc,
+        after: None,
+    };
+    let mut stored_items = match components
+        .conversation_item_storage
+        .list_items(conv_id, params)
+        .await
+    {
+        Ok(stored_items) => stored_items,
+        Err(e) => {
+            warn!("Failed to load conversation history: {}", e);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
+            return Err(error::storage_failure(
+                "load_conversation_history_failed",
+                "Failed to load conversation history",
+                &e,
+            ));
+        }
+    };
+    stored_items.reverse();
+    let cut = stored_items.len() > MAX_CONVERSATION_HISTORY_ITEMS;
+    if cut {
+        stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
+    }
+    let mut items: Vec<ResponseInputOutputItem> = stored_items
+        .into_iter()
+        .filter_map(stored_item_as_input)
+        .collect();
+    if cut {
+        items = without_outputs_of_missing_calls(from_turn_boundary(items));
+    }
+    Ok(items)
+}
+
+/// A stored conversation item as the request input item it was; nothing for
+/// one that is not replayed (a reasoning item, an unknown type, a record that
+/// does not deserialize: the last two are logged).
+fn stored_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputItem> {
+    match item.item_type.as_str() {
+        "message" => {
+            // Stored content may be either the raw content array
+            // (legacy shape) or an object `{content: [...], phase: ...}`
+            // when the message carried a phase label (P3).
+            let (content_value, stored_phase) = split_stored_message_content(item.content);
+            match serde_json::from_value::<Vec<ResponseContentPart>>(content_value) {
+                Ok(content_parts) => Some(ResponseInputOutputItem::Message {
+                    id: item.id.0,
+                    role: item.role.unwrap_or_else(|| "user".to_string()),
+                    content: content_parts,
+                    status: item.status,
+                    phase: stored_phase,
+                }),
+                Err(e) => {
+                    tracing::error!("Failed to deserialize message content: {}", e);
+                    None
+                }
+            }
+        }
+        ItemType::FUNCTION_CALL => {
+            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
+                Ok(func_call) => Some(func_call),
+                Err(e) => {
+                    tracing::error!("Failed to deserialize function_call: {}", e);
+                    None
+                }
+            }
+        }
+        ItemType::FUNCTION_CALL_OUTPUT => {
+            tracing::debug!(
+                item_id = %item.id.0,
+                "Loading function_call_output from DB"
+            );
+            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
+                Ok(func_output) => {
+                    tracing::debug!("Successfully deserialized function_call_output");
+                    Some(func_output)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to deserialize function_call_output: {}", e);
+                    None
+                }
+            }
+        }
+        "reasoning" => None,
+        _ => {
+            warn!("Unknown item type in conversation: {}", item.item_type);
+            None
+        }
+    }
 }
 
 /// Deserialize ResponseInputOutputItems from a JSON array value
@@ -333,7 +375,7 @@ mod tests {
     use rustls::crypto::ring;
     use serde_json::json;
     use smg_data_connector::{
-        AddedAtSequence, ConversationStorage, MemoryConversationItemStorage,
+        AddedAtSequence, ConversationItemId, ConversationStorage, MemoryConversationItemStorage,
         MemoryConversationStorage, MemoryResponseStorage, NewConversation, NewConversationItem,
     };
     use smg_mcp::{McpConfig, McpOrchestrator};
@@ -599,5 +641,39 @@ mod tests {
         // rows 53 to 150, then the request
         assert_eq!(items.len(), 150 - 52 + 1);
         assert_eq!(kinds.last().map(String::as_str), Some("user:item 151"));
+    }
+
+    /// A stored row replays as the item it was (a message by its role and
+    /// content, a call as itself); a reasoning row, a row of an unknown type
+    /// and a message whose content does not read are not replayed.
+    #[test]
+    fn a_stored_row_replays_as_its_item_or_not_at_all() {
+        let row = |item_type: &str, content: Value| ConversationItem {
+            id: ConversationItemId::from("item_1"),
+            response_id: None,
+            item_type: item_type.to_string(),
+            role: Some("assistant".to_string()),
+            content,
+            status: Some("completed".to_string()),
+            created_at: chrono::Utc::now(),
+            tenant: None,
+        };
+        let message = stored_item_as_input(row(
+            "message",
+            json!([{"type": "output_text", "text": "item 1", "annotations": []}]),
+        ))
+        .expect("a message replays");
+        assert_eq!(shape(&[message]), vec!["assistant:item 1"]);
+        let call = stored_item_as_input(row(
+            ItemType::FUNCTION_CALL,
+            json!({"type": "function_call", "call_id": "call_A", "name": "calc", "arguments": "{}", "status": "completed"}),
+        ))
+        .expect("a call replays");
+        assert_eq!(shape(&[call]), vec!["function_call:call_A"]);
+        assert!(stored_item_as_input(row("reasoning", json!({}))).is_none());
+        assert!(stored_item_as_input(row("mystery", json!({}))).is_none());
+        assert!(
+            stored_item_as_input(row("message", json!({"text": "no content array"}))).is_none()
+        );
     }
 }

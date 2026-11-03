@@ -14,34 +14,54 @@
 //! request-type frame (a single raw byte ahead of the payload, so the receiver
 //! dispatches without decoding) is `ADD = 0x00` / `ABORT = 0x01`, and the
 //! abort payload is a plain msgpack `list[str]` of request ids, not a tagged
-//! struct.
+//! struct. A scheduler of the control-wire revision also takes `CONTROL =
+//! 0x02` (`(call_id, method, args)`, answered by a `ControlReplySlim` on the
+//! output socket) and says so by declaring that reply in its handshake
+//! ([`wire_carries_control_calls`]); SMG sends control calls to no other.
 
 pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames},
+    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
+        control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
+        handshake::EngineCoreReadyResponse,
+        positional::check_prefix,
         tokenspeed::{
-            output::{BatchTokenIDOutSlim, TokenSpeedOutput},
+            output::{
+                decode_wire_output, SlimOutputLayout, TokenSpeedOutput, TokenSpeedWireOutput,
+            },
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
-        EngineBatch, EngineLoad, EngineProtocol,
+        EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
     },
 };
 
+/// Whether the engine's handshake declared the control reply
+/// (`positional_layouts["ControlReplySlim"]`): the scheduler then takes
+/// control calls (`FlushCache`, profiling) on its input socket and answers
+/// them on its output socket. A scheduler that declares no layout at all
+/// (today's) carries generate and abort only, and the servicer says so.
+pub fn wire_carries_control_calls(layouts: &BTreeMap<String, Vec<String>>) -> bool {
+    layouts.contains_key(CONTROL_REPLY_SLIM_TAG)
+}
+
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
-/// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`] back.
+/// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`](output::BatchTokenIDOutSlim) back.
 pub struct TokenSpeedProtocol;
 
 impl EngineProtocol for TokenSpeedProtocol {
     type Request = TokenizedGenerateReqInput;
     type Output = TokenSpeedOutput;
+    type Layout = SlimOutputLayout;
 
     fn add_frame() -> Bytes {
         TokenSpeedRequestType::Add.to_frame()
@@ -49,6 +69,19 @@ impl EngineProtocol for TokenSpeedProtocol {
 
     fn abort_frame() -> Bytes {
         TokenSpeedRequestType::Abort.to_frame()
+    }
+
+    /// A scheduler that declares the control reply declares its field order
+    /// too (a tagged struct's tag, element 0, is not a field): a reordered
+    /// or renamed reply fails here, naming the field, instead of decoding
+    /// wrong and leaving the caller to wait out its deadline. A scheduler
+    /// that declares nothing (today's) passes: it takes no control calls.
+    fn check_layouts(ready: &EngineCoreReadyResponse) -> Result<()> {
+        check_prefix(
+            CONTROL_REPLY_SLIM_TAG,
+            &CONTROL_REPLY_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )
     }
 
     fn prompt_tokens(request: &Self::Request) -> u64 {
@@ -72,12 +105,12 @@ impl EngineProtocol for TokenSpeedProtocol {
         &request.rid
     }
 
-    fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // The TokenSpeed generate request carries no DP-rank field and needs
-        // none: rank routing is purely by ZMQ identity — the connector selects
-        // a rank and sends on that rank's socket identity. `None` means "never
-        // pinned", so every request goes through least-loaded selection.
-        None
+    fn data_parallel_rank(request: &Self::Request) -> Option<u32> {
+        // Rank routing is by ZMQ identity: the connector sends on the chosen
+        // rank's socket. The sender decides the rank as the engine's own
+        // dispatcher would (a disaggregated request by its room's residue, a
+        // pinned one by its pin); `None` is the least-loaded selection.
+        request.data_parallel_rank
     }
 
     fn validate(_request: &Self::Request) -> Result<()> {
@@ -90,7 +123,10 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
     /// request, or one whose tensors are all small, keeps its one frame.
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(
+        request: &Self::Request,
+        _layout: &SlimOutputLayout,
+    ) -> Result<(Vec<u8>, Vec<Bytes>)> {
         encode_with_aux_frames(request)
     }
 
@@ -107,7 +143,33 @@ impl EngineProtocol for TokenSpeedProtocol {
         Ok(None)
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
+    fn encode_utility(
+        call_id: i64,
+        method: &str,
+        args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // `[engine, CONTROL, (call_id, method, args)]`, the triple the SGLang
+        // plugin takes: a scheduler of the control-wire revision builds its
+        // own control request from it and answers under the call id. The
+        // caller sends it only to a scheduler whose handshake declared the
+        // reply ([`wire_carries_control_calls`]).
+        Ok(Some((
+            TokenSpeedRequestType::Control.to_frame(),
+            encode_msgpack(&(call_id, method, args))?,
+        )))
+    }
+
+    fn read_layout(ready: &EngineCoreReadyResponse) -> SlimOutputLayout {
+        // The finish-detail columns are read where the engine declares them
+        // (`positional_layouts["BatchTokenIDOutSlim"]`), never at a pinned
+        // position: an engine that declares neither is read as before.
+        SlimOutputLayout::declared(&ready.positional_layouts)
+    }
+
+    fn decode_batch(
+        frames: &[Bytes],
+        layout: &SlimOutputLayout,
+    ) -> Result<EngineBatch<Self::Output>> {
         // Output messages are `[payload, aux...]`. The slim batch carries no
         // tensor fields today, so aux frames are unexpected but not fatal.
         if frames.len() > 1 {
@@ -118,7 +180,19 @@ impl EngineProtocol for TokenSpeedProtocol {
             );
         }
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch: BatchTokenIDOutSlim = decode_msgpack(payload)?;
+        let batch = match decode_wire_output(payload, layout)? {
+            TokenSpeedWireOutput::Tokens(batch) => *batch,
+            TokenSpeedWireOutput::ControlReply(reply) => {
+                return Ok(EngineBatch {
+                    engine_index: reply.engine_index,
+                    utility: Some(UtilityReply {
+                        call_id: reply.call_id,
+                        outcome: Ok(reply.into_outcome()),
+                    }),
+                    ..EngineBatch::default()
+                });
+            }
+        };
         let engine_index = batch.engine_index;
         // `kv_total_pages == 0` marks a pre-piggyback sender (or a snapshot
         // the engine could not take): report no load rather than fabricating
@@ -142,6 +216,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             outputs,
             finished_request_ids,
             load,
+            kv_transfer: None,
             wave: None,
             utility: None,
         })
@@ -157,13 +232,16 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            decode_value,
+            decode_msgpack, decode_value,
             tensor::{
                 resolve_array_bytes, TensorFields, WireArrayData, WireTensor, TENSOR_AUX_MIN_BYTES,
             },
         },
-        protocol::tokenspeed::multimodal::{
-            mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+        protocol::tokenspeed::{
+            multimodal::{
+                mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            },
+            output::BatchTokenIDOutSlim,
         },
     };
 
@@ -175,11 +253,16 @@ mod tests {
             hash,
             pad_value: mm_pad_value(TokenSpeedWireModality::Image, hash),
             offsets: vec![(1, 2)],
-            feature: WireTensor::from_raw("uint8", vec![feature], vec![7; feature]),
+            feature: Some(WireTensor::from_raw(
+                "uint8",
+                vec![feature],
+                vec![7; feature],
+            )),
             model_specific_data: BTreeMap::from([(
                 "grid".to_string(),
                 WireTensor::from_raw("uint8", vec![side], vec![3; side]),
             )]),
+            encode_handshake: None,
         }
     }
 
@@ -199,6 +282,7 @@ mod tests {
                 ],
                 im_token_id: Some(9),
                 video_token_id: None,
+                ..Default::default()
             }),
             ..TokenizedGenerateReqInput::default()
         }
@@ -231,7 +315,7 @@ mod tests {
     fn large_media_tensors_ride_as_frames_the_payload_addresses() {
         let request = media_request();
         let inline = encode_msgpack(&request).unwrap();
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
         assert_eq!(
             aux.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
@@ -286,7 +370,8 @@ mod tests {
             let mut request = media_request();
             request.multimodal_inputs.as_mut().unwrap().mm_items =
                 vec![media_item(1, size, size), media_item(2, size, 0)];
-            let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+            let (payload, aux) =
+                TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
             assert!(aux.is_empty(), "size={size}");
             assert_eq!(payload, encode_msgpack(&request).unwrap(), "size={size}");
         }
@@ -295,7 +380,7 @@ mod tests {
             input_ids: vec![1, 2, 3],
             ..TokenizedGenerateReqInput::default()
         };
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&text).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&text, &Default::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&text).unwrap());
     }
@@ -307,8 +392,10 @@ mod tests {
         let mut request = media_request();
         request.multimodal_inputs.as_mut().unwrap().mm_items[1]
             .feature
+            .as_mut()
+            .unwrap()
             .data = WireArrayData::AuxIndex(1);
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
     }
@@ -328,6 +415,9 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            finished_status_codes: Vec::new(),
+            finished_messages: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -372,7 +462,7 @@ mod tests {
     #[test]
     fn decode_batch_maps_outputs_and_finished_ids() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
         // The batch names its producing DP rank; the connector routes in-flight
@@ -398,7 +488,7 @@ mod tests {
             ..slim_batch()
         };
         let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert!(decoded.load.is_none());
     }
 
@@ -410,7 +500,7 @@ mod tests {
             Bytes::from(encode_msgpack(&slim_batch()).unwrap()),
             Bytes::from_static(b"opaque-aux-frame"),
         ];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
     }
 
@@ -418,6 +508,124 @@ mod tests {
     fn request_type_frames_match_wire_contract() {
         assert_eq!(TokenSpeedProtocol::add_frame().as_ref(), b"\x00");
         assert_eq!(TokenSpeedProtocol::abort_frame().as_ref(), b"\x01");
+        assert_eq!(
+            TokenSpeedRequestType::from_frame(b"\x02"),
+            Some(TokenSpeedRequestType::Control)
+        );
+        assert_eq!(TokenSpeedRequestType::Control.to_frame().as_ref(), b"\x02");
+        // 3 is the encode worker's request type (its own change); 9 is unclaimed.
+        assert_eq!(TokenSpeedRequestType::from_frame(b"\x09"), None);
+    }
+
+    /// `[7, "flush_cache", [1.5]]` as the scheduler's msgspec decoder of the
+    /// control triple takes it.
+    const FLUSH_CALL_VECTOR: &str = "9307ab666c7573685f636163686591cb3ff8000000000000";
+    /// `["ControlReplySlim", 7, True, None, 0]` from the scheduler's own
+    /// struct: an accepted flush on rank 0.
+    const CONTROL_REPLY_ACCEPTED_VECTOR: &str = "95b0436f6e74726f6c5265706c79536c696d07c3c000";
+    /// `["ControlReplySlim", 9, False, "no profiler running", 1]`: a refused
+    /// profiler stop on rank 1.
+    const CONTROL_REPLY_REFUSED_VECTOR: &str =
+        "95b0436f6e74726f6c5265706c79536c696d09c2b36e6f2070726f66696c65722072756e6e696e6701";
+
+    /// A control call rides the `CONTROL` frame as the positional triple the
+    /// SGLang plugin takes; the reply comes back on the output socket as a
+    /// utility reply under the call id; and the handshake's layout
+    /// declaration is what tells a scheduler that takes control calls from
+    /// one that does not.
+    #[test]
+    fn control_calls_ride_the_control_frame_and_replies_resolve_by_call_id() {
+        use crate::protocol::{control::ControlReplySlim, positional::vector_bytes};
+
+        let (frame, payload) =
+            TokenSpeedProtocol::encode_utility(7, "flush_cache", &[OpaqueValue::F64(1.5)])
+                .unwrap()
+                .expect("the control-wire revision has control calls");
+        assert_eq!(frame.as_ref(), b"\x02");
+        let decoded: (i64, String, Vec<OpaqueValue>) = decode_msgpack(&payload).unwrap();
+        assert_eq!(
+            decoded,
+            (7, "flush_cache".to_string(), vec![OpaqueValue::F64(1.5)])
+        );
+        // Byte for byte what the scheduler's msgspec decoder of the triple
+        // takes, and what its `ControlReplySlim` struct emits for an accepted
+        // flush and for a refused profiler stop: the captured vectors.
+        assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
+        let accepted = TokenSpeedProtocol::decode_batch(
+            &[Bytes::from(vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR))],
+            &SlimOutputLayout::default(),
+        )
+        .unwrap();
+        assert_eq!(accepted.engine_index, 0);
+        let utility = accepted.utility.expect("a utility reply");
+        assert_eq!(utility.call_id, 7);
+        assert_eq!(
+            utility.outcome.unwrap().as_map().unwrap(),
+            &[
+                (OpaqueValue::from("success"), OpaqueValue::Boolean(true)),
+                (OpaqueValue::from("message"), OpaqueValue::Nil),
+            ]
+        );
+        let refused: ControlReplySlim =
+            decode_msgpack(&vector_bytes(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
+        assert_eq!(
+            refused,
+            ControlReplySlim {
+                call_id: 9,
+                success: false,
+                message: Some("no profiler running".into()),
+                engine_index: 1,
+            }
+        );
+        let accepted_reply = ControlReplySlim {
+            call_id: 7,
+            success: true,
+            message: None,
+            engine_index: 0,
+        };
+        assert_eq!(
+            encode_msgpack(&accepted_reply).unwrap(),
+            vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR)
+        );
+
+        let reply = ControlReplySlim {
+            call_id: 9,
+            success: false,
+            message: Some("busy".into()),
+            engine_index: 1,
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
+        let batch =
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
+        assert!(batch.outputs.is_empty() && batch.load.is_none());
+        assert_eq!(batch.engine_index, 1);
+        let utility = batch.utility.expect("a utility reply");
+        assert_eq!(utility.call_id, 9);
+        let map = utility.outcome.unwrap();
+        assert_eq!(
+            map.as_map().unwrap()[0],
+            (OpaqueValue::from("success"), OpaqueValue::Boolean(false))
+        );
+        // The token batch still decodes through the same dispatch.
+        let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
+        assert_eq!(
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default())
+                .unwrap()
+                .outputs
+                .len(),
+            2
+        );
+
+        let mut layouts = BTreeMap::new();
+        assert!(!wire_carries_control_calls(&layouts));
+        layouts.insert(
+            "ControlReplySlim".to_string(),
+            ["call_id", "success", "message", "engine_index"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+        assert!(wire_carries_control_calls(&layouts));
     }
 
     #[test]
@@ -427,5 +635,93 @@ mod tests {
         let payload = TokenSpeedProtocol::encode_abort("req-1").unwrap();
         let decoded: Vec<String> = decode_msgpack(&payload).unwrap();
         assert_eq!(decoded, vec!["req-1".to_string()]);
+    }
+
+    /// The declared control reply pins its field order: the scheduler's own
+    /// order passes, a reordered one fails at connect naming the field, and
+    /// a scheduler that declares nothing passes (it takes no control calls).
+    #[test]
+    fn check_layouts_pins_the_control_replys_field_order() {
+        use crate::mock_engine::default_ready_response;
+
+        let ready = |fields: &[&str]| {
+            let mut ready = default_ready_response();
+            ready.positional_layouts.insert(
+                CONTROL_REPLY_SLIM_TAG.to_string(),
+                fields.iter().map(ToString::to_string).collect(),
+            );
+            ready
+        };
+        assert!(TokenSpeedProtocol::check_layouts(&default_ready_response()).is_ok());
+        assert!(TokenSpeedProtocol::check_layouts(&ready(&CONTROL_REPLY_WIRE_FIELDS)).is_ok());
+        let error = TokenSpeedProtocol::check_layouts(&ready(&[
+            "call_id",
+            "message",
+            "success",
+            "engine_index",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("`ControlReplySlim` field 1 is `success` on this side and `message`"),
+            "{error}"
+        );
+    }
+
+    /// The connection's layout comes off the ready response by name, and the
+    /// batch decoder reads the finish details where it points; an engine that
+    /// declares nothing is read as before.
+    #[test]
+    fn the_layout_is_read_off_the_handshake_and_drives_the_batch_decode() {
+        use crate::protocol::tokenspeed::output::{
+            BASE_COLUMN_NAMES, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+        };
+        let mut ready = crate::mock_engine::default_ready_response();
+        assert_eq!(
+            TokenSpeedProtocol::read_layout(&ready),
+            SlimOutputLayout::default()
+        );
+        let mut names: Vec<String> = BASE_COLUMN_NAMES.iter().map(|n| n.to_string()).collect();
+        names.push(FINISHED_STATUS_CODES.to_string());
+        names.push(FINISHED_MESSAGES.to_string());
+        ready
+            .positional_layouts
+            .insert(output::BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), names);
+        let layout = TokenSpeedProtocol::read_layout(&ready);
+        assert_eq!(
+            layout,
+            SlimOutputLayout {
+                finish_status: Some(13),
+                finish_message: Some(14),
+                ..Default::default()
+            }
+        );
+
+        let batch = BatchTokenIDOutSlim {
+            rids: vec!["edge".into()],
+            output_ids: vec![vec![]],
+            finished_reasons: vec!["abort".into()],
+            prompt_tokens: vec![8191],
+            completion_tokens: vec![0],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            finished_status_codes: vec![Some(400)],
+            finished_messages: vec![Some("Invalid request: too long".into())],
+            ..Default::default()
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
+        let read = TokenSpeedProtocol::decode_batch(&frames, &layout).unwrap();
+        assert_eq!(read.outputs[0].finish_status, Some(400));
+        assert_eq!(
+            read.outputs[0].finish_message.as_deref(),
+            Some("Invalid request: too long")
+        );
+        assert_eq!(read.finished_request_ids, vec!["edge".to_string()]);
+        let unread =
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
+        assert_eq!(unread.outputs[0].finish_reason.as_deref(), Some("abort"));
+        assert_eq!(unread.outputs[0].finish_status, None);
+        assert_eq!(unread.outputs[0].finish_message, None);
     }
 }

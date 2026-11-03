@@ -1,6 +1,6 @@
 [package]
 name = "llm-tokenizer"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2021"
 description = "LLM tokenizer library with caching and chat template support"
 license = "Apache-2.0"
@@ -30,7 +30,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
-futures.workspace = true
 # Only used by tokenizer
 aho-corasick = "1.1"
 base64 = "0.23"
@@ -49,13 +48,31 @@ rayon = "1.12"
 thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
-tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.2", optional = true, default-features = false, features = ["regex"] }
-unicode-normalization = "0.1"
+# rc.3 splits what rc.2 compiled unconditionally into features: the pipeline's normalizers, the model types the
+# replayed vocabularies use, the serialized form `from_json` reads, the parallelism switches the adapter sets, and the
+# Unicode-scripts pre-tokenizer; the training progress bar and the hub client stay out.
+tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = true, default-features = false, features = [
+    "regex",
+    "serialize",
+    "normalizers",
+    "parallelism",
+    "bpe",
+    "unigram",
+    "wordpiece",
+    "wordlevel",
+    "unicode-scripts",
+] }
+# The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
+# the same text (a newer crate's tables know marks and compositions the library's do not).
+unicode-normalization-alignments = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+# The hub tests build the Hub's answers to a file request: http for the response, the reqwest hf-hub binds for the error.
+http.workspace = true
+reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).

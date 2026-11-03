@@ -39,7 +39,7 @@ pub(crate) const RESTART_WINDOW: u64 = 1_024;
 
 /// Missed batches beyond this clear the rank instead of keeping its state:
 /// the same decision the servicers make when their replay buffer overflows.
-const GAP_CLEAR_THRESHOLD: u64 = 1_024;
+pub(crate) const GAP_CLEAR_THRESHOLD: u64 = 1_024;
 
 /// Where the rank's cursor stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -144,6 +144,14 @@ impl RankState {
     #[cfg(test)]
     pub(crate) fn replay_pending(&self) -> Option<PendingReplay> {
         self.replay
+    }
+
+    /// The batches a pending replay was asked for (`received - expected`),
+    /// 0 when none is pending. Read before a reset drops the replay, so a
+    /// resume the server refused still counts what it skipped.
+    pub(crate) fn pending_gap(&self) -> u64 {
+        self.replay
+            .map_or(0, |replay| replay.received - replay.expected)
     }
 
     /// Decide what to do with a batch carrying `seq`; `clears` says whether

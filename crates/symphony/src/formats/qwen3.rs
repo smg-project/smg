@@ -6,7 +6,7 @@
 //! per pair of markers as the template writes it and several in one as a model may write a
 //! parallel answer. Qwen 3.5 puts the
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
-//! [`Placement`](crate::tagged::Placement) says.
+//! [`Placement`] says.
 //!
 //! The table carries the one part of its chat template's layout the tags write: after the
 //! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
@@ -61,7 +61,7 @@ mod tests {
         ids::CallIds,
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            reasoning, the_same_at_every_cut, Said,
+            dropped, reasoning, the_same_at_every_cut, weather_declared, Said,
         },
     };
 
@@ -128,20 +128,13 @@ mod tests {
                         source: more_source,
                     },
                 ) if *i == j => {
-                    json.push_str(&more);
+                    json.to_mut().push_str(&more);
                     source.text.to_mut().push_str(&more_source.text);
                 }
                 (_, event) => out.push(event),
             }
         }
         out
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,
@@ -333,7 +326,7 @@ mod tests {
     /// The content deltas a client of the stream receives when `pieces` arrive one by one after
     /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
     fn content_deltas(format: Format, prompt: &str, pieces: &[&str]) -> Vec<String> {
-        let mut parser = Engine::new(format, declared());
+        let mut parser = Engine::new(format, weather_declared());
         let mut out = Events::new();
         parser
             .feed(
@@ -1042,25 +1035,6 @@ mod tests {
         );
     }
 
-    /// A tool `get_weather` with a string `city` and an integer `days`.
-    fn declared() -> Declared {
-        use openai_protocol::common::{Function, Tool};
-        use serde_json::json as value;
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
-
     const TAGGED_CALL: &str = concat!(
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>",
         "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
@@ -1069,7 +1043,7 @@ mod tests {
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         for piece in pieces {
@@ -1080,11 +1054,11 @@ mod tests {
     }
 
     /// A parameter written in XML-attribute style, `<parameter name="city">`, which the tagged
-    /// syntax has no tag for: the call is delivered with no arguments, and the chat message's
-    /// content is the model's lines, byte for byte, the whitespace between the words included,
-    /// whole, at every cut and in the stream's deltas alike.
+    /// syntax has no tag for: the call is delivered with no arguments, and the model's lines are
+    /// refused, byte for byte, the whitespace between the words included, never the chat
+    /// message's content nor a delta, at every cut alike.
     #[test]
-    fn an_xml_attribute_parameter_reaches_the_client_as_the_model_wrote_it() {
+    fn an_xml_attribute_parameter_is_refused_never_content() {
         let output = concat!(
             "<tool_call>\n<function=get_weather>\n<parameter name=\"city\">Paris</parameter>\n",
             "<parameter name=\"days\">three or four days</parameter>\n</function>\n</tool_call>"
@@ -1100,18 +1074,32 @@ mod tests {
                 .filter_map(|choice| choice.delta.content)
                 .collect()
         };
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect()
+        };
         let whole = run_tagged(&[output], EngineFinish::Stop);
         let message = chat::message(0, &whole).message;
-        assert_eq!(message.content.as_deref(), Some(lines));
+        assert_eq!(message.content, None);
         let calls = message.tool_calls.expect("a call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[0].function.arguments.as_deref(), Some("{}"));
-        assert_eq!(streamed(&whole), lines);
+        assert_eq!(streamed(&whole), "");
+        assert_eq!(refused(&whole), lines);
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
             let events = run_tagged(&[&output[..cut], &output[cut..]], EngineFinish::Stop);
-            assert_eq!(content(&events).as_deref(), Some(lines), "cut at {cut}");
-            assert_eq!(streamed(&events), lines, "cut at {cut}");
+            assert_eq!(content(&events), None, "cut at {cut}");
+            assert_eq!(streamed(&events), "", "cut at {cut}");
+            assert_eq!(refused(&events), lines, "cut at {cut}");
         }
     }
 
@@ -1309,22 +1297,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_block_its_marker_closes_inside_a_string_leaves_it_open_and_so_does_a_cut_stream() {
-        // The block's closing marker arrives before `</function>`, inside a string: nothing is
-        // closed for a value the model never finished, and one `Malformed` event of no bytes,
-        // under the engine's name for a block a marker closed, says so before the call's end.
+    fn a_tagged_block_its_marker_closes_inside_a_string_closes_it_there_and_a_cut_stream_does_not()
+    {
+        // The block's closing marker arrives before `</function>`, inside a string: the model
+        // ended the call, so the string is closed with the value's bytes whole, under one
+        // `Malformed { OpenAtTheMarker }` event of no bytes right before the closing quote, and
+        // the arguments read as JSON.
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
         let events = run_tagged(&[output], EngineFinish::Stop);
-        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
         assert_eq!(bytes(&events), output);
-        let ended = events
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .expect("the call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(
             matches!(
-                &events[ended - 1],
-                Event::Malformed { text, .. } if text.text.is_empty()
+                &events[at..at + 2],
+                [
+                    Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                    Event::ToolCallArguments { json, .. }
+                ] if text.text.is_empty() && json == "\""
             ),
             "{events:#?}"
         );
@@ -1383,7 +1376,7 @@ mod tests {
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         parser
@@ -1750,7 +1743,7 @@ mod tests {
         ));
     }
 
-    /// The tool `get_weather` of [`declared()`] and one without parameters, as a request lists
+    /// The tool `get_weather` of [`weather_declared()`] and one without parameters, as a request lists
     /// them.
     fn weather_tools() -> Vec<openai_protocol::common::Tool> {
         use openai_protocol::common::{Function, Tool};
@@ -1794,7 +1787,7 @@ mod tests {
     /// The events of `pieces` after the turn's opener, read by `format` with the weather tool.
     fn read_with(format: &Format, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
-            &mut engine(format.clone(), declared()),
+            &mut engine(format.clone(), weather_declared()),
             "<|im_start|>assistant\n",
             pieces,
         )

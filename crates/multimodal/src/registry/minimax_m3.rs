@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -10,7 +12,7 @@ use crate::{
         EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
         VideoSamplingInfo,
     },
-    vision::{MiniMaxM3VisionProcessor, PreProcessorConfig},
+    vision::{MiniMaxM3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 /// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
@@ -20,7 +22,7 @@ const MAX_IMAGES_PER_REQUEST: usize = 200;
 const MAX_VIDEOS_PER_REQUEST: usize = 20;
 
 /// Frame rate the reference `video_processor.py` samples at.
-const DEFAULT_VIDEO_SAMPLE_FPS: f32 = 1.0;
+const DEFAULT_VIDEO_SAMPLE_FPS: f64 = 1.0;
 
 /// MiniMax-M3 vision spec.
 ///
@@ -377,7 +379,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
 
     /// Matching the reference sampling rate keeps a default video request at
     /// the reference's frame and token counts.
-    fn default_video_sample_fps(&self) -> Option<f32> {
+    fn default_video_sample_fps(&self) -> Option<f64> {
         Some(DEFAULT_VIDEO_SAMPLE_FPS)
     }
 
@@ -385,6 +387,29 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     /// keeps the last frame.
     fn video_frame_sampling(&self) -> FrameSampling {
         FrameSampling::Interval
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                MiniMaxM3VisionProcessor::from_preprocessor_config(preprocessor_config).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

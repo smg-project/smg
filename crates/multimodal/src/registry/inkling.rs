@@ -9,7 +9,7 @@ use crate::{
         MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{processors::InklingImageProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct InklingSpec;
@@ -102,6 +102,29 @@ impl ModelProcessorSpec for InklingSpec {
             limits.insert(Modality::Audio, 10);
         }
         Ok(limits)
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(
+                InklingImageProcessor::from_preprocessor_config(preprocessor_config).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn audio_processor(

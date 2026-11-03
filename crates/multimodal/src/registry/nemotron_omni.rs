@@ -37,7 +37,7 @@ use crate::{
     },
     vision::{
         processors::nemotron_omni::{grid_tokens, VIDEO_TEMPORAL_PATCH_SIZE},
-        NemotronOmniProcessor, PreProcessorConfig,
+        NemotronOmniProcessor, PreProcessorConfig, VisionPreProcessor,
     },
 };
 
@@ -285,6 +285,21 @@ impl ModelProcessorSpec for NemotronOmniSpec {
             limits.insert(Modality::Audio, MAX_AUDIOS_PER_REQUEST);
         }
         Ok(limits)
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        _preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(NemotronOmniProcessor::new())),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn audio_processor(

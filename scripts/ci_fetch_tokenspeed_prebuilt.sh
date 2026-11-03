@@ -8,7 +8,7 @@
 #   /opt/smg-ci          venv + prebuilt stamp
 # then advertise the venv via SMG_BAKED_VENV (GITHUB_ENV, i.e. subsequent
 # steps) so ci_setup_python_venv.sh adopts it and
-# ci_install_tokenspeed.sh upgrades it from the nightly wheel index.
+# ci_install_tokenspeed.sh finds the pinned nightly already installed.
 #
 # PER-NODE CACHE. The runner pods are ephemeral and their dind storage is a
 # per-pod emptyDir, so without a cache every lane re-pulls the ~8 GB carrier

@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     error, known,
-    metrics::{bool_to_static_str, metrics_labels, Metrics},
+    metrics::{bool_to_static_str, error_reason_for_refused_selection, metrics_labels, Metrics},
     tenant::{storage_tenant, TenantRequestMeta},
     worker::{SelectWorkerRequest, WorkerSource},
 };
@@ -71,7 +71,11 @@ pub(in crate::openai) async fn route_responses(
     {
         Ok(w) => w,
         Err(response) => {
-            super::record_error(model, metrics_labels::ERROR_NO_WORKERS);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
+            );
             return response;
         }
     };
@@ -86,7 +90,11 @@ pub(in crate::openai) async fn route_responses(
         .as_ref()
         .is_some_and(|s| !s.is_empty());
     if conversation.is_some() && has_previous_response {
-        super::record_error(model, metrics_labels::ERROR_VALIDATION);
+        super::record_error(
+            model,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
         return error::bad_request(
             "invalid_request",
             "Cannot specify both 'conversation' and 'previous_response_id'".to_string(),
@@ -120,7 +128,11 @@ pub(in crate::openai) async fn route_responses(
     let mut payload = match to_value_exact(&request_body) {
         Ok(v) => v,
         Err(e) => {
-            super::record_error(model, metrics_labels::ERROR_VALIDATION);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
+            );
             return error::bad_request(
                 "invalid_request",
                 format!("Failed to serialize request: {e}"),
@@ -130,7 +142,11 @@ pub(in crate::openai) async fn route_responses(
 
     let provider = resolve_provider(deps.provider_registry, worker.as_ref(), model);
     if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
-        super::record_error(model, metrics_labels::ERROR_VALIDATION);
+        super::record_error(
+            model,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
         return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
     }
 

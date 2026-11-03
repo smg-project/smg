@@ -11,10 +11,10 @@ use image::DynamicImage;
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
     encoder_inputs::EncoderDtype,
-    types::RgbFrameRef,
+    types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
     },
 };
@@ -93,6 +93,7 @@ impl Qwen3OmniVisionProcessor {
                 .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         )
+        .with_transform_config(config)
     }
 
     fn from_video_preprocessor_config(config: &PreProcessorConfig) -> Self {
@@ -109,29 +110,24 @@ impl Qwen3OmniVisionProcessor {
                 .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         )
+        .with_transform_config(config)
     }
 
-    fn with_image_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides() {
+    fn with_transform_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.inner = self.inner.with_preprocessor_config(config);
+        self
+    }
+
+    /// Build a processor for a resolved image or video configuration.
+    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+        if modality == Modality::Video && !config.is_image_only_processor_type() {
+            Self::from_video_preprocessor_config(config)
+        } else {
+            // Qwen3-Omni's shared preprocessor_config.json carries image
+            // limits. The HF processor supplies separate video defaults at
+            // call time, so those image limits must not become a per-frame
+            // video budget here.
             Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
-    }
-
-    fn with_video_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides() {
-            if config.is_image_only_processor_type() {
-                // Qwen3-Omni's shared preprocessor_config.json carries image
-                // limits. The HF processor supplies separate video defaults at
-                // call time, so those image limits must not become a per-frame
-                // video budget here.
-                Self::from_preprocessor_config(config)
-            } else {
-                Self::from_video_preprocessor_config(config)
-            }
-        } else {
-            self.clone()
         }
     }
 }
@@ -152,61 +148,44 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.with_image_preprocessor_config(config)
-            .inner
-            .preprocess(images, config)
+        self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        self.with_image_preprocessor_config(config)
-            .inner
-            .preprocess_wire(images, config, dtype)
+        self.inner.preprocess_wire(images, dtype)
     }
 
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        config: &PreProcessorConfig,
+        clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.with_video_preprocessor_config(config)
-            .inner
-            .preprocess_video(frames, config)
+        self.inner.preprocess_video(frames, clip)
     }
 
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        config: &PreProcessorConfig,
+        clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.with_video_preprocessor_config(config)
-            .inner
-            .preprocess_video_rgb(frames, config)
+        self.inner.preprocess_video_rgb(frames, clip)
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        self.with_image_preprocessor_config(config)
-            .inner
-            .calculate_num_tokens(width, height, config)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        self.inner.calculate_num_tokens(width, height)
     }
 
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        self.inner.get_processed_size(config)
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        self.inner.get_processed_size()
     }
 }
 
@@ -269,7 +248,7 @@ mod tests {
             r#"{"image_processor_type":"Qwen2VLImageProcessor","min_pixels":3136,"max_pixels":12845056,"patch_size":16,"merge_size":2,"temporal_patch_size":2}"#,
         )
         .unwrap();
-        let processor = Qwen3OmniVisionProcessor::new().with_video_preprocessor_config(&config);
+        let processor = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video);
 
         assert_eq!(processor.inner.video_min_pixels(), DEFAULT_VIDEO_MIN_PIXELS);
         assert_eq!(processor.inner.video_max_pixels(), DEFAULT_VIDEO_MAX_PIXELS);
@@ -283,7 +262,7 @@ mod tests {
     fn empty_config_uses_omni_half_normalization() {
         let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
         let output = Qwen3OmniVisionProcessor::new()
-            .preprocess(&[image], &PreProcessorConfig::default())
+            .preprocess(&[image])
             .unwrap();
 
         assert!(output
@@ -296,7 +275,7 @@ mod tests {
     #[test]
     fn sampled_video_fps_controls_mrope_grid_timing() {
         let config = PreProcessorConfig::from_json(
-            r#"{"size":{"shortest_edge":1024,"longest_edge":65536},"fps":4.0}"#,
+            r#"{"size":{"shortest_edge":1024,"longest_edge":65536}}"#,
         )
         .unwrap();
         let frames = vec![
@@ -304,8 +283,8 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
         ];
 
-        let output = Qwen3OmniVisionProcessor::new()
-            .preprocess_video(&frames, &config)
+        let output = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video)
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(4.0))
             .unwrap();
 
         assert!(matches!(

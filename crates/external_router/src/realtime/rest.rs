@@ -11,7 +11,9 @@ use tracing::error;
 use super::RealtimeLabels;
 use crate::{
     header_utils::extract_auth_header,
-    metrics::{metrics_labels, Metrics},
+    metrics::{
+        error_reason_for_refused_selection, error_reason_from_status, metrics_labels, Metrics,
+    },
     upstream_body,
     worker::ExternalWorker,
 };
@@ -53,6 +55,7 @@ pub async fn forward_realtime_rest(
                 model,
                 endpoint_label,
                 metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
             );
             return response;
         }
@@ -68,6 +71,7 @@ pub async fn forward_realtime_rest(
                 model,
                 endpoint_label,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -109,6 +113,7 @@ pub async fn forward_realtime_rest(
                     model,
                     endpoint_label,
                     metrics_labels::ERROR_BACKEND,
+                    error_reason_from_status(status),
                 );
             }
             response
@@ -123,6 +128,7 @@ pub async fn forward_realtime_rest(
                 model,
                 endpoint_label,
                 metrics_labels::ERROR_BACKEND,
+                metrics_labels::REASON_TRANSPORT_DISCONNECT,
             );
             StatusCode::BAD_GATEWAY.into_response()
         }

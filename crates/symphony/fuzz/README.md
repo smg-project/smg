@@ -136,6 +136,6 @@ check saw. In fork mode the message is in the job's own log; replaying the artif
    as a Rust string literal and the cuts are enough to replay it; attach the minimized bytes when
    the literal is unwieldy), the invariant that failed and the check's message. Nothing else from
    the machine that ran it. A crash is a parser defect: the fix adds the output to the subject's
-   outputs in `tests/contract.rs`, where the contract test then replays it under every chunking.
+   outputs in `tests/parser/contract.rs`, where the contract test then replays it under every chunking.
 
 A case that is no breach but a wrong check is fixed in `src/lib.rs`, with the case as a unit test.

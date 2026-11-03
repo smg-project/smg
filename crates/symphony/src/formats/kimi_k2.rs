@@ -25,21 +25,27 @@
 //! there, as the engine reads every table (bellwether #16), and the block's close ends a call
 //! still open with what arrived; a second `<|tool_call_begin|>` inside an open call is the
 //! call's text, since a shaped call's opener may open none and the engine cannot send it back
-//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether holds the
-//! line's manifests and no recorded set yet: the table stands on the tests below, which hold a
-//! hand-picked set of the turns the six templates render for the shapes a tool-calling conversation
-//! takes (an answer, a call, two calls, content before a call, a thought and a call, the turn after
-//! a tool result, a call with thinking off, arguments that nest and hold text outside ASCII, a
-//! brace inside a string value), read whole and at every cut, and on the id contract; the six slugs
-//! are listed in the corpus harness, which replays their recorded sets from the fixture pin once
-//! bellwether has them. The gateway's older `kimik2` parser reads the same spelling, with the
-//! `kimi_thinking` and `kimi_k25` thought parsers; one departure from `kimi_thinking`, which read
-//! everything before `</think>` as the thought whether or not `<think>` came first: this table
-//! starts K2 Thinking in content, so an output that closes a thought it never opened is content as
-//! written, the marker included (the templates always write the opener; the tests pin it).
+//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether records
+//! the six groups' hand-written sets with the vendor's tokenizer class in its sandbox: the render
+//! set whole, and of the parse sets the content and reasoning cases, since the templates write a
+//! call's id and arguments and never its name (a served model puts the name inside the id, and the
+//! hand-written cases carry no id), so a renamed call renders the same and the recorder refuses
+//! every call case as lossy. The corpus harness replays what is recorded from the fixture pin,
+//! five to ten cases per group, each as the reference says but the listed reasoning probe; the
+//! call shapes stand on the tests below, which hold a hand-picked set of the turns the six
+//! templates render for the shapes a tool-calling conversation takes (an answer, a call, two
+//! calls, content before a call, a thought and a call, the turn after a tool result, a call with
+//! thinking off, arguments that nest and hold text outside ASCII, a brace inside a string value),
+//! read whole and at every cut, and on the id contract. The gateway's older `kimik2` parser reads
+//! the same spelling, with the `kimi_thinking` and `kimi_k25` thought parsers; one departure from
+//! `kimi_thinking`, which read everything before `</think>` as the thought whether or not `<think>`
+//! came first: this table starts K2 Thinking in content, so an output that closes a thought it
+//! never opened is content as written, the marker included (a thought's opener comes first, from
+//! the model on K2 Thinking and from the prompt on K2.5, K2.6 and K2.7-Code, and K2 Instruct
+//! writes none; the tests pin it).
 //!
 //! The structural tag of a forced or required call is written from the table's layout
-//! ([`layout`], [`Format::grammar_for`]), which spells a call as the templates render one: the
+//! (`layout`, [`Format::grammar_for`]), which spells a call as the templates render one: the
 //! block's opener, `<|tool_call_begin|>functions.NAME:`, the call's number as a run of digits
 //! (the model counts its calls; no request knows the count ahead), `<|tool_call_argument_begin|>`,
 //! the tool's schema as the one JSON value, `<|tool_call_end|>`, and the block's close; from the
@@ -191,7 +197,7 @@ fn call_shape() -> CallShape {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
+    use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
     use super::*;
@@ -200,7 +206,7 @@ mod tests {
         event::{DropReason, Event, FinishReason},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        testing::{bytes, calls, content, drive, drive_to, reasoning},
+        testing::{bytes, calls, content, drive, drive_to, finish, reasoning, tool},
         Declared,
     };
 
@@ -337,19 +343,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it, and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     #[test]
@@ -704,19 +697,6 @@ mod tests {
         let table = kimi_k2();
         assert_eq!(table.validate(), Ok(()));
         assert_eq!(table.name(), "kimi_k2");
-    }
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
     }
 
     /// The tool of the recorded named case: a forecast with three required parameters.

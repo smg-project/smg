@@ -34,18 +34,20 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
 
 # The switch's flag and choices live with the plugins' registration (stdlib
 # only); re-exported here as this module's documented values.
+from smg_grpc_servicer.metrics_flag import METRICS_PORT_FLAG
 from smg_grpc_servicer.servicer_impl_flag import (  # noqa: F401
     IMPLS,
     SERVICER_IMPL_FLAG,
 )
 from smg_grpc_servicer.warmup import (
+    DEFAULT_BUDGET_SECS,
     WarmupInputs,
     WarmupPlan,
     WarmupReport,
@@ -76,7 +78,31 @@ DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 # over half an hour to load on a cold start; four hours leaves room for the
 # storage path. 0 lifts the ceiling.
 DEFAULT_STARTUP_CEILING_SECS = 4 * 3600.0
+# Bound on the connected engine's silence: how long it may hold requests in
+# flight, in total since its last output, with nothing pending prefill, before
+# the Rust server treats it as dead and fails them (the crate's default). The
+# prompt tokens pending prefill extend it at ``DEFAULT_PREFILL_TOKENS_PER_SEC``:
+# a wire that says nothing until a prompt's first token is silent through a
+# whole prefill, and a batch of long prompts prefills for longer than any fixed
+# bound.
+DEFAULT_SILENCE_TIMEOUT_SECS = 300.0
+# The prefill rate the silence bound allows the engine, in tokens per second: a
+# bound on how slowly a healthy engine may prefill (500 s per million pending
+# prompt tokens on top of the window; the crate's default), not an estimate of
+# how fast it does. 0 allows nothing.
+DEFAULT_PREFILL_TOKENS_PER_SEC = 2000
 _POLL_SECS = 0.5
+# How long the planned warm-up waits, once the engine connected, for the
+# KV-event relay's subscription to reach the engine's publisher (the server's
+# ``kv_relay_subscribed``). The warm-up's batches are the first the engine
+# publishes, and a subscription that lands after them leaves the relay's
+# history starting late for the engine's life (every gateway that subscribes
+# later is served a snapshot marked degraded). The relay dials the publisher
+# every second from the servicer's start and the engines bind it before their
+# handshake, so the subscription has normally landed before this wait begins;
+# a publisher that never comes up holds readiness no longer than this, and
+# the warm-up runs without the relay.
+RELAY_JOIN_GRACE_SECS = 30.0
 # Grace a scheduler process this process started gets between SIGTERM and
 # SIGKILL at shutdown, and how long the kill is waited for.
 SCHEDULER_GRACE_SECS = 10.0
@@ -182,6 +208,30 @@ def env_float(
     return value
 
 
+def env_int(
+    name: str,
+    default: int,
+    *,
+    environ: Mapping[str, str] | None = None,
+    minimum: int | None = None,
+) -> int:
+    """``int(environ[name])``, ``default`` when the variable is unset or
+    empty. A value that is not a whole number, or below ``minimum``, is a
+    :class:`ServicerConfigError` naming the variable: a fraction is refused
+    rather than rounded, so ``0.5`` does not become a silent ``0``."""
+    source = os.environ if environ is None else environ
+    raw = source.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ServicerConfigError(f"{name}={raw!r} is not a whole number") from None
+    if minimum is not None and value < minimum:
+        raise ServicerConfigError(f"{name}={raw!r} must be at least {minimum}")
+    return value
+
+
 def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | None:
     """A TCP port from ``environ[name]``, 1 to 65535; ``None`` when the
     variable is unset, empty or 0 (the caller picks a free port). Anything
@@ -199,6 +249,82 @@ def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | No
     if not 1 <= value <= 65535:
         raise ServicerConfigError(f"{name}={raw!r} must be between 1 and 65535")
     return value
+
+
+def metrics_port(
+    args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> int | None:
+    """The port the Rust servicer serves Prometheus metrics on, or ``None``
+    for no endpoint: ``--metrics-port`` when the launcher's namespace carries
+    it (``args.metrics_port``), else ``environ[env_name]``, else none. The
+    flag's action exports its value under the variable on every launcher, so
+    a launcher whose namespace keeps only the engine's own fields reads the
+    flag through the variable too. 0 binds an ephemeral port (tests); any
+    other value outside 1 to 65535 is a :class:`ServicerConfigError` naming
+    the flag and the variable."""
+    source = os.environ if environ is None else environ
+    value = getattr(args, "metrics_port", None) if args is not None else None
+    origin = METRICS_PORT_FLAG
+    if value is None:
+        raw = source.get(env_name)
+        if raw is None or not raw.strip():
+            return None
+        origin = env_name
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ServicerConfigError(f"{env_name}={raw!r} is not a port number") from None
+    if not 0 <= int(value) <= 65535:
+        raise ServicerConfigError(f"{origin}={value!r} must be a port between 0 and 65535")
+    return int(value)
+
+
+def metrics_bind_address(
+    args: Any,
+    *,
+    port_env: str,
+    host_env: str,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Where the Rust servicer serves ``GET /metrics``, as ``host:port`` (an
+    IPv6 host bracketed), or ``None`` for no endpoint: the port from
+    :func:`metrics_port`; the host from ``--metrics-host``
+    (``args.metrics_host``), else ``environ[host_env]``, else the gRPC
+    listener's host (``args.host``; every interface when unset, as the gRPC
+    bind). A metrics port equal to the gRPC port (``args.port``) is a
+    :class:`ServicerConfigError`: the listener could not bind beside the
+    gRPC one, and the error belongs before the engine starts."""
+    source = os.environ if environ is None else environ
+    port = metrics_port(args, port_env, environ=source)
+    if port is None:
+        return None
+    grpc_port = int(getattr(args, "port", 0) or 0)
+    if port and port == grpc_port:
+        raise ServicerConfigError(
+            f"{METRICS_PORT_FLAG}={port} is the gRPC port: the metrics listener needs a port "
+            f"of its own (or 0 for an ephemeral one)"
+        )
+    host = getattr(args, "metrics_host", None) if args is not None else None
+    if not host:
+        host = source.get(host_env) or None
+    if not host:
+        host = getattr(args, "host", None) or "0.0.0.0"
+    return host_port(host, port)
+
+
+def check_metrics_port_needs_rust(
+    impl: str, args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """A metrics port given (the flag or its variable) with the Python
+    servicer selected is a :class:`ServicerConfigError`: the Python servicer
+    exposes no metrics endpoint, and a port nobody will serve is a
+    misconfiguration best refused before the engine starts."""
+    if impl == "rust" or metrics_port(args, env_name, environ=environ) is None:
+        return
+    raise ServicerConfigError(
+        f"{METRICS_PORT_FLAG} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
+        "servicer exposes no metrics endpoint"
+    )
 
 
 def free_port() -> int:
@@ -241,6 +367,8 @@ class LauncherKnobs:
     drain_secs: float
     startup_timeout_secs: float
     startup_ceiling_secs: float
+    silence_timeout_secs: float
+    prefill_tokens_per_sec: int
     socket_dir: str
 
 
@@ -250,16 +378,20 @@ def read_launcher_knobs(
     drain_secs_env: str,
     startup_timeout_secs_env: str,
     startup_ceiling_secs_env: str,
+    silence_timeout_secs_env: str,
+    prefill_tokens_per_sec_env: str,
     socket_dir: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> LauncherKnobs:
     """Every knob of a Rust-servicer launcher at once, each failure a
     :class:`ServicerConfigError` naming its variable: the handshake port (1 to
     65535, or a free one), the drain on a signal (0 s or more), the startup
-    silence bound (above 0 s), the startup ceiling (0 lifts it), the IPC socket
-    directory (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the
-    default; created). Nothing is read later: a bad value is refused before
-    the gRPC port is bound and before the engine starts."""
+    silence bound (above 0 s), the startup ceiling (0 lifts it), the connected
+    engine's silence bound (above 0 s) and the prefill rate it allows (0 or
+    more tokens per second; 0 allows nothing), the IPC socket directory
+    (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the default; created).
+    Nothing is read later: a bad value is refused before the gRPC port is
+    bound and before the engine starts."""
     return LauncherKnobs(
         handshake_port=env_port(handshake_port_env, environ=environ),
         drain_secs=env_float(drain_secs_env, DEFAULT_DRAIN_SECS, environ=environ, minimum=0.0),
@@ -272,23 +404,35 @@ def read_launcher_knobs(
         startup_ceiling_secs=env_float(
             startup_ceiling_secs_env, DEFAULT_STARTUP_CEILING_SECS, environ=environ, minimum=0.0
         ),
+        silence_timeout_secs=env_float(
+            silence_timeout_secs_env, DEFAULT_SILENCE_TIMEOUT_SECS, environ=environ, positive=True
+        ),
+        prefill_tokens_per_sec=env_int(
+            prefill_tokens_per_sec_env, DEFAULT_PREFILL_TOKENS_PER_SEC, environ=environ, minimum=0
+        ),
         socket_dir=prepare_socket_dir(
             default_socket_dir(environ) if socket_dir is None else socket_dir
         ),
     )
 
 
-def read_warmup_setting(name: str, *, environ: Mapping[str, str] | None = None) -> WarmupSetting:
+def read_warmup_setting(
+    name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    default_budget_secs: float = DEFAULT_BUDGET_SECS,
+) -> WarmupSetting:
     """The planned warm-up's setting from ``environ[name]``
-    (:func:`smg_grpc_servicer.warmup.parse_setting`); a value the knob does
-    not take is a :class:`ServicerConfigError` naming the variable, found with
-    the other knobs before the engine starts. A launcher without such a
-    variable (an empty ``name``) runs none."""
+    (:func:`smg_grpc_servicer.warmup.parse_setting`, under the launcher's
+    ``default_budget_secs``); a value the knob does not take is a
+    :class:`ServicerConfigError` naming the variable, found with the other
+    knobs before the engine starts. A launcher without such a variable (an
+    empty ``name``) runs none."""
     if not name:
         return WarmupSetting(False)
     source = os.environ if environ is None else environ
     try:
-        return parse_setting(source.get(name), name=name)
+        return parse_setting(source.get(name), name=name, default_budget_secs=default_budget_secs)
     except ValueError as error:
         raise ServicerConfigError(str(error)) from None
 
@@ -782,7 +926,9 @@ class SchedulerProcesses:
     it was given, or raises; :meth:`watch_ready` runs it on a thread, so the
     reports are drained (a process never blocks on its report) and a failed
     start is logged at once, while the supervisor keeps polling the
-    processes themselves.
+    processes themselves. ``holding`` is what lives as long as the processes
+    do (a prefill side's bootstrap server, which the ranks register with):
+    referenced here, and shut down with them where it has a ``shutdown``.
     """
 
     def __init__(
@@ -791,10 +937,12 @@ class SchedulerProcesses:
         *,
         ready: Callable[[], Any] | None = None,
         grace_secs: float = SCHEDULER_GRACE_SECS,
+        holding: Iterable[Any] = (),
     ):
         self.processes = list(processes)
         self._ready = ready
         self._grace_secs = grace_secs
+        self.holding = list(holding)
         self.ready_thread: threading.Thread | None = None
         self.ready_error: Exception | None = None
 
@@ -846,6 +994,11 @@ class SchedulerProcesses:
                 )
                 process.kill()
                 process.join(SCHEDULER_KILL_SECS)
+        for held in self.holding:
+            shutdown = getattr(held, "shutdown", None)
+            if callable(shutdown) and not asyncio.iscoroutinefunction(shutdown):
+                with contextlib.suppress(Exception):
+                    shutdown()
 
 
 def wait_for_ready_reports(
@@ -1081,16 +1234,61 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 
 def hold_readiness(server: Any, ready: bool) -> None:
     """Hold (``False``) or release (``True``) the server's health answer
-    alone, admission left open, so the servicer's own requests still reach
-    the engine while readiness is held (the planned warm-up runs over the
-    server's own port): ``set_ready`` where the server has it. ``set_serving``
-    is the drain switch (it closes admission as well, and would refuse the
-    warm-up's requests); a server without ``set_ready`` is an older binding
-    whose ``set_serving`` flipped health alone, and that is what it gets."""
+    alone, admission left open to the servicer's own requests (the planned
+    warm-up's ``smg-warmup-<n>``, over the server's own port) and closed to
+    every other while readiness is held, so nothing shares the engine's
+    steps with the warm-up: ``set_ready`` where the server has it.
+    ``set_serving`` is the drain switch (it closes admission as well, and
+    would refuse the warm-up's requests); a server without ``set_ready`` is
+    an older binding whose ``set_serving`` flipped health alone, and that is
+    what it gets."""
     setter = getattr(server, "set_ready", None)
     if setter is None:
         setter = server.set_serving
     setter(ready)
+
+
+class _WarmupHold:
+    """The planned warm-up, held after the engine connected until the
+    KV-event relay's subscription reached the engine's publisher, so the
+    warm-up's batches start the relay's history and a gateway that subscribes
+    later gets the engine's whole life; released after
+    :data:`RELAY_JOIN_GRACE_SECS` without it, with a warning. A server that
+    says nothing about its relay (an older binding) is not held."""
+
+    def __init__(self, warmup: Callable[[], WarmupReport], connected_at: float) -> None:
+        self.warmup = warmup
+        self.connected_at = connected_at
+        self.waiting = False
+
+    def released(self, server: Any, now: float) -> bool:
+        waited = now - self.connected_at
+        if getattr(server, "kv_relay_subscribed", True):
+            if self.waiting:
+                logger.info(
+                    "KV event relay joined the engine's publisher %.1f s after the engine "
+                    "connected; the planned warm-up starts",
+                    waited,
+                )
+            return True
+        if waited >= RELAY_JOIN_GRACE_SECS:
+            logger.warning(
+                "KV event relay has not joined the engine's publisher %.0f s after the engine "
+                "connected; the planned warm-up starts without it (its batches reach the relay "
+                "only through the engine's replay; without one the relay's history starts late "
+                "and its snapshots say so)",
+                waited,
+            )
+            return True
+        if not self.waiting:
+            self.waiting = True
+            logger.info(
+                "KV event relay has not joined the engine's publisher yet; the planned warm-up "
+                "waits for the subscription (%.0f s at most) so its batches start the relay's "
+                "history",
+                RELAY_JOIN_GRACE_SECS,
+            )
+        return False
 
 
 def _warmup_over(server: Any, task: asyncio.Task) -> None:
@@ -1127,9 +1325,13 @@ async def supervise(
 
     A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
     the caller held the server's health at NOT_SERVING with
-    :func:`hold_readiness`, admission open) runs on a thread the moment the
-    engine connected, with the engine polled meanwhile; the health flips to
-    SERVING when it returned, whatever it returned.
+    :func:`hold_readiness`, admission open to the warm-up's own requests only)
+    runs on a thread once the engine
+    connected and the KV-event relay's subscription reached the engine's
+    publisher (``kv_relay_subscribed``, waited for up to
+    :data:`RELAY_JOIN_GRACE_SECS` so the warm-up's batches start the relay's
+    history), with the engine polled meanwhile; the health flips to SERVING
+    when it returned, whatever it returned.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get up to ``drain_secs`` to finish with the
@@ -1145,6 +1347,7 @@ async def supervise(
             loop.add_signal_handler(sig, stop_event.set)
     exit_code = 0
     announced_ready = False
+    held: _WarmupHold | None = None
     warming: asyncio.Task | None = None
     try:
         while not stop_event.is_set():
@@ -1161,7 +1364,10 @@ async def supervise(
                     logger.info(
                         "Engine connected; the planned warm-up runs before the servicer is SERVING"
                     )
-                    warming = asyncio.create_task(asyncio.to_thread(warmup))
+                    held = _WarmupHold(warmup, loop.time())
+            if held is not None and held.released(server, loop.time()):
+                warming = asyncio.create_task(asyncio.to_thread(held.warmup))
+                held = None
             if warming is not None and warming.done():
                 _warmup_over(server, warming)
                 warming = None
@@ -1235,12 +1441,21 @@ class RustLauncher:
     drain_secs_env: str
     startup_timeout_secs_env: str
     startup_ceiling_secs_env: str
+    silence_timeout_secs_env: str
+    prefill_tokens_per_sec_env: str
     kv_events_env: str
+    # The metrics endpoint's variables (the fallbacks of --metrics-port and
+    # --metrics-host; see :func:`metrics_bind_address`).
+    metrics_port_env: str
+    metrics_host_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
     # The planned warm-up's knob (:mod:`smg_grpc_servicer.warmup`); a launcher
     # that names none runs no warm-up.
     warmup_env: str = ""
+    # The pass's default budget in seconds when the knob names none: the
+    # shared default, or an engine module's own for a longer plan.
+    warmup_default_budget_secs: float = DEFAULT_BUDGET_SECS
 
     def prepare(self, args: Any) -> None:
         """Engine-specific set-up after the knobs are read and the binding is
@@ -1292,6 +1507,20 @@ class RustLauncher:
         host = getattr(args, "host", None) or "0.0.0.0"
         return host_port(host, int(getattr(args, "port", 0) or 0))
 
+    def metrics_bind_address(
+        self, args: Any, environ: Mapping[str, str] | None = None
+    ) -> str | None:
+        """Where the Rust server serves Prometheus metrics, or ``None`` for no
+        endpoint (:func:`metrics_bind_address` with this launcher's
+        variables): ``--metrics-port``, else the variable, else none; the
+        host from ``--metrics-host``, its variable, else the gRPC host."""
+        return metrics_bind_address(
+            args,
+            port_env=self.metrics_port_env,
+            host_env=self.metrics_host_env,
+            environ=environ,
+        )
+
     def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:
         """Further keyword arguments of the Rust server (none by default)."""
         return {}
@@ -1329,9 +1558,10 @@ class RustLauncher:
     def announce(
         self, server: Any, knobs: LauncherKnobs, handshake_port: int, engine_count: int
     ) -> None:
-        """The two lines an operator reads at the start: where the server
-        listens and what dials its handshake, and the startup bounds with the
-        variables that set them."""
+        """The three lines an operator reads at the start: where the server
+        listens and what dials its handshake, the startup bounds with the
+        variables that set them, and the connected engine's silence bound with
+        its prefill allowance."""
         logger.info(
             "Rust %s servicer listening on %s (%s handshake tcp://127.0.0.1:%d, %d %s(s))",
             self.engine,
@@ -1341,8 +1571,11 @@ class RustLauncher:
             engine_count,
             self.counted,
         )
+        metrics_address = getattr(server, "metrics_address", None)
+        if metrics_address:
+            logger.info("Prometheus metrics on http://%s/metrics", metrics_address)
         logger.info(
-            "%s startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+            "%s startup bounds: %gs without a sign of life (%s), ceiling %s (%s); "
             "the handshake waits while the %s process is alive",
             self.started.capitalize(),
             knobs.startup_timeout_secs,
@@ -1350,6 +1583,15 @@ class RustLauncher:
             f"{knobs.startup_ceiling_secs:.0f}s" if knobs.startup_ceiling_secs else "none",
             self.startup_ceiling_secs_env,
             self.started,
+        )
+        logger.info(
+            "%s silence bound once connected: %gs without an output while requests are in "
+            "flight (%s), plus the prompt pending prefill at %d tokens/s (%s)",
+            self.started.capitalize(),
+            knobs.silence_timeout_secs,
+            self.silence_timeout_secs_env,
+            knobs.prefill_tokens_per_sec,
+            self.prefill_tokens_per_sec_env,
         )
 
     async def serve(self, args: Any) -> int:
@@ -1362,9 +1604,13 @@ class RustLauncher:
             drain_secs_env=self.drain_secs_env,
             startup_timeout_secs_env=self.startup_timeout_secs_env,
             startup_ceiling_secs_env=self.startup_ceiling_secs_env,
+            silence_timeout_secs_env=self.silence_timeout_secs_env,
+            prefill_tokens_per_sec_env=self.prefill_tokens_per_sec_env,
             socket_dir=default_socket_dir(),
         )
-        warmup_setting = read_warmup_setting(self.warmup_env)
+        warmup_setting = read_warmup_setting(
+            self.warmup_env, default_budget_secs=self.warmup_default_budget_secs
+        )
         servicer = importlib.import_module("smg.servicer")
         self.prepare(args)
         servicer.init_servicer_tracing()
@@ -1376,8 +1622,19 @@ class RustLauncher:
         self.announce_capabilities(facts, tokenizer_dir)
         plan = None
         if self.warmup_env:
-            plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
+            # The inputs (a tokenizer load, the media material of a language-side
+            # worker) are built only when the knob is on: plan_for logs the off
+            # reason first and reads no inputs then.
+            plan = plan_for(
+                warmup_setting,
+                self.warmup_inputs(args, facts) if warmup_setting.enabled else None,
+                knob=self.warmup_env,
+            )
         handshake_port = knobs.handshake_port or free_port()
+        # The metrics endpoint, resolved and checked before the port is
+        # bound and the engine starts (a clash with the gRPC port is refused
+        # here, not by a bind after the engine loaded).
+        metrics_bind_address = self.metrics_bind_address(args)
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
             # Per process, not per requested port: `--port 0` launchers would
@@ -1388,6 +1645,9 @@ class RustLauncher:
             tokenizer_dir=tokenizer_dir,
             engine_startup_timeout_secs=knobs.startup_timeout_secs,
             engine_startup_ceiling_secs=knobs.startup_ceiling_secs,
+            engine_silence_timeout_secs=knobs.silence_timeout_secs,
+            engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
+            metrics_bind_address=metrics_bind_address,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )

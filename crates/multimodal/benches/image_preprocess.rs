@@ -20,9 +20,12 @@ use llm_multimodal::{
     encoder_inputs::EncoderDtype,
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
+        processors::{
+            DeepseekV41Processor, Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+        },
         transforms, VisionPreProcessor,
     },
+    Modality,
 };
 
 /// Create a synthetic RGB image with some variation (not all zeros).
@@ -42,7 +45,6 @@ fn load_preprocessor_config(model_path: &str) -> Option<PreProcessorConfig> {
 // ── Full pipeline benchmarks ─────────────────────────────────────
 
 fn bench_qwen3_vl(c: &mut Criterion) {
-    let processor = Qwen3VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen3-VL-8B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -50,6 +52,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -67,7 +70,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -83,7 +86,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("640x480", format!("batch{batch_size}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -102,14 +105,13 @@ fn bench_qwen3_vl(c: &mut Criterion) {
         let image = make_test_image(w, h);
         let images = [image];
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
-            b.iter(|| processor.preprocess(imgs, &config).unwrap());
+            b.iter(|| processor.preprocess(imgs).unwrap());
         });
     }
     group.finish();
 }
 
 fn bench_qwen2_vl(c: &mut Criterion) {
-    let processor = Qwen2VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen2-VL-2B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -117,6 +119,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+    let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[(224, 224), (640, 480), (1024, 768), (1920, 1080)];
 
@@ -128,7 +131,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -136,7 +139,6 @@ fn bench_qwen2_vl(c: &mut Criterion) {
 }
 
 fn bench_llama4(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -145,6 +147,7 @@ fn bench_llama4(c: &mut Criterion) {
                 )
                 .unwrap()
             });
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -162,7 +165,7 @@ fn bench_llama4(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -229,7 +232,6 @@ fn bench_individual_steps(c: &mut Criterion) {
 }
 
 fn bench_llama4_steps(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -238,6 +240,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
                 )
                 .unwrap()
             });
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
 
     // 1024x768 is the worst case (1.8x slower than HF)
     let sizes: &[(u32, u32)] = &[(640, 480), (1024, 768), (1920, 1080)];
@@ -252,7 +255,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
             &image,
             |b, img| {
                 let imgs = [img.clone()];
-                b.iter(|| processor.preprocess(&imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(&imgs).unwrap());
             },
         );
 
@@ -294,7 +297,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write
+    targets = bench_wire_write, bench_deepseek_v41
 );
 criterion_main!(benches, wire_benches);
 
@@ -492,7 +495,6 @@ const WIRE_DTYPES: [EncoderDtype; 2] = [EncoderDtype::BFloat16, EncoderDtype::Fl
 fn bench_wire_arms<P: VisionPreProcessor>(
     group: &mut BenchmarkGroup<'_, CpuTime>,
     processor: &P,
-    config: &PreProcessorConfig,
     class: &str,
     images: &[DynamicImage],
     with_float16: bool,
@@ -514,7 +516,7 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             |b, imgs| {
                 b.iter(|| {
                     processor
-                        .preprocess(imgs, config)
+                        .preprocess(imgs)
                         .unwrap()
                         .encoder_input
                         .into_bytes_as(dtype)
@@ -528,7 +530,7 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             |b, imgs| {
                 b.iter(|| {
                     processor
-                        .preprocess_wire(imgs, config, dtype)
+                        .preprocess_wire(imgs, dtype)
                         .expect("the pixel-byte processors write wires")
                         .unwrap()
                         .encoder_input
@@ -553,6 +555,50 @@ fn wire_class(w: u32, h: u32, target: (usize, usize)) -> String {
     }
 }
 
+// ── DeepSeek V4.1: one image per size class ──────────────────────
+
+/// The per-image cost of the patch processor (the contain fit or stretch to
+/// the planned grid, then the normalised patches) on one image of each size
+/// class, in CPU time: what an image pays before its request can leave.
+fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
+    let config = PreProcessorConfig::from_json(
+        r#"{"patch_size": 14, "min_pixels": 295936, "downsample_ratio": 3, "max_image_tokens": 1024}"#,
+    )
+    .unwrap();
+    let processor = DeepseekV41Processor::from_preprocessor_config(&config);
+    // (class, width, height): the medians of the size classes an image
+    // corpus falls into, from a small diagram to a 4k-side scan.
+    let classes: &[(&str, u32, u32)] = &[
+        ("small", 300, 232),
+        ("medium", 640, 480),
+        ("large", 1024, 768),
+        ("document", 1240, 1754),
+        ("scan", 2048, 1536),
+        ("huge", 4096, 3072),
+    ];
+    let mut group = c.benchmark_group("deepseek_v41");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(class, w, h) in classes {
+        let plan = processor.plan_image_grid(w, h);
+        let images = [make_test_image(w, h)];
+        group.bench_with_input(
+            BenchmarkId::new(
+                "single",
+                format!(
+                    "{class}-{w}x{h}-to-{}x{}",
+                    plan.best_width, plan.best_height
+                ),
+            ),
+            &images,
+            |b, imgs| b.iter(|| processor.preprocess(imgs).unwrap()),
+        );
+    }
+    group.finish();
+}
+
 /// The processors that emit pixel bytes write the wire in two passes or in
 /// one; this group is the speed of each per image class and wire dtype on
 /// the sizes of the groups above (the plain sizes, the extremes) and the
@@ -563,7 +609,7 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
     )
     .unwrap();
 
-    let qwen3 = Qwen3VLProcessor::new();
+    let qwen3 = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
     // (width, height, measured in float16 too)
     let qwen3_classes: &[(u32, u32, bool)] = &[
         (320, 256, false),
@@ -587,11 +633,11 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
         let target = qwen3.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
         let images = [make_test_image(w, h)];
-        bench_wire_arms(&mut group, &qwen3, &config, &class, &images, with_float16);
+        bench_wire_arms(&mut group, &qwen3, &class, &images, with_float16);
     }
     group.finish();
 
-    let qwen2 = Qwen2VLProcessor::new();
+    let qwen2 = Qwen2VLProcessor::from_preprocessor_config(&config);
     let qwen2_classes: &[(u32, u32, bool)] = &[
         (644, 476, true),
         (640, 480, false),
@@ -607,7 +653,7 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
         let target = qwen2.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
         let images = [make_test_image(w, h)];
-        bench_wire_arms(&mut group, &qwen2, &config, &class, &images, with_float16);
+        bench_wire_arms(&mut group, &qwen2, &class, &images, with_float16);
     }
     group.finish();
 }

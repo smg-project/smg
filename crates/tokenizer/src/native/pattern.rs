@@ -12,20 +12,71 @@
 //! that can match the empty string is declined like everything else outside
 //! the subset, and the caller keeps the `tokenizers` pipeline for it.
 //!
+//! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
+//! and their kin ship one template, the digit rule's bound apart) is matched
+//! by a [`Scanner`] instead of the program: each of its seven alternatives
+//! is decided at a position by a few class tests and class runs, which is
+//! what the backtracking engine arrives at for that shape, so the pieces are
+//! the same and no character is interpreted op by op. The classes are the
+//! parser's, so the two matchers cannot read a category differently.
+//!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
-use super::unicode;
+use super::{chain, unicode};
 
 /// A set of characters: Unicode categories, code point ranges, negation.
 #[derive(Debug, Clone, Default)]
-struct Class {
+pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
     /// Membership of U+0000..=U+007F, resolved once.
-    ascii: u128,
+    ascii: AsciiSet,
+}
+
+/// A set of ASCII characters as a membership table, one entry per code
+/// point. The matcher asks it once per character it tests (every class test
+/// and every first-set test on ASCII text), and a table read is one load
+/// where a bit of a 128-bit word costs a two-word select and a variable shift.
+#[derive(Clone, Copy)]
+struct AsciiSet([bool; 128]);
+
+impl Default for AsciiSet {
+    fn default() -> Self {
+        Self([false; 128])
+    }
+}
+
+impl std::fmt::Debug for AsciiSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members: String = (0u8..128)
+            .filter(|&code| self.0[usize::from(code)])
+            .map(char::from)
+            .collect();
+        f.debug_tuple("AsciiSet").field(&members).finish()
+    }
+}
+
+impl AsciiSet {
+    /// Membership of `code`, which the caller has checked is below U+0080.
+    #[inline]
+    fn contains(&self, code: u32) -> bool {
+        debug_assert!(code < 128);
+        self.0[(code & 0x7f) as usize]
+    }
+
+    fn insert(&mut self, code: u32) {
+        self.0[(code & 0x7f) as usize] = true;
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0) {
+            *mine |= theirs;
+        }
+        self
+    }
 }
 
 const CAT_LETTER: u16 = 1 << 0;
@@ -68,10 +119,10 @@ fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
 
 impl Class {
     fn finish(mut self) -> Self {
-        let mut ascii = 0u128;
+        let mut ascii = AsciiSet::default();
         for code in 0u32..128 {
             if self.contains_slow(code) {
-                ascii |= 1 << code;
+                ascii.insert(code);
             }
         }
         self.ascii = ascii;
@@ -89,18 +140,30 @@ impl Class {
     }
 
     #[inline]
-    fn contains(&self, c: char) -> bool {
+    pub(super) fn contains(&self, c: char) -> bool {
         let code = u32::from(c);
         if code < 128 {
-            (self.ascii >> code) & 1 == 1
+            self.ascii.contains(code)
         } else {
             self.contains_slow(code)
+        }
+    }
+
+    /// The characters the class may hold, exact below U+0080 and one bit for
+    /// the rest, set unless every member of the class is ASCII.
+    fn first(&self) -> First {
+        First {
+            ascii: self.ascii,
+            non_ascii: self.negated
+                || self.categories != 0
+                || self.ranges.iter().any(|&(_, end)| end >= 128),
+            nullable: false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-enum Node {
+pub(super) enum Node {
     /// One character of the class.
     Class(usize),
     /// Greedy repetition of one class character, `min..=max` times.
@@ -109,25 +172,130 @@ enum Node {
         min: u32,
         max: u32,
     },
-    /// Greedy repetition of a group, `min..=max` times.
+    /// Greedy repetition of a group, `min..=max` times; `first` is what the
+    /// group's body can begin with ([`first_sets`] fills it).
     Repeat {
         node: Box<Node>,
         min: u32,
         max: u32,
+        first: First,
     },
     Concat(Vec<Node>),
     /// Alternatives tried in order; the first that lets the rest match wins.
-    Alt(Vec<Node>),
+    /// `firsts` holds, per alternative, the characters a match of it can
+    /// begin with ([`first_sets`] fills them once the classes are final), so
+    /// an alternative that cannot start at a position is not stepped into.
+    Alt {
+        alternatives: Vec<Node>,
+        firsts: Vec<First>,
+    },
     /// `(?!...)` over one class: succeeds when the next character is not in it.
     NotAhead(usize),
 }
 
-/// A parsed pattern.
+/// The characters a match of a node can begin with: a table of the ASCII
+/// code points, one bit for every character beyond ASCII (set when a class
+/// may hold any of them), and whether the node can match without consuming a
+/// character, in which case any character may follow it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct First {
+    ascii: AsciiSet,
+    non_ascii: bool,
+    nullable: bool,
+}
+
+impl First {
+    #[inline]
+    fn may_start(&self, c: char) -> bool {
+        let code = u32::from(c);
+        self.nullable
+            || if code < 128 {
+                self.ascii.contains(code)
+            } else {
+                self.non_ascii
+            }
+    }
+
+    /// The set of this node followed by `next`: `next` widens it only when
+    /// this node can match empty.
+    fn then(self, next: First) -> First {
+        if self.nullable {
+            First {
+                ascii: self.ascii.union(next.ascii),
+                non_ascii: self.non_ascii || next.non_ascii,
+                nullable: next.nullable,
+            }
+        } else {
+            self
+        }
+    }
+
+    fn or(self, other: First) -> First {
+        First {
+            ascii: self.ascii.union(other.ascii),
+            non_ascii: self.non_ascii || other.non_ascii,
+            nullable: self.nullable || other.nullable,
+        }
+    }
+}
+
+/// A parsed pattern: the program the matcher runs, compiled once from the
+/// tree the parser built.
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
     classes: Vec<Class>,
-    root: Node,
+    program: Vec<Op>,
+    /// The first-character sets the `Split` ops index.
+    firsts: Vec<First>,
+    /// The matcher of the GPT-4 family's template, when the pattern is one.
+    scanner: Option<Scanner>,
+    /// What the pattern is as a stage of a three-stage chain, when it is
+    /// one (see [`chain`]).
+    part: Option<chain::Part>,
 }
+
+/// One instruction of a compiled pattern. The tree is flattened into a
+/// sequence so that a match is one loop over it: every point where the tree
+/// matcher recursed with a continuation (an alternative, a greedy run) is an
+/// entry on an explicit stack of [`Choice`]s instead of a stack frame.
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    /// One character of the class.
+    Char(usize),
+    /// A greedy run of `min..=max` characters of the class; when what follows
+    /// fails it gives back one character at a time, down to `min`.
+    Run { class: usize, min: u32, max: u32 },
+    /// Succeeds when the next character is not in the class.
+    NotAhead(usize),
+    /// A choice: the ops that follow are tried first; `next` is where to go
+    /// when they fail (the following alternative's `Split`, the op after an
+    /// optional group, or [`NO_NEXT`] for the last alternative). `first`
+    /// indexes the set of characters the ops that follow can begin with, and
+    /// a character outside it takes `next` without an entry on the stack.
+    Split { next: usize, first: usize },
+    /// The end of an alternative: continue after the alternation.
+    Jump(usize),
+    /// The whole pattern matched up to the position.
+    Match,
+}
+
+/// `Split.next` of the last alternative: a failure there backtracks.
+const NO_NEXT: usize = usize::MAX;
+
+/// A choice the matcher may come back to: `pc` is the `Split` whose `next`
+/// is the way not taken, or the `Run` that may give back characters, in which
+/// case `pos` is where its run ends and `count` how many characters it holds.
+#[derive(Debug, Clone, Copy, Default)]
+struct Choice {
+    pc: usize,
+    pos: usize,
+    count: u32,
+}
+
+/// Choices a match can hold at once: one per alternation and per run on the
+/// deepest path of the tree (four for the GPT-2 and Qwen patterns, six for the
+/// largest in use). A pattern that needs more is declined.
+const MAX_CHOICES: usize = 32;
 
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
@@ -143,17 +311,50 @@ impl Pattern {
             classes: Vec::new(),
             case_insensitive: false,
         };
-        let root = parser.parse_alternation()?;
+        let mut root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
             return None;
         }
         if can_match_empty(&root) {
             return None;
         }
+        first_sets(&mut root, &parser.classes);
+        if choices(&root) > MAX_CHOICES {
+            return None;
+        }
+        let scanner = Scanner::recognize(&root, &parser.classes);
+        let part = chain::Part::recognize(&root);
+        let mut program = Vec::new();
+        let mut firsts = Vec::new();
+        compile(&root, &mut program, &mut firsts);
+        program.push(Op::Match);
         Some(Self {
             classes: parser.classes,
-            root,
+            program,
+            firsts,
+            scanner,
+            part,
         })
+    }
+
+    /// The pattern's classes, which its [`Part`](chain::Part) indexes.
+    pub(super) fn classes(&self) -> &[Class] {
+        &self.classes
+    }
+
+    /// What the pattern is as a stage of a three-stage chain, if anything.
+    pub(super) fn part(&self) -> Option<&chain::Part> {
+        self.part.as_ref()
+    }
+
+    /// This pattern matched by its program alone, the scanner set aside: the
+    /// tests hold the two against each other.
+    #[cfg(test)]
+    fn program_only(&self) -> Self {
+        Self {
+            scanner: None,
+            ..self.clone()
+        }
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -162,104 +363,576 @@ impl Pattern {
             pattern: self,
             text,
             pos: 0,
+            choices: [Choice::default(); MAX_CHOICES],
         }
     }
 
-    /// The end of the match that starts exactly at `pos`, if any.
-    fn match_at(&self, text: &str, pos: usize) -> Option<usize> {
-        let mut end = None;
-        self.step(&self.root, text, pos, &mut |p| {
-            end = Some(p);
-            true
-        });
-        end
-    }
-
-    fn step(&self, node: &Node, text: &str, pos: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
-        match node {
-            Node::Class(class) => match next_char(text, pos) {
-                Some((c, len)) if self.classes[*class].contains(c) => k(pos + len),
-                _ => false,
-            },
-            Node::ClassRepeat { class, min, max } => {
-                let class = &self.classes[*class];
-                let mut count = 0u32;
-                let mut p = pos;
-                while count < *max {
-                    match next_char(text, p) {
-                        Some((c, len)) if class.contains(c) => {
-                            p += len;
-                            count += 1;
+    /// The end of the match that starts exactly at `pos`, if any: the program
+    /// run from its first op, alternatives in order and runs longest first,
+    /// the first path that reaches `Match` winning, as the engine does it.
+    fn match_at(
+        &self,
+        text: &str,
+        pos: usize,
+        choices: &mut [Choice; MAX_CHOICES],
+    ) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut pc = 0usize;
+        let mut pos = pos;
+        loop {
+            let failed = match self.program[pc] {
+                Op::Char(class) => match next_char(text, pos) {
+                    Some((c, len)) if self.classes[class].contains(c) => {
+                        pos += len;
+                        pc += 1;
+                        false
+                    }
+                    _ => true,
+                },
+                Op::Run { class, min, max } => {
+                    let class = &self.classes[class];
+                    let mut count = 0u32;
+                    let mut p = pos;
+                    while count < max {
+                        match next_char(text, p) {
+                            Some((c, len)) if class.contains(c) => {
+                                p += len;
+                                count += 1;
+                            }
+                            _ => break,
                         }
-                        _ => break,
+                    }
+                    if count < min {
+                        true
+                    } else {
+                        choices[depth] = Choice { pc, pos: p, count };
+                        depth += 1;
+                        pos = p;
+                        pc += 1;
+                        false
                     }
                 }
-                loop {
-                    if count < *min {
-                        return false;
+                Op::NotAhead(class) => match next_char(text, pos) {
+                    Some((c, _)) if self.classes[class].contains(c) => true,
+                    _ => {
+                        pc += 1;
+                        false
                     }
-                    if k(p) {
-                        return true;
+                },
+                Op::Split { next, first } => {
+                    let excluded = match next_char(text, pos) {
+                        Some((c, _)) => !self.firsts[first].may_start(c),
+                        None => false,
+                    };
+                    if excluded {
+                        if next == NO_NEXT {
+                            true
+                        } else {
+                            pc = next;
+                            false
+                        }
+                    } else {
+                        if next != NO_NEXT {
+                            choices[depth] = Choice { pc, pos, count: 0 };
+                            depth += 1;
+                        }
+                        pc += 1;
+                        false
                     }
-                    if count == *min {
-                        return false;
+                }
+                Op::Jump(target) => {
+                    pc = target;
+                    false
+                }
+                Op::Match => return Some(pos),
+            };
+            if !failed {
+                continue;
+            }
+            // Back to the latest choice: a run gives back one character and
+            // goes on after itself; an exhausted run or a split is dropped,
+            // the split's other way taken.
+            loop {
+                if depth == 0 {
+                    return None;
+                }
+                let choice = &mut choices[depth - 1];
+                match self.program[choice.pc] {
+                    Op::Run { min, .. } if choice.count > min => {
+                        let mut p = choice.pos - 1;
+                        while !text.is_char_boundary(p) {
+                            p -= 1;
+                        }
+                        choice.pos = p;
+                        choice.count -= 1;
+                        pos = p;
+                        pc = choice.pc + 1;
+                        break;
                     }
-                    p -= 1;
-                    while !text.is_char_boundary(p) {
-                        p -= 1;
+                    Op::Run { .. } => depth -= 1,
+                    Op::Split { next, .. } => {
+                        pos = choice.pos;
+                        pc = next;
+                        depth -= 1;
+                        break;
                     }
-                    count -= 1;
+                    // No other op leaves a choice.
+                    _ => depth -= 1,
                 }
             }
-            Node::Repeat { node, min, max } => self.repeat(node, *min, *max, 0, text, pos, k),
-            Node::Concat(nodes) => self.concat(nodes, text, pos, k),
-            Node::Alt(alternatives) => alternatives
-                .iter()
-                .any(|alternative| self.step(alternative, text, pos, k)),
-            Node::NotAhead(class) => match next_char(text, pos) {
-                Some((c, _)) if self.classes[*class].contains(c) => false,
-                _ => k(pos),
-            },
         }
     }
+}
 
-    fn concat(
-        &self,
-        nodes: &[Node],
-        text: &str,
-        pos: usize,
-        k: &mut dyn FnMut(usize) -> bool,
-    ) -> bool {
-        match nodes.split_first() {
-            None => k(pos),
-            Some((first, rest)) => self.step(first, text, pos, &mut |p| {
-                self.concat(rest, text, p, &mut *k)
-            }),
-        }
+/// A part of the GPT-4 family's template that one class fills: the bit of
+/// [`Scanner::ascii`] and the slot of [`Scanner::classes`] that hold it.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum Role {
+    /// The first character of a clitic alternative (a bit only: beyond
+    /// ASCII the alternatives are tried).
+    CliticStart,
+    /// The optional lead-in of a letter run (`[^\r\n\p{L}\p{N}]?`).
+    WordPrefix,
+    /// A letter run (`\p{L}+`).
+    Word,
+    /// A digit (`\p{N}`, up to the digit cap at once).
+    Digit,
+    /// The optional space before a punctuation run (` ?`).
+    PunctPrefix,
+    /// A punctuation run (`[^\s\p{L}\p{N}]+`).
+    Punct,
+    /// The line breaks after a punctuation run (`[\r\n]*`).
+    PunctBreak,
+    /// The whitespace before line breaks (`\s*`).
+    BreakSpace,
+    /// A run of line breaks (`[\r\n]+`).
+    Break,
+    /// Whitespace that leaves its last character to what follows (`\s+`
+    /// before `(?!\S)`).
+    TrailSpace,
+    /// What may not follow that whitespace (`\S`).
+    NotTrail,
+    /// A whitespace run (`\s+`).
+    Space,
+}
+
+/// The roles, so many slots of [`Scanner::classes`].
+const ROLES: usize = 12;
+
+/// The roles that one class fills, every role but the clitic start.
+const CLASSED_ROLES: [Role; ROLES - 1] = [
+    Role::WordPrefix,
+    Role::Word,
+    Role::Digit,
+    Role::PunctPrefix,
+    Role::Punct,
+    Role::PunctBreak,
+    Role::BreakSpace,
+    Role::Break,
+    Role::TrailSpace,
+    Role::NotTrail,
+    Role::Space,
+];
+
+impl Role {
+    #[inline(always)]
+    fn bit(self) -> u16 {
+        1 << (self as u16)
     }
+}
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the recursion carries its bounds"
-    )]
-    fn repeat(
-        &self,
-        node: &Node,
-        min: u32,
-        max: u32,
-        count: u32,
-        text: &str,
-        pos: usize,
-        k: &mut dyn FnMut(usize) -> bool,
-    ) -> bool {
-        if count < max
-            && self.step(node, text, pos, &mut |p| {
-                p != pos && self.repeat(node, min, max, count + 1, text, p, &mut *k)
+/// The matcher of the GPT-4 family's pre-tokenizer template,
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// with whatever classes stand in those places and whatever bound the digit
+/// rule has (Qwen 2 and 3 take one digit, Llama 3 and GLM 4.6 up to three,
+/// Qwen 3.5 counts marks among the letters). For this shape, leftmost-first
+/// alternation over greedy runs comes down to a decision per alternative
+/// that one scan settles:
+///
+/// 1. a clitic: the first alternative whose characters follow in order;
+/// 2. a letter run, with the lead-in when a letter follows it;
+/// 3. up to the bound of digits;
+/// 4. a punctuation run, with the space when punctuation follows it, and
+///    the line breaks after the run;
+/// 5. whitespace ending in line breaks: the whitespace run up to and
+///    including its last line break, when it holds one;
+/// 6. whitespace before a non-space: the run short of its last character,
+///    or whole at the end of the text, when it has a character to give;
+/// 7. the whitespace run.
+///
+/// Each is what the engine's backtracking arrives at: a greedy optional
+/// lead-in is kept only when the run after it can start, a greedy run before
+/// a required class gives back characters until the class follows, and the
+/// first alternative to reach the end of the pattern wins.
+#[derive(Debug, Clone)]
+struct Scanner {
+    /// Per ASCII code point, a bit per [`Role`] whose class holds it.
+    ascii: [u16; 128],
+    /// The class of each role, read for characters beyond ASCII (the clitic
+    /// start's slot is unused).
+    classes: [usize; ROLES],
+    /// Whether a clitic alternative may begin beyond ASCII.
+    clitic_beyond_ascii: bool,
+    /// The clitic alternatives, each the classes of its characters in order.
+    clitics: Vec<Vec<usize>>,
+    /// The most digits the digit alternative takes at once.
+    digit_cap: u32,
+}
+
+impl Scanner {
+    /// The scanner of `root`, when it is the template; `None` for every other
+    /// shape, which the program matches.
+    fn recognize(root: &Node, classes: &[Class]) -> Option<Self> {
+        let Node::Alt { alternatives, .. } = root else {
+            return None;
+        };
+        let [clitics, word, digits, punct, breaks, trail, space] = alternatives.as_slice() else {
+            return None;
+        };
+        let Node::Alt {
+            alternatives: clitic_alternatives,
+            ..
+        } = clitics
+        else {
+            return None;
+        };
+        let clitics = clitic_alternatives
+            .iter()
+            .map(|alternative| match alternative {
+                Node::Class(class) => Some(vec![*class]),
+                Node::Concat(nodes) => nodes.iter().map(plain_class).collect(),
+                _ => None,
             })
-        {
-            return true;
+            .collect::<Option<Vec<Vec<usize>>>>()?;
+        if clitics.iter().any(Vec::is_empty) {
+            return None;
         }
-        count >= min && k(pos)
+        let [word_prefix, word_run] = concat(word)? else {
+            return None;
+        };
+        let (digit, digit_cap) = match digits {
+            Node::Class(class) => (*class, 1),
+            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            _ => return None,
+        };
+        let [punct_prefix, punct_run, punct_break] = concat(punct)? else {
+            return None;
+        };
+        let [break_space, break_run] = concat(breaks)? else {
+            return None;
+        };
+        let [trail_space, not_trail] = concat(trail)? else {
+            return None;
+        };
+        let Node::NotAhead(not_trail) = not_trail else {
+            return None;
+        };
+        let mut roles = [0usize; ROLES];
+        roles[Role::WordPrefix as usize] = repeat(word_prefix, 0, 1)?;
+        roles[Role::Word as usize] = repeat(word_run, 1, u32::MAX)?;
+        roles[Role::Digit as usize] = digit;
+        roles[Role::PunctPrefix as usize] = repeat(punct_prefix, 0, 1)?;
+        roles[Role::Punct as usize] = repeat(punct_run, 1, u32::MAX)?;
+        roles[Role::PunctBreak as usize] = repeat(punct_break, 0, u32::MAX)?;
+        roles[Role::BreakSpace as usize] = repeat(break_space, 0, u32::MAX)?;
+        roles[Role::Break as usize] = repeat(break_run, 1, u32::MAX)?;
+        roles[Role::TrailSpace as usize] = repeat(trail_space, 1, u32::MAX)?;
+        roles[Role::NotTrail as usize] = *not_trail;
+        roles[Role::Space as usize] = repeat(space, 1, u32::MAX)?;
+        let mut ascii = [0u16; 128];
+        for (code, bits) in ascii.iter_mut().enumerate() {
+            let c = char::from(code as u8);
+            for role in CLASSED_ROLES {
+                if classes[roles[role as usize]].contains(c) {
+                    *bits |= role.bit();
+                }
+            }
+            if clitics
+                .iter()
+                .any(|alternative| classes[alternative[0]].contains(c))
+            {
+                *bits |= Role::CliticStart.bit();
+            }
+        }
+        let clitic_beyond_ascii = clitics
+            .iter()
+            .any(|alternative| classes[alternative[0]].first().non_ascii);
+        Some(Self {
+            ascii,
+            classes: roles,
+            clitic_beyond_ascii,
+            clitics,
+            digit_cap,
+        })
+    }
+
+    /// Whether `c` is in the class of `role`.
+    #[inline(always)]
+    fn has(&self, classes: &[Class], role: Role, c: char) -> bool {
+        let code = u32::from(c);
+        if code < 128 {
+            self.ascii[code as usize] & role.bit() != 0
+        } else {
+            classes[self.classes[role as usize]].contains(c)
+        }
+    }
+
+    /// The end of the run of `role`'s class that starts at `pos`.
+    #[inline(always)]
+    fn run_end(&self, classes: &[Class], text: &str, mut pos: usize, role: Role) -> usize {
+        while let Some((c, len)) = next_char(text, pos) {
+            if !self.has(classes, role, c) {
+                break;
+            }
+            pos += len;
+        }
+        pos
+    }
+
+    /// The end of the piece that starts at `pos`, if one does: the first of
+    /// the seven alternatives that matches there, as the engine picks it.
+    fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+        let (c, len) = next_char(text, pos)?;
+        let after = pos + len;
+        // 1. A clitic: the first alternative whose characters follow in order.
+        let may_start_clitic = if u32::from(c) < 128 {
+            self.ascii[u32::from(c) as usize] & Role::CliticStart.bit() != 0
+        } else {
+            self.clitic_beyond_ascii
+        };
+        if may_start_clitic {
+            'alternatives: for alternative in &self.clitics {
+                let mut p = pos;
+                for &class in alternative {
+                    match next_char(text, p) {
+                        Some((d, n)) if classes[class].contains(d) => p += n,
+                        _ => continue 'alternatives,
+                    }
+                }
+                return Some(p);
+            }
+        }
+        // 2. A letter run, with the lead-in when a letter follows it.
+        if self.has(classes, Role::WordPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Word, d) {
+                    return Some(self.run_end(classes, text, after + n, Role::Word));
+                }
+            }
+        }
+        if self.has(classes, Role::Word, c) {
+            return Some(self.run_end(classes, text, after, Role::Word));
+        }
+        // 3. Up to the bound of digits.
+        if self.has(classes, Role::Digit, c) {
+            let mut end = after;
+            let mut count = 1;
+            while count < self.digit_cap {
+                match next_char(text, end) {
+                    Some((d, n)) if self.has(classes, Role::Digit, d) => {
+                        end += n;
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            return Some(end);
+        }
+        // 4. A punctuation run, with the space when punctuation follows it,
+        //    and the line breaks after the run.
+        if self.has(classes, Role::PunctPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Punct, d) {
+                    let end = self.run_end(classes, text, after + n, Role::Punct);
+                    return Some(self.run_end(classes, text, end, Role::PunctBreak));
+                }
+            }
+        }
+        if self.has(classes, Role::Punct, c) {
+            let end = self.run_end(classes, text, after, Role::Punct);
+            return Some(self.run_end(classes, text, end, Role::PunctBreak));
+        }
+        // 5. Whitespace ending in line breaks: the greedy whitespace run
+        //    gives back characters until a line break follows it.
+        let mut end = self.run_end(classes, text, pos, Role::BreakSpace);
+        loop {
+            if let Some((d, n)) = next_char(text, end) {
+                if self.has(classes, Role::Break, d) {
+                    return Some(self.run_end(classes, text, end + n, Role::Break));
+                }
+            }
+            if end == pos {
+                break;
+            }
+            end = previous_boundary(text, end);
+        }
+        // 6. Whitespace before a non-space: the greedy run gives back its last
+        //    character while a non-space follows it, down to one.
+        if self.has(classes, Role::TrailSpace, c) {
+            let mut end = self.run_end(classes, text, after, Role::TrailSpace);
+            loop {
+                match next_char(text, end) {
+                    Some((d, _)) if self.has(classes, Role::NotTrail, d) => {}
+                    _ => return Some(end),
+                }
+                let shorter = previous_boundary(text, end);
+                if shorter == pos {
+                    break;
+                }
+                end = shorter;
+            }
+        }
+        // 7. The whitespace run.
+        if self.has(classes, Role::Space, c) {
+            return Some(self.run_end(classes, text, after, Role::Space));
+        }
+        None
+    }
+}
+
+/// The class of a node that is one character of a class.
+pub(super) fn plain_class(node: &Node) -> Option<usize> {
+    match node {
+        Node::Class(class) => Some(*class),
+        _ => None,
+    }
+}
+
+/// The class of a node that is a run of `min..=max` characters of one class.
+pub(super) fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
+    match node {
+        Node::ClassRepeat {
+            class,
+            min: node_min,
+            max: node_max,
+        } if *node_min == min && *node_max == max => Some(*class),
+        _ => None,
+    }
+}
+
+/// The nodes of a concatenation.
+pub(super) fn concat(node: &Node) -> Option<&[Node]> {
+    match node {
+        Node::Concat(nodes) => Some(nodes),
+        _ => None,
+    }
+}
+
+/// The start of the character before `pos`, a character boundary past 0.
+#[inline]
+pub(super) fn previous_boundary(text: &str, pos: usize) -> usize {
+    let mut p = pos - 1;
+    while !text.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Appends the ops of `node` to `program`; the first-character sets the
+/// splits index go to `firsts`. Alternatives are laid out in order, each
+/// ending in a jump past the alternation, so that the program tries them the
+/// way the tree matcher did.
+fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
+    match node {
+        Node::Class(class) => program.push(Op::Char(*class)),
+        Node::ClassRepeat { class, min, max } => program.push(Op::Run {
+            class: *class,
+            min: *min,
+            max: *max,
+        }),
+        Node::Repeat {
+            node,
+            min,
+            max,
+            first,
+        } => match (*min, *max) {
+            // `{0}`: matches empty, nothing to run.
+            (_, 0) => {}
+            // The optional group: its body first, the way past it when the
+            // body fails (or the character cannot begin it).
+            (0, _) => {
+                let split = program.len();
+                let set = firsts.len();
+                firsts.push(*first);
+                program.push(Op::Split {
+                    next: NO_NEXT,
+                    first: set,
+                });
+                compile(node, program, firsts);
+                program[split] = Op::Split {
+                    next: program.len(),
+                    first: set,
+                };
+            }
+            // `{1}`: the body itself.
+            _ => compile(node, program, firsts),
+        },
+        Node::Concat(nodes) => {
+            for node in nodes {
+                compile(node, program, firsts);
+            }
+        }
+        Node::Alt {
+            alternatives,
+            firsts: sets,
+        } => {
+            // The sets are filled by `first_sets` before the compile; an
+            // alternation without them would compile to no ops and match
+            // empty. Once per pattern, so the check stays in release builds.
+            assert_eq!(sets.len(), alternatives.len());
+            let mut previous_split = None;
+            let mut jumps = Vec::new();
+            for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
+                let split = program.len();
+                if let Some(previous) = previous_split {
+                    if let Op::Split { first: set, .. } = program[previous] {
+                        program[previous] = Op::Split {
+                            next: split,
+                            first: set,
+                        };
+                    }
+                }
+                program.push(Op::Split {
+                    next: NO_NEXT,
+                    first: firsts.len(),
+                });
+                firsts.push(*first);
+                previous_split = Some(split);
+                compile(alternative, program, firsts);
+                if index + 1 < alternatives.len() {
+                    jumps.push(program.len());
+                    program.push(Op::Jump(NO_NEXT));
+                }
+            }
+            let end = program.len();
+            for jump in jumps {
+                program[jump] = Op::Jump(end);
+            }
+        }
+        Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
+    }
+}
+
+/// The most choices a match of `node` can hold at once: every run and every
+/// alternation on a path leaves one until the path is done or backs off.
+fn choices(node: &Node) -> usize {
+    match node {
+        Node::Class(_) | Node::NotAhead(_) => 0,
+        Node::ClassRepeat { .. } => 1,
+        Node::Repeat { node, max, .. } => {
+            if *max == 0 {
+                0
+            } else {
+                1 + choices(node)
+            }
+        }
+        Node::Concat(nodes) => nodes.iter().map(choices).sum(),
+        Node::Alt { alternatives, .. } => 1 + alternatives.iter().map(choices).max().unwrap_or(0),
     }
 }
 
@@ -268,6 +941,8 @@ pub(crate) struct Matches<'p, 't> {
     pattern: &'p Pattern,
     text: &'t str,
     pos: usize,
+    /// The matcher's stack, held here so that one text's matches share it.
+    choices: [Choice; MAX_CHOICES],
 }
 
 impl Iterator for Matches<'_, '_> {
@@ -276,7 +951,11 @@ impl Iterator for Matches<'_, '_> {
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
             let start = self.pos;
-            match self.pattern.match_at(self.text, start) {
+            let end = match &self.pattern.scanner {
+                Some(scanner) => scanner.match_at(&self.pattern.classes, self.text, start),
+                None => self.pattern.match_at(self.text, start, &mut self.choices),
+            };
+            match end {
                 Some(end) if end > start => {
                     self.pos = end;
                     return Some((start, end));
@@ -306,13 +985,64 @@ fn can_match_empty(node: &Node) -> bool {
         Node::ClassRepeat { min, .. } => *min == 0,
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
-        Node::Alt(alternatives) => alternatives.iter().any(can_match_empty),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
         Node::NotAhead(_) => true,
     }
 }
 
+/// Fills the first-character sets of every alternation under `node` and
+/// returns `node`'s own. It runs once per pattern, after the parser has
+/// finished the classes.
+fn first_sets(node: &mut Node, classes: &[Class]) -> First {
+    match node {
+        Node::Class(class) => classes[*class].first(),
+        Node::ClassRepeat { class, min, .. } => First {
+            nullable: *min == 0,
+            ..classes[*class].first()
+        },
+        Node::Repeat {
+            node, min, first, ..
+        } => {
+            *first = first_sets(node, classes);
+            First {
+                nullable: *min == 0 || first.nullable,
+                ..*first
+            }
+        }
+        Node::Concat(nodes) => {
+            // Every node is visited (an alternation deeper in the run needs
+            // its sets too); only the nullable prefix widens the run's own.
+            let mut first = First {
+                nullable: true,
+                ..First::default()
+            };
+            for node in nodes {
+                let next = first_sets(node, classes);
+                first = first.then(next);
+            }
+            first
+        }
+        Node::Alt {
+            alternatives,
+            firsts,
+        } => {
+            *firsts = alternatives
+                .iter_mut()
+                .map(|alternative| first_sets(alternative, classes))
+                .collect();
+            firsts
+                .iter()
+                .fold(First::default(), |all, first| all.or(*first))
+        }
+        Node::NotAhead(_) => First {
+            nullable: true,
+            ..First::default()
+        },
+    }
+}
+
 #[inline]
-fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
+pub(super) fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
     let byte = *text.as_bytes().get(pos)?;
     if byte < 0x80 {
         return Some((byte as char, 1));
@@ -336,7 +1066,10 @@ impl Parser<'_> {
         Some(if alternatives.len() == 1 {
             alternatives.pop()?
         } else {
-            Node::Alt(alternatives)
+            Node::Alt {
+                alternatives,
+                firsts: Vec::new(),
+            }
         })
     }
 
@@ -412,13 +1145,15 @@ impl Parser<'_> {
         Some(match atom {
             Node::Class(class) => Node::ClassRepeat { class, min, max },
             Node::NotAhead(_) => return None,
-            // A group repeats by recursion, one frame per repetition: only the
-            // optional form is accepted, longer runs stay with `tokenizers`.
+            // A group that repeats would need the engine's rule for an empty
+            // iteration and an unbounded choice stack: only the optional form
+            // is accepted, longer runs stay with `tokenizers`.
             _ if max > 1 => return None,
             node => Node::Repeat {
                 node: Box::new(node),
                 min,
                 max,
+                first: First::default(),
             },
         })
     }
@@ -671,12 +1406,18 @@ mod tests {
     const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    /// The template with a digit rule of up to two digits, and with an
+    /// unbounded one: the other two bounds the scanner takes.
+    const TWO_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const ANY_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const DIGITS: &str = r"\p{N}{1,3}";
     const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 8] = [GPT2, QWEN2, QWEN35, CL100K, DIGITS, CJK, DEEPSEEK, CASED];
+    const PATTERNS: [&str; 10] = [
+        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED,
+    ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -819,6 +1560,62 @@ mod tests {
         }
     }
 
+    /// The first-character sets of the alternatives whose first `Split` is
+    /// at `pc`, in order (each `Split` names the next one).
+    fn split_chain(pattern: &Pattern, mut pc: usize) -> Vec<First> {
+        let mut sets = Vec::new();
+        loop {
+            let Op::Split { next, first } = pattern.program[pc] else {
+                panic!("op {pc} is not a split: {:?}", pattern.program[pc]);
+            };
+            sets.push(pattern.firsts[first]);
+            if next == NO_NEXT {
+                return sets;
+            }
+            pc = next;
+        }
+    }
+
+    #[test]
+    fn alternatives_know_the_characters_a_match_of_theirs_can_begin_with() {
+        let parsed = Pattern::parse(QWEN2).expect("parses");
+        // The program begins with the root alternation's first split; the
+        // alternatives in the pattern's order: the clitics, a letter run with
+        // an optional lead-in, a digit, punctuation with an optional space,
+        // whitespace ending in a line break, whitespace before a non-space,
+        // whitespace.
+        let firsts = split_chain(&parsed, 0);
+        assert_eq!(firsts.len(), 7);
+        let starts = |c: char| -> Vec<usize> {
+            firsts
+                .iter()
+                .enumerate()
+                .filter(|(_, first)| first.may_start(c))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        assert_eq!(starts('\''), vec![0, 1, 3]);
+        assert_eq!(starts('a'), vec![1]);
+        assert_eq!(starts('7'), vec![2]);
+        assert_eq!(starts(','), vec![1, 3]);
+        assert_eq!(starts(' '), vec![1, 3, 4, 5, 6]);
+        assert_eq!(starts('\n'), vec![4, 5, 6]);
+        // Beyond ASCII the sets are exact only in the negative: a letter run
+        // may start with a non-ASCII letter, a digit alternative built from a
+        // category may hold one, and no set excludes what it cannot see.
+        assert!(starts('\u{E9}').contains(&1));
+        assert!(!starts('\u{E9}').contains(&0));
+        // The clitic group is an alternation of its own, laid out right after
+        // the root's first split; each alternative begins with the apostrophe
+        // and with nothing else.
+        let clitics = split_chain(&parsed, 1);
+        assert_eq!(clitics.len(), 7);
+        assert!(clitics
+            .iter()
+            .all(|first| first.may_start('\'') && !first.may_start('s')));
+        assert!(matches!(parsed.program.last(), Some(Op::Match)));
+    }
+
     #[test]
     fn unsupported_syntax_is_rejected() {
         for pattern in [
@@ -870,6 +1667,88 @@ mod tests {
                     ours,
                     oracle_matches(pattern, &text),
                     "pattern {pattern:?} text {text:?}"
+                );
+                if parsed.scanner.is_some() {
+                    let program: Vec<(usize, usize)> =
+                        parsed.program_only().find_iter(&text).collect();
+                    assert_eq!(ours, program, "pattern {pattern:?} text {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_gpt4_family_template_takes_the_scanner_and_no_other_shape_does() {
+        for (pattern, digit_cap) in [
+            (QWEN2, 1),
+            (QWEN35, 1),
+            (CL100K, 3),
+            (TWO_DIGITS, 2),
+            (ANY_DIGITS, u32::MAX),
+        ] {
+            let scanner = Pattern::parse(pattern)
+                .expect("parses")
+                .scanner
+                .expect("the template takes the scanner");
+            assert_eq!(scanner.digit_cap, digit_cap, "{pattern}");
+            assert_eq!(scanner.clitics.len(), 7, "{pattern}");
+            assert!(!scanner.clitic_beyond_ascii, "{pattern}");
+        }
+        // The last two alternatives the other way round, a digit rule of two
+        // or more, a lead-in run: the same classes in another shape.
+        const SWAPPED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+|\s+(?!\S)";
+        const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        for pattern in [
+            GPT2,
+            DIGITS,
+            CJK,
+            DEEPSEEK,
+            CASED,
+            SWAPPED,
+            TWO_OR_MORE,
+            LEAD_IN_RUN,
+        ] {
+            assert!(
+                Pattern::parse(pattern).expect("parses").scanner.is_none(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_agrees_with_the_program_and_the_engine_on_shaped_text() {
+        // Text shaped like JSON, code and prose: runs of spaces and line
+        // breaks before letters, digits, quotes and brackets, where the
+        // whitespace alternatives give characters back, clitics in every
+        // case, lead-ins of every kind, and the characters beyond ASCII
+        // that the classes hold or exclude.
+        const PARTS: &[&str] = &[
+            " ", "  ", "   ", "\n", "\n\n", "\r\n", "\t", "\u{A0}", "\u{2028}", "\u{3000}", "\"",
+            "'", "'s", "'S", "'ll", "'LL", "'ve", "'re", "'d", "'m", "'t", "'x", "'ſ", ":", ",",
+            ".", "{", "}", "[", "]", "(", ")", "-", "_", "a", "Word", "ſ", "é", "ß", "1", "22",
+            "333", "4444", "٣", "²", "中", "ก", "\u{301}", "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
+            "x",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for pattern in [QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(parsed.scanner.is_some(), "{pattern}");
+            let program = parsed.program_only();
+            for round in 0..2000 {
+                let text: String = (0..1 + round % 40)
+                    .map(|_| PARTS[(pseudo_random(&mut state) % PARTS.len() as u64) as usize])
+                    .collect();
+                let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                assert_eq!(
+                    ours,
+                    program.find_iter(&text).collect::<Vec<_>>(),
+                    "the program; pattern {pattern:?} text {text:?}"
+                );
+                assert_eq!(
+                    ours,
+                    oracle_matches(pattern, &text),
+                    "the engine; pattern {pattern:?} text {text:?}"
                 );
             }
         }
@@ -957,6 +1836,56 @@ mod tests {
     }
 
     #[test]
+    fn the_choice_stack_holds_a_pattern_at_its_limit_and_declines_one_past_it() {
+        // Every optional class leaves one choice on the stack while the rest
+        // of the pattern runs: a pattern of MAX_CHOICES of them fills the
+        // stack exactly at the match, one more is declined at parse time.
+        // (A text of a's with no b would back off through every one of the
+        // 2^MAX_CHOICES ways, in this matcher and in the engine alike.)
+        let at_limit = "a?".repeat(MAX_CHOICES) + "b";
+        let parsed = Pattern::parse(&at_limit).expect("parses at the limit");
+        for text in [
+            "a".repeat(MAX_CHOICES) + "b",
+            "a".repeat(MAX_CHOICES - 1) + "b",
+            "ab b".into(),
+        ] {
+            assert_eq!(
+                parsed.find_iter(&text).collect::<Vec<_>>(),
+                oracle_matches(&at_limit, &text),
+                "{text:?}"
+            );
+        }
+        assert!(Pattern::parse(&("a?".repeat(MAX_CHOICES + 1) + "b")).is_none());
+        // The bound counts the deepest path, not the whole tree: an
+        // alternation of MAX_CHOICES such runs needs two choices.
+        let wide = (0..MAX_CHOICES)
+            .map(|_| "a?b")
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(Pattern::parse(&wide).is_some());
+    }
+
+    #[test]
+    fn optional_groups_whose_body_can_match_empty_agree_with_the_engine() {
+        // The body of an optional group may match empty; the group then
+        // matches like the engine's, which takes the empty body and goes on.
+        for (pattern, text) in [
+            (r"(?:\p{N}*|x)?x", "xx 1x x"),
+            (r"(?:\p{N}*|x)?y", "xy 2y y"),
+            (r"(?:\p{N}*){1}x", "x 1x 22x"),
+            (r"(?:\p{N}*)?x", "x 1x 22x"),
+            (r"(?:x|\p{N}*)?x", "xx 1x x"),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(
+                parsed.find_iter(text).collect::<Vec<_>>(),
+                oracle_matches(pattern, text),
+                "pattern {pattern:?} text {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn case_insensitive_groups_decline_classes_and_non_ascii_literals() {
         // Under `(?i:)` the engine folds classes, properties and non-ASCII
         // literals as well; this matcher folds ASCII letters only, so a
@@ -1031,10 +1960,11 @@ mod tests {
 
     #[test]
     fn group_repeats_and_long_runs_on_a_small_stack() {
-        // A group under `+`, `*` or `{n,}` would recurse once per repetition
-        // and overflow the stack on a long run, which aborts the process; such
-        // patterns are declined, the optional form recurses at most once and
-        // class runs iterate, so long inputs match on a 256 KiB stack.
+        // A group under `+`, `*` or `{n,}` is declined (its choices would
+        // grow with the run); the optional form and class runs each leave one
+        // choice on a stack sized at parse time, so a match uses no stack
+        // frame per repetition or per character and long inputs match on a
+        // 256 KiB stack.
         let worker = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(|| {

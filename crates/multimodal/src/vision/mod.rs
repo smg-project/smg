@@ -9,7 +9,7 @@
 //!
 //! - `transforms`: Core image transformations (resize, normalize, crop, etc.)
 //! - `preprocessor_config`: HuggingFace config parsing
-//! - `processor`: Vision processor trait and registry
+//! - `processor`: Vision processor trait
 //! - `processors`: Model-specific implementations (LLaVA, Qwen-VL, etc.)
 //!
 //! Modality-neutral encoder outputs live in [`crate::encoder_inputs`], while
@@ -27,9 +27,9 @@
 //! // Load config from HuggingFace
 //! let config = PreProcessorConfig::from_json(config_json)?;
 //!
-//! // Create processor and preprocess images
-//! let processor = LlavaProcessor::new();
-//! let result = processor.preprocess(&images, &config)?;
+//! // Create a processor that resolves the config once, then preprocess images
+//! let processor = LlavaProcessor::from_configs(&model_config, &config);
+//! let result = processor.preprocess(&images)?;
 //! ```
 
 pub mod execution;
@@ -46,8 +46,8 @@ pub mod transforms;
 // preprocessing outputs.
 pub use preprocessor_config::PreProcessorConfig;
 pub use processor::{
-    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionPreprocessingContext,
-    VisionProcessorRegistry,
+    ModelSpecificValue, PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+    VisionPreprocessingContext,
 };
 pub use processors::{
     DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,

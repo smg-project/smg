@@ -18,9 +18,6 @@ from ..common import CONVERGE, Gateway, free_port
 
 # The service every test's workers are instances of.
 SERVICE = "smg-worker"
-# A periodic pass no test outlives: under it, only Consul's answers to the
-# blocking queries change the fleet.
-NO_PASS_SECS = 3600
 # The management token of an agent started with ACLs on.
 MANAGEMENT_TOKEN = "e2e-management"
 # The files of an agent serving HTTPS, by the variable that carries each into

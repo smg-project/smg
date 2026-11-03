@@ -37,6 +37,8 @@ pub struct InklingImageProcessor {
     rescale_image_max_upscaled_long_edge: Option<u32>,
     /// Upper bound on total patches per preprocess call; `None` disables it.
     max_patches: Option<usize>,
+    mean: [f64; 3],
+    std: [f64; 3],
 }
 
 impl Default for InklingImageProcessor {
@@ -57,7 +59,17 @@ impl InklingImageProcessor {
                 DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE,
             ),
             max_patches: Some(DEFAULT_INKLING_MAX_PATCHES),
+            mean: INKLING_IMAGE_MEAN,
+            std: INKLING_IMAGE_STD,
         }
+    }
+
+    /// Resolve `config` over the defaults once; a config whose geometry or
+    /// rescale the processor cannot serve is refused here.
+    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
+        let processor = Self::new().with_preprocessor_config(config);
+        processor.validate()?;
+        Ok(processor)
     }
 
     fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
@@ -85,6 +97,26 @@ impl InklingImageProcessor {
         {
             processor.max_patches = Some(limit);
         }
+        processor.mean = config
+            .image_mean
+            .as_ref()
+            .map_or(INKLING_IMAGE_MEAN, |values| {
+                if values.len() >= 3 {
+                    [values[0], values[1], values[2]]
+                } else {
+                    INKLING_IMAGE_MEAN
+                }
+            });
+        processor.std = config
+            .image_std
+            .as_ref()
+            .map_or(INKLING_IMAGE_STD, |values| {
+                if values.len() >= 3 {
+                    [values[0], values[1], values[2]]
+                } else {
+                    INKLING_IMAGE_STD
+                }
+            });
         processor
     }
 
@@ -233,35 +265,12 @@ impl VisionPreProcessor for InklingImageProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        let processor = self.with_preprocessor_config(config);
-        processor.validate()?;
-
-        let mean = config
-            .image_mean
-            .as_ref()
-            .map_or(INKLING_IMAGE_MEAN, |values| {
-                if values.len() >= 3 {
-                    [values[0], values[1], values[2]]
-                } else {
-                    INKLING_IMAGE_MEAN
-                }
-            });
-        let std = config
-            .image_std
-            .as_ref()
-            .map_or(INKLING_IMAGE_STD, |values| {
-                if values.len() >= 3 {
-                    [values[0], values[1], values[2]]
-                } else {
-                    INKLING_IMAGE_STD
-                }
-            });
+        let (mean, std) = (self.mean, self.std);
 
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut tokens_per_item = Vec::with_capacity(images.len());
@@ -269,9 +278,9 @@ impl VisionPreProcessor for InklingImageProcessor {
         let mut total_patches = 0usize;
         for image in images {
             let (width, height) = image.dimensions();
-            let (scaled_width, scaled_height) = processor.scaled_image_dimensions(width, height);
+            let (scaled_width, scaled_height) = self.scaled_image_dimensions(width, height);
             let (_, _, num_patches) =
-                processor.patch_grid(scaled_width as usize, scaled_height as usize);
+                self.patch_grid(scaled_width as usize, scaled_height as usize);
             feature_token_counts.push(num_patches);
             tokens_per_item.push(num_patches as i64);
             item_sizes.push((scaled_width, scaled_height));
@@ -281,8 +290,8 @@ impl VisionPreProcessor for InklingImageProcessor {
         // Enforce the patch budget BEFORE reserving. A small crafted image can
         // decode to huge dimensions; the reservation below would otherwise abort
         // the whole process (with_capacity/handle_alloc_error is uncatchable).
-        processor.ensure_patch_budget(total_patches)?;
-        let capacity = total_patches * processor.num_patch_features();
+        self.ensure_patch_budget(total_patches)?;
+        let capacity = total_patches * self.num_patch_features();
         let mut patches: Vec<f32> = Vec::new();
         patches.try_reserve_exact(capacity).map_err(|e| {
             TransformError::ShapeError(format!(
@@ -290,15 +299,15 @@ impl VisionPreProcessor for InklingImageProcessor {
             ))
         })?;
         for image in images {
-            processor.append_image_patches(image, &mean, &std, &mut patches);
+            self.append_image_patches(image, &mean, &std, &mut patches);
         }
 
         let encoder_input = ArrayD::from_shape_vec(
             IxDyn(&[
                 total_patches,
-                processor.temporal_patch_size,
-                processor.patch_size,
-                processor.patch_size,
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
                 3,
             ]),
             patches,
@@ -306,7 +315,7 @@ impl VisionPreProcessor for InklingImageProcessor {
         .map_err(|e| {
             TransformError::ShapeError(format!(
                 "failed to create Inkling image encoder input [{total_patches}, {}, {}, {}, 3]: {e}",
-                processor.temporal_patch_size, processor.patch_size, processor.patch_size
+                self.temporal_patch_size, self.patch_size, self.patch_size
             ))
         })?;
 
@@ -319,15 +328,9 @@ impl VisionPreProcessor for InklingImageProcessor {
         )
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        let (scaled_width, scaled_height) = processor.scaled_image_dimensions(width, height);
-        Ok(processor
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        let (scaled_width, scaled_height) = self.scaled_image_dimensions(width, height);
+        Ok(self
             .patch_grid(scaled_width as usize, scaled_height as usize)
             .2)
     }
@@ -336,7 +339,7 @@ impl VisionPreProcessor for InklingImageProcessor {
         "inkling"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -364,6 +367,8 @@ mod tests {
             rescale_image_frac: None,
             rescale_image_max_upscaled_long_edge: None,
             max_patches: None,
+            mean: INKLING_IMAGE_MEAN,
+            std: INKLING_IMAGE_STD,
         }
     }
 
@@ -379,7 +384,6 @@ mod tests {
 
     #[test]
     fn preprocess_rejects_image_exceeding_in_patch_limit() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(2),
@@ -393,8 +397,9 @@ mod tests {
             )]),
             ..PreProcessorConfig::default()
         };
+        let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
         let err = processor
-            .preprocess(&[test_image()], &config)
+            .preprocess(&[test_image()])
             .expect_err("must reject an image exceeding in_patch_limit");
         assert!(
             matches!(err, TransformError::ShapeError(_)),
@@ -404,7 +409,6 @@ mod tests {
 
     #[test]
     fn preprocess_succeeds_within_in_patch_limit() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(2),
@@ -417,7 +421,8 @@ mod tests {
             )]),
             ..PreProcessorConfig::default()
         };
-        assert!(processor.preprocess(&[test_image()], &config).is_ok());
+        let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
+        assert!(processor.preprocess(&[test_image()]).is_ok());
     }
 
     fn norm(raw: f32, channel: usize) -> f32 {
@@ -432,7 +437,6 @@ mod tests {
 
     #[test]
     fn inkling_image_shape_includes_extra_patch_column_and_temporal_duplication() {
-        let processor = processor_without_rescale();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(2),
@@ -441,7 +445,8 @@ mod tests {
             temporal_patch_size: Some(2),
             ..PreProcessorConfig::default()
         };
-        let result = processor.preprocess(&[test_image()], &config).unwrap();
+        let processor = processor_without_rescale().with_preprocessor_config(&config);
+        let result = processor.preprocess(&[test_image()]).unwrap();
         assert_eq!(result.encoder_input.shape(), &[2, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![2]);
 
@@ -464,7 +469,6 @@ mod tests {
 
     #[test]
     fn calculate_num_tokens_matches_expected_grid_rule() {
-        let processor = processor_without_rescale();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(40),
@@ -472,46 +476,32 @@ mod tests {
             }),
             ..PreProcessorConfig::default()
         };
-        assert_eq!(processor.calculate_num_tokens(80, 40, &config).unwrap(), 3);
-        assert_eq!(processor.calculate_num_tokens(81, 41, &config).unwrap(), 6);
+        let processor = processor_without_rescale().with_preprocessor_config(&config);
+        assert_eq!(processor.calculate_num_tokens(80, 40).unwrap(), 3);
+        assert_eq!(processor.calculate_num_tokens(81, 41).unwrap(), 6);
     }
 
     #[test]
     fn calculate_num_tokens_uses_authored_dimensions_by_default() {
         let processor = InklingImageProcessor::new();
-        let config = PreProcessorConfig::default();
-
-        assert_eq!(
-            processor.calculate_num_tokens(640, 480, &config).unwrap(),
-            204
-        );
-        assert_eq!(
-            processor.calculate_num_tokens(1200, 600, &config).unwrap(),
-            465
-        );
-        assert_eq!(
-            processor.calculate_num_tokens(3000, 2000, &config).unwrap(),
-            3800
-        );
+        assert_eq!(processor.calculate_num_tokens(640, 480).unwrap(), 204);
+        assert_eq!(processor.calculate_num_tokens(1200, 600).unwrap(), 465);
+        assert_eq!(processor.calculate_num_tokens(3000, 2000).unwrap(), 3800);
     }
 
     #[test]
     fn config_can_explicitly_enable_image_rescale() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig::from_json(
             r#"{"patch_size":40,"rescale_image_frac":2.0,"rescale_image_max_upscaled_long_edge":2048}"#,
         )
         .unwrap();
+        let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
 
-        assert_eq!(
-            processor.calculate_num_tokens(640, 480, &config).unwrap(),
-            792
-        );
+        assert_eq!(processor.calculate_num_tokens(640, 480).unwrap(), 792);
     }
 
     #[test]
     fn preprocess_preserves_authored_size_by_default() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(2),
@@ -520,8 +510,9 @@ mod tests {
             temporal_patch_size: Some(2),
             ..PreProcessorConfig::default()
         };
+        let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
 
-        let result = processor.preprocess(&[test_image()], &config).unwrap();
+        let result = processor.preprocess(&[test_image()]).unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[2, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![2]);
@@ -535,13 +526,13 @@ mod tests {
 
     #[test]
     fn preprocess_applies_explicit_resize_before_patchifying() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig::from_json(
             r#"{"patch_size":2,"temporal_patch_size":2,"rescale_image_frac":2.0}"#,
         )
         .unwrap();
+        let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
 
-        let result = processor.preprocess(&[test_image()], &config).unwrap();
+        let result = processor.preprocess(&[test_image()]).unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[6, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![6]);
@@ -556,6 +547,8 @@ mod tests {
             rescale_image_frac: Some(1.5),
             rescale_image_max_upscaled_long_edge: None,
             max_patches: None,
+            mean: INKLING_IMAGE_MEAN,
+            std: INKLING_IMAGE_STD,
         };
 
         assert_eq!(processor.scaled_image_dimensions(3, 2), (5, 3));
@@ -568,6 +561,8 @@ mod tests {
                 DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE,
             ),
             max_patches: None,
+            mean: INKLING_IMAGE_MEAN,
+            std: INKLING_IMAGE_STD,
         };
         assert_eq!(
             capped_processor.scaled_image_dimensions(1200, 600),

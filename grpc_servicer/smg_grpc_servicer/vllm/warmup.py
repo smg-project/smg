@@ -23,6 +23,14 @@ own scheduler, and routes a request that names a ``data_parallel_rank`` to
 that rank (the Rust server over its wire, the in-process engine client by the
 same argument): the plan carries the rank count and pins every request, so
 every rank runs every shape, and the log's count is per rank.
+
+The plan keeps to the length classes (:attr:`WarmupInputs.every_prefill_length`
+stays off): the first use of a prefill length between two classes has only
+cost this engine a kernel search, never a hang, and at its default step of
+16,384 tokens a pass over every length would take an hour. Its longest
+prompt is the context less the one output token: this engine admits a
+prompt and an output budget that together fill the context
+(:attr:`WarmupInputs.context_reserve_tokens` stays zero).
 """
 
 from __future__ import annotations
@@ -39,7 +47,9 @@ from smg_grpc_servicer.warmup import (
     WarmupRequest,
     parse_setting,
     plan_for,
+    refused,
     run_warmup_async,
+    unserved,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +100,7 @@ class GrpcWire:
         self._stub = vllm_engine_pb2_grpc.VllmEngineStub(self._channel)
 
     def generate(self, request: WarmupRequest, timeout: float) -> None:
+        import grpc
         from smg_grpc_proto import vllm_engine_pb2
 
         message = vllm_engine_pb2.GenerateRequest(
@@ -108,16 +119,34 @@ class GrpcWire:
         if request.data_parallel_rank is not None:
             message.data_parallel_rank = request.data_parallel_rank
         last = None
-        for frame in self._stub.Generate(message, timeout=timeout):
-            last = frame
+        try:
+            for frame in self._stub.Generate(message, timeout=timeout):
+                last = frame
+        except grpc.RpcError as error:
+            if refusal := refused(error):
+                # The servicer answered the refusal as the status its code
+                # means: a failed request, not a covered step; whether it is
+                # a step toward the stop is UnservedRequest's rule.
+                raise refusal from error
+            raise
         if last is None or not last.HasField("complete"):
             raise RuntimeError("the request ended without a complete frame")
+        if error := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
+            # The engine ended the request without serving it (an abort at
+            # admission arrives as a completion with no token): a failed
+            # request, not a covered step.
+            raise error
 
     def flush_cache(self) -> bool:
         from smg_grpc_proto.generated import common_pb2
 
         response = self._stub.FlushCache(common_pb2.FlushCacheRequest(), timeout=60)
-        return bool(getattr(response, "success", True))
+        success = bool(getattr(response, "success", True))
+        if not success and (message := str(getattr(response, "message", "") or "")):
+            # The servicer answered the refusal with its reason: raised, the
+            # warm-up's end line carries the words as it does for a raised status.
+            raise RuntimeError(message)
+        return success
 
     def close(self) -> None:
         if self._owns_channel:
@@ -152,13 +181,21 @@ class EngineWire:
         )
 
         async def consume() -> None:
-            async for _ in self._engine.generate(
+            last = None
+            async for last in self._engine.generate(
                 TokensPrompt(prompt_token_ids=list(request.token_ids)),
                 params,
                 request.request_id,
                 **pinned,
             ):
                 pass
+            if last is None or not last.outputs:
+                raise RuntimeError("the request ended without an output")
+            output = last.outputs[0]
+            if error := unserved(output.finish_reason, len(output.token_ids)):
+                # The engine ended the request without serving it: a failed
+                # request, not a covered step.
+                raise error
 
         await asyncio.wait_for(consume(), timeout)
 

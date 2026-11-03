@@ -34,6 +34,15 @@
 //!    extra listener. The listener is plain HTTP and serves until process
 //!    exit, so probes stay answerable through the entire drain window.
 //!
+//! # The per-model section
+//!
+//! Both readiness bodies carry `models`: one entry per served model with the
+//! gateway's own predicates applied to that model's workers (`ready`, a
+//! `reason` when it is not, its healthy and registered worker counts), so a
+//! rollout or a traffic switch can ask about one model from the same probe
+//! while the status keeps answering for the gateway as a whole. A model whose
+//! last worker left is no longer listed.
+//!
 //! # Drain semantics
 //!
 //! Once graceful shutdown begins (`InFlightRequestTracker::begin_drain`),
@@ -53,7 +62,8 @@ use axum::{
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
-use openai_protocol::worker::MmProcessingMode;
+use openai_protocol::worker::{MmProcessingMode, WorkerStatus};
+use serde::Serialize;
 use serde_json::json;
 use tokio::{
     sync::broadcast::{
@@ -65,11 +75,11 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{RouterConfig, RoutingMode},
+    config::{ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
     routers::grpc::multimodal::{mm_settings, models_without_media_processing},
-    worker::{event::WorkerEvent, WorkerRegistry, WorkerType},
+    worker::{event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 /// How often the maintainer re-derives readiness from the registry even
@@ -84,8 +94,8 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 /// values the `/readiness` handler used to compute inline per probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadinessSnapshot {
-    /// Per-mode worker presence: any healthy worker in a single-pool mode,
-    /// or at least one healthy worker for every required disaggregated role.
+    /// Per-mode worker capacity: any healthy worker in IGW/single-pool modes,
+    /// or every pipeline role meeting its configured threshold in PD/EPD.
     pub workers_ready: bool,
     /// Tokenizer-autoload gate: every healthy gRPC/ZMQ worker's tokenizer is
     /// registered (`true` when autoload is disabled — the gateway does not
@@ -107,6 +117,137 @@ pub struct ReadinessSnapshot {
     /// and every other model, and a probe that failed would take all of them
     /// out of rotation. Empty under the other placements.
     pub models_without_media_processing: Vec<String>,
+    /// Per-role capacity details for PD/EPD modes.
+    pub roles: Option<ReadinessRolesSnapshot>,
+    /// One entry per served model, sorted by id: the gateway's predicates
+    /// above applied to the model's own workers (reported in both bodies).
+    pub models: Vec<ModelReadiness>,
+}
+
+/// One served model's readiness, the `models` section of the `/readiness`
+/// body. The same predicates the gateway-level decision reads, over the
+/// workers of this model alone: a Ready worker (one per role the PD/EPD mode
+/// needs; the fleet-level thresholds stay the gateway's), then the tokenizer
+/// of every healthy worker on the gRPC pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelReadiness {
+    pub model: String,
+    pub ready: bool,
+    /// Why the model is not ready (`no_healthy_worker`, `draining` when every
+    /// worker of it drains, `no_healthy_prefill_worker` and its encode and
+    /// decode siblings, `tokenizer_not_ready`); absent on a ready model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    pub healthy_workers: usize,
+    pub total_workers: usize,
+}
+
+impl ModelReadiness {
+    /// The entry for `model` from its workers (at least one: a model with
+    /// none is not served and gets no entry), under the gateway's mode and
+    /// tokenizer rule.
+    fn derive(
+        model: String,
+        workers: &[Arc<dyn Worker>],
+        router_config: &RouterConfig,
+        tokenizer_registered: &impl Fn(&str) -> bool,
+    ) -> Self {
+        let healthy_of = |role: Option<WorkerType>| {
+            workers
+                .iter()
+                .filter(|worker| {
+                    worker.is_healthy() && role.is_none_or(|role| *worker.worker_type() == role)
+                })
+                .count()
+        };
+        let healthy_workers = healthy_of(None);
+        // The roles the mode needs a healthy worker of, with the reason a
+        // model that lacks one reports. Under encode-prefill-decode the
+        // encode role is asked of a model that has an encode worker
+        // registered: routing asks for one only when a request carries
+        // media, so a text-only model on that pipeline serves all of its
+        // traffic on prefill and decode alone, and a model whose encode
+        // pool is down still serves its text requests but is not whole.
+        const PREFILL: (WorkerType, &str) = (WorkerType::Prefill, "no_healthy_prefill_worker");
+        const DECODE: (WorkerType, &str) = (WorkerType::Decode, "no_healthy_decode_worker");
+        const ENCODE: (WorkerType, &str) = (WorkerType::Encode, "no_healthy_encode_worker");
+        let has_encode_worker = || {
+            workers
+                .iter()
+                .any(|worker| *worker.worker_type() == WorkerType::Encode)
+        };
+        let roles_needed: &[(WorkerType, &'static str)] = match &router_config.mode {
+            RoutingMode::PrefillDecode { .. } => &[PREFILL, DECODE],
+            RoutingMode::EncodePrefillDecode { .. } if has_encode_worker() => {
+                &[ENCODE, PREFILL, DECODE]
+            }
+            RoutingMode::EncodePrefillDecode { .. } => &[PREFILL, DECODE],
+            RoutingMode::Regular { .. }
+            | RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => &[],
+        };
+        let reason = if healthy_workers == 0 {
+            if workers
+                .iter()
+                .all(|worker| worker.status() == WorkerStatus::Draining)
+            {
+                Some("draining")
+            } else {
+                Some("no_healthy_worker")
+            }
+        } else if let Some((_, lacking)) = roles_needed
+            .iter()
+            .find(|(role, _)| healthy_of(Some(*role)) == 0)
+        {
+            Some(*lacking)
+        } else if !router_config.disable_tokenizer_autoload
+            && !workers
+                .iter()
+                .filter(|worker| {
+                    worker.is_healthy() && worker.connection_mode().uses_grpc_pipeline()
+                })
+                .all(|worker| tokenizer_registered(worker.model_id()))
+        {
+            Some("tokenizer_not_ready")
+        } else {
+            None
+        };
+        Self {
+            model,
+            ready: reason.is_none(),
+            reason,
+            healthy_workers,
+            total_workers: workers.len(),
+        }
+    }
+}
+
+/// Cached readiness evaluation for one pipeline role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReadinessRoleSnapshot {
+    #[serde(rename = "healthy")]
+    pub healthy_workers: usize,
+    #[serde(rename = "registered")]
+    pub registered_workers: usize,
+    #[serde(rename = "expected", skip_serializing_if = "Option::is_none")]
+    pub expected_workers: Option<usize>,
+    #[serde(rename = "minimum")]
+    pub min_healthy_workers: usize,
+    #[serde(rename = "minimum_percent", skip_serializing_if = "Option::is_none")]
+    pub min_healthy_percent: Option<u8>,
+    #[serde(rename = "required")]
+    pub required_workers: usize,
+    pub ready: bool,
+}
+
+/// Role snapshots included in PD/EPD readiness responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReadinessRolesSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode: Option<ReadinessRoleSnapshot>,
+    pub prefill: ReadinessRoleSnapshot,
+    pub decode: ReadinessRoleSnapshot,
 }
 
 /// Shared O(1) probe state: the cached readiness snapshot plus the drain
@@ -174,40 +315,63 @@ impl ProbeState {
         let workers = worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
-        let workers_ready = if router_config.enable_igw
-            && !matches!(
-                &router_config.mode,
-                RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
-            ) {
-            !healthy_workers.is_empty()
-        } else {
-            match &router_config.mode {
-                RoutingMode::PrefillDecode { .. } => {
-                    let has_prefill = healthy_workers
-                        .iter()
-                        .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                    let has_decode = healthy_workers
-                        .iter()
-                        .any(|w| matches!(w.worker_type(), WorkerType::Decode));
-                    has_prefill && has_decode
-                }
-                RoutingMode::EncodePrefillDecode { .. } => {
-                    let has_encode = healthy_workers
-                        .iter()
-                        .any(|w| matches!(w.worker_type(), WorkerType::Encode));
-                    let has_prefill = healthy_workers
-                        .iter()
-                        .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                    let has_decode = healthy_workers
-                        .iter()
-                        .any(|w| matches!(w.worker_type(), WorkerType::Decode));
-                    has_encode && has_prefill && has_decode
-                }
-                RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
-                RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
-                RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
-                RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+        let role_snapshot = |worker_type: WorkerType, threshold: ReadinessRoleConfig| {
+            let registered_workers = workers
+                .iter()
+                .filter(|worker| *worker.worker_type() == worker_type)
+                .count();
+            let healthy_count = healthy_workers
+                .iter()
+                .filter(|worker| *worker.worker_type() == worker_type)
+                .count();
+            let required_workers = threshold.required_workers();
+            ReadinessRoleSnapshot {
+                healthy_workers: healthy_count,
+                registered_workers,
+                expected_workers: threshold.expected_workers,
+                min_healthy_workers: threshold.min_healthy_workers,
+                min_healthy_percent: threshold.min_healthy_percent,
+                required_workers,
+                ready: healthy_count >= required_workers,
             }
+        };
+
+        // PD/EPD capacity gates take precedence over the IGW shortcut. Service
+        // discovery automatically enables IGW, so checking IGW first would
+        // silently reduce configured role thresholds back to "any healthy
+        // worker" in the deployment mode that needs them most.
+        let (workers_ready, roles) = match &router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let thresholds = router_config.pd_readiness.unwrap_or_default();
+                let prefill = role_snapshot(WorkerType::Prefill, thresholds.prefill);
+                let decode = role_snapshot(WorkerType::Decode, thresholds.decode);
+                (
+                    prefill.ready && decode.ready,
+                    Some(ReadinessRolesSnapshot {
+                        encode: None,
+                        prefill,
+                        decode,
+                    }),
+                )
+            }
+            RoutingMode::EncodePrefillDecode { .. } => {
+                let thresholds = router_config.pd_readiness.unwrap_or_default();
+                let encode = role_snapshot(WorkerType::Encode, Default::default());
+                let prefill = role_snapshot(WorkerType::Prefill, thresholds.prefill);
+                let decode = role_snapshot(WorkerType::Decode, thresholds.decode);
+                (
+                    encode.ready && prefill.ready && decode.ready,
+                    Some(ReadinessRolesSnapshot {
+                        encode: Some(encode),
+                        prefill,
+                        decode,
+                    }),
+                )
+            }
+            RoutingMode::Regular { .. }
+            | RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => (!healthy_workers.is_empty(), None),
         };
 
         // A worker reports healthy (engine SERVING) as soon as its process is
@@ -237,6 +401,24 @@ impl ProbeState {
         // model's text requests and every other model, and a failed probe
         // would take the whole pod out of rotation for all of them.
         let media_unserved = models_without_media_processing(mm_processing, &workers);
+
+        // The per-model section, from the registry's model index (a worker
+        // that serves several models counts for each); the gateway's own
+        // wildcard id is not a model, and a model whose last worker left
+        // between the two reads has no entry (the removal's own recompute
+        // follows).
+        let mut model_ids = worker_registry.get_models();
+        model_ids.sort_unstable();
+        let models = model_ids
+            .into_iter()
+            .filter(|model| model != UNKNOWN_MODEL_ID)
+            .filter_map(|model| {
+                let of_model = worker_registry.get_by_model(&model);
+                (!of_model.is_empty()).then(|| {
+                    ModelReadiness::derive(model, &of_model, router_config, &tokenizer_registered)
+                })
+            })
+            .collect();
         {
             let previous = self.readiness.load();
             if media_unserved != previous.models_without_media_processing {
@@ -264,21 +446,23 @@ impl ProbeState {
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),
+            roles,
             models_without_media_processing: media_unserved,
+            models,
         }));
     }
 
     /// Build the `/readiness` response from cached state only: one drain
     /// flag load plus one snapshot pointer load — no registry access.
     ///
-    /// Response bodies are byte-identical to the previous inline handler,
-    /// with two additions: while draining, readiness reports not-ready with
-    /// reason `"draining"` so load balancers stop routing new connections
-    /// during shutdown (liveness intentionally stays OK — see module docs);
-    /// and while worker-side media placement has a model no worker processes
-    /// media for, the ready body names it under
-    /// `models_without_media_processing` (the status stays ready: the pod
-    /// serves everything else).
+    /// While draining, readiness reports not-ready with reason `"draining"`
+    /// so load balancers stop routing new connections during shutdown
+    /// (liveness intentionally stays OK). Under worker-side media placement,
+    /// the ready body names models no worker processes media for under
+    /// `models_without_media_processing`; status stays ready because the pod
+    /// serves everything else. PD/EPD responses additionally expose the
+    /// cached per-role capacity decision. Both bodies carry the per-model
+    /// section (`models`).
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
             return mark_probe(
@@ -300,10 +484,14 @@ impl ProbeState {
                 "healthy_workers": snapshot.healthy_workers,
                 "total_workers": snapshot.total_workers
             });
+            if let Some(roles) = snapshot.roles {
+                body["roles"] = json!(roles);
+            }
             if !snapshot.models_without_media_processing.is_empty() {
                 body["models_without_media_processing"] =
                     json!(snapshot.models_without_media_processing);
             }
+            body["models"] = json!(snapshot.models);
             mark_probe((StatusCode::OK, Json(body)).into_response())
         } else {
             let reason = if snapshot.workers_ready {
@@ -311,16 +499,12 @@ impl ProbeState {
             } else {
                 "insufficient healthy workers"
             };
-            mark_probe(
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "status": "not ready",
-                        "reason": reason
-                    })),
-                )
-                    .into_response(),
-            )
+            let mut body = json!({"status": "not ready", "reason": reason});
+            if let Some(roles) = snapshot.roles {
+                body["roles"] = json!(roles);
+            }
+            body["models"] = json!(snapshot.models);
+            mark_probe((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response())
         }
     }
 }
@@ -540,7 +724,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker};
+    use crate::{
+        config::PdReadinessConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
+    };
 
     fn worker(
         url: &str,
@@ -640,19 +827,17 @@ mod tests {
         assert_eq!(snapshot.healthy_workers, 0);
     }
 
+    /// Default readiness still requires both roles and follows health transitions.
     #[test]
-    fn pd_mode_requires_healthy_prefill_and_decode_with_igw() {
+    fn pd_mode_requires_healthy_prefill_and_decode() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
-        let router_config = RouterConfig {
-            enable_igw: true,
-            ..config(RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-            })
-        };
+        let router_config = config(RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        });
 
         let prefill_id = registry
             .register(worker(
@@ -681,17 +866,182 @@ mod tests {
         recompute(&state, &registry, &router_config);
         assert!(state.readiness().workers_ready);
 
+        // Losing the prefill side flips readiness back off.
         registry.transition_status(&prefill_id, WorkerStatus::NotReady);
         recompute(&state, &registry, &router_config);
         assert!(!state.readiness().workers_ready);
     }
 
+    /// Worker removal cannot shrink the configured percentage denominator.
+    #[tokio::test]
+    async fn pd_readiness_uses_expected_count_as_stable_percentage_denominator() {
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = RouterConfig {
+            pd_readiness: Some(PdReadinessConfig {
+                prefill: ReadinessRoleConfig {
+                    expected_workers: Some(8),
+                    min_healthy_workers: 4,
+                    min_healthy_percent: Some(80),
+                },
+                decode: ReadinessRoleConfig {
+                    expected_workers: Some(1),
+                    min_healthy_workers: 1,
+                    min_healthy_percent: Some(100),
+                },
+            }),
+            ..config(RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            })
+        };
+
+        registry
+            .register(worker(
+                "http://d1:8080",
+                "llama-3",
+                WorkerType::Decode,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        for index in 1..=6 {
+            registry
+                .register(worker(
+                    &format!("http://p{index}:8080"),
+                    "llama-3",
+                    WorkerType::Prefill,
+                    ConnectionMode::Http,
+                    WorkerStatus::Ready,
+                ))
+                .unwrap();
+        }
+
+        recompute(&state, &registry, &router_config);
+        let snapshot = state.readiness();
+        let roles = snapshot
+            .roles
+            .expect("PD readiness must expose role counts");
+        assert_eq!(roles.prefill.required_workers, 7);
+        assert_eq!(roles.prefill.healthy_workers, 6);
+        assert!(!snapshot.workers_ready);
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "insufficient healthy workers");
+        assert_eq!(body["roles"]["prefill"]["required"], 7);
+
+        registry
+            .register(worker(
+                "http://p7:8080",
+                "llama-3",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        recompute(&state, &registry, &router_config);
+        assert!(state.readiness().workers_ready);
+
+        // The configured expectation remains the denominator after registry
+        // removal; it must not silently become 6/6 = 100%.
+        let id = registry.get_id_by_url("http://p7:8080").unwrap();
+        registry.remove(&id);
+        recompute(&state, &registry, &router_config);
+        let snapshot = state.readiness();
+        let roles = snapshot.roles.unwrap();
+        assert_eq!(roles.prefill.expected_workers, Some(8));
+        assert_eq!(roles.prefill.required_workers, 7);
+        assert!(!snapshot.workers_ready);
+    }
+
+    /// Service discovery and unrelated workers cannot bypass role capacity gates.
     #[test]
-    fn igw_epd_does_not_accept_an_untyped_healthy_worker() {
+    fn pd_role_thresholds_take_precedence_over_igw_shortcut() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = RouterConfig {
             enable_igw: true,
+            pd_readiness: Some(PdReadinessConfig {
+                prefill: ReadinessRoleConfig {
+                    expected_workers: Some(2),
+                    min_healthy_workers: 1,
+                    min_healthy_percent: Some(100),
+                },
+                decode: ReadinessRoleConfig::default(),
+            }),
+            ..config(RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            })
+        };
+
+        recompute(&state, &registry, &router_config);
+        assert!(!state.readiness().workers_ready);
+
+        registry
+            .register(http_worker("http://w1:8080", WorkerStatus::Ready))
+            .unwrap();
+        recompute(&state, &registry, &router_config);
+        assert!(
+            !state.readiness().workers_ready,
+            "a regular IGW worker must not satisfy PD role thresholds"
+        );
+
+        for (url, worker_type) in [
+            ("http://p1:8080", WorkerType::Prefill),
+            ("http://d1:8080", WorkerType::Decode),
+        ] {
+            registry
+                .register(worker(
+                    url,
+                    "llama-3",
+                    worker_type,
+                    ConnectionMode::Http,
+                    WorkerStatus::Ready,
+                ))
+                .unwrap();
+        }
+        recompute(&state, &registry, &router_config);
+        assert!(
+            !state.readiness().workers_ready,
+            "one prefill must remain below the configured threshold of two"
+        );
+
+        registry
+            .register(worker(
+                "http://p2:8080",
+                "llama-3",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        recompute(&state, &registry, &router_config);
+        assert!(state.readiness().workers_ready);
+    }
+
+    /// EPD still needs an encode worker as well as both PD roles.
+    #[test]
+    fn epd_role_thresholds_take_precedence_over_igw_shortcut() {
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = RouterConfig {
+            enable_igw: true,
+            pd_readiness: Some(PdReadinessConfig {
+                decode: ReadinessRoleConfig {
+                    min_healthy_workers: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             ..config(RoutingMode::EncodePrefillDecode {
                 encode_urls: vec![],
                 prefill_urls: vec![],
@@ -707,6 +1057,35 @@ mod tests {
             .unwrap();
         recompute(&state, &registry, &router_config);
         assert!(!state.readiness().workers_ready);
+
+        for (url, worker_type) in [
+            ("http://e1:8080", WorkerType::Encode),
+            ("http://p1:8080", WorkerType::Prefill),
+            ("http://d1:8080", WorkerType::Decode),
+        ] {
+            registry
+                .register(worker(
+                    url,
+                    "llama-3",
+                    worker_type,
+                    ConnectionMode::Http,
+                    WorkerStatus::Ready,
+                ))
+                .unwrap();
+        }
+        recompute(&state, &registry, &router_config);
+        assert!(!state.readiness().workers_ready);
+        registry
+            .register(worker(
+                "http://d2:8080",
+                "llama-3",
+                WorkerType::Decode,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        recompute(&state, &registry, &router_config);
+        assert!(state.readiness().workers_ready);
     }
 
     #[test]
@@ -932,6 +1311,248 @@ mod tests {
         let body = body_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
         assert!(body.get("models_without_media_processing").is_none());
+    }
+
+    /// The per-model section: the gateway's predicates applied to each
+    /// served model's workers, with a reason on a model that is not ready,
+    /// while the status keeps answering for the gateway as a whole; a model
+    /// whose last worker left is no longer listed.
+    #[tokio::test]
+    async fn readiness_names_each_served_model_with_a_reason() {
+        async fn body_of(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = regular_config();
+        let m1 = registry
+            .register(worker(
+                "http://a:8080",
+                "m1",
+                WorkerType::Regular,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        let m2 = registry
+            .register(worker(
+                "grpc://b:9000",
+                "m2",
+                WorkerType::Regular,
+                ConnectionMode::Grpc,
+                WorkerStatus::NotReady,
+            ))
+            .unwrap();
+        let only_m1_tokenizer = |model: &str| model == "m1";
+
+        // The gateway is ready on m1; m2 has no healthy worker and says so.
+        state.recompute_with(
+            &registry,
+            &router_config,
+            only_m1_tokenizer,
+            MmProcessingMode::Auto,
+        );
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert_eq!(body["status"], "ready");
+        assert_eq!(
+            body["models"],
+            json!([
+                {"model": "m1", "ready": true, "healthy_workers": 1, "total_workers": 1},
+                {"model": "m2", "ready": false, "reason": "no_healthy_worker",
+                 "healthy_workers": 0, "total_workers": 1},
+            ])
+        );
+
+        // m2's worker passes its checks before its tokenizer lands: the model
+        // waits on the tokenizer, and so does the gateway, which holds on
+        // every gRPC worker's.
+        registry.transition_status(&m2, WorkerStatus::Ready);
+        state.recompute_with(
+            &registry,
+            &router_config,
+            only_m1_tokenizer,
+            MmProcessingMode::Auto,
+        );
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_of(response).await;
+        assert_eq!(body["reason"], "tokenizer not yet registered");
+        assert_eq!(body["models"][0]["ready"], true);
+        assert_eq!(
+            body["models"][1],
+            json!({"model": "m2", "ready": false, "reason": "tokenizer_not_ready",
+                   "healthy_workers": 1, "total_workers": 1})
+        );
+
+        // The tokenizer lands: every model ready, no reason anywhere.
+        state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
+        let body = body_of(state.readiness_response()).await;
+        assert_eq!(body["status"], "ready");
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models
+            .iter()
+            .all(|model| model["ready"] == true && model.get("reason").is_none()));
+
+        // m2 drains: not ready with that reason; the gateway stays ready on m1.
+        registry.transition_status(&m2, WorkerStatus::Draining);
+        state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert_eq!(body["models"][1]["reason"], "draining");
+        assert_eq!(body["models"][1]["healthy_workers"], 0);
+
+        // m2's last worker leaves: the model is no longer served, so no
+        // longer listed.
+        registry.remove(&m2);
+        state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
+        let body = body_of(state.readiness_response()).await;
+        assert_eq!(
+            body["models"],
+            json!([{"model": "m1", "ready": true, "healthy_workers": 1, "total_workers": 1}])
+        );
+
+        // No worker at all: the not-ready body carries an empty section.
+        registry.remove(&m1);
+        state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_of(response).await;
+        assert_eq!(body["reason"], "insufficient healthy workers");
+        assert_eq!(body["models"], json!([]));
+    }
+
+    /// Under PD a model is ready when each role the mode needs has a healthy
+    /// worker of it; the role it lacks is the reason, while the gateway's
+    /// own answer reads the fleet-level thresholds.
+    #[tokio::test]
+    async fn pd_readiness_names_the_role_a_model_lacks() {
+        async fn body_of(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = config(RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        });
+        for (url, model, role) in [
+            ("http://p1:8080", "m1", WorkerType::Prefill),
+            ("http://d1:8080", "m1", WorkerType::Decode),
+            ("http://p2:8080", "m2", WorkerType::Prefill),
+        ] {
+            registry
+                .register(worker(
+                    url,
+                    model,
+                    role,
+                    ConnectionMode::Http,
+                    WorkerStatus::Ready,
+                ))
+                .unwrap();
+        }
+        recompute(&state, &registry, &router_config);
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert_eq!(body["roles"]["decode"]["healthy"], 1);
+        assert_eq!(
+            body["models"],
+            json!([
+                {"model": "m1", "ready": true, "healthy_workers": 2, "total_workers": 2},
+                {"model": "m2", "ready": false, "reason": "no_healthy_decode_worker",
+                 "healthy_workers": 1, "total_workers": 1},
+            ])
+        );
+    }
+
+    /// Under encode-prefill-decode the encode role counts for a model that
+    /// has an encode worker: a text-only model serves on prefill and decode
+    /// alone and reads ready; a model whose encode pool is not healthy names
+    /// it. The entry's roles follow the workers the model has, not the mode.
+    #[tokio::test]
+    async fn epd_readiness_asks_encode_of_a_model_with_an_encode_worker() {
+        async fn body_of(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = config(RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        });
+        for (url, model, role, status) in [
+            (
+                "http://e1:8080",
+                "vision",
+                WorkerType::Encode,
+                WorkerStatus::NotReady,
+            ),
+            (
+                "http://p1:8080",
+                "vision",
+                WorkerType::Prefill,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://d1:8080",
+                "vision",
+                WorkerType::Decode,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://e2:8080",
+                "other-vision",
+                WorkerType::Encode,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://p2:8080",
+                "text",
+                WorkerType::Prefill,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://d2:8080",
+                "text",
+                WorkerType::Decode,
+                WorkerStatus::Ready,
+            ),
+        ] {
+            registry
+                .register(worker(url, model, role, ConnectionMode::Http, status))
+                .unwrap();
+        }
+        recompute(&state, &registry, &router_config);
+        let body = body_of(state.readiness_response()).await;
+        assert_eq!(
+            body["models"],
+            json!([
+                {"model": "other-vision", "ready": false, "reason": "no_healthy_prefill_worker",
+                 "healthy_workers": 1, "total_workers": 1},
+                {"model": "text", "ready": true, "healthy_workers": 2, "total_workers": 2},
+                {"model": "vision", "ready": false, "reason": "no_healthy_encode_worker",
+                 "healthy_workers": 2, "total_workers": 3},
+            ])
+        );
     }
 
     #[test]

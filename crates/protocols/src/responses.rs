@@ -690,7 +690,7 @@ pub struct CustomToolGrammar {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CustomToolGrammarSyntax {
-    /// Lark grammar (https://lark-parser.readthedocs.io/).
+    /// Lark grammar (<https://lark-parser.readthedocs.io/>).
     Lark,
     /// Regular expression.
     Regex,
@@ -2250,7 +2250,7 @@ pub struct McpToolInfo {
 /// Structured `mcp_call.error`: a `type`-tagged union of protocol,
 /// tool-execution, and HTTP failures. OpenAI removed the legacy plain-string
 /// shape from the wire; stored/replayed string errors still deserialize via
-/// [`mcp_call_error_compat`].
+/// `mcp_call_error_compat`.
 #[expect(
     clippy::enum_variant_names,
     reason = "variant names mirror the spec's `*_error` tag set"
@@ -3292,6 +3292,30 @@ pub struct ResponsesRequest {
 pub enum ResponseInput {
     Items(Vec<ResponseInputOutputItem>),
     Text(String),
+}
+
+impl ResponsesRequest {
+    /// `top_k` when the request set it: the field is a plain value whose
+    /// serde default (`-1`) stands for unset, so a reader whose own `top_k`
+    /// is an `Option` (the chat request, where `None` lets the model's own
+    /// defaults fill the knob) does not take the default for a choice. A
+    /// request that writes `-1` by hand reads as unset too; keeping the two
+    /// apart would take an `Option` field.
+    pub fn top_k_if_set(&self) -> Option<i32> {
+        (self.top_k != default_top_k()).then_some(self.top_k)
+    }
+
+    /// `min_p` when the request set it; the serde default (`0.0`) stands for
+    /// unset, as for [`Self::top_k_if_set`].
+    pub fn min_p_if_set(&self) -> Option<f32> {
+        (self.min_p != 0.0).then_some(self.min_p)
+    }
+
+    /// `repetition_penalty` when the request set it; the serde default
+    /// (`1.0`) stands for unset, as for [`Self::top_k_if_set`].
+    pub fn repetition_penalty_if_set(&self) -> Option<f32> {
+        (self.repetition_penalty != default_repetition_penalty()).then_some(self.repetition_penalty)
+    }
 }
 
 impl Default for ResponsesRequest {
@@ -4483,6 +4507,64 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three sampling knobs the request keeps as plain values read as set
+    /// only off their serde defaults: absent is unset, a value is set, and a
+    /// knob written as the default's own value reads as unset (the limit of a
+    /// plain field).
+    #[test]
+    fn the_plain_valued_sampling_knobs_read_as_set_only_off_their_defaults() {
+        let parse = |body: Value| -> ResponsesRequest {
+            serde_json::from_value(body).expect("the request deserializes")
+        };
+
+        let unset = parse(serde_json::json!({"model": "m", "input": "hi"}));
+        assert_eq!(unset.top_k_if_set(), None, "an absent top_k is unset");
+        assert_eq!(unset.min_p_if_set(), None, "an absent min_p is unset");
+        assert_eq!(
+            unset.repetition_penalty_if_set(),
+            None,
+            "an absent repetition_penalty is unset"
+        );
+
+        let set = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1
+        }));
+        assert_eq!(
+            set.top_k_if_set(),
+            Some(40),
+            "a top_k the request wrote is set"
+        );
+        assert_eq!(
+            set.min_p_if_set(),
+            Some(0.05),
+            "a min_p the request wrote is set"
+        );
+        assert_eq!(
+            set.repetition_penalty_if_set(),
+            Some(1.1),
+            "a repetition_penalty the request wrote is set"
+        );
+
+        let at_default = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0
+        }));
+        assert_eq!(
+            at_default.top_k_if_set(),
+            None,
+            "a top_k written as -1 reads as unset"
+        );
+        assert_eq!(
+            at_default.min_p_if_set(),
+            None,
+            "a min_p written as 0 reads as unset"
+        );
+        assert_eq!(
+            at_default.repetition_penalty_if_set(),
+            None,
+            "a repetition_penalty written as 1 reads as unset"
+        );
+    }
 
     /// The outputs of calls not among the items go; every other item keeps
     /// its place.

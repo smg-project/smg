@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError, Weak},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     time::Duration,
 };
 
@@ -297,6 +297,59 @@ fn describe(error: &(dyn std::error::Error + 'static)) -> String {
         );
     }
     text
+}
+
+/// A worker's HTTP client handle, materialized on first use.
+///
+/// Registration hands in a shared client from the worker client cache. A
+/// worker built without one whose connection mode never speaks HTTP (ZMQ:
+/// local health check, admin ops rejected up front) would otherwise pay for a
+/// connector and idle pool it can never use, so the fallback client is built
+/// only when a caller actually asks for it.
+pub struct LazyHttpClient {
+    cell: OnceLock<Arc<reqwest::Client>>,
+}
+
+impl LazyHttpClient {
+    /// Wrap an already-built client (the registration paths hand one in).
+    /// The strong handle is what keeps the client's cache entry alive.
+    pub fn ready(client: Arc<reqwest::Client>) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(client);
+        Self { cell }
+    }
+
+    /// Defer construction until [`Self::client`] is first called.
+    pub fn deferred() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    /// Whether the client is still unbuilt (test-only observation of laziness).
+    #[cfg(test)]
+    pub(crate) fn cell_is_empty(&self) -> bool {
+        self.cell.get().is_none()
+    }
+
+    /// The client, building the default one on first use. The fallback sets
+    /// no total timeout: dispatch deadlines come from the router config via
+    /// the client cache, and every health/admin call site sets its own.
+    pub fn client(&self) -> &reqwest::Client {
+        self.init()
+    }
+
+    /// A strong handle to the client if one was materialized, for a
+    /// replacement worker to adopt. Never forces the lazy cell: a worker
+    /// that never spoke HTTP hands its replacement a still-deferred slot.
+    pub fn handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.cell.get().map(Arc::clone)
+    }
+
+    fn init(&self) -> &Arc<reqwest::Client> {
+        self.cell
+            .get_or_init(|| Arc::new(crate::clients::http_client()))
+    }
 }
 
 /// Test support: run one `#[test]` of this binary in a child process whose

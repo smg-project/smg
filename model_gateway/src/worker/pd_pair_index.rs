@@ -160,10 +160,11 @@ fn pairing_mismatches(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
-
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType, WorkerType};
+    use crate::worker::{
+        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType,
+        WorkerType,
+    };
 
     fn worker(url: &str, worker_type: WorkerType, connector: Option<&str>) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
@@ -171,10 +172,7 @@ mod tests {
             .worker_type(worker_type)
             .connection_mode(ConnectionMode::Grpc)
             .runtime_type(RuntimeType::Vllm)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
+            .health_config(no_health_check());
         if let Some(connector) = connector {
             builder = builder.kv_connector(connector);
         }
