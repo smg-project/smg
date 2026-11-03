@@ -27,7 +27,9 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{
+        compose_stamp, intern_tenant, stamp_age_secs, MatchResult, TenantId, MATCHED_TENANTS_CAP,
+    },
     RadixTree,
 };
 
@@ -156,6 +158,10 @@ pub struct PrefixMatchResult {
     /// so a router can pressure-select among them instead of being bound to
     /// the single cached `tenant`. Empty when nothing matched.
     pub matched_tenants: Vec<TenantId>,
+    /// Seconds since `tenant` last accessed the deepest matched node, before
+    /// this match stamped it: how far back the reused prefix reaches. `None`
+    /// when nothing matched.
+    pub reuse_age_secs: Option<u64>,
 }
 
 impl MatchResult for PrefixMatchResult {
@@ -172,11 +178,17 @@ impl MatchResult for PrefixMatchResult {
     }
 }
 
-/// Global timestamp counter for LRU ordering
+/// Global sequence counter: a node's creation order, and the low half of an
+/// access stamp.
 static GLOBAL_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
-fn next_timestamp() -> u64 {
+fn next_sequence() -> u64 {
     GLOBAL_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// An access stamp (see [`compose_stamp`]) on this tree's sequence.
+fn next_timestamp() -> u64 {
+    compose_stamp(next_sequence())
 }
 
 /// Node in the token-based radix tree.
@@ -213,7 +225,7 @@ impl Node {
             parent: ParkingLotRwLock::new(Weak::new()),
             page_key: ParkingLotRwLock::new(None),
             hit_count: AtomicU64::new(0),
-            creation_time: next_timestamp(),
+            creation_time: next_sequence(),
             priority: AtomicI32::new(0),
         }
     }
@@ -323,23 +335,25 @@ impl Node {
     /// A returned tenant is always one this call stamped: both branches pick
     /// and stamp under the same shard guard, so an eviction cannot remove the
     /// pick in between and leave the match naming a tenant that no longer
-    /// owns the node. A match never re-attaches an evicted tenant.
-    fn touch_any_tenant(&self, ts: u64, track_lfu: bool) -> Option<TenantId> {
+    /// owns the node. A match never re-attaches an evicted tenant. Returned
+    /// with the tenant: the stamp it held before this call.
+    fn touch_any_tenant(&self, ts: u64, track_lfu: bool) -> Option<(TenantId, u64)> {
         let cached = self.last_tenant.read().clone();
-        let tenant = cached
-            .filter(|tenant| {
-                self.tenant_last_access_time
+        let (tenant, prev) = cached
+            .and_then(|tenant| {
+                let prev = self
+                    .tenant_last_access_time
                     .get_mut(tenant.as_ref())
-                    .map(|mut stamp| *stamp = ts)
-                    .is_some()
+                    .map(|mut stamp| std::mem::replace(&mut *stamp, ts))?;
+                Some((tenant, prev))
             })
             .or_else(|| {
                 self.tenant_last_access_time
                     .iter_mut()
                     .next()
                     .map(|mut entry| {
-                        *entry.value_mut() = ts;
-                        Arc::clone(entry.key())
+                        let prev = std::mem::replace(entry.value_mut(), ts);
+                        (Arc::clone(entry.key()), prev)
                     })
             })?;
         if track_lfu {
@@ -350,7 +364,7 @@ impl Node {
                 *guard = Some(Arc::clone(&tenant));
             }
         }
-        Some(tenant)
+        Some((tenant, prev))
     }
 }
 
@@ -725,6 +739,7 @@ impl TokenTree {
                 matched_token_count: 0,
                 input_token_count,
                 matched_tenants: Vec::new(),
+                reuse_age_secs: None,
             };
         }
         let tokens = &tokens[..aligned_len];
@@ -732,11 +747,16 @@ impl TokenTree {
         let mut matched_tokens = 0;
         let mut last_tenant: Option<TenantId> = None;
         let mut last_match_node: Option<NodeRef> = None;
+        // The stamp the deepest matched node held before this match.
+        let mut last_prev_stamp: Option<u64> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
 
         // Compute once: only track hit counts for LFU policy
         let track_lfu = self.eviction_policy == EvictionPolicy::Lfu;
+        // One stamp per match, as in `match_and_insert_dyn`: the order
+        // eviction needs, with one clock read instead of one per node.
+        let ts = next_timestamp();
 
         enum MatchStep {
             Done,
@@ -744,11 +764,11 @@ impl TokenTree {
             Continue {
                 next: NodeRef,
                 advance: usize,
-                tenant: Option<TenantId>,
+                tenant: Option<(TenantId, u64)>,
             },
             PartialMatch {
                 matched: usize,
-                tenant: Option<TenantId>,
+                tenant: Option<(TenantId, u64)>,
                 node: NodeRef,
             },
         }
@@ -788,19 +808,15 @@ impl TokenTree {
                     if match_len == 0 {
                         MatchStep::Done
                     } else {
-                        let tenant = child.get_any_tenant();
+                        // Update timestamp on match to keep LRU in sync with backend
+                        // SGLang does: child.last_access_time = access_time
+                        let tenant = child.touch_any_tenant(ts, track_lfu);
 
                         // If node has no tenants (all evicted), stop matching here
                         // This ensures we only route to workers that still have the prefix cached
                         if tenant.is_none() {
                             MatchStep::Done
                         } else {
-                            // Update timestamp on match to keep LRU in sync with backend
-                            // SGLang does: child.last_access_time = access_time
-                            if let Some(ref t) = tenant {
-                                child.touch_tenant(t, next_timestamp(), track_lfu);
-                            }
-
                             if match_len < child_tokens.len() {
                                 // Partial match within node (at page boundary)
                                 drop(child_tokens);
@@ -832,9 +848,10 @@ impl TokenTree {
                     node,
                 } => {
                     matched_tokens += matched;
-                    if let Some(t) = tenant {
+                    if let Some((t, prev)) = tenant {
                         last_tenant = Some(t);
                         last_match_node = Some(node);
+                        last_prev_stamp = Some(prev);
                     }
                     break;
                 }
@@ -844,9 +861,10 @@ impl TokenTree {
                     tenant,
                 } => {
                     matched_tokens += advance;
-                    if let Some(t) = tenant {
+                    if let Some((t, prev)) = tenant {
                         last_tenant = Some(t);
                         last_match_node = Some(Arc::clone(&next));
+                        last_prev_stamp = Some(prev);
                     }
                     remaining = &remaining[advance..];
                     current = next;
@@ -861,6 +879,7 @@ impl TokenTree {
             matched_tenants: last_match_node
                 .map(|node| node.matched_tenants())
                 .unwrap_or_default(),
+            reuse_age_secs: last_prev_stamp.and_then(stamp_age_secs),
         }
     }
 
@@ -926,6 +945,7 @@ impl TokenTree {
                 matched_token_count: 0,
                 input_token_count,
                 matched_tenants: Vec::new(),
+                reuse_age_secs: None,
             };
             let _ = select(&result);
             return result;
@@ -959,6 +979,8 @@ impl TokenTree {
         // tenant (an index into `path`), or the partial-match node.
         let mut last_full: Option<usize> = None;
         let mut partial: Option<(NodeRef, TenantId)> = None;
+        // The stamp the deepest matched node held before this match.
+        let mut last_prev_stamp: Option<u64> = None;
         // Once match would stop (all-evicted node / partial), freeze the match
         // result but keep descending for insert (insert's reach is a superset).
         let mut match_frozen = false;
@@ -1007,9 +1029,10 @@ impl TokenTree {
                         // Partial match within the node: match stops here.
                         drop(child_tokens);
                         if !match_frozen {
-                            if let Some(t) = child.touch_any_tenant(ts, track_lfu) {
+                            if let Some((t, prev)) = child.touch_any_tenant(ts, track_lfu) {
                                 matched_tokens += match_len;
                                 partial = Some((child, t));
+                                last_prev_stamp = Some(prev);
                             }
                             // (If the node is all-evicted, match records nothing
                             // and simply stops — same as match_prefix_with_counts.)
@@ -1029,9 +1052,10 @@ impl TokenTree {
                                     // All-evicted: match stops, insert continues.
                                     match_frozen = true;
                                 }
-                                Some(t) => {
+                                Some((t, prev)) => {
                                     matched_tokens += match_len;
                                     tenant = Some(t);
+                                    last_prev_stamp = Some(prev);
                                 }
                             }
                         }
@@ -1080,6 +1104,7 @@ impl TokenTree {
             matched_token_count: matched_tokens,
             input_token_count,
             matched_tenants,
+            reuse_age_secs: last_prev_stamp.and_then(stamp_age_secs),
         };
         let Some(tenant) = select(&result) else {
             // No insert (router selected no worker).
@@ -1599,12 +1624,16 @@ impl TokenTree {
     /// removes leaves in policy order across tenants — least recently used
     /// first under LRU — using the same leaf-first machinery as
     /// [`Self::evict_tenant`].
-    pub fn evict_tenant_by_size(&self, max_size: usize) {
+    ///
+    /// Returns the age in seconds of the most recently accessed entry it
+    /// evicted: under LRU, how far back the tree still remembers. `None`
+    /// when nothing was evicted.
+    pub fn evict_tenant_by_size(&self, max_size: usize) -> Option<u64> {
         use std::{cmp::Reverse, collections::BinaryHeap};
 
         let initial_total = self.total_token_size();
         if initial_total <= max_size {
-            return;
+            return None;
         }
 
         let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
@@ -1612,12 +1641,14 @@ impl TokenTree {
 
         // Min-heap by eviction priority (policy-dependent), across all tenants
         let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
-        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::with_capacity(leaves.len());
+        let mut leaf_data: Vec<(NodeRef, TenantId, u64)> = Vec::with_capacity(leaves.len());
+        // The newest stamp among the evicted entries.
+        let mut newest_evicted: Option<u64> = None;
 
         for (node, tenant, ts) in leaves.drain(..) {
             let priority = self.compute_eviction_priority(&node, ts);
             let idx = leaf_data.len();
-            leaf_data.push((node, tenant));
+            leaf_data.push((node, tenant, ts));
             heap.push(Reverse((priority, idx)));
         }
 
@@ -1626,9 +1657,9 @@ impl TokenTree {
                 break;
             };
 
-            let (node, tenant) = {
-                let (node, tenant) = &leaf_data[idx];
-                (Arc::clone(node), Arc::clone(tenant))
+            let (node, tenant, ts) = {
+                let (node, tenant, ts) = &leaf_data[idx];
+                (Arc::clone(node), Arc::clone(tenant), *ts)
             };
             // Verify this node is still a leaf for this tenant: a concurrent
             // insert may have attached the tenant to a descendant.
@@ -1638,12 +1669,13 @@ impl TokenTree {
             let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(&node, &tenant);
             if node_tokens > 0 {
                 self.sub_tenant_tokens(&tenant, node_tokens);
+                newest_evicted = newest_evicted.max(Some(ts));
 
                 // Incremental leaf promotion (matching SGLang's approach)
                 if let Some((parent_node, parent_ts)) = parent_became_leaf {
                     let priority = self.compute_eviction_priority(&parent_node, parent_ts);
                     let new_idx = leaf_data.len();
-                    leaf_data.push((parent_node, tenant));
+                    leaf_data.push((parent_node, tenant, parent_ts));
                     heap.push(Reverse((priority, new_idx)));
                 }
             }
@@ -1656,6 +1688,7 @@ impl TokenTree {
             policy = ?self.eviction_policy,
             "Evicted tokens to tree-wide budget (leaf-first)"
         );
+        newest_evicted.and_then(stamp_age_secs)
     }
 
     /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant.

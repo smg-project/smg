@@ -9,6 +9,7 @@ use rand::{
 };
 
 use super::*;
+use crate::common::stamp_seconds;
 
 /// Helper to convert tenant_char_count to HashMap<String, usize> for comparison
 fn get_maintained_counts(tree: &Tree) -> HashMap<String, usize> {
@@ -2048,7 +2049,9 @@ fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
         tree.match_and_insert_with(&prompt, |_| {
             match eviction {
                 0 => tree.evict_by_tenant(&victim, budget),
-                1 => tree.evict_tenant_by_size(budget * TENANTS),
+                1 => {
+                    tree.evict_tenant_by_size(budget * TENANTS);
+                }
                 2 => tree.remove_tenant_all(&victim),
                 _ => {}
             }
@@ -2079,4 +2082,157 @@ fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
             );
         }
     }
+}
+
+/// Re-stamp every timed tenant stamp below `node` as taken `secs_ago`
+/// seconds back, keeping each stamp's epoch half; an untimed (0) stamp stays.
+fn age_stamps(node: &NodeRef, secs_ago: u64) {
+    for child in &node.children {
+        for mut stamp in child.value().tenant_last_access_time.iter_mut() {
+            if *stamp >> 32 != 0 {
+                *stamp = ((stamp_seconds() - secs_ago) << 32) | (*stamp & 0xFFFF_FFFF);
+            }
+        }
+        age_stamps(child.value(), secs_ago);
+    }
+}
+
+/// An age read in a test: `secs` give or take the second the test may cross.
+fn assert_age(age: Option<u64>, secs: u64) {
+    let age = age.expect("an age");
+    assert!((secs..=secs + 1).contains(&age), "age {age}, want {secs}");
+}
+
+/// A match ending on a request's leaf reports how long ago that request
+/// stamped it; the plain match and the fused walk read the same, and a miss
+/// reports nothing. (A plain match touches the stamp one time in eight, so
+/// the stamps are aged again before each read.)
+#[test]
+fn test_match_reports_reuse_age_of_the_leaf() {
+    let tree = Tree::new();
+    tree.insert_text("system prompt, turn one", "w1");
+    age_stamps(&tree.root, 60);
+
+    assert_age(
+        tree.match_prefix_with_counts("system prompt, turn one")
+            .reuse_age_secs,
+        60,
+    );
+    age_stamps(&tree.root, 60);
+    assert_age(
+        tree.match_and_insert("system prompt, turn one", "w1")
+            .reuse_age_secs,
+        60,
+    );
+    // That insert ended on the leaf and stamped it.
+    assert_age(
+        tree.match_prefix_with_counts("system prompt, turn one")
+            .reuse_age_secs,
+        0,
+    );
+    assert_eq!(
+        tree.match_prefix_with_counts("unrelated").reuse_age_secs,
+        None
+    );
+}
+
+/// The next turn of a session extends the last one: its match ends on the
+/// last turn's leaf, so the age is the gap between the turns.
+#[test]
+fn test_session_continuation_reports_gap_between_turns() {
+    let tree = Tree::new();
+    tree.insert_text("system. user: hi", "w1");
+    age_stamps(&tree.root, 300);
+
+    let result = tree.match_and_insert("system. user: hi assistant: hello user: more", "w1");
+    assert_eq!(
+        result.matched_char_count,
+        "system. user: hi".chars().count()
+    );
+    assert_age(result.reuse_age_secs, 300);
+}
+
+/// A tenant attached to a node only on the way to its own leaf holds an
+/// untimed stamp there: a match resolving on it on that tenant has no age.
+#[test]
+fn test_untimed_intermediate_stamp_reports_no_age() {
+    let tree = Tree::new();
+    tree.insert_text("shared head, tail a", "w1");
+    tree.insert_text("shared head, tail b", "w1");
+    // The split node "shared head, tail " holds w1 untimed or with a leaf's
+    // old stamp; make it untimed.
+    for child in &tree.root.children {
+        for mut stamp in child.value().tenant_last_access_time.iter_mut() {
+            *stamp = 0;
+        }
+    }
+    let result = tree.match_prefix_with_counts("shared head, tail c");
+    assert_eq!(
+        result.matched_char_count,
+        "shared head, tail ".chars().count()
+    );
+    assert_eq!(result.reuse_age_secs, None);
+}
+
+/// Tree-wide eviction reports the age of the newest entry it evicted, and
+/// nothing when it evicts nothing.
+#[test]
+fn test_evict_by_size_reports_newest_evicted_age() {
+    let tree = Tree::new();
+    tree.insert_text("aaaaaaaaaa", "w1");
+    age_stamps(&tree.root, 100);
+    tree.insert_text("bbbbbbbbbb", "w2");
+
+    assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
+    assert_age(tree.evict_tenant_by_size(10), 100);
+    assert_eq!(
+        tree.match_prefix_with_counts("aaaaaaaaaa")
+            .matched_char_count,
+        0
+    );
+    assert_eq!(
+        tree.match_prefix_with_counts("bbbbbbbbbb")
+            .matched_char_count,
+        10
+    );
+}
+
+/// A snapshot from before stamps carried seconds restores with untimed
+/// stamps: eviction takes them first, and they report no age.
+#[test]
+fn test_snapshot_with_bare_epochs_restores_untimed() {
+    let snapshot = crate::snapshot::TreeSnapshot {
+        nodes: vec![
+            crate::snapshot::SnapshotNode {
+                edge: String::new(),
+                tenants: vec![("w1".to_string(), 0)],
+                child_count: 1,
+            },
+            crate::snapshot::SnapshotNode {
+                edge: "old prompt".to_string(),
+                tenants: vec![("w1".to_string(), 12_345)],
+                child_count: 0,
+            },
+        ],
+    };
+    let tree = Tree::from_snapshot(&snapshot);
+    // No match before the eviction: one match in eight would stamp the entry.
+    assert_eq!(tree.total_char_size(), 10);
+    tree.insert_text("new prompt", "w2");
+
+    assert_eq!(
+        tree.evict_tenant_by_size(10),
+        None,
+        "the evicted entry carries no time"
+    );
+    assert_eq!(
+        tree.match_prefix_with_counts("old prompt")
+            .matched_char_count,
+        0
+    );
+    assert_eq!(
+        tree.match_prefix_with_counts("new prompt")
+            .matched_char_count,
+        10
+    );
 }
