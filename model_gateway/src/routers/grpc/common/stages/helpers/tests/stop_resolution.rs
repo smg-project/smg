@@ -1,5 +1,6 @@
 //! How a request's string stops are resolved per wire: forwarded as stop token ids, kept for the
-//! router's decoder, or cleared.
+//! router's decoder, or cleared; and the prefill-decode metadata injection, which leaves a request
+//! untouched when its wire is not the one its selection names.
 
 use std::sync::Arc;
 
