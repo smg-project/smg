@@ -14,7 +14,9 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{
+        compose_stamp, intern_tenant, stamp_age_secs, MatchResult, TenantId, MATCHED_TENANTS_CAP,
+    },
     RadixTree,
 };
 
@@ -62,6 +64,14 @@ pub struct PrefixMatchResult {
     /// so a router can pressure-select among them instead of being bound to
     /// the single cached `tenant`. Empty when nothing matched.
     pub matched_tenants: Vec<TenantId>,
+    /// Seconds since `tenant` last accessed the node the match resolved on,
+    /// read before this match touched it: how far back the reused prefix
+    /// reaches. A node gets a stamp when a request ends on it (its leaf
+    /// insert) and on one match in eight, so on a node only passed through
+    /// the age can run up to that sampling gap long. `None` when nothing
+    /// matched, or when the tenant's stamp on that node carries no time (an
+    /// intermediate attach no access has stamped since).
+    pub reuse_age_secs: Option<u64>,
 }
 
 impl MatchResult for PrefixMatchResult {
@@ -234,24 +244,25 @@ impl Clone for NodeText {
     }
 }
 
-/// Global epoch counter for LRU ordering.
+/// Global epoch counter for LRU ordering: the low half of an access stamp.
 /// Uses a simple incrementing counter instead of wall clock time.
 ///
 /// Benefits:
 /// - No syscall overhead (vs SystemTime::now())
 /// - Smaller memory footprint (u64 vs u128)
 /// - Perfectly monotonic (no clock skew issues)
-///
-/// For LRU eviction, relative ordering is all that matters.
 static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Get the next epoch value for LRU timestamp ordering.
+/// Get the next access stamp for LRU ordering (see [`compose_stamp`]): the
+/// coarse seconds over the epoch counter, so stamps order as bare epochs did
+/// and carry their age. Its low bits are the counter's, as the probabilistic
+/// touch in `finish_match` samples on.
 /// Uses fetch_add for lock-free, monotonically increasing values.
 /// Relaxed ordering is sufficient since we only need eventual consistency
 /// for approximate LRU behavior.
 #[inline]
 fn get_epoch() -> u64 {
-    EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    compose_stamp(EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Debug)]
@@ -697,11 +708,12 @@ impl Tree {
         // miss), its cache populate on that slow path, the probabilistic
         // timestamp touch and the result are the tail the fused walk shares
         // with this match.
-        let (tenant, took_slow_path) = self.resolve_tenant_readonly(&curr);
+        let (tenant, took_slow_path, stamp) = self.resolve_tenant_readonly(&curr);
         self.finish_match(
             &curr,
             tenant,
             took_slow_path,
+            stamp,
             matched_chars,
             input_char_count,
         )
@@ -710,9 +722,10 @@ impl Tree {
     /// Read-only resolution of a node's "owning" tenant: the `last_tenant`
     /// cache when it still names a tenant of the node, else the first tenant
     /// of the node's map (the slow path), **without** the cache-populate or
-    /// probabilistic timestamp side effects. Returns the tenant plus whether
-    /// the slow path was taken; [`Self::finish_match`] replays the single
-    /// deferred side effect on the final node.
+    /// probabilistic timestamp side effects. Returns the tenant, whether the
+    /// slow path was taken, and the tenant's stamp on the node (`None` for
+    /// the synthetic "empty" tenant); [`Self::finish_match`] replays the
+    /// single deferred side effect on the final node.
     ///
     /// Both [`Self::match_prefix_with_counts`] and the fused walk behind
     /// [`Self::match_and_insert_with`] resolve through it; the fused walk does
@@ -723,21 +736,19 @@ impl Tree {
         clippy::unused_self,
         reason = "method logically belongs to the tree; the match's tenant resolution"
     )]
-    fn resolve_tenant_readonly(&self, node: &NodeRef) -> (TenantId, bool) {
+    fn resolve_tenant_readonly(&self, node: &NodeRef) -> (TenantId, bool, Option<u64>) {
         let cached = node.last_tenant.read();
         if let Some(ref t) = *cached {
-            if node.tenant_last_access_time.contains_key(t.as_ref()) {
-                return (Arc::clone(t), false);
+            if let Some(stamp) = node.tenant_last_access_time.get(t.as_ref()) {
+                return (Arc::clone(t), false, Some(*stamp));
             }
         }
         drop(cached);
-        let t = node
-            .tenant_last_access_time
+        node.tenant_last_access_time
             .iter()
             .next()
-            .map(|kv| Arc::clone(kv.key()))
-            .unwrap_or_else(|| intern_tenant("empty"));
-        (t, true)
+            .map(|kv| (Arc::clone(kv.key()), true, Some(*kv.value())))
+            .unwrap_or_else(|| (intern_tenant("empty"), true, None))
     }
 
     /// Combined match + insert for a known `tenant` in a single descent.
@@ -852,11 +863,12 @@ impl Tree {
             (None, Some(i)) => &path[i],
             (None, None) => &self.root,
         };
-        let (match_tenant, match_slow) = self.resolve_tenant_readonly(match_curr);
+        let (match_tenant, match_slow, match_stamp) = self.resolve_tenant_readonly(match_curr);
         let result = self.finish_match(
             match_curr,
             match_tenant,
             match_slow,
+            match_stamp,
             matched_chars,
             input_char_count,
         );
@@ -970,7 +982,8 @@ impl Tree {
     /// fused walk behind [`Self::match_and_insert_with`]: replay the single
     /// deferred side effect of the tenant resolution (populate the
     /// `last_tenant` cache on the slow path), then the probabilistic 1-in-8
-    /// timestamp touch on the resolved final node, and build the match result,
+    /// timestamp touch on the resolved final node, and build the match result
+    /// (its reuse age from `stamp`, the tenant's stamp before that touch),
     /// which takes `tenant` as it is (the callers hand over the id they
     /// resolved, so the tail costs what the inline one did).
     #[expect(
@@ -982,6 +995,7 @@ impl Tree {
         match_node: &NodeRef,
         tenant: TenantId,
         took_slow_path: bool,
+        stamp: Option<u64>,
         matched_chars: usize,
         input_char_count: usize,
     ) -> PrefixMatchResult {
@@ -1009,6 +1023,11 @@ impl Tree {
                 match_node.matched_tenants()
             } else {
                 Vec::new()
+            },
+            reuse_age_secs: if matched_chars > 0 {
+                stamp.and_then(stamp_age_secs)
+            } else {
+                None
             },
         }
     }
@@ -1119,10 +1138,16 @@ impl Tree {
     /// The budget is shared across all tenants of this tree: eviction triggers
     /// on the tree-wide total (no single tenant has to exceed anything) and
     /// removes leaves in LRU order across tenants, least recently used first.
-    pub fn evict_tenant_by_size(&self, max_size: usize) {
+    ///
+    /// Returns the age in seconds of the most recently accessed entry it
+    /// evicted: how far back the tree still remembers. `None` when nothing
+    /// was evicted, or when no evicted entry's stamp carries time.
+    pub fn evict_tenant_by_size(&self, max_size: usize) -> Option<u64> {
         if self.total_char_size() <= max_size {
-            return;
+            return None;
         }
+        // The newest stamp among the evicted entries.
+        let mut newest_evicted: Option<u64> = None;
 
         // Collect leaves across all tenants
         let mut stack = vec![Arc::clone(&self.root)];
@@ -1160,7 +1185,11 @@ impl Tree {
             let Some(Reverse(entry)) = pq.pop() else {
                 break;
             };
-            let EvictionEntry { tenant, node, .. } = entry;
+            let EvictionEntry {
+                timestamp,
+                tenant,
+                node,
+            } = entry;
 
             // Root is never eligible for eviction (re-enters via promotion)
             if Arc::ptr_eq(&node, &self.root) {
@@ -1186,6 +1215,7 @@ impl Tree {
 
             // Remove tenant from node
             node.tenant_last_access_time.remove(tenant.as_ref());
+            newest_evicted = newest_evicted.max(Some(timestamp));
 
             // Get parent reference outside of the borrow scope
             // Use Weak::upgrade() to get a strong reference if the parent still exists
@@ -1229,6 +1259,7 @@ impl Tree {
         for entry in &self.tenant_char_count {
             debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
+        newest_evicted.and_then(stamp_age_secs)
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {

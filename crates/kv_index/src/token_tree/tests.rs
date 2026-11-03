@@ -1,6 +1,7 @@
 use std::{sync::Arc, thread};
 
 use super::*;
+use crate::common::stamp_seconds;
 
 /// `body(tree, t)` on `num_threads` scoped threads at once, `t` the thread's
 /// index; every thread is joined, and a panic in one re-raised, before this
@@ -2198,7 +2199,9 @@ fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
         tree.match_and_insert_with(&prompt, |_| {
             match eviction {
                 0 => tree.evict_tenant(&victim, budget),
-                1 => tree.evict_tenant_by_size(budget * TENANTS),
+                1 => {
+                    tree.evict_tenant_by_size(budget * TENANTS);
+                }
                 2 => tree.remove_tenant_all(&victim),
                 _ => {}
             }
@@ -2244,17 +2247,19 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
 
     // Cached fast path: the cached tenant still owns the node.
     *node.last_tenant.write() = Some(Arc::clone(&w1));
-    let picked = node.touch_any_tenant(10, false).expect("owned node");
+    let (picked, prev) = node.touch_any_tenant(10, false).expect("owned node");
     assert!(Arc::ptr_eq(&picked, &w1));
+    assert_eq!(prev, 1, "the stamp w1 held before this touch");
     assert_eq!(*node.tenant_last_access_time.get("w1").expect("w1"), 10);
     assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 2);
 
     // The cached tenant was evicted: the fallback picks a tenant that
     // owns the node, stamps it, and does not bring the evicted one back.
     node.tenant_last_access_time.remove("w1");
-    let picked = node
+    let (picked, prev) = node
         .touch_any_tenant(32, false)
         .expect("w2 still owns the node");
+    assert_eq!(prev, 2, "the stamp w2 held before this touch");
     assert!(Arc::ptr_eq(&picked, &w2), "picked {picked}");
     assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 32);
     assert!(
@@ -2284,7 +2289,7 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
         &w1
     };
     node.tenant_last_access_time.remove(first_in_order.as_ref());
-    let picked = node.touch_any_tenant(41, false).expect("one owner left");
+    let (picked, _) = node.touch_any_tenant(41, false).expect("one owner left");
     assert!(Arc::ptr_eq(&picked, other), "picked {picked}");
     assert_eq!(
         *node
@@ -2301,4 +2306,94 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
     node.tenant_last_access_time.remove(other.as_ref());
     assert!(node.touch_any_tenant(42, false).is_none());
     assert!(node.tenant_last_access_time.is_empty());
+}
+
+/// Re-stamp every tenant of every node below `node` as accessed `secs_ago`
+/// seconds back, keeping each stamp's sequence half.
+fn age_stamps(node: &NodeRef, secs_ago: u64) {
+    for child in &node.children {
+        for mut stamp in child.value().tenant_last_access_time.iter_mut() {
+            let seconds = stamp_seconds() - secs_ago;
+            *stamp = (seconds << 32) | (*stamp & 0xFFFF_FFFF);
+        }
+        age_stamps(child.value(), secs_ago);
+    }
+}
+
+/// An age read in a test: `secs` give or take the second the test may cross.
+fn assert_age(age: Option<u64>, secs: u64) {
+    let age = age.expect("an age");
+    assert!((secs..=secs + 1).contains(&age), "age {age}, want {secs}");
+}
+
+/// Stamps order by second, then by sequence; their seconds give their age,
+/// and a stamp with no seconds (the root's) has none.
+#[test]
+fn test_stamps_order_by_second_and_carry_their_age() {
+    let (a, b) = (next_timestamp(), next_timestamp());
+    assert!(a < b);
+    assert_age(stamp_age_secs(a), 0);
+
+    let older = ((stamp_seconds() - 30) << 32) | (b & 0xFFFF_FFFF).wrapping_add(1);
+    assert!(
+        older < a,
+        "an earlier second orders first whatever its sequence"
+    );
+    assert_age(stamp_age_secs(older), 30);
+    assert_eq!(stamp_age_secs(0), None);
+}
+
+/// A match reports how long ago the deepest matched node was last accessed,
+/// read before the match stamps it; nothing matched, no age.
+#[test]
+fn test_match_reports_reuse_age_of_the_deepest_node() {
+    let tree = TokenTree::new();
+    let tokens = make_tokens(1, 2);
+    tree.insert_tokens(&tokens, "w1");
+    age_stamps(&tree.root, 60);
+
+    assert_age(tree.match_prefix_with_counts(&tokens).reuse_age_secs, 60);
+    // That match stamped the path: the next one reads its stamp.
+    assert_age(tree.match_prefix_with_counts(&tokens).reuse_age_secs, 0);
+
+    age_stamps(&tree.root, 90);
+    assert_age(tree.match_and_insert(&tokens, "w1").reuse_age_secs, 90);
+    assert_age(tree.match_and_insert(&tokens, "w1").reuse_age_secs, 0);
+
+    let miss = make_tokens(10_000, 2);
+    assert_eq!(tree.match_prefix_with_counts(&miss).reuse_age_secs, None);
+    assert_eq!(tree.match_and_insert(&miss, "w1").reuse_age_secs, None);
+}
+
+/// A partial match reads the node it stops in.
+#[test]
+fn test_partial_match_reports_reuse_age() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 2), "w1");
+    age_stamps(&tree.root, 45);
+
+    let mut diverging = make_tokens(1, 1);
+    diverging.extend(make_tokens(50_000, 1));
+    let result = tree.match_and_insert(&diverging, "w1");
+    assert_eq!(result.matched_token_count, PAGE_SIZE);
+    assert_age(result.reuse_age_secs, 45);
+}
+
+/// Tree-wide eviction reports the age of the newest entry it evicted, and
+/// nothing when it evicts nothing.
+#[test]
+fn test_evict_by_size_reports_newest_evicted_age() {
+    let tree = TokenTree::new();
+    let (old, recent) = (make_tokens(1, 2), make_tokens(100_000, 2));
+    tree.insert_tokens(&old, "w1");
+    age_stamps(&tree.root, 100);
+    tree.insert_tokens(&recent, "w2");
+
+    assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
+    assert_age(tree.evict_tenant_by_size(2 * PAGE_SIZE), 100);
+    assert_eq!(tree.match_prefix_with_counts(&old).matched_token_count, 0);
+    assert_eq!(
+        tree.match_prefix_with_counts(&recent).matched_token_count,
+        2 * PAGE_SIZE
+    );
 }

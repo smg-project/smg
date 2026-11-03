@@ -314,6 +314,98 @@ fn cache_tree_setters_emit_per_model_gauges() {
     }
 }
 
+#[test]
+fn cache_tree_retention_setter_emits_per_model_and_tree_gauge() {
+    let rendered = render_with_recorder(|| {
+        Metrics::set_cache_tree_retention_seconds("m", "token", "prefill", 1800);
+    });
+
+    assert_metric(
+        &rendered,
+        "smg_cache_tree_retention_seconds",
+        &["model=\"m\"", "tree=\"token\"", "worker_type=\"prefill\""],
+        "1800",
+    );
+}
+
+/// A window's maximum is exact, the next window starts empty, and a tree
+/// that never observed one reports nothing.
+#[test]
+fn reuse_age_max_takes_the_window_maximum_and_restarts() {
+    let max = ReuseAgeMax::new();
+    assert_eq!(max.take(), None, "never observed");
+
+    for secs in [3, 4000, 0, 45] {
+        max.observe(secs);
+    }
+    assert_eq!(max.take(), Some(4000));
+    assert_eq!(max.take(), Some(0), "nothing since the last take");
+
+    max.observe(0);
+    assert_eq!(max.take(), Some(0), "an observed 0 is a 0, not nothing");
+}
+
+/// A scrape publishes the largest reuse age recorded since the previous one,
+/// by tree.
+#[test]
+fn scrape_publishes_cache_tree_reuse_age_max() {
+    let rendered = render_with_recorder(|| {
+        Metrics::record_cache_tree_reuse_age("string", "decode", 12);
+        Metrics::record_cache_tree_reuse_age("string", "decode", 7777);
+        record_cache_tree_reuse_age_max();
+    });
+
+    // Other tests record token-tree ages in parallel: match the string line.
+    let series =
+        "smg_cache_tree_reuse_age_max_seconds{tree=\"string\",worker_type=\"decode\"} 7777";
+    assert!(
+        rendered.lines().any(|l| l == series),
+        "{series} missing; rendered:\n{rendered}"
+    );
+}
+
+/// The reuse age renders on its own second-scale edges, by tree, once its
+/// buckets are registered the way `start_prometheus` does.
+#[test]
+fn cache_tree_reuse_age_renders_bucketed_histogram() {
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
+            CACHE_TREE_REUSE_AGE_BUCKETS,
+        )
+        .expect("bucket override")
+        .build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_cache_tree_reuse_age("token", "regular", 0);
+        Metrics::record_cache_tree_reuse_age("token", "regular", 45);
+        Metrics::record_cache_tree_reuse_age("token", "regular", 4000);
+    });
+    let rendered = handle.render();
+
+    for (le, count) in [
+        ("0", "1"),
+        ("30", "1"),
+        ("60", "2"),
+        ("3600", "2"),
+        ("7200", "3"),
+    ] {
+        let series = format!(
+            "smg_cache_tree_reuse_age_seconds_bucket{{tree=\"token\",worker_type=\"regular\",le=\"{le}\"}} {count}"
+        );
+        assert!(
+            rendered.lines().any(|l| l == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(
+            "smg_cache_tree_reuse_age_seconds{tree=\"token\",worker_type=\"regular\",quantile="
+        ),
+        "reuse age rendered as a summary; rendered:\n{rendered}"
+    );
+}
+
 /// The match ratio must render as a real histogram (`_bucket{le=...}`
 /// lines) once its buckets are registered the way `start_prometheus` does;
 /// without them the recorder falls back to a summary.
