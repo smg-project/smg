@@ -175,8 +175,9 @@ async fn a_router_request_under_tracing_reaches_the_collector_as_two_spans() {
     println!("Total spans received by collector: {span_count}");
     assert_eq!(
         span_count, 2,
-        "the collector receives the test's span and the request's http_request span; \
-         fewer means the spans are not exported to the OTLP collector"
+        "the collector receives exactly the test's span and the request's http_request span; \
+         fewer means spans are not exported to the OTLP collector, more means a new span joined \
+         the request path and this count needs updating"
     );
 
     // 13. cleanup
