@@ -639,24 +639,36 @@ mod tests {
 
     /// `HF_HOME` and `HF_ENDPOINT` pointed at a test's cache and Hub, and put
     /// back when the test ends, so a failing assertion leaves no other test on
-    /// this Hub.
-    struct HubEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    /// this Hub. The variables are process-wide, so the tests that set them
+    /// take turns: the guard holds the turn until the variables are restored.
+    struct HubEnv {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    static HUB_ENV_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     impl HubEnv {
-        fn set(home: &Path, endpoint: &str) -> Self {
+        async fn set(home: &Path, endpoint: &str) -> Self {
+            let turn = HUB_ENV_TURN.lock().await;
             let previous = ["HF_HOME", "HF_ENDPOINT"]
                 .into_iter()
                 .map(|name| (name, std::env::var_os(name)))
                 .collect();
             std::env::set_var("HF_HOME", home);
             std::env::set_var("HF_ENDPOINT", endpoint);
-            Self(previous)
+            Self {
+                previous,
+                _turn: turn,
+            }
         }
     }
 
     impl Drop for HubEnv {
         fn drop(&mut self) {
-            for (name, value) in self.0.drain(..) {
+            // The variables go back before the turn is released (the fields
+            // drop after this body).
+            for (name, value) in self.previous.drain(..) {
                 match value {
                     Some(value) => std::env::set_var(name, value),
                     None => std::env::remove_var(name),
@@ -675,7 +687,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let status = Arc::new(AtomicU16::new(503));
         let endpoint = hub_answering(status.clone()).await;
-        let _env = HubEnv::set(home.path(), &endpoint);
+        let _env = HubEnv::set(home.path(), &endpoint).await;
         let config_json = r#"{"model_type":"llama"}"#;
         let reg = MultimodalConfigRegistry::new();
 
@@ -733,6 +745,138 @@ mod tests {
             reg.get("tok-uuid-absent").is_some(),
             "an absent file is cached as the default, as before"
         );
+
+        // config.json itself, on a cold checkpoint: a 503 is the same typed
+        // failure, nothing cached; a 404 is a checkpoint without the file, the
+        // request's error rather than the Hub's.
+        status.store(503, Ordering::SeqCst);
+        let failed = reg
+            .get_or_load("tok-uuid-cold", "cell/cold")
+            .await
+            .expect_err("a 503 on config.json fails the request");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "config.json's 503 is the typed failure: {failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("download config.json for") && failed.contains("503"),
+            "the error names config.json and the Hub's answer: {failed}"
+        );
+        assert!(reg.get("tok-uuid-cold").is_none(), "nothing is cached");
+        status.store(404, Ordering::SeqCst);
+        let missing = reg
+            .get_or_load("tok-uuid-missing", "cell/missing")
+            .await
+            .expect_err("a checkpoint without config.json fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&missing),
+            "config.json's 404 is not a failure of the Hub: {missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("config.json"),
+            "the error names the file: {missing:#}"
+        );
+        assert!(reg.get("tok-uuid-missing").is_none(), "nothing is cached");
+
+        // Without a token the Hub answers a repository that does not exist
+        // with a 401: the same plain error, not a failure of the Hub.
+        status.store(401, Ordering::SeqCst);
+        let refused = reg
+            .get_or_load("tok-uuid-refused", "cell/refused")
+            .await
+            .expect_err("a 401 on config.json fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&refused),
+            "config.json's 401 is not a failure of the Hub: {refused:#}"
+        );
+        assert!(reg.get("tok-uuid-refused").is_none(), "nothing is cached");
+
+        // A processor config of a gated checkpoint whose config.json is a
+        // cache hit, without access: the same plain error, nothing cached,
+        // and no default in place of a file that may exist.
+        hub_cache(home.path(), "cell/gated", &[("config.json", config_json)]);
+        let gated = reg
+            .get_or_load("tok-uuid-gated", "cell/gated")
+            .await
+            .expect_err("a 401 on a processor config fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&gated),
+            "a processor config's 401 is not a failure of the Hub: {gated:#}"
+        );
+        let gated = format!("{gated:#}");
+        assert!(
+            gated.contains("preprocessor_config.json") && gated.contains("401"),
+            "the error names the file and the Hub's answer: {gated}"
+        );
+        assert!(reg.get("tok-uuid-gated").is_none(), "nothing is cached");
+    }
+
+    /// A Hub that takes the connection and never answers holds a fetch only
+    /// for its bound, a processor config's on a warm checkpoint and
+    /// `config.json`'s on a cold one: the request fails within it as the typed
+    /// error naming the file and the elapsed bound, and nothing is cached. The
+    /// clock is paused, so the bound elapses as soon as the runtime idles on
+    /// the answer that never comes.
+    #[tokio::test(start_paused = true)]
+    async fn registry_get_or_load_gives_up_on_a_hub_that_never_answers() {
+        let home = TempDir::new().unwrap();
+        // Bound and never accepted: the connection completes into the backlog
+        // and the request waits for an answer that never comes.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", silent.local_addr().unwrap());
+        let _env = HubEnv::set(home.path(), &endpoint).await;
+        hub_cache(
+            home.path(),
+            "cell/silent",
+            &[("config.json", r#"{"model_type":"llama"}"#)],
+        );
+        let reg = MultimodalConfigRegistry::new();
+
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            reg.get_or_load("tok-uuid-silent", "cell/silent"),
+        )
+        .await
+        .expect("the fetch's own bound ends the wait, long before this one")
+        .expect_err("a fetch with no answer fails within its bound");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "{failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("preprocessor_config.json") && failed.contains("no answer within"),
+            "the error names the file and the elapsed bound: {failed}"
+        );
+        assert!(
+            reg.get("tok-uuid-silent").is_none(),
+            "nothing is cached after a fetch that ran out of its bound"
+        );
+
+        // A cold checkpoint: `config.json` itself is the first fetch, and the
+        // bound covers it the same way.
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            reg.get_or_load("tok-uuid-silent-cold", "cell/silent-cold"),
+        )
+        .await
+        .expect("the fetch's own bound ends the wait, long before this one")
+        .expect_err("a fetch with no answer fails within its bound");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "{failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("download config.json for") && failed.contains("no answer within"),
+            "the error names config.json and the elapsed bound: {failed}"
+        );
+        assert!(
+            reg.get("tok-uuid-silent-cold").is_none(),
+            "nothing is cached after a fetch that ran out of its bound"
+        );
+        drop(silent);
     }
 
     #[test]

@@ -156,8 +156,8 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// `multimodal_processing_failed`.
 /// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
 /// is a 400 under a code of its own, so a client can tell the item's size from a
-/// fetch or a decode that failed. A processor config the model's hub failed to
-/// serve is answered by [`config_unavailable_response`].
+/// fetch or a decode that failed. A configuration file the model's hub failed
+/// to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
@@ -191,8 +191,8 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     }
 }
 
-/// The client's answer when the model's hub failed to serve a processor
-/// config ([`HubFetchError`] in the chain), on every path a request's media
+/// The client's answer when the model's hub failed to serve a configuration
+/// file ([`HubFetchError`] in the chain), on every path a request's media
 /// is resolved: a 502 under `multimodal_config_unavailable` with a generic
 /// message, since the fault is upstream of the gateway and the message of the
 /// chain names the hub's address. The response is left retryable: nothing of
@@ -204,7 +204,7 @@ pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Respo
     HubFetchError::is(error).then(|| {
         error::bad_gateway(
             "multimodal_config_unavailable",
-            "The model's processor configuration could not be fetched from the model hub; \
+            "The model's configuration could not be fetched from the model hub; \
              retry the request",
         )
     })
@@ -452,7 +452,7 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
-    /// A processor config the model's hub failed to serve is a 502 under its
+    /// A configuration file the model's hub failed to serve is a 502 under its
     /// own code with a generic message: the hub's answer and its address stay
     /// out of the body, and the response carries no non-retryable mark, since
     /// the next request resolves the checkpoint again. Any other failure is
@@ -481,7 +481,7 @@ mod tests {
             "the cause stays out of the body: {message}"
         );
         assert!(
-            message.contains("processor configuration"),
+            message.contains("configuration could not be fetched"),
             "the body says what was not fetched: {message}"
         );
 
