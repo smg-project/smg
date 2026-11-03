@@ -107,6 +107,57 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             finish: "stop",
             label: "Messages API, non-stream, 8 output tokens",
         },
+        // The streamed answers below are not in `DEFAULT_PATHS`: each prices
+        // one stream shape (`PERF_PATHS` names them), at rates that keep the
+        // frames per second near the `stream` path's.
+        PathSpec {
+            name: "messages_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "messages",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "106",
+            ],
+            answer: words(300),
+            finish: "length",
+            label: "Messages stream, 300 deltas of one token",
+        },
+        PathSpec {
+            name: "generate_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "107",
+            ],
+            answer: words(300),
+            finish: "length",
+            label: "generate stream, 300 frames of one token, the whole text in every frame",
+        },
+        PathSpec {
+            name: "generate_stream_long",
+            rate: 15.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "2000",
+                "--seed",
+                "108",
+            ],
+            answer: words(2000),
+            finish: "length",
+            label: "generate stream, 2,000 frames of one token, the whole text in every frame",
+        },
     ]
 });
 
@@ -202,6 +253,20 @@ mod tests {
         let stream = path_named("stream").unwrap();
         assert_eq!(stream.finish, "length");
         assert!(stream.client.contains(&"--stream"));
+        for (name, tokens) in [
+            ("messages_stream", 300),
+            ("generate_stream", 300),
+            ("generate_stream_long", 2000),
+        ] {
+            let spec = path_named(name).unwrap();
+            assert_eq!(spec.finish, "length", "{name}");
+            assert!(spec.client.contains(&"--stream"), "{name}");
+            assert_eq!(spec.answer.split_whitespace().count(), tokens, "{name}");
+            assert!(
+                !DEFAULT_PATHS.split(',').any(|p| p == name),
+                "{name} is opt-in"
+            );
+        }
         let tools: Value = serde_json::from_str(&path_named("tools").unwrap().answer).unwrap();
         assert!(tools["name"].as_str().unwrap().starts_with("lookup_"));
         let json: Value = serde_json::from_str(&path_named("json").unwrap().answer).unwrap();

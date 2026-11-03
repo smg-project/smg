@@ -68,6 +68,15 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
+Three streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+per second near the `stream` path's):
+
+| path | request | answer | rate |
+|---|---|---|---|
+| `messages_stream` | `POST /v1/messages`, `stream: true`, `max_tokens` 300 | 300 tokens, one per event, `length` | 100/s |
+| `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
+| `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 15/s |
+
 The gateway runs with `--parser symphony --tool-call-parser json` (`--gw-args` changes it),
 `cache_aware` routing, 8 runtime threads and log level `warn`, as `grpc_stress/bed.sh` sets
 it up; 4 mock engines (`--workers`).
@@ -166,7 +175,7 @@ gateway each, so a step never inherits the previous step's queue.
 | module | what |
 |---|---|
 | `main.rs` | the `gateway-perf` binary: `cpu`, `alloc`, `mem`, `live`, `bed up\|down\|smoke`, `report`, `tokenizer`, `base` |
-| `paths.rs` | the five paths: the client's flags, the scripted answer, the rate; the interleaving |
+| `paths.rs` | the paths: the client's flags, the scripted answer, the rate; the interleaving |
 | `bed.rs` | the bed through `bed.sh` (ports, environment, up/down, bed.json) and the engines' script API (enqueue, hit/miss counts) |
 | `http.rs` | a small HTTP/1.1 client over `std::net` for the loopback endpoints (no TLS, no runtime) |
 | `counters.rs` | `/proc` CPU time and memory, the allocator gauges, `perf stat`, jemalloc's exit statistics |
