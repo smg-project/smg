@@ -197,7 +197,9 @@ def test_invalid_archive_is_not_extracted_or_published(download):
     result, calls, cache = download(corrupt=True)
     assert result.returncode != 0
     assert len(selected(calls, "wget")) == 1
-    assert len(selected(calls, "unzip")) == 1
+    unzip_calls = selected(calls, "unzip")
+    assert len(unzip_calls) == 1
+    assert any(arg.startswith("-t") for arg in unzip_calls[0])
     empty_cache(cache)
 
 
