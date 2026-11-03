@@ -73,15 +73,6 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 
-# The engines whose gRPC server carries no ``grpc.health.v1`` service:
-# TRT-LLM, whose upstream server registers its own service and no standard
-# health (it answers its own proto's HealthCheck, the one the gateway
-# probes). For these alone a ready channel that answers UNIMPLEMENTED counts
-# as the worker, until the harness asks their own HealthCheck instead. The
-# scripted mock worker hosts the standard service like the engine servicers.
-ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
-
-
 def _excerpt(line: str) -> str:
     if len(line) <= LOG_EXCERPT_CHARS:
         return line
@@ -1088,22 +1079,18 @@ class Worker:
                 self._log_file = None
             raise
 
-    def grpc_serving(self, timeout: float = 5.0) -> bool:
-        """One health answer of a gRPC worker: ``True`` on SERVING from its
-        ``grpc.health.v1`` service, ``False`` on anything else: a NOT_SERVING,
-        a refused connection, and an answer without the health service.
+    def grpc_serving(self, timeout: float = 5.0, *, _deadline: float | None = None) -> bool:
+        """Require the engine's health answer, within one probe deadline.
 
-        Every engine servicer of this repository hosts the health service, so
-        UNIMPLEMENTED is not this worker speaking. An engine binds its port
-        only once it has loaded its model, and another process's listener can
-        sit on the number until then: an HTTP/2 server's 404 reads as
-        UNIMPLEMENTED through grpc, and the ready channel behind it is the
-        stranger's, which the nightly PD sweep once certified as a decode
-        worker. One engine's server carries no such service, TRT-LLM
-        (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
-        HealthCheck, the one the gateway probes); for it alone a ready
-        channel that answers UNIMPLEMENTED counts.
+        TRT-LLM has its own HealthCheck, without ``grpc.health.v1``. It must
+        also name the model passed to its launcher: a ready channel, another
+        service's UNIMPLEMENTED, or a different model on the chosen port is
+        not this worker. Other engines require the standard SERVING answer.
         """
+        if self.engine == "trtllm":
+            deadline = time.monotonic() + timeout
+            if _deadline is not None:
+                deadline = min(deadline, _deadline)
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -1114,23 +1101,45 @@ class Worker:
 
         channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
+            if self.engine == "trtllm":
+                try:
+                    from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
+                except ImportError as error:
+                    raise RuntimeError("TRT gRPC health check requires smg-grpc-proto") from error
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                stub = trtllm_service_pb2_grpc.TrtllmServiceStub(channel)
+                try:
+                    health = stub.HealthCheck(
+                        trtllm_service_pb2.HealthCheckRequest(), timeout=remaining
+                    )
+                    if health.status != "OK":
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    info = stub.GetModelInfo(
+                        trtllm_service_pb2.GetModelInfoRequest(), timeout=remaining
+                    )
+                    # This is the positional model argument in _build_cmd,
+                    # not the spec's logical key or a guessed path basename.
+                    expected_model = get_model_spec(self.model_id)["model"]
+                    return (
+                        time.monotonic() < deadline
+                        and isinstance(expected_model, str)
+                        and bool(expected_model.strip())
+                        and info.model_id == expected_model
+                    )
+                except Exception:
+                    return False
+
             try:
                 stub = health_pb2_grpc.HealthStub(channel)
                 request = health_pb2.HealthCheckRequest(service="")
                 response = stub.Check(request, timeout=timeout)
                 return response.status == health_pb2.HealthCheckResponse.SERVING
-            except grpc.RpcError as e:
-                if (
-                    self.engine in ENGINES_WITHOUT_GRPC_HEALTH
-                    and hasattr(e, "code")
-                    and e.code() == grpc.StatusCode.UNIMPLEMENTED
-                ):
-                    try:
-                        grpc.channel_ready_future(channel).result(timeout=timeout)
-                        return True
-                    except Exception:
-                        return False
-                return False
             except Exception:
                 return False
         finally:
@@ -1138,12 +1147,28 @@ class Worker:
 
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
-        start = time.perf_counter()
-        while time.perf_counter() - start < timeout:
-            self.raise_if_exited()
-            if self.grpc_serving():
-                return
-            time.sleep(HEALTH_CHECK_INTERVAL)
+        if self.engine == "trtllm":
+            deadline = time.monotonic() + timeout
+            while (remaining := deadline - time.monotonic()) > 0:
+                self.raise_if_exited()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if (
+                    self.grpc_serving(timeout=min(5.0, remaining), _deadline=deadline)
+                    and time.monotonic() < deadline
+                ):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(HEALTH_CHECK_INTERVAL, remaining))
+        else:
+            start = time.perf_counter()
+            while time.perf_counter() - start < timeout:
+                self.raise_if_exited()
+                if self.grpc_serving():
+                    return
+                time.sleep(HEALTH_CHECK_INTERVAL)
 
         raise TimeoutError(
             f"gRPC worker {self.model_id} on port {self.port} "
