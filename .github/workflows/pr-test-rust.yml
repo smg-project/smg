@@ -1665,7 +1665,7 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
       timeout: 32
       test_timeout: 24
-      # Missing classes/methods fail collection; this floor rejects empty selection.
+      # Require all 41 cases in this partial local Responses selection.
       # The full e2e-1gpu-responses job retains its min_selected: 92 floor.
       test_dirs: >-
         e2e_test/responses/test_background.py::TestBackgroundResponsesGptOss
@@ -1679,7 +1679,7 @@ jobs:
         e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_streaming
         e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_basic_function_call
       test_filter: ""
-      min_selected: 1
+      min_selected: 41
       setup_agentic_deps: false
       provider_api_keys: false
       gpu_vendor: amd
