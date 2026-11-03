@@ -746,7 +746,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "deepseek-v4-flash",
         model: "deepseek-ai/DeepSeek-V4-Flash",
-        also: &[],
+        also: &["DeepSeek-V4-Pro"],
         released: "2026-04-22",
         smg: (Some("deepseek_v4"), Some("deepseek_v4")),
         table: Some(Table::DeepSeekV4),

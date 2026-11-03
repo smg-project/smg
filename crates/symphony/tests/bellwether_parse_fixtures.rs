@@ -252,6 +252,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // turn the prompt opens no turn for inside the thought, so the opener the replay feeds before
     // the tail ([`GenerationPrompt::text`]) is what tells a closed thought from an unopened turn.
     ("deepseek-v4-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek-V4-Pro is a member of the V4-Flash group (the same encoder, tokenizer and
+    // configuration files), so its sets read with the V4 table and the same statement; bellwether
+    // records no set of its own yet, so the slug keeps its notice until one is recorded.
+    ("deepseek-v4-pro", GenerationPrompt::OpensTheThought),
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
     // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. Chat mode is its
     // default: only a request that turns thinking on opens the thought, so a recorded case that

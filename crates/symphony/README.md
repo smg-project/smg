@@ -232,7 +232,7 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-224 groups, 396 checkpoints, newest first.
+224 groups, 397 checkpoints, newest first.
 12 ready, 156 replaying a recorded set, 7 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -284,7 +284,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-05-01 | [apertus-v1.1-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-v1.1-4b-instruct) | swiss-ai/Apertus-v1.1-4B-Instruct | Apertus-v1.1-0.5B-Instruct, Apertus-v1.1-1.5B-Instruct | — | 184,972 | pending | none |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 | MiMo-V2.5-Base | `qwen3`, tagged calls, the value between the tags | 589,278 | replaying the set | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 490,452 | replaying the set | none |
-| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash |  | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
+| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash | DeepSeek-V4-Pro | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-19 | [bar-2x7b-base](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-base) | allenai/BAR-2x7B-Base |  | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-code](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-code) | allenai/BAR-2x7B-Code | BAR-2x7B-Code-SFT, BAR-2x7B-Safety, BAR-2x7B-Tool-Use, BAR-5x7B | — | 328,662 | pending | none |
