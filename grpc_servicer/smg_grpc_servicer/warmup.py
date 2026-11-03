@@ -17,7 +17,11 @@ flips, so the first-time costs are paid while nothing is routed here:
 - the **decode staircase**: as many concurrent requests as the running window
   holds, each asking for one more output token than the one before, so the
   running batch shrinks by one per step and every batch size from the window
-  down to one runs once;
+  down to one runs once. Not on an engine that runs prefill alone
+  (:attr:`WarmupInputs.prefill_only`: the prefill side of a disaggregated
+  pair, whose decode steps are its peer's): there the staircase would warm
+  nothing and only hold a window's worth of transfers and their KV at once,
+  and such an engine's plan is one request (below);
 - the **prefill ladder**: one request per prefill length class the admission
   step admits (every :data:`PREFILL_CLASS_TOKENS`-token class up to the
   step's token budget at the ``full`` level; the engine tuners' coarser
@@ -222,6 +226,18 @@ class WarmupInputs:
     #: disaggregated pair: every request carries it, so the leg warms up
     #: without its peer. ``None`` for a single engine.
     lone_leg_bootstrap: str | None = None
+    #: Whether this engine runs prefill alone: the prefill side of a
+    #: disaggregated pair, whose decode steps run on its peer. No running
+    #: batch of its own ever decodes here, and every warm-up request it
+    #: takes is a stand-in transfer whose slots an engine release has been
+    #: seen not to give back: a ladder of them, one at a time, ran a
+    #: side's pool dry before its top. So such an engine's plan is one request
+    #: of the smallest shape per rank (the first forward and the transfer
+    #: path are paid before the health flips; nothing more is held), plus
+    #: the media step's one request per rank when the engine module asks
+    #: for one, and the length classes are paid by the first request of
+    #: each during serving, as the engine's own warm-up leaves them.
+    prefill_only: bool = False
     #: Whether the plan carries one request with one media item through the
     #: engine's media path (after the second pass, before the chunk
     #: remainders): an engine module sets it for a worker whose first media
@@ -316,6 +332,7 @@ class WarmupPlan:
                 if self.inputs.lone_leg_bootstrap
                 else ""
             )
+            + (", one request: this engine runs prefill alone" if self.inputs.prefill_only else "")
         )
 
 
@@ -418,6 +435,18 @@ class _Requests:
         )
 
 
+def _media_step(requests: _Requests, ranks: tuple[int | None, ...]) -> WarmupStep:
+    """One item through the engine's media path, on every rank: its first-use
+    cost is the media path's own, which no text shape reaches."""
+    return WarmupStep(
+        name="one media item through the engine's media path",
+        kind="media",
+        requests=tuple(
+            requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
+        ),
+    )
+
+
 def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
@@ -432,7 +461,10 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     no step reaches a shape the engine refuses. Under data parallelism
     (``inputs.data_parallel_size`` above one) the staircase runs once per
     rank and every prefill shape goes to every rank at once, each request
-    pinned to its rank."""
+    pinned to its rank. An engine that runs prefill alone
+    (``inputs.prefill_only``) gets neither the staircase nor the ladder: its
+    plan is one request of the smallest shape per rank, and the media step
+    when the inputs ask for one."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
@@ -453,6 +485,23 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     ranks: tuple[int | None, ...] = (
         tuple(range(inputs.data_parallel_size)) if inputs.data_parallel_size > 1 else (None,)
     )
+
+    if inputs.prefill_only:
+        # An engine that runs prefill alone: one stand-in request of the
+        # smallest shape per rank (an engine release that gave no stand-in's
+        # slots back ran a side's pool dry under a ladder of them), and the
+        # media step when asked for: the media path's first use is its own,
+        # and one more request per rank.
+        steps.append(
+            WarmupStep(
+                name="one request on the prefill side",
+                kind="prefill",
+                requests=tuple(requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank) for rank in ranks),
+            )
+        )
+        if inputs.media_leg:
+            steps.append(_media_step(requests, ranks))
+        return WarmupPlan(level, inputs, tuple(steps))
 
     # The decode staircase: as many requests as fit the window and one
     # admission step of short prompts, asking for 2..N+1 output tokens (the
@@ -496,17 +545,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
             )
         )
     if inputs.media_leg:
-        # One item through the engine's media path, on every rank: its
-        # first-use cost is the media path's own, which no text shape reaches.
-        steps.append(
-            WarmupStep(
-                name="one media item through the engine's media path",
-                kind="media",
-                requests=tuple(
-                    requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
-                ),
-            )
-        )
+        steps.append(_media_step(requests, ranks))
     if inputs.every_prefill_length and level == LEVEL_FULL:
         for length in spread_order(limit):
             if length in lengths:
