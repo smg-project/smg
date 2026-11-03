@@ -25,6 +25,11 @@
 //! - `avg_frame_rate`: the time scale times the sample count over the track
 //!   duration, in lowest terms (the demuxer's own derivation);
 //! - the movie header's duration and time scale for the container's duration.
+//!
+//! The edit list may start at the track's first sample or at the codec's
+//! reorder delay, where ffmpeg's muxer starts it by default for a video with
+//! B-frames; the demuxer reports the same numbers either way (see
+//! `edit_list_is_whole_track`).
 
 use std::{
     fs::File,
@@ -166,6 +171,17 @@ fn child<'a>(list: &[([u8; 4], &'a [u8])], kind: [u8; 4]) -> Option<&'a [u8]> {
         .map(|(_, payload)| *payload)
 }
 
+/// The `kind` box of `list` if it holds at most one: `Some(None)` when it
+/// holds none, `None` when it holds several.
+fn sole_child<'a>(list: &[([u8; 4], &'a [u8])], kind: [u8; 4]) -> Option<Option<&'a [u8]>> {
+    let mut found = list
+        .iter()
+        .filter(|(k, _)| *k == kind)
+        .map(|(_, payload)| *payload);
+    let first = found.next();
+    found.next().is_none().then_some(first)
+}
+
 fn be_u32(data: &[u8], at: usize) -> Option<u32> {
     data.get(at..at + 4)
         .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -193,9 +209,22 @@ fn header_timescale_duration(payload: &[u8]) -> Option<(u32, u64)> {
     }
 }
 
+/// Whether the demuxer reads `time_scale` as written: it holds a time scale
+/// in a signed 32-bit integer and puts 1 in place of one that is not
+/// positive (zero, or past `i32::MAX`).
+fn time_scale_kept(time_scale: u32) -> bool {
+    i32::try_from(time_scale).is_ok_and(|time_scale| time_scale > 0)
+}
+
 fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
     let top = boxes(moov)?;
     let (movie_timescale, movie_duration_ts) = header_timescale_duration(child(&top, *b"mvhd")?)?;
+    // The demuxer puts a tick a second in place of a time scale it cannot
+    // hold, so its numbers are not the header's; and against a zero movie
+    // time scale a zero-length edit would pass for the track.
+    if !time_scale_kept(movie_timescale) {
+        return None;
+    }
     for (kind, trak) in &top {
         if kind != b"trak" {
             continue;
@@ -209,18 +238,8 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         // The first video track decides; a shape this module does not
         // accept keeps the probe process.
         let (timescale, duration_ts) = header_timescale_duration(child(&mdia, *b"mdhd")?)?;
-        if timescale == 0 || duration_ts == 0 {
+        if !time_scale_kept(timescale) || duration_ts == 0 {
             return None;
-        }
-        if let Some(edts) = child(&trak, *b"edts") {
-            if !edit_list_is_whole_track(
-                child(&boxes(edts)?, *b"elst")?,
-                duration_ts,
-                timescale,
-                movie_timescale,
-            ) {
-                return None;
-            }
         }
         let stbl = boxes(child(&boxes(child(&mdia, *b"minf")?)?, *b"stbl")?)?;
         let (width, height) = sample_entry_size(child(&stbl, *b"stsd")?)?;
@@ -231,6 +250,20 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         let (count, delta) = (u64::from(be_u32(stts, 8)?), u64::from(be_u32(stts, 12)?));
         if count == 0 || delta == 0 || count.checked_mul(delta)? != duration_ts {
             return None;
+        }
+        // After the sample table: a codec delay is counted in its frames. At
+        // most one edit list in at most one `edts`: of several, the demuxer
+        // reads the last that has entries.
+        if let Some(edts) = sole_child(&trak, *b"edts")? {
+            if !edit_list_is_whole_track(
+                sole_child(&boxes(edts)?, *b"elst")??,
+                duration_ts,
+                timescale,
+                movie_timescale,
+                delta,
+            ) {
+                return None;
+            }
         }
         let sample_count = match (child(&stbl, *b"stsz"), child(&stbl, *b"stz2")) {
             (Some(stsz), _) => u64::from(be_u32(stsz, 8)?),
@@ -257,14 +290,50 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
     None
 }
 
-/// True for an edit list of one entry that maps the whole track from its
-/// start at normal speed: the shape under which the demuxer's stream
-/// duration is the media header's.
+/// The deepest codec reorder delay accepted as the start of an edit list, in
+/// frames. A muxer starts the list at the delay so that the first frame is
+/// presented at zero, and the decoded picture buffer bounds the delay: 16
+/// frames in H.264 (`max_num_reorder_frames` <= `max_dec_frame_buffering`
+/// <= 16), 15 in HEVC (`sps_max_num_reorder_pics` <=
+/// `sps_max_dec_pic_buffering_minus1` <= 15).
+const MAX_REORDER_FRAMES: u64 = 16;
+
+/// Whether an edit list that starts `media_time` media ticks into the track
+/// starts where a muxer starts one: at the first sample, or at a codec
+/// reorder delay of whole frames (`delta` ticks each) up to
+/// [`MAX_REORDER_FRAMES`]. A negative start is neither: `-1` is an empty
+/// edit, which presents nothing for its duration, and the format defines no
+/// other.
+fn is_codec_reorder_delay(media_time: i64, delta: u64) -> bool {
+    let Ok(media_time) = u64::try_from(media_time) else {
+        return false;
+    };
+    delta != 0 && media_time % delta == 0 && media_time / delta <= MAX_REORDER_FRAMES
+}
+
+/// True for an edit list of one entry, at normal speed, whose duration is
+/// the track's and which starts at the first sample or at a codec reorder
+/// delay: the shapes under which the demuxer's stream duration is the media
+/// header's and its frame count the sample count.
+///
+/// The start is in none of those numbers. The demuxer takes the stream
+/// duration from the media header, the sample table and the edit's
+/// duration, and the frame count and average rate from the sample table, so
+/// a whole-track edit reports the same numbers wherever it starts, and an
+/// edit shorter than the track is refused by the duration clause, since the
+/// demuxer reports the edit's length. The start is held to what a muxer
+/// writes all the same, whole frames up to [`MAX_REORDER_FRAMES`], so that a
+/// shape nobody has compared with the probe keeps the probe. Nor is it
+/// checked against the track's composition offsets: a start past the codec's
+/// own delay drops frames from the decoded output, and the probe still
+/// counts them. `delta` is the track's one frame duration, which the caller
+/// has read and checked.
 fn edit_list_is_whole_track(
     elst: &[u8],
     duration_ts: u64,
     timescale: u32,
     movie_timescale: u32,
+    delta: u64,
 ) -> bool {
     let Some(entries) = be_u32(elst, 4) else {
         return false;
@@ -294,9 +363,13 @@ fn edit_list_is_whole_track(
         },
         _ => return false,
     };
-    // media_time 0 at rate 1.0 exactly, and the edit's duration (in the
-    // movie's time scale) equal to the track's (in the media's).
-    media_time == 0
+    // A start a muxer writes (in the media's time scale), rate 1.0 exactly,
+    // and the edit's duration (in the movie's time scale) equal to the
+    // track's (in the media's). Not every cut reaches the duration clause: a
+    // B-frame clip stream-copied with `-t` to a point inside a group of
+    // B-frames keeps an edit as long as its media header, which then runs
+    // past the sample table, and is refused before, by the header check.
+    is_codec_reorder_delay(media_time, delta)
         && rate == 1
         && fraction == 0
         && u128::from(segment_duration) * u128::from(timescale)
@@ -358,6 +431,23 @@ mod tests {
         edit: Option<Vec<u8>>,
         stts_entries: Vec<(u32, u32)>,
     ) -> Vec<u8> {
+        let edts = edit
+            .map(|elst| boxed(*b"edts", &boxed(*b"elst", &elst)))
+            .unwrap_or_default();
+        movie_with_edts(timescale, delta, frames, width, height, &edts, stts_entries)
+    }
+
+    /// `movie`, with `edts` (whole boxes, as many as it holds) where the
+    /// track keeps its edit list.
+    fn movie_with_edts(
+        timescale: u32,
+        delta: u32,
+        frames: u32,
+        width: u16,
+        height: u16,
+        edts: &[u8],
+        stts_entries: Vec<(u32, u32)>,
+    ) -> Vec<u8> {
         let duration = u64::from(delta) * u64::from(frames);
         let movie_timescale = 1000u32;
         let movie_duration = (duration * u64::from(movie_timescale) / u64::from(timescale)) as u32;
@@ -400,10 +490,7 @@ mod tests {
             boxed(*b"minf", &minf),
         ]
         .concat();
-        let mut trak = Vec::new();
-        if let Some(elst) = edit {
-            trak.extend_from_slice(&boxed(*b"edts", &boxed(*b"elst", &elst)));
-        }
+        let mut trak = edts.to_vec();
         trak.extend_from_slice(&boxed(*b"mdia", &mdia));
         let moov = [boxed(*b"mvhd", &full(0, &mvhd)), boxed(*b"trak", &trak)].concat();
         let mut file = boxed(*b"ftyp", b"isom\0\0\0\0isom");
@@ -418,6 +505,14 @@ mod tests {
         elst.extend_from_slice(&0u32.to_be_bytes());
         elst.extend_from_slice(&1u16.to_be_bytes());
         elst.extend_from_slice(&0u16.to_be_bytes());
+        elst
+    }
+
+    /// `whole_track_edit`, starting `media_time` media ticks into the track
+    /// instead of at its first sample (`-1`: an empty edit).
+    fn edit_starting_at(movie_duration_ms: u32, media_time: i32) -> Vec<u8> {
+        let mut elst = whole_track_edit(movie_duration_ms);
+        elst[12..16].copy_from_slice(&media_time.to_be_bytes());
         elst
     }
 
@@ -502,17 +597,212 @@ mod tests {
         assert_eq!(info.frames_per_second(), Some(30000.0 / 1001.0));
     }
 
+    /// The edit list a muxer writes when the codec reorders frames: the whole
+    /// track at normal speed, started at the reorder delay, a whole number of
+    /// frames in (16 is the deepest accepted). The demuxer's numbers do not
+    /// depend on the start, so the track reads exactly as it does when its
+    /// edit list starts at the first sample. (A real B-frame track also
+    /// carries composition offsets, `ctts`; the reader does not read them,
+    /// and the agreement test in the media module runs real B-frame clips.)
+    #[test]
+    fn a_codec_delay_edit_is_read_like_the_probe() {
+        let undelayed = written(&movie(
+            12288,
+            512,
+            24,
+            320,
+            240,
+            Some(whole_track_edit(1000)),
+            vec![(24, 512)],
+        ));
+        let undelayed = read(undelayed.path()).expect("readable");
+        assert!(undelayed.is_some());
+        for frames in [1, 2, 4, 16] {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(edit_starting_at(1000, 512 * frames)),
+                vec![(24, 512)],
+            ));
+            assert_eq!(
+                read(file.path()).expect("readable"),
+                undelayed,
+                "a {frames}-frame codec delay"
+            );
+        }
+    }
+
+    /// Starts a muxer does not write for a codec delay keep the probe
+    /// process: deeper than 16 frames, part of a frame in, or before the
+    /// track (`-1` is an empty edit, which presents nothing for its
+    /// duration; the format defines no other negative start).
+    #[test]
+    fn an_edit_that_is_no_codec_delay_keeps_the_probe() {
+        for media_time in [512 * 17, 700, -1, -512] {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(edit_starting_at(1000, media_time)),
+                vec![(24, 512)],
+            ));
+            assert_eq!(
+                read(file.path()).expect("readable"),
+                None,
+                "an edit list starting at {media_time}"
+            );
+        }
+    }
+
+    /// An edit list that starts at a codec delay but is not the one whole
+    /// track at normal speed keeps the probe process. A shortened edit
+    /// changes what the demuxer reports: the edit's length, which the tables
+    /// do not show. The rate and the entry count are shape policy (the
+    /// demuxer ignores the rate, and reports these two-entry lists as it
+    /// reports the track): the module vouches only for the shape it has
+    /// compared with the probe.
+    #[test]
+    fn an_edit_that_is_not_the_whole_track_keeps_the_probe() {
+        // 0.9 s of the 1 s track: a trim the tables do not show.
+        let shortened = edit_starting_at(900, 1024);
+        // Rate 2.0 (`0x0002_0000`), whose fraction is zero.
+        let mut doubled = edit_starting_at(1000, 1024);
+        doubled[16..18].copy_from_slice(&2u16.to_be_bytes());
+        // Two entries: 83 ms of nothing (an empty edit) and then the track,
+        // as `-avoid_negative_ts make_zero` writes it, which its first start
+        // declines as well; and the whole track followed by half of it
+        // again, which only the entry count declines.
+        let two_entries = |entries: [(u32, i32); 2]| {
+            let mut elst = full(0, &2u32.to_be_bytes());
+            for (duration, start) in entries {
+                elst.extend_from_slice(&duration.to_be_bytes());
+                elst.extend_from_slice(&start.to_be_bytes());
+                elst.extend_from_slice(&[0, 1, 0, 0]);
+            }
+            elst
+        };
+        let cases = [
+            ("shortened", shortened),
+            ("rate 2", doubled),
+            ("an empty edit first", two_entries([(83, -1), (1000, 1024)])),
+            ("a second edit", two_entries([(1000, 1024), (500, 1024)])),
+        ];
+        for (case, elst) in cases {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(elst),
+                vec![(24, 512)],
+            ));
+            assert_eq!(read(file.path()).expect("readable"), None, "{case}");
+        }
+    }
+
+    /// The repository's H.264 fixture starts its edit list at a codec delay,
+    /// but its media header runs one frame past its sample table (18432
+    /// ticks against 8 frames of 2048), a shape ffmpeg's muxer writes for
+    /// some B-frame clips. The demuxer then reports the shorter of the two,
+    /// which this module does not compute, so the file keeps the probe. The
+    /// fixture's edit is as long as its samples, so the duration clause
+    /// declines it too; a copy whose edit is as long as the header, as a
+    /// B-frame clip cut with `-t` inside a group of B-frames has it, is
+    /// declined by the header check alone.
+    #[test]
+    fn a_media_header_past_the_samples_keeps_the_probe() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4");
+        assert_eq!(read(&fixture).expect("readable"), None);
+        let mut bytes = std::fs::read(&fixture).expect("fixture bytes");
+        // The edit's duration, in the movie's milliseconds: after the `elst`
+        // box type, its version, flags and entry count.
+        let elst = bytes
+            .windows(4)
+            .position(|kind| kind == b"elst")
+            .expect("elst")
+            + 4;
+        assert_eq!(&bytes[elst + 8..elst + 12], &1000u32.to_be_bytes());
+        bytes[elst + 8..elst + 12].copy_from_slice(&1125u32.to_be_bytes());
+        assert_eq!(read(written(&bytes).path()).expect("readable"), None);
+    }
+
+    /// Two edit lists in one track, in one `edts` or in two: the demuxer
+    /// reads the last that has entries, so the first is no account of the
+    /// track. Here the first is the whole track and the last only half of
+    /// it, the half the demuxer would report; the file keeps the probe
+    /// process.
+    #[test]
+    fn a_track_with_two_edit_lists_keeps_the_probe() {
+        let whole = boxed(*b"elst", &edit_starting_at(1000, 512));
+        let half = boxed(*b"elst", &edit_starting_at(500, 512));
+        let cases = [
+            (
+                "one edts",
+                boxed(*b"edts", &[whole.clone(), half.clone()].concat()),
+            ),
+            (
+                "two edts",
+                [boxed(*b"edts", &whole), boxed(*b"edts", &half)].concat(),
+            ),
+        ];
+        for (case, edts) in cases {
+            let file = written(&movie_with_edts(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                &edts,
+                vec![(24, 512)],
+            ));
+            assert_eq!(read(file.path()).expect("readable"), None, "{case}");
+        }
+    }
+
+    /// A time scale the demuxer does not read as written keeps the probe
+    /// process: it holds a time scale in a signed 32-bit integer and puts 1
+    /// in place of one that is not positive. Against a zero movie time scale
+    /// a zero-length edit would pass for the whole track, and a media time
+    /// scale past `i32::MAX` would be read as written here and as 1 by the
+    /// probe.
+    #[test]
+    fn a_time_scale_the_demuxer_replaces_keeps_the_probe() {
+        let cases = [
+            (*b"mvhd", 0, Some(edit_starting_at(0, 512))),
+            (*b"mvhd", 0x8000_0000, None),
+            (*b"mdhd", 0x8000_0000, None),
+        ];
+        for (header, time_scale, edit) in cases {
+            let mut bytes = movie(12288, 512, 24, 320, 240, edit, vec![(24, 512)]);
+            // The time scale follows the header's box header, its version and
+            // flags, and two 32-bit times.
+            let at = bytes
+                .windows(4)
+                .position(|kind| kind == header)
+                .expect("header")
+                + 4;
+            bytes[at + 12..at + 16].copy_from_slice(&u32::to_be_bytes(time_scale));
+            assert_eq!(
+                read(written(&bytes).path()).expect("readable"),
+                None,
+                "{} time scale {time_scale}",
+                String::from_utf8_lossy(&header)
+            );
+        }
+    }
+
     /// Shapes the module does not vouch for keep the probe process.
     #[test]
     fn other_shapes_are_declined() {
         let vfr = movie(12288, 512, 25, 320, 240, None, vec![(24, 512), (1, 1024)]);
         assert_eq!(read(written(&vfr).path()).expect("read"), None);
-        let mut offset_edit = full(0, &1u32.to_be_bytes());
-        offset_edit.extend_from_slice(&1000u32.to_be_bytes());
-        offset_edit.extend_from_slice(&512u32.to_be_bytes());
-        offset_edit.extend_from_slice(&[0, 1, 0, 0]);
-        let edited = movie(12288, 512, 24, 320, 240, Some(offset_edit), vec![(24, 512)]);
-        assert_eq!(read(written(&edited).path()).expect("read"), None);
         assert_eq!(
             read(written(b"RIFF\0\0\0\0WEBPVP8 ").path()).expect("read"),
             None

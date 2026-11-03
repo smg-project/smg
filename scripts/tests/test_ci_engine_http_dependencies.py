@@ -20,6 +20,7 @@ EXTENSION_SOURCE = (
 )
 FAKE = r"""
 import importlib.metadata
+import importlib.util
 import json
 import os
 import sys
@@ -31,11 +32,20 @@ if args[0].endswith("ci_verify_sglang_rocm_cohort.py"):
         log.write(json.dumps(args) + "\n")
     if os.environ.get("FAIL_NATIVE_CHECK"):
         raise SystemExit(44)
+    # Run the real builtin rejection logic with native objects replaced by
+    # software fixtures. The remaining full-cohort checks are native acceptance,
+    # outside this shell-wiring test; RECORD is exercised separately below.
+    spec = importlib.util.spec_from_file_location("cohort_verifier", args[0])
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    api = object()
+    torch = types.SimpleNamespace(Tensor=types.SimpleNamespace(__dlpack_c_exchange_api__=api))
+    core = types.SimpleNamespace(_lib=os.environ.get("IMAGE_DLPACK_LIB"),
+                                 load_torch_c_dlpack_extension=lambda: None)
+    verifier.verify_builtin_dlpack(core, torch, api)
     if len(args) == 2 and os.environ.get("FAIL_PIP_STAGE") != "check":
         with open(args[1], "w") as report:
             json.dump({"verified": True, "fixture": True}, report)
-    # This dependency is a software fixture; the real verifier is exercised by
-    # the installation and by RECORD controls below, not by fake native modules.
     args = ["-m", "pip", "check"]
 if args == ["-V"]:
     print("Python (test fixture)")
@@ -75,6 +85,21 @@ elif args[0] == "-c":
         sys.modules["torch"] = torch
     exec(args[1])
 elif args[:2] == ["-m", "pip"]:
+    known = (
+        args == ["-m", "pip", "check"]
+        or args == ["-m", "pip", "install", "clients/python/"]
+        or (args[:4] == ["-m", "pip", "install", "e2e_test/"]
+            and all(arg.startswith(("mcp", "fastapi", "starlette")) for arg in args[4:]))
+        or (args[:3] == ["-m", "pip", "install"] and len(args) == 5
+            and args[3].startswith("grpcio-health-checking==")
+            and args[4].startswith("grpcio-reflection=="))
+        or args == ["-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"]
+        or (args[:8] == ["-m", "pip", "install", "--no-cache-dir", "--no-build-isolation",
+                        "--no-binary=torch-c-dlpack-ext", "apache-tvm-ffi==0.1.12", "tilelang==0.1.15"]
+            and len(args) == 9 and args[8].startswith("torch-c-dlpack-ext @ https://files.pythonhosted.org/"))
+    )
+    if not known:
+        raise RuntimeError("unknown fixture pip command: " + repr(args))
     with open(os.environ["TOOL_LOG"], "a") as log:
         log.write(json.dumps(args) + "\n")
     with open(os.environ["TOOL_ENV_LOG"], "a") as log:
@@ -122,6 +147,7 @@ def run_installer(
         "IMAGE_TORCH_VERSION",
         "IMAGE_TORCH_HIP",
         "IMAGE_TORCH_C_API",
+        "IMAGE_DLPACK_LIB",
         "FAIL_PIP_STAGE",
         "FAIL_NATIVE_CHECK",
     ):
@@ -227,16 +253,16 @@ def test_missing_sglang_image_companion_stops_before_install(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bad_image",
+    "bad_image,diagnostic",
     [
-        {"IMAGE_SGLANG_VERSION": "0.5.22"},
-        {"IMAGE_TORCH_VERSION": "2.13.0"},
-        {"IMAGE_TORCH_HIP": ""},
-        {"IMAGE_TORCH_C_API": "absent"},
-        {"IMAGE_TORCH_C_API": "invalid"},
+        ({"IMAGE_SGLANG_VERSION": "0.5.22"}, "observed sglang=0.5.22"),
+        ({"IMAGE_TORCH_VERSION": "2.13.0"}, "torch=2.13.0"),
+        ({"IMAGE_TORCH_HIP": ""}, "hip=''"),
+        ({"IMAGE_TORCH_C_API": "absent"}, "expected PyCapsule, observed NoneType"),
+        ({"IMAGE_TORCH_C_API": "invalid"}, "expected PyCapsule, observed object"),
     ],
 )
-def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image):
+def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image, diagnostic):
     result, calls = run_installer(
         tmp_path,
         {},
@@ -245,6 +271,7 @@ def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image):
     )
     assert result.returncode != 0
     assert "ERROR:" in result.stderr
+    assert diagnostic in result.stderr
     assert calls == [] and not (tmp_path / "github.env").exists()
 
 
@@ -374,3 +401,164 @@ def test_cohort_record_requires_matching_bodies_and_contained_paths(tmp_path, st
     else:
         with pytest.raises(RuntimeError):
             verifier.verify_record(root, folder)
+
+def test_dlpack_own_library_is_rejected_before_check_and_handoff(tmp_path):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "IMAGE_DLPACK_LIB": "fixture-dlpack-library",
+        },
+    )
+    assert result.returncode != 0
+    assert "DLPack extension loaded its own library" in result.stderr
+    assert "fixture-dlpack-library" in result.stderr
+    assert len(calls) == 2
+    assert not (tmp_path / "github.env").exists()
+
+
+def load_cohort_verifier():
+    spec = importlib.util.spec_from_file_location(
+        "cohort_verifier", ROOT / "scripts/ci_verify_sglang_rocm_cohort.py"
+    )
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    return verifier
+
+
+@pytest.mark.parametrize("image", [None, "different-image"])
+def test_verify_only_rejects_missing_or_different_image_before_tools(tmp_path, image):
+    extra = {"IMAGE_REFLECTION_VERSION": "1.84.0"}
+    if image is not None:
+        extra["SMG_SGLANG_ROCM_IMAGE"] = image
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only",), extra_env=extra,
+    )
+    assert result.returncode == 1
+    assert "unsupported E2E SGLang image" in result.stderr
+    assert calls == []
+    assert not (tmp_path / "native.jsonl").exists()
+    assert not (tmp_path / "github.env").exists()
+
+
+@pytest.mark.parametrize("arguments", [("--unknown",), ("--verify-only", "one", "two")])
+def test_invalid_mode_stops_before_tools(tmp_path, arguments):
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh", arguments=arguments,
+    )
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+    assert calls == [] and not (tmp_path / "native.jsonl").exists()
+
+
+def test_verify_only_rejects_own_library_before_check_or_success_report(tmp_path):
+    report = tmp_path / "native.json"
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)),
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+                   "IMAGE_DLPACK_LIB": "fixture-dlpack-library"},
+    )
+    assert result.returncode != 0
+    assert "DLPack extension loaded its own library: 'fixture-dlpack-library'" in result.stderr
+    assert calls == [] and not report.exists()
+    assert not (tmp_path / "github.env").exists()
+
+
+def test_ambient_dlpack_fixture_is_sanitized(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMAGE_DLPACK_LIB", "ambient-must-not-be-used")
+    result, _ = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "github.env").exists()
+
+
+@pytest.mark.parametrize("state", ["valid", "own-library", "loaded-library", "replaced-api"])
+def test_real_verifier_builtin_api_rejects_replacements(state):
+    from types import SimpleNamespace
+
+    verifier = load_cohort_verifier()
+    api = object()
+    torch = SimpleNamespace(Tensor=SimpleNamespace(__dlpack_c_exchange_api__=api))
+
+    def load():
+        if state == "replaced-api":
+            torch.Tensor.__dlpack_c_exchange_api__ = object()
+        return object() if state == "loaded-library" else None
+
+    core = SimpleNamespace(_lib="fixture-library" if state == "own-library" else None,
+                           load_torch_c_dlpack_extension=load)
+    if state == "valid":
+        verifier.verify_builtin_dlpack(core, torch, api)
+    else:
+        diagnostic = {
+            "own-library": "loaded its own library: 'fixture-library'",
+            "loaded-library": "loaded a replacement builtin API",
+            "replaced-api": "replaced the Torch builtin C API",
+        }[state]
+        with pytest.raises(RuntimeError, match=diagnostic):
+            verifier.verify_builtin_dlpack(core, torch, api)
+
+
+def test_verifier_unexpected_failure_keeps_json_exit_and_traceback(tmp_path, monkeypatch, capsys):
+    verifier = load_cohort_verifier()
+    report = tmp_path / "unexpected.json"
+
+    def broken(_):
+        raise ValueError("fixture unexpected verifier failure")
+
+    monkeypatch.setattr(verifier, "verify", broken)
+    monkeypatch.setattr(sys, "argv", ["ci_verify_sglang_rocm_cohort.py", str(report)])
+    assert verifier.main() == 1
+    captured = capsys.readouterr()
+    data = json.loads(report.read_text())
+    assert json.loads(captured.out) == data
+    assert data["verified"] is False
+    assert data["error"] == {"type": "ValueError", "message": "fixture unexpected verifier failure"}
+    assert "Traceback (most recent call last)" in captured.err
+    assert "ValueError: fixture unexpected verifier failure" in captured.err
+
+
+def test_python_fixture_rejects_unknown_pip_commands(tmp_path):
+    result, _ = run_installer(tmp_path, {})
+    assert result.returncode == 0, result.stderr
+    env = {**os.environ, "TOOL_LOG": str(tmp_path / "unexpected-pip.jsonl"),
+           "TOOL_ENV_LOG": str(tmp_path / "unexpected-env.jsonl")}
+    unknown = subprocess.run(
+        [str(tmp_path / "bin/python3"), "-m", "pip", "install", "unapproved-package"],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert unknown.returncode != 0
+    assert "unknown fixture pip command" in unknown.stderr
+    assert not (tmp_path / "unexpected-pip.jsonl").exists()
+
+
+def test_real_verifier_native_version_mismatch_reports_observed_and_expected(tmp_path, monkeypatch):
+    verifier = load_cohort_verifier()
+    constraint = tmp_path / "torch-rocm.txt"
+    constraint.write_bytes(b"fixture unchanged constraint")
+    monkeypatch.setattr(verifier, "CONSTRAINT", constraint)
+    monkeypatch.setattr(verifier, "CONSTRAINT_SHA", hashlib.sha256(constraint.read_bytes()).hexdigest())
+    monkeypatch.setattr(verifier.sys, "prefix", "/opt/venv")
+    monkeypatch.setenv("SMG_SGLANG_ROCM_IMAGE", verifier.IMAGE)
+    monkeypatch.setenv("PIP_CONSTRAINT", str(constraint))
+    observed = {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
+                "apache-tvm-ffi": "0.2.0", "tilelang": "0.1.16", "torch-c-dlpack-ext": "0.1.6"}
+    monkeypatch.setattr(verifier.md, "version", observed.__getitem__)
+    # The real version guard must fail before distribution traversal/native imports.
+    def unexpected_distributions():
+        raise AssertionError("version mismatch reached installed/native inspection")
+
+    monkeypatch.setattr(verifier.md, "distributions", unexpected_distributions)
+    with pytest.raises(RuntimeError) as failure:
+        verifier.verify({})
+    message = str(failure.value)
+    assert "ERROR: native dependency versions (TVM, TileLang, DLPack):" in message
+    assert "observed=('0.2.0', '0.1.16', '0.1.6')" in message
+    assert "expected=('0.1.12', '0.1.15', '0.1.5')" in message
+    assert "full cohort observed=" in message and "expected=" in message

@@ -48,12 +48,25 @@ python3 -c '
 from importlib.metadata import version
 import torch
 
-if (version("sglang") != "0.5.21"
-        or version("torch") != "2.11.0+rocm10.0.0" or not torch.version.hip):
-    raise SystemExit("ERROR: unsupported SGLang ROCm native dependency cohort")
+sglang_version = version("sglang")
+torch_version = version("torch")
+hip_version = torch.version.hip
+if (sglang_version != "0.5.21"
+        or torch_version != "2.11.0+rocm10.0.0" or not hip_version):
+    raise SystemExit(
+        "ERROR: unsupported SGLang ROCm native dependency cohort: "
+        "observed sglang=%s torch=%s hip=%r; "
+        "expected sglang=0.5.21 torch=2.11.0+rocm10.0.0 and HIP enabled. "
+        "Update TVM/TileLang/DLPack pins in "
+        "scripts/ci_setup_sglang_rocm_image.sh with the image."
+        % (sglang_version, torch_version, hip_version)
+    )
 api = getattr(torch.Tensor, "__dlpack_c_exchange_api__", None)
 if api is None or type(api).__name__ != "PyCapsule":
-    raise SystemExit("ERROR: SGLang ROCm image lacks the Torch builtin DLPack C API")
+    raise SystemExit(
+        "ERROR: SGLang ROCm image lacks the Torch builtin DLPack C API: "
+        "expected PyCapsule, observed %s" % type(api).__name__
+    )
 '
 if [ "$verify_only" -eq 0 ]; then
     $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \

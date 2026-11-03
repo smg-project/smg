@@ -5,6 +5,7 @@ use axum::response::Response;
 use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
+    profile::ProviderProfile,
 };
 use tracing::error;
 
@@ -147,10 +148,17 @@ impl MessagePreparationStage {
         // decoder keeps the special tokens the reader needs, is decided as for
         // a chat request (`reading::prepare`), over the tools the template
         // renders.
+        // The model's provider profile, derived once for the request and
+        // read by the later stages from the state.
+        let provider = ProviderProfile::for_model(&request.model);
+        ctx.state.provider = Some(provider);
         let reading::Prepared {
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,
             keeps_special_tokens: preserve_reasoning_special_tokens,
+            names: parser_names,
+            prompt_thought,
+            reading,
         } = reading::prepare(
             ctx,
             symphony::Asks::Messages {
@@ -159,14 +167,18 @@ impl MessagePreparationStage {
             },
             &filtered_tools,
             &processed_messages.text,
-            utils::messages_reasoning_starts_in_prefill(
+            utils::messages_reasoning_starts_in_prefill_for(
                 request,
+                provider,
                 processed_messages.continued_final_message,
                 tokenizer.as_ref(),
             ),
             &tokenizer,
             "MessagePreparationStage::execute",
         )?;
+        ctx.state.parser_names = Some(parser_names);
+        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved
@@ -247,18 +259,13 @@ mod tests {
 
         use llm_tokenizer::{traits::Tokenizer, HuggingFaceTokenizer, TokenizerRegistry};
         use openai_protocol::messages::CreateMessageRequest;
-        use reasoning_parser::ParserFactory as ReasoningParserFactory;
         use serde_json::{json, Value};
-        use tool_parser::ParserFactory as ToolParserFactory;
 
         use crate::{
             routers::grpc::{
                 common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext, SharedComponents},
-                regular::{
-                    stages::messages::MessagePreparationStage, symphony::template::Templates,
-                },
-                utils::ParserResolver,
+                context::{PreparationOutput, RequestContext},
+                regular::stages::{messages::MessagePreparationStage, testing::components_over},
             },
             worker::WorkerRegistry,
         };
@@ -295,18 +302,11 @@ mod tests {
             .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
             .await
             .unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+        let components = components_over(
             tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
-        });
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
             (json!({"effort": 2}), Ok("effort=2")),

@@ -31,6 +31,9 @@
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
+//! - `rate_limit_cell` — one logical request's tenant rate-limit
+//!   reservation: reserved once before any dispatch, then settled, handed
+//!   to a streaming body, or closed unsettled
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
 //!   body, routing derivatives and serialized upstream bytes, with a
 //!   retry-aware release point
@@ -54,6 +57,7 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
