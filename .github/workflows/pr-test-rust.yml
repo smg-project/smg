@@ -1687,6 +1687,37 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
+  e2e-2gpu-pd-vllm-nixl-amd:
+    # Includes the local Messages gRPC cases in the full router selection.
+    # Qualify selection and shared-runner admission before enabling this lane.
+    name: e2e-2gpu-pd-vllm-nixl-amd (vllm)
+    needs: [e2e-1gpu-gateway, detect-changes]
+    # Require an explicit AMD route; a generic GPU fallback may select NVIDIA.
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_NIXL_PD == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_2 != ''
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      timeout: 50
+      test_timeout: 34
+      test_dirs: e2e_test/router
+      vllm_kv_backend: nixl
+      min_selected: 15 # Selection floor; the full applicable router suite is required
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-2gpu-pd:
     name: e2e-2gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
@@ -2391,7 +2422,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2453,6 +2484,16 @@ jobs:
               echo "AMD Responses memory core returned an unknown CI result"
               exit 1 ;;
           esac
+          # This optional AMD PD lane rejects unknown or empty CI results.
+          case "${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}" in
+            success|skipped) ;;
+            failure|cancelled)
+              echo "AMD vLLM NIXL PD failed or was cancelled"
+              exit 1 ;;
+            *)
+              echo "AMD vLLM NIXL PD returned an unknown CI result"
+              exit 1 ;;
+          esac
           # A job that runs into its timeout-minutes ends "cancelled", not
           # "failure", and fails this gate the same way (smg-project/smg-lab#171).
           # A run cancelled as a whole ends with this gate failed too: it did
@@ -2487,6 +2528,7 @@ jobs:
                 "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-responses-memory-core-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
