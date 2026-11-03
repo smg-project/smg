@@ -20,6 +20,7 @@ use tonic::Status;
 
 use super::State;
 use crate::{
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
     stream::{poll_engine_item, Choice, Choices, RequestStream},
@@ -55,6 +56,32 @@ pub(super) async fn generate(
         .as_ref()
         .map_or(1, |config| config.num_return_sequences.max(1));
     let subs = client.generate_trtllm_streams(req, trace_headers).await?;
+    // The load tracker's view of the request: in flight on the rank its
+    // first choice went to (the choice that reports the prompt) from here
+    // until the shim's first output (or the stream's end), with a
+    // servicer-clock prefill sample when it met no queue there (this wire
+    // carries no engine timing).
+    let at = Instant::now();
+    let rank = rank_of(
+        subs.iter()
+            .find(|sub| sub.index() == 0)
+            .or_else(|| subs.first())
+            .and_then(TrtllmGenerateStream::engine_index),
+    );
+    let mut probe = state.shared.loads.submit(Submission {
+        request_id: &request_id,
+        rank,
+        prompt_tokens,
+        choices: n,
+        tail: u32::try_from(rank)
+            .ok()
+            .and_then(|rank| client.engine_load(rank)),
+        window: state
+            .shared
+            .running_window(state.model.max_running_requests),
+        at,
+    });
+    let loads = PendingGuard::new(Arc::clone(state), &request_id);
     let metrics = state.shared.metrics.request(
         arrival,
         subs.first().and_then(TrtllmGenerateStream::engine_index),
@@ -64,19 +91,28 @@ pub(super) async fn generate(
     );
     let mut choices = Choices::new();
     for sub in subs {
+        // Each choice's engine request went to its own rank (an unpinned
+        // fan-out is placed per choice): its tokens are credited there.
+        let load = ChoiceLoad::new(
+            rank_of(sub.engine_index()),
+            sub.index(),
+            if sub.index() == 0 {
+                std::mem::take(&mut probe)
+            } else {
+                PrefillProbe::default()
+            },
+        );
         choices.push(ChoiceStream {
             request_id: Arc::clone(&request_id),
+            state: Arc::clone(state),
             inner: Some(sub),
             streaming,
             metrics: metrics.choice(),
+            load,
         });
     }
-    Ok(Box::pin(RequestStream::new(
-        choices,
-        cancel,
-        registration,
-        metrics,
-    )))
+    let stream = RequestStream::new(choices, cancel, registration, metrics).holding(loads);
+    Ok(Box::pin(stream))
 }
 
 /// One choice of a generate request: the ZMQ-mapped stream under the
@@ -95,6 +131,10 @@ struct ChoiceStream {
     streaming: bool,
     /// This choice's observation of the request's metrics.
     metrics: ChoiceMetrics,
+    /// The servicer state, for the load tracker.
+    state: Arc<State>,
+    /// This choice's share of the load tracker's bookkeeping.
+    load: ChoiceLoad,
 }
 
 impl ChoiceStream {
@@ -160,14 +200,31 @@ impl Stream for ChoiceStream {
             };
             let is_chunk = match item.response.as_ref() {
                 Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                    this.metrics.chunk(
-                        u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+                    let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
+                    // The metrics' clock read serves the load tracker too.
+                    let at = this
+                        .metrics
+                        .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
+                        .unwrap_or_else(Instant::now);
+                    let loads = &this.state.shared.loads;
+                    this.load.count_prompt(
+                        loads,
+                        &this.request_id,
                         chunk.prompt_tokens,
                         chunk.cached_tokens,
+                        at,
                     );
+                    this.load.generated(loads, tokens, at);
                     true
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
+                    this.load.count_prompt(
+                        &this.state.shared.loads,
+                        &this.request_id,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                        Instant::now(),
+                    );
                     this.metrics.complete(
                         &complete.finish_reason,
                         complete.prompt_tokens,
