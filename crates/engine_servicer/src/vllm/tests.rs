@@ -2150,9 +2150,6 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
-/// servicer's message. With one configured, the call resolves before any
-/// event (headers go out eagerly, as the Python relay's initial metadata),
 /// A subscriber that wants the load records alone gets them with or without
 /// a relay (the servicer's own figures need none): `load_only` batches
 /// numbered 0, one per rank, with the engine's telemetry, and never an
@@ -2224,6 +2221,9 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
+/// servicer's message. With one configured, the call resolves before any
+/// event (headers go out eagerly, as the Python relay's initial metadata),
 /// batches arrive under the publisher's sequence numbers, and stopping the
 /// servicer closes the subscription on the publisher's side.
 #[tokio::test]

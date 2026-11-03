@@ -127,6 +127,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
         .shared
         .running_window(state.model.max_running_requests);
     let snapshot = client.get_loads();
+    let none_reported = snapshot.loads.is_empty();
     let mut loads: Vec<ts::SchedulerLoad> = snapshot
         .loads
         .into_iter()
@@ -149,11 +150,15 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             }
         })
         .collect();
-    if loads.is_empty() && dp_rank.is_none() {
-        // No output batch has carried a snapshot yet: a zero-filled entry per
-        // rank, as the Python servicer reports an idle scheduler.
+    if none_reported {
+        // No output batch has carried a snapshot yet: a zero-filled entry for
+        // each rank the request asks about (every connected rank, or the one it
+        // names; a rank past the connected ones gets none), as the Python
+        // servicer reports an idle scheduler and as the vLLM module answers:
+        // the records-only stream reads each rank this way from its first tick.
         let ranks = state.shared.rank_count(state.model.data_parallel_size);
         loads = rank_ids(ranks)
+            .filter(|rank| dp_rank.is_none_or(|asked| asked == *rank))
             .map(|dp_rank| ts::SchedulerLoad {
                 dp_rank,
                 max_running_requests,

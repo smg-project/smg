@@ -1188,6 +1188,31 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(idle.loads[0].max_running_requests, 64);
     assert_eq!(idle.loads[0].num_running_reqs, 0);
     assert_eq!(idle.version, "tokenspeed");
+    // The rank the request names gets its own zero entry before any step (the
+    // records-only stream reads each rank this way); a rank past the
+    // connected ones gets none.
+    let own = h
+        .client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(0),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(own.loads.len(), 1);
+    assert_eq!(own.loads[0].dp_rank, 0);
+    assert_eq!(own.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
 
     // A step carrying a load snapshot updates the rank's report while the
     // request is in flight.
