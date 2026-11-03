@@ -1385,12 +1385,10 @@ ship_release() { # the GitHub release on the tag: a prerelease for a candidate, 
   ship_say "release: created $url (${flags[*]#--})"
 }
 
-plan_dispatches() { # <ref>: the publish plan's dispatch lines as read at <ref>, without their comments
-  publish_plan "$ship_version" "$1" | sed -n 's/^ *\(gh workflow run .*\)$/\1/p' | sed 's/ *#.*$//'
-}
-run_rows() { # <tag> <workflow file>: the workflow's runs on <tag>: "id<TAB>title<TAB>status<TAB>conclusion" per line
+run_rows() { # <tag> <workflow file>: the workflow's runs on <tag>, "id<TAB>title<TAB>status<TAB>conclusion" per line, with gh's
+  # status: a read that failed is not an empty list (an empty list would dispatch the whole plan again)
   "$GH" run list --workflow "$2" --branch "$1" --limit 100 --json databaseId,displayTitle,status,conclusion \
-    --jq '.[] | "\(.databaseId)\t\(.displayTitle)\t\(.status)\t\(.conclusion // "")"' 2>/dev/null || true
+    --jq '.[] | "\(.databaseId)\t\(.displayTitle)\t\(.status)\t\(.conclusion // "")"'
 }
 dispatched() { # <dispatch line> <its workflow's runs>: 0 when a run of this dispatch that did not fail is among them (dispatched_run
   # names it). An engine-image dispatch is told by its run name, which carries the engine and the base image.
@@ -1408,20 +1406,28 @@ dispatched() { # <dispatch line> <its workflow's runs>: 0 when a run of this dis
 }
 
 ship_publish() { # the publish plan's dispatches against the tag, each once; then the runs on the tag
-  local ref=$ship_tag cache line words file failed=0 id workflow status conclusion title
+  local ref=$ship_tag plan cache line words file failed=0 id workflow status conclusion title table
   local lines=()
   if ! has_ref "refs/tags/$ship_tag"; then
     [ "$ship_dry" -eq 1 ] || die "the tag $ship_tag does not exist: the dispatches run against it (release.sh ship $ship_version --from tag)"
     ref=$ship_head
     ship_say "publish: the plan is read at $(git rev-parse --short "$ref"), before the bump: its dispatch lines are the tag's, its crate versions the bump's once it exists"
   fi
-  mapfile -t lines < <(plan_dispatches "$ref")
+  # The plan is read whole, with its exit status, before the first dispatch: a plan that fails after its first lines
+  # (the component list, a registry) dispatches nothing. Its dispatch lines are read from the file, without the comments.
+  plan=$(mktemp)
+  if ! (publish_plan "$ship_version" "$ref") > "$plan"; then
+    die "the publish plan of v$ship_version could not be read (its message is above): nothing is dispatched"
+  fi
+  mapfile -t lines < <(sed -n 's/^ *\(gh workflow run .*\)$/\1/p' "$plan" | sed 's/ *#.*$//')
   [ ${#lines[@]} -gt 0 ] || die "the publish plan of v$ship_version names no dispatch"
   cache=$(mktemp -d)
   for line in ${lines[@]+"${lines[@]}"}; do
     read -r -a words <<< "$line" # gh workflow run <file> --ref <tag> [-f <input>=<value>]...
     file=${words[3]}
-    [ -f "$cache/$file" ] || run_rows "$ship_tag" "$file" > "$cache/$file"
+    if [ ! -f "$cache/$file" ] && ! run_rows "$ship_tag" "$file" > "$cache/$file"; then
+      die "the runs of $file on $ship_tag could not be read (gh run list --workflow $file --branch $ship_tag; its message is above): a run that is there must not be dispatched twice, so nothing more is dispatched; rerun the ship (--from publish) once gh answers (what was dispatched is skipped then)"
+    fi
     if dispatched "$line" "$cache/$file"; then
       ship_say "publish: done, $line: run $dispatched_run"
       ship_had=$((ship_had + 1))
@@ -1439,11 +1445,15 @@ ship_publish() { # the publish plan's dispatches against the tag, each once; the
   ship_say "publish: $ship_new dispatched, $ship_had there already, $failed failed"
   [ "$ship_new" -eq 0 ] || sleep 5 # a dispatch's run is listed a moment after gh returns
   say "the runs on $ship_tag (gh run list --branch $ship_tag):"
-  while IFS=$'\t' read -r id workflow status conclusion title; do
-    [ -n "$id" ] || continue
-    printf '  %-12s %-36s %-20s %s\n' "$id" "$workflow" "$status${conclusion:+ $conclusion}" "$title"
-  done < <("$GH" run list --branch "$ship_tag" --limit 100 --json databaseId,workflowName,status,conclusion,displayTitle \
-    --jq '.[] | "\(.databaseId)\t\(.workflowName)\t\(.status)\t\(.conclusion // "")\t\(.displayTitle)"' 2>/dev/null || true)
+  if table=$("$GH" run list --branch "$ship_tag" --limit 100 --json databaseId,workflowName,status,conclusion,displayTitle \
+    --jq '.[] | "\(.databaseId)\t\(.workflowName)\t\(.status)\t\(.conclusion // "")\t\(.displayTitle)"'); then
+    while IFS=$'\t' read -r id workflow status conclusion title; do
+      [ -n "$id" ] || continue
+      printf '  %-12s %-36s %-20s %s\n' "$id" "$workflow" "$status${conclusion:+ $conclusion}" "$title"
+    done <<< "$table"
+  else
+    say "  (the run list could not be read; the dispatches above stand)"
+  fi
   [ "$failed" -eq 0 ] || die "$failed dispatch(es) failed: rerun the ship (--from publish) once the cause is fixed; the ones that ran are skipped"
 }
 

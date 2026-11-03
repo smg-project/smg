@@ -97,6 +97,7 @@ case "$1 $2" in
   "release create") echo "https://example.invalid/releases/$3" ;;
   "workflow run") ;;
   "run list") # the runs on a tag: GH_STUB_TAG_RUNS holds "file;id;title;status;conclusion" lines, --workflow narrows
+    [ -z "${GH_STUB_RUN_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_RUN_LIST_ERROR" >&2; exit 1; }
     workflow=""
     for ((i = 1; i <= $#; i++)); do
       if [ "${!i}" = "--workflow" ]; then j=$((i + 1)); workflow=${!j}; fi
@@ -2218,6 +2219,28 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
         "no release/1.15 on origin: cut it first"
         in repo.tool("ship", "1.15.0-rc.1", "--dry-run", check=False).stderr
     )
+
+
+def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo: Sandbox) -> None:
+    """The plan is read whole, with its status, before the first dispatch, and a failed read of a workflow's runs is
+    not an empty list: either failure stops the ship with nothing dispatched (a rerun would double a run otherwise)."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    unread = repo.tool(
+        "ship", "1.14.0-rc.2", "--from", "publish", check=False, GH_STUB_RUN_LIST_ERROR="no answer"
+    )
+    assert unread.returncode == 1
+    assert "the runs of release-pypi.yml on v1.14.0-rc.2 could not be read" in unread.stderr
+    assert "gh: no answer" in unread.stderr, "gh's own message is shown"
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    broken = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False, PYTHON="false")
+    assert broken.returncode == 1
+    assert "the publish plan of v1.14.0-rc.2 could not be read" in broken.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
 
 
 # --- a rehearsal: the cut before its push ------------------------------------------------------------
