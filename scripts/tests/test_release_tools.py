@@ -1860,9 +1860,8 @@ def ship_lines(out: str) -> list[str]:
 
 
 ENGINE_RUN = "SMG+{engine} | base={base} | engine=latest | smg=release tag |  by @owner"
+# a candidate's plan: the Python package, the crates and the gRPC packages wait for the final
 CANDIDATE_DISPATCHES = [
-    "gh workflow run release-pypi.yml --ref v1.14.0-rc.2",
-    "gh workflow run release-crates.yml --ref v1.14.0-rc.2",
     "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
     "gh workflow run release-helm.yml --ref v1.14.0-rc.2",
     "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm",
@@ -1870,7 +1869,6 @@ CANDIDATE_DISPATCHES = [
     " -f base_image_ref=vllm/vllm-openai:v0.27.1",
     "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=sglang",
     "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=tokenspeed",
-    "gh workflow run release-grpc.yml --ref v1.14.0-rc.2",
     "gh workflow run release-go.yml --ref v1.14.0-rc.2 -f version=1.14.0-rc.2",
 ]
 
@@ -1897,7 +1895,7 @@ def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None
         "would create the GitHub release: gh release create v1.14.0-rc.2 --verify-tag --prerelease"
         " --title 'SMG v1.14.0-rc.2' --notes-file ",
         "publish: the plan is read at ",
-        "would dispatch: gh workflow run release-pypi.yml --ref v1.14.0-rc.2",
+        "would dispatch: gh workflow run release-docker.yml --ref v1.14.0-rc.2",
         "dry run of v1.14.0-rc.2 done: nothing was committed, pushed, tagged, created or dispatched",
     ]
     found = [next(i for i, line in enumerate(lines) if line.startswith(step)) for step in steps]
@@ -1925,6 +1923,9 @@ def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None
     release = [line for line in final if line.startswith("would create the GitHub release: ")]
     assert len(release) == 1 and " --latest " in release[0] and "--prerelease" not in release[0]
     assert "would dispatch: gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in final
+    assert "would dispatch: gh workflow run release-pypi.yml --ref v1.14.0" in final, (
+        "the final's plan carries the registry dispatches a candidate's leaves out"
+    )
 
 
 def test_ship_plans_the_bump_by_a_pull_request_when_a_rule_the_caller_cannot_bypass_applies(
@@ -1983,18 +1984,16 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
         f" --notes-file {notes}" in calls
     )
     assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
-    assert "publish: 10 dispatched, 0 there already, 0 failed" in out
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in out
     assert "the runs on v1.14.0-rc.2 (gh run list --branch v1.14.0-rc.2):" in out
     assert out.rstrip().endswith(
-        "10 new dispatch(es) (0 were there already); a run that fails is dispatched again by"
+        "7 new dispatch(es) (0 were there already); a run that fails is dispatched again by"
         " 'release.sh ship 1.14.0-rc.2 --from publish'"
     )
     # the rerun: the branch, the tag, the release and the runs are there; a failed or cancelled run is
     # dispatched again, nothing else is
     runs = "\n".join(
         [
-            "release-pypi.yml;1;Release SMG to PyPI;completed;success",
-            "release-crates.yml;2;Publish Crates;in_progress;",
             "release-docker.yml;3;Release Docker Image;completed;failure",
             "release-helm.yml;4;Release Helm Chart;completed;success",
             "release-engine-docker.yml;5;"
@@ -2009,7 +2008,6 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
             "release-engine-docker.yml;8;"
             + ENGINE_RUN.format(engine="tokenspeed", base="engine default")
             + ";queued;",
-            "release-grpc.yml;9;Release gRPC packages to PyPI;completed;success",
             "release-go.yml;10;Release gRPC goLang packages;completed;success",
         ]
     )
@@ -2029,17 +2027,17 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
         "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in again
     )
     assert (
-        "publish: done, gh workflow run release-pypi.yml --ref v1.14.0-rc.2: run 1 (success)"
+        "publish: done, gh workflow run release-helm.yml --ref v1.14.0-rc.2: run 4 (success)"
         in again
     )
     assert (
-        "publish: done, gh workflow run release-crates.yml --ref v1.14.0-rc.2: run 2 (in_progress)"
-        in again
+        "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm:"
+        " run 5 (queued)" in again
     )
     assert (
         "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm"
+        " -f base_image_ref=vllm/vllm-openai:v0.27.1: run 6 (queued)" in again
     )
-    " -f base_image_ref=vllm/vllm-openai:v0.27.1: run 6 (queued)" in again
     new_calls = repo.gh_calls()[before:]
     assert [call for call in new_calls if call.startswith("gh workflow run ")] == [
         "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
@@ -2048,9 +2046,9 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
     assert not [
         call for call in new_calls if call.split()[1:3] in (["release", "create"], ["pr", "create"])
     ]
-    assert "publish: 2 dispatched, 8 there already, 0 failed" in again
+    assert "publish: 2 dispatched, 5 there already, 0 failed" in again
     assert repo.origin_ref("refs/heads/release/1.14") == head
-    assert "  1            release-pypi.yml                     completed success" in again
+    assert "  4            release-helm.yml                     completed success" in again
 
 
 def test_ship_opens_the_bump_pull_request_when_the_remote_refuses_the_push_and_waits_for_its_merge(
@@ -2103,8 +2101,10 @@ def test_ship_stops_when_the_bump_pull_request_is_not_merged_in_time_and_resumes
         "the bump pull request #1 is not merged after 0 min: merge it, then rerun the ship"
         in done.stderr
     )
-    assert "bump: opening the pull request of chore/release-1.14.0-rc.2 against release/1.14"
-    " (by a pull request (BUMP_PUSH=0))" in done.stdout
+    assert (
+        "bump: opening the pull request of chore/release-1.14.0-rc.2 against release/1.14"
+        " (by a pull request (BUMP_PUSH=0))" in done.stdout
+    )
     assert repo.origin_ref("refs/heads/chore/release-1.14.0-rc.2") is not None, (
         "the topic is pushed and its pull request open"
     )
@@ -2207,7 +2207,7 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
         "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title SMG v1.14.0-rc.2"
         f" --notes-file {authored}" in repo.gh_calls()
     )
-    assert "publish: 10 dispatched, 0 there already, 0 failed" in lines
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in lines
     wrong = repo.base / "wrong.md"
     wrong.write_text("# notes\n")
     stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(wrong), check=False)
@@ -2241,7 +2241,7 @@ def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo
         "ship", "1.14.0-rc.2", "--from", "publish", check=False, GH_STUB_RUN_LIST_ERROR="no answer"
     )
     assert unread.returncode == 1
-    assert "the runs of release-pypi.yml on v1.14.0-rc.2 could not be read" in unread.stderr
+    assert "the runs of release-docker.yml on v1.14.0-rc.2 could not be read" in unread.stderr
     assert "gh: no answer" in unread.stderr, "gh's own message is shown"
     assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
     broken = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False, PYTHON="false")
