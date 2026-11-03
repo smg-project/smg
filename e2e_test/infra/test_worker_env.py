@@ -230,3 +230,63 @@ def test_out_of_range_gpu_ids_explain_the_inherited_hip_slice(monkeypatch, gpu_i
         worker._build_env()
 
     assert worker_module.os.environ["HIP_VISIBLE_DEVICES"] == "2,3"
+
+
+@pytest.mark.parametrize(
+    "inherited_hip",
+    ["0,", ",0", "0,,1", "0, ", " ,1", " ", "\t"],
+    ids=["empty_tail", "empty_head", "empty_middle", "blank_tail", "blank_head", "blank", "tab"],
+)
+def test_inherited_hip_empty_entries_are_rejected_before_selection(monkeypatch, inherited_hip):
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", inherited_hip)
+    worker = _worker("sglang", ConnectionMode.HTTP)
+
+    with pytest.raises(ValueError, match="HIP_VISIBLE_DEVICES=.*has an empty entry"):
+        worker._build_env()
+
+    assert worker_module.os.environ["HIP_VISIBLE_DEVICES"] == inherited_hip
+
+
+@pytest.mark.parametrize(
+    "gpu_ids", [[2], [0, 2]], ids=["out_of_range_single", "out_of_range_group"]
+)
+def test_explicit_both_gpu_masks_replace_the_inherited_assignment(monkeypatch, gpu_ids):
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3,1,0,2")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    worker = _worker("sglang", ConnectionMode.HTTP)
+    worker.gpu_ids = gpu_ids
+    worker.extra_env = {"HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "0"}
+
+    env = worker._build_env()
+
+    assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert env["ROCR_VISIBLE_DEVICES"] == "3,1,0,2"
+    assert worker_module.os.environ["HIP_VISIBLE_DEVICES"] == "2,3"
+    assert worker_module.os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
+
+
+def test_a_hip_only_override_preserves_the_derived_cuda_mask(monkeypatch):
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3,1,0,2")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    worker = _worker("sglang", ConnectionMode.HTTP)
+    worker.gpu_ids = [1]
+    worker.extra_env = {"HIP_VISIBLE_DEVICES": "0"}
+
+    env = worker._build_env()
+
+    assert env["HIP_VISIBLE_DEVICES"] == "0"
+    assert env["CUDA_VISIBLE_DEVICES"] == "3"
+    assert env["ROCR_VISIBLE_DEVICES"] == "3,1,0,2"
+
+
+@pytest.mark.parametrize("variable", ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"])
+def test_a_single_mask_override_still_requires_a_valid_inherited_assignment(monkeypatch, variable):
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    worker = _worker("sglang", ConnectionMode.HTTP)
+    worker.gpu_ids = [2]
+    worker.extra_env = {variable: "0"}
+
+    with pytest.raises(ValueError, match="exceed the inherited HIP_VISIBLE_DEVICES='2,3'"):
+        worker._build_env()
