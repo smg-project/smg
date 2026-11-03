@@ -92,3 +92,11 @@ workspace = true
 [[bench]]
 name = "minimax_m3_concurrency"
 harness = false
+
+[[bench]]
+name = "pixel_cache_hit"
+harness = false
+
+[[bench]]
+name = "audio_clip"
+harness = false

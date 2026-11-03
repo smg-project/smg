@@ -112,8 +112,8 @@ type TokenizerStream =
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
 /// for a stream that outlasts its dispatch. Every call's input token ids,
-/// prompt text and engine request id are recorded, as is every aborted
-/// request id.
+/// prompt text, stop sequences and engine request id are recorded, as is
+/// every aborted request id.
 #[derive(Clone, Default)]
 struct GatedScheduler {
     probe: Option<Weak<CompletionRequest>>,
@@ -138,6 +138,7 @@ struct GatedScheduler {
     seen_original_texts: Arc<Mutex<Vec<String>>>,
     seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
     seen_request_ids: Arc<Mutex<Vec<String>>>,
+    seen_stops: Arc<Mutex<Vec<Vec<String>>>>,
     aborted_request_ids: Arc<Mutex<Vec<String>>>,
 }
 
@@ -231,6 +232,16 @@ impl TokenSpeedScheduler for GatedScheduler {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.request_id.clone());
+        self.seen_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                request
+                    .sampling_params
+                    .as_ref()
+                    .map(|params| params.stop.clone())
+                    .unwrap_or_default(),
+            );
         if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
             return Err(Status::unavailable("release-test induced failure"));
         }
@@ -2544,6 +2555,39 @@ async fn a_client_that_leaves_a_stalled_harmony_responses_stream_aborts_it_on_th
         serde_json::Value::Null,
         "nothing of an abandoned foreground stream is stored"
     );
+}
+
+/// Harmony Responses over the gRPC regular path: the request's `stop`
+/// sequences reach the engine on the request the Harmony pipeline built, as
+/// a chat request's do; the stub reads them off its sampling parameters.
+#[tokio::test]
+async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
+    let scheduler = GatedScheduler::default();
+    let port = spawn_stub(scheduler.clone()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+    let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "input": "hi",
+        "stream": true,
+        "stop": ["STOP", "\n\n"],
+    }))
+    .expect("responses request");
+
+    let response = serve_harmony_responses_stream(&ctx, request, anonymous(), None).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("the stream's body");
+    assert!(!body.is_empty(), "the stream answers");
+
+    let seen = scheduler
+        .seen_stops
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(seen, vec![vec!["STOP".to_string(), "\n\n".to_string()]]);
 }
 
 /// Harmony Responses over the gRPC PD path: the same client leaves while

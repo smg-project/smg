@@ -1657,7 +1657,8 @@ impl RequestPipeline {
     /// Runs through dispatch and returns the raw ExecutionResult (with
     /// stream) and LoadGuards for token-level streaming processing, with the
     /// iteration's tenant rate-limit reservation (taken under a charge id of
-    /// its own). The caller keeps
+    /// its own) and the router's stop obligations (the string `stop`s the
+    /// engine cannot match, for the reader to scan for). The caller keeps
     /// load_guards alive until stream processing completes, then settles the
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
@@ -1669,7 +1670,15 @@ impl RequestPipeline {
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>, Arc<RateLimitCell>), Response> {
+    ) -> Result<
+        (
+            ExecutionResult,
+            Option<LoadGuards>,
+            Arc<RateLimitCell>,
+            Vec<String>,
+        ),
+        Response,
+    > {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
@@ -1693,7 +1702,16 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
                 Some(execution_result) => {
                     let load_guards = dctx.load_guards.take();
-                    Ok((execution_result, load_guards, rate_limit_cell.clone()))
+                    // The string stops the engine will never match, for the
+                    // Harmony reader to scan the channel text for, as the
+                    // response stage hands them to a non-streamed iteration.
+                    let router_stops = std::mem::take(&mut dctx.response.router_stop_obligations);
+                    Ok((
+                        execution_result,
+                        load_guards,
+                        rate_limit_cell.clone(),
+                        router_stops,
+                    ))
                 }
                 None => {
                     error!(

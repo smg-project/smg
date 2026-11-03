@@ -10,6 +10,7 @@ real repository or the network.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1440,10 +1441,15 @@ def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sand
 # --- publish-plan ----------------------------------------------------------------------------
 
 
+def plan_items(out: str) -> list[int]:
+    """The numbers of a publishing plan's items, in the order printed."""
+    return [int(line.split(".", 1)[0]) for line in out.splitlines() if re.match(r"\d+\. ", line)]
+
+
 def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> None:
     finished_release(repo)
     calls = len(repo.gh_calls())
-    out = repo.tool("publish-plan", "1.14.0-rc.1").stdout
+    out = repo.tool("publish-plan", "1.14.0").stdout
     assert len(repo.gh_calls()) == calls, "the plan runs nothing"
     for workflow in (
         "release-pypi.yml",
@@ -1452,12 +1458,11 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
         "release-helm.yml",
         "release-grpc.yml",
     ):
-        assert f"gh workflow run {workflow} --ref v1.14.0-rc.1" in out
-    assert "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.1 -f engine=vllm" in out
-    assert "gh workflow run release-go.yml --ref v1.14.0-rc.1 -f version=1.14.0-rc.1" in out
-    assert "smg==1.14.0rc1" in out
-    assert "latest does not move" in out
-    assert "     smg 1.14.0-rc.1\n" in out and "     tool-parser 0.6.0\n" in out
+        assert f"gh workflow run {workflow} --ref v1.14.0" in out
+    assert "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=vllm" in out
+    assert "gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in out
+    assert "smg==1.14.0," in out and "and latest" in out
+    assert "     smg 1.14.0\n" in out and "     tool-parser 0.6.0\n" in out
     assert "openapi-gen" not in out, (
         "a crate with publish = false is never published: not in the plan"
     )
@@ -1465,8 +1470,26 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
         "a crate with publish = [] is never published either: not in the plan"
     )
     assert "publish = false or publish = [] is never published and not listed" in out
-    final = repo.tool("publish-plan", "1.14.0").stdout
-    assert "smg==1.14.0," in final and "and latest" in final
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox) -> None:
+    """A candidate is never published to PyPI or crates.io: its plan carries the images, the chart, the engine
+    images, the Go module tag and the GitHub pre-release, says once why the three registry dispatches are not
+    there, reads no registry, and numbers its items without a gap."""
+    finished_release(repo)
+    out = repo.tool("publish-plan", "1.14.0-rc.1").stdout
+    for workflow in ("release-docker.yml", "release-helm.yml"):
+        assert f"gh workflow run {workflow} --ref v1.14.0-rc.1" in out
+    assert "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.1 -f engine=vllm" in out
+    assert "gh workflow run release-go.yml --ref v1.14.0-rc.1 -f version=1.14.0-rc.1" in out
+    assert "latest does not move" in out
+    for workflow in ("release-pypi.yml", "release-crates.yml", "release-grpc.yml"):
+        assert f"gh workflow run {workflow}" not in out, workflow
+    assert "A candidate is never published to PyPI or crates.io" in out
+    assert "smg==" not in out and "tool-parser" not in out
+    assert repo.curl_calls() == [], "no registry is read for a plan that publishes to none"
+    assert plan_items(out) == [1, 2, 3, 4, 5]
 
 
 def test_publish_plan_prints_one_engine_dispatch_per_release_base(repo: Sandbox) -> None:
@@ -1520,6 +1543,24 @@ def test_check_reads_the_gate_items_and_leaves_the_verifier_lines_to_the_owner(
     repo.tool("tag", "1.14.0-rc.1")
     assert (
         "[ok]   tag: v1.14.0-rc.1 is at the branch head" in repo.tool("check", "1.14.0-rc.1").stdout
+    )
+
+
+def test_check_reports_that_a_candidate_never_reaches_the_registries(repo: Sandbox) -> None:
+    repo.cut()
+    out = repo.tool("check", "1.14.0-rc.1").stdout
+    assert (
+        "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi,"
+        " release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan 1.14.0-rc.1"
+        " leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub"
+        " pre-release" in out
+    )
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    out = repo.tool("check", "1.14.0").stdout
+    assert (
+        "[note] publish: the final publishes to PyPI and crates.io by its dispatches"
+        " (release.sh publish-plan 1.14.0 lists them; a candidate never does)" in out
     )
 
 
@@ -1729,7 +1770,18 @@ def test_check_fails_the_registry_item_when_the_component_list_cannot_be_read(
     assert "[FAIL] registry: the crate and package list at " in done.stdout
     assert "workspace versioning" in done.stdout and "[ok]   registry" not in done.stdout
     assert repo.curl_calls() == [], "nothing is compared when the list is unknown"
-    plan = repo.tool("publish-plan", "1.14.0-rc.1", check=False)
+    # a candidate's plan reads neither the list nor a registry, so this manifest cannot stop it
+    candidate = repo.tool("publish-plan", "1.14.0-rc.1")
+    assert "A candidate is never published to PyPI or crates.io" in candidate.stdout
+    assert repo.curl_calls() == [], "a candidate's plan reads no registry"
+    # the final's plan reads the list, and fails the same way as the gate (the bump is written by hand: the
+    # checker refuses this manifest)
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put("model_gateway/Cargo.toml", versioned("smg", "1.14.0"))
+    repo.git("commit", "--quiet", "-am", "chore(release): bump versions to 1.14.0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    plan = repo.tool("publish-plan", "1.14.0", check=False)
     assert plan.returncode == 1
     assert "could not be read" in plan.stderr and "workspace versioning" in plan.stderr
 
@@ -1779,7 +1831,8 @@ def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) 
     assert said in status.stderr and "== versions: 1.14.0-rc.1" in status.stdout
     plan = repo.tool("publish-plan", "1.14.0-rc.1")
     assert (
-        said in plan.stderr and "gh workflow run release-pypi.yml --ref v1.14.0-rc.1" in plan.stdout
+        said in plan.stderr
+        and "gh workflow run release-docker.yml --ref v1.14.0-rc.1" in plan.stdout
     )
     notes = repo.tool("notes", "1.14.0-rc.1")
     assert said in notes.stderr and "## SMG v1.14.0-rc.1" in notes.stdout
@@ -2123,6 +2176,107 @@ def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_
         "proto": "true",
         "servicer": "true",
     }
+
+
+# --- a candidate never reaches PyPI or crates.io --------------------------------------------------
+
+# The publish workflows the rule holds, by the jobs a dispatch enters: their `if` skips a candidate's ref and every
+# other job needs them, so the dispatch is a no-op; their first step refuses the ref with the reason when the job is
+# reached anyway.
+REGISTRY_WORKFLOWS = {
+    "release-pypi.yml": ("build", "build-sdist"),
+    "release-crates.yml": ("tier1",),
+    "release-grpc.yml": ("detect",),
+}
+CANDIDATE_IF = "${{ !contains(github.ref_name, '-rc.') }}"
+GUARD_STEP = "Refuse a release candidate"
+# a version or a ref name, and whether it is a candidate: the tag's form with the v and the bare version
+CANDIDATE_CASES = (
+    ("v1.14.0", False),
+    ("1.14.0", False),
+    ("v1.14.0-rc.1", True),
+    ("1.14.0-rc.1", True),
+    ("v1.14.0-rc.12", True),
+    ("1.14.0-rc.12", True),
+    ("release/1.14", False),
+    ("main", False),
+)
+
+
+def is_candidate(name: str) -> bool:
+    """release.sh's predicate, run as the script defines it (its one line, in bash), on a version or a tag name."""
+    source = (ROOT / TOOL).read_text().splitlines()
+    line = next(text for text in source if text.startswith("is_candidate()"))
+    done = subprocess.run(
+        ["bash", "-c", f'{line}\nis_candidate "$1"', "is_candidate", name],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode in (0, 1), done.stderr
+    return done.returncode == 0
+
+
+def candidate_guard(workflow: str, job: str, name: str) -> subprocess.CompletedProcess[str]:
+    """The first step of a publish workflow's entry job, run as the workflow runs it, dispatched on the named ref."""
+    loaded = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
+    step = loaded["jobs"][job]["steps"][0]
+    assert step["name"] == GUARD_STEP, (workflow, job)
+    assert step["shell"] == "bash", (workflow, job, "the wheels' matrix has a Windows runner")
+    return subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        env={
+            "PATH": os.pathsep.join(["/usr/bin", "/bin"]),
+            "GITHUB_REF_TYPE": "tag" if name.startswith("v") else "branch",
+            "GITHUB_REF_NAME": name,
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("name,candidate", CANDIDATE_CASES)
+def test_the_candidate_predicate_reads_a_version_or_a_tag_name(name: str, candidate: bool) -> None:
+    """One rule in release.sh and in the three publish workflows: a name with `-rc.` in it is a candidate, with the
+    tag's v or without; a final, a release branch and main are not."""
+    assert is_candidate(name) is candidate
+    for workflow, jobs in REGISTRY_WORKFLOWS.items():
+        for job in jobs:
+            guard = candidate_guard(workflow, job, name)
+            assert guard.returncode == (1 if candidate else 0), (workflow, job, guard.stderr)
+            if candidate:
+                assert f"{name} is a release candidate" in guard.stderr, (workflow, job)
+                assert "PyPI" in guard.stderr or "crates.io" in guard.stderr, (workflow, job)
+            else:
+                assert guard.stderr == "", (workflow, job)
+
+
+def test_the_publish_workflows_skip_a_candidate_before_their_first_step() -> None:
+    """The jobs a dispatch enters carry the rule as their `if`, and every other job of the workflow needs one of
+    them, so a candidate's dispatch builds and uploads nothing; a job that runs under always() reads the needed
+    job's outputs or result, which a skipped job leaves empty."""
+    for workflow, entries in REGISTRY_WORKFLOWS.items():
+        loaded = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
+        assert list(loaded[True]) == ["workflow_dispatch"], workflow
+        jobs = loaded["jobs"]
+
+        def upstream(name: str) -> set[str]:
+            needs = jobs[name].get("needs", [])
+            needs = [needs] if isinstance(needs, str) else list(needs)
+            found = set(needs)
+            for need in needs:
+                found |= upstream(need)
+            return found
+
+        for entry in entries:
+            assert jobs[entry]["if"] == CANDIDATE_IF, (workflow, entry)
+            assert jobs[entry]["steps"][0]["name"] == GUARD_STEP, (workflow, entry)
+        for name, job in jobs.items():
+            if name in entries:
+                continue
+            assert upstream(name) & set(entries), (workflow, name, "no entry job gates it")
+            condition = str(job.get("if", ""))
+            if "always()" in condition:
+                assert "needs." in condition, (workflow, name, "always() without reading its needs")
 
 
 def test_the_rule_end_to_end_the_trunk_is_next(repo: Sandbox) -> None:
