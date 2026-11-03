@@ -1373,6 +1373,7 @@ ship_notes() { # the notes file the GitHub release carries: NOTES when given, el
 
 ship_release() { # the GitHub release on the tag: a prerelease for a candidate, latest for a final; one that exists is kept
   local flags=() existing url
+  [ -n "$ship_notes_file" ] || ship_notes # --from release: the notes step ran in an earlier run, or runs now
   if is_final "$ship_version"; then flags=(--latest); else flags=(--prerelease); fi
   if existing=$("$GH" release view "$ship_tag" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null); then
     ship_say "release: done, $existing"

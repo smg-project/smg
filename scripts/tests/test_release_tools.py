@@ -2207,6 +2207,9 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
     assert (
         "not ready for publication: the first line is not '## SMG v1.14.0-rc.2'" in stopped.stderr
     )
+    # from the release step the notes of the earlier run are read, not rendered again
+    later = repo.tool("ship", "1.14.0-rc.2", "--from", "release", NOTES=str(authored)).stdout
+    assert f"notes: {authored} (NOTES)" in later and "release: created" in later
     assert (
         "unknown step 'frobnicate'"
         in repo.tool("ship", "1.14.0-rc.2", "--from", "frobnicate", check=False).stderr
