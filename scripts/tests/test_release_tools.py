@@ -1770,8 +1770,12 @@ def test_check_fails_the_registry_item_when_the_component_list_cannot_be_read(
     assert "[FAIL] registry: the crate and package list at " in done.stdout
     assert "workspace versioning" in done.stdout and "[ok]   registry" not in done.stdout
     assert repo.curl_calls() == [], "nothing is compared when the list is unknown"
-    # a candidate's plan reads no registry and no list; the final's does, and fails the same way (the bump is
-    # written by hand: the checker refuses this manifest)
+    # a candidate's plan reads neither the list nor a registry, so this manifest cannot stop it
+    candidate = repo.tool("publish-plan", "1.14.0-rc.1")
+    assert "A candidate is never published to PyPI or crates.io" in candidate.stdout
+    assert repo.curl_calls() == [], "a candidate's plan reads no registry"
+    # the final's plan reads the list, and fails the same way as the gate (the bump is written by hand: the
+    # checker refuses this manifest)
     repo.git("switch", "--quiet", "release/1.14")
     repo.put("model_gateway/Cargo.toml", versioned("smg", "1.14.0"))
     repo.git("commit", "--quiet", "-am", "chore(release): bump versions to 1.14.0")
