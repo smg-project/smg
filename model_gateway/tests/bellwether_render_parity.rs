@@ -270,20 +270,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "llama-3-1-nemotron-ultra-253b-cpt-v1/render/glaive-v2-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (1,500 of the 4,012 cases \
-         of glaive-v2-44)",
-    ),
-    (
-        "llama-3.1-nemotron-8b-ultralong-2m-instruct/render/glaive-v2-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (1,405 of the 3,975 cases \
-         of glaive-v2-57)",
-    ),
-    (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -301,13 +287,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          on 13 Oct 2026 and the job renders at SOURCE_DATE_EPOCH's 14 Oct 2026, so every case \
          of the set differs by that one line (4,046 of 4,046 cases of glaive-v2-27; a \
          recording-date class, nothing of the gateway's)",
-    ),
-    (
-        "mimo-v2.6-distill-qwen-9b/render/glaive-v2-*",
-        "a history call's arguments: the gateway hands them to the template as an object, \
-         which its tool-call branch writes as parameter tags, where the template reference, \
-         given the string as recorded, writes the JSON text inside the function tag (1,482 of \
-         the 4,144 cases of glaive-v2-19; the arguments-object class in this template's form)",
     ),
     (
         "nanollama/render/swehero-*",
@@ -359,13 +338,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "a non-ASCII character inside a history call's arguments: the gateway writes the \
          character itself, the template's JSON filter escapes it as a JSON unicode escape (a \
          backslash, u and four hex digits) (2 cases of the 5,635 of the set)",
-    ),
-    (
-        "swerankllm-small/render/tau2-gpt-4-1-mini-2025-04-14-telecom-base-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (12,357 of the 12,673 cases \
-         of the set)",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
