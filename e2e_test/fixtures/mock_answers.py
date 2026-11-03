@@ -18,10 +18,11 @@ registers the class's workers here (every wire, cached or not).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, overload
 
 import httpx
 import pytest
@@ -90,6 +91,38 @@ def _pieces(model_dir: str, text: str) -> tuple[list[int], list[str]]:
     return encoding.ids, pieces
 
 
+HARMONY_FINAL_OPEN = "<|channel|>final<|message|>"
+HARMONY_RETURN = "<|return|>"
+
+
+@overload
+def on_final_channel(output_text: str, *, closed: bool = True) -> str: ...
+
+
+@overload
+def on_final_channel(output_text: list[str], *, closed: bool = True) -> list[str]: ...
+
+
+def on_final_channel(output_text: str | list[str], *, closed: bool = True) -> str | list[str]:
+    """A plain text on a Harmony model's final channel, as the model writes
+    an answer; a text that opens with a channel marker as it is (it states its
+    channels itself). The channel is closed with the model's own end unless
+    the answer was cut short (``closed=False``: a matched stop sequence, the
+    token limit), when an engine leaves it open. Pieces keep their shape: the
+    markers are pieces of their own."""
+    pieces = [output_text] if isinstance(output_text, str) else list(output_text)
+    if pieces and pieces[0].startswith("<|"):
+        return output_text
+    wrapped = [HARMONY_FINAL_OPEN, *pieces, *([HARMONY_RETURN] if closed else [])]
+    return "".join(wrapped) if isinstance(output_text, str) else wrapped
+
+
+def _ends_on_its_own(answer: dict[str, Any]) -> bool:
+    """Whether a stated answer ends with the model's own end: not on a matched
+    stop sequence, not on the token limit."""
+    return answer.get("matched_stop") is None and answer.get("finish_reason") != "length"
+
+
 @dataclass
 class MockAnswers:
     """Enqueue answers on the class's mock worker."""
@@ -101,6 +134,13 @@ class MockAnswers:
     def active(self) -> bool:
         return self.worker is not None
 
+    @property
+    def harmony(self) -> bool:
+        """The class's model answers on the Harmony channels (a gpt-oss model:
+        the gateway picks that pipeline by the model's name), so a stated text
+        rides on the final channel unless the answer states its channels."""
+        return self.worker is not None and "gpt-oss" in self.worker.model_id.lower()
+
     def enqueue(self, output_text: str | list[str] | None = None, **answer: Any) -> None:
         """State the mock worker's next answer.
 
@@ -108,17 +148,66 @@ class MockAnswers:
         streams); the other keys are the mock's (``output_ids``,
         ``finish_reason``, ``matched_stop``, ``cached_tokens``,
         ``prompt_tokens``, ``logprobs``, ``delay_ms``, ``chunk_tokens``).
+        On a Harmony model the text rides on the final channel (the mock's
+        tokenizer turns the channel markers into the special tokens the
+        gateway's Harmony pipeline reads), closed with the model's own end
+        unless the answer ends on a ``matched_stop`` or on ``length``, when
+        the channel stays open as an engine leaves it; a text that opens with
+        a channel marker states its channels itself (``enqueue_harmony``).
         No-op on a real engine.
         """
         if self.worker is None:
             return
         if output_text is not None:
-            answer["output_text"] = output_text
+            answer["output_text"] = (
+                on_final_channel(output_text, closed=_ends_on_its_own(answer))
+                if self.harmony
+                else output_text
+            )
         response = httpx.post(
             f"{self.worker.admin_url}/admin/script/all", json=answer, timeout=10.0
         )
         response.raise_for_status()
         self.enqueued += 1
+
+    def enqueue_harmony(
+        self,
+        *,
+        final: str | None = None,
+        analysis: str | None = None,
+        tool_call: tuple[str, dict[str, Any] | str] | None = None,
+        **answer: Any,
+    ) -> None:
+        """State the mock worker's next answer on the Harmony channels.
+
+        ``analysis`` is the reasoning (the analysis channel), then either
+        ``tool_call`` (a function's name and its JSON arguments on the
+        commentary channel; the answer ends with the call) or ``final`` (the
+        final channel). Each channel after the first opens a new assistant
+        message, as the model writes them. No-op on a real engine.
+        """
+        if self.worker is None:
+            return
+        if tool_call is not None and final is not None:
+            raise ValueError(
+                "state a tool call or a final text, not both (the answer ends with the call)"
+            )
+        segments: list[str] = []
+        if analysis is not None:
+            segments.append(f"<|channel|>analysis<|message|>{analysis}<|end|>")
+        if tool_call is not None:
+            name, arguments = tool_call
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            segments.append(
+                f"<|channel|>commentary to=functions.{name} <|constrain|>json"
+                f"<|message|>{arguments}<|call|>"
+            )
+        elif final is not None:
+            segments.append(f"{HARMONY_FINAL_OPEN}{final}{HARMONY_RETURN}")
+        if not segments:
+            raise ValueError("state an analysis, a final text or a tool call")
+        self.enqueue("<|start|>assistant".join(segments), **answer)
 
     def enqueue_with_logprobs(self, output_text: str, logprob: float = -0.1, **answer: Any) -> None:
         """State the mock worker's next answer with a logprob per token.
@@ -134,6 +223,8 @@ class MockAnswers:
         """
         if self.worker is None:
             return
+        if self.harmony:
+            output_text = on_final_channel(output_text, closed=_ends_on_its_own(answer))
         ids, pieces = _pieces(get_model_spec(self.worker.model_id)["model"], output_text)
         self.enqueue(pieces, output_ids=ids, logprobs=[logprob] * len(ids), **answer)
 

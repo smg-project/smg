@@ -1307,7 +1307,7 @@ async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carrie
             input_ids: input_ids.clone(),
             original_text: String::new(),
         }),
-        mm_inputs: Some(assembled.into_proto()),
+        mm_inputs: Some(Box::new(assembled.into_proto())),
         ..Default::default()
     };
     let BackendClient::Zmq(zmq) = &client else {

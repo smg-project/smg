@@ -1,6 +1,7 @@
 """CPU-only checks for the answers a test states with a logprob per token."""
 
 import importlib
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -150,3 +151,103 @@ def test_an_answer_with_logprobs_is_a_no_op_without_a_mock_worker(monkeypatch):
     answers.enqueue_with_logprobs("Paris.")
 
     assert answers.enqueued == 0
+
+
+def _harmony_worker():
+    return Worker(
+        model_id="openai/gpt-oss-20b", engine="mock", port=100, gpu_ids=[], admin_port=200
+    )
+
+
+def test_a_plain_answer_rides_on_the_final_channel_of_a_harmony_model(monkeypatch):
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    answers = MockAnswers(worker=_harmony_worker())
+    assert answers.harmony
+
+    answers.enqueue("Paris.")
+    answers.enqueue(["Pa", "ris."])
+    # An answer that states its channels is left as it is.
+    answers.enqueue("<|channel|>final<|message|>Rome.<|return|>")
+    # An answer cut short (a matched stop sequence, the token limit) leaves
+    # the channel open, as an engine does.
+    answers.enqueue("1,", finish_reason="stop", matched_stop=",")
+    answers.enqueue(["1, 2,", " 3"], finish_reason="length")
+    assert [a["output_text"] for a in posted] == [
+        "<|channel|>final<|message|>Paris.<|return|>",
+        ["<|channel|>final<|message|>", "Pa", "ris.", "<|return|>"],
+        "<|channel|>final<|message|>Rome.<|return|>",
+        "<|channel|>final<|message|>1,",
+        ["<|channel|>final<|message|>", "1, 2,", " 3"],
+    ]
+    assert answers.enqueued == 5
+
+    # A model that is not a Harmony one takes the text as stated.
+    plain = MockAnswers(
+        worker=Worker(model_id="twin", engine="mock", port=101, gpu_ids=[], admin_port=201)
+    )
+    assert not plain.harmony
+    plain.enqueue("Paris.")
+    assert posted[-1]["output_text"] == "Paris."
+
+
+def test_a_logprob_answer_cut_short_leaves_the_harmony_channel_open(monkeypatch):
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    def pieces_by_marker(model, text):
+        # The channel markers as whole pieces, the text between them as one
+        # piece each: the shape the model's tokenizer gives, without its files.
+        pieces = [p for p in re.split(r"(<\|[a-z_]+\|>)", text) if p]
+        return list(range(len(pieces))), pieces
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": "unused"})
+    monkeypatch.setattr(answers_module, "_pieces", pieces_by_marker)
+    answers = MockAnswers(worker=_harmony_worker())
+
+    answers.enqueue_with_logprobs("1, 2, 3.")
+    answers.enqueue_with_logprobs("1,", finish_reason="stop", matched_stop=",")
+    answers.enqueue_with_logprobs("1, 2,", finish_reason="length")
+    assert ["".join(a["output_text"]) for a in posted] == [
+        "<|channel|>final<|message|>1, 2, 3.<|return|>",
+        "<|channel|>final<|message|>1,",
+        "<|channel|>final<|message|>1, 2,",
+    ]
+    assert all(len(a["logprobs"]) == len(a["output_ids"]) == len(a["output_text"]) for a in posted)
+    assert answers.enqueued == 3
+
+
+def test_the_harmony_channels_are_stated_as_the_model_writes_them(monkeypatch):
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    answers = MockAnswers(worker=_harmony_worker())
+
+    answers.enqueue_harmony(analysis="Think.", final="144")
+    answers.enqueue_harmony(tool_call=("get_weather", {"location": "Seattle"}))
+    answers.enqueue_harmony(analysis="A call.", tool_call=("calculate", '{"expression": "1+1"}'))
+    assert [a["output_text"] for a in posted] == [
+        "<|channel|>analysis<|message|>Think.<|end|>"
+        "<|start|>assistant<|channel|>final<|message|>144<|return|>",
+        '<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{"location": "Seattle"}<|call|>',
+        "<|channel|>analysis<|message|>A call.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.calculate <|constrain|>json"
+        '<|message|>{"expression": "1+1"}<|call|>',
+    ]
+    with pytest.raises(ValueError, match="state an analysis"):
+        answers.enqueue_harmony()
+    with pytest.raises(ValueError, match="not both"):
+        answers.enqueue_harmony(tool_call=("calculate", {}), final="4")

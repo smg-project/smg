@@ -22,6 +22,10 @@ class _SamplingParamsBase:
     echoing them back; whether they reached the worker is the engine rows' verdict.
     """
 
+    # The budget of the one-word answer. A reasoning model's class raises it: the analysis
+    # channel comes before the word, and a turn the budget cuts reads incomplete.
+    one_word_budget = 16
+
     def test_all_sampling_params_accepted(self, model, api_client, mock_answers):
         """Non-default sampling params produce a valid response with correct echo-back."""
         mock_answers.enqueue("2 + 2 = 4.")
@@ -62,7 +66,7 @@ class _SamplingParamsBase:
             "model": model,
             "input": "What is the capital of France? Answer in one word.",
             "temperature": 0,
-            "max_output_tokens": 16,
+            "max_output_tokens": self.one_word_budget,
         }
         resp1 = api_client.responses.create(**kwargs)
         resp2 = api_client.responses.create(**kwargs)
@@ -114,11 +118,13 @@ class TestSamplingParamsLocal(_SamplingParamsBase):
     """Regular model (Qwen via SGLang)."""
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSamplingParamsHarmony(_SamplingParamsBase):
     """Harmony model (gpt-oss-20b via all gRPC backends)."""
+
+    one_word_budget = 256
