@@ -1062,7 +1062,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
         return MultimodalProcessorOutput(
             mm_items=mm_items,
-            im_token_id=im_token_id if im_token_id is not None else video_token_id,
+            im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
             video_token_id=video_token_id,
         )
 
