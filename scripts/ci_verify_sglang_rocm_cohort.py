@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import sysconfig
+import traceback
 from email.parser import Parser
 from pathlib import Path
 
@@ -84,6 +85,15 @@ def verify_record(root, folder, consoles=()):
     return names
 
 
+def verify_builtin_dlpack(core, torch, api):
+    require(core._lib is None,
+            "ERROR: DLPack extension loaded its own library: %r" % core._lib)
+    require(core.load_torch_c_dlpack_extension() is None,
+            "ERROR: DLPack extension loaded a replacement builtin API")
+    require(torch.Tensor.__dlpack_c_exchange_api__ is api,
+            "ERROR: DLPack extension replaced the Torch builtin C API")
+
+
 def verify(report):
     require(sys.prefix == "/opt/venv", "Expected fixed-image interpreter")
     require(os.environ.get("SMG_SGLANG_ROCM_IMAGE", IMAGE) == IMAGE, "Unsupported SGLang image")
@@ -91,8 +101,14 @@ def verify(report):
     require(not CONSTRAINT.is_symlink() and digest(CONSTRAINT) == CONSTRAINT_SHA, "Torch constraint changed")
     versions = {name: md.version(name) for name in (
         "sglang", "torch", "apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext")}
-    require(versions == {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
-        "apache-tvm-ffi": "0.1.12", "tilelang": "0.1.15", "torch-c-dlpack-ext": "0.1.5"}, "Native cohort version changed")
+    expected = {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
+        "apache-tvm-ffi": "0.1.12", "tilelang": "0.1.15", "torch-c-dlpack-ext": "0.1.5"}
+    native_names = ("apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext")
+    require(versions == expected,
+            "ERROR: native dependency versions (TVM, TileLang, DLPack): observed=%r expected=%r; "
+            "full cohort observed=%r expected=%r" % (
+                tuple(versions[name] for name in native_names),
+                tuple(expected[name] for name in native_names), versions, expected))
     root = Path(sysconfig.get_path("purelib")).resolve()
     require(root.is_relative_to(Path("/opt/venv")), "Unexpected site-packages")
     installed, record_names = {}, set()
@@ -152,8 +168,7 @@ def verify(report):
         require(Path(modules[name].__file__).resolve() == root / relative, "Unexpected native module origin: " + name)
     require(Path(importlib.util.find_spec("build_backend").origin).resolve() == root / "build_backend.py", "Unexpected extension build-backend origin")
     core = modules["torch_c_dlpack_ext.core"]
-    require(core._lib is None and core.load_torch_c_dlpack_extension() is None
-            and torch.Tensor.__dlpack_c_exchange_api__ is api, "Extension replaced the builtin API")
+    verify_builtin_dlpack(core, torch, api)
     require(not any("torch_c_dlpack" in line or "libtorch_c_dlpack_addon" in line
                     for line in Path("/proc/self/maps").read_text().splitlines()), "Addon library mapped")
     source = torch.arange(12, device="cpu").reshape(3, 4)[:, ::2]
@@ -182,6 +197,7 @@ def main():
         report["verified"] = True
     except Exception as exc:
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        traceback.print_exc(file=sys.stderr)
     text = json.dumps(report, indent=2) + "\n"
     if args.output:
         Path(args.output).write_text(text)

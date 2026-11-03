@@ -110,7 +110,10 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
   output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
-  quoted in a tool result move nothing). The legacy reasoning parser for this checkpoint starts
+  quoted in a tool result move nothing). A prompt that is the thought's markers with no opener
+  before them is such a prompt too: the corpus replay feeds the turn opener before the template's
+  tail for this reason (the tail alone read a thinking-off turn's text as reasoning; the gateway
+  replays the whole prompt and never meets it). The legacy reasoning parser for this checkpoint starts
   inside the thought whenever the request leaves thinking on, whatever the prompt; the two agree
   on this shape. The V4.1 template opens the turn after a mid-conversation system message too, so
   its table meets no unopened turn. The table is pinned against the turns the
@@ -147,10 +150,11 @@ Beyond that:
   `</think>` in chat mode), the tails the table anchors the turn at, so the output starts inside
   the thought, or in the content, as the tail says.
 - **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
-  content under this table and this block is content under theirs; the registry reads V3.2 and
-  V3.2-Speciale here, V3.2-Exp (it writes the earlier V3.1 spelling) with `deepseek_v3.1`, and
-  the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the
-  older parser to this table.
+  content under this table and this block is content under theirs; the registry reads V3.2,
+  V3.2-Speciale and V3.2-Exp here (the Exp checkpoint's own template writes the earlier V3.1
+  spelling, but the engine renders its architecture through the V3.2 encoder, and bellwether
+  records it so), the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment
+  that names the older parser to this table.
 - **A string value that holds a closing tag is two parameters.** DSML writes a string raw, so a
   value holding `</｜DSML｜parameter>` and another parameter's opening tag reads as two parameters,
   to the encoder's own parser (it splits at the first closing tag) and to this table alike; the
@@ -190,9 +194,9 @@ What the table says beyond the DSML ones:
   `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
 - **The recorded set holds no call.** The template concatenates a call's arguments as a string,
   and bellwether's corpus holds them as an object, so the recorder refused every call case of
-  `deepseek-v3.1` (and of `deepseek-v3.2-exp`, the same spelling): the content sets replay; the
-  calls stand on the turns the template renders with string arguments, held in the module's tests
-  at every cut, as the V4 table stands on its encoder's turns.
+  `deepseek-v3.1`: the content sets replay; the calls stand on the turns the template renders
+  with string arguments, held in the module's tests at every cut, as the V4 table stands on its
+  encoder's turns.
 
 - **A forced call's tag is the block around the calls the table reads.** `Format::grammar` writes
   the block's ways in (`<｜tool▁calls▁begin｜>` from the turn's own state, or `</think>` first from

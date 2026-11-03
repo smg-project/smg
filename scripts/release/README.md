@@ -5,28 +5,38 @@ never pauses for it. Nothing publishes by itself: a push to a release branch run
 artifacts come from the release workflows a maintainer dispatches against the release tag.
 
 The tooling is `scripts/release/release.sh`, reached through `make` (run the targets from a
-checkout that has this directory, `main` for instance; `cut`, `bump` and `pick` leave you on the
-branch they created):
+checkout that has this directory, `main` for instance; `cut` leaves you where you were with the
+release branch behind you, `bump` and `pick` leave you on the topic branch they created):
 
 | step | command | what it does | who |
 |---|---|---|---|
-| cut | `make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1]` | creates `release/1.14` from `FROM` (default `origin/main`), commits the version bump to `1.14.0-rc.1` on it, prints the push command | a maintainer with push rights to `release/**` |
+| plan | `make release-plan [TAG=v1.13.0] [VERSION=1.14.0-rc.1]` | before a cut: the versions the cut's bump writes against the previous final, quietly, nothing changed: the crates and packages by their conventional commits, the gateway and its mirrors to `VERSION` (default: the first candidate of `main`'s development version, `1.14.0-rc.1` when `main` reads `1.14.0-dev`). On `main` every crate changed since the last release reads as unbumped by design: the cut bumps them, so `make check-versions` there lists them all as issues | anyone |
+| cut | `make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1]` | creates `release/1.14` from `FROM` (default `origin/main`), commits the version bump to `1.14.0-rc.1` on it, prints the push command; then the pull request that moves `main` above the branch, to `1.15.0-dev` (pushed and opened with `PUSH=1`, printed otherwise); before anything is made, the cut checks that the move's topic is free on the remote and, with `PUSH=1`, that `gh` is there and no open pull request carries it | a maintainer with push rights to `release/**` |
 | gate | `make release-check VERSION=1.14.0-rc.1` | the release gate: what the repository can read (the versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) | the release owner |
-| pick | `make release-pick RELEASE=1.14 SHA=<sha>[,<sha>]` | `git cherry-pick -x -s` of commits of `main` onto a topic branch off `release/1.14`, pushed, with its pull request against the release branch; a conflict stops with the resolution steps, `make release-pick-pr RELEASE=1.14` finishes it | anyone with push rights; the pull request merges like any other |
+| pick | `make release-pick RELEASE=1.14 SHA=<sha>[,<sha>]` | `git cherry-pick -x -s` of commits of `main` onto a topic branch off `release/1.14`, pushed, with its pull request against the release branch; a conflict stops with the resolution steps, `make release-pick-pr RELEASE=1.14 PICK=pick/1.14-<sha>` finishes it from `main` (the pick branch may lack these targets) | anyone with push rights; the pull request merges like any other |
 | status | `make release-status RELEASE=1.14` | what is on `main` and not on the branch (same patch or picked with `-x` excluded), the branch's own commits, its tags, the open pull requests against it | anyone |
 | candidate or final | `make release-bump VERSION=1.14.0-rc.2` (or `VERSION=1.14.0`) | the version bump on a topic branch off `release/1.14` and its pull request against the release branch; the body carries the release gate | the release owner |
 | tag | `make release-tag VERSION=1.14.0-rc.1 [PUSH=1]` | checks the versions at the branch head against the previous tag, creates the annotated tag `v1.14.0-rc.1` with a `Signed-off-by` line, prints the push command | a maintainer with tag rights (the tag ruleset) |
 | publish | `make release-publish-plan VERSION=1.14.0-rc.1` | prints the workflow dispatches to run against the tag and the artifact names they produce; runs nothing | the release owner dispatches them |
 | notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes skeleton: the merged pull requests since the previous final, by type, and the Docker image list; prints the `gh release create` line | the release owner |
-| main follows | `make release-bump-main VERSION=1.14.0` | after a final: a pull request that moves `main`'s version files to the release's | the release owner |
+| main follows | `make release-bump-main VERSION=1.14.0` | after a final: a pull request that moves `main`'s crates and packages to at least the release's; the gateway keeps its development version (it moves to the next one only when `main` still reads below the release) | the release owner |
 
-`PUSH=1` is needed to push a release branch (`cut`) or a tag (`tag`); `PUSH=0` keeps a topic
-branch local (`bump`, `pick`, `bump-main` otherwise push it and open the pull request with `gh`).
-Every commit, pick and tag carries the caller's git identity and sign-off.
+`PUSH=1` is needed to push a release branch (`cut`, with the pull request that moves `main`) or a
+tag (`tag`); `PUSH=0` keeps a topic branch local (`bump`, `pick`, `bump-main` otherwise push it and
+open the pull request with `gh`).
+Every commit, pick and tag carries the caller's git identity and sign-off. Before the cut is
+pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read the local
+`release/<x.y>` and say so, which rehearses a release end to end on a clone; `bump`, `pick`,
+`pick-pr`, `tag` and `bump-main` (before the tag) need the branch on `origin`.
 
 ## Versions
 
-- A version is `X.Y.Z` or `X.Y.Z-rc.N`; its release branch is `release/X.Y`.
+- A version is `X.Y.Z` or `X.Y.Z-rc.N`; its release branch is `release/X.Y`. Between cuts `main`
+  reads `X.Y.Z-dev`, the next development version (the trunk is next): above every release
+  before it, below the `X.Y.Z` line it leads. Cargo and Helm read it as a semver pre-release,
+  Python tooling as `X.Y.Z.dev0` (as it reads `1.14.0-rc.1` as `1.14.0rc1`), so `smg --version`,
+  the nightly wheels (`X.Y.Z.devYYYYMMDD`) and every build of `main` identify above the release
+  branch they are a superset of.
 - Every version file carries the one string as written: `model_gateway/Cargo.toml`, the two
   binding manifests, `bindings/python/pyproject.toml`, `bindings/python/src/smg/version.py`,
   `deploy/helm/smg/Chart.yaml` and the `SMG_RELEASE_TAG` line of the engine-image workflow.
@@ -40,35 +50,48 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
   version (the previous release's, on its own branch: no release tag is reachable from `main`
   under this process, and the checker diffs `tag..HEAD`, so none has to be), else the newest
   tag reachable from the branch (a release made before this process). Two live release lines
-  share the crate versions, in both directions: a patch of the older line, bumped against that
-  line's own tag, can land on a version the newer line's candidate or final already published;
-  a crate bumped by a patch of the older line after the newer line was cut reads as bumped
-  already against that patch's tag (the checker treats any difference from the tag's version as
-  a bump), and a bump computed against the newer line's own final can land on the version the
-  patch published. Until the bump starts above the highest version any release tag carries, the
-  release owner checks every crate a bump moves against the registry before the tag while two
-  lines are live.
-- `main` keeps the last final release's versions. After a final, `make release-bump-main` opens
-  the pull request that moves them: the gateway and its mirrors to the release's version, every
-  other crate or package to the release's version where that is higher than main's (crates.io
-  and PyPI never take a version twice, so the next cut starts above what was published). The
-  nightly and dev builds derive their versions from main's plain `X.Y.Z`, which is why main
-  carries no suffix. A cut from a `main` that reads below the previous final's version is refused:
-  merge that pull request first, or cut from a commit after it. `main` never goes back: after a
-  patch of an older line (v1.14.1 once v1.15.0 is out), `make release-bump-main` keeps the
-  gateway's higher version and moves only the crates and packages the patch raised.
+  share the crate versions, so the checker reads every release tag, not the comparison tag
+  alone: a crate whose version a release tag carries with other code is unbumped (the
+  comparison tag's version with changes since it; a version another line published, above or
+  below it, that `release-bump-main` moved to `main` or that a cut found there), and a
+  proposed version a release tag carries steps to the next free patch (crates.io and PyPI take
+  a version once). A version a tag carries with this very code needs nothing. A version
+  published without a release tag is not seen by the tags: `make release-check` reads crates.io
+  and PyPI for every crate and package at the branch head and fails on a version they hold
+  already with changes after it (the commits since the registry's own publish time of that
+  version, or since its bump when the registry gives none; crates.io is read through the sparse
+  index cargo reads, one component at a time), and `make release-publish-plan` marks such versions
+  (`REGISTRY=0` skips the reads).
+- `main` moves the moment a release branch is cut: `make release-cut VERSION=1.14.0-rc.1` opens
+  the pull request that moves the gateway and its mirrors to `1.15.0-dev` and every crate and
+  package to at least the version the cut gave the branch (the same numbers, so the next cut's
+  bump computes from what the registries will hold; crates.io and PyPI never see `main`'s
+  versions, since `main`'s artifacts are not published). After a final, `make release-bump-main`
+  opens the pull request that moves the crates and packages the release raised since the cut
+  (its candidates' and final's bumps) to at least the release's; the gateway keeps its
+  development version, and moves to the one after the release (`1.15.0-dev` for v1.14.0) only
+  when `main` still reads below it (a line cut before this rule, a move not merged). The nightly
+  and dev-wheel builds read a `-dev` version as the number to build (`1.15.0.devYYYYMMDD`) and a
+  plain `X.Y.Z` as the patch above it. A cut from a `main` that reads below the previous final's
+  version is refused: merge the pull request that moves `main` first, or cut from a commit after
+  it. `main` never goes back: after a patch of an older line (v1.14.1 once `main` reads
+  `1.16.0-dev`), `make release-bump-main` keeps the gateway's version and moves only the crates
+  and packages the patch raised.
 
 ## What publishes, and when
 
-Nothing, on its own. The `release-pypi`, `release-helm`, `release-crates`, `release-grpc` and
-`release-engine-docker` workflows run on `workflow_dispatch` only; `release-docker` builds the
-image on a push to `main` or `release/**` that touches the Dockerfile and pushes it on a
-dispatch only. The release owner dispatches each against the tag once the gate is green;
-`make release-publish-plan VERSION=<x.y.z>` prints the exact commands and the artifact names
-(the gateway image's `latest` moves only for a final; a crate publishes when its exact version
-is not on crates.io yet; a PyPI version that is complete, wheel and sdist, is skipped, and
-`-f packages=proto|servicer|both` on `release-grpc` names a package outright for a retry). The nightly prerelease and the
-CI images are unchanged by this process.
+Nothing, on its own. The `release-pypi`, `release-helm`, `release-crates`, `release-grpc`,
+`release-go` (the Go module tag `crates/grpc_client/go/v<version>`) and `release-engine-docker`
+workflows run on `workflow_dispatch` only; `release-grpc` and `release-go` also refuse a dispatch
+whose ref is not a tag (`release-go`: not the version's tag), since a branch can move between a
+dispatch and its retry; `release-docker` builds the image on a push to `main` or `release/**`
+that touches the Dockerfile and pushes it on a dispatch only. The release owner dispatches each
+against the tag once the gate is green; `make release-publish-plan VERSION=<x.y.z>` prints the
+exact commands and the artifact names (the gateway image's `latest` moves only for a final; a
+crate publishes when its exact version is not on crates.io yet; a PyPI version that is complete,
+wheel and sdist, is skipped, and `-f packages=proto|servicer|both` on `release-grpc` names a
+package outright for a retry). The nightly prerelease and the CI images are unchanged by this
+process.
 
 ## The gate
 
@@ -79,16 +102,23 @@ A candidate or a final is tagged when, on the branch head:
    `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
    `gh workflow run pr-test-rust.yml --ref release/<x.y>`);
 2. the versions are consistent (`make release-check` reads them; `make release-tag` refuses
-   otherwise);
+   otherwise), and no crate or package sits at a version crates.io or PyPI hold already with
+   changes after it (`make release-check` reads the registries; such a version is skipped by
+   its publish dispatch and the release would ship none of those changes: a bump pull request
+   against the release branch moves it);
 3. the four model-provider verifiers (DeepSeek, GLM, Kimi, MiniMax) ran against the candidate
    build: the release owner records one link each. `make release-check` prints the four lines
    to fill; the final's bump pull request carries them in its "Release gate" section.
 
 ## The steps of a release
 
-1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, locally.
-   Read the commit, then `git push origin refs/heads/release/1.14:refs/heads/release/1.14`
-   (or `PUSH=1`). CI runs on the branch; nothing is published. `main` is not touched.
+1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, and the
+   topic branch `chore/main-versions-1.15.0-dev` that moves `main` above it, both locally; you
+   stay on the branch you ran it from. Read the commits (`git show --stat refs/heads/release/1.14`,
+   `git show --stat refs/heads/chore/main-versions-1.15.0-dev`), then
+   `git push origin refs/heads/release/1.14:refs/heads/release/1.14` and the printed push and
+   `gh pr create` lines of the topic (or `PUSH=1` for all of it). CI runs on the branch; nothing
+   is published. `main` moves by its pull request alone.
 2. `make release-check VERSION=1.14.0-rc.1`, then `make release-tag VERSION=1.14.0-rc.1` and
    its push (`PUSH=1`, by a maintainer with tag rights).
 3. `make release-publish-plan VERSION=1.14.0-rc.1` lists the dispatches for the candidate's
@@ -101,7 +131,8 @@ A candidate or a final is tagged when, on the branch head:
 6. The final: `make release-bump VERSION=1.14.0` (its pull request body carries the gate with
    the four verifier records), merge, `make release-tag VERSION=1.14.0`, the dispatches of
    `make release-publish-plan VERSION=1.14.0`, `make release-notes VERSION=1.14.0`.
-7. `make release-bump-main VERSION=1.14.0`: the pull request that moves `main`'s versions.
+7. `make release-bump-main VERSION=1.14.0`: the pull request that moves `main`'s crates and
+   packages to at least the release's (the gateway keeps `1.15.0-dev`).
 8. A patch release later: `make release-bump VERSION=1.14.1` on the same branch, picks, step 2
    onwards; a candidate first (`1.14.1-rc.1`) when it needs one.
 
@@ -123,10 +154,13 @@ A candidate or a final is tagged when, on the branch head:
   (named by its sha, holding its subject), one commit the squash keeps, and `status`, `check`
   and `notes` read the branch's picks from them (the notes name the originals under their
   types). Files of different names never conflict, so several pick pull requests can be open
-  against one branch. The directory is the release branch's; `bump-main` moves version files only.
+  against one branch. The directory is the release branch's; the cut's main-move pull request and
+  `bump-main` move version files only.
 - A pick conflicts: the tool leaves you on the pick branch and prints the three steps
-  (`git add`, `git cherry-pick --continue`, `make release-pick-pr RELEASE=<x.y>`);
-  `git cherry-pick --abort` gives it up.
+  (`git add`, `git cherry-pick --continue`, then from `main`
+  `make release-pick-pr RELEASE=<x.y> PICK=<pick branch>`, which checks the branch out itself: a
+  line cut before a change to these targets does not carry them); `git cherry-pick --abort`
+  gives it up.
 - A candidate is bad: the next candidate is a bump pull request after the fixes are picked;
   tags are never moved.
 - A dispatched workflow fails: dispatch it again against the same tag; every publish step skips

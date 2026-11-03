@@ -10,6 +10,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use openai_protocol::profile::ProviderProfile;
 use tracing::{debug, error, warn};
 
 use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
@@ -345,13 +346,14 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
+        provider: Option<ProviderProfile>,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new(prep, &input.request_type)
+            ContextRequirements::new_for(prep, &input.request_type, provider)
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
@@ -489,6 +491,7 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
+            ctx.state.provider,
         );
         ctx.state.sticky_key = self
             .policy_registry

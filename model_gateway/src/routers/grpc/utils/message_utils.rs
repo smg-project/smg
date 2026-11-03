@@ -275,7 +275,9 @@ pub fn template_tools<'a>(
 /// from the registries before the template renders, as the preparation
 /// stages resolve it: nothing is fetched or preprocessed here.
 pub(crate) struct ResolvedMedia {
-    /// Where the model's template wants media parts relative to text.
+    /// Where the model's template wants media parts relative to text; the
+    /// default (`MediaFirst`) for a request without media, which no renderer
+    /// acts on: with no media part there is nothing to place.
     pub(crate) media_order: MediaPartOrder,
     /// The request's media and the placeholders the template writes for it,
     /// when the request carries media.
@@ -328,9 +330,10 @@ pub(crate) async fn resolve_messages_media(
 }
 
 /// Resolve what a chat-like request's media needs before the template
-/// renders: the model's media-part order and, for a request with media, the
+/// renders: for a request with media, the model's media-part order and the
 /// plan `plan` builds from the request and the placeholder tokens (the
-/// engine's own limits applied). A renderer that writes media as template
+/// engine's own limits applied); a request without media returns before the
+/// registries are read, with the default order and no plan. A renderer that writes media as template
 /// text has no plan and keeps the authored order, its request's media
 /// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
@@ -369,6 +372,23 @@ pub(crate) async fn resolve_media(
             media: None,
         });
     }
+    let plan = plan();
+    if record_media {
+        record(&plan);
+    }
+    // No images or video to a pool whose every worker is language model only (the engine admits
+    // such a request and never schedules it), and no modality to a pool whose engines take none of
+    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
+    // on the declared parts, before any byte of media is fetched, decoded or sent.
+    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    if plan.is_empty() {
+        // A request without media renders the same under either order (its text parts in
+        // their own order): the registries are not asked for a model with nothing to place.
+        return Ok(ResolvedMedia {
+            media_order: MediaPartOrder::MediaFirst,
+            media: None,
+        });
+    }
     // The tokenizer's registry entry (its id and source) is read for the
     // media paths alone, which need the multimodal components; a gateway
     // without them looks nothing up.
@@ -394,21 +414,6 @@ pub(crate) async fn resolve_media(
         _ => MediaPartOrder::MediaFirst,
     };
 
-    let plan = plan();
-    if record_media {
-        record(&plan);
-    }
-    // No images or video to a pool whose every worker is language model only (the engine admits
-    // such a request and never schedules it), and no modality to a pool whose engines take none of
-    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
-    // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
-    if plan.is_empty() {
-        return Ok(ResolvedMedia {
-            media_order,
-            media: None,
-        });
-    }
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -1192,6 +1197,46 @@ mod tests {
         };
         assert_eq!(string(MediaPartOrder::MediaFirst), "<image>\nquestion");
         assert_eq!(string(MediaPartOrder::Authored), "question\n<image>");
+    }
+
+    /// The early return in `resolve_media` (an empty plan: no registry is read
+    /// for the order) serves this renderer too: a user turn of text and
+    /// document blocks carries no media part, so both orders render it the
+    /// same under both content formats, as the chat renderer's twin test pins
+    /// for a content array without media.
+    #[test]
+    fn blocks_without_media_render_the_same_under_either_order() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Text(TextBlock {
+                    text: "question".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+                InputContentBlock::Document(messages::DocumentBlock {
+                    source: messages::DocumentSource::Text {
+                        data: "the notes".to_string(),
+                    },
+                    cache_control: None,
+                    title: Some("notes".to_string()),
+                    context: None,
+                    citations: None,
+                }),
+            ]),
+        }];
+        for format in [
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ] {
+            let media_first =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            let authored =
+                process_message_content_format(&messages, format, None, MediaPartOrder::Authored)
+                    .unwrap();
+            assert_eq!(media_first, authored, "{format:?}");
+        }
     }
 
     /// The Messages path renders a user turn's blocks where the request put
