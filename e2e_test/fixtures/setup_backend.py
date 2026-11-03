@@ -42,9 +42,14 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import vllm_kv_backend
+from infra.constants import (
+    ENV_STARTUP_PROFILE,
+    get_startup_profile,
+    startup_profile_definition,
+    vllm_kv_backend,
+)
 from infra.model_specs import get_model_spec
-from infra.worker import stop_workers
+from infra.worker import stop_workers, validate_startup_profile_worker, worker_startup_timeout
 from infra.worker_pool import get_pool
 
 from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
@@ -117,6 +122,8 @@ def _start_workers_tracked(**kwargs) -> list:
     owns teardown of those.
     """
     engine = kwargs.get("engine") or get_runtime()
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        validate_startup_profile_worker(**kwargs)
     try:
         return get_pool().acquire(**kwargs)
     except (TimeoutError, RuntimeError):
@@ -151,8 +158,29 @@ def _gateway_readiness_timeout(
     their model load happens *inside* the gateway's readiness gate, so that gate
     must cover model load too. Use the model's ``startup_timeout`` (what the
     worker gate would have applied), never shrinking an explicitly larger
-    gateway timeout.
+    gateway timeout. An explicit startup profile instead pins its model-load
+    bound and rejects a larger gateway timeout; non-ZMQ profiles retain their
+    separate short gateway wait.
     """
+    profile = get_startup_profile()
+    if profile is not None:
+        definition = startup_profile_definition()
+        if connection_mode not in definition.modes:
+            raise ValueError(f"{profile} does not permit gateway wire {connection_mode!r}")
+        if connection_mode == ConnectionMode.ZMQ:
+            model_contract = definition.models.get(model_id)
+            if model_contract is None:
+                raise ValueError(f"{profile} has no frozen startup contract for {model_id!r}")
+            bound = model_contract[0]
+        else:
+            bound = definition.max_floor
+        if base_timeout > bound:
+            raise ValueError(
+                f"{profile} gateway timeout {base_timeout!r} exceeds frozen wait {bound}"
+            )
+        if connection_mode == ConnectionMode.ZMQ:
+            return worker_startup_timeout(model_id)
+        return effective_startup_timeout(base_timeout)
     if connection_mode != ConnectionMode.ZMQ:
         return effective_startup_timeout(base_timeout)
     startup_timeout = effective_startup_timeout(
@@ -306,6 +334,8 @@ def setup_backend(request: pytest.FixtureRequest):
         connection_mode = mode_override
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
+    if get_startup_profile() is not None:
+        _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
     if is_pd and pool_counts is not None:
@@ -485,6 +515,12 @@ def _setup_local(
     num_workers = workers_config.get("count") or 1
     logger.info("Starting %s backend: model=%s, workers=%d", backend_name, model_id, num_workers)
 
+    # ZMQ loads inside gateway readiness. Check the bound before acquiring
+    # uncached workers so a rejection cannot strand them outside teardown.
+    gateway_config = {
+        **gateway_config,
+        "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
+    }
     workers = _start_workers_tracked(
         model_id=model_id,
         engine=engine,
@@ -499,12 +535,6 @@ def _setup_local(
     # caller owns their teardown (like the PD path). gRPC/HTTP workers stay
     # in the pool and outlive the gateway.
     is_zmq = connection_mode == ConnectionMode.ZMQ
-    # ZMQ engines load the model inside the gateway's readiness gate (the worker
-    # spawn returned immediately), so that gate must cover model load.
-    gateway_config = {
-        **gateway_config,
-        "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
-    }
     # The class's workers, cached or not, for the answers a test states on
     # the mock engine.
     set_class_workers(workers)
@@ -922,6 +952,7 @@ def backend_router(request: pytest.FixtureRequest):
         connection_mode = mode_override
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
+    gateway_timeout = _gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT)
     model_path = get_model_spec(model_id)["model"]
     is_zmq = connection_mode == ConnectionMode.ZMQ
 
@@ -942,7 +973,7 @@ def backend_router(request: pytest.FixtureRequest):
             model_path=model_path,
             backend=engine if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
-            timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
+            timeout=gateway_timeout,
         )
         yield gateway
     finally:

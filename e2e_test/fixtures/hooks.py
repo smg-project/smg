@@ -23,6 +23,7 @@ from infra import (
     get_servicer_impl,
     get_zmq_engine_count,
 )
+from infra.constants import get_startup_profile, validate_startup_profile_selection
 from infra.worker_pool import get_pool
 
 from .markers import model_id_for_engine, resolve_class_marker
@@ -62,7 +63,10 @@ def pytest_runtest_makereport(item: pytest.Item, call):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom markers."""
+    """Register custom markers and validate an opt-in startup selection."""
+    validate_startup_profile_selection(config)
+    if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+        get_startup_profile()
     config.addinivalue_line(
         "markers",
         "engine(*names): engines this test runs on (sglang, vllm, trtllm)",
@@ -491,6 +495,12 @@ class _SelectionReporter:
     def __init__(self) -> None:
         self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
         self.passing_calls = 0
+
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+            validate_startup_profile_selection(session.config, session.items)
+            get_startup_profile()
+            _enforce_selection_floor(len(session.items))
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.when == "call" and report.passed:
