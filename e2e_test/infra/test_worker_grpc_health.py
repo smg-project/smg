@@ -156,9 +156,10 @@ def test_a_refused_connection_is_not_yet():
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang", "tokenspeed", "trtllm"])
-def test_an_http2_server_answering_404_is_not_the_worker(engine):
+def test_an_http2_server_answering_404_is_not_the_worker(engine, monkeypatch):
     """The stranger of the nightly: grpc reads its 404 as UNIMPLEMENTED and
     offers a ready channel to it; neither makes it this worker."""
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: {"model": _TRT_MODEL})
     with http2_404_listener() as port:
         assert _worker(port, engine).grpc_serving() is False
 
@@ -168,13 +169,15 @@ def test_a_grpc_server_without_the_health_service_is_not_the_worker():
         assert _worker(port).grpc_serving() is False
 
 
-def test_trt_does_not_accept_an_empty_grpc_server():
+def test_trt_does_not_accept_an_empty_grpc_server(monkeypatch):
     """A ready channel without native TRT RPCs cannot identify this worker."""
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: {"model": _TRT_MODEL})
     with grpc_listener(None) as port:
         assert _worker(port, engine="trtllm").grpc_serving() is False
 
 
-def test_trt_does_not_accept_a_standard_health_only_server():
+def test_trt_does_not_accept_a_standard_health_only_server(monkeypatch):
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: {"model": _TRT_MODEL})
     with grpc_listener("SERVING") as port:
         assert _worker(port, engine="trtllm").grpc_serving() is False
 
@@ -278,12 +281,29 @@ def test_trt_requires_a_successful_native_model_info_rpc(trt_model, error):
         assert calls == ["HealthCheck", "GetModelInfo"]
 
 
-def test_trt_two_real_rpcs_share_one_probe_budget(trt_model):
+def test_trt_two_real_rpcs_share_one_probe_budget(trt_model, monkeypatch):
+    import grpc
+
     # Each reply fits a fresh 0.18s timeout, but the pair does not fit the
     # one probe deadline. A per-RPC timeout reset would incorrectly pass.
     with trt_listener(health_delay=0.12, info_delay=0.12) as (port, calls):
-        assert _trt_worker(port).grpc_serving(timeout=0.18) is False
-        assert calls[0] == "HealthCheck"
+        target = host_port(DEFAULT_HOST, port)
+        with grpc.insecure_channel(target) as channel:
+            # Establish transport before measuring the RPC budget. The worker
+            # must use this exact channel, not a second cold connection.
+            grpc.channel_ready_future(channel).result(timeout=5.0)
+            channels = []
+
+            def create_channel(actual_target):
+                assert actual_target == target
+                channels.append(channel)
+                return channel
+
+            monkeypatch.setattr(grpc, "insecure_channel", create_channel)
+            assert _trt_worker(port).grpc_serving(timeout=0.18) is False
+            assert calls == ["HealthCheck", "GetModelInfo"]
+            assert calls[0] == "HealthCheck"
+            assert channels == [channel]
 
 
 @pytest.mark.parametrize(
@@ -500,3 +520,202 @@ def test_a_worker_whose_port_a_stranger_holds_reports_its_death_at_once(tmp_path
         in text
     )
     assert text.endswith(f"; log file worker-org__model_sglang_grpc_{port}.log")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(KeyError("missing launcher model"), id="key-error"),
+        pytest.param(TypeError("malformed model spec"), id="type-error"),
+    ],
+)
+def test_trt_model_lookup_error_is_not_a_readiness_retry(monkeypatch, error):
+    import grpc
+    from smg_grpc_proto import trtllm_service_pb2_grpc
+
+    channel = SimpleNamespace(closed=0)
+    calls = []
+
+    def close():
+        channel.closed += 1
+
+    def bad_spec(model_id):
+        assert model_id == _TRT_MODEL_KEY
+        calls.append("spec")
+        raise error
+
+    def unexpected_rpc(channel):
+        raise AssertionError("native RPC stub constructed before model configuration resolved")
+
+    channel.close = close
+    monkeypatch.setattr(grpc, "insecure_channel", lambda *args, **kwargs: channel)
+    monkeypatch.setattr(worker_module, "get_model_spec", bad_spec)
+    monkeypatch.setattr(trtllm_service_pb2_grpc, "TrtllmServiceStub", unexpected_rpc)
+    with pytest.raises(type(error)) as raised:
+        _trt_worker(1).grpc_serving()
+    assert raised.value is error
+    assert calls == ["spec"]
+    assert channel.closed == 1
+
+
+@pytest.mark.parametrize(
+    "answered",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("other/model", id="foreign"),
+        pytest.param(_TRT_MODEL_KEY, id="logical-key"),
+        pytest.param("exact-repository", id="basename"),
+    ],
+)
+def test_trt_timeout_names_actual_and_expected_model(trt_model, monkeypatch, answered):
+    import grpc
+    from smg_grpc_proto import trtllm_service_pb2_grpc
+
+    clock = SimpleNamespace(now=100.0)
+    sleeps = []
+    calls = []
+    channel = SimpleNamespace(closed=0)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    def close():
+        channel.closed += 1
+
+    class Stub:
+        def HealthCheck(self, request, timeout):
+            calls.append("health")
+            assert timeout == pytest.approx(0.125)
+            return SimpleNamespace(status="OK")
+
+        def GetModelInfo(self, request, timeout):
+            calls.append("info")
+            assert timeout == pytest.approx(0.125)
+            return SimpleNamespace(model_id=answered)
+
+    channel.close = close
+    monkeypatch.setattr(
+        worker_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+    )
+    monkeypatch.setattr(grpc, "insecure_channel", lambda *args, **kwargs: channel)
+    monkeypatch.setattr(trtllm_service_pb2_grpc, "TrtllmServiceStub", lambda channel: Stub())
+    worker = _trt_worker(1)
+    monkeypatch.setattr(worker, "raise_if_exited", lambda: None)
+    with pytest.raises(TimeoutError) as raised:
+        worker._wait_grpc_healthy(timeout=0.125)
+    assert str(raised.value) == (
+        f"gRPC worker {_TRT_MODEL_KEY} on port 1 did not become healthy within 0.125s; "
+        f"answered as {answered!r}, expected {_TRT_MODEL!r}"
+    )
+    assert calls == ["health", "info"]
+    assert channel.closed == 1
+    assert sleeps == [0.125]
+    assert clock.now == 100.125
+
+
+def test_trt_wait_does_not_reuse_a_previous_model_mismatch(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    probes = []
+
+    def sleep(seconds):
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        worker_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+    )
+    worker = _trt_worker(1)
+    worker._last_trt_model_identity = ("old-answer", "old-expected")
+    monkeypatch.setattr(worker, "raise_if_exited", lambda: None)
+
+    def probe(timeout=5.0, *, _deadline=None):
+        probes.append((timeout, _deadline))
+        return False
+
+    monkeypatch.setattr(worker, "grpc_serving", probe)
+    with pytest.raises(TimeoutError) as raised:
+        worker._wait_grpc_healthy(timeout=0.125)
+    assert str(raised.value) == (
+        f"gRPC worker {_TRT_MODEL_KEY} on port 1 did not become healthy within 0.125s"
+    )
+    assert worker._last_trt_model_identity is None
+    assert probes == [(0.125, 100.125)]
+    assert clock.now == 100.125
+
+
+def test_trt_startup_returns_after_one_healthy_probe_before_deadline(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    sleeps = []
+    probes = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        worker_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+    )
+    worker = _trt_worker(1)
+    worker.process = SimpleNamespace(pid=424242, returncode=None, poll=lambda: None)
+
+    def probe(timeout=5.0, *, _deadline=None):
+        probes.append((timeout, _deadline))
+        clock.now += 0.025
+        return True
+
+    monkeypatch.setattr(worker, "grpc_serving", probe)
+    worker.wait_ready(timeout=0.125)
+    assert probes == [(0.125, 100.125)]
+    assert clock.now == 100.025
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("death_phase", ["initially-dead", "during-final-probe"])
+def test_trt_startup_reports_real_launcher_death(tmp_path, monkeypatch, death_phase):
+    clock = SimpleNamespace(now=100.0)
+    sleeps = []
+    probes = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        worker_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+    )
+    worker = _trt_worker(1)
+    process = SimpleNamespace(
+        pid=424242, returncode=17 if death_phase == "initially-dead" else None
+    )
+    process.poll = lambda: process.returncode
+    worker.process = process
+    worker.log_dir = str(tmp_path)
+    log_path = tmp_path / "trt-startup.log"
+    log_path.write_text("RuntimeError: TRT launcher exited before readiness\n")
+    worker.log_path = str(log_path)
+
+    def probe(timeout=5.0, *, _deadline=None):
+        assert process.returncode is None
+        probes.append((timeout, _deadline))
+        clock.now = _deadline
+        process.returncode = 17
+        return False
+
+    # Only the probe is controlled. Keep real is_alive/raise_if_exited and
+    # _death_report/read_log active, including their poll and log-file reads.
+    monkeypatch.setattr(worker, "grpc_serving", probe)
+    with pytest.raises(RuntimeError, match="died during startup") as raised:
+        worker.wait_ready(timeout=0.125)
+    assert str(raised.value) == (
+        f"Worker {_TRT_MODEL_KEY} (PID 424242) died during startup (exit status 17); "
+        'the log says: "RuntimeError: TRT launcher exited before readiness"; '
+        "log file trt-startup.log"
+    )
+    assert process.returncode == 17
+    if death_phase == "initially-dead":
+        assert probes == []
+        assert clock.now == 100.0
+    else:
+        assert probes == [(0.125, 100.125)]
+        assert clock.now == 100.125
+    assert sleeps == []

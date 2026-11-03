@@ -153,6 +153,8 @@ class Worker:
     # handle, the ports) runs once per start, and once for a worker that never
     # started; a second ``stop`` finds nothing to do.
     _torn_down: bool = field(default=False, repr=False)
+    # Last native model answer during this wait, for identity failure diagnostics.
+    _last_trt_model_identity: tuple[str, str] | None = field(default=None, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -1108,6 +1110,9 @@ class Worker:
                 except ImportError as error:
                     raise RuntimeError("TRT gRPC health check requires smg-grpc-proto") from error
 
+                # The launcher's positional model argument; configuration errors
+                # must propagate instead of looking like a not-yet-ready worker.
+                expected_model = get_model_spec(self.model_id)["model"]
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -1124,9 +1129,7 @@ class Worker:
                     info = stub.GetModelInfo(
                         trtllm_service_pb2.GetModelInfoRequest(), timeout=remaining
                     )
-                    # This is the positional model argument in _build_cmd,
-                    # not the spec's logical key or a guessed path basename.
-                    expected_model = get_model_spec(self.model_id)["model"]
+                    self._last_trt_model_identity = (info.model_id, expected_model)
                     return (
                         time.monotonic() < deadline
                         and isinstance(expected_model, str)
@@ -1149,6 +1152,7 @@ class Worker:
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
         if self.engine == "trtllm":
+            self._last_trt_model_identity = None
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0:
                 self.raise_if_exited()
@@ -1163,6 +1167,9 @@ class Worker:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(HEALTH_CHECK_INTERVAL, remaining))
+            # A launcher can exit while the final probe consumes the deadline.
+            # Prefer its exit status and log over a generic readiness timeout.
+            self.raise_if_exited()
         else:
             start = time.perf_counter()
             while time.perf_counter() - start < timeout:
@@ -1171,9 +1178,14 @@ class Worker:
                     return
                 time.sleep(HEALTH_CHECK_INTERVAL)
 
+        identity_detail = ""
+        if self.engine == "trtllm" and self._last_trt_model_identity is not None:
+            actual_model, expected_model = self._last_trt_model_identity
+            if actual_model != expected_model:
+                identity_detail = f"; answered as {actual_model!r}, expected {expected_model!r}"
         raise TimeoutError(
             f"gRPC worker {self.model_id} on port {self.port} "
-            f"did not become healthy within {timeout}s"
+            f"did not become healthy within {timeout}s{identity_detail}"
         )
 
 
