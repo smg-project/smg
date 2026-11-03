@@ -43,6 +43,8 @@ use crate::routers::grpc::common::responses::{
 /// - `input` (text/items) → `messages` (chat messages)
 /// - `instructions` → system message (prepended)
 /// - `max_output_tokens` → `max_completion_tokens`
+/// - `stop` → `stop` (the engine's stop list and the gateway's own trim of a
+///   matched sequence both read it from the chat request)
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
@@ -398,6 +400,9 @@ fn chat_request(
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
+        // The engine's stop list and the gateway's own trim of a matched
+        // sequence both read the chat request's `stop`, on every turn.
+        stop: req.stop.clone(),
         skip_special_tokens: true,
         tools,
         tool_choice,
@@ -797,7 +802,9 @@ pub(super) fn responses_usage(usage: &Usage) -> ResponsesUsage {
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
-        chat::ChatCompletionMessage, common::StreamOptions, responses::ReasoningEffort,
+        chat::ChatCompletionMessage,
+        common::{StreamOptions, StringOrArray},
+        responses::ReasoningEffort,
     };
 
     use super::*;
@@ -1120,6 +1127,42 @@ mod tests {
         assert_eq!(chat_req.messages.len(), 2); // system + user
         assert_eq!(chat_req.model, "gpt-4");
         assert_eq!(chat_req.temperature, Some(0.7));
+    }
+
+    /// The stop sequences a Responses request sets are the chat request's, in
+    /// the string form and in the list form: the engine's stop list and the
+    /// gateway's own trim of a matched sequence both read them there.
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_chat_request_in_both_forms() {
+        let as_string = ResponsesRequest {
+            input: ResponseInput::Text("Count from 1 to 10.".to_string()),
+            model: "local-model".to_string(),
+            stop: Some(StringOrArray::String(",".to_string())),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&as_string).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::String(",".to_string())),
+            "a stop string is the chat request's stop"
+        );
+
+        let as_list = ResponsesRequest {
+            stop: Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string(),
+            ])),
+            ..as_string
+        };
+        let chat = responses_to_chat(&as_list).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string()
+            ])),
+            "a stop list is the chat request's stop"
+        );
     }
 
     #[test]
