@@ -64,7 +64,7 @@ def gateway(statuses, *, body_mode=None):
 def run_gate(port, limit=5):
     url = GATE.replace("$ARM_B_GW_PORT", str(port))
     return subprocess.run(
-        ["/usr/bin/bash", "-c", WAIT_HTTP + "\nwait_http " + shlex.quote(url) + " " + str(limit)],
+        ["/bin/bash", "-c", WAIT_HTTP + "\nwait_http " + shlex.quote(url) + " " + str(limit)],
         capture_output=True,
         text=True,
         timeout=12,

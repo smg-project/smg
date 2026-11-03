@@ -258,7 +258,7 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream.unwrap_or(false),
-            stop: vec![], // Does not pass through body.stop yet (follow-up fix)
+            stop: stop_strings(body.stop.as_ref()),
             stop_token_ids: vec![],
             ignore_eos: false,
             guided_decoding,
@@ -782,6 +782,43 @@ mod tests {
         assert_eq!(disabled_cfg.top_k, None);
         // Default min_p (0.0) maps to None for the same reason.
         assert_eq!(disabled_cfg.min_p, None);
+    }
+
+    #[tokio::test]
+    async fn a_responses_request_s_stop_sequences_reach_the_engine_request() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // A client over a lazy channel nothing listens on (made under the
+        // runtime a channel needs): the builders dial nothing.
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+        };
+        let build = |request: &ResponsesRequest| {
+            client
+                .build_generate_request_from_responses(
+                    "r".to_string(),
+                    request,
+                    String::new(),
+                    vec![1],
+                    None,
+                )
+                .expect("build request")
+        };
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(build(&request).stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        assert!(build(&ResponsesRequest::default()).stop.is_empty());
     }
 
     #[tokio::test]

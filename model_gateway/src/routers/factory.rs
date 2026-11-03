@@ -172,7 +172,7 @@ impl RouterFactory {
     ///
     /// For PD/EPD modes the caller must register the prefill/decode (and encode)
     /// policies first via [`Self::set_pd_policies`] / [`Self::set_epd_policies`].
-    pub(crate) fn create_grpc_router(
+    fn create_grpc_router(
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {

@@ -500,10 +500,10 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
-    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
-    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
-    # X-SMG-Parser header overrides it
-    parser: str = "legacy"
+    # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
+    # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
+    # request's X-SMG-Parser header overrides it
+    parser: str = "symphony"
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
@@ -656,7 +656,8 @@ class RouterArgs:
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one (or, for a cache-aware
-    # prefill pool of a prefill/decode pair, by its policy)
+    # prefill pool of a prefill/decode pair or a regular request that
+    # consistent_hashing places by its routing key, by its policy)
     worker_overload_shed: bool = False
     # Absolute per-worker overload thresholds (token usage, waiting requests), as
     # the Rust CLI defaults them; None switches one signal off
@@ -1116,7 +1117,9 @@ class RouterArgs:
                 " request goes to the least-loaded one (see"
                 " --worker-overload-shed). Unless --worker-overload-shed is"
                 " set, a cache-aware prefill pool of a prefill/decode pair is"
-                " not steered by the thresholds: its spill gate balances it."
+                " not steered by the thresholds: its spill gate balances it;"
+                " nor is a regular request that consistent_hashing places by"
+                " its routing key, which stays on its ring owner."
                 " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
@@ -1170,7 +1173,9 @@ class RouterArgs:
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
                 " use is overloaded, instead of routing it to the least-loaded one"
-                " (or, for a cache-aware prefill pool, by its policy); also sheds"
+                " (or, for a cache-aware prefill pool or a regular request that"
+                " consistent_hashing places by its routing key, by its policy);"
+                " also sheds"
                 " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
             ),
@@ -2548,8 +2553,9 @@ class RouterArgs:
             type=str,
             default=RouterArgs.parser,
             choices=["legacy", "symphony"],
-            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
-            "parsers (legacy, the default) or Symphony. With Symphony, a model's worker labels decide, "
+            help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
+            "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
+            "worker labels decide, "
             "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
             "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
             "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "

@@ -30,10 +30,11 @@ pub struct PrefillStats {
 /// `num_running_reqs` / `num_waiting_reqs` are SMG's per-rank DP load signal —
 /// fresher than any polled `GetLoads`, and the reason the connector consumes
 /// these instead of the reference's client-side load balancer. The engine's
-/// map carries more (prefix-cache and connector-cache hit counts, eviction
-/// samples, speculative-decoding, connector, graph and performance stats);
-/// nothing on the receiving side reads those, so the decoder skips them and
-/// the stats ride the batch unboxed.
+/// map carries more: the connector's KV-transfer samples ride boxed beside
+/// these (`RequestBatchOutputs::kv_transfer`); nothing on the receiving side
+/// reads the rest (prefix-cache and connector-cache hit counts, eviction
+/// samples, speculative-decoding, graph and performance stats), so the decoder
+/// skips it and the load rides the batch unboxed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
     /// Number of requests in model execution batches.

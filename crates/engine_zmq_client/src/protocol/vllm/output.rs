@@ -18,10 +18,13 @@ use crate::{
         decode_msgpack, deserialize_tolerant_seq, tensor::WireTensor, OpaqueValue, TrailingTolerant,
     },
     error::{Error, Result},
-    protocol::vllm::{
-        logprobs::{Logprobs, WireLogprobs},
-        pooling::PoolingOutput,
-        stats::{PrefillStats, SchedulerStats},
+    protocol::{
+        kv_transfer::KvTransferStats,
+        vllm::{
+            logprobs::{Logprobs, WireLogprobs},
+            pooling::PoolingOutput,
+            stats::{PrefillStats, SchedulerStats},
+        },
     },
 };
 
@@ -309,7 +312,7 @@ struct WireEngineCoreOutputs {
     #[serde(default, deserialize_with = "deserialize_tolerant_seq")]
     outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<SchedulerStats>,
+    scheduler_stats: Option<WireSchedulerStats>,
     #[serde(default)]
     timestamp: f64,
     /// A utility RPC reply, tolerant of fields a newer engine appends.
@@ -326,6 +329,73 @@ struct WireEngineCoreOutputs {
     start_wave: Option<u64>,
 }
 
+/// The scheduler stats map as the engine sends it, as far as this client reads
+/// it: the load fields, which ride the batch unboxed as [`SchedulerStats`], and
+/// the connector's KV-transfer samples when the engine runs a KV connector
+/// (absent or nil otherwise), which ride boxed beside them. The rest of the map
+/// (cache hit counts, eviction samples, speculative-decoding, graph and
+/// performance stats) is skipped.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct WireSchedulerStats {
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
+    #[serde(default)]
+    num_skipped_waiting_reqs: u64,
+    kv_cache_usage: f64,
+    #[serde(default)]
+    kv_connector_stats: Option<OpaqueValue>,
+}
+
+impl WireSchedulerStats {
+    /// The load and, when the connector recorded any, its samples.
+    fn split(self) -> (SchedulerStats, Option<Box<KvTransferStats>>) {
+        let Self {
+            num_running_reqs,
+            num_waiting_reqs,
+            num_skipped_waiting_reqs,
+            kv_cache_usage,
+            kv_connector_stats,
+        } = self;
+        let load = SchedulerStats {
+            num_running_reqs,
+            num_waiting_reqs,
+            num_skipped_waiting_reqs,
+            kv_cache_usage,
+        };
+        let transfers = kv_connector_stats
+            .as_ref()
+            .map(KvTransferStats::from_wire)
+            .filter(|stats| !stats.is_empty())
+            .map(Box::new);
+        (load, transfers)
+    }
+}
+
+/// The same map on the send side: the load fields and, when the batch carries
+/// connector samples, their wire form.
+#[derive(Serialize)]
+struct WireSchedulerStatsOut {
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
+    num_skipped_waiting_reqs: u64,
+    kv_cache_usage: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_connector_stats: Option<OpaqueValue>,
+}
+
+impl WireSchedulerStatsOut {
+    fn from_batch(batch: &RequestBatchOutputs) -> Option<Self> {
+        let load = batch.scheduler_stats?;
+        Some(Self {
+            num_running_reqs: load.num_running_reqs,
+            num_waiting_reqs: load.num_waiting_reqs,
+            num_skipped_waiting_reqs: load.num_skipped_waiting_reqs,
+            kv_cache_usage: load.kv_cache_usage,
+            kv_connector_stats: batch.kv_transfer.as_ref().map(|stats| stats.to_wire()),
+        })
+    }
+}
+
 /// Data-parallel control notifications multiplexed through `EngineCoreOutputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpControlMessage {
@@ -339,6 +409,9 @@ pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
     pub scheduler_stats: Option<SchedulerStats>,
+    /// The KV-transfer samples the engine's connector reported with this
+    /// batch, when it runs one and recorded any.
+    pub kv_transfer: Option<Box<KvTransferStats>>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
@@ -474,6 +547,13 @@ impl WireEngineCoreOutputs {
             wave_complete,
             start_wave,
         } = self;
+        let (scheduler_stats, kv_transfer) = match scheduler_stats {
+            Some(stats) => {
+                let (load, transfers) = stats.split();
+                (Some(load), transfers)
+            }
+            None => (None, None),
+        };
         let has_request_payload =
             !outputs.is_empty() || scheduler_stats.is_some() || finished_requests.is_some();
 
@@ -496,6 +576,7 @@ impl WireEngineCoreOutputs {
                     engine_index,
                     outputs: resolved,
                     scheduler_stats,
+                    kv_transfer,
                     timestamp,
                     finished_requests,
                 }
@@ -533,7 +614,7 @@ impl WireEngineCoreOutputs {
 struct WireEngineCoreOutputsRef<'a> {
     engine_index: u32,
     outputs: &'a [EngineCoreOutput],
-    scheduler_stats: Option<&'a SchedulerStats>,
+    scheduler_stats: Option<WireSchedulerStatsOut>,
     timestamp: f64,
     utility_output: Option<&'a UtilityOutput>,
     finished_requests: Option<&'a BTreeSet<String>>,
@@ -557,7 +638,7 @@ impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
             EngineCoreOutputs::RequestBatch(batch) => Self {
                 engine_index: batch.engine_index,
                 outputs: &batch.outputs,
-                scheduler_stats: batch.scheduler_stats.as_ref(),
+                scheduler_stats: WireSchedulerStatsOut::from_batch(batch),
                 timestamp: batch.timestamp,
                 finished_requests: batch.finished_requests.as_ref(),
                 ..empty
@@ -1075,9 +1156,9 @@ mod tests {
     }
 
     /// The engine's scheduler stats map carries more than the load (cache hit
-    /// counts, eviction samples, speculative-decoding, connector, graph and
-    /// performance stats, and whatever a newer engine adds): the decoder reads
-    /// the load fields and skips the rest.
+    /// counts, eviction samples, speculative-decoding, graph and performance
+    /// stats, and whatever a newer engine adds): the decoder reads the load
+    /// fields (and the connector's samples, below) and skips the rest.
     #[test]
     fn scheduler_stats_decode_the_load_and_skip_the_rest() {
         use rmpv::Value;
@@ -1174,6 +1255,99 @@ mod tests {
                 num_skipped_waiting_reqs: 1,
                 kv_cache_usage: 0.25,
             })
+        );
+    }
+
+    /// A connector-equipped engine's `kv_connector_stats` ride beside the
+    /// load, as the connector keyed them; an engine without a connector (nil
+    /// or absent) and a report without a sample yield none. The send side
+    /// writes what the decode side reads.
+    #[test]
+    fn the_connectors_kv_transfer_samples_ride_beside_the_load() {
+        use rmpv::Value;
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (Value::from(key), value))
+                    .collect(),
+            )
+        };
+        let stats_with = |kv_connector_stats: Value| {
+            map(vec![
+                ("num_running_reqs", Value::from(1u64)),
+                ("num_waiting_reqs", Value::from(0u64)),
+                ("kv_cache_usage", Value::from(0.5f64)),
+                ("kv_connector_stats", kv_connector_stats),
+            ])
+        };
+        let decode = |stats: Value| {
+            let mut envelope = wire_array(&batch(Vec::new()));
+            envelope[2] = stats;
+            let frame = Bytes::from(encode_value(&Value::Array(envelope)));
+            decode_engine_core_outputs(&[frame])
+                .unwrap()
+                .into_request_batch()
+                .expect("request batch")
+        };
+        let report = map(vec![
+            (
+                "transfer_duration",
+                Value::Array(vec![Value::from(0.25f64)]),
+            ),
+            (
+                "bytes_transferred",
+                Value::Array(vec![Value::from(4096u64)]),
+            ),
+            ("num_descriptors", Value::Array(vec![Value::from(2u64)])),
+            ("num_failed_transfers", Value::Array(vec![])),
+        ]);
+        let decoded = decode(stats_with(report));
+        assert_eq!(
+            decoded.scheduler_stats,
+            Some(SchedulerStats {
+                num_running_reqs: 1,
+                num_waiting_reqs: 0,
+                num_skipped_waiting_reqs: 0,
+                kv_cache_usage: 0.5,
+            })
+        );
+        assert_eq!(
+            decoded.kv_transfer.as_deref(),
+            Some(
+                &KvTransferStats::default()
+                    .with_samples("transfer_duration", vec![0.25])
+                    .with_samples("bytes_transferred", vec![4096.0])
+                    .with_samples("num_descriptors", vec![2.0])
+                    .with_samples("num_failed_transfers", vec![])
+            )
+        );
+        assert_eq!(
+            decode(stats_with(Value::Nil)).kv_transfer,
+            None,
+            "no connector"
+        );
+        let nothing_recorded = map(vec![("transfer_duration", Value::Array(vec![]))]);
+        assert_eq!(decode(stats_with(nothing_recorded)).kv_transfer, None);
+        let sent = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats::default()),
+            kv_transfer: Some(Box::new(
+                KvTransferStats::default().with_samples("transfer_duration", vec![0.5]),
+            )),
+            ..Default::default()
+        });
+        let frame = Bytes::from(encode_msgpack(&sent).unwrap());
+        let back = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(back.scheduler_stats, Some(SchedulerStats::default()));
+        assert_eq!(
+            back.kv_transfer
+                .as_deref()
+                .and_then(|stats| stats.samples("transfer_duration")),
+            Some(&[0.5][..])
         );
     }
 

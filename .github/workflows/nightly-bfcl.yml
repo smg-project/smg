@@ -11,9 +11,9 @@
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
-# AMD legs run models from the H100 and Blackwell legs on an AMD Instinct self-hosted runner; until
-# one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
-# dispatch that asks for them (`only`, or `hardware: amd`) runs them.
+# AMD BFCL requires SMG_RUN_AMD_BFCL="true", including an explicit AMD dispatch.
+# Missing/false leaves AMD off; SMG_RUN_AMD_LEGS still controls automatic selection.
+# Opt-in is not shared-node admission or proof of owned-process cleanup.
 name: Nightly BFCL
 
 on:
@@ -77,10 +77,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-
 jobs:
   # Build the smg wheel once and cache it by lockfile hash.
   # CPU-only work (Rust/maturin compile) — no GPU needed, so don't occupy a GPU runner.
@@ -136,6 +132,7 @@ jobs:
           # AMD legs: the AMD runner's label, and "true" once that runner is online.
           AMD_RUNNER: ${{ vars.SMG_RUNNER_AMD_GPU_8 }}
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          AMD_BFCL_ENABLED: ${{ vars.SMG_RUN_AMD_BFCL }}
         run: |
           set -euo pipefail
           # Enforce the paired-override contract: `model` and `bfcl_model` must be
@@ -378,15 +375,17 @@ jobs:
           # legs stay one click away once the runner is back.
           if os.environ.get("EVENT_NAME") == "schedule":
               legs = [l for l in legs if l["runner"] != "blackwell"]
-          # The AMD legs need AMD's runner. Until it is online (SMG_RUN_AMD_LEGS
-          # = "true") they run only when a dispatch asks for them (`only`, or
-          # `hardware: amd`), for the same 24h-queue reason, and never on
-          # pull_request: that runner takes code from main only.
+          # AMD always requires SMG_RUN_AMD_BFCL=true, including explicit dispatch.
+          # SMG_RUN_AMD_LEGS=true selects it automatically; otherwise only an
+          # explicit `only` or `hardware: amd` request can select it. Never on PRs.
           amd_requested = bool(only) or hardware == "amd"
-          if os.environ.get("EVENT_NAME") == "pull_request" or (
+          amd_bfcl_enabled = os.environ.get("AMD_BFCL_ENABLED") == "true"
+          if os.environ.get("EVENT_NAME") == "pull_request" or not amd_bfcl_enabled or (
               os.environ.get("AMD_ENABLED") != "true" and not amd_requested
           ):
               legs = [l for l in legs if l.get("vendor") != "amd"]
+          if not legs and amd_requested and not amd_bfcl_enabled:
+              raise SystemExit("AMD BFCL is disabled: SMG_RUN_AMD_BFCL must be true")
           print("matrix=" + json.dumps({"include": legs}))
           PY
 
@@ -507,6 +506,7 @@ jobs:
           # picks a port, frees it, then vLLM binds it ~40s later — another leg
           # grabs it meanwhile) and on GPU memory. A host-wide flock runs them one
           # at a time; the lock releases when this step's shell exits.
+          # AMD container-local flock is not shared-host admission.
           #
           # CRITICAL: every `launch_arm.sh` call below is invoked with `9>&-` so the
           # setsid-detached vLLM/SMG servers do NOT inherit lock FD 9. Otherwise a
@@ -518,22 +518,22 @@ jobs:
           echo "waiting for host lock..."
           flock -w 9000 9 || { echo "::error::host lock not acquired within 9000s"; exit 1; }
           echo "acquired host lock"
-          # Pre-flight GPU nuke: free the node before launching. Clears leftovers from
-          # a prior cancelled/killed leg whose always() teardown was skipped (a detached
-          # vLLM/smg::router that the pidfile group-kill missed and that pins GPU mem).
-          # Safe here: we hold the host lock, so no other bfcl leg is running; node-wide
-          # nuke (kills by GPU occupancy) is accepted on these hosts. The default
-          # nuke reads nvidia-smi; AMD hosts use the script's ROCm mode.
-          NUKE=(nuke_gpus)
-          [ "$GPU_VENDOR" = amd ] && NUKE=(rocm nuke_gpus)
-          bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
-          # Tear this leg's servers down AND nuke GPUs before releasing the lock, so the
-          # next leg starts clean. Both run inside the lock (never hit the next leg). The
-          # always() Teardown step is a leg-scoped backstop for when this trap can't run.
+          # NVIDIA preflight clears servers left by a cancelled leg whose always()
+          # teardown was skipped. Its host lock excludes other BFCL legs; shared
+          # AMD hosts must not use this node-wide cleanup.
+          if [ "$GPU_VENDOR" != amd ]; then
+            NUKE=(nuke_gpus)
+            bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
+          fi
+          # Stop this leg's servers before releasing the lock. On NVIDIA, also
+          # clear GPU leftovers so the next leg starts clean. The always() Teardown
+          # step remains a backstop if this trap cannot run.
           cleanup() {
             bash scripts/bfcl/launch_arm.sh stop 9>&- || true
-            # the verdict is discarded here: one reading, no wait for a draining card
-            CI_GPU_GUARD_WAIT_SECS=0 bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
+            # One reading, no wait for a draining NVIDIA card; discard its verdict.
+            if [ "$GPU_VENDOR" != amd ]; then
+              CI_GPU_GUARD_WAIT_SECS=0 bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
+            fi
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM
@@ -652,12 +652,11 @@ jobs:
           path: ${{ runner.temp }}/bfcl_artifact/
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs (failure only)
-        if: failure()
+      - name: Upload arm logs
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}
-          # vLLM/SMG logs — only useful on crash/timeout; noise on success.
           path: ${{ runner.temp }}/bfcl_run/*.log
           if-no-files-found: ignore
           retention-days: 14

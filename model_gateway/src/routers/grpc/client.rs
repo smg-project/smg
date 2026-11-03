@@ -556,10 +556,12 @@ impl GrpcClient {
         let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
-                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    MultimodalData::Sglang(data) => Some(data.into_protos()),
                     _ => None,
                 });
-                let req = sglang(
+                let (sglang_mm, extras) =
+                    sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+                let mut req = sglang(
                     client,
                     request_id,
                     body,
@@ -571,6 +573,7 @@ impl GrpcClient {
                         require_reasoning,
                     },
                 )?;
+                req.extra_mm_inputs = extras;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {
@@ -941,6 +944,9 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    smg_grpc_client::sglang_media_identity::LABEL,
+    "mm_processor",
+    "mm_media_ref_schemes",
     "model_path",
     "served_model_name",
     "tokenizer_path",

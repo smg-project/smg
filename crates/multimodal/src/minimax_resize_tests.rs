@@ -284,3 +284,47 @@ fn image_budget_boundary_needs_no_decode() {
         assert_eq!(image(frame, side).is_ok(), valid);
     }
 }
+
+/// Day-0 clamps the short-side raise and keeps engine-specific pixel identities.
+#[test]
+fn sglang_day0_geometry_and_cache_identity() {
+    for ((w, h, cap), expected) in [
+        ((1000, 50, 2016), (2016, 112)),
+        ((320, 240, 756), (308, 252)),
+        ((56, 56, 2016), (112, 112)),
+        ((1024, 1024, 2016), (1036, 1036)),
+    ] {
+        assert_eq!(sglang_dimensions(w, h, cap).unwrap(), expected);
+    }
+    for cap in [0, 56, 1000, 3612] {
+        assert!(sglang_dimensions(512, 512, cap).is_err());
+    }
+    assert!(sglang_dimensions(201, 1, 2016).is_err());
+    let frame = encoded(512, 512);
+    let vllm = image(frame.clone(), 2016).unwrap();
+    let sglang = image_for_runtime(frame, 2016, true).unwrap();
+    assert_eq!(vllm.size(), sglang.size());
+    assert_ne!(vllm.hash, sglang.hash);
+}
+
+/// Preserve vLLM's source geometry, exact cache key and Torch-AA pixels.
+#[test]
+fn vllm_source_contract_is_unchanged_by_sglang_opt_in() {
+    let frame = encoded(1000, 50);
+    let resized = image(frame.clone(), 1000).unwrap();
+    assert_eq!(resized.size(), ImageSize::new(2240, 112));
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"minimax-m3-source-resize-v1");
+    hash.update(frame.hash.as_bytes());
+    hash.update(&2240u32.to_le_bytes());
+    hash.update(&112u32.to_le_bytes());
+    assert_eq!(resized.hash, hash.finalize().to_hex().to_string());
+    assert_eq!(
+        resized.image().unwrap().to_rgb8(),
+        resize_image(frame.image().unwrap().clone(), 2240, 112).to_rgb8()
+    );
+    let error = sglang_dimensions(512, 512, 1000).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("multiple of 28 within 112..=3584"));
+}
