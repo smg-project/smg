@@ -25,10 +25,6 @@ concurrency:
   group: benchmark-radix-tree-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-
 permissions:
   contents: read
 
