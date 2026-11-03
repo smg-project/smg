@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fixtures.mock_answers import MockAnswers
+from infra.constants import WorkerType
 from infra.worker import Worker
 from tokenizers import Tokenizer, decoders, pre_tokenizers
 from tokenizers.models import WordLevel
@@ -62,7 +63,7 @@ def test_an_answer_with_logprobs_states_its_pieces_and_ids_with_one_logprob_each
     monkeypatch.setattr(httpx, "post", post)
     monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": model_dir})
     worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
-    answers = MockAnswers(worker=worker)
+    answers = MockAnswers(workers=[worker])
 
     answers.enqueue_with_logprobs("the capital of france is paris.", logprob=-0.25, delay_ms=5)
 
@@ -92,7 +93,7 @@ def test_the_pieces_carry_the_text_between_the_tokens(monkeypatch, word_model_di
         answers_module, "get_model_spec", lambda model_id: {"model": word_model_dir}
     )
     worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
-    answers = MockAnswers(worker=worker)
+    answers = MockAnswers(workers=[worker])
 
     answers.enqueue_with_logprobs("the capital of france is paris.")
 
@@ -112,7 +113,7 @@ def test_an_answer_whose_token_offsets_do_not_partition_the_text_is_refused(monk
     monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": "unused"})
     monkeypatch.setattr(answers_module, "_tokenizer", lambda model_dir: Backwards())
     worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
-    answers = MockAnswers(worker=worker)
+    answers = MockAnswers(workers=[worker])
 
     with pytest.raises(ValueError, match="do not partition the text; state this answer as pieces"):
         answers.enqueue_with_logprobs("Paris.")
@@ -124,7 +125,7 @@ def test_an_answer_without_tokens_is_refused(monkeypatch, model_dir):
     monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("nothing to post"))
     monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": model_dir})
     worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
-    answers = MockAnswers(worker=worker)
+    answers = MockAnswers(workers=[worker])
 
     with pytest.raises(ValueError, match="'': no tokens to state a logprob for"):
         answers.enqueue_with_logprobs("")
@@ -136,7 +137,7 @@ def test_a_model_directory_without_a_tokenizer_file_is_named(monkeypatch, tmp_pa
     monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("nothing to post"))
     monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": str(tmp_path)})
     worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
-    answers = MockAnswers(worker=worker)
+    answers = MockAnswers(workers=[worker])
 
     with pytest.raises(FileNotFoundError, match="tokenizer.json: no tokenizer file"):
         answers.enqueue_with_logprobs("Paris.")
@@ -153,6 +154,11 @@ def test_an_answer_with_logprobs_is_a_no_op_without_a_mock_worker(monkeypatch):
     assert answers.enqueued == 0
 
 
+def _nothing_served(url, timeout):
+    """A worker that served nothing yet (the reconcile before a filing reads the hits)."""
+    return httpx.Response(200, json={"hits": 0}, request=httpx.Request("GET", url))
+
+
 def _harmony_worker():
     return Worker(
         model_id="openai/gpt-oss-20b", engine="mock", port=100, gpu_ids=[], admin_port=200
@@ -167,7 +173,8 @@ def test_a_plain_answer_rides_on_the_final_channel_of_a_harmony_model(monkeypatc
         return httpx.Response(200, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", post)
-    answers = MockAnswers(worker=_harmony_worker())
+    monkeypatch.setattr(httpx, "get", _nothing_served)
+    answers = MockAnswers(workers=[_harmony_worker()])
     assert answers.harmony
 
     answers.enqueue("Paris.")
@@ -189,7 +196,7 @@ def test_a_plain_answer_rides_on_the_final_channel_of_a_harmony_model(monkeypatc
 
     # A model that is not a Harmony one takes the text as stated.
     plain = MockAnswers(
-        worker=Worker(model_id="twin", engine="mock", port=101, gpu_ids=[], admin_port=201)
+        workers=[Worker(model_id="twin", engine="mock", port=101, gpu_ids=[], admin_port=201)]
     )
     assert not plain.harmony
     plain.enqueue("Paris.")
@@ -210,9 +217,10 @@ def test_a_logprob_answer_cut_short_leaves_the_harmony_channel_open(monkeypatch)
         return list(range(len(pieces))), pieces
 
     monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", _nothing_served)
     monkeypatch.setattr(answers_module, "get_model_spec", lambda model_id: {"model": "unused"})
     monkeypatch.setattr(answers_module, "_pieces", pieces_by_marker)
-    answers = MockAnswers(worker=_harmony_worker())
+    answers = MockAnswers(workers=[_harmony_worker()])
 
     answers.enqueue_with_logprobs("1, 2, 3.")
     answers.enqueue_with_logprobs("1,", finish_reason="stop", matched_stop=",")
@@ -234,7 +242,8 @@ def test_the_harmony_channels_are_stated_as_the_model_writes_them(monkeypatch):
         return httpx.Response(200, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", post)
-    answers = MockAnswers(worker=_harmony_worker())
+    monkeypatch.setattr(httpx, "get", _nothing_served)
+    answers = MockAnswers(workers=[_harmony_worker()])
 
     answers.enqueue_harmony(analysis="Think.", final="144")
     answers.enqueue_harmony(tool_call=("get_weather", {"location": "Seattle"}))
@@ -251,3 +260,118 @@ def test_the_harmony_channels_are_stated_as_the_model_writes_them(monkeypatch):
         answers.enqueue_harmony()
     with pytest.raises(ValueError, match="not both"):
         answers.enqueue_harmony(tool_call=("calculate", {}), final="4")
+
+
+def _posting(monkeypatch):
+    """Record every answer posted, by admin URL; answer each post with 200."""
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append((url, json))
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    return posted
+
+
+def _decodes(count):
+    return [
+        Worker(
+            model_id="twin",
+            engine="mock",
+            port=100 + i,
+            gpu_ids=[],
+            worker_type=WorkerType.DECODE,
+            admin_port=200 + i,
+        )
+        for i in range(count)
+    ]
+
+
+def test_an_answer_for_a_prompt_is_filed_on_every_worker_of_the_class(monkeypatch):
+    posted = _posting(monkeypatch)
+    answers = MockAnswers(workers=_decodes(2))
+
+    answers.enqueue("apricot", prompt_contains="apricot")
+
+    assert [url for url, _ in posted] == [
+        "http://127.0.0.1:200/admin/script/all",
+        "http://127.0.0.1:201/admin/script/all",
+    ]
+    assert all(
+        body == {"output_text": "apricot", "prompt_contains": "apricot"} for _, body in posted
+    )
+    assert answers.enqueued == 1, "one answer stated, wherever it is served"
+
+
+def test_a_class_of_several_workers_takes_no_answer_without_its_prompt(monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("nothing to post"))
+    answers = MockAnswers(workers=_decodes(3))
+
+    with pytest.raises(ValueError, match="runs 3 mock workers.*prompt_contains"):
+        answers.enqueue("apricot")
+
+    assert answers.enqueued == 0
+
+
+def test_the_answers_served_are_the_workers_hits_since_the_test_began(monkeypatch):
+    hits = {"http://127.0.0.1:200": 4, "http://127.0.0.1:201": 1}
+
+    def get(url, timeout):
+        base = url.removesuffix("/admin/script/all")
+        return httpx.Response(200, json={"hits": hits[base]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    deleted = []
+    monkeypatch.setattr(httpx, "delete", lambda url, timeout: deleted.append(url))
+    answers = MockAnswers(workers=_decodes(2))
+    answers.note_served()
+    answers.enqueued = 2
+
+    assert answers.served() == 0
+    assert answers.leftovers() == 2, "stated, not yet served"
+    hits["http://127.0.0.1:201"] += 2
+    assert answers.leftovers() == 0, "served on whichever worker the gateway picked"
+    hits["http://127.0.0.1:200"] += 1
+    assert answers.leftovers() == -1, "more served than stated: a text matched twice"
+
+    answers.clear()
+    assert deleted == [
+        "http://127.0.0.1:200/admin/script/all",
+        "http://127.0.0.1:201/admin/script/all",
+    ]
+
+
+def test_the_copies_left_on_the_other_workers_are_dropped_once_every_stated_answer_was_served(
+    monkeypatch,
+):
+    hits = {"http://127.0.0.1:200": 0, "http://127.0.0.1:201": 0}
+
+    def get(url, timeout):
+        base = url.removesuffix("/admin/script/all")
+        return httpx.Response(200, json={"hits": hits[base]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    posted = _posting(monkeypatch)
+    deleted = []
+    monkeypatch.setattr(httpx, "delete", lambda url, timeout: deleted.append(url))
+    answers = MockAnswers(workers=_decodes(2))
+    answers.note_served()
+
+    # The first turn's answer, served on one worker: its copy on the other
+    # would match the second turn's prompt, which carries the first turn.
+    answers.enqueue("OK", prompt_contains="Reply OK.")
+    assert deleted == [], "nothing stated before it: nothing to drop"
+    hits["http://127.0.0.1:200"] += 1
+    answers.enqueue("marigold", prompt_contains="What is the password?")
+    assert deleted == [
+        "http://127.0.0.1:200/admin/script/all",
+        "http://127.0.0.1:201/admin/script/all",
+    ], "every stated answer served: the leftover copies go before the next is filed"
+    assert [body["output_text"] for _, body in posted] == ["OK", "OK", "marigold", "marigold"]
+
+    # Stated answers still waiting are not dropped by the next filing.
+    deleted.clear()
+    answers.enqueue("blue", prompt_contains="colour")
+    assert deleted == [], "marigold is still waiting"
+    assert answers.leftovers() == 2

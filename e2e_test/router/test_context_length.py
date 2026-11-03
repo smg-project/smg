@@ -110,10 +110,14 @@ class _ContextLengthContract:
         assert resp.status_code == 200, f"{resp.status_code}: {resp.text[:300]}"
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(2)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(
+    _MODEL,
+    tokenspeed=_MODEL_BY_ENGINE["tokenspeed"],
+    mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+)
 @pytest.mark.workers(extra_engine_args=_WINDOW_ARGS)
 @pytest.mark.parametrize(
     "setup_backend", [pytest.param(("pd_grpc", (1, 1)), id="1p1d")], indirect=True
