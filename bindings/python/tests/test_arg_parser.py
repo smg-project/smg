@@ -1861,6 +1861,7 @@ class TestHelpGroups:
                 spelling for action in group._group_actions for spelling in action.option_strings
             }
             for group in parser._action_groups
+            if group.title is not None
         }
 
     @pytest.mark.parametrize(
