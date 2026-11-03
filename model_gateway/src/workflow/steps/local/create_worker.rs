@@ -575,7 +575,7 @@ pub(super) fn validate_parser_overrides(
 /// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
 /// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
 /// start-up).
-pub(super) fn symphony_table_of(
+fn symphony_table_of(
     card: &ModelCard,
     parser: ParserChoice,
     connection_mode: ConnectionMode,
@@ -600,7 +600,7 @@ pub(super) fn symphony_table_of(
 /// registry does not know, flags that select nothing or the registry's own table, and the legacy
 /// parser choice. Workers of one model registering at the same moment may each say it, as the
 /// override check above may: the registry gains the worker a step later.
-pub(super) fn registry_reads_over_the_flags(
+fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,

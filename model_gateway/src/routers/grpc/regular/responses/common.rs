@@ -219,7 +219,7 @@ pub(super) fn partition_tool_calls(
 /// A batch that fits may continue to a final model answer. An overflowing
 /// batch executes its permitted prefix, then stops normally for a user cap
 /// or fails for the internal safety cap. A user cap wins when both are equal.
-pub(super) fn apply_mcp_tool_call_limit(
+fn apply_mcp_tool_call_limit(
     calls: &mut Vec<ExtractedToolCall>,
     total_calls: usize,
     max_tool_calls: Option<usize>,

@@ -378,6 +378,115 @@ pub enum ProtoResponseVariant {
     None,
 }
 
+/// The accessors every engine-response wrapper answers with the same five-arm
+/// match, written once and invoked inside each wrapper's `impl` (as the engine
+/// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
+/// semantics of the response shape, the index, the four token counters and the
+/// reported weight version. What differs per wrapper (the typed accessors, the
+/// token ids, the logprobs, the finish reason) stays in its own `impl`.
+macro_rules! engine_response_basics {
+    () => {
+        /// Check if this is SGLang
+        pub fn is_sglang(&self) -> bool {
+            matches!(self, Self::Sglang(_))
+        }
+
+        /// Check if this is TensorRT-LLM
+        pub fn is_trtllm(&self) -> bool {
+            matches!(self, Self::Trtllm(_))
+        }
+
+        /// Check if this is MLX
+        pub fn is_mlx(&self) -> bool {
+            matches!(self, Self::Mlx(_))
+        }
+
+        /// Check if this is TokenSpeed
+        pub fn is_tokenspeed(&self) -> bool {
+            matches!(self, Self::TokenSpeed(_))
+        }
+
+        /// How this response's payloads relate to the preceding ones of its
+        /// stream — see [`ChunkSemantics`]: a `Delta` stream's counts are
+        /// accumulated chunk by chunk, a `Cumulative` stream's `Complete` reports
+        /// them.
+        pub fn chunk_semantics(&self) -> ChunkSemantics {
+            match self {
+                Self::Vllm(_) => ChunkSemantics::Delta,
+                Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                    ChunkSemantics::Cumulative
+                }
+            }
+        }
+
+        /// Get index (for n>1 support)
+        /// Returns the index of this output when n>1 was requested (0-indexed)
+        pub fn index(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.index,
+                Self::Vllm(c) => c.index,
+                Self::Trtllm(c) => c.sequence_index,
+                Self::Mlx(c) => c.index,
+                Self::TokenSpeed(c) => c.index,
+            }
+        }
+
+        /// Get prompt tokens
+        pub fn prompt_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.prompt_tokens,
+                Self::Vllm(c) => c.prompt_tokens,
+                Self::Trtllm(c) => c.prompt_tokens,
+                Self::Mlx(c) => c.prompt_tokens,
+                Self::TokenSpeed(c) => c.prompt_tokens,
+            }
+        }
+
+        /// Get completion tokens (the running count on a chunk, the total on a
+        /// `Complete`)
+        pub fn completion_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.completion_tokens,
+                Self::Vllm(c) => c.completion_tokens,
+                Self::Trtllm(c) => c.completion_tokens,
+                Self::Mlx(c) => c.completion_tokens,
+                Self::TokenSpeed(c) => c.completion_tokens,
+            }
+        }
+
+        /// Get cached tokens
+        pub fn cached_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.cached_tokens,
+                Self::Vllm(c) => c.cached_tokens,
+                Self::Trtllm(c) => c.cached_tokens,
+                Self::Mlx(c) => c.cached_tokens,
+                Self::TokenSpeed(c) => c.cached_tokens,
+            }
+        }
+
+        /// Get reasoning tokens.
+        pub fn reasoning_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.reasoning_tokens,
+                Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
+            }
+        }
+
+        /// Weight version the engine reported for this response. Only TokenSpeed
+        /// carries it on the wire; see [`is_reported_version`] for what counts.
+        pub fn weight_version(&self) -> Option<&str> {
+            match self {
+                Self::TokenSpeed(c) => c
+                    .weight_version
+                    .as_deref()
+                    .filter(|v| is_reported_version(v)),
+                Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            }
+        }
+    };
+}
+
 /// Unified GenerateStreamChunk
 #[derive(Clone)]
 pub enum ProtoGenerateStreamChunk {
@@ -389,6 +498,8 @@ pub enum ProtoGenerateStreamChunk {
 }
 
 impl ProtoGenerateStreamChunk {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -425,37 +536,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// How this chunk's payloads relate to the preceding ones — see
-    /// [`ChunkSemantics`].
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -464,18 +544,6 @@ impl ProtoGenerateStreamChunk {
             Self::Trtllm(c) => &c.token_ids,
             Self::Mlx(c) => &c.token_ids,
             Self::TokenSpeed(c) => &c.token_ids,
-        }
-    }
-
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
         }
     }
 
@@ -517,59 +585,6 @@ impl ProtoGenerateStreamChunk {
             Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
-
-    /// Get prompt tokens (cumulative)
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens (cumulative)
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
-    /// Get cached tokens (cumulative)
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
-    }
-
-    /// Get reasoning tokens (cumulative).
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
-    }
-
-    /// Weight version the engine reported for this chunk. Only TokenSpeed
-    /// carries it on the wire; see [`is_reported_version`] for what counts.
-    pub fn weight_version(&self) -> Option<&str> {
-        match self {
-            Self::TokenSpeed(c) => c
-                .weight_version
-                .as_deref()
-                .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
-        }
-    }
 }
 
 /// Whether an engine-stamped `weight_version` names a real version. TokenSpeed
@@ -594,6 +609,8 @@ pub enum ProtoGenerateComplete {
 }
 
 impl ProtoGenerateComplete {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -642,38 +659,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// Chunk semantics of the stream this `Complete` terminates — see
-    /// [`ChunkSemantics`]. `Delta` streams already accumulated their counts
-    /// chunk by chunk; `Cumulative` streams report them here.
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -685,28 +670,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get prompt tokens
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
     /// Get finish reason
     pub fn finish_reason(&self) -> &str {
         match self {
@@ -715,18 +678,6 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => &c.finish_reason,
             Self::Mlx(c) => &c.finish_reason,
             Self::TokenSpeed(c) => &c.finish_reason,
-        }
-    }
-
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
         }
     }
 
@@ -780,37 +731,6 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => &c.output_token_ids,
             Self::Mlx(c) => &c.output_ids,
             Self::TokenSpeed(c) => &c.output_ids,
-        }
-    }
-
-    /// Get cached tokens
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
-    }
-
-    /// Get reasoning tokens.
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
-    }
-
-    /// Weight version the engine reported for this completion. Only TokenSpeed
-    /// carries it on the wire; see [`is_reported_version`] for what counts.
-    pub fn weight_version(&self) -> Option<&str> {
-        match self {
-            Self::TokenSpeed(c) => c
-                .weight_version
-                .as_deref()
-                .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 

@@ -453,41 +453,14 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        // Pre-tokenized requests route on the token tree; the decimal-string
-        // rendering is only materialized when there are no tokens. A valid
-        // x-smg-routing-tokens hint wins over body-derived tokens/text.
-        let routing_tokens: Option<Vec<u32>> = header_utils::parse_routing_tokens_hint(headers)
-            .or_else(|| {
-                typed_req
-                    .routing_tokens()
-                    .map(|ids| ids.iter().map(|&id| id as u32).collect())
-            });
-        let text = routing_tokens
-            .is_none()
-            .then(|| typed_req.extract_text_for_routing());
-        let rid_key = self
-            .policy_registry
-            .derive_rid_key(typed_req.rid())
-            .map(str::to_string);
-        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
+        let routing = self.routing_derivatives(headers, &typed_req);
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let model = self.worker_registry.metric_model_label(model_id);
-        let endpoint = route_to_endpoint(route);
-
-        // Record request start (Layer 2)
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            endpoint,
-            bool_to_static_str(is_stream),
-        );
+        let outcome = self.begin_route(route, model_id, is_stream);
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
         let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
@@ -495,45 +468,20 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        // Reserve once per logical request, before any dispatch: every attempt
-        // below dispatches under this one reservation. A denial is the
-        // request's answer, never retried.
-        let (reservation, denial) = match (&self.rate_limit_manager, tenant_meta) {
-            (Some(manager), Some(tenant_meta)) => {
-                let cell = RateLimitCell::new();
-                let estimate = typed_req.estimated_input_tokens(text.as_deref());
-                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
-                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
-                    Err(mut denied) => {
-                        mark_non_retryable(&mut denied);
-                        (None, Some(denied))
-                    }
-                }
-            }
-            _ => (None, None),
-        };
+        let (reservation, denial) = self
+            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
+            .await;
 
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
             typed_req,
-            RoutingDerivatives {
-                tokens: routing_tokens,
-                text,
-                rid_key,
-                cache_namespace,
-            },
+            routing,
             ReleasePoint::from_retry_config(retry_config),
         );
-        // The engines a failed attempt of this request dispatched to; a retry
-        // re-selects away from them while another available worker is left.
+        // The state the attempts share; `TypedAttempt` names each piece.
         let tried = parking_lot::Mutex::new(Vec::new());
-
-        // The request's bookkeeping across attempts: each worker is charged
-        // one breaker failure at most, and a worker whose answer was
-        // definitive takes no further attempt.
         let ledger = AttemptLedger::default();
-
         let attempt = TypedAttempt {
             headers,
             lease: &lease,
@@ -548,61 +496,185 @@ impl Router {
         let response = if let Some(denied) = denial {
             denied
         } else if lease.release_point() == ReleasePoint::AfterDispatch {
-            // Retries disabled: one dispatch; the lease frees the parsed
-            // request the moment the upstream bytes are serialized.
-            let res = self.route_typed_request_once(&attempt).await;
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                res.status().as_u16(),
-                extract_error_code_from_response(&res),
-            );
-            // Mirror the retry executor's exhaustion accounting for a
-            // retryable response that gets no retry.
-            if is_retryable_response(&res) {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            }
-            res
+            self.dispatch_once(&attempt, outcome.endpoint).await
         } else {
-            RetryExecutor::execute_response_with_retry(
-                retry_config,
-                // operation per attempt; the lease keeps the request alive
-                // for replay until the retry window closes (first
-                // non-retryable response).
-                |_: u32| async {
-                    let res = self.route_typed_request_once(&attempt).await;
-
-                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                    Metrics::record_router_upstream_response(
-                        metrics_labels::ROUTER_HTTP,
-                        res.status().as_u16(),
-                        extract_error_code_from_response(&res),
-                    );
-
-                    res
-                },
-                // should_retry predicate
-                |res, _attempt| is_retryable_response(res),
-                // on_backoff hook
-                |delay, attempt| {
-                    // Layer 3 worker metrics
-                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                    Metrics::record_worker_retry_backoff(attempt, delay);
-                },
-                // on_exhausted hook
-                || {
-                    Metrics::record_worker_retries_exhausted(
-                        metrics_labels::WORKER_REGULAR,
-                        endpoint,
-                    );
-                },
-            )
-            .await
+            self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                .await
         };
+        let response = self
+            .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+            .await;
+        outcome.answered_typed(&response, start);
+        response
+    }
 
-        // The one answer both dispatch paths converge on resolves the
-        // reservation, once: settled, handed to the streamed body, or closed
-        // at the estimate.
-        let response = match &reservation {
+    /// The routing inputs of a typed request, derived once before the lease
+    /// takes it: the token ids when the request or a valid hint carries them
+    /// (the text rendering only when neither does), the request-id key and
+    /// the cache namespace.
+    fn routing_derivatives<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+    ) -> RoutingDerivatives {
+        // Pre-tokenized requests route on the token tree; the decimal-string
+        // rendering is only materialized when there are no tokens. A valid
+        // x-smg-routing-tokens hint wins over body-derived tokens/text.
+        let tokens: Option<Vec<u32>> =
+            header_utils::parse_routing_tokens_hint(headers).or_else(|| {
+                typed_req
+                    .routing_tokens()
+                    .map(|ids| ids.iter().map(|&id| id as u32).collect())
+            });
+        let text = tokens
+            .is_none()
+            .then(|| typed_req.extract_text_for_routing());
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(typed_req.rid())
+            .map(str::to_string);
+        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
+        RoutingDerivatives {
+            tokens,
+            text,
+            rid_key,
+            cache_namespace,
+        }
+    }
+
+    /// The start of a typed route: the request counted under the metric
+    /// label of its canonical model and the route's endpoint label, which the
+    /// returned finalizers of its router metrics carry to every exit.
+    fn begin_route<'a>(
+        &self,
+        route: &'static str,
+        model_id: &'a str,
+        is_stream: bool,
+    ) -> RouteOutcome<'a> {
+        let model_label = self.worker_registry.metric_model_label(model_id);
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_label,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+        RouteOutcome {
+            model_label: Cow::Borrowed(model_label),
+            endpoint,
+        }
+    }
+
+    /// Reserve the tenant's estimate once per logical request, before any
+    /// dispatch: every attempt dispatches under this one reservation. With
+    /// the rate limiter on and a tenant to charge, either the reservation
+    /// (with the request's samples per prompt, for the resolve) or the
+    /// denial, which is the request's answer, never retried; `(None, None)`
+    /// for a request outside the limiter.
+    async fn reserve_tenant_estimate<T: TenantCharge>(
+        &self,
+        tenant_meta: Option<&TenantRequestMeta>,
+        typed_req: &T,
+        model_id: &str,
+        routing_text: Option<&str>,
+    ) -> (Option<(RateLimitCell, u32)>, Option<Response>) {
+        match (&self.rate_limit_manager, tenant_meta) {
+            (Some(manager), Some(tenant_meta)) => {
+                let cell = RateLimitCell::new();
+                let estimate = typed_req.estimated_input_tokens(routing_text);
+                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
+                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
+                    Err(mut denied) => {
+                        mark_non_retryable(&mut denied);
+                        (None, Some(denied))
+                    }
+                }
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// The one dispatch of a request with retries disabled: the lease frees
+    /// the parsed request the moment the upstream bytes are serialized, and a
+    /// retryable answer that gets no retry is counted as an exhaustion, as
+    /// the retry executor would count it.
+    async fn dispatch_once<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        endpoint: &'static str,
+    ) -> Response {
+        let res = self.route_typed_request_once(attempt).await;
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            res.status().as_u16(),
+            extract_error_code_from_response(&res),
+        );
+        // Mirror the retry executor's exhaustion accounting for a
+        // retryable response that gets no retry.
+        if is_retryable_response(&res) {
+            Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+        }
+        res
+    }
+
+    /// The attempts of a request under the retry executor: the lease keeps
+    /// the request alive for replay until the retry window closes (the first
+    /// non-retryable answer); every attempt's upstream response, every
+    /// back-off and the exhaustion are counted.
+    async fn dispatch_with_retries<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        retry_config: &RetryConfig,
+        endpoint: &'static str,
+    ) -> Response {
+        RetryExecutor::execute_response_with_retry(
+            retry_config,
+            // operation per attempt; the lease keeps the request alive
+            // for replay until the retry window closes (first
+            // non-retryable response).
+            |_: u32| async {
+                let res = self.route_typed_request_once(attempt).await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
+            },
+            // should_retry predicate
+            |res, _attempt| is_retryable_response(res),
+            // on_backoff hook
+            |delay, attempt| {
+                // Layer 3 worker metrics
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // on_exhausted hook
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await
+    }
+
+    /// Resolve the reservation, once, on the one answer both dispatch paths
+    /// converge on: settled, handed to the streamed body, or closed at the
+    /// estimate. An answer outside the limiter passes through.
+    async fn resolve_tenant_reservation(
+        &self,
+        reservation: Option<&(RateLimitCell, u32)>,
+        route: &'static str,
+        is_stream: bool,
+        response: Response,
+    ) -> Response {
+        match reservation {
             Some((cell, samples_per_prompt)) => {
                 tenant_rate_limit::resolve(
                     cell,
@@ -615,31 +687,7 @@ impl Router {
                 .await
             }
             None => response,
-        };
-
-        if response.status().is_success() {
-            let duration = start.elapsed();
-            Metrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_response(&response) {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_for_response(&response),
-                error_reason_for_response(&response),
-            );
         }
-
-        response
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
@@ -1706,10 +1754,11 @@ fn build_transcription_form(
     Ok(form)
 }
 
-/// The terminal accounting of one multipart transcription request: the
-/// labels its router metrics carry and the finalizers that write them, one
-/// per way the request ends. The typed route keeps its own inline
-/// accounting, shaped by its retry policy.
+/// The terminal accounting of one HTTP route: the labels its router
+/// metrics carry and the finalizers that write them, one per way the
+/// request ends. `Router::begin_route` builds it for the typed route,
+/// which ends through `answered_typed`; the multipart transcription
+/// route builds it after the same prologue.
 struct RouteOutcome<'a> {
     model_label: Cow<'a, str>,
     endpoint: &'static str,
@@ -1795,6 +1844,34 @@ impl RouteOutcome<'_> {
                 self.endpoint,
                 error_type_from_status(status),
                 reason,
+            );
+        }
+    }
+
+    /// [`Self::answered`] for the typed route, whose answer may be replayed:
+    /// the duration on a success, the response's own error class and reason
+    /// on a definitive failure, nothing on a retryable answer (the retry
+    /// executor's exhaustion counter is the record of those).
+    fn answered_typed(&self, response: &Response, start: Instant) {
+        if response.status().is_success() {
+            let duration = start.elapsed();
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                duration,
+            );
+        } else if !is_retryable_response(response) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_for_response(response),
+                error_reason_for_response(response),
             );
         }
     }

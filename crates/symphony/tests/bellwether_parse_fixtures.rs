@@ -252,6 +252,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // turn the prompt opens no turn for inside the thought, so the opener the replay feeds before
     // the tail ([`GenerationPrompt::text`]) is what tells a closed thought from an unopened turn.
     ("deepseek-v4-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek-V4-Pro is a member of the V4-Flash group (the same encoder, tokenizer and
+    // configuration files), so its sets read with the V4 table and the same statement; bellwether
+    // records no set of its own yet, so the slug keeps its notice until one is recorded.
+    ("deepseek-v4-pro", GenerationPrompt::OpensTheThought),
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
     // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. Chat mode is its
     // default: only a request that turns thinking on opens the thought, so a recorded case that
@@ -274,14 +278,16 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
     // prompt (`<think>`, no newline: the shared tail's is prompt text inside the thought, as for
     // Kimi K3). K2.5 and K2.6 close it at once (`<think></think>`) when the request's `thinking`
-    // is false, a switch bellwether's requests do not set (they carry `enable_thinking`), so the
-    // recorded sets start inside the thought whatever the request says. bellwether holds the six
-    // manifests and no set yet: each slug is skipped with the notice until the pin holds its sets.
+    // is false: the turns set carries that switch beside `enable_thinking`, so its thinking-off
+    // cases start in content, and the common set carries `enable_thinking` alone, which these
+    // templates do not read, so its cases start inside the thought; K2.7-Code's template reads
+    // neither. bellwether's reference refused the reasoning probes for K2 Thinking, K2.5 and K2.6
+    // ([`REFUSED_PROBES`]).
     ("kimi-k2-instruct", GenerationPrompt::Plain),
     ("kimi-k2-instruct-0905", GenerationPrompt::Plain),
     ("kimi-k2-thinking", GenerationPrompt::ModelDecides),
-    ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
-    ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
+    ("kimi-k2.5", GenerationPrompt::OpensTheThoughtOrClosesIt),
+    ("kimi-k2.6", GenerationPrompt::OpensTheThoughtOrClosesIt),
     ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
     // DeepSeek V3.1 closes the thought in the prompt (`</think>` right after the opener) unless
     // the request's `thinking` kwarg opens it; the recorded requests carry `enable_thinking`,
@@ -787,6 +793,10 @@ enum GenerationPrompt {
     /// off, when the template opens the answer instead (`<|open|>response<|sep|>`): the engine's
     /// renderer hands the request's switch to the vendor class, and the output starts in content.
     OpensTheThoughtOrTheAnswer,
+    /// Kimi K2.5 and K2.6: `<think>` (the thought opened, no newline) unless the request's
+    /// `thinking` is false, when the template closes it at once (`<think></think>`) and the output
+    /// starts in content; `enable_thinking` moves nothing in these templates.
+    OpensTheThoughtOrClosesIt,
     /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
@@ -841,6 +851,10 @@ impl GenerationPrompt {
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, true) => K3_ANSWER_OPEN.to_string(),
+            (Self::OpensTheThoughtOrClosesIt, _) if request.thinking_kwarg_off() => {
+                format!("{open}{close}")
+            }
+            (Self::OpensTheThoughtOrClosesIt, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, false) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
@@ -1216,6 +1230,12 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "llama-3-3-nemotron-super-49b-v1-5",
         "parse/reasoning-with-marker-text",
     ),
+    // bellwether's reference refused the reasoning probes for these templates: each slug's common
+    // set records the two content probes and the fence probe, three of the sixteen cases, and no
+    // reasoning probe (K2.7-Code's records seven, this one among them).
+    ("kimi-k2-thinking", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.5", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.6", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -1294,6 +1314,15 @@ impl Request {
         self.enable_thinking() == Some(true)
     }
 
+    /// Whether the request's `thinking`, the switch Kimi K2.5's and K2.6's templates read, is
+    /// false.
+    fn thinking_kwarg_off(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.thinking)
+            == Some(false)
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1304,6 +1333,7 @@ impl Request {
 #[derive(Deserialize)]
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
+    thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]

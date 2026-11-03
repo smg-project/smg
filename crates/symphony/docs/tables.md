@@ -103,9 +103,11 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   with `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside
   the thought or in the content; bellwether has not recorded the group's set yet.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
-  `<｜Assistant｜>` and the thought's opener after a user message only: a conversation that ends with
-  a system message rendered in place (a coding agent's environment notes after the user turn, and
-  after every tool result) has no opener for the model's turn, and the model, which thinks unless
+  `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
+  ends the conversation or that an assistant turn follows (a coding agent's environment notes and
+  its notes after tool results take the opener); a system message a latest reminder follows stays
+  bare, and the checkpoint's own encoder file opens the turn after user and developer turns only,
+  so a prompt can still have no opener for the model's turn, and the model, which thinks unless
   told not to, writes its thought and `</think>` as it would after `<｜Assistant｜><think>`. The table
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the

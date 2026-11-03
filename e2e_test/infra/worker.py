@@ -140,9 +140,6 @@ class Worker:
     # KV transfer backend for this PD worker ("nixl", "mooncake" or "moriio");
     # None takes the lane's default, so one fleet can mix transports.
     kv_backend: str | None = None
-    # In-engine RL control app port (TokenSpeed gRPC workers). None allocates
-    # one at launch; SMG discovers it from the engine's server info.
-    rl_control_port: int | None = None
     # Environment for the engine process on top of the infra's own settings
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
@@ -383,9 +380,6 @@ class Worker:
         from .process_utils import release_port
 
         release_port(self.port)
-        if self.rl_control_port is not None:
-            release_port(self.rl_control_port)
-            self.rl_control_port = None
         if self.bootstrap_port is not None:
             release_port(self.bootstrap_port)
         if self.nixl_port is not None:
@@ -451,6 +445,10 @@ class Worker:
         if self.engine == "tokenspeed":
             # TokenSpeed moves KV over Mooncake only; the lane-wide setting
             # exists for the engines that have a choice.
+            return "mooncake"
+        if self.engine == "mock":
+            # The mock engine moves no KV; the gateway pairs it on the
+            # scheduler wire it speaks, whose one transport is Mooncake.
             return "mooncake"
         return vllm_kv_backend()
 
@@ -713,6 +711,17 @@ class Worker:
             cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
         else:
             cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
+        # The disaggregation role, as the engines take theirs: a prefill
+        # worker also binds the bootstrap port the gateway is told of, where
+        # the probe finds it; both advertise the role in their server args.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+            if self.mode != ConnectionMode.GRPC:
+                raise ValueError("the mock engine's prefill and decode roles are gRPC workers")
+            cmd += ["--worker-type", self.worker_type.value]
+            if self.worker_type == WorkerType.PREFILL and self.bootstrap_port is not None:
+                cmd += ["--bootstrap-base-port", str(self.bootstrap_port)]
+        elif self.worker_type == WorkerType.ENCODE:
+            raise ValueError("the mock engine has no encode role")
         return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
@@ -780,9 +789,10 @@ class Worker:
     def _build_tokenspeed_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TokenSpeed gRPC server command.
 
-        Launches ``smg_grpc_servicer.tokenspeed`` which wraps TokenSpeed's
-        ``AsyncLLM`` behind the dedicated ``tokenspeed.grpc.scheduler``
-        service.
+        Launches ``smg_grpc_servicer.tokenspeed``, which serves the dedicated
+        ``tokenspeed.grpc.scheduler`` service over the engine's ranks (the
+        Rust servicer under ``--servicer-impl rust``, the harness's setting
+        for TokenSpeed).
         """
         cmd = [
             "python3",
@@ -807,14 +817,10 @@ class Worker:
             # ``logprobs=True`` requests get real per-token data back.
             "--enable-output-logprobs",
         ]
-        # Only the port: without ``--rl-control-host`` the engine binds the
-        # control app on its own ``--host`` (the harness address the gateway
-        # already dials) and advertises that URL; a wildcard bind would not be
-        # advertised at all. ``ts serve`` always enables the control app, so
-        # every lane runs the engine as deployed.
-        if self.rl_control_port is None:
-            self.rl_control_port = get_engine_port()
-        cmd.extend(["--rl-control-port", str(self.rl_control_port)])
+        # No ``--rl-control-port``: the pinned engine has no in-engine control
+        # app any more (its RL and weight operations are control calls on its
+        # wire), and every flag this entrypoint does not own goes to the
+        # engine's parser, which rejects what it no longer defines.
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:

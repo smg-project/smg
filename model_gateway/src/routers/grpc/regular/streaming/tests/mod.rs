@@ -1,6 +1,7 @@
 mod delta_slicing;
 pub(crate) mod eof;
 mod failure;
+mod generate_finish;
 mod isolation;
 mod local_stop;
 mod pd_anchor;

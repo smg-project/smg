@@ -1450,6 +1450,15 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
         .map_err(Into::into)
 }
 
+/// Whether a filter call passed no keyword argument at all. `Kwargs::args`
+/// lists the string keys only, so a splat with a non-string key would read
+/// as empty; the engine's own check, run before any read, is `Ok` for an
+/// empty map alone (a string key reads as unknown, a non-string key as its
+/// own error), and costs nothing on an empty map.
+fn passed_no_keyword(kwargs: &Kwargs) -> bool {
+    kwargs.args().next().is_none() && kwargs.assert_all_used().is_ok()
+}
+
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
 ///
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
@@ -1463,13 +1472,27 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
 /// This is necessary for compatibility with chat templates from HuggingFace Hub models.
 /// See: <https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py>
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
-    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
-    let indent: Option<Value> = kwargs.get("indent")?;
-    let separators: Option<Value> = kwargs.get("separators")?;
-    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
-
-    // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
-    kwargs.assert_all_used()?;
+    // A call without keyword arguments, the common `value | tojson`, takes the
+    // defaults without reading the keywords: `Kwargs::get` records every key
+    // it reads in a set the engine allocates per call, so the four reads cost
+    // six allocations on each call, paid before a kept text is found. A call
+    // with keywords reads them as before, and an unknown one still raises the
+    // engine's own error.
+    let (ensure_ascii, indent, separators, sort_keys): (
+        Option<bool>,
+        Option<Value>,
+        Option<Value>,
+        Option<bool>,
+    ) = if passed_no_keyword(&kwargs) {
+        (None, None, None, None)
+    } else {
+        let ensure_ascii = kwargs.get("ensure_ascii")?;
+        let indent = kwargs.get("indent")?;
+        let separators = kwargs.get("separators")?;
+        let sort_keys = kwargs.get("sort_keys")?;
+        kwargs.assert_all_used()?;
+        (ensure_ascii, indent, separators, sort_keys)
+    };
 
     let indent = parse_indent(indent)?;
     let separators = parse_separators(separators, indent.is_some())?;
@@ -1771,8 +1794,14 @@ fn python_join_filter(
     joiner: Option<Cow<'_, str>>,
     kwargs: Kwargs,
 ) -> std::result::Result<String, MinijinjaError> {
-    let attribute: Option<Cow<'_, str>> = kwargs.get("attribute")?;
-    kwargs.assert_all_used()?;
+    // As in `tojson_filter`: no keyword, no recorded read.
+    let attribute: Option<Cow<'_, str>> = if passed_no_keyword(&kwargs) {
+        None
+    } else {
+        let attribute = kwargs.get("attribute")?;
+        kwargs.assert_all_used()?;
+        attribute
+    };
     let joiner = joiner.as_deref().unwrap_or_default();
     let mut text = String::new();
     for (index, item) in value.try_iter()?.enumerate() {
@@ -3475,6 +3504,55 @@ mod tests {
              [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
              [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
              Get_weather Don't|A\u{1c}B Οδος Και|A\u{1c}b οδος και|ΑσΑς|x-y.z|Hi, Yo"
+        );
+    }
+
+    /// A filter call without keyword arguments takes its defaults without
+    /// reading any (the engine records every read in a set it allocates per
+    /// call); a call with a keyword the filter does not know still raises
+    /// the engine's own error, and so does a splat with a non-string key
+    /// (the key `args()` does not list), for `tojson` and for `join`.
+    #[test]
+    fn a_filter_call_with_an_unknown_keyword_still_raises_the_engine_s_error() {
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        for (template, expected) in [
+            (
+                "{{ tools | tojson(bogus=1) }}",
+                "unknown keyword argument 'bogus'",
+            ),
+            (
+                "{{ ['a', 'b'] | join(', ', bogus=1) }}",
+                "unknown keyword argument 'bogus'",
+            ),
+            (
+                "{{ tools | tojson(**{1: 2}) }}",
+                "non string keys passed to kwargs",
+            ),
+            (
+                "{{ ['a', 'b'] | join(', ', **{1: 2}) }}",
+                "non string keys passed to kwargs",
+            ),
+        ] {
+            let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+            let params = ChatTemplateParams {
+                tools: Some(&tools),
+                ..Default::default()
+            };
+            let error = state.apply(&messages, params).unwrap_err().to_string();
+            assert!(error.contains(expected), "{template}: {error}");
+        }
+        let state = ChatTemplateState::new(Some(
+            "{{ tools | tojson }}|{{ ['a', 'b'] | join(', ') }}".to_string(),
+        ))
+        .unwrap();
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(
+            state.apply(&messages, params).unwrap(),
+            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|a, b"
         );
     }
 

@@ -325,6 +325,10 @@ mod tests {
             factory.create("DEEPSEEK_V4_LOCAL").model_type(),
             "deepseek_v4"
         );
+        assert_eq!(
+            factory.create("deepseek-ai/DeepSeek-V4-Pro").model_type(),
+            "deepseek_v4"
+        );
 
         let mut parser = factory.create("deepseek-ai/DeepSeek-V4-Flash");
         parser.mark_reasoning_started();

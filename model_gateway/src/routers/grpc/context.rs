@@ -242,10 +242,11 @@ pub(crate) struct ProcessingState {
     /// The parser names the request's model's cards set (its workers' labels), resolved once
     /// in preparation (`reading::prepare`: one resolution, a walk over the model's workers per
     /// name) and read by request building in its place (`reading::reasoning_decision`,
-    /// `reading::decide`, `backed_plan::build`): one resolution for preparation and request
-    /// building. The response stages (`processor`, `streaming`) still resolve their two names
-    /// themselves; they are the next read. `None` on the endpoints whose preparation resolves
-    /// no names; a read then resolves them itself.
+    /// `reading::decide`, `backed_plan::build`), which hands them to the response spec
+    /// (`ChatResponseSpec::parser_names`, `MessagesResponseSpec::parser_names`) for the
+    /// response stages' two readers (`processor`, `streaming`): one resolution per request.
+    /// `None` on the endpoints whose preparation resolves no names; a read then resolves them
+    /// itself.
     pub parser_names: Option<Names>,
 
     /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
