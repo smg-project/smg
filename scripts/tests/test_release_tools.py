@@ -1497,10 +1497,18 @@ def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sand
     assert "### Fixes\n\n- fix(router): three (#123)\n- fix(router): two\n" in out
     assert "chore(release): bump versions" not in out
     assert "### Docker images\n\n- stub images for v1.14.0" in out
-    assert "gh release create v1.14.0 --verify-tag --title 'SMG v1.14.0'" in done.stderr
+    assert "gh release create v1.14.0 --verify-tag --title 'v1.14.0'" in done.stderr, (
+        "the tag alone is the title"
+    )
+    assert "### Storage" not in out, (
+        "no pull request declares a storage change: no Storage subsection"
+    )
     assert "--prerelease" not in done.stderr
     candidate = repo.tool("notes", "1.14.0-rc.1")
-    assert "gh release create v1.14.0-rc.1 --verify-tag --prerelease" in candidate.stderr
+    assert (
+        "gh release create v1.14.0-rc.1 --verify-tag --prerelease --title 'v1.14.0-rc.1'"
+        in candidate.stderr
+    )
     since = repo.tool("notes", "1.14.0", "v1.14.0-rc.1").stdout
     assert "fix(router): two" not in since and "fix(router): three (#123)" in since
 
@@ -1580,10 +1588,10 @@ SKELETON = (
     "### Configuration that now refuses to start",
     "### Changed defaults",
     "### API behavior",
-    "### Metrics, logs and traces",
+    "### Metrics",
     "### Engine side",
     "### Bindings and Rust crates",
-    "## Packages and engines",
+    "## Packages",
     "## Known limits",
     "## What's Changed",
 )
@@ -1699,7 +1707,7 @@ def test_notes_render_the_template_seeded_by_the_pull_requests_release_notes(
     )
     assert "release.sh notes --check <file>" in done.stderr
     assert (
-        "gh release create v1.14.0 --verify-tag --title 'SMG v1.14.0' --notes-file <file>"
+        "gh release create v1.14.0 --verify-tag --title 'v1.14.0' --notes-file <file>"
         in done.stderr
     )
 
@@ -1710,7 +1718,7 @@ def test_notes_seed_upgrade_notes_from_what_the_pull_requests_declare(
     pulls = tmp_path / "pulls"
     noted_release(repo, pulls)
     out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
-    upgrade = section(out, "## Upgrade notes", "## Packages and engines")
+    upgrade = section(out, "## Upgrade notes", "## Packages")
     declared = "<!-- AUTHOR: declared: {}; keep it here, move it or drop it -->"
     assert "- The memory history backend is bounded at 10,000 responses. (#214) " + declared.format(
         "a breaking change"
@@ -1722,7 +1730,7 @@ def test_notes_seed_upgrade_notes_from_what_the_pull_requests_declare(
         upgrade, "### Changed defaults"
     )
     assert "(#206) " + declared.format("a removed or renamed flag or setting") in subsection(
-        upgrade, "### Metrics, logs and traces"
+        upgrade, "### Metrics"
     )
     empty = "<!-- AUTHOR: nothing declared by the pull requests under this heading: write it or delete the heading. -->"
     for heading in ("### API behavior", "### Engine side", "### Bindings and Rust crates"):
@@ -1739,7 +1747,7 @@ def test_notes_name_the_packages_and_engines_at_the_tag(repo: Sandbox, tmp_path:
     pulls = tmp_path / "pulls"
     noted_release(repo, pulls)
     out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
-    packages = section(out, "## Packages and engines", "## Known limits")
+    packages = section(out, "## Packages", "## Known limits")
     assert (
         "- `smg` 1.14.0 on PyPI and crates.io, with container images and Helm chart 1.14.0. Release images build on"
         " vLLM (vllm/vllm-openai:v0.31.0 and vllm/vllm-openai:v0.27.1), SGLang (lmsysorg/sglang:v0.5.21) and"
@@ -1882,6 +1890,24 @@ def test_the_release_note_of_a_pull_request_body() -> None:
     assert notes.note_section("## Release note\n\n<!-- alone -->\n") == (True, None)
     assert notes.note_section("## Description\n\nx") == (False, None)
     assert notes.note_section("## Release note\n\nnone\n") == (True, "")
+    # the four bodies of the pull request template's section: untouched (its comment alone) -> missing, seeded and
+    # marked; a sentence -> as written; "none" with a reason -> declared none; the section deleted -> missing
+    template_comment = (
+        '<!-- One sentence on what a user gets, written to be pasted into the release notes as it stands, or "none"'
+        " with the reason. The release notes are written from these sentences. -->"
+    )
+    untouched = (
+        f"## Description\n\nx\n\n## Release note\n\n{template_comment}\n\n## Test Plan\n\ny\n"
+    )
+    assert notes.release_note(untouched) is None
+    assert (
+        notes.release_note(untouched.replace(template_comment, "A sentence, as written."))
+        == "A sentence, as written."
+    )
+    assert (
+        notes.release_note(untouched.replace(template_comment, "none: a test-only change.")) == ""
+    )
+    assert notes.release_note("## Description\n\nx\n\n## Test Plan\n\ny\n") is None
     assert (
         notes.release_note("## Release note\n\nA --> closer first, then a <!-- opener.\n")
         == "A --&gt; closer first, then a &lt;!-- opener."

@@ -30,9 +30,7 @@ These bugs shipped in v{{previous}}. Problems introduced and fixed during this c
 
 ## Upgrade notes
 
-<!-- AUTHOR: the candidates below come from pull requests that declared a breaking change, a removed or renamed flag or setting, a changed default or a configuration that now refuses to start; each sits under the subsection its declaration suggests, with the declaration named. Check every candidate against its diff, add what the pull requests did not declare, delete the subsections that stay empty, then replace this comment. -->
-
-### Storage
+<!-- AUTHOR: the candidates below come from pull requests that declared a breaking change, a removed or renamed flag or setting, a changed default or a configuration that now refuses to start; each sits under the subsection its declaration suggests, with the declaration named. A Storage subsection opens the list only when the release carries a schema migration (the tool opens it when a pull request declares a storage change). Check every candidate against its diff, add what the pull requests did not declare, delete the subsections that stay empty, then replace this comment. -->
 
 {{upgrade_storage}}
 
@@ -48,7 +46,7 @@ These bugs shipped in v{{previous}}. Problems introduced and fixed during this c
 
 {{upgrade_api}}
 
-### Metrics, logs and traces
+### Metrics
 
 {{upgrade_metrics}}
 
@@ -62,7 +60,7 @@ These bugs shipped in v{{previous}}. Problems introduced and fixed during this c
 
 {{upgrade_unsorted}}
 
-## Packages and engines
+## Packages
 
 {{packages}}
 

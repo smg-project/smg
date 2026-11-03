@@ -18,7 +18,7 @@ release branch behind you, `bump` and `pick` leave you on the topic branch they 
 | candidate or final | `make release-bump VERSION=1.14.0-rc.2` (or `VERSION=1.14.0`) | the version bump on a topic branch off `release/1.14` and its pull request against the release branch; the body carries the release gate | the release owner |
 | tag | `make release-tag VERSION=1.14.0-rc.1 [PUSH=1]` | checks the versions at the branch head against the previous tag, creates the annotated tag `v1.14.0-rc.1` with a `Signed-off-by` line, prints the push command | a maintainer with tag rights (the tag ruleset) |
 | publish | `make release-publish-plan VERSION=1.14.0-rc.1` | prints the workflow dispatches to run against the tag and the artifact names they produce; runs nothing | the release owner dispatches them |
-| notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes draft: `scripts/release/NOTES-TEMPLATE.md` with the merged pull requests since the previous final seeding Highlights, Notable fixes and Upgrade notes from their "## Release note" sections, the packages and images at the tag, and the list by type under What's Changed; the narrative stays as marked placeholders (see [Writing the notes](#writing-the-notes)); `scripts/release/release.sh notes --check notes.md` refuses a draft that still carries one | the release owner |
+| notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes draft: `scripts/release/NOTES-TEMPLATE.md` with the merged pull requests since the previous final seeding Highlights, Notable fixes and Upgrade notes from their "## Release note" sections, the packages and images at the tag under Packages, and the list by type under What's Changed; the narrative stays as marked placeholders (see [Writing the notes](#writing-the-notes)); `scripts/release/release.sh notes --check notes.md` refuses a draft that still carries one | the release owner |
 | main follows | `make release-bump-main VERSION=1.14.0` | after a final: a pull request that moves `main`'s crates and packages to at least the release's; the gateway keeps its development version (it moves to the next one only when `main` still reads below the release) | the release owner |
 | ship | `make release-ship VERSION=1.14.1 [DRY_RUN=1] [FROM=<step>]` | the candidate, final or patch in one run on an existing release branch: the gate's CI rows for the commit the bump builds on, the bump (pushed to the branch when the rules allow the caller a push, else its pull request, waited for), the tag, the notes, the GitHub release and the publish dispatches; a rerun skips what is there ([Ship](#ship-the-release-in-one-run)) | the release owner, with push or bypass rights for the direct bump |
 
@@ -199,8 +199,9 @@ and the patches.
 
 The published notes are a narrative, not a list. `scripts/release/NOTES-TEMPLATE.md` is their
 skeleton (the title and opening, Before you upgrade, Highlights with one `###` narrative each and
-how the release was validated, Notable fixes by area, Upgrade notes by kind, Packages and engines,
-Known limits, then What's Changed), and `make release-notes` renders it:
+how the release was validated, Notable fixes by area, Upgrade notes by kind (a Storage subsection
+opens the list only when a pull request declares a storage change), Packages, Known limits, then
+What's Changed), as the published notes are laid out, and `make release-notes` renders it:
 
 - every merged pull request's release note (one or two sentences on what a user gets, under a
   `## Release note` heading or a `Release note:` line in the pull request body) seeds the
@@ -213,7 +214,7 @@ Known limits, then What's Changed), and `make release-notes` renders it:
   removed or renamed flag or setting, a changed default or a configuration that now refuses to
   start seeds Upgrade notes under the subsection its declaration suggests, with the declaration
   named;
-- Packages and engines reads the publish plan's crates and packages at the tag against the
+- Packages reads the publish plan's crates and packages at the tag against the
   previous final (new crates, moved versions), the engine images' bases from the workflow's table
   and the published image list; What's Changed is the list by type, as before;
 - the opening paragraphs, Before you upgrade, every narrative, How this release was validated and

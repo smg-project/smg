@@ -458,8 +458,13 @@ def upgrade_sections(pulls: list[Pull]) -> dict[str, str]:
     sections = {
         f"upgrade_{name}": "\n".join(lines) or empty
         for name, lines in slots.items()
-        if name != "unsorted"
+        if name not in ("storage", "unsorted")
     }
+    # Storage opens the list only when a release carries a storage change (a schema migration): the heading comes
+    # with its candidates, or not at all
+    sections["upgrade_storage"] = (
+        "### Storage\n\n" + "\n".join(slots["storage"]) if slots["storage"] else ""
+    )
     unsorted = slots["unsorted"]
     sections["upgrade_unsorted"] = (
         "<!-- AUTHOR: candidates with no obvious subsection: place each under one above, or drop it. -->\n\n"
@@ -521,7 +526,7 @@ def engine_bases(workflow: str) -> str | None:
 
 
 def packages(args: argparse.Namespace) -> str:
-    """The Packages and engines section: the publish plan's components at the release, against the previous tag."""
+    """The Packages section: the publish plan's components at the release, against the previous tag."""
     before = components(Path(args.components_since)) if args.components_since else {}
     after = components(Path(args.components_ref)) if args.components_ref else {}
     bases = (

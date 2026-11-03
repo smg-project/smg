@@ -632,7 +632,7 @@ cmd_notes() {
   # the release; the published images. The pull request bodies are read through gh and kept under $NOTES_CACHE.
   contributors=$(git shortlog -s --no-merges "$since..$ref" | grep -c . || true)
   component_list "$ref" "$scratch/components-ref" \
-    || { note "notes: Packages and engines names the gateway alone"; : > "$scratch/components-ref"; }
+    || { note "notes: Packages names the gateway alone"; : > "$scratch/components-ref"; }
   component_list "$since" "$scratch/components-since" 2>/dev/null || : > "$scratch/components-since"
   git show "$ref:.github/workflows/release-engine-docker.yml" > "$scratch/engine-workflow" 2>/dev/null || : > "$scratch/engine-workflow"
   chart=$(git show "$ref:deploy/helm/smg/Chart.yaml" 2>/dev/null | sed -n 's/^version: *//p' | head -n 1)
@@ -652,9 +652,9 @@ cmd_notes() {
   rm -rf -- "$scratch"
   note "a draft: replace every <!-- AUTHOR: --> comment, then 'release.sh notes --check <file>' before the GitHub release:"
   if is_final "$version"; then
-    note "  gh release create $tagname --verify-tag --title 'SMG $tagname' --notes-file <file>"
+    note "  gh release create $tagname --verify-tag --title '$tagname' --notes-file <file>"
   else
-    note "  gh release create $tagname --verify-tag --prerelease --title 'SMG $tagname' --notes-file <file>"
+    note "  gh release create $tagname --verify-tag --prerelease --title '$tagname' --notes-file <file>"
   fi
 }
 
