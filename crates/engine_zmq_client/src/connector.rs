@@ -365,6 +365,15 @@ impl<O: EngineOutput> RequestRegistry<O> {
         self.prefill_pending
     }
 
+    /// Whether a prompt the engine was handed is still unanswered: a request
+    /// whose add frame the engine accepted and whose first output has not
+    /// come.
+    fn awaits_first_output(&self) -> bool {
+        self.requests
+            .values()
+            .any(|entry| entry.handed && !entry.started)
+    }
+
     /// How long the engine may take to prefill `tokens` at the allowed rate
     /// (`prefill_tokens_per_sec`); zero when nothing is allowed.
     fn prefill_allowance(&self, tokens: u64) -> Duration {
@@ -1029,8 +1038,29 @@ impl<P: EngineProtocol> ClientInner<P> {
             // own `current_wave` on the way out; track that so the next wake
             // names a wave the ranks will still accept.
             WaveEvent::Complete(wave) => {
-                let mut current = state.lock();
-                *current = (*current).max(wave.saturating_add(1));
+                let advanced = {
+                    let mut current = state.lock();
+                    let next = (*current).max(wave.saturating_add(1));
+                    let advanced = next > *current;
+                    *current = next;
+                    advanced
+                };
+                // A drain reported while a prompt the group was handed has no
+                // output yet is the drain racing a submit: the holder's peers
+                // read the wake while they were still stepping (a no-op) and
+                // the group agreed to park before the holder's loop had read
+                // the add, which an engine's input thread hands over later
+                // than a wake (it decodes and preprocesses the request
+                // first). The holder then reads the add alone and blocks in
+                // the group's collective; without a DP coordinator nobody
+                // wakes its peers again, and the silence watchdog ends the
+                // group. So the group is woken once more, at a fresh wave.
+                // Every rank reports the drain: the report that moves the
+                // clock wakes, the rest find it moved. Nothing pending,
+                // nothing sent: an idle group stays parked.
+                if advanced && self.registry.lock().awaits_first_output() {
+                    self.queue_wake(wave, "a prompt pending through a drained wave");
+                }
             }
             // A rank took a request for an already-drained wave and is asking
             // for the rest of the group to catch up.
@@ -1039,18 +1069,23 @@ impl<P: EngineProtocol> ClientInner<P> {
                     let mut current = state.lock();
                     *current = (*current).max(wave);
                 }
-                // Queued for every rank, not awaited: a frame blocked ahead in
-                // the input queue must not park the dispatcher (the output of
-                // every rank keeps flowing), and the wake reaches the whole
-                // group when the engine reads again.
-                let queued = match self.next_wave() {
-                    Some(next) => self.queue_start_wave(next),
-                    None => Ok(()),
-                };
-                if let Err(error) = queued {
-                    warn!(%error, wave, "failed to queue the requested wave");
-                }
+                self.queue_wake(wave, "the requested wave");
             }
+        }
+    }
+
+    /// Queue a wake of the whole group at a fresh wave, from the dispatcher:
+    /// for every rank and not awaited, since a frame blocked ahead in the
+    /// input queue must not park the dispatcher (the output of every rank
+    /// keeps flowing), and the wake reaches the whole group when the engine
+    /// reads again. `wave` and `why` name the notification it answers.
+    fn queue_wake(&self, wave: u64, why: &str) {
+        let queued = match self.next_wave() {
+            Some(next) => self.queue_start_wave(next),
+            None => Ok(()),
+        };
+        if let Err(error) = queued {
+            warn!(%error, wave, "failed to queue the wake for {why}");
         }
     }
 

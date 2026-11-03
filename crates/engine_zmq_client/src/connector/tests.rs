@@ -1275,6 +1275,91 @@ async fn wave_complete_updates_the_clock_without_waking() {
     assert!(next_wake(&mut engines[0]).await > 3);
 }
 
+/// The drain can race a submit. The holder's peers read the submit's wake
+/// while they are still stepping (a no-op) and the group agrees to park
+/// before the holder's loop has read the add: an engine's input thread
+/// decodes and preprocesses a request before it reaches the loop, a wake it
+/// hands over at once. The holder then reads the add alone and blocks in the
+/// group's collective, and without a DP coordinator nobody wakes its peers
+/// again. So a drained wave reported while a prompt the group was handed has
+/// no output yet wakes the group once more, at a fresh wave, once for the
+/// park however many ranks report it; answered, the prompt leaves a drained
+/// wave the bookkeeping it is.
+#[tokio::test]
+async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_again() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    match engines[0].recv().await.unwrap() {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
+        other => panic!("rank 0 expected the Add, got {other:?}"),
+    }
+    let first = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, first);
+
+    // Both ranks report the wave drained: they parked before the holder's
+    // loop read the add, the prompt still unanswered.
+    for rank in 0..2u32 {
+        engines[rank as usize]
+            .send_output(wave_control(rank, DpControlMessage::WaveComplete(first)))
+            .await
+            .unwrap();
+    }
+    let again = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
+        .await
+        .expect("the group was not woken again after its drain");
+    assert!(
+        again > first,
+        "the second wake {again} does not outrank the parked ranks at {}",
+        first + 1
+    );
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
+            .await
+            .expect("rank 1 was not woken again after its drain"),
+        again
+    );
+
+    // The holder answers and finishes the prompt: the next drain is
+    // bookkeeping again, and the group stays parked. Nothing else may have
+    // reached a rank meanwhile: the two reports of one park were one wake.
+    engines[0]
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "req-1".into(),
+                new_token_ids: vec![10],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
+    assert!(stream.next().await.is_none());
+    engines[0]
+        .send_output(wave_control(0, DpControlMessage::WaveComplete(again)))
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while *client.inner.wave.as_ref().unwrap().lock() <= again {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the drained wave never reached the clock");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), engines[1].recv())
+            .await
+            .is_err(),
+        "a drained wave with nothing pending woke the group"
+    );
+}
+
 /// Independent ranks keep no wave clock, so a stray wave notification (a
 /// mislabeled engine, say) must be ignored rather than panic or start
 /// waking ranks that never park.
