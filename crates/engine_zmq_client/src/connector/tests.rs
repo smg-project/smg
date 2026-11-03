@@ -12,6 +12,7 @@ use crate::{
     },
     protocol::{
         handshake::EngineCoreReadyResponse,
+        kv_transfer::KvTransferStats,
         vllm::{
             output::{
                 DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
@@ -3384,4 +3385,70 @@ fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
         connection_layout::<SglangProtocol>(&[]),
         SglangLayout::default()
     );
+}
+
+/// A connector's transfer samples are kept for a taker only, fold per rank
+/// until the taker drains them, and a take leaves nothing behind.
+#[tokio::test]
+async fn kv_transfer_samples_fold_for_a_taker_until_taken() {
+    let (client, mut engine, _ns) = connect().await;
+    let report = |durations: Vec<f64>| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats::default()),
+            kv_transfer: Some(Box::new(
+                KvTransferStats::default().with_samples("transfer_duration", durations),
+            )),
+            ..Default::default()
+        })
+    };
+    // A later load report on the same socket proves the batches before it
+    // were routed.
+    let marker = |running: u64| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: running,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    async fn routed(client: &EngineCoreClient, running: u64) {
+        let deadline = Instant::now() + TIMEOUT;
+        while client.engine_load(0).map(|load| load.num_running) != Some(running) {
+            assert!(
+                Instant::now() < deadline,
+                "the marker {running} never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    // Nobody asked: the report is not kept.
+    for outputs in [report(vec![0.7]), marker(5)] {
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+    }
+    routed(&client, 5).await;
+    assert!(
+        client.take_kv_transfer().is_empty(),
+        "without a taker nothing is kept"
+    );
+    // A taker asked: the reports fold until taken, once.
+    client.keep_kv_transfer();
+    for outputs in [report(vec![0.1]), report(vec![0.3]), marker(7)] {
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+    }
+    routed(&client, 7).await;
+    let taken = client.take_kv_transfer();
+    assert_eq!(taken.len(), 1, "{taken:?}");
+    let (engine_index, stats) = &taken[0];
+    assert_eq!(*engine_index, 0);
+    assert_eq!(stats.samples("transfer_duration"), Some(&[0.1, 0.3][..]));
+    assert!(client.take_kv_transfer().is_empty(), "taken once");
 }
