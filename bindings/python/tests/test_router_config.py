@@ -659,3 +659,28 @@ class TestJwtConfigRoleClaim:
         assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
         auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
         assert auth.jwt.role_claim == "groups"
+
+
+class TestTheRouterRefusesWhatTheCliRefuses:
+    """The binary refuses these flag shapes at parse time; the Router refuses
+    the same values from ``start()`` with the same words, before anything binds."""
+
+    @staticmethod
+    def router(**kwargs) -> _Router:
+        return _Router(worker_urls=["http://worker:8000"], **kwargs)
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused(self):
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            self.router(prometheus_duration_buckets=[1.0, 0.5]).start()
+
+    @pytest.mark.parametrize("bound", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_a_bucket_bound_that_is_not_a_finite_number_above_zero_is_refused(self, bound):
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            self.router(prometheus_duration_buckets=[0.5, bound]).start()
+
+    def test_a_role_mapping_to_an_unknown_gateway_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"Gateway.Admin": "administrator"})
+        with pytest.raises(ValueError, match="the gateway role must be 'admin' or 'user'"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()

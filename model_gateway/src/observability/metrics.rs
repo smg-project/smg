@@ -20,7 +20,10 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
-use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
+use crate::{
+    config::{ConfigError, ConfigResult},
+    routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -383,6 +386,32 @@ impl Default for PrometheusConfig {
             host: "0.0.0.0".to_string(),
             duration_buckets: None,
         }
+    }
+}
+
+impl PrometheusConfig {
+    /// Refuses a duration bucket list the exporter would render wrongly: a
+    /// bound that is not a finite number above 0, or bounds that do not
+    /// ascend strictly (the `le` labels of every duration histogram would
+    /// come out of order). The one check for every construction path, so
+    /// the CLI and the Python binding refuse the same list with the same
+    /// words.
+    pub fn validate_duration_buckets(buckets: &[f64]) -> ConfigResult<()> {
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                bad,
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        Ok(())
     }
 }
 
