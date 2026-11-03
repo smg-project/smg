@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use common::counting_alloc::{calls, Counting};
 use llm_tokenizer::{
@@ -149,28 +149,26 @@ fn an_exact_cache_hit_of_an_8k_id_prompt_copies_the_ids_once() {
 
 /// `ids` through one stream as the gateway reads it: each token's text
 /// appended into the stream's buffer, cleared per token and keeping its
-/// capacity. The allocation calls of the first token and of all the others.
-fn allocations_per_step(tokenizer: Arc<dyn Tokenizer>, ids: &[u32]) -> (usize, usize, String) {
+/// capacity. The allocation calls of every step, in order, and the text.
+fn allocations_per_step(tokenizer: Arc<dyn Tokenizer>, ids: &[u32]) -> (Vec<usize>, String) {
     let mut sequence = Sequence::new(tokenizer);
     let mut out = String::with_capacity(64);
     let mut text = String::new();
-    let (appended, first) = allocations_during(|| {
-        sequence
-            .append_token_into(ids[0], &mut out)
-            .expect("the first step")
-    });
-    assert!(appended, "the first token has text of its own");
-    text.push_str(&out);
-    let mut rest = 0;
-    for &id in &ids[1..] {
+    let mut steps = Vec::with_capacity(ids.len());
+    for &id in ids {
         out.clear();
         let (appended, calls) =
             allocations_during(|| sequence.append_token_into(id, &mut out).expect("a step"));
         assert!(appended, "every token of the stream has text of its own");
-        rest += calls;
+        steps.push(calls);
         text.push_str(&out);
     }
-    (first, rest, text)
+    (steps, text)
+}
+
+/// The distinct counts among `steps`, for a failure message.
+fn distinct(steps: &[usize]) -> BTreeSet<usize> {
+    steps.iter().copied().collect()
 }
 
 #[test]
@@ -179,18 +177,19 @@ fn a_decode_step_on_a_byte_level_vocabulary_allocates_nothing() {
     let prompt = "hello the world ".repeat(400);
     let encoding = tokenizer.encode(&prompt, false).expect("an encode");
     let ids = &encoding.token_ids()[..1_000];
-    let (first, rest, text) = allocations_per_step(Arc::clone(&tokenizer), ids);
+    let (steps, text) = allocations_per_step(Arc::clone(&tokenizer), ids);
     assert_eq!(
         text,
         tokenizer.decode(ids, false).expect("a decode"),
         "the stream is the decode"
     );
-    assert_eq!(
-        (first, rest),
-        (0, 0),
-        "a 1,000-token stream on a byte-level vocabulary allocated {first} times on its first \
-         token and {rest} times on the other 999: every step borrows the whole token's text from \
-         the table and appends it into the stream's buffer"
+    assert!(
+        steps.iter().all(|&calls| calls == 0),
+        "a 1,000-token stream on a byte-level vocabulary allocated {:?} times per token ({} on \
+         the first): every step borrows the whole token's text from the table and appends it \
+         into the stream's buffer",
+        distinct(&steps),
+        steps[0]
     );
 }
 
@@ -207,22 +206,23 @@ fn a_decode_step_on_a_byte_fallback_vocabulary_costs_two_strings_today() {
     ] {
         let count = pieces.len() as u32;
         let ids: Vec<u32> = (0..1_000).map(|k| pieces.start + k % count).collect();
-        let (first, rest, text) = allocations_per_step(Arc::clone(&tokenizer), &ids);
+        let (steps, text) = allocations_per_step(Arc::clone(&tokenizer), &ids);
         assert_eq!(
             text,
             tokenizer.decode(&ids, false).expect("a decode"),
             "the stream is the decode"
         );
-        assert_eq!(
-            rest,
-            expected * 999,
-            "a 1,000-token stream of pieces {name} on a byte-fallback vocabulary allocated \
-             {rest} times over its 999 steady steps (and {first} on the first): today each step \
-             copies the piece's text out of the table and renders the one-id window into a new \
-             prefix string sized at four bytes per id, which {growth} for such a piece: \
-             {expected} allocations per token where the byte-level decoder makes none; a step \
-             that borrows the piece and keeps its window takes this to 0, and a step that goes \
-             back to the two window decodes per token takes it to 4 or more"
+        let (first, steady) = steps.split_first().expect("a thousand steps");
+        assert!(
+            steady.iter().all(|&calls| calls == expected),
+            "a 1,000-token stream of pieces {name} on a byte-fallback vocabulary allocated {:?} \
+             times per steady step (and {first} on the first): today each step copies the \
+             piece's text out of the table and renders the one-id window into a new prefix \
+             string sized at four bytes per id, which {growth} for such a piece: {expected} \
+             allocations per token where the byte-level decoder makes none; a step that borrows \
+             the piece and keeps its window takes this to 0, and a step that goes back to the \
+             two window decodes per token takes it to 4 or more",
+            distinct(steady)
         );
     }
 }

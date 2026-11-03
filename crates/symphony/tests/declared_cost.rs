@@ -345,10 +345,7 @@ fn a_delta_of_a_tagged_calls_string_argument_costs_two_strings_today() {
         steady
             .iter()
             .copied()
-            .fold(std::collections::BTreeSet::new(), |mut set, cost| {
-                set.insert(cost);
-                set
-            }),
+            .collect::<std::collections::BTreeSet<_>>(),
         &costs[..4]
     );
     // One more piece, read for its shape: one fragment, the escaped text and its source both
