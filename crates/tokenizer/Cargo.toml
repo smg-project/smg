@@ -24,7 +24,6 @@ tokenizers-v1 = ["dep:tokenizers-v1"]
 anyhow.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
-http.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -69,7 +68,8 @@ unicode-normalization = "0.1"
 criterion = "0.8"
 openai-protocol.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
-# The reqwest hf-hub binds: the hub tests build the Hub's answers to a file request with it.
+# The hub tests build the Hub's answers to a file request: http for the response, the reqwest hf-hub binds for the error.
+http.workspace = true
 reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
