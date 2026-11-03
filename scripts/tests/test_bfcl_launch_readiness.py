@@ -17,7 +17,11 @@ SCRIPT = Path(
 )
 SOURCE = SCRIPT.read_text()
 WAIT_HTTP = re.search(r"(?ms)^wait_http\(\).*?^}", SOURCE).group()
-GATE = re.search(r'wait_http "(http://127\.0\.0\.1:\$ARM_B_GW_PORT/[^\"]+)"', SOURCE).group(1)
+_GATE = re.search(
+    r'(?m)^\s*wait_http "(http://127\.0\.0\.1:\$ARM_B_GW_PORT/[^\"]+)"[^|&;\n]*$', SOURCE
+)
+assert _GATE is not None, "the arm B readiness gate must not have a trailing fallback"
+GATE = _GATE.group(1)
 
 
 @contextlib.contextmanager
@@ -122,9 +126,9 @@ class LaunchReadiness(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        result = run_gate(port)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("TIMEOUT", result.stderr)
+            result = run_gate(port)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TIMEOUT", result.stderr)
 
 
 if __name__ == "__main__":
