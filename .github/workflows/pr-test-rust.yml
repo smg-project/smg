@@ -1640,6 +1640,55 @@ jobs:
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
+  # Initial local Responses API coverage on AMD, intentionally partial.
+  # The ten positive pytest paths name 21 authored method bodies in the frozen
+  # source; parametrized collection and current runtime qualification are separate.
+  # This is not the full SGLang Responses row or original38 index22 acceptance.
+  # Keep the full NVIDIA/CPU/vendor/Oracle/MCP lanes above and below unchanged.
+  # Default OFF. Review the exact caller/callee combination and shared-host
+  # admission before setting this flag; ordinary PRs need their own opt-in too.
+  e2e-1gpu-responses-memory-core-amd:
+    name: e2e-1gpu-responses-memory-core-amd (vllm; partial local core)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_RESPONSES_CORE == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-agentic != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 32
+      test_timeout: 24
+      # Literal node IDs reject unknown class/method paths rather than silently
+      # accepting a substring match. Keep the full original row's92 floor intact;
+      # this separate partial lane rejects empty selection but claims no collected count.
+      test_dirs: >-
+        e2e_test/responses/test_background.py::TestBackgroundResponsesGptOss
+        e2e_test/responses/test_sampling_params.py::TestSamplingParamsHarmony
+        e2e_test/responses/test_state_management.py::TestStateManagementGptOss
+        e2e_test/responses/test_streaming_events.py::TestStreamingEventsGptOss
+        e2e_test/responses/test_structured_output.py::TestStructuredOutputGptOss
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_auto
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_required
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_specific_function
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_streaming
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_basic_function_call
+      test_filter: ""
+      min_selected: 1
+      setup_agentic_deps: false
+      provider_api_keys: false
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-2gpu-pd:
     name: e2e-2gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
@@ -2342,7 +2391,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2393,6 +2442,17 @@ jobs:
 
       - name: Check CI result
         run: |
+          # This optional partial AMD lane has a typed verdict even while OFF.
+          # Unknown/empty results cannot be accepted as a successful invocation.
+          case "${{ needs.e2e-1gpu-responses-memory-core-amd.result }}" in
+            success|skipped) ;;
+            failure|cancelled)
+              echo "AMD Responses memory core failed or was cancelled"
+              exit 1 ;;
+            *)
+              echo "AMD Responses memory core returned an unknown CI result"
+              exit 1 ;;
+          esac
           # A job that runs into its timeout-minutes ends "cancelled", not
           # "failure", and fails this gate the same way (smg-project/smg-lab#171).
           # A run cancelled as a whole ends with this gate failed too: it did
@@ -2426,6 +2486,7 @@ jobs:
                 "${{ needs.e2e-1gpu-realtime.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses-memory-core-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \

@@ -224,3 +224,296 @@ def test_real_children_carrying_the_marker_are_ended_and_others_are_not(mod):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+
+
+STRICT_UID = 31415
+
+
+def _strict_process(root, pid, *, ppid=1, uid=STRICT_UID, birth=100, marker=MARKER):
+    directory = root / str(pid)
+    directory.mkdir(exist_ok=True)
+    fields = ["S", str(ppid), *(["0"] * 17), str(birth)]
+    (directory / "stat").write_text(f"{pid} (worker) {' '.join(fields)}\n")
+    (directory / "status").write_text(f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    (directory / "environ").write_bytes(f"E2E_JOB_MARKER={marker}\0".encode())
+
+
+@pytest.fixture
+def strict_tree(tmp_path):
+    root = tmp_path / "strict-proc"
+    root.mkdir()
+    for pid, ppid in [(1, 0), (50, 1), (60, 50), (61, 60), (100, 1), (101, 100)]:
+        _strict_process(root, pid, ppid=ppid, birth=1000 + pid)
+    _strict_process(root, 200, marker=MARKER + "-other", birth=1200)
+    _strict_process(root, 300, uid=STRICT_UID + 1, birth=1300)
+    # Clearly foreign users are excluded without reading their environments.
+    (root / "300" / "environ").unlink()
+    return root
+
+
+class _Pidfds:
+    def __init__(self, root):
+        self.root = root
+        self.opened = {}
+        self.closed = set()
+        self.sent = []
+        self.now = 0.0
+        self.on_open = lambda pid: None
+        self.on_signal = lambda pid, sig: self.remove(pid)
+        self.on_sleep = lambda: None
+
+    def remove(self, pid):
+        directory = self.root / str(pid)
+        if directory.exists():
+            for child in directory.iterdir():
+                child.unlink()
+            directory.rmdir()
+
+    def open(self, pid, flags):
+        assert flags == 0
+        fd = 1000 + len(self.opened)
+        self.opened[fd] = pid
+        self.on_open(pid)
+        return fd
+
+    def send(self, fd, sig, info, flags):
+        assert fd in self.opened and fd not in self.closed
+        assert info is None and flags == 0
+        pid = self.opened[fd]
+        self.sent.append((pid, sig))
+        self.on_signal(pid, sig)
+
+    def close(self, fd):
+        assert fd in self.opened and fd not in self.closed
+        self.closed.add(fd)
+
+    def sleep(self, seconds):
+        self.now += seconds
+        self.on_sleep()
+
+    def run(self, mod, **overrides):
+        kwargs = dict(
+            proc_root=str(self.root),
+            grace=0.4,
+            pidfd_open=self.open,
+            pidfd_send_signal=self.send,
+            close=self.close,
+            sleep=self.sleep,
+            clock=lambda: self.now,
+            self_pid=61,
+            uid=STRICT_UID,
+            log=lambda message: None,
+        )
+        kwargs.update(overrides)
+        return mod.reap_strict(MARKER, **kwargs)
+
+
+def test_strict_ends_only_bound_owned_processes_and_closes_all_handles(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+
+    def signal_owned(pid, sig):
+        if pid == 101 or sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_signal = signal_owned
+    assert runtime.run(mod)
+    assert runtime.sent == [(100, signal.SIGTERM), (101, signal.SIGTERM), (100, signal.SIGKILL)]
+    assert runtime.closed == set(runtime.opened)
+    assert all((strict_tree / str(pid)).exists() for pid in (1, 50, 60, 61, 200, 300))
+
+
+@pytest.mark.parametrize("change", ["birth", "marker", "uid"])
+def test_strict_rechecks_identity_after_open_before_any_signal(mod, strict_tree, change):
+    runtime = _Pidfds(strict_tree)
+
+    def replace(pid):
+        if pid != 100:
+            return
+        _strict_process(
+            strict_tree,
+            pid,
+            birth=9999 if change == "birth" else 1100,
+            marker=MARKER + "-replacement" if change == "marker" else MARKER,
+            uid=STRICT_UID + 1 if change == "uid" else STRICT_UID,
+        )
+
+    runtime.on_open = replace
+    assert not runtime.run(mod)
+    assert runtime.sent == []
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("missing", ["pidfd_open", "pidfd_send_signal"])
+def test_strict_missing_pidfd_api_has_no_numeric_fallback(mod, strict_tree, monkeypatch, missing):
+    runtime = _Pidfds(strict_tree)
+    target = mod.os if missing == "pidfd_open" else mod.signal
+    monkeypatch.setattr(target, missing, None, raising=False)
+    numeric = []
+    monkeypatch.setattr(mod.os, "kill", lambda *args: numeric.append(args))
+    assert not runtime.run(mod, **{missing: None})
+    assert runtime.sent == [] and runtime.opened == {} and numeric == []
+
+
+def test_strict_changed_marker_after_term_is_not_killed_or_reported_clean(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+
+    def signal_owned(pid, sig):
+        if pid == 100 and sig == signal.SIGTERM:
+            (strict_tree / "100" / "environ").write_bytes(b"E2E_JOB_MARKER=other\0")
+        else:
+            runtime.remove(pid)
+
+    runtime.on_signal = signal_owned
+    assert not runtime.run(mod)
+    assert (100, signal.SIGKILL) not in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_survivors_are_failure_after_bounded_term_and_kill(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    runtime.on_signal = lambda pid, sig: None
+    assert not runtime.run(mod)
+    assert runtime.sent == [
+        (100, signal.SIGTERM),
+        (101, signal.SIGTERM),
+        (100, signal.SIGKILL),
+        (101, signal.SIGKILL),
+    ]
+    assert runtime.now <= 2.4 + 1e-9
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_complete_rescan_finds_a_late_reparented_child(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+
+    def signal_owned(pid, sig):
+        if pid == 100:
+            _strict_process(strict_tree, 102, ppid=1, birth=1102)
+        runtime.remove(pid)
+
+    runtime.on_signal = signal_owned
+    assert runtime.run(mod)
+    assert (102, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("file", ["environ", "status", "stat"])
+def test_strict_incomplete_owned_observation_is_failure_without_signal(mod, strict_tree, file):
+    runtime = _Pidfds(strict_tree)
+    path = strict_tree / "100" / file
+    if file == "environ":
+        path.unlink()  # The PID/stat remains: this is not process disappearance.
+    else:
+        path.write_text("unparseable\n")
+    assert not runtime.run(mod)
+    assert runtime.sent == []
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_reused_numeric_pid_during_rescan_is_not_retargeted(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+
+    def signal_owned(pid, sig):
+        runtime.remove(pid)
+        if pid == 100:
+            _strict_process(strict_tree, 100, birth=9999)
+
+    runtime.on_signal = signal_owned
+    assert not runtime.run(mod)
+    assert runtime.sent.count((100, signal.SIGTERM)) == 1
+    assert (100, signal.SIGKILL) not in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_ancestor_observation_failure_never_signals(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    (strict_tree / "60" / "stat").write_text("unparseable\n")
+    assert not runtime.run(mod)
+    assert runtime.sent == [] and runtime.opened == {}
+
+
+def test_strict_cli_rejects_fake_proc_and_dry_run(mod, strict_tree):
+    for args in [
+        ["--strict", "--proc-root", str(strict_tree), MARKER],
+        ["--strict", "--dry-run", MARKER],
+    ]:
+        with pytest.raises(SystemExit) as refused:
+            mod.main(args)
+        assert refused.value.code == 2
+
+
+def test_strict_failure_is_nonzero_while_legacy_default_still_reports(mod, monkeypatch):
+    monkeypatch.setattr(mod, "reap_strict", lambda *args, **kwargs: False)
+    monkeypatch.setattr(mod, "reap", lambda *args, **kwargs: [])
+    assert mod.main(["--strict", MARKER]) == 1
+    assert mod.main([MARKER]) == 0
+
+
+@pytest.mark.skipif(
+    not callable(getattr(os, "pidfd_open", None))
+    or not callable(getattr(signal, "pidfd_send_signal", None)),
+    reason="Linux pidfd APIs are unavailable; strict refusal is tested separately",
+)
+def test_real_pidfd_cleanup_within_explicit_ownership_view(mod, tmp_path):
+    """Real pidfds and proc identities; this does not qualify a full-host scan."""
+    marker = f"e2e-strict-{os.getpid()}-{time.time_ns()}"
+    view = tmp_path / "real-proc-view"
+    view.mkdir()
+    children = []
+    try:
+        owned = subprocess.Popen(["sleep", "300"], env={**os.environ, "E2E_JOB_MARKER": marker})
+        children.append(owned)
+        other = subprocess.Popen(
+            ["sleep", "300"], env={**os.environ, "E2E_JOB_MARKER": marker + "-other"}
+        )
+        children.append(other)
+        protected = mod._strict_ancestors("/proc", os.getpid())
+        assert os.getpid() in protected
+        for pid in {1, *protected, owned.pid, other.pid}:
+            target = Path("/proc") / str(pid)
+            link = view / str(pid)
+            link.symlink_to(target, target_is_directory=True)
+            assert link.is_symlink() and link.resolve(strict=True) == target.resolve(strict=True)
+        assert mod._strict_ancestors(str(view), os.getpid()) == protected
+        owned_before = mod._strict_stat("/proc", owned.pid)
+        other_before = mod._strict_stat("/proc", other.pid)
+        assert owned_before is not None and other_before is not None
+        lines = []
+        assert mod.reap_strict(marker, proc_root=str(view), grace=2.0, log=lines.append)
+        assert owned.wait(timeout=5) == -signal.SIGTERM
+        assert other.poll() is None
+        other_after = mod._strict_stat("/proc", other.pid)
+        assert other_after is not None and other_after[2] == other_before[2]
+        assert mod._strict_ancestors(str(view), os.getpid()) == protected
+        identity = f"pid {owned.pid} uid {os.getuid()} birth {owned_before[2]}"
+        assert any(identity in line and "strict signal" in line for line in lines)
+    finally:
+        for process in children:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+
+def test_strict_same_uid_unmarked_unreadable_process_holds_without_signal(
+    mod, strict_tree, monkeypatch
+):
+    runtime = _Pidfds(strict_tree)
+    _strict_process(strict_tree, 400, birth=1400)
+    unreadable = strict_tree / "400" / "environ"
+    unreadable.write_bytes(b"HOME=/unmarked\0")
+    assert b"E2E_JOB_MARKER=" not in unreadable.read_bytes()
+    real_open = open
+    denied = []
+
+    def deny_unmarked_environment(file, *args, **kwargs):
+        if file == str(unreadable):
+            denied.append(file)
+            raise PermissionError(13, "Permission denied", file)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny_unmarked_environment)
+    lines = []
+    assert not runtime.run(mod, log=lines.append)
+    assert denied == [str(unreadable)]
+    assert runtime.sent == [] and runtime.opened == {} and runtime.closed == set()
+    assert any("PermissionError" in line and str(unreadable) in line for line in lines)
