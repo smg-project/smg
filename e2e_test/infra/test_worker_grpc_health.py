@@ -299,9 +299,9 @@ def test_trt_requires_a_successful_native_model_info_rpc(trt_model, error):
 def test_trt_two_real_rpcs_share_one_probe_budget(trt_model, monkeypatch):
     import grpc
 
-    # Each reply fits a fresh 0.18s timeout, but the pair does not fit the
+    # Each reply fits a fresh 1s timeout, but the pair does not fit the
     # one probe deadline. A per-RPC timeout reset would incorrectly pass.
-    with trt_listener(health_delay=0.12, info_delay=0.12) as (port, calls):
+    with trt_listener(health_delay=0.6, info_delay=0.6) as (port, calls):
         target = host_port(DEFAULT_HOST, port)
         with grpc.insecure_channel(target) as channel:
             # Establish transport before measuring the RPC budget. The worker
@@ -315,9 +315,8 @@ def test_trt_two_real_rpcs_share_one_probe_budget(trt_model, monkeypatch):
                 return channel
 
             monkeypatch.setattr(grpc, "insecure_channel", create_channel)
-            assert _trt_worker(port).grpc_serving(timeout=0.18) is False
+            assert _trt_worker(port).grpc_serving(timeout=1.0) is False
             assert calls == ["HealthCheck", "GetModelInfo"]
-            assert calls[0] == "HealthCheck"
             assert channels == [channel]
 
 
