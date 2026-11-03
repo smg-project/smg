@@ -157,11 +157,21 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
-| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD 1-GPU e2e jobs (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+
+The `e2e-1gpu-completions-amd`, `e2e-1gpu-embeddings-amd`,
+`e2e-1gpu-gateway-amd` and `e2e-1gpu-chat-mm-worker-amd` jobs in
+`pr-test-rust.yml` require both
+`SMG_RUN_AMD_VLLM_LOCAL_LEGS` and `SMG_RUN_AMD_LEGS` to be `true`.
+The extra switch allows these AMD vLLM lanes to be qualified separately
+on shared runners; "local" does not select a model-cache location. On
+pull requests, `SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip
+those jobs; normal workflow triggers, wheel builds and change filters
+still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -214,6 +224,15 @@ They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.
+
+---
+
+## Releases
+
+A release is cut from `main` onto a `release/<x.y>` branch and moves there by pull requests
+(cherry-picks from `main`, candidate and final bumps); `main` never pauses, and nothing is
+published without a maintainer's dispatch. The steps, the `make release-*` targets and the
+gate are in [`scripts/release/README.md`](./scripts/release/README.md).
 
 ---
 

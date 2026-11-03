@@ -619,7 +619,7 @@ impl Assembler {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out);
         text.len()
     }
@@ -686,7 +686,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect()

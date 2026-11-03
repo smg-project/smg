@@ -120,7 +120,7 @@ impl Mock {
 
     /// Wait up to `limit` for the exit; a process still alive by then is
     /// killed and the test fails. Returns the exit status, when it happened
-    /// and the process's log.
+    /// and the process's log. Async polling keeps connection tasks scheduled.
     async fn exit(mut self, limit: Duration) -> (ExitStatus, Instant, String) {
         let deadline = Instant::now() + limit;
         loop {
@@ -243,7 +243,7 @@ async fn sigint_is_handled_the_same_way() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
     // ~40 tokens at 20 ms each: streams of about a second, well inside the
     // default 5 s drain.
@@ -331,7 +331,7 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
     assert!(log.contains("drained; exiting"), "log:\n{log}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn the_drain_deadline_bounds_the_exit() {
     // A stream of several seconds against a half-second drain: the process
     // exits at the deadline, cleanly, and says what it left behind.
@@ -384,7 +384,7 @@ async fn the_drain_deadline_bounds_the_exit() {
     assert!(delivered.chunks < 400);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sigterm_ends_a_kv_event_subscription_held_open() {
     // The gateway's cache-aware policy keeps a SubscribeKvEvents stream open
     // on every worker; a stop that waited for it would never drain.
@@ -421,13 +421,13 @@ async fn sigterm_ends_a_kv_event_subscription_held_open() {
     );
     assert!(
         exited - sent < Duration::from_secs(2),
-        "the held subscription does not run the drain to its deadline: {:?}",
+        "the held subscription does not run the drain to its deadline: {:?}; log:\n{log}",
         exited - sent
     );
     assert!(log.contains("drained; exiting"), "log:\n{log}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_second_signal_during_the_drain_exits_at_once() {
     // A long stream against the default 5 s drain; a second SIGTERM a moment
     // later ends the wait.
@@ -471,7 +471,7 @@ fn zmq_request(request_id: &str, max_tokens: u32) -> EngineCoreRequest {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     // Two requests in flight on a ZMQ rank: one the frontend gives up on
     // during the drain (an Abort; the forwarder it cancels is no fault to

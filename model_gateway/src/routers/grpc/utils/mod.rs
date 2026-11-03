@@ -27,7 +27,7 @@ pub use chat_utils::{
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
-    convert_proto_to_openai_logprobs,
+    convert_proto_to_openai_logprobs, has_entries,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use message_utils::{resolve_media, MediaContext};
@@ -36,14 +36,14 @@ pub(crate) use metrics::{
     route_to_endpoint,
 };
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
-// predicate instead of duplicating it.
-pub use parsers::chat_reasoning_starts_in_prefill;
+// predicates instead of duplicating them: the rendered one where they render,
+// the request-based guess where they do not.
+pub use parsers::{chat_reasoning_starts_in_prefill, chat_reasoning_starts_in_rendered_prefill};
 pub(crate) use parsers::{
-    chat_reasoning_starts_in_rendered_prefill, check_reasoning_parser_availability,
-    check_tool_parser_availability, create_reasoning_parser, create_tool_parser, get_tool_parser,
-    messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
-    rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
-    ParserResolver, WorkerDecoding,
+    check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
+    create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
+    reasoning_parser_requires_special_tokens, rendered_prompt_reasoning_in_prefill,
+    tool_constraints_for_worker, ModelNames, Names, ParserResolver, TagVocabulary, WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

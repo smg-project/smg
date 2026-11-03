@@ -48,7 +48,20 @@ rayon = "1.12"
 thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
-tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.2", optional = true, default-features = false, features = ["regex"] }
+# rc.3 splits what rc.2 compiled unconditionally into features: the pipeline's normalizers, the model types the
+# replayed vocabularies use, the serialized form `from_json` reads, the parallelism switches the adapter sets, and the
+# Unicode-scripts pre-tokenizer; the training progress bar and the hub client stay out.
+tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = true, default-features = false, features = [
+    "regex",
+    "serialize",
+    "normalizers",
+    "parallelism",
+    "bpe",
+    "unigram",
+    "wordpiece",
+    "wordlevel",
+    "unicode-scripts",
+] }
 unicode-normalization = "0.1"
 
 [dev-dependencies]

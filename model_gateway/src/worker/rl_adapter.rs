@@ -3,15 +3,22 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
-use openai_protocol::worker::{ConnectionMode, HttpPoolConfig};
-use smg_rl::{resolve_control_url, RlState, RlWorkerInfo, RlWorkerView};
+use async_trait::async_trait;
+use openai_protocol::worker::{ConnectionMode, HttpPoolConfig, RuntimeType};
+use smg_rl::{
+    resolve_control_url, CallFailure, RankReply, RlControlCalls, RlState, RlWorkerInfo,
+    RlWorkerView,
+};
 use tracing::warn;
 
 use crate::{
     config::RouterConfig,
+    routers::grpc::backend_client::BackendClient,
     worker::{registry::WorkerId, Worker, WorkerHttpClientCache, WorkerRegistry},
 };
 
@@ -104,6 +111,23 @@ impl RegistryRlView {
         let id = self.registry.get_id_by_url(worker.url())?;
         let spec = &worker.metadata().spec;
         let (control_url, control_client) = self.control_endpoint(worker);
+        // A TokenSpeed engine on the direct ZMQ lane takes the RL routes as
+        // control calls on the worker's own connection, when its handshake
+        // declared the control reply: a connected engine that declared none
+        // has no call to take (its wire carries generate and abort only), so
+        // discovery reports it without and a call answers as for a worker
+        // without a control endpoint. An engine still handshaking is taken
+        // at its word until it lands.
+        let control_calls = (*worker.connection_mode() == ConnectionMode::Zmq
+            && spec.runtime_type == RuntimeType::TokenSpeed
+            && worker.backend_client_if_initialized().is_none_or(|client| {
+                matches!(client.as_ref(), BackendClient::Zmq(client) if client.carries_control_calls())
+            }))
+            .then(|| {
+                Arc::new(EngineConnectionControl {
+                    worker: Arc::clone(worker),
+                }) as Arc<dyn RlControlCalls>
+            });
         Some(RlWorkerInfo {
             id: id.as_str().to_string(),
             url: worker.url().to_string(),
@@ -119,7 +143,62 @@ impl RegistryRlView {
             labels: spec.labels.clone(),
             control_url,
             control_client,
+            control_calls,
         })
+    }
+}
+
+/// The RL routes as control calls on a direct-ZMQ worker's own engine
+/// connection, reached through the worker when a call is made (it may still
+/// be handshaking when the registry is read).
+struct EngineConnectionControl {
+    worker: Arc<dyn Worker>,
+}
+
+impl fmt::Debug for EngineConnectionControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EngineConnectionControl")
+            .field("worker", &self.worker.url())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl RlControlCalls for EngineConnectionControl {
+    async fn call(
+        &self,
+        method: &str,
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<Vec<RankReply>, CallFailure> {
+        let client = self
+            .worker
+            .get_backend_client()
+            .await
+            .map_err(|e| CallFailure::Failed(format!("the engine is not connected: {e}")))?
+            .ok_or_else(|| {
+                CallFailure::Failed("the worker has no engine connection".to_string())
+            })?;
+        let BackendClient::Zmq(client) = client.as_ref() else {
+            return Err(CallFailure::Failed(
+                "the worker is not a direct-ZMQ worker".to_string(),
+            ));
+        };
+        match client.rl_control_call(method, body, timeout).await {
+            Ok(replies) => Ok(replies
+                .into_iter()
+                .map(|(success, message)| RankReply { success, message })
+                .collect()),
+            Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
+                Err(CallFailure::Timeout)
+            }
+            // The wire carries no control calls (declared at the handshake):
+            // not a failure of a reachable engine, the route's 422.
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                Err(CallFailure::Unsupported(status.message().to_string()))
+            }
+            Err(status) => Err(CallFailure::Failed(status.message().to_string())),
+        }
     }
 }
 
@@ -237,6 +316,40 @@ mod tests {
         );
         let info = view_over(vec![worker]).list().pop().expect("one worker");
         assert!(info.control_url.is_none());
+    }
+
+    /// A TokenSpeed engine on the direct ZMQ lane is controlled over its own
+    /// connection (one still handshaking is taken at its word; a connected one
+    /// that declared no control reply is not, which needs a live handshake to
+    /// show: the adapter's own test covers that refusal); another runtime's
+    /// ZMQ worker and a gRPC worker are not.
+    #[test]
+    fn a_tokenspeed_zmq_worker_is_controlled_over_its_engine_connection() {
+        let zmq = |url: &str, runtime: RuntimeType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(ConnectionMode::Zmq)
+                    .runtime_type(runtime)
+                    .build(),
+            )
+        };
+        let infos = view_over(vec![
+            zmq("ipc:///tmp/smg-zmq/ts", RuntimeType::TokenSpeed),
+            zmq("ipc:///tmp/smg-zmq/vllm", RuntimeType::Vllm),
+            grpc_worker("grpc://a:1"),
+        ])
+        .list();
+        let calls = |url: &str| {
+            infos
+                .iter()
+                .find(|info| info.url == url)
+                .expect("registered")
+                .control_calls
+                .is_some()
+        };
+        assert!(calls("ipc:///tmp/smg-zmq/ts"));
+        assert!(!calls("ipc:///tmp/smg-zmq/vllm"));
+        assert!(!calls("grpc://a:1"));
     }
 
     #[test]

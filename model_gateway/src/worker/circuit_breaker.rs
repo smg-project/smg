@@ -6,7 +6,7 @@ use std::{
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::observability::metrics::Metrics;
+use crate::{observability::metrics::Metrics, worker::endpoint::Endpoint};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,7 +244,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %self.metric_label,
+                    worker_url = %Endpoint::redacted_str(&self.metric_label),
                     "Success recorded while circuit is open"
                 );
             }
@@ -306,7 +306,7 @@ impl CircuitBreaker {
         let (from, to) = (from.as_str(), to.as_str());
         // An absent `cause` records no field: the line reads as before.
         info!(
-            worker_url = %self.metric_label,
+            worker_url = %Endpoint::redacted_str(&self.metric_label),
             from,
             to,
             cause,
