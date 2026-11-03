@@ -167,7 +167,7 @@ runners only has to set the variables it needs (**Settings → Secrets and varia
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` (nightly benchmark only) | AMD nightly benchmark (requires `SMG_RUN_AMD_LEGS=true`); the opt-in TP4 lane requires a nonempty label and has no fallback |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
-| `SMG_RUN_AMD_LEGS` | `false` (when unset) | Shared AMD switch; required by both opt-in vLLM lanes on every supported trigger |
+| `SMG_RUN_AMD_LEGS` | `false` (when unset) | Enables AMD 1-GPU chat, nightly benchmark and automatic BFCL/PD selection; also required by both vLLM opt-ins |
 | `SMG_RUN_AMD_ON_PRS` | `false` (when unset) | Additional gate for AMD pull-request lanes; not required for push or manual runs |
 | `SMG_RUN_AMD_VLLM_ZMQ_DP2` | `false` | AMD DP2 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU2 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
 | `SMG_RUN_AMD_VLLM_CHAT_TP4` | `false` | AMD TP4 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU4 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
@@ -176,7 +176,9 @@ runners only has to set the variables it needs (**Settings → Secrets and varia
 Both vLLM opt-ins require the shared switch, their dedicated switch and a
 nonempty runner label for pull requests, pushes to `main` or `release/**`, and
 manual `workflow_dispatch` runs. Pull requests additionally require
-`SMG_RUN_AMD_ON_PRS=true`. Other job conditions still apply.
+`SMG_RUN_AMD_ON_PRS=true`. TP4 also requires the existing AMD 1-GPU chat job
+(`e2e-1gpu-chat-amd`) to succeed; that job uses `SMG_RUNNER_AMD_GPU_1`, with
+`1-gpu-mi300x` as its fallback. Other job conditions still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
