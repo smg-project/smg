@@ -235,7 +235,7 @@ impl ToolLike for Tool {
         Some(ToolDescription::new(
             self.function.name.clone(),
             self.function.description.clone().unwrap_or_default(),
-            Some(self.function.parameters.clone()),
+            Some(self.function.parameters_schema().clone()),
         ))
     }
 }
@@ -282,7 +282,7 @@ impl ToolLike for ResponseTool {
             ResponseTool::Function(ft) => Some(ToolDescription::new(
                 ft.function.name.clone(),
                 ft.function.description.clone().unwrap_or_default(),
-                Some(ft.function.parameters.clone()),
+                Some(ft.function.parameters_schema().clone()),
             )),
             ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
             _ => None,
@@ -1661,13 +1661,13 @@ mod tests {
                     function: Function {
                         name: "image_generation".to_string(),
                         description: Some("mcp-exposed duplicate".to_string()),
-                        parameters: json!({
+                        parameters: Some(json!({
                             "type": "object",
                             "properties": {
                                 "prompt": {"type": "string"}
                             },
                             "required": ["prompt"]
-                        }),
+                        })),
                         strict: None,
                         extra: Default::default(),
                     },

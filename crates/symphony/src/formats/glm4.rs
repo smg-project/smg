@@ -64,7 +64,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -221,9 +221,11 @@ mod tests {
             function: Function {
                 name: "answer_string".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "required": ["answer"], "properties": {
-                    "answer": {"type": "string"},
-                }}),
+                parameters: Some(
+                    value!({"type": "object", "required": ["answer"], "properties": {
+                        "answer": {"type": "string"},
+                    }}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },

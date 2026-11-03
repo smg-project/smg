@@ -655,11 +655,11 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "s": {"type": "string"},
                     "n": {"type": "integer"},
                     "ns": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },

@@ -843,11 +843,11 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "limit": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1023,13 +1023,13 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "metrics": {
                         "type": "array",
                         "items": {"type": "string"},
                         "enum": ["temperature", "humidity"],
                     },
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },

@@ -57,10 +57,10 @@ mod tests {
             function: Function {
                 name: "ChaDri_change_drink".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "drink_id": {"type": "string"},
                     "new_preferences": {"type": "object"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -84,7 +84,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -479,7 +479,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -713,7 +713,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },

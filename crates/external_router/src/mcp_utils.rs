@@ -602,7 +602,7 @@ mod tests {
             function: Function {
                 name: "dummy".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -828,7 +828,7 @@ mod tests {
             function: Function {
                 name: "dummy".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -851,7 +851,7 @@ mod tests {
                 function: Function {
                     name: "dummy".to_string(),
                     description: None,
-                    parameters: json!({}),
+                    parameters: Some(json!({})),
                     strict: None,
                     extra: Default::default(),
                 },

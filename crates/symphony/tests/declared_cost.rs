@@ -79,7 +79,7 @@ fn tools() -> Arc<[Tool]> {
             function: Function {
                 name: format!("lookup_{k}"),
                 description: Some(filler.clone()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "key": {"type": "string", "description": "the record key"},
@@ -94,7 +94,7 @@ fn tools() -> Arc<[Tool]> {
                         }
                     },
                     "required": ["key"]
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

@@ -1224,7 +1224,7 @@ mod tests {
                 function: Function {
                     name: name.to_string(),
                     description: None,
-                    parameters,
+                    parameters: Some(parameters),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -1601,10 +1601,10 @@ mod tests {
                 function: Function {
                     name: "submit_patch".to_string(),
                     description: None,
-                    parameters: value!({
+                    parameters: Some(value!({
                         "type": "object",
                         "properties": {"patch": {"type": "string"}},
-                    }),
+                    })),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -1753,7 +1753,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },

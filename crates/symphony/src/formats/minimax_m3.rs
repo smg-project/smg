@@ -74,7 +74,7 @@ mod tests {
             function: Function {
                 name: "alert".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "name": {"type": "string"},
                     "threshold": {"type": "number"},
                     "count": {"type": "integer"},
@@ -90,7 +90,7 @@ mod tests {
                     "meta": {"type": "object"},
                     "año": {"type": "integer"},
                     "cart": {"type": "object", "properties": {"item": {"type": "string"}}},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -108,7 +108,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },

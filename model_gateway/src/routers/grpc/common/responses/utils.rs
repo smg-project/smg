@@ -252,7 +252,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
     openai_protocol::common::Function {
         name: ct.name.clone(),
         description: ct.description.clone(),
-        parameters: serde_json::json!({
+        parameters: Some(serde_json::json!({
             "type": "object",
             "properties": {
                 "input": {
@@ -262,7 +262,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
             },
             "required": ["input"],
             "additionalProperties": false
-        }),
+        })),
         strict: Some(false),
         extra: Default::default(),
     }

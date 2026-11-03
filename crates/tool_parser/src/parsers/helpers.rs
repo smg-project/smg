@@ -21,7 +21,7 @@ pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<Stri
     };
     if let Some(props) = tool
         .function
-        .parameters
+        .parameters_schema()
         .get("properties")
         .and_then(Value::as_object)
     {
