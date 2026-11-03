@@ -619,7 +619,7 @@ impl AppContextBuilder {
             .with_mcp_orchestrator(&router_config)
             .await?
             .with_wasm_manager(&router_config)
-            .with_kv_event_monitor(&router_config)
+            .with_kv_event_monitor()
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -925,7 +925,7 @@ impl AppContextBuilder {
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
-    fn with_kv_event_monitor(mut self, _config: &RouterConfig) -> Self {
+    fn with_kv_event_monitor(mut self) -> Self {
         let monitor = Arc::new(KvEventMonitor::new());
         debug!("Created KV event monitor for the workers' KV-event and load streams");
         // The load records on the streams are polls of the worker.
@@ -1172,7 +1172,7 @@ mod tests {
         let config = config_with_policy(policy);
         AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
+            .with_kv_event_monitor()
             .kv_event_monitor
             .is_some()
     }
@@ -1248,7 +1248,7 @@ mod tests {
         let config = config_with_policy(PolicyConfig::Random);
         let builder = AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config);
+            .with_kv_event_monitor();
         assert!(builder.kv_event_monitor.is_some());
         let registry = builder
             .policy_registry

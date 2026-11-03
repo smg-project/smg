@@ -452,7 +452,9 @@ impl KvEventMonitor {
             Self::remove_indexer_worker(Arc::clone(indexer), worker_id, &worker_url, state.index)
                 .await;
         }
-        if unsupported {
+        // The gauge is the index's: a loads-only subscription a backend refuses
+        // leaves the worker on the poll, which is the designed fallback.
+        if unsupported && index.is_some() {
             Metrics::set_kv_events_unavailable(&worker_url, true);
         }
     }
@@ -530,7 +532,7 @@ impl KvEventMonitor {
                              disabling KV event subscription for this worker; \
                              cache-aware routing sees nothing of its cache"
                         ),
-                        Role::Loads => warn!(
+                        Role::Loads => info!(
                             worker_url = %Endpoint::redacted_str(worker_url),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling the load stream for this worker; its load \
@@ -1027,6 +1029,22 @@ mod tests {
         )
     }
 
+    /// A rank worker of a data-parallel engine at `addr`: rank `rank` of `size`.
+    fn rank_worker(addr: SocketAddr, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .dp_config(rank, size)
+                .build(),
+        )
+    }
+
     /// The test scheduler served on a free port, listening.
     async fn serve(behaviour: Subscribe) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let port = portpicker::pick_unused_port().expect("a free port");
@@ -1249,8 +1267,8 @@ mod tests {
         }
     }
 
-    /// A loads-only stream: every record reaches the worker monitor as a
-    /// pushed load (the worker's own rank only), a batch of events from a
+    /// A loads-only stream: every record of the worker's own rank reaches the
+    /// worker monitor as a pushed load (another rank's is dropped), a batch of events from a
     /// servicer that predates the request field is dropped rather than
     /// indexed, and any batch counts as the stream working.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1278,7 +1296,12 @@ mod tests {
             Ok(record(9, Some(1), true)),
         ];
         let (addr, server) = serve(Subscribe::Stream(script)).await;
-        let (worker, client) = connected(addr).await;
+        let worker = rank_worker(addr, 0, 2);
+        let client = worker
+            .get_backend_client()
+            .await
+            .expect("a backend client")
+            .expect("a gRPC worker has one");
         let registry = Arc::new(WorkerRegistry::new());
         registry.register(Arc::clone(&worker));
         let monitor = Arc::new(WorkerMonitor::new(
@@ -1334,8 +1357,8 @@ mod tests {
             .get(worker.url())
             .expect("the worker's pushed report is in the snapshot");
         assert_eq!(report.version, "pushed");
-        // A worker of no particular rank takes every rank's record, as a
-        // poll's answer names every rank.
+        // A rank worker keeps its own rank's records (the event batch carried
+        // rank 0's newer one); another rank's record is not its own.
         let ranks: Vec<(i32, i32)> = report
             .loads
             .iter()
@@ -1343,8 +1366,8 @@ mod tests {
             .collect();
         assert_eq!(
             ranks,
-            vec![(0, 5), (1, 9)],
-            "the old servicer's event batch carried rank 0's newer record"
+            vec![(0, 5)],
+            "rank 0's newer record from the event batch; rank 1's dropped"
         );
         assert_eq!(
             state.index.counters,

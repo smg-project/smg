@@ -2590,8 +2590,6 @@ mod native_loads_tests {
         .expect("cache_aware with overlap_decay must trigger load polling");
     }
 
-    /// Load monitoring is on by default: a load-blind policy with no flags and
-    /// no spec blocks still gets its workers polled from registration onward.
     /// The one predicate behind the poll tick and the load stream: wanted
     /// by default; under `--disable-load-monitoring` only for a reason.
     #[tokio::test]
@@ -2619,6 +2617,8 @@ mod native_loads_tests {
         assert!(load_aware.loads_wanted(&[vllm_worker("http://a:8000")]));
     }
 
+    /// Load monitoring is on by default: a load-blind policy with no flags and
+    /// no spec blocks still gets its workers polled from registration onward.
     #[tokio::test]
     async fn load_blind_policy_polls_by_default() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
