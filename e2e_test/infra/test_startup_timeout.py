@@ -521,9 +521,7 @@ def test_profile_ci_budgets_include_startups_and_prior_test_allowance():
         ("vllm-zmq-dp2-chat", "e2e-2gpu-chat-zmq-dp-vllm-amd", 40, 6),
         ("vllm-4gpu-chat", "e2e-4gpu-chat-vllm-amd", 25, 5),
     ]:
-        startup_seconds = sum(
-            bound for bound, _tp in _STARTUP_PROFILES[profile].models.values()
-        )
+        startup_seconds = sum(bound for bound, _tp in _STARTUP_PROFILES[profile].models.values())
         step_match = re.search(r"^      test_timeout: (\d+)$", jobs[job], re.M)
         job_match = re.search(r"^      timeout: (\d+)$", jobs[job], re.M)
         assert step_match is not None and job_match is not None
