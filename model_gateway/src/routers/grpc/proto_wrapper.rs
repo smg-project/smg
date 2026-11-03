@@ -2587,10 +2587,10 @@ mod tests {
             modality: common::Modality::Image as i32,
             url: "https://example.test/image.png".into(),
         });
-        assert!(request
-            .set_media_refs(mixed)
-            .unwrap_err()
-            .contains("single modality"));
+        request.set_media_refs(mixed).unwrap();
+        let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
     }
 
     #[test]
@@ -2602,6 +2602,24 @@ mod tests {
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            extra_batches: vec![SglangMultimodalData {
+                extra_batches: Vec::new(),
+                modality: "video".to_string(),
+                image_data: Vec::new(),
+                pixel_values: vec![0; 8],
+                pixel_values_shape: vec![2],
+                pixel_values_dtype: "float32".to_string(),
+                model_specific_tensors: HashMap::from([(
+                    "video_grid_thw".to_string(),
+                    TensorBytes {
+                        data: vec![0; 24],
+                        shape: vec![1, 3],
+                        dtype: "int64".to_string(),
+                    },
+                )]),
+                im_token_id: Some(8),
+                mm_placeholders: vec![(4, 2)],
+            }],
             modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
@@ -2618,7 +2636,7 @@ mod tests {
             im_token_id: None,
             mm_placeholders: vec![(0, 4)],
         });
-        assert_eq!(sglang.inline_bytes(), 42);
+        assert_eq!(sglang.inline_bytes(), 42 + 8 + 24);
     }
 
     #[test]

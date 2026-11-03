@@ -448,14 +448,26 @@ pub(crate) fn translate_request_sglang(
     // embeddings arrive, as behind the engine's own frontend, which sends the
     // text it rendered. Preprocessed tensors take the processor-output path.
     let (mm_inputs, input_text) = match req.mm_inputs {
-        Some(mm) if encode_media_refs(&mm)?.is_some() => (
-            None,
-            (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
-        ),
+        Some(mm) if encode_media_refs(&mm)?.is_some() => {
+            if !req.extra_mm_inputs.is_empty() {
+                return Err("SGLang media references cannot carry extra tensor batches".into());
+            }
+            (
+                None,
+                (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
+            )
+        }
         Some(mm) => (
-            Some(translate_sglang_multimodal(*mm, input_ids.len())?),
+            Some(translate_sglang_multimodal(
+                *mm,
+                req.extra_mm_inputs,
+                input_ids.len(),
+            )?),
             None,
         ),
+        None if !req.extra_mm_inputs.is_empty() => {
+            return Err("SGLang extra_mm_inputs requires mm_inputs".into())
+        }
         None => (None, None),
     };
     // The prefill/decode rendezvous (the prefill side's bootstrap server and
@@ -538,6 +550,32 @@ pub(crate) fn encode_media_refs(
 /// Media references must have been resolved by a configured native processor
 /// or dispatched to an encoder before reaching this tensor-only boundary.
 pub(crate) fn translate_sglang_multimodal(
+    mm: sglang_proto::MultimodalInputs,
+    extras: Vec<sglang_proto::MultimodalInputs>,
+    prompt_len: usize,
+) -> Result<SglangWireMmInputs, String> {
+    let mut output = translate_sglang_batch(mm, prompt_len)?;
+    for batch in extras {
+        let translated = translate_sglang_batch(batch, prompt_len)?;
+        if output
+            .mm_items
+            .iter()
+            .any(|item| item.modality == translated.mm_items[0].modality)
+        {
+            return Err("SGLang requires one batch per modality".into());
+        }
+        if translated.video_token_id.is_some() {
+            output.video_token_id = translated.video_token_id;
+        } else {
+            output.im_token_id = translated.im_token_id;
+        }
+        output.mm_items.extend(translated.mm_items);
+    }
+    Ok(output)
+}
+
+/// Translate one modality with its own tensor storage and absolute prompt offsets.
+fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
 ) -> Result<SglangWireMmInputs, String> {
@@ -1022,6 +1060,45 @@ mod tests {
         }
     }
 
+    #[test]
+    /// Preserve item metadata regardless of which modality is the primary batch.
+    fn mixed_media_keeps_each_modality_tensor_offsets_and_token_id() {
+        let image = media_payload();
+        let mut video = media_payload();
+        video.modalities = vec!["video".into()];
+        video.im_token_id = Some(8);
+        video.mm_placeholders[0].offset = 5;
+        let grid = video
+            .model_specific_tensors
+            .remove("image_grid_thw")
+            .unwrap();
+        video
+            .model_specific_tensors
+            .insert("video_grid_thw".into(), grid);
+        for (first, second) in [
+            (image.clone(), video.clone()),
+            (video.clone(), image.clone()),
+        ] {
+            let output = translate_sglang_multimodal(first, vec![second], 9).unwrap();
+            assert_eq!(output.im_token_id, Some(7));
+            assert_eq!(output.video_token_id, Some(8));
+            assert_eq!(output.mm_items.len(), 2);
+            for item in output.mm_items {
+                let (offset, key) = if item.modality == SglangWireModality::Image {
+                    (1, "image_grid_thw")
+                } else {
+                    (5, "video_grid_thw")
+                };
+                assert_eq!(item.offsets, Some(vec![(offset, offset + 2)]));
+                assert!(item.feature.is_some());
+                assert!(item.model_specific_data.contains_key(key));
+            }
+        }
+        assert!(translate_sglang_multimodal(image.clone(), vec![image], 9)
+            .unwrap_err()
+            .contains("one batch per modality"));
+    }
+
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
         sglang_proto::GenerateRequest {
             request_id: "mm".into(),
@@ -1084,13 +1161,13 @@ mod tests {
         mm.modalities = vec!["video".to_string()];
         let mut missing_id = mm.clone();
         missing_id.im_token_id = None;
-        assert!(translate_sglang_multimodal(missing_id, 5)
+        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5)
             .unwrap_err()
             .contains("placeholder token id"));
         let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
         mm.model_specific_tensors
             .insert("video_grid_thw".into(), grid.clone());
-        let output = translate_sglang_multimodal(mm, 5).unwrap();
+        let output = translate_sglang_multimodal(mm, Vec::new(), 5).unwrap();
         let item = &output.mm_items[0];
         assert_eq!(item.modality, SglangWireModality::Video);
         assert_eq!(output.video_token_id, Some(7));
@@ -1125,7 +1202,7 @@ mod tests {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, 5).unwrap_err();
+        let error = translate_sglang_multimodal(references, Vec::new(), 5).unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
