@@ -3,7 +3,6 @@
 from itertools import count
 
 import pytest
-
 from infra import constants as constants_module
 from infra import worker as worker_module
 from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType

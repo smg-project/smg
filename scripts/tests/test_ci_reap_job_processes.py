@@ -404,7 +404,7 @@ def test_strict_incomplete_owned_observation_is_failure_without_signal(mod, stri
     if file == "environ":
         path.unlink()  # The PID/stat remains: this is not process disappearance.
     else:
-        path.write_text("unparseable\n")
+        path.write_text("malformed\n")
     assert not runtime.run(mod)
     assert runtime.sent == []
     assert runtime.closed == set(runtime.opened)
@@ -427,7 +427,7 @@ def test_strict_reused_numeric_pid_during_rescan_is_not_retargeted(mod, strict_t
 
 def test_strict_ancestor_observation_failure_never_signals(mod, strict_tree):
     runtime = _Pidfds(strict_tree)
-    (strict_tree / "60" / "stat").write_text("unparseable\n")
+    (strict_tree / "60" / "stat").write_text("malformed\n")
     assert not runtime.run(mod)
     assert runtime.sent == [] and runtime.opened == {}
 

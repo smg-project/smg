@@ -230,7 +230,7 @@ def test_blank_profile_retains_current_model_and_floor_semantics(monkeypatch):
 
 
 def test_declared_profile_literals_preserve_models_lane_and_limits():
-    from infra.constants import ConnectionMode, _STARTUP_PROFILES
+    from infra.constants import _STARTUP_PROFILES, ConnectionMode
 
     zmq = _STARTUP_PROFILES["vllm-zmq-dp2-chat"]
     four = _STARTUP_PROFILES["vllm-4gpu-chat"]
