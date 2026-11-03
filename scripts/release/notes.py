@@ -35,11 +35,21 @@ HEADING = re.compile(r"^#{1,6}\s+(?P<text>.*?)\s*#*\s*$")
 NOTE_HEADING = re.compile(r"^release[ -]notes?\b(?P<rest>.*)$", re.IGNORECASE)
 NOTE_LINE = re.compile(r"^\**release[ -]notes?\**\s*:\**\s*(?P<text>.*)$", re.IGNORECASE)
 LIST_MARKER = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+# The spellings of a release note that declares none, one set read in two places: the renderer drops the section
+# on it, the check reports a candidate line that still reads as one. Accepted: none, n/a, nothing, no release note,
+# no (user-visible | user-facing | visible | behaviour | functional) change(s), not user-visible, internal (only);
+# alone, or followed by a reason after a separator (: ; , . ( ) or a dash of any width) or a word that opens one
+# (because, as, since). A sentence that goes on in its own words ("None of the defaults change", "Nothing breaks
+# when") is a release note.
 NONE_NOTE = re.compile(
-    r"^\W*(none|n/?a|nothing|no release note|no (user[- ]visible |visible |behaviour |behavior |functional )?"
-    r"changes?|not user[- ]visible|internal( only)?)\b\s*(?:[:;,.)(-].*)?$",
+    r"^\W*(none|n/?a|nothing|no release note|no (user[- ](?:visible|facing) |visible |behaviour |behavior "
+    r"|functional )?changes?|not user[- ](?:visible|facing)|internal( only)?)\b"
+    r"\s*(?:(?:[:;,.)(\-\u2013\u2014]|because\b|as\b|since\b).*)?$",
     re.IGNORECASE,
 )
+NONE_LINE = re.compile(
+    r"^- (?P<text>.+?) \(#\d+\)$", re.MULTILINE
+)  # a candidate line as the renderer seeds it
 DECLARING_HEADING = re.compile(r"breaking|upgrade|compatib|migrat|deprecat", re.IGNORECASE)
 DETAILS = re.compile(r"^\s*</?(details|summary)\b", re.IGNORECASE)
 CHECKBOX = re.compile(r"^\[[ xX]\]\s*")
@@ -665,6 +675,8 @@ def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, st
     defines are placeholders, every token-shaped text when the names are unknown. An author comment counts wherever
     "AUTHOR:" sits in it (a stray opener before it would swallow it), and an opener without a closer is reported
     too: published, it hides everything after it. Backtick spans are skipped: a comment quoted in code hides nothing.
+    A candidate line whose sentence reads as a declared none (NONE_NOTE) is reported as well: the renderer seeds
+    none, so one in a draft came from an older render or a hand, and it is not a release note.
     """
     found = []
     scanned = CODE_SPAN.sub(
@@ -687,6 +699,9 @@ def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, st
     for match in TOKEN.finditer(text):
         if names is None or match.group(1) in names:
             found.append((text.count("\n", 0, match.start()) + 1, match.group(0)))
+    for match in NONE_LINE.finditer(text):
+        if NONE_NOTE.match(match.group("text")):
+            found.append((text.count("\n", 0, match.start()) + 1, match.group(0)))
     return sorted(found)
 
 
@@ -701,9 +716,11 @@ def check(args: argparse.Namespace) -> int:
         warn(f"{path} carries no placeholder")
         return 0
     comments = sum(1 for _, excerpt in left if excerpt.startswith("<!--"))
-    tokens = len(left) - comments
+    tokens = sum(1 for _, excerpt in left if excerpt.startswith("{{"))
+    nones = len(left) - comments - tokens
     warn(
-        f"{path} still carries {len(left)} placeholder(s): {comments} author comment(s), {tokens} template token(s)"
+        f"{path} still carries {len(left)} placeholder(s): {comments} author comment(s), {tokens} template token(s),"
+        f" {nones} line(s) that say none"
     )
     for line, excerpt in left:
         shown = excerpt if len(excerpt) <= 100 else excerpt[:97] + "..."

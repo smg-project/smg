@@ -1841,6 +1841,11 @@ def test_notes_check_refuses_a_placeholder_and_passes_a_filled_draft(
     assert missing.returncode == 1 and "no such file" in missing.stderr
     usage = repo.tool("notes", "--check", check=False)
     assert usage.returncode == 1 and "usage: release.sh notes --check <file>" in usage.stderr
+    draft.write_text(
+        filled + "\n- none because tests only (#5)\n"
+    )  # a candidate line that says none
+    none_line = repo.tool("notes", "--check", str(draft), check=False)
+    assert none_line.returncode == 1 and "1 line(s) that say none" in none_line.stderr
 
 
 def test_notes_refuse_a_template_token_the_render_does_not_fill(repo: Sandbox) -> None:
@@ -1908,6 +1913,24 @@ def test_the_release_note_of_a_pull_request_body() -> None:
         notes.release_note(untouched.replace(template_comment, "none: a test-only change.")) == ""
     )
     assert notes.release_note("## Description\n\nx\n\n## Test Plan\n\ny\n") is None
+    # "none" with a reason, in the spellings the template invites: a dash of any width or a word opens the reason
+    for declared in (
+        "none because it is a test-only change",
+        "None \u2014 tests only",
+        "none \u2013 CI only",
+        "none as the change is internal",
+        "N/A \u2014 refactor",
+        "No user-facing change.",
+    ):
+        assert notes.release_note(f"## Release note\n\n{declared}\n") == "", declared
+    for sentence in (
+        "None of the defaults change in this release.",
+        "Nothing breaks when the flag is unset.",
+    ):
+        assert notes.release_note(f"## Release note\n\n{sentence}\n") == sentence, sentence
+    assert notes.placeholders("- none because tests only (#5)\n- A real sentence. (#6)\n") == [
+        (1, "- none because tests only (#5)")
+    ]
     assert (
         notes.release_note("## Release note\n\nA --> closer first, then a <!-- opener.\n")
         == "A --&gt; closer first, then a &lt;!-- opener."
