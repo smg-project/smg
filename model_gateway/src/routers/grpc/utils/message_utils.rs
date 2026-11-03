@@ -451,13 +451,16 @@ pub(crate) async fn resolve_media(
     )
     .await
     .map_err(|e| {
+        // The chain, not the outermost context alone: a hub failure's cause
+        // (the file, the hub's answer, its address) is answered generically
+        // below and lives here.
         error!(
             function = stage,
             model = %model_id,
-            error = %e,
+            error = %format!("{e:#}"),
             "Failed to prepare the multimodal prompt plan"
         );
-        invalid_multimodal_request(e)
+        multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
     })?;
 
     Ok(ResolvedMedia {

@@ -5,7 +5,10 @@
 //! `preprocessor_config.json` / video processor config files to the local HF
 //! cache and returns the resolved path.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
@@ -16,7 +19,12 @@ const HF_TOKEN_ENV: &str = "HF_TOKEN";
 ///
 /// If the source is already a local directory with `config.json`, returns it as-is.
 /// Otherwise, treats the source as a HuggingFace model ID and downloads
-/// `config.json` plus optional processor configs to the local HF cache.
+/// `config.json` plus the processor configs the checkpoint ships to the local
+/// HF cache. A processor config the Hub answers 404 for is one the checkpoint
+/// does not ship, and the directory is complete without it; a fetch that fails
+/// any other way (no answer, a 5xx, a denied token) fails the resolution, so
+/// the caller never reads an incomplete directory as a checkpoint without the
+/// file.
 pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(source);
     if path.join("config.json").exists() {
@@ -39,10 +47,13 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
         .await
         .with_context(|| format!("Failed to download config.json for model '{source}'"))?;
 
-    // The processor configs beside config.json, best-effort: a checkpoint
-    // ships the ones of its modalities, and the processor takes a missing file
-    // as absent. Any other failure is logged, so a processor loaded as if the
-    // file were absent can be traced to the fetch that failed.
+    // The processor configs beside config.json: a checkpoint ships the ones of
+    // its modalities, and the Hub's 404 is its answer that this one is not
+    // among them, which the processor takes as absent. Any other failure
+    // leaves the directory incomplete, so it fails the resolution rather than
+    // hand the caller a directory it would read as a checkpoint without the
+    // file; the next resolution fetches the file again, the ones already
+    // fetched being served from the cache.
     for config_file in [
         "preprocessor_config.json",
         "video_preprocessor_config.json",
@@ -50,12 +61,12 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
     ] {
         if let Err(error) = repo.get(config_file).await {
             if !is_absent(&error) {
-                tracing::warn!(
-                    model = source,
-                    file = config_file,
-                    error = %describe(&error),
-                    "processor config not fetched; the processor loads as if the file were absent"
-                );
+                return Err(HubFetchError {
+                    model: source.to_string(),
+                    file: config_file,
+                    cause: describe(&error),
+                }
+                .into());
             }
         }
     }
@@ -65,6 +76,41 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
         .map(|p| p.to_path_buf())
         .ok_or_else(|| anyhow::anyhow!("Invalid HF cache path for model '{source}'"))
 }
+
+/// A file of a checkpoint the Hub failed to serve: no answer, a 5xx, a denied
+/// token; never its 404, which is the answer that the checkpoint does not ship
+/// the file. The message names the model, the file and the cause (the Hub's
+/// answer or the transport failure, the file's URL included) for the log; a
+/// client is told only that the model's configuration could not be fetched,
+/// since the fault is on the Hub's side and the next resolution asks again.
+#[derive(Debug)]
+pub struct HubFetchError {
+    /// The checkpoint, as the source named it.
+    pub model: String,
+    /// The file the Hub did not serve.
+    pub file: &'static str,
+    /// The failure with its causes, each written once.
+    pub cause: String,
+}
+
+impl HubFetchError {
+    /// Whether `error` is, or wraps, a file the Hub failed to serve.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<HubFetchError>())
+    }
+}
+
+impl fmt::Display for HubFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Failed to download {} for model '{}': {}",
+            self.file, self.model, self.cause
+        )
+    }
+}
+
+impl std::error::Error for HubFetchError {}
 
 /// `true` when the Hub answered that the file is not in the repository (HTTP
 /// 404): the expected answer of a checkpoint without that processor config.
@@ -82,8 +128,8 @@ fn is_absent(error: &ApiError) -> bool {
 /// does not already end with: each `ApiError` variant embeds its source's
 /// message in its own (`request error: {0}`), as `io::Error` does for the
 /// error it wraps, so a plain walk of the chain would write those twice while
-/// the deeper causes (the connect error, the OS error) are what the line is
-/// for.
+/// the deeper causes (the connect error, the OS error) are what the
+/// description is for.
 fn describe(error: &ApiError) -> String {
     let mut message = error.to_string();
     let mut cause = std::error::Error::source(error);
@@ -104,7 +150,7 @@ mod tests {
 
     use hf_hub::api::tokio::ApiError;
 
-    use super::{describe, is_absent};
+    use super::{describe, is_absent, HubFetchError};
 
     /// The error `repo.get` returns when the Hub answers `status` to the
     /// file's request (hf-hub runs `error_for_status` on the answer).
@@ -137,6 +183,25 @@ mod tests {
         )))));
     }
 
+    /// The typed failure is found through the contexts a caller wraps it in,
+    /// and its message names the file, the model and the cause.
+    #[test]
+    fn a_file_the_hub_failed_to_serve_is_found_through_the_chain() {
+        let failed = anyhow::Error::from(HubFetchError {
+            model: "org/name".to_string(),
+            file: "preprocessor_config.json",
+            cause: "request error: HTTP status server error (503 Service Unavailable)".to_string(),
+        })
+        .context("Failed to resolve model config directory for 'org/name'");
+        assert!(HubFetchError::is(&failed));
+        assert_eq!(
+            failed.root_cause().to_string(),
+            "Failed to download preprocessor_config.json for model 'org/name': request error: \
+             HTTP status server error (503 Service Unavailable)"
+        );
+        assert!(!HubFetchError::is(&anyhow::anyhow!("decode failed")));
+    }
+
     /// An error whose message is its own and whose cause is the next one
     /// down: the shape of a connect failure's chain, without a network.
     #[derive(Debug)]
@@ -156,7 +221,7 @@ mod tests {
         }
     }
 
-    /// The logged description writes each message of the chain once: hf-hub's
+    /// The description writes each message of the chain once: hf-hub's
     /// variant embeds its source's message, `io::Error` embeds the error it
     /// wraps, and a connect error embeds the OS error, so the causes already
     /// at the end of the message are not written again while every deeper
