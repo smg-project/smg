@@ -85,8 +85,7 @@ case "$1 $2" in
     else
       echo "${GH_STUB_PR_STATE:-OPEN}"
     fi ;;
-  "auth status") [ -z "${GH_STUB_AUTH_ERROR-}" ] || { echo "You are not logged into any GitHub hosts." >&2; exit 1; } ;;
-  "api user") echo 1 ;;
+  "api user") [ -z "${GH_STUB_AUTH_ERROR-}" ] || { echo "gh: HTTP 401: Bad credentials" >&2; exit 1; }; echo 1 ;;
   "api repos/example/repo/branches/"*) echo "${GH_STUB_PROTECTED:-false}" ;;
   "api repos/example/repo/rules/branches/"*) [ -z "${GH_STUB_RULES-}" ] || printf '%b\n' "$GH_STUB_RULES" ;;
   "api repos/example/repo/rulesets/"*) [ -z "${GH_STUB_BYPASS-}" ] || printf '%b\n' "$GH_STUB_BYPASS" ;;
@@ -2249,6 +2248,35 @@ def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo
     assert broken.returncode == 1
     assert "the publish plan of v1.14.0-rc.2 could not be read" in broken.stderr
     assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+
+
+def test_ship_dispatches_nothing_when_the_engine_table_cannot_be_read(repo: Sandbox) -> None:
+    """The engine table is read inside the plan, whose failures `set -e` does not see under `if`: a table the
+    Python cannot parse stops the plan by name, so the ship dispatches nothing (not the registry workflows
+    alone, with the engine images missing)."""
+    repo.commit_main(
+        "ci: a trailing comma in the engine table",
+        ".github/workflows/release-engine-docker.yml",
+        ENGINE_WORKFLOW.replace(
+            '"tokenspeed": {"release_bases": [""]}', '"tokenspeed": {"release_bases": [""]},'
+        ),
+    )
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    done = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False)
+    assert done.returncode == 1
+    assert (
+        "the engine table of .github/workflows/release-engine-docker.yml at v1.14.0-rc.2 could not be read"
+        in done.stderr
+    )
+    assert "the publish plan of v1.14.0-rc.2 could not be read" in done.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    plan = repo.tool("publish-plan", "1.14.0-rc.2", check=False)
+    assert plan.returncode == 1 and "no engine dispatch listed" in plan.stderr
 
 
 def test_ship_leaves_no_notes_file_behind_when_the_render_fails(repo: Sandbox) -> None:

@@ -927,7 +927,9 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
   say "$((n += 1)). Engine images (ghcr.io/smg-project/smg:$version-<engine>-<engine version>, built from SMG_RELEASE_TAG = $tagname at that ref;"
   say "   one dispatch per engine and release base, the table of .github/workflows/release-engine-docker.yml at $tagname: a dispatch"
   say "   without base_image_ref builds the engine's first base only, so every other base is a dispatch of its own)"
-  engine_dispatches "$ref" "$tagname" | sed 's/^/   /'
+  # explicit, so that a table the Python cannot read stops the plan on every call path (under `if` and `||`, where set -e is off)
+  engine_dispatches "$ref" "$tagname" | sed 's/^/   /' \
+    || die "publish-plan: the engine table of .github/workflows/release-engine-docker.yml at $ref could not be read (its message is above); no engine dispatch listed"
   if ! is_candidate "$version"; then
     say "$((n += 1)). gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}$(registry_mark "$marks" smg-grpc-proto PyPI), smg-grpc-servicer==${servicer:-?}$(registry_mark "$marks" smg-grpc-servicer PyPI); versions already on PyPI are skipped)"
     say "   gh workflow run release-grpc.yml --ref $tagname"
@@ -1169,7 +1171,8 @@ cmd_ship() {
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   case " $SHIP_STEPS " in *" $from "*) ;; *) die "unknown step '$from': --from takes one of: $SHIP_STEPS" ;; esac
   command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
-  "$GH" auth status >/dev/null 2>&1 || die "'$GH' is not logged in (gh auth login, or GH_TOKEN): the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
+  # the account the ship acts as, read as the rules probe reads it (one host, one token): a bare `gh auth status` judges every host and account gh knows
+  "$GH" api user --jq .id >/dev/null 2>&1 || die "'$GH' is not logged in (gh auth login, or GH_TOKEN): the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
   ship_version=$version; ship_release=$(release_of "$version"); ship_branch="release/$ship_release"; ship_tag="v$version"
   [ "$ship_dry" -eq 1 ] || require_identity
   fetch
