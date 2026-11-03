@@ -1295,24 +1295,13 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.routing.host.clone(),
-            port: self.routing.port,
-            health_check_port: self.routing.health_check_port,
-            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.serving.max_payload_size,
             log_dir: self.serving.log_dir.clone(),
             log_level: Some(self.serving.log_level.clone()),
             log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.serving.request_timeout_secs,
-            request_id_headers: if self.serving.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.serving.request_id_headers.clone())
-            },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,

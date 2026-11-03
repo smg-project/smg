@@ -2100,20 +2100,13 @@ impl Router {
         py.detach(|| {
             runtime.block_on(async move {
             Box::pin(server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                health_check_port: self.health_check_port,
-                runtime_worker_threads: self.runtime_worker_threads,
                 router_config,
-                max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
                 mesh_discovery_config,
                 prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
                 shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
