@@ -107,6 +107,10 @@ def classify_result(value) -> str | None:
                 return None
             pending.extend((item, depth + 1) for item in current)
             continue
+        if isinstance(current, dict) or current is None:
+            # BFCL FC uses function->arguments dictionaries and nullable model
+            # replies. Arguments are opaque model output, not inference errors.
+            continue
         if not isinstance(current, str):
             return None
         if not current.startswith("Error during inference:"):
@@ -194,7 +198,9 @@ def collect_result_diagnostics(
                     record = json.loads(line)
                     case_id = record.get("id") if isinstance(record, dict) else None
                     kind = (
-                        classify_result(record.get("result")) if isinstance(record, dict) else None
+                        classify_result(record["result"])
+                        if isinstance(record, dict) and "result" in record
+                        else None
                     )
                     if (
                         not isinstance(case_id, str)

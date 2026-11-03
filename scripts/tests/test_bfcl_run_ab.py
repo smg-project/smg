@@ -293,9 +293,7 @@ def test_result_diagnostics_unknown_evidence_never_becomes_zero_errors(tmp_path,
         if state == "malformed":
             path.write_text('{"id": "simple_python_0", "result":')
         elif state == "unsupported":
-            path.write_text(
-                json.dumps({"id": "simple_python_0", "result": {"unknown": True}}) + "\n"
-            )
+            path.write_text(json.dumps({"id": "simple_python_0", "result": 42}) + "\n")
         elif state == "duplicate":
             path.write_text(path.read_text() * 2)
         elif state == "ambiguous":
@@ -602,3 +600,60 @@ def test_result_diagnostics_valid_unknown_inventory_round_trip_stays_unknown(tmp
     assert restored.result_diagnostics == arm.result_diagnostics
     assert restored.result_diagnostics["counts"] is None
     assert restored.result_diagnostics["categories"]["simple_python"]["unique_ids"] == 1
+
+
+@pytest.mark.parametrize(
+    "model_output",
+    [
+        [{"calculate_area": '{"base":10,"height":5}'}],
+        None,
+        [[{"first_call": '{"x":1}'}], [{"second_call": '{"y":2}'}]],
+        [
+            {
+                "tool": {
+                    "nested_argument": "Error during inference: Error code: 503 - no_available_workers"
+                }
+            }
+        ],
+        [{"tool": "Error during inference: Error code: 503 - no_available_workers"}],
+        [None, {"tool": '{"empty":null}'}],
+    ],
+)
+def test_real_bfcl_fc_dict_null_and_nested_outputs_keep_infra_counts(tmp_path, model_output):
+    # Real pinned BFCL FC transcripts use list[dict[function, arguments]], and
+    # multi-turn nests those lists. Function arguments are model output, never
+    # a caught infrastructure error, even if their text resembles one.
+    before, error = diagnostics_before(tmp_path)
+    write_results(
+        tmp_path,
+        "simple_python",
+        [
+            {"id": "simple_python_0", "result": model_output},
+            {"id": "simple_python_1", "result": UNAVAILABLE},
+        ],
+    )
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error, {"simple_python": 2}
+    )
+    assert diagnostic["status"] == "observed"
+    assert diagnostic["counts"] == {
+        "non_error_result": 1,
+        "http_503_no_available_workers": 1,
+        "other_inference_error": 0,
+    }
+    row = diagnostic["categories"]["simple_python"]
+    assert row["unique_ids"] == 2 and row["duplicate_ids"] == []
+    assert [item["classification"] for item in row["id_inventory"]] == [
+        "non_error_result",
+        "http_503_no_available_workers",
+    ]
+
+
+def test_result_diagnostics_missing_result_key_is_not_a_null_model_reply(tmp_path):
+    before, error = diagnostics_before(tmp_path)
+    write_results(tmp_path, "simple_python", [{"id": "simple_python_0"}])
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error, {"simple_python": 1}
+    )
+    assert diagnostic["status"] == "unknown"
+    assert diagnostic["counts"] is None
