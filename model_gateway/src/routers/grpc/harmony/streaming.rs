@@ -45,7 +45,6 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
-                    utils::function_call_status,
                 },
             },
             context,
@@ -996,8 +995,8 @@ impl ResponsesDecode {
         self.finalized_analysis = final_output.analysis;
         self.tool_calls = final_output.commentary;
         self.reasoning_token_count = final_output.reasoning_token_count;
-        // Each closed call reads its status under this finish, the message item through the
-        // emitter, and the terminal event and the stored object their own, as the regular
+        // Each closed call and the message item read their status through the emitter under
+        // this finish, and the terminal event and the stored object their own, as the regular
         // stream's do under the final chunk's.
         self.finish_reason = Some(final_output.finish_reason);
         emitter.set_finish_reason(self.finish_reason.as_deref());
@@ -1045,13 +1044,14 @@ impl ResponsesDecode {
 
             let type_str =
                 ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
-            // A function call's status is read under this iteration's finish (none when the
-            // stream ended before its terminal frame): a recovered call the finish cut is
-            // `incomplete`, and the response reads it as cut. A hosted or MCP call's item keeps
-            // `completed`; its result replaces the item.
+            // A function call's status is read through the emitter under this iteration's
+            // finish (none when the stream ended before its terminal frame): a recovered call
+            // the finish cut is `incomplete`, and the response reads it as cut on its terminal
+            // event and stored object. A hosted or MCP call's item keeps `completed`; its
+            // result replaces the item.
             let status = match response_format {
                 Some(_) => "completed",
-                None => function_call_status(self.finish_reason.as_deref(), args_str),
+                None => emitter.function_call_status(args_str),
             };
             let mut item = json!({
                 "id": item_id,

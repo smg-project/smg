@@ -75,12 +75,11 @@ pub(crate) fn cut_call<'a>(
 
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
 /// finish is the token limit; a call cut by anything else (`cut_call`, read on the calls'
-/// function-shaped arguments) leaves the response incomplete with no stated reason. The
-/// regular gRPC builders of a
-/// Responses object read their status here (the non-streaming conversion and the stored
-/// object of a streamed turn), as does the emitter for its terminal event and stored object
-/// when chat chunks gave it a finish reason; the Harmony builders set their status
-/// themselves.
+/// function-shaped arguments) leaves the response incomplete with no stated reason. Every
+/// builder of a Responses object reads its status here: the non-streaming conversions,
+/// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
+/// terminal event and stored object under the finish it holds, whether chat chunks or a
+/// Harmony stream gave it.
 pub(crate) fn response_status(
     finish_reason: Option<&str>,
     cut_call: bool,
