@@ -121,3 +121,30 @@ async fn the_stored_object_of_a_streamed_text_turn_carries_its_message_item() {
         assert_eq!(shown["content"][0]["text"], text, "{name}: {shown}");
     }
 }
+
+#[tokio::test]
+async fn the_message_item_of_a_turn_the_engine_failed_reads_in_progress() {
+    // The regular stream leaves a message item `in_progress` when the generation failed:
+    // closing the event sequence does not say it succeeded. The Harmony stream closes its
+    // message item under the same finish, the one its terminal frame named, not the finish an
+    // earlier turn of the request left on the emitter. (An `error` finish never reaches the
+    // decode as a terminal frame: the stream reader ends the iteration with an error first.)
+    let ids = harmony_tokens(None, "Hello there!");
+    let (stored, terminal) = streamed(frames(&ids, "failed")).await;
+    let name = "a turn the engine ended with failed";
+
+    assert_eq!(stored["status"], "failed", "{name}: {stored}");
+    let item = only_item(&stored, &format!("{name}, the stored object"));
+    assert_eq!(item["type"], "message", "{name}: {item}");
+    assert_eq!(item["status"], "in_progress", "{name}: {item}");
+
+    assert_eq!(
+        terminal["response"]["status"], "failed",
+        "{name}: {terminal}"
+    );
+    let shown = only_item(
+        &terminal["response"],
+        &format!("{name}, the terminal event"),
+    );
+    assert_eq!(shown["status"], item["status"], "{name}: {shown} vs {item}");
+}

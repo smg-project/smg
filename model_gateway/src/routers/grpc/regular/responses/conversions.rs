@@ -19,11 +19,10 @@ use openai_protocol::{
     },
     profile::ProviderProfile,
     responses::{
-        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
-        IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus, ResponseUsage,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
-        TextFormat,
+        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, ResponseContentPart,
+        ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseReasoningContent::ReasoningText, ResponseUsage, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
 };
@@ -32,9 +31,9 @@ use tracing::warn;
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
     utils::{
-        custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-        extract_tools_from_response_tools, function_call_status, generation_failure_error,
-        resolve_function_identity,
+        custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
+        encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
+        generation_failure_error, resolve_function_identity, response_status,
     },
 };
 
@@ -655,9 +654,20 @@ pub(crate) fn chat_to_responses(
     let mut output: Vec<ResponseOutputItem> = Vec::new();
     output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
     output.extend(message_output_item(choice, &chat_resp.id));
+    // The cut-call read comes before the calls become items: a custom tool's
+    // item carries no status.
+    let cut = cut_call(
+        choice.finish_reason.as_deref(),
+        choice
+            .message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| call.function.arguments.as_deref().unwrap_or_default()),
+    );
     push_tool_call_output_items(&mut output, choice, original_req);
 
-    let (status, incomplete_details) = finish_reason_status(choice.finish_reason.as_deref());
+    let (status, incomplete_details) = response_status(choice.finish_reason.as_deref(), cut);
     let usage = chat_resp.usage.as_ref().map(responses_usage);
 
     // Generate response
@@ -775,30 +785,6 @@ fn push_tool_call_output_items(
             )
             .to_string(),
         });
-    }
-}
-
-/// The response status for a chat finish reason alone: "length" is a
-/// max_output_tokens truncation, which the Responses contract reports as
-/// status=incomplete with incomplete_details. Unlike the streaming path's
-/// `utils::response_status`, this read has no `cut_call` arm: a turn whose
-/// last call was cut by anything but the token limit reads completed here
-/// and incomplete there, as the non-streaming conversion has always read
-/// it; closing that gap is a behaviour change of its own.
-fn finish_reason_status(
-    finish_reason: Option<&str>,
-) -> (ResponseStatus, Option<IncompleteDetails>) {
-    match finish_reason {
-        Some("stop") => (ResponseStatus::Completed, None),
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(IncompleteDetails {
-                reason: IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("tool_calls") => (ResponseStatus::Completed, None),
-        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-        _ => (ResponseStatus::Completed, None), // Default to completed
     }
 }
 
@@ -1613,6 +1599,65 @@ mod tests {
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["output"][0]["status"], "completed");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_cut_call_under_a_finish_other_than_length_leaves_the_response_incomplete() {
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire = serde_json::to_value(
+                chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_custom_tool_call_leaves_the_response_incomplete_too() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire =
+                serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["type"], "custom_tool_call",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+        }
     }
 
     /// The MCP tool loop's conversion: the request's function tools and the

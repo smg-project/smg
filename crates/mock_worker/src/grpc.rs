@@ -34,7 +34,7 @@ use ts::{
 };
 
 use crate::{
-    config::Config,
+    config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
@@ -109,6 +109,27 @@ pub async fn serve_with_listener_until(
         cfg.kv_zmq_for(index, 0)
             .map(|kv| crate::kv_zmq::serve(rank.engine.clone(), kv))
     });
+    // A prefill worker's bootstrap port, numbered by the same offset: bound
+    // before the worker serves, as an engine's bootstrap server is up when
+    // its health answers; a port that cannot be bound stops the worker as its
+    // own port would.
+    let bootstrap_port = addr
+        .map(|a| a.port())
+        .and_then(|port| port.checked_sub(cfg.grpc_base_port))
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match bootstrap_port {
+        Some(port) => match TcpListener::bind((cfg.host.as_str(), port)).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                tracing::error!(
+                    "grpc worker {addr:?} bootstrap port bind {}:{port} failed: {e}",
+                    cfg.host
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
     // (a KV-event subscription) before the server's graceful shutdown
@@ -123,6 +144,7 @@ pub async fn serve_with_listener_until(
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
     };
+    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
@@ -132,6 +154,7 @@ pub async fn serve_with_listener_until(
         stopped,
         in_flight: WorkerInFlight::default(),
         overrides,
+        bootstrap_port,
     };
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
@@ -163,19 +186,58 @@ pub async fn serve_with_listener_until(
             tracing::error!("grpc worker {addr:?} stopped: {e}");
         }
     };
-    match publisher {
-        Some(publisher) => {
-            // When the server stops (the shutdown, or an error) the publisher
-            // goes with it; a publisher that stops on its own leaves the
-            // server serving, as before.
-            let mut server = pin!(server);
-            let mut publisher = pin!(publisher);
-            tokio::select! {
-                () = &mut server => {}
-                () = &mut publisher => server.await,
+    // The worker's side tasks run beside the server and go with it when it
+    // stops (the shutdown, or an error): the KV-event publisher, which leaves
+    // the server serving when it stops on its own, as before, and a prefill
+    // worker's bootstrap listener, which ends at the stop. The two are
+    // joined, so one ending early leaves the other polled.
+    let mut server = pin!(server);
+    let sides = async {
+        let publisher = async {
+            match publisher {
+                Some(publisher) => publisher.await,
+                None => pending().await,
             }
+        };
+        let bootstrap = async {
+            match bootstrap {
+                Some(bootstrap) => bootstrap.await,
+                None => pending().await,
+            }
+        };
+        tokio::join!(publisher, bootstrap);
+    };
+    tokio::select! {
+        () = &mut server => {}
+        () = sides => server.await,
+    }
+}
+
+/// A prefill worker's bootstrap port: where a decode partner's engine would
+/// rendezvous for the KV handoff, which the mock never performs (the decode
+/// side has the prompt). Each connection is accepted and closed, which is
+/// all the gateway's probe of the port asks, until the worker stops.
+async fn accept_and_close(listener: TcpListener, mut stopped: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((connection, _)) => drop(connection),
+                Err(e) => {
+                    tracing::warn!(
+                        "bootstrap port {:?}: accept failed: {e}",
+                        listener.local_addr().ok()
+                    );
+                    // A listener out of descriptors would fail every accept
+                    // at once; a pause keeps the loop from spinning on it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            // The wait's guard stays inside its own future: a select arm
+            // that yielded it would hold it across the loop's awaits.
+            () = async {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            } => break,
         }
-        None => server.await,
     }
 }
 
@@ -220,6 +282,9 @@ struct MockScheduler {
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,
+    /// The bootstrap port this worker bound and advertises: a prefill
+    /// worker's, when it was given one.
+    bootstrap_port: Option<u16>,
 }
 
 /// One data-parallel rank of a gRPC worker: its engine, the prefill work in
@@ -330,6 +395,66 @@ impl TokenSpeedScheduler for MockScheduler {
                 tracing::error!("capturing request {} failed: {e}", req.request_id);
                 return Err(Status::internal(format!("mock-worker capture failed: {e}")));
             }
+        }
+
+        // A prefill worker's answer: the prompt side's completion alone,
+        // ahead of the script and of either engine mode. The decode side of
+        // the pair has the prompt and generates the output, so nothing is
+        // scripted here and nothing counts as a miss; the canned delay paces
+        // it as it paces a canned answer. The realistic engine's fault and
+        // admission hooks apply as to any request (the stall, a status
+        // before admission, the admission delay and rate), counted as the
+        // regular path counts them: `finish=error` ends the prompt side with
+        // `error` whatever the status and counts as a cut; with no output to
+        // cut after, a status cut fires at once, as a cut; a status before
+        // admission is a failure. The engine never runs the prompt: nothing
+        // is admitted, no record is left.
+        if self.cfg.role == Some(Role::Prefill) {
+            let mut finish_reason = "stop";
+            if !self.ranks.is_empty() {
+                let (rank, _placed) = self.place(req.data_parallel_rank)?;
+                let engine = &self.ranks[rank].engine;
+                if let Some(fault) = engine.inject() {
+                    if !fault.stall.is_zero() {
+                        tokio::time::sleep(fault.stall).await;
+                    }
+                    if fault.finish_error {
+                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                        finish_reason = "error";
+                    } else if fault.status != 0 {
+                        if fault.after_tokens.is_some() {
+                            engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            engine.record_failure();
+                        }
+                        return Err(injected_status(fault.status));
+                    }
+                }
+                engine.admit().await;
+            }
+            if !self.cfg.gen_delay.is_zero() {
+                tokio::time::sleep(self.cfg.gen_delay).await;
+            }
+            let prompt_tokens = req
+                .tokenized
+                .as_ref()
+                .map_or(0, |tokenized| tokenized.input_ids.len());
+            let complete = ts::GenerateResponse {
+                request_id: req.request_id,
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: Vec::new(),
+                    finish_reason: finish_reason.to_string(),
+                    prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+                    completion_tokens: 0,
+                    cached_tokens: 0,
+                    index: 0,
+                    weight_version: self.cfg.weight_version.clone(),
+                    ..Default::default()
+                })),
+            };
+            return Ok(Response::new(Box::pin(
+                in_flight.until_done(stream::iter([Ok(complete)])),
+            )));
         }
 
         // A scripted answer, ahead of either engine mode: the worker's queue
@@ -578,6 +703,35 @@ impl TokenSpeedScheduler for MockScheduler {
                     kind: Some(prost_types::value::Kind::StringValue(
                         self.ranks.len().to_string(),
                     )),
+                },
+            );
+        }
+        // A disaggregated worker advertises its role and, on the prefill
+        // side, the port its partners rendezvous on, as the engines' server
+        // args carry them; the gateway reads both into the worker's labels.
+        if let Some(role) = self.cfg.role {
+            fields.insert(
+                "disaggregation_mode".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        role.as_str().to_string(),
+                    )),
+                },
+            );
+            if let Some(port) = self.bootstrap_port {
+                fields.insert(
+                    "disaggregation_bootstrap_port".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::NumberValue(f64::from(port))),
+                    },
+                );
+            }
+        }
+        if let Some(protocol) = &self.cfg.pairing_protocol {
+            fields.insert(
+                "pairing_protocol".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(protocol.clone())),
                 },
             );
         }
@@ -1665,6 +1819,7 @@ mod tests {
             stopped,
             in_flight: WorkerInFlight::default(),
             overrides: crate::overrides::for_port(port),
+            bootstrap_port: None,
             name,
             cfg,
         };

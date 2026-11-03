@@ -24,11 +24,11 @@
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
-use super::unicode;
+use super::{chain, unicode};
 
 /// A set of characters: Unicode categories, code point ranges, negation.
 #[derive(Debug, Clone, Default)]
-struct Class {
+pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
@@ -140,7 +140,7 @@ impl Class {
     }
 
     #[inline]
-    fn contains(&self, c: char) -> bool {
+    pub(super) fn contains(&self, c: char) -> bool {
         let code = u32::from(c);
         if code < 128 {
             self.ascii.contains(code)
@@ -163,7 +163,7 @@ impl Class {
 }
 
 #[derive(Debug, Clone)]
-enum Node {
+pub(super) enum Node {
     /// One character of the class.
     Class(usize),
     /// Greedy repetition of one class character, `min..=max` times.
@@ -198,7 +198,7 @@ enum Node {
 /// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
 #[derive(Debug, Clone, Copy, Default)]
-struct First {
+pub(super) struct First {
     ascii: AsciiSet,
     non_ascii: bool,
     nullable: bool,
@@ -249,6 +249,9 @@ pub(crate) struct Pattern {
     firsts: Vec<First>,
     /// The matcher of the GPT-4 family's template, when the pattern is one.
     scanner: Option<Scanner>,
+    /// What the pattern is as a stage of a three-stage chain, when it is
+    /// one (see [`chain`]).
+    part: Option<chain::Part>,
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -320,6 +323,7 @@ impl Pattern {
             return None;
         }
         let scanner = Scanner::recognize(&root, &parser.classes);
+        let part = chain::Part::recognize(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -329,7 +333,18 @@ impl Pattern {
             program,
             firsts,
             scanner,
+            part,
         })
+    }
+
+    /// The pattern's classes, which its [`Part`](chain::Part) indexes.
+    pub(super) fn classes(&self) -> &[Class] {
+        &self.classes
+    }
+
+    /// What the pattern is as a stage of a three-stage chain, if anything.
+    pub(super) fn part(&self) -> Option<&chain::Part> {
+        self.part.as_ref()
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -781,7 +796,7 @@ impl Scanner {
 }
 
 /// The class of a node that is one character of a class.
-fn plain_class(node: &Node) -> Option<usize> {
+pub(super) fn plain_class(node: &Node) -> Option<usize> {
     match node {
         Node::Class(class) => Some(*class),
         _ => None,
@@ -789,7 +804,7 @@ fn plain_class(node: &Node) -> Option<usize> {
 }
 
 /// The class of a node that is a run of `min..=max` characters of one class.
-fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
+pub(super) fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
     match node {
         Node::ClassRepeat {
             class,
@@ -801,7 +816,7 @@ fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
 }
 
 /// The nodes of a concatenation.
-fn concat(node: &Node) -> Option<&[Node]> {
+pub(super) fn concat(node: &Node) -> Option<&[Node]> {
     match node {
         Node::Concat(nodes) => Some(nodes),
         _ => None,
@@ -810,7 +825,7 @@ fn concat(node: &Node) -> Option<&[Node]> {
 
 /// The start of the character before `pos`, a character boundary past 0.
 #[inline]
-fn previous_boundary(text: &str, pos: usize) -> usize {
+pub(super) fn previous_boundary(text: &str, pos: usize) -> usize {
     let mut p = pos - 1;
     while !text.is_char_boundary(p) {
         p -= 1;
@@ -1027,7 +1042,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
 }
 
 #[inline]
-fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
+pub(super) fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
     let byte = *text.as_bytes().get(pos)?;
     if byte < 0x80 {
         return Some((byte as char, 1));
