@@ -1,7 +1,7 @@
-// TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
-// array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
-// wire as an untagged positional msgpack array nested inside the tokenized
-// request. **Field order is the wire contract** — append only, never reorder.
+//! TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
+//! array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
+//! wire as an untagged positional msgpack array nested inside the tokenized
+//! request. **Field order is the wire contract** — append only, never reorder.
 
 use std::collections::HashMap;
 
