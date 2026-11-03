@@ -45,8 +45,9 @@ fn is_image(filename: &str) -> bool {
     lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
-/// Checks if a file is a tokenizer file
-fn is_tokenizer_file(filename: &str) -> bool {
+/// Checks if a file is a tokenizer file. `pub` so that the Python binding
+/// fingerprints a checkpoint by the files this download fetches.
+pub fn is_tokenizer_file(filename: &str) -> bool {
     filename.ends_with("tokenizer.json")
         || filename.ends_with("tokenizer_config.json")
         || filename.ends_with("special_tokens_map.json")
