@@ -220,8 +220,10 @@ Known limits, then What's Changed), and `make release-notes` renders it:
   Known limits are `<!-- AUTHOR: ... -->` comments that say what goes there.
 
 The pull request bodies are read through `gh` in batches and kept under `NOTES_CACHE`
-(`~/.cache/smg-release/pull-requests`, one file per number); without `gh`, or offline, every
-candidate falls back to its subject, marked, and the draft still renders.
+(`~/.cache/smg-release/pull-requests`, one file per number); `NOTES_REFRESH=1` reads every body
+again (a note added to a pull request after the first draft), as deleting the directory does;
+without `gh`, or offline, every candidate falls back to its subject, marked, and the draft still
+renders.
 
 The flow: draft at the first candidate (`make release-notes VERSION=1.14.0-rc.1 > notes.md` reads
 the tag, or the branch head before it), write the narratives during the cycle as the candidates

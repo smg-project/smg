@@ -55,7 +55,8 @@
 # Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1, the cut's main-move pull request
 # included; bump, pick and bump-main push their topic branch and open the pull request unless PUSH=0; the ship pushes);
 # REGISTRY=0 (check, publish-plan and the ship do not read crates.io and PyPI); NOTES_CACHE (where notes keeps the pull request
-# bodies it read, ~/.cache/smg-release/pull-requests by default); GH, CARGO, CURL, PYTHON, MAKE (the tools).
+# bodies it read, ~/.cache/smg-release/pull-requests by default), NOTES_REFRESH=1 (notes reads every body again);
+# GH, CARGO, CURL, PYTHON, MAKE (the tools).
 # The ship's: NOTES (an authored notes file, instead of the one it renders); BUMP_PUSH=1 (push the bump to the release
 # branch without reading the rules) or 0 (always its pull request); MERGE_WAIT (minutes it waits for the bump pull
 # request's merge, 120) and MERGE_POLL (seconds between two reads of it, 30).
@@ -580,7 +581,8 @@ cmd_notes() {
   [ -n "$version" ] || die "usage: release.sh notes <version> [<since>], or notes --check <file>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   local release tagname ref subject count picked full original unknown line path seen=' ' scratch slug compare chart rust contributors
-  local lines=() subjects=()
+  local lines=() subjects=() refresh=()
+  [ "${NOTES_REFRESH:-0}" = 0 ] || refresh=(--refresh)
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
@@ -645,6 +647,7 @@ cmd_notes() {
     --contributors "$contributors" --components-since "$scratch/components-since" --components-ref "$scratch/components-ref" \
     --engine-workflow "$scratch/engine-workflow" --docker "$scratch/docker" --chart "$chart" --rust-version "$rust" \
     --repo "$slug" --gh "$GH" --cache "$NOTES_CACHE" --compare-url "${slug:+https://github.com/$slug/compare/$since...$compare}" \
+    ${refresh[@]+"${refresh[@]}"} \
     || die "notes: the draft was not rendered (the cause is above); its inputs stay under $scratch"
   rm -rf -- "$scratch"
   note "a draft: replace every <!-- AUTHOR: --> comment, then 'release.sh notes --check <file>' before the GitHub release:"

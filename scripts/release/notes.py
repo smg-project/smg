@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -160,6 +161,7 @@ class Pull:
     bang: bool
     read: bool = False  # the body was read (a pull request the repository has)
     body: str = ""
+    section: bool = False  # the body has a release-note section, with a sentence or left empty
     # the release-note sentence; "" when the section declares none; None without a section
     note: str | None = None
     kinds: list[str] = field(default_factory=list)
@@ -219,18 +221,16 @@ class Pull:
 
     @property
     def line(self) -> str:
-        """The candidate line: the sentence, or the subject marked for the author."""
+        """The candidate line: the sentence, or the subject marked for the author with what is missing."""
         if self.note:
             return f"- {self.note} (#{self.number})"
         if self.number is None:
-            return (
-                f"- {self.subject} <!-- AUTHOR: no pull request number in the subject:"
-                " write the sentence or drop the line -->"
-            )
-        return (
-            f"- {self.subject} <!-- AUTHOR: no release note in the pull request:"
-            " write the sentence or drop the line -->"
-        )
+            missing = "no pull request number in the subject"
+        elif self.read and self.section:
+            missing = "the release-note section is empty"
+        else:
+            missing = "no release note in the pull request"
+        return f"- {self.subject} <!-- AUTHOR: {missing}: write the sentence or drop the line -->"
 
     @property
     def upgrade_line(self) -> str:
@@ -259,11 +259,13 @@ class Pull:
 # --- the pull request bodies ------------------------------------------------------------------------
 
 
-def release_note(body: str) -> str | None:
-    """The "## Release note" sentence of a body: None without the section, "" when it declares none.
+def note_section(body: str) -> tuple[bool, str | None]:
+    """Whether the body has a release-note section, and its sentence: None when the section is absent or was left
+    empty (nothing, or a template's placeholder comment alone), "" when it declares none.
 
     The section is a heading (any level) that starts with "Release note", read until the next heading, or a
-    "Release note:" line, read until the blank line after it; list markers go, the lines join into one.
+    "Release note:" line, read until the blank line after it; list markers go, the lines join into one. A comment
+    opener or closer inside the sentence is written out as text, so it cannot open a comment in the draft.
     """
     mode = None
     collected: list[str] = []
@@ -290,14 +292,24 @@ def release_note(body: str) -> str | None:
             mode = "inline"
             collected = [inline.group("text")]
     if mode is None:
-        return None
+        return False, None
     parts = (CHECKBOX.sub("", LIST_MARKER.sub("", part.strip())) for part in collected)
     text = re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()
-    return "" if not text or NONE_NOTE.match(text) else text
+    if not text:
+        return True, None
+    if NONE_NOTE.match(text):
+        return True, ""
+    return True, text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
 
 
-def read_bodies(pulls: list[Pull], gh: str, repo: str, cache: Path) -> None:
-    """Each numbered pull request's body from the cache, the rest fetched in batches and cached."""
+def release_note(body: str) -> str | None:
+    """The release-note sentence of a body: None without one (no section, or an empty one), "" for a declared none."""
+    return note_section(body)[1]
+
+
+def read_bodies(pulls: list[Pull], gh: str, repo: str, cache: Path, refresh: bool = False) -> None:
+    """Each numbered pull request's body from the cache, the rest fetched in batches and cached; every one fetched
+    again under refresh (a note added to a pull request after the first draft)."""
     numbered: dict[
         int, list[Pull]
     ] = {}  # a number can be listed twice (a revert, a pick's original)
@@ -313,19 +325,28 @@ def read_bodies(pulls: list[Pull], gh: str, repo: str, cache: Path) -> None:
         return
     store = cache / repo.replace("/", "-")
     store.mkdir(parents=True, exist_ok=True)
-    missing = sorted(number for number in numbered if not (store / f"{number}.json").is_file())
+    records = {} if refresh else {number: cached(store, number) for number in numbered}
+    missing = sorted(number for number in numbered if records.get(number) is None)
     if missing:
         fetch(missing, gh, repo, store)
+        for number in missing:
+            records[number] = cached(store, number)
     for number, listed_pulls in numbered.items():
-        entry = store / f"{number}.json"
-        if not entry.is_file():
-            continue
-        record = json.loads(entry.read_text(encoding="utf-8"))
-        if record.get("missing"):
+        record = records.get(number)
+        if record is None or record.get("missing"):
             continue
         for pull in listed_pulls:
             pull.read = True
             pull.body = record.get("body") or ""
+
+
+def cached(store: Path, number: int) -> dict | None:
+    """The cached record of a pull request; None when there is none, or when the file does not parse (a write cut
+    short): read again."""
+    try:
+        return json.loads((store / f"{number}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
@@ -344,15 +365,15 @@ def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
         done = subprocess.run(
             [gh, "api", "graphql", "-f", f"query={query}"], capture_output=True, text=True
         )
-        # gh exits 1 when any alias errors (a number that is an issue, not a pull request) and still prints the data
+        # gh exits 1 when any alias errors (a number that is an issue, not a pull request) and still prints the
+        # data; a repository the token cannot see answers "repository": null and no data at all
         try:
             data = json.loads(done.stdout)["data"]["repository"]
-        except (ValueError, KeyError, TypeError):
-            cause = (
-                done.stderr.strip().split("\n")[0]
-                if done.stderr.strip()
-                else f"gh exited {done.returncode}"
-            )
+            if not isinstance(data, dict):
+                raise TypeError("no repository in the answer")
+        except (ValueError, KeyError, TypeError) as error:
+            first = done.stderr.strip().split("\n")[0] if done.stderr.strip() else ""
+            cause = first or str(error) or f"gh exited {done.returncode}"
             warn(
                 f"the read of {len(numbers) - start} pull request bodies failed ({cause});"
                 " they fall back to their subjects"
@@ -362,7 +383,10 @@ def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
             record = data.get(f"p{number}") or {"number": number, "missing": True}
             if "author" in record:
                 record["author"] = (record.get("author") or {}).get("login", "")
-            (store / f"{number}.json").write_text(json.dumps(record), encoding="utf-8")
+            # written whole: a run cut during the write leaves no half file for every later render to refuse
+            partial = store / f"{number}.json.tmp"
+            partial.write_text(json.dumps(record), encoding="utf-8")
+            os.replace(partial, store / f"{number}.json")
 
 
 # --- the sections --------------------------------------------------------------------------------------
@@ -536,20 +560,21 @@ def render(args: argparse.Namespace) -> int:
         for subject in subjects
         if not subject.startswith("chore(release): bump versions")
     ]
-    read_bodies(pulls, args.gh, args.repo, Path(args.cache))
+    read_bodies(pulls, args.gh, args.repo, Path(args.cache), args.refresh)
     for pull in pulls:
         if pull.read:
-            pull.note = release_note(pull.body)
+            pull.section, pull.note = note_section(pull.body)
         pull.declare()
     with_note = sum(1 for pull in pulls if pull.note)
     none = sum(1 for pull in pulls if pull.note == "")
-    no_section = sum(1 for pull in pulls if pull.read and pull.note is None)
+    empty = sum(1 for pull in pulls if pull.read and pull.section and pull.note is None)
+    no_section = sum(1 for pull in pulls if pull.read and not pull.section)
     unread = sum(1 for pull in pulls if pull.number is not None and not pull.read)
     no_number = sum(1 for pull in pulls if pull.number is None)
     warn(
-        f"{len(pulls)} pull requests: {with_note} carry a release note, {none} declare none, {no_section} have no"
-        f" release-note section, {unread} could not be read, {no_number} subjects name no pull request"
-        " (the last three fall back to their subject, marked for the author)"
+        f"{len(pulls)} pull requests: {with_note} carry a release note, {none} declare none, {empty} leave the"
+        f" section empty, {no_section} have no release-note section, {unread} could not be read, {no_number}"
+        " subjects name no pull request (the last four fall back to their subject, marked for the author)"
     )
     values = {
         "version": args.version,
@@ -592,15 +617,28 @@ def template_tokens(path: Path) -> set[str] | None:
 
 
 def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, str]]:
-    """(line, excerpt) of every author comment, and every template token of the given names, left in the text.
+    """(line, excerpt) of every author comment, every template token of the given names, and every comment left
+    open in the text.
 
     A sentence may quote a template expression of its own (`{{ bos_token }}`): only the names the notes template
-    defines are placeholders, every token-shaped text when the names are unknown.
+    defines are placeholders, every token-shaped text when the names are unknown. An author comment counts wherever
+    "AUTHOR:" sits in it (a stray opener before it would swallow it), and an opener without a closer is reported
+    too: published, it hides everything after it.
     """
     found = []
+    closed_to = 0
     for match in COMMENT.finditer(text):
-        if match.group(0)[4:-3].strip().upper().startswith("AUTHOR:"):
+        closed_to = match.end()
+        if "AUTHOR:" in match.group(0).upper():
             found.append((text.count("\n", 0, match.start()) + 1, match.group(0).split("\n")[0]))
+    stray = text.find("<!--", closed_to)
+    if stray != -1:
+        found.append(
+            (
+                text.count("\n", 0, stray) + 1,
+                "<!-- (an opener without a closer: it hides everything after it)",
+            )
+        )
     for match in TOKEN.finditer(text):
         if names is None or match.group(1) in names:
             found.append((text.count("\n", 0, match.start()) + 1, match.group(0)))
@@ -660,6 +698,9 @@ def main(argv: list[str]) -> int:
         "--cache", required=True, help="where the pull request bodies are kept, by number"
     )
     draft.add_argument("--compare-url", default="")
+    draft.add_argument(
+        "--refresh", action="store_true", help="read every body again, whatever the cache holds"
+    )
     draft.set_defaults(run=render)
     verify = commands.add_parser("check", help="refuse notes that still carry a placeholder")
     verify.add_argument("file")

@@ -112,6 +112,11 @@ case "$1 $2" in
   "repo view") echo "example/repo" ;;
   "api graphql") # the notes' batch read of pull request bodies: GH_STUB_PULLS/<number>.md is a body, no file a null
     [ -z "${GH_STUB_GRAPHQL_ERROR-}" ] || { echo "gh: $GH_STUB_GRAPHQL_ERROR" >&2; exit 1; }
+    if [ -n "${GH_STUB_GRAPHQL_NULL_REPO-}" ]; then # a repository the token cannot see: null, an error, exit 1
+      echo '{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}'
+      echo "gh: Could not resolve to a Repository with the name 'example/repo'. (NOT_FOUND)" >&2
+      exit 1
+    fi
     python3 - "${GH_STUB_PULLS:-/nonexistent}" "$*" <<'PY'
 import json
 import re
@@ -1558,6 +1563,11 @@ NOTED_PULLS: tuple[tuple[str, str | None], ...] = (
         "## Compatibility\n\nBREAKING CHANGE: an evicted id answers 404.\n",
     ),
     ("feat(gateway): a test-only change (#215)", "## Release note\n\nNone: a test-only change.\n"),
+    (
+        "fix(gateway): a fix whose note was left blank (#216)",
+        "## Description\n\nx\n\n## Release note\n\n<!-- one or two sentences on what a user gets -->\n\n"
+        "## Test Plan\n\ny\n",
+    ),
 )
 SKELETON = (
     "# Shepherd Model Gateway v1.14.0",
@@ -1580,7 +1590,7 @@ SKELETON = (
 
 
 def noted_release(repo: Sandbox, pulls: Path) -> None:
-    """The fifteen pull requests merged on main, their bodies where GH_STUB_PULLS serves them, v1.14.0 tagged."""
+    """The sixteen pull requests merged on main, their bodies where GH_STUB_PULLS serves them, v1.14.0 tagged."""
     pulls.mkdir()
     for index, (subject, body) in enumerate(NOTED_PULLS):
         repo.commit_main(subject, f"model_gateway/src/change_{index}.rs", f"// {index}\n")
@@ -1671,6 +1681,10 @@ def test_notes_render_the_template_seeded_by_the_pull_requests_release_notes(
     )
     assert "**Metrics and observability**\n\n- `smg_kv_event_lag_seconds` is a histogram;" in fixes
     assert "- fix(router): two <!-- AUTHOR: no pull request number in the subject" in fixes
+    assert (
+        "- fix(gateway): a fix whose note was left blank (#216) <!-- AUTHOR: the release-note section is empty:"
+        " write the sentence or drop the line -->" in fixes
+    ), "an empty section is a marked subject, never a silent drop"
     assert "#201" not in fixes
     changed = out[out.index("## What's Changed") :]
     assert "commits since v1.13.0 on `release/1.14` (the merged pull requests, by type):" in changed
@@ -1680,8 +1694,8 @@ def test_notes_render_the_template_seeded_by_the_pull_requests_release_notes(
     assert "### Documentation\n\n- docs(readme): the upgrade page (#211)\n" in changed
     assert "### Maintenance\n\n- chore(ci): pin the runner image (#213)\n" in changed
     assert (
-        "17 pull requests: 11 carry a release note, 2 declare none, 1 have no release-note section, 1 could not be"
-        " read, 2 subjects name no pull request" in done.stderr
+        "18 pull requests: 11 carry a release note, 2 declare none, 1 leave the section empty, 1 have no"
+        " release-note section, 1 could not be read, 2 subjects name no pull request" in done.stderr
     )
     assert "release.sh notes --check <file>" in done.stderr
     assert (
@@ -1772,7 +1786,7 @@ def test_notes_render_without_the_bodies_when_gh_cannot_read_them(
         NOTES_CACHE=str(tmp_path / "c1"),
     )
     assert (
-        "the read of 15 pull request bodies failed (gh: boom); they fall back to their subjects"
+        "the read of 16 pull request bodies failed (gh: boom); they fall back to their subjects"
         in offline.stderr
     )
     assert "0 carry a release note" in offline.stderr
@@ -1861,6 +1875,28 @@ def test_the_release_note_of_a_pull_request_body() -> None:
     )
     assert notes.release_note("## Description\n\nno section\n") is None
     assert notes.release_note("") is None
+    # an empty section (nothing, or a placeholder comment alone) is no note: the subject is seeded and marked
+    assert notes.release_note("## Release note\n\n\n\n## Test Plan\n\nx") is None
+    assert notes.release_note("## Release note\n\n## Test Plan\n") is None
+    assert (
+        notes.release_note("## Release note\n\n<!-- a comment alone -->\n\n## Test Plan\n") is None
+    )
+    assert notes.note_section("## Release note\n\n<!-- alone -->\n") == (True, None)
+    assert notes.note_section("## Description\n\nx") == (False, None)
+    assert notes.note_section("## Release note\n\nnone\n") == (True, "")
+    assert (
+        notes.release_note("## Release note\n\nA --> closer first, then a <!-- opener.\n")
+        == "A --&gt; closer first, then a &lt;!-- opener."
+    )
+    assert notes.placeholders("a <!-- x\n<!-- AUTHOR: y -->") == [(1, "<!-- x")], (
+        "AUTHOR: anywhere in a comment"
+    )
+    assert notes.placeholders("text <!-- open\nmore") == [
+        (1, "<!-- (an opener without a closer: it hides everything after it)")
+    ]
+    assert notes.placeholders("<!-- see AUTHOR: later -->\n<!-- not one -->") == [
+        (1, "<!-- see AUTHOR: later -->")
+    ]
     pull = notes.Pull.of("feat(gateway, python)!: x (#7)")
     assert (pull.number, pull.type, pull.scope, pull.bang, pull.area) == (
         7,
@@ -1878,6 +1914,46 @@ def test_the_release_note_of_a_pull_request_body() -> None:
         (2, "<!-- AUTHOR: x -->"),
         (3, "{{t}}"),
     ]
+
+
+def test_notes_render_without_the_bodies_when_the_repository_is_not_visible(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    """A token that cannot see the repository gets "repository": null and no data: the fallback, not a crash."""
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    done = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls), GH_STUB_GRAPHQL_NULL_REPO="1")
+    assert (
+        "the read of 16 pull request bodies failed (gh: Could not resolve to a Repository"
+        in done.stderr
+    )
+    assert "0 carry a release note" in done.stderr and "## What's Changed" in done.stdout
+    assert "(#201) <!-- AUTHOR: no release note in the pull request" in done.stdout
+
+
+def test_notes_refresh_reads_every_body_again_and_a_cut_cache_file_is_read_again(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    cache = tmp_path / "cache"
+    env = {"GH_STUB_PULLS": str(pulls), "NOTES_CACHE": str(cache)}
+    first = repo.tool("notes", "1.14.0", **env).stdout
+    assert "(#212) <!-- AUTHOR: no release note in the pull request" in first
+    (pulls / "212.md").write_text("## Release note\n\nThe retry charge is one per request.\n")
+    cached = repo.tool("notes", "1.14.0", **env).stdout
+    assert "(#212) <!-- AUTHOR: no release note" in cached, "the cache answers until a refresh"
+    refreshed = repo.tool("notes", "1.14.0", NOTES_REFRESH="1", **env).stdout
+    assert "- The retry charge is one per request. (#212)" in refreshed
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert len(reads) == 2 and "p201:" in reads[1], "the refresh asked for every number again"
+    (cache / "example-repo" / "201.json").write_text("{")  # a write cut short
+    again = repo.tool("notes", "1.14.0", **env).stdout
+    assert "- The readiness body names each served model with a reason. (#201)" in again
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert len(reads) == 3 and "p201:" in reads[2] and "p202:" not in reads[2], (
+        "only the cut file is read again"
+    )
 
 
 # --- publish-plan ----------------------------------------------------------------------------
