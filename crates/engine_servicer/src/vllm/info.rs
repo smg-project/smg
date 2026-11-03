@@ -9,7 +9,7 @@ use tonic::Status;
 use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
-use crate::load_report::{unreported_ranks, RankFigures};
+use crate::{load_report::rank_entries, servicer::proto_token_ids};
 
 /// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
 /// default).
@@ -84,14 +84,7 @@ pub(super) fn health_check(state: &State) -> vllm::HealthCheckResponse {
 /// as the fallback for a launcher that reported none.
 pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
     let model = &state.model;
-    // The launcher's context length wins; the handshake's is the fallback
-    // for a launcher that reported none.
-    let mut max_context_length = model.max_context_length;
-    if max_context_length == 0 {
-        if let Some(ready) = state.shared.ready() {
-            max_context_length = u32::try_from(ready.max_model_len).unwrap_or(u32::MAX);
-        }
-    }
+    let max_context_length = state.shared.context_window(model.max_context_length);
     vllm::GetModelInfoResponse {
         model_path: model.model_path.clone(),
         is_generation: model.is_generation,
@@ -102,11 +95,7 @@ pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
         tokenizer_path: model.tokenizer_path.clone(),
         model_type: model.model_type.clone(),
         architectures: model.architectures.clone(),
-        eos_token_ids: model
-            .eos_token_ids
-            .iter()
-            .map(|&id| i32::try_from(id).unwrap_or(i32::MAX))
-            .collect(),
+        eos_token_ids: proto_token_ids(&model.eos_token_ids),
         pad_token_id: model.pad_token_id,
         bos_token_id: model.bos_token_id,
         max_req_input_len: i32::try_from(max_context_length).unwrap_or(i32::MAX),
@@ -191,12 +180,19 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let ready = client.ready_response();
     let max_running_requests = state.shared.running_window(state.model.max_num_seqs);
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let snapshot = client.get_loads();
-    let mut loads: Vec<vllm::SchedulerLoad> = snapshot
-        .loads
-        .into_iter()
-        .map(|load| {
-            let figures = RankFigures::of(&load, max_total_num_tokens);
+    let ranks = state.shared.rank_count(state.model.data_parallel_size);
+    // The servicer's own figures do not wait for the engine's first snapshot:
+    // what a rank cached and streamed so far, and the token-work queued to
+    // it. Before that snapshot the engine has not said how many requests it
+    // holds waiting, and that is every request submitted to the rank and not
+    // started, so all of them count (an overestimate by what is already in
+    // prefill, better than a zero that reads as known-empty).
+    let (loads, _) = rank_entries(
+        client.get_loads().loads,
+        max_total_num_tokens,
+        ranks,
+        None,
+        |load, figures| {
             let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
             vllm::SchedulerLoad {
                 dp_rank: figures.dp_rank,
@@ -212,32 +208,20 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 gen_throughput: estimate.gen_throughput,
                 cache_hit_rate: estimate.cache_hit_rate,
             }
-        })
-        .collect();
-    // A connected rank no output batch has carried a snapshot for yet gets a
-    // zero-filled entry (see `unreported_ranks`; the Router reads an empty
-    // list as no report at all). The servicer's own figures do not wait for
-    // the engine's first snapshot: what this rank cached and streamed so far,
-    // and the token-work queued to it. The engine has not said how many
-    // requests it holds waiting, and before its first snapshot that is every
-    // request submitted to the rank and not started, so all of them count
-    // (an overestimate by what is already in prefill, better than a zero
-    // that reads as known-empty).
-    let reported: Vec<i32> = loads.iter().map(|load| load.dp_rank).collect();
-    let ranks = state.shared.rank_count(state.model.data_parallel_size);
-    loads.extend(unreported_ranks(ranks, &reported).map(|dp_rank| {
-        let estimate = state.loads.estimate(dp_rank, i32::MAX);
-        vllm::SchedulerLoad {
-            dp_rank,
-            max_running_requests,
-            max_total_num_tokens,
-            num_waiting_uncached_tokens: estimate.queued_token_work,
-            gen_throughput: estimate.gen_throughput,
-            cache_hit_rate: estimate.cache_hit_rate,
-            ..Default::default()
-        }
-    }));
-    loads.sort_by_key(|load| load.dp_rank);
+        },
+        |dp_rank| {
+            let estimate = state.loads.estimate(dp_rank, i32::MAX);
+            vllm::SchedulerLoad {
+                dp_rank,
+                max_running_requests,
+                max_total_num_tokens,
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
+                ..Default::default()
+            }
+        },
+    );
     let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
     Ok(vllm::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
