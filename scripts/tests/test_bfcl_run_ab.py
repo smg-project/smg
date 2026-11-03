@@ -211,3 +211,394 @@ def test_actual_evaluate_timeout_is_incomplete_even_with_scores(
         assert all(v == "timed out during: evaluate" for v in payload["incomplete"].values())
     else:
         assert payload["incomplete"] == {}
+
+
+# Infrastructure diagnostics are separate from the official scorer and gates.
+MODEL = "Qwen/Qwen3-4B-FC"
+UNAVAILABLE = "Error during inference: Error code: 503 - no_available_workers"
+
+
+def write_results(root, category, records, *, model=MODEL, section="non_live"):
+    path = root / "result" / model.replace("/", "_") / section / f"BFCL_v4_{category}_result.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return path
+
+
+def diagnostics_before(root, categories=("simple_python",)):
+    return run_ab.result_paths(root, MODEL, list(categories))
+
+
+@pytest.mark.parametrize(
+    "value,kind",
+    [
+        ("", "non_error_result"),
+        ([], "non_error_result"),
+        ("A legitimate answer mentioning503/no_available_workers", "non_error_result"),
+        (UNAVAILABLE, "http_503_no_available_workers"),
+        (["ok", UNAVAILABLE], "http_503_no_available_workers"),
+        ("Error during inference: Request timed out.", "other_inference_error"),
+    ],
+)
+def test_result_diagnostics_classification_and_source_bound_ids(tmp_path, value, kind):
+    import hashlib
+
+    before, error = diagnostics_before(tmp_path)
+    path = write_results(
+        tmp_path,
+        "simple_python",
+        [
+            {"id": "simple_python_0", "result": []},
+            {"id": "simple_python_1", "result": value},
+        ],
+    )
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error, {"simple_python": 2}
+    )
+    assert diagnostic["status"] == "observed"
+    row = diagnostic["categories"]["simple_python"]
+    assert row["source"] == {
+        "path": str(path.relative_to(tmp_path)),
+        "bytes": len(path.read_bytes()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    assert row["id_inventory"] == [
+        {"id": "simple_python_0", "line": 1, "classification": "non_error_result"},
+        {"id": "simple_python_1", "line": 2, "classification": kind},
+    ]
+    assert row["unique_ids"] == 2 and row["duplicate_ids"] == []
+    assert sum(diagnostic["counts"].values()) == 2
+    assert diagnostic["counts"][kind] == (2 if kind == "non_error_result" else 1)
+
+
+def test_result_diagnostics_preexisting_rewrite_is_not_fresh(tmp_path):
+    path = write_results(tmp_path, "simple_python", [{"id": "simple_python_0", "result": []}])
+    before, error = diagnostics_before(tmp_path)
+    path.write_text(json.dumps({"id": "simple_python_0", "result": UNAVAILABLE}) + "\n")
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error
+    )
+    assert diagnostic["status"] == "unknown" and diagnostic["counts"] is None
+    assert diagnostic["categories"]["simple_python"]["reason"] == "preexisting_result_files"
+    assert "source" not in diagnostic["categories"]["simple_python"]
+
+
+@pytest.mark.parametrize(
+    "state", ["missing", "malformed", "unsupported", "duplicate", "ambiguous", "linked"]
+)
+def test_result_diagnostics_unknown_evidence_never_becomes_zero_errors(tmp_path, state):
+    before, error = diagnostics_before(tmp_path)
+    if state != "missing":
+        path = write_results(tmp_path, "simple_python", [{"id": "simple_python_0", "result": []}])
+        if state == "malformed":
+            path.write_text('{"id": "simple_python_0", "result":')
+        elif state == "unsupported":
+            path.write_text(
+                json.dumps({"id": "simple_python_0", "result": {"unknown": True}}) + "\n"
+            )
+        elif state == "duplicate":
+            path.write_text(path.read_text() * 2)
+        elif state == "ambiguous":
+            write_results(
+                tmp_path,
+                "simple_python",
+                [{"id": "simple_python_1", "result": []}],
+                section="other",
+            )
+        elif state == "linked":
+            outside = tmp_path / "outside-private.txt"
+            outside.write_text("PRIVATE must not be read")
+            path.unlink()
+            path.symlink_to(outside)
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error
+    )
+    assert diagnostic["status"] == "unknown" and diagnostic["counts"] is None
+    assert all(row["counts"] is None for row in diagnostic["categories"].values())
+    assert "PRIVATE" not in json.dumps(diagnostic)
+    if state == "duplicate":
+        assert diagnostic["categories"]["simple_python"]["duplicate_ids"] == ["simple_python_0"]
+
+
+def test_result_diagnostics_only_exact_model_and_category_are_observed(tmp_path):
+    before, error = diagnostics_before(tmp_path, ("multiple",))
+    write_results(tmp_path, "multiple", [{"id": "multiple_0", "result": []}])
+    write_results(
+        tmp_path, "parallel_multiple", [{"id": "parallel_multiple_0", "result": UNAVAILABLE}]
+    )
+    write_results(
+        tmp_path, "multiple", [{"id": "multiple_9", "result": UNAVAILABLE}], model="Other/Model-FC"
+    )
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["multiple"], before, error, {"multiple": 1}
+    )
+    assert diagnostic["status"] == "observed"
+    assert diagnostic["counts"]["http_503_no_available_workers"] == 0
+    assert diagnostic["categories"]["multiple"]["unique_ids"] == 1
+
+
+def test_result_diagnostics_partial_result_count_is_unknown(tmp_path):
+    before, error = diagnostics_before(tmp_path)
+    write_results(tmp_path, "simple_python", [{"id": "simple_python_0", "result": []}])
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error, {"simple_python": 400}
+    )
+    assert diagnostic["status"] == "unknown" and diagnostic["counts"] is None
+    assert diagnostic["categories"]["simple_python"]["reason"] == "result_and_score_counts_differ"
+    assert diagnostic["categories"]["simple_python"]["unique_ids"] == 1
+
+
+def test_result_diagnostics_automatic_collection_preserves_generate_contract(tmp_path, monkeypatch):
+    arm = run_ab.parse_arm("smg=http://127.0.0.1:30000", tmp_path)
+    calls = []
+
+    def fake_run(cmd, env, label, timeout=0):
+        calls.append((cmd, label, timeout))
+        root = Path(env["BFCL_PROJECT_ROOT"])
+        if cmd[1] == "generate":
+            write_results(
+                root,
+                "simple_python",
+                [
+                    {"id": "simple_python_0", "result": []},
+                    {"id": "simple_python_1", "result": UNAVAILABLE},
+                ],
+            )
+        elif cmd[1] == "evaluate":
+            score_dir = cmd[cmd.index("--score-dir") + 1]
+            write_score(root / score_dir, "non_live", "simple_python", 0.9, 2)
+        else:
+            raise AssertionError("unknown synthetic BFCL command")
+        return True
+
+    monkeypatch.setattr(run_ab, "_run", fake_run)
+    run_ab.run_bfcl(
+        arm,
+        bfcl="fixture-only",
+        model=MODEL,
+        categories=["simple_python"],
+        num_threads=16,
+        temperature=0.001,
+        skip_generate=False,
+        run_timeout=14400,
+    )
+    assert arm.scores == {"simple_python": 0.9} and arm.counts == {"simple_python": 2}
+    assert arm.timed_out == []
+    assert arm.result_diagnostics["counts"]["http_503_no_available_workers"] == 1
+    assert [call[0][1] for call in calls] == ["generate", "evaluate"]
+    assert all(call[2] == 14400 for call in calls)
+    generate = calls[0][0]
+    assert generate[generate.index("--num-threads") + 1] == "16"
+    assert generate[generate.index("--temperature") + 1] == "0.001"
+    run_ab.run_bfcl(
+        arm,
+        bfcl="fixture-only",
+        model=MODEL,
+        categories=["simple_python"],
+        num_threads=16,
+        temperature=0.001,
+        skip_generate=True,
+    )
+    assert arm.result_diagnostics["status"] == "unknown"
+    assert arm.result_diagnostics["reason"] == "generation_skipped"
+
+
+def test_result_diagnostics_round_trip_legacy_and_quality_gate_are_separate(tmp_path):
+    from types import SimpleNamespace
+
+    baseline = run_ab.parse_arm("vllm=http://127.0.0.1:30000", tmp_path)
+    candidate = run_ab.parse_arm("smg=http://127.0.0.1:30001", tmp_path)
+    for arm, result in [(baseline, []), (candidate, UNAVAILABLE)]:
+        before, error = diagnostics_before(arm.project_root)
+        write_results(
+            arm.project_root, "simple_python", [{"id": "simple_python_0", "result": result}]
+        )
+        arm.scores, arm.counts = {"simple_python": 0.9}, {"simple_python": 1}
+        arm.result_diagnostics = run_ab.collect_result_diagnostics(
+            arm.project_root, MODEL, ["simple_python"], before, error, arm.counts
+        )
+        saved = tmp_path / (arm.name + ".json")
+        run_ab.save_scores(arm, saved)
+        restored = run_ab.load_scores(saved)
+        assert restored.result_diagnostics == arm.result_diagnostics
+        assert restored.scores == arm.scores and restored.timed_out == []
+    output = tmp_path / "report.json"
+    args = SimpleNamespace(out=None, json_out=output, tolerance=0.02, allow_incomplete=False)
+    assert (
+        run_ab.write_report_and_gate(baseline, candidate, ["simple_python"], args) == run_ab.EXIT_OK
+    )
+    payload = json.loads(output.read_text())
+    assert payload["overall"] == {"baseline": 0.9, "candidate": 0.9, "delta": 0.0}
+    assert payload["incomplete"] == {}
+    assert (
+        payload["candidate"]["result_diagnostics"]["counts"]["http_503_no_available_workers"] == 1
+    )
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"name": "old", "scores": {"simple_python": 0.9}}))
+    restored = run_ab.load_scores(legacy)
+    assert restored.result_diagnostics["status"] == "unknown"
+    assert restored.result_diagnostics["counts"] is None
+
+
+@pytest.mark.parametrize(
+    "message,kind",
+    [
+        (
+            "Error during inference: Error code: 429 - prompt mentioned503 no_available_workers",
+            "other_inference_error",
+        ),
+        (
+            "Error during inference: Error code: 500 - context: Error code: 503 no_available_workers",
+            "other_inference_error",
+        ),
+        (
+            "Error during inference: Error code: 5030 - no_available_workers",
+            "other_inference_error",
+        ),
+        (
+            "Error during inference: context mentioned503 no_available_workers",
+            "other_inference_error",
+        ),
+        ("Error during inference: Error code: 503 - unrelated_failure", "other_inference_error"),
+        (
+            "Error during inference: HTTP 503 - no_available_workers",
+            "http_503_no_available_workers",
+        ),
+    ],
+)
+def test_result_diagnostics_explicit_status_precedes_quoted_context(tmp_path, message, kind):
+    before, error = diagnostics_before(tmp_path)
+    write_results(tmp_path, "simple_python", [{"id": "simple_python_0", "result": message}])
+    diagnostic = run_ab.collect_result_diagnostics(
+        tmp_path, MODEL, ["simple_python"], before, error, {"simple_python": 1}
+    )
+    assert diagnostic["status"] == "observed"
+    assert diagnostic["counts"][kind] == 1
+    assert diagnostic["counts"]["http_503_no_available_workers"] == (
+        kind == "http_503_no_available_workers"
+    )
+
+
+@pytest.mark.parametrize("depth", [65, 1100])
+def test_result_diagnostics_deep_data_is_unknown_without_aborting_score_report(
+    tmp_path, monkeypatch, depth
+):
+    from types import SimpleNamespace
+
+    arm = run_ab.parse_arm("smg=http://127.0.0.1:30000", tmp_path)
+
+    def fake_run(cmd, env, label, timeout=0):
+        root = Path(env["BFCL_PROJECT_ROOT"])
+        if cmd[1] == "generate":
+            path = write_results(root, "simple_python", [])
+            nested = "[" * depth + '"ok"' + "]" * depth
+            path.write_text('{"id":"simple_python_0","result":' + nested + "}\n")
+        elif cmd[1] == "evaluate":
+            score_dir = cmd[cmd.index("--score-dir") + 1]
+            write_score(root / score_dir, "non_live", "simple_python", 0.9, 1)
+        else:
+            raise AssertionError("unknown synthetic BFCL command")
+        return True
+
+    monkeypatch.setattr(run_ab, "_run", fake_run)
+    run_ab.run_bfcl(
+        arm,
+        bfcl="fixture-only",
+        model=MODEL,
+        categories=["simple_python"],
+        num_threads=16,
+        temperature=0.001,
+        skip_generate=False,
+    )
+    assert arm.scores == {"simple_python": 0.9} and arm.timed_out == []
+    assert arm.result_diagnostics["status"] == "unknown"
+    assert arm.result_diagnostics["counts"] is None
+    args = SimpleNamespace(
+        out=None, json_out=tmp_path / "deep-report.json", tolerance=0.02, allow_incomplete=False
+    )
+    assert run_ab.write_report_and_gate(arm, arm, ["simple_python"], args) == run_ab.EXIT_OK
+    payload = json.loads(args.json_out.read_text())
+    assert payload["overall"]["delta"] == 0.0 and payload["incomplete"] == {}
+    assert payload["candidate"]["result_diagnostics"]["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "unbound_dictionary",
+        "missing_model",
+        "bad_digest",
+        "forged_id",
+        "boolean_count",
+        "stale_source",
+        "missing_source",
+        "escaped_root",
+        "absolute_root",
+        "moved_artifact",
+    ],
+)
+def test_result_diagnostics_saved_observed_requires_actual_matching_source(tmp_path, state):
+    arm = run_ab.parse_arm("smg=http://127.0.0.1:30000", tmp_path)
+    before, error = diagnostics_before(arm.project_root)
+    result = write_results(
+        arm.project_root, "simple_python", [{"id": "simple_python_0", "result": []}]
+    )
+    arm.scores, arm.counts = {"simple_python": 0.9}, {"simple_python": 1}
+    arm.result_diagnostics = run_ab.collect_result_diagnostics(
+        arm.project_root, MODEL, ["simple_python"], before, error, arm.counts
+    )
+    saved = tmp_path / "cached.json"
+    run_ab.save_scores(arm, saved)
+    assert run_ab.load_scores(saved).result_diagnostics == arm.result_diagnostics
+    data = json.loads(saved.read_text())
+    row = data["result_diagnostics"]["categories"]["simple_python"]
+    if state == "unbound_dictionary":
+        data["result_diagnostics"] = {
+            "status": "observed",
+            "counts": {"http_503_no_available_workers": 0},
+            "categories": {},
+        }
+    elif state == "missing_model":
+        del data["result_diagnostics"]["model"]
+    elif state == "bad_digest":
+        row["source"]["sha256"] = "0" * 64
+    elif state == "forged_id":
+        row["id_inventory"][0]["id"] = "simple_python_99"
+    elif state == "boolean_count":
+        data["result_diagnostics"]["counts"]["http_503_no_available_workers"] = False
+    elif state == "stale_source":
+        result.write_text(json.dumps({"id": "simple_python_0", "result": UNAVAILABLE}) + "\n")
+    elif state == "missing_source":
+        result.unlink()
+    elif state == "escaped_root":
+        data["result_source_root"] = "../outside"
+    elif state == "absolute_root":
+        data["result_source_root"] = str(arm.project_root)
+    elif state == "moved_artifact":
+        saved = tmp_path / "new-location" / "cached.json"
+        saved.parent.mkdir()
+    saved.write_text(json.dumps(data))
+    restored = run_ab.load_scores(saved)
+    assert restored.scores == arm.scores and restored.counts == arm.counts
+    assert restored.timed_out == arm.timed_out
+    assert restored.result_diagnostics["status"] == "unknown"
+    assert restored.result_diagnostics["counts"] is None
+
+
+def test_result_diagnostics_valid_unknown_inventory_round_trip_stays_unknown(tmp_path):
+    arm = run_ab.parse_arm("smg=http://127.0.0.1:30000", tmp_path)
+    before, error = diagnostics_before(arm.project_root)
+    write_results(
+        arm.project_root, "simple_python", [{"id": "simple_python_0", "result": UNAVAILABLE}]
+    )
+    arm.scores, arm.counts = {"simple_python": 0.9}, {"simple_python": 400}
+    arm.result_diagnostics = run_ab.collect_result_diagnostics(
+        arm.project_root, MODEL, ["simple_python"], before, error, arm.counts
+    )
+    assert arm.result_diagnostics["status"] == "unknown"
+    saved = tmp_path / "unknown.json"
+    run_ab.save_scores(arm, saved)
+    restored = run_ab.load_scores(saved)
+    assert restored.result_diagnostics == arm.result_diagnostics
+    assert restored.result_diagnostics["counts"] is None
+    assert restored.result_diagnostics["categories"]["simple_python"]["unique_ids"] == 1

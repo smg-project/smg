@@ -36,10 +36,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -51,6 +53,185 @@ from urllib.parse import urlparse
 EXIT_OK = 0
 EXIT_REGRESSION = 1
 EXIT_INCOMPLETE = 2
+
+
+RESULT_FILE_LIMIT = 64 * 1024 * 1024
+RESULT_TOTAL_LIMIT = 128 * 1024 * 1024
+RESULT_CLASSES = ("non_error_result", "http_503_no_available_workers", "other_inference_error")
+
+
+def unknown_result_diagnostics(reason: str) -> dict:
+    return {"status": "unknown", "reason": reason, "counts": None, "categories": {}}
+
+
+def result_paths(project_root: Path, model: str, categories: list[str]) -> tuple[dict, str | None]:
+    """Find only this BFCL model's exact category files, without following links."""
+    paths = {category: [] for category in categories}
+    model_dir = model.replace("/", "_")
+    if model_dir in ("", ".", "..") or "\\" in model_dir:
+        return paths, "unsupported_model_directory"
+    result_root = project_root / "result" / model_dir
+    try:
+        if any(path.is_symlink() for path in (project_root, project_root / "result", result_root)):
+            return paths, "linked_result_directory"
+        patterns = {
+            category: re.compile(rf"(?:BFCL_v\d+_)?{re.escape(category)}_result\.json")
+            for category in categories
+        }
+        for index, path in enumerate(result_root.rglob("*")):
+            if index >= 4096:
+                return paths, "result_directory_limit"
+            if path.is_symlink():
+                return paths, "linked_result_payload"
+            if path.is_file():
+                for category, pattern in patterns.items():
+                    if pattern.fullmatch(path.name):
+                        paths[category].append(path)
+    except OSError:
+        return paths, "unreadable_result_directory"
+    return paths, None
+
+
+def classify_result(value) -> str | None:
+    """Classify explicit status prefixes, with finite depth/work for result data."""
+    pending = [(value, 0)]
+    result = "non_error_result"
+    visited = 0
+    while pending:
+        current, depth = pending.pop()
+        visited += 1
+        if depth > 64 or visited > 10000:
+            return None
+        if isinstance(current, list):
+            if len(current) + len(pending) > 10000:
+                return None
+            pending.extend((item, depth + 1) for item in current)
+            continue
+        if not isinstance(current, str):
+            return None
+        if not current.startswith("Error during inference:"):
+            continue
+        status = re.match(
+            r"Error during inference:\s*(?:Error code:\s*|HTTP\s+)([0-9]{3})(?![0-9])", current
+        )
+        if status and status[1] == "503" and "no_available_workers" in current:
+            result = "http_503_no_available_workers"
+        elif result == "non_error_result":
+            result = "other_inference_error"
+    return result
+
+
+def collect_result_diagnostics(
+    project_root: Path,
+    model: str,
+    categories: list[str],
+    before: dict,
+    before_error: str | None,
+    expected_counts: dict[str, int] | None = None,
+) -> dict:
+    """Read new generation outputs only. Missing/ambiguous evidence stays unknown.
+
+    A pre-existing category file is never borrowed, even if generation rewrites
+    it. The digest and ordered ID/line inventory describe observed results, not
+    proof that a model served those cases or that the official scorer is correct.
+    """
+    if not categories or len(categories) != len(set(categories)):
+        return unknown_result_diagnostics("empty_or_duplicate_categories")
+    if before_error:
+        return unknown_result_diagnostics(before_error)
+    paths, error = result_paths(project_root, model, categories)
+    if error:
+        return unknown_result_diagnostics(error)
+    diagnostic = {"status": "observed", "model": model, "counts": None, "categories": {}}
+    remaining = RESULT_TOTAL_LIMIT
+    for category in categories:
+        row = {"status": "unknown", "counts": None}
+        diagnostic["categories"][category] = row
+        if before.get(category):
+            row["reason"] = "preexisting_result_files"
+            continue
+        if len(paths[category]) != 1:
+            row["reason"] = "missing_or_ambiguous_result_files"
+            continue
+        path = paths[category][0]
+        try:
+            if not hasattr(os, "O_NOFOLLOW"):
+                raise ValueError("nofollow_unavailable")
+            with os.fdopen(
+                os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"
+            ) as source:
+                initial = os.fstat(source.fileno())
+                if not stat.S_ISREG(initial.st_mode) or initial.st_size > min(
+                    remaining, RESULT_FILE_LIMIT
+                ):
+                    raise ValueError("result_size_or_type_limit")
+                body = source.read(min(remaining, RESULT_FILE_LIMIT) + 1)
+                final = os.fstat(source.fileno())
+            current = path.stat(follow_symlinks=False)
+            identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+            if any(
+                getattr(initial, key) != getattr(value, key)
+                for key in identity_fields
+                for value in (final, current)
+            ):
+                raise ValueError("result_changed_during_read")
+            if len(body) != initial.st_size:
+                raise ValueError("result_size_changed")
+            remaining -= len(body)
+            row["source"] = {
+                "path": str(path.relative_to(project_root)),
+                "bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+            }
+            counts = dict.fromkeys(RESULT_CLASSES, 0)
+            inventory, seen, duplicates, invalid = [], set(), [], False
+            for line_number, line in enumerate(body.splitlines(), 1):
+                if not line.strip():
+                    continue
+                if len(line) > 1024 * 1024 or len(inventory) >= 10000:
+                    raise ValueError("result_record_limit")
+                try:
+                    record = json.loads(line)
+                    case_id = record.get("id") if isinstance(record, dict) else None
+                    kind = (
+                        classify_result(record.get("result")) if isinstance(record, dict) else None
+                    )
+                    if (
+                        not isinstance(case_id, str)
+                        or len(case_id) > 256
+                        or not case_id.startswith(category + "_")
+                    ):
+                        raise ValueError("invalid_case_id")
+                    inventory.append(
+                        {"id": case_id, "line": line_number, "classification": kind or "unknown"}
+                    )
+                    if case_id in seen:
+                        duplicates.append(case_id)
+                    seen.add(case_id)
+                    if kind is None:
+                        invalid = True
+                    else:
+                        counts[kind] += 1
+                except (ValueError, UnicodeError, RecursionError):
+                    invalid = True
+            row.update(id_inventory=inventory, unique_ids=len(seen), duplicate_ids=duplicates)
+            if not inventory or invalid or duplicates:
+                row["reason"] = "empty_invalid_or_duplicate_records"
+            elif expected_counts is not None and len(inventory) != expected_counts.get(category):
+                row["scored_count"] = expected_counts.get(category)
+                row["reason"] = "result_and_score_counts_differ"
+            else:
+                row.update(status="observed", counts=counts)
+        except (OSError, ValueError) as exc:
+            row["reason"] = str(exc) if isinstance(exc, ValueError) else "unreadable_result_file"
+    if any(row["status"] != "observed" for row in diagnostic["categories"].values()):
+        diagnostic.update(status="unknown", reason="one_or_more_categories_unknown")
+    else:
+        diagnostic["counts"] = {
+            kind: sum(row["counts"][kind] for row in diagnostic["categories"].values())
+            for kind in RESULT_CLASSES
+        }
+    return diagnostic
 
 
 @dataclass
@@ -65,6 +246,9 @@ class Arm:
     scores: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)  # per-category test-case count
     timed_out: list[str] = field(default_factory=list)  # stages killed by --run-timeout
+    result_diagnostics: dict = field(
+        default_factory=lambda: unknown_result_diagnostics("not_collected")
+    )
 
 
 def parse_arm(spec: str, project_root: Path) -> Arm:
@@ -120,6 +304,9 @@ def run_bfcl(
     # missing cache. Export HF_HUB_OFFLINE=1 yourself for air-gapped runs.
 
     cats = ",".join(categories)
+    before, before_error = (
+        result_paths(arm.project_root, model, categories) if not skip_generate else ({}, None)
+    )
     if not skip_generate:
         if not _run(
             [
@@ -167,6 +354,14 @@ def run_bfcl(
     ):
         arm.timed_out.append("evaluate")
     arm.scores, arm.counts = parse_scores(arm.project_root / score_dir, model, categories)
+    if skip_generate or "generate" in arm.timed_out:
+        arm.result_diagnostics = unknown_result_diagnostics(
+            "generation_skipped" if skip_generate else "generation_timed_out"
+        )
+    else:
+        arm.result_diagnostics = collect_result_diagnostics(
+            arm.project_root, model, categories, before, before_error, arm.counts
+        )
 
 
 def _run(cmd: list[str], env: dict[str, str], label: str, timeout: int = 0) -> bool:
@@ -328,6 +523,19 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
         "calculate_unweighted/weighted_accuracy._"
     )
 
+    lines.append("")
+    lines.append(
+        "Infrastructure-result diagnostics (separate from scores and gates; non-error is not served-quality proof):"
+    )
+    for arm in (baseline, candidate):
+        diagnostic = arm.result_diagnostics
+        detail = (
+            json.dumps(diagnostic.get("counts"), sort_keys=True)
+            if diagnostic.get("status") == "observed"
+            else "UNKNOWN"
+        )
+        lines.append(f"- `{arm.name}`: {detail}.")
+
     payload = {
         "baseline": {
             "name": baseline.name,
@@ -335,6 +543,7 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "scores": baseline.scores,
             "counts": baseline.counts,
             "timed_out": baseline.timed_out,
+            "result_diagnostics": baseline.result_diagnostics,
         },
         "candidate": {
             "name": candidate.name,
@@ -342,6 +551,7 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "scores": candidate.scores,
             "counts": candidate.counts,
             "timed_out": candidate.timed_out,
+            "result_diagnostics": candidate.result_diagnostics,
         },
         "incomplete": incomplete,
         "per_category": rows,
@@ -361,6 +571,10 @@ def save_scores(arm: Arm, path: Path) -> None:
     Used by the sequential mode: when a model needs the whole node (TP=8) the two
     arms cannot run at once, so each is scored on its own and diffed afterwards.
     """
+    try:
+        relative_source = str(arm.project_root.resolve().relative_to(path.parent.resolve()))
+    except (OSError, ValueError):
+        relative_source = None
     path.write_text(
         json.dumps(
             {
@@ -369,6 +583,8 @@ def save_scores(arm: Arm, path: Path) -> None:
                 "scores": arm.scores,
                 "counts": arm.counts,
                 "timed_out": arm.timed_out,
+                "result_diagnostics": arm.result_diagnostics,
+                "result_source_root": relative_source,
             },
             indent=2,
         )
@@ -377,15 +593,72 @@ def save_scores(arm: Arm, path: Path) -> None:
     )
 
 
+def saved_result_diagnostics(data: dict, path: Path) -> tuple[dict, Path]:
+    """Revalidate saved diagnostics from contained source, otherwise UNKNOWN.
+
+    A score file may be moved or its source cleaned up. Scores remain usable;
+    metadata never turns those missing bindings into zero infrastructure errors.
+    """
+    unknown = unknown_result_diagnostics("saved_diagnostics_not_source_verified")
+    try:
+        cached = data.get("result_diagnostics")
+        relative_root = data.get("result_source_root")
+        if not isinstance(cached, dict) or cached.get("status") not in ("observed", "unknown"):
+            return unknown, Path()
+        if not isinstance(relative_root, str):
+            return unknown, Path()
+        relative_root = Path(relative_root)
+        if relative_root.is_absolute() or ".." in relative_root.parts:
+            return unknown, Path()
+        root = path.parent / relative_root
+        current = root
+        while current != path.parent:
+            if current.is_symlink():
+                return unknown, Path()
+            current = current.parent
+        if not root.resolve().is_relative_to(path.parent.resolve()):
+            return unknown, Path()
+        model, rows = cached.get("model"), cached.get("categories")
+        scores, counts = data.get("scores"), data.get("counts")
+        if not isinstance(model, str) or not model or len(model) > 256:
+            return unknown, Path()
+        if (
+            not isinstance(rows, dict)
+            or not rows
+            or not isinstance(scores, dict)
+            or not isinstance(counts, dict)
+        ):
+            return unknown, Path()
+        if set(rows) != set(scores) or set(rows) != set(counts):
+            return unknown, Path()
+        if not all(
+            isinstance(key, str) and type(counts[key]) is int and counts[key] > 0 for key in rows
+        ):
+            return unknown, Path()
+        fresh = collect_result_diagnostics(root, model, list(rows), {}, None, counts)
+        # Canonical JSON equality rejects booleans masquerading as numeric0 and
+        # unknown/extra schema fields as well as stale digests, IDs or counters.
+        if json.dumps(cached, sort_keys=True, allow_nan=False) != json.dumps(
+            fresh, sort_keys=True, allow_nan=False
+        ):
+            return unknown, Path()
+        return fresh, root
+    except (OSError, ValueError, TypeError, RecursionError):
+        return unknown, Path()
+
+
 def load_scores(path: Path) -> Arm:
-    """Rebuild an Arm from a file written by save_scores."""
+    """Rebuild scores; optional diagnostics require their actual contained source."""
     data = json.loads(path.read_text(encoding="utf-8"))
+    diagnostic, root = saved_result_diagnostics(data, path)
     return Arm(
         name=data["name"],
         base_url=data.get("base_url", ""),
+        project_root=root,
         scores=data["scores"],
         counts=data.get("counts", {}),
         timed_out=data.get("timed_out", []),
+        result_diagnostics=diagnostic,
     )
 
 
