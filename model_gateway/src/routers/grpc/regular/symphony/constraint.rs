@@ -216,8 +216,8 @@ fn generates(worker: &dyn Worker) -> bool {
 }
 
 /// The vocabulary of structural-tag nodes the model's `workers` take together, before one is
-/// selected, for a tag every one of them takes as it is (a forced call's, [`constraint`]): the
-/// older one when any worker that generates tokens ([`generates`]) advertises it in its
+/// selected, for a tag every one of them takes as it is (a forced call's, [`constraint_for`]):
+/// the older one when any worker that generates tokens ([`generates`]) advertises it in its
 /// `structural_tag_vocabulary` label (read as parsed at its construction, like the start above),
 /// since every compiler takes that spelling and the worker
 /// that needs it may be the one selected; the current one otherwise, the tag then as the table
@@ -315,7 +315,7 @@ impl<'a> Asks<'a> {
     /// calls (`tool_choice: none`), or continues the assistant's message (the tag writes a turn
     /// from its start). A chat request that carries a constraint of its own, which the tag would
     /// displace (a JSON `response_format`, a `regex`, an `ebnf`), takes none; a Messages choice
-    /// that forces a call takes none, its tag being [`constraint`]'s.
+    /// that forces a call takes none, its tag being [`constraint_for`]'s.
     fn auto_calls(self, tools: &[Tool]) -> Option<bool> {
         if tools.is_empty() || self.continues() {
             return None;
@@ -451,19 +451,7 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
     }
 }
 
-/// What the table gives a request's forced or required call to one of `tools`, or a chat request's
-/// JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside its
-/// thought: the call's structural tag, built for `start`, where the model's workers start the
-/// grammar together ([`calls_tag`], [`grammar_start_of`]), in the `vocabulary` they take together
-/// ([`vocabulary_of`]); the answer's as it derives for the selected worker's own start and
-/// vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose workers start the grammar
-/// at different places has no one answer tag that fits them all.
-/// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
-/// the table has no tag for the call; the older registry then decides as before. An error refuses
-/// the request: the response template's table cannot constrain the call it is asked (the answer's
-/// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
-/// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
-/// the template's text after it, which the calls' tag then owes nothing of.
+/// [`constraint_for`] over the table decision read here ([`reading`]), as the tests ask it.
 #[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
@@ -491,9 +479,22 @@ pub(crate) fn constraint(
     )
 }
 
-/// [`constraint`] over the table decision already read for the request (`read`), which
-/// preparation reads once for the replay, the constraint and the decoder's special tokens
-/// (`regular::stages::reading::prepare`); the tests ask through [`constraint`].
+/// What the table gives a request's forced or required call to one of `tools`, or a chat request's
+/// JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside its
+/// thought, over the table decision already read for the request (`read`, which preparation reads
+/// once for the replay, the constraint and the decoder's special tokens,
+/// `regular::stages::reading::prepare`): the call's structural tag, built for `start`, where the
+/// model's workers start the grammar together ([`calls_tag`], [`grammar_start_of`]), in the
+/// `vocabulary` they take together ([`vocabulary_of`]); the answer's as it derives for the selected
+/// worker's own start and vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose
+/// workers start the grammar at different places has no one answer tag that fits them all.
+/// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
+/// the table has no tag for the call; the older registry then decides as before. An error refuses
+/// the request: the response template's table cannot constrain the call it is asked (the answer's
+/// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
+/// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
+/// the template's text after it, which the calls' tag then owes nothing of. The tests ask through
+/// `constraint`, which reads the decision first.
 pub(crate) fn constraint_for(
     read: &Reading,
     asks: Asks<'_>,
@@ -555,7 +556,8 @@ pub(crate) fn constraint_for(
 /// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
 /// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
 /// request takes no tag for its calls ([`Asks::auto_calls`]), or the table has none for them. A
-/// thought and an answer alone are not constrained today. `thought_closed` as for [`constraint`].
+/// thought and an answer alone are not constrained today. `thought_closed` as for
+/// [`constraint_for`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model"
@@ -614,8 +616,8 @@ pub(super) fn auto_tag(
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
-/// ([`constraint`]): a forced call's tag, the table's or the older registry's; a JSON answer's tag
-/// as it derives for a worker's start; or why the table cannot constrain the request. Request
+/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's; a JSON answer's
+/// tag as it derives for a worker's start; or why the table cannot constrain the request. Request
 /// building decides on the selected worker ([`worker_constraint`]).
 pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
 
