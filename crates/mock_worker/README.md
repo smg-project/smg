@@ -264,6 +264,45 @@ duplicated work. `status=499` makes a gRPC worker answer `cancelled`, the code
 a call gets when the worker's connection closes under it (a worker dying as
 the request arrives); an HTTP worker answers the bare 499.
 
+## Prefill/decode roles
+
+`--worker-type prefill|decode` gives the gRPC workers a role in a
+disaggregated fleet, so a gateway in PD mode (`--prefill <url> <bootstrap
+port> --decode <url>`) runs with no engine behind it. The gateway detects
+the mock by the scheduler service it serves and runs that wire's PD
+protocol: both sides get the same request, with the rendezvous the gateway
+mints (`kv_bootstrap_info`), and the client reads the decode side's output.
+
+- A **prefill** worker answers every request with the prompt side's
+  completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
+  and of either engine mode, and advertises `disaggregation_mode: prefill`.
+  With `--bootstrap-base-port <port>`, worker `i` also binds `port + i`,
+  where a decode partner's engine would rendezvous for the KV handoff: it
+  accepts and closes each connection (the gateway probes the port once the
+  worker is registered) and advertises it as
+  `disaggregation_bootstrap_port`.
+- A **decode** worker generates as a regular worker (canned, realistic or
+  scripted: the answers a test states go to the decode side) and advertises
+  `disaggregation_mode: decode`.
+
+No KV moves between the two: the decode side has the prompt. HTTP and ZMQ
+workers take no role.
+
+Every gRPC worker advertises the pairing protocol its environment names
+(`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
+a prefill and a decode that name the same one pair; name different ones for
+the two to see the gateway refuse the pair.
+
+In realistic mode (`--engine realistic`) a prefill worker honors the
+[fault hooks](#fault-hooks) as any request: the stall, a status before
+admission (`fail?status=S`, counted under `failed_total`), the admission
+delay and rate (`pause` freezes the passes, which the prompt side never
+takes). With no output to cut after, an armed cut (`after_tokens=K`) fires
+as its status at once, and `finish=error` ends the prompt side with `error`
+whatever the status; both count under `cut_total`, as on any worker. The
+engine itself never runs the prompt: nothing is admitted and no record is
+left.
+
 ## Long prompts
 
 A gRPC worker decodes and encodes messages of any size by default, as the
@@ -302,17 +341,30 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order
   (`all`: whichever worker gets the request). An answer with a `key` or
-  `input_ids` is filed under its prompt for every worker instead.
-  `GET /admin/script/{worker}` reads `queued`, `hits`, `misses` and the
-  `keyed` count; `DELETE` drops the queue; a name no worker of the process
-  has is a 404. This is the form a test wants: it states the model's answer
-  right before it sends the request, no tokenizer prediction needed.
+  `input_ids` is filed under its prompt for every worker instead. An answer
+  with a `prompt_contains` text is filed for the first request whose prompt
+  holds the text, served once, whatever order the requests arrive in: what
+  a test states when its requests run concurrently, or when the gateway
+  picks the worker. `GET /admin/script/{worker}` reads `queued`, `marked`
+  (the answers filed under a text), `hits`, `misses` and the `keyed` count;
+  `DELETE` drops the queue and the answers filed under a text; a name no
+  worker of the process has is a 404. This is the form a test wants: it
+  states the model's answer right before it sends the request, no tokenizer
+  prediction needed.
 
 For a request a worker looks in this order: its own queue, the shared queue,
-the keyed answers under its prompt's key. Nothing found is a miss, counted
-per worker, and the request goes to the canned or realistic engine as if no
-script existed. A scripted answer is served by the wire, not by the engine
-simulator: no load, no KV events, no request record.
+the answers filed under a text its prompt holds (its own, then the shared
+ones), the keyed answers under its prompt's key. Nothing found is a miss,
+counted per worker, and the request goes to the canned or realistic engine as
+if no script existed. A scripted answer is served by the wire, not by the
+engine simulator: no load, no KV events, no request record. The prompt's text
+is what an HTTP worker was sent (a message's string content or the `text` of
+its parts, a prompt string or the strings of a prompt array); a gRPC worker
+reads the rendered text the gateway sends beside the ids (`original_text`)
+and decodes the ids with its `--tokenizer` only when that is empty, as a ZMQ
+worker always does. Either reads the prompt only while answers filed under a
+text wait for it, and a prompt it cannot read then fails the request with
+the reason, the filed answers left where they are.
 
 Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` and ends with
 the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,

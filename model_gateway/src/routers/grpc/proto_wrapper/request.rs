@@ -469,7 +469,7 @@ impl ProtoGenerateRequest {
                         "SGLang media references require a single modality per request".into(),
                     );
                 }
-                req.mm_inputs = Some(mm);
+                req.mm_inputs = Some(Box::new(mm));
                 Ok(())
             }
             Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {

@@ -40,15 +40,13 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
             "missing path {path}: {rendered}"
         );
     }
-    for reason in ["not_nfc", "piece_declined"] {
-        assert!(
-            rendered.lines().any(|line| {
-                line.starts_with("smg_tokenizer_encode_fallbacks_total{")
-                    && line.contains(&format!("reason=\"{reason}\""))
-            }),
-            "missing reason {reason}: {rendered}"
-        );
-    }
+    assert!(
+        rendered.lines().any(|line| {
+            line.starts_with("smg_tokenizer_encode_fallbacks_total{")
+                && line.contains("reason=\"piece_declined\"")
+        }),
+        "missing reason piece_declined: {rendered}"
+    );
 }
 
 #[test]

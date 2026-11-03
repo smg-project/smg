@@ -2,6 +2,8 @@
 //!   - encoder shapes a nested-object schema with `?` for optional fields
 //!   - encoder emits a TS union for `enum` schemas
 //!   - encoder preserves `$defs` insertion order (byte-equal with upstream)
+//!   - encoder writes an array's object item at the array's own depth, and
+//!     a described item one level in, as upstream does
 //!   - encoder abandons the TS namespace (returns `None`) on unsupported
 //!     schemas, so the chat template falls back to JSON tool declarations
 //!   - end-to-end: a tokenizer loaded with `KimiK25ForConditionalGeneration`
@@ -48,6 +50,86 @@ fn encoder_renders_nested_object_with_required() {
     .unwrap();
 
     let expected = "# Tools\n\n## functions\nnamespace functions {\n// Create a new user record.\ntype create_user = (_: {\n  user: {\n    name: string,\n    age?: number\n  }\n}) => any;\n}\n";
+    assert_eq!(
+        encode_tools_to_typescript(&tools).as_deref(),
+        Some(expected)
+    );
+}
+
+/// An object inside an array is written at the array's own depth: its fields
+/// one level under the array's line, its closing brace at that line's
+/// indent (the reference render of this schema; the fields were two levels
+/// deeper before).
+#[test]
+fn encoder_writes_an_arrays_object_item_at_the_arrays_depth() {
+    let tools: Vec<Value> = serde_json::from_str(
+        r##"[{
+            "type": "function",
+            "function": {
+                "name": "book_flight",
+                "description": "Book a flight",
+                "parameters": {
+                    "$defs": {"airport": {"type": "string", "pattern": "^[A-Z]{3}$"}},
+                    "type": "object",
+                    "properties": {
+                        "from": {"$ref": "#/$defs/airport"},
+                        "to": {"$ref": "#/$defs/airport"},
+                        "passengers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "age": {"type": "integer"}
+                                },
+                                "required": ["name"]
+                            }
+                        }
+                    },
+                    "required": ["from", "to"]
+                }
+            }
+        }]"##,
+    )
+    .unwrap();
+
+    let expected = "# Tools\n\n## functions\nnamespace functions {\ninterface airport string\n// Book a flight\ntype book_flight = (_: {\n  from: airport,\n  to: airport,\n  passengers?: Array<{\n    name: string,\n    age?: number\n  }>\n}) => any;\n}\n";
+    assert_eq!(
+        encode_tools_to_typescript(&tools).as_deref(),
+        Some(expected)
+    );
+}
+
+/// An array item with a description is written one level in, under its
+/// comment, the `>` back at the array's indent (unchanged; pinned beside the
+/// plain item's depth).
+#[test]
+fn encoder_writes_a_described_array_item_one_level_in() {
+    let tools: Vec<Value> = serde_json::from_str(
+        r#"[{
+            "type": "function",
+            "function": {
+                "name": "book_flight",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "passengers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "description": "The passenger",
+                                "properties": {"name": {"type": "string"}},
+                                "required": ["name"]
+                            }
+                        }
+                    }
+                }
+            }
+        }]"#,
+    )
+    .unwrap();
+
+    let expected = "# Tools\n\n## functions\nnamespace functions {\ntype book_flight = (_: {\n  passengers?: Array<\n    // The passenger\n    {\n      name: string\n    }\n  >\n}) => any;\n}\n";
     assert_eq!(
         encode_tools_to_typescript(&tools).as_deref(),
         Some(expected)
@@ -214,5 +296,69 @@ fn chat_template_renders_typescript_namespace() {
     assert!(
         !rendered.contains(r#"[{"function":"#),
         "rendered prompt fell into JSON fallback path:\n{rendered}"
+    );
+}
+
+/// The checkpoint's own tokenizer class sorts the keys of every map in the
+/// tools before it hands them to the encoder, so a tokenizer of this family
+/// renders the `$defs` interfaces in key order whatever order the request
+/// declared them in; the encoder alone keeps the order it is given.
+#[test]
+fn the_tokenizer_hands_the_encoder_the_tools_key_sorted() {
+    let dir = TempDir::new().unwrap();
+    let template = fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kimi_k25/chat_template.jinja"),
+    )
+    .expect("vendored chat_template.jinja must exist");
+    fs::write(dir.path().join("tiktoken.model"), MIN_TIKTOKEN_MODEL).unwrap();
+    fs::write(
+        dir.path().join("config.json"),
+        r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("chat_template.jinja"), template).unwrap();
+    fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
+
+    let tok = TiktokenTokenizer::from_dir(dir.path()).expect("tokenizer should load");
+    let messages = vec![json!({"role": "user", "content": "Book LIS to CDG."})];
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "book_flight",
+            "parameters": {
+                "$defs": {"zone": {"type": "string"}, "airport": {"type": "string"}},
+                "type": "object",
+                "properties": {
+                    "to": {"$ref": "#/$defs/airport"},
+                    "area": {"$ref": "#/$defs/zone"}
+                },
+                "required": ["to", "area"]
+            }
+        }
+    })];
+
+    let declared = encode_tools_to_typescript(&tools).expect("the schema is supported");
+    assert!(
+        declared.contains("interface zone string\ninterface airport string\n"),
+        "the encoder alone keeps the request's order:\n{declared}"
+    );
+    let rendered = tok
+        .apply_chat_template(
+            &messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                tools: Some(&tools),
+                ..Default::default()
+            },
+        )
+        .expect("render should succeed");
+    assert!(
+        rendered.contains("interface airport string\ninterface zone string\n"),
+        "the tokenizer renders the interfaces in key order:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("type book_flight = (_: {\n  area: zone,\n  to: airport\n}) => any;"),
+        "{rendered}"
     );
 }

@@ -651,6 +651,9 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         let mut decode = ResponsesDecode::new(pd_timing)?;
+        // A fresh iteration: no finish until its terminal frame names one, so the finish of an
+        // earlier turn of the request never reads for this one.
+        emitter.set_finish_reason(None);
         // Each read races the engine against the client's leaving (see `next_response`).
         loop {
             let result = match next_response(&mut decode_stream, tx).await {
@@ -708,6 +711,9 @@ struct ResponsesDecode {
     final_text: String,
     /// The calls the terminal frame or the recovery found.
     tool_calls: Option<Vec<ToolCall>>,
+    /// The turn's finish reason as the parser reads it (`tool_calls` when the turn ended on
+    /// closed calls, else the engine's), once the terminal frame came.
+    finish_reason: Option<String>,
     /// The message item the first final-channel delta opened: its output index and id.
     message: Option<(usize, String)>,
     content_part_added: bool,
@@ -742,6 +748,7 @@ impl ResponsesDecode {
             has_analysis: false,
             final_text: String::new(),
             tool_calls: None,
+            finish_reason: None,
             message: None,
             content_part_added: false,
             calls: HashMap::new(),
@@ -988,6 +995,11 @@ impl ResponsesDecode {
         self.finalized_analysis = final_output.analysis;
         self.tool_calls = final_output.commentary;
         self.reasoning_token_count = final_output.reasoning_token_count;
+        // Each closed call and the message item read their status through the emitter under
+        // this finish, and the terminal event and the stored object their own, as the regular
+        // stream's do under the final chunk's.
+        self.finish_reason = Some(final_output.finish_reason);
+        emitter.set_finish_reason(self.finish_reason.as_deref());
 
         self.close_calls(emitter, tx, session).await;
         self.close_message(emitter, tx).await;
@@ -1032,13 +1044,22 @@ impl ResponsesDecode {
 
             let type_str =
                 ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
+            // A function call's status is read through the emitter under this iteration's
+            // finish (none when the stream ended before its terminal frame): a recovered call
+            // the finish cut is `incomplete`, and the response reads it as cut on its terminal
+            // event and stored object. A hosted or MCP call's item keeps `completed`; its
+            // result replaces the item.
+            let status = match response_format {
+                Some(_) => "completed",
+                None => emitter.function_call_status(args_str),
+            };
             let mut item = json!({
                 "id": item_id,
                 "type": type_str,
                 "name": tool_name,
                 "call_id": &tool_call.id,
                 "arguments": args_str,
-                "status": "completed"
+                "status": status
             });
             let label = session
                 .map(|s| s.resolve_tool_server_label(tool_name))
@@ -1052,7 +1073,7 @@ impl ResponsesDecode {
     }
 
     /// The message item, if one opened, closes: `text_done`, `content_part.done`, and
-    /// `output_item.done` with the whole text.
+    /// `output_item.done` with the whole text and its status.
     async fn close_message(&self, emitter: &mut ResponseStreamEventEmitter, tx: &SseSender) {
         let Some((output_index, item_id)) = &self.message else {
             return;
@@ -1069,7 +1090,10 @@ impl ResponsesDecode {
             "content": [{
                 "type": "output_text",
                 "text": self.final_text.clone()
-            }]
+            }],
+            // The status the regular stream writes on its message item; the stored object's
+            // typed read keeps an item only with one.
+            "status": emitter.message_status()
         });
         let event = emitter.emit_output_item_done(*output_index, &item);
         // Mark as completed before sending (so it's included in final output even if send fails)
@@ -1149,6 +1173,7 @@ impl ResponsesDecode {
                 partial_text: self.final_text,
                 usage,
                 request_id: emitter.response_id.clone(),
+                finish_reason: self.finish_reason,
             };
         }
         // For streaming, the caller builds the response from the SSE events; this result's
@@ -1700,85 +1725,4 @@ impl Default for HarmonyStreamingProcessor {
 }
 
 #[cfg(test)]
-mod client_leave_tests;
-#[cfg(test)]
-mod local_stop_tests;
-#[cfg(test)]
-mod logprobs_tests;
-#[cfg(test)]
-mod lone_complete_tests;
-#[cfg(test)]
-mod usage_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Compile-time exhaustiveness anchor.
-    ///
-    /// This helper exists solely to force every [`ResponseFormat`] variant
-    /// to flow through a non-wildcard `match`. If a new variant is added to
-    /// [`ResponseFormat`] without being classified, this function fails to
-    /// compile — which in turn breaks `streams_arguments_explicit_variants`
-    /// below, since both helpers iterate the same variant set.
-    ///
-    /// Intentionally *does not* call [`streams_arguments`] — this mirrors
-    /// the production classifier so a drift between the two is a separate
-    /// failure (runtime assertion miss) from a missing variant (compile
-    /// error here).
-    fn expected_streams_arguments(format: ResponseFormat) -> bool {
-        match format {
-            ResponseFormat::Passthrough => true,
-            ResponseFormat::WebSearchCall
-            | ResponseFormat::CodeInterpreterCall
-            | ResponseFormat::FileSearchCall
-            | ResponseFormat::ImageGenerationCall => false,
-        }
-    }
-
-    // Locks the `streams_arguments` classification so the Harmony router
-    // keeps treating hosted built-in tools — including `image_generation`
-    // — as structured-event emitters rather than argument streamers.
-    //
-    // Every `ResponseFormat` variant is named explicitly (no `_` arm, no
-    // iteration over a hand-maintained array), so adding a new variant
-    // fails to compile in `expected_streams_arguments` above AND in every
-    // explicit `let ... = ResponseFormat::X;` binding here — which in
-    // turn ensures the production `streams_arguments` classifier must
-    // also be updated to compile.
-    #[test]
-    fn streams_arguments_explicit_variants() {
-        // `None` (plain function tool) streams arguments.
-        assert!(streams_arguments(None), "function_call should stream args");
-
-        // `Some(Passthrough)` (mcp_call) streams arguments.
-        let passthrough = ResponseFormat::Passthrough;
-        assert!(
-            streams_arguments(Some(&passthrough)),
-            "mcp_call (Passthrough) should stream args",
-        );
-        assert!(expected_streams_arguments(passthrough));
-
-        // Hosted built-ins do *not* stream arguments — they surface
-        // progress via structured `*.in_progress` / `*.searching` /
-        // `*.generating` / `*.completed` events from the shared emitter.
-        let web_search = ResponseFormat::WebSearchCall;
-        assert!(!streams_arguments(Some(&web_search)));
-        assert!(!expected_streams_arguments(web_search));
-
-        let code_interpreter = ResponseFormat::CodeInterpreterCall;
-        assert!(!streams_arguments(Some(&code_interpreter)));
-        assert!(!expected_streams_arguments(code_interpreter));
-
-        let file_search = ResponseFormat::FileSearchCall;
-        assert!(!streams_arguments(Some(&file_search)));
-        assert!(!expected_streams_arguments(file_search));
-
-        let image_generation = ResponseFormat::ImageGenerationCall;
-        assert!(
-            !streams_arguments(Some(&image_generation)),
-            "image_generation_call must ride the structured-event path",
-        );
-        assert!(!expected_streams_arguments(image_generation));
-    }
-}
+mod tests;

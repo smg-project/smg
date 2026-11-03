@@ -7,8 +7,8 @@ use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
     common::{ChatLogProbs, ToolCall, Usage},
     responses::{
-        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseUsage,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use tracing::error;
@@ -23,7 +23,10 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::{response_collection, response_formatting},
+            common::{
+                response_collection, response_formatting,
+                responses::utils::{generation_failure_error, response_status},
+            },
             context::{DispatchMetadata, ExecutionResult},
         },
     },
@@ -246,6 +249,11 @@ pub(crate) enum ResponsesIterationResult {
         partial_text: String,     // For streaming emission or message output
         usage: Usage,             // Token usage from this iteration
         request_id: String,       // Request ID from dispatch
+        /// The turn's finish reason as the parser reads it (`tool_calls` when
+        /// the turn ended on closed calls, else the engine's); none when a
+        /// stream ended before its terminal frame. The non-streamed response
+        /// reads its status and its calls' from it.
+        finish_reason: Option<String>,
     },
     /// No tool calls - return final ResponsesResponse
     Completed {
@@ -355,6 +363,7 @@ impl HarmonyResponseProcessor {
                     partial_text: parsed.final_text,
                     usage,
                     request_id: dispatch.request_id.clone(),
+                    finish_reason: Some(parsed.finish_reason),
                 },
                 counts,
             ));
@@ -396,15 +405,27 @@ impl HarmonyResponseProcessor {
             output.push(message_item);
         }
 
-        // Build ResponsesResponse with all required fields
-        let response = ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
-            .copy_from_request(&responses_request)
-            .created_at(dispatch.created as i64)
-            .status(ResponseStatus::Completed)
-            .output(output)
-            .maybe_text(responses_request.text.clone())
-            .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
-            .build();
+        // The status is read where every Responses object reads it: a
+        // `length` finish is incomplete with `max_output_tokens`, a failed
+        // generation is failed with its error. No call was found, so none
+        // was cut.
+        let finish_reason = Some(parsed.finish_reason.as_str());
+        let (status, incomplete_details) = response_status(finish_reason, false);
+        let mut builder =
+            ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
+                .copy_from_request(&responses_request)
+                .created_at(dispatch.created as i64)
+                .status(status)
+                .output(output)
+                .maybe_text(responses_request.text.clone())
+                .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+        if let Some(details) = incomplete_details {
+            builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(finish_reason) {
+            builder = builder.error(error);
+        }
+        let response = builder.build();
 
         Ok((
             ResponsesIterationResult::Completed {

@@ -40,9 +40,9 @@ use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
-        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
-        WaveEvent,
+        kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
+        trtllm::TrtllmProtocol, vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput,
+        EngineProtocol, UtilityReply, WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -138,6 +138,11 @@ struct InFlight<O> {
     prompt_tokens: u64,
     handed: bool,
     started: bool,
+    /// A lockstep group that drained while this prompt was still unanswered
+    /// was woken again on its behalf ([`RequestRegistry::rewake_due`]): once
+    /// per prompt, so a prompt the holder never schedules ends by the
+    /// silence watchdog instead of cycling waves.
+    rewoken: bool,
     every_step: bool,
 }
 
@@ -205,6 +210,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 prompt_tokens,
                 handed: false,
                 started: false,
+                rewoken: false,
                 every_step,
             },
         );
@@ -365,6 +371,23 @@ impl<O: EngineOutput> RequestRegistry<O> {
         self.prefill_pending
     }
 
+    /// Whether a prompt the engine was handed is still unanswered and has not
+    /// had the drain re-wake yet: a request whose add frame the engine
+    /// accepted, whose first output has not come, and on whose behalf no
+    /// wake went out after a drain. Every such prompt is marked as woken
+    /// here, so one wake covers them all and a prompt never answered buys
+    /// one re-wake and no more.
+    fn rewake_due(&mut self) -> bool {
+        let mut due = false;
+        for entry in self.requests.values_mut() {
+            if entry.handed && !entry.started && !entry.rewoken {
+                entry.rewoken = true;
+                due = true;
+            }
+        }
+        due
+    }
+
     /// How long the engine may take to prefill `tokens` at the allowed rate
     /// (`prefill_tokens_per_sec`); zero when nothing is allowed.
     fn prefill_allowance(&self, tokens: u64) -> Duration {
@@ -451,6 +474,11 @@ struct RoutingState {
     /// `select_engine` never mutates this map; its reservations live in
     /// `inflight`.
     load: HashMap<u32, EngineLoad>,
+    /// The KV-transfer samples each rank's connector reported since the last
+    /// [`Client::take_kv_transfer`], folded per engine index once a taker
+    /// asked for them ([`Client::keep_kv_transfer`]): the engine reports
+    /// them with its steps, the servicer logs them per interval.
+    kv_transfer: HashMap<u32, KvTransferStats>,
     /// This client's own unfinished request ids, per rank: a floor under the
     /// (possibly stale) reported load, so routing never trusts a snapshot that
     /// says an engine we just loaded is idle. Keyed by id rather than counted,
@@ -593,6 +621,11 @@ struct ClientInner<P: EngineProtocol> {
     /// step report): its silence is then the scheduler's own, not a prefill
     /// in progress. Read by [`Client::reports_steps`].
     steps_reported: AtomicBool,
+    /// A taker wants the KV-transfer samples the engines report
+    /// ([`Client::keep_kv_transfer`]). Until one does, the dispatcher folds
+    /// none, so a client nobody drains (the gateway's direct lane) keeps no
+    /// growing series. Read by the dispatcher on every batch.
+    kv_transfer_wanted: AtomicBool,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -646,7 +679,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                     });
                 }
                 let mut routing = self.routing.lock();
-                let RoutingState { load, inflight } = &mut *routing;
+                let RoutingState { load, inflight, .. } = &mut *routing;
                 let count = self.engines.len();
                 let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
                 let mut best: Option<(f64, usize)> = None;
@@ -1029,8 +1062,35 @@ impl<P: EngineProtocol> ClientInner<P> {
             // own `current_wave` on the way out; track that so the next wake
             // names a wave the ranks will still accept.
             WaveEvent::Complete(wave) => {
-                let mut current = state.lock();
-                *current = (*current).max(wave.saturating_add(1));
+                let advanced = {
+                    let mut current = state.lock();
+                    let next = (*current).max(wave.saturating_add(1));
+                    let advanced = next > *current;
+                    *current = next;
+                    advanced
+                };
+                // A drain reported while a prompt the group was handed has no
+                // output yet is the drain racing a submit: the holder's peers
+                // read the wake while they were still stepping (a no-op) and
+                // the group agreed to park before the holder's loop had read
+                // the add, which an engine's input thread hands over later
+                // than a wake (it decodes and preprocesses the request
+                // first). The holder then reads the add alone and blocks in
+                // the group's collective; without a DP coordinator nobody
+                // wakes its peers again, and the silence watchdog ends the
+                // group. So the group is woken once more, at a fresh wave.
+                // Every rank reports the drain: the report that moves the
+                // clock wakes, the rest find it moved. Once per prompt: a
+                // prompt the holder never schedules (an add the engine
+                // dropped while staying alive) buys one extra round, then
+                // the group stays parked and the silence watchdog ends it as
+                // it did before; every frame of the round would otherwise
+                // reset the watchdog and the group would cycle waves for
+                // good. Nothing pending, nothing sent: an idle group stays
+                // parked.
+                if advanced && self.registry.lock().rewake_due() {
+                    self.queue_wake(wave, "a prompt pending through a drained wave");
+                }
             }
             // A rank took a request for an already-drained wave and is asking
             // for the rest of the group to catch up.
@@ -1039,18 +1099,23 @@ impl<P: EngineProtocol> ClientInner<P> {
                     let mut current = state.lock();
                     *current = (*current).max(wave);
                 }
-                // Queued for every rank, not awaited: a frame blocked ahead in
-                // the input queue must not park the dispatcher (the output of
-                // every rank keeps flowing), and the wake reaches the whole
-                // group when the engine reads again.
-                let queued = match self.next_wave() {
-                    Some(next) => self.queue_start_wave(next),
-                    None => Ok(()),
-                };
-                if let Err(error) = queued {
-                    warn!(%error, wave, "failed to queue the requested wave");
-                }
+                self.queue_wake(wave, "the requested wave");
             }
+        }
+    }
+
+    /// Queue a wake of the whole group at a fresh wave, from the dispatcher:
+    /// for every rank and not awaited, since a frame blocked ahead in the
+    /// input queue must not park the dispatcher (the output of every rank
+    /// keeps flowing), and the wake reaches the whole group when the engine
+    /// reads again. `wave` and `why` name the notification it answers.
+    fn queue_wake(&self, wave: u64, why: &str) {
+        let queued = match self.next_wave() {
+            Some(next) => self.queue_start_wave(next),
+            None => Ok(()),
+        };
+        if let Err(error) = queued {
+            warn!(%error, wave, "failed to queue the wake for {why}");
         }
     }
 
@@ -1165,7 +1230,51 @@ impl<P: EngineProtocol> Client<P> {
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
+            kv_transfer_wanted: AtomicBool::new(false),
         });
+
+        // The input monitor was opened when the frontend bound the input
+        // socket, before the handshake, and holds every peer event since.
+        // Read from the start, a disconnect queued there would pass for the
+        // fresh engine's transport loss; which of them are this link's, the
+        // order per identity tells. A connection under an identity the
+        // socket already holds replaces the earlier one, in the peer map and
+        // in the receive queue, before its accept is reported, and a replaced
+        // connection's end is never read again. So the data socket of a
+        // previous engine generation, which dialed this frontend's new bind
+        // by itself and closed when that generation was replaced, under the
+        // identity the next generation registers with, is a disconnect
+        // before the accept of the connection that carried the registration:
+        // not this link's, and read off here, else it would end a client
+        // whose engine, having handshaken once, never dials again. A
+        // disconnect after an engine's last accept is that engine's own
+        // loss: on a link of several engines, one that registered first can
+        // go away while the handshake still waits for the others, and the
+        // monitor arm below, armed at the admission, would never see a
+        // second event for a peer the socket has forgotten. Such a loss ends
+        // the link at its admission, as the arm ends it on a loss after.
+        let mut gone: HashSet<Bytes> = HashSet::new();
+        while let Ok(event) = input_events.try_recv() {
+            match event {
+                zeromq::SocketEvent::Accepted(_, peer) => {
+                    gone.remove(&peer[..]);
+                }
+                zeromq::SocketEvent::Disconnected(peer) => {
+                    info!(
+                        ?peer,
+                        "an input peer disconnected before this link was admitted"
+                    );
+                    gone.insert(Bytes::from(peer));
+                }
+                _ => {}
+            }
+        }
+        let lost_at_admission = inner
+            .engines
+            .iter()
+            .map(|engine| &engine.engine_id)
+            .find(|engine_id| gone.contains(&engine_id[..]))
+            .cloned();
 
         // Input writer: the one owner of the input socket's send half.
         let writer_inner = inner.clone();
@@ -1195,13 +1304,36 @@ impl<P: EngineProtocol> Client<P> {
                 } => {}
 
                 () = async {
+                    if let Some(engine_id) = lost_at_admission {
+                        warn!(
+                            ?engine_id,
+                            "an engine of this link disconnected while the handshake admitted it"
+                        );
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
+                    }
                     while let Some(event) = input_events.next().await {
-                        if let zeromq::SocketEvent::Disconnected(peer) = event {
-                            warn!(?peer, "engine input transport disconnected after queue admission");
-                            writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
-                            writer_inner.routing.lock().inflight.clear();
-                            return;
+                        let zeromq::SocketEvent::Disconnected(peer) = event else {
+                            continue;
+                        };
+                        // The monitor reports every peer of the shared input
+                        // socket; only this link's engines are its loss.
+                        if !writer_inner
+                            .engines
+                            .iter()
+                            .any(|engine| engine.engine_id[..] == peer[..])
+                        {
+                            info!(
+                                ?peer,
+                                "an input peer that is not an engine of this link disconnected; ignored"
+                            );
+                            continue;
                         }
+                        warn!(?peer, "engine input transport disconnected after queue admission");
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
                     }
                     // Monitor closure alone does not prove engine death.
                     std::future::pending::<()>().await;
@@ -1298,6 +1430,20 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call, by engine index in order, nothing for a rank that reported none:
+    /// the servicer takes them on its stats tick and logs them in the
+    /// engine's own words ([`KvTransferStats::summary`]).
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        let taken = std::mem::take(&mut self.inner.routing.lock().kv_transfer);
+        let mut reports: Vec<(u32, KvTransferStats)> = taken
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .collect();
+        reports.sort_unstable_by_key(|(engine_index, _)| *engine_index);
+        reports
+    }
+
     /// How long the engine has produced nothing while this client holds
     /// requests in flight on it that the engine reports on every step
     /// ([`EngineProtocol::reported_every_step`]): the time since its last
@@ -1341,6 +1487,15 @@ impl<P: EngineProtocol> Client<P> {
     /// client told nothing is classified by what its wire shows.
     pub fn note_reports_steps(&self) {
         self.inner.steps_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`]: the taker announces itself and drains on
+    /// its own interval (the servicer's stats tick). A client without a
+    /// taker folds nothing, whatever its engines report, so nothing grows
+    /// behind the routing lock of a client nobody drains.
+    pub fn keep_kv_transfer(&self) {
+        self.inner.kv_transfer_wanted.store(true, Ordering::Relaxed);
     }
 
     /// Prompt tokens of the requests the engine has accepted (their add
@@ -1712,8 +1867,21 @@ impl<P: EngineProtocol> Dispatcher<P> {
         {
             inner.steps_reported.store(true, Ordering::Relaxed);
         }
-        if let Some(load) = batch.load {
-            inner.routing.lock().load.insert(batch.engine_index, load);
+        let kv_transfer = batch
+            .kv_transfer
+            .filter(|_| inner.kv_transfer_wanted.load(Ordering::Relaxed));
+        if batch.load.is_some() || kv_transfer.is_some() {
+            let mut routing = inner.routing.lock();
+            if let Some(load) = batch.load {
+                routing.load.insert(batch.engine_index, load);
+            }
+            if let Some(transfers) = kv_transfer {
+                routing
+                    .kv_transfer
+                    .entry(batch.engine_index)
+                    .or_default()
+                    .merge(*transfers);
+            }
         }
         if let Some(event) = batch.wave {
             inner.observe_wave(event, batch.engine_index);
