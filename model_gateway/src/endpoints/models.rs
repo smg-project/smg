@@ -4,7 +4,12 @@
 //! self-hosted model is listed as an entry of its own (the same model under
 //! the alias name), so every name a client may send is one it can discover.
 //! A caller presenting its own provider credential (bring your own key) is
-//! answered from the external upstreams instead, but never when that
+//! answered from the external upstreams of the API family it speaks instead:
+//! a credential presented with the Messages API's headers reaches the
+//! Anthropic upstreams alone, one presented the OpenAI way the
+//! OpenAI-compatible ones (the providers each family's router takes, a
+//! worker's provider judged as admission judges it: declared, else read from
+//! its address), and never another family's provider. And never when that
 //! credential is one of the gateway's own keys: a tenant-scoped key must not
 //! be forwarded to a third party as if it were the caller's.
 //!
@@ -23,12 +28,13 @@ use axum::{
 use futures::future::select_all;
 use openai_protocol::{messages, model_card::ModelCard, models::ListModelsResponse};
 use serde_json::Value;
+use smg_external_router::{known, ExternalRouterSpec};
 use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
     middleware::{into_messages_envelope, AuthConfig},
-    routers::{common::header_utils::apply_provider_headers, error},
+    routers::{common::header_utils::apply_provider_headers, error, provider_support},
     worker::{endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
 };
 
@@ -47,6 +53,18 @@ impl ModelShape {
             Self::Anthropic
         } else {
             Self::OpenAi
+        }
+    }
+
+    /// The external router of the caller's API family, whose providers are
+    /// the only upstreams a credential presented in this family may reach:
+    /// the scope the routers define for their workers, which worker selection
+    /// applies to a serving request's credential when a miss refreshes the
+    /// external workers' models.
+    fn router(self) -> ExternalRouterSpec {
+        match self {
+            Self::OpenAi => known::OPENAI,
+            Self::Anthropic => known::ANTHROPIC,
         }
     }
 
@@ -134,10 +152,11 @@ pub(crate) async fn list_models_with(
         }
     }
 
-    // A foreign token is tried against the external upstreams first (bring
-    // your own key). On total failure fall through to the registry.
+    // A foreign token is tried against the external upstreams of the caller's
+    // API family first (bring your own key). On total failure fall through to
+    // the registry.
     if let Some(ref token) = bearer_token {
-        let upstream_cards = fetch_upstream_models(registry, client, token).await;
+        let upstream_cards = fetch_upstream_models(registry, client, token, shape.router()).await;
         if !upstream_cards.is_empty() {
             return shape.list(upstream_cards);
         }
@@ -251,17 +270,21 @@ async fn registry_models_response(
     }
 }
 
-/// Fan out to all healthy external upstreams concurrently with the caller's
-/// bearer token and return the first successful model inventory. Returns an
-/// empty vec on total failure.
+/// Fan out to the healthy external upstreams of the caller's API family (the
+/// providers `router` takes) concurrently with the caller's bearer token and
+/// return the first successful model inventory. An upstream of another family
+/// is not asked: a credential presented in one family's API never reaches
+/// another family's provider. Returns an empty vec on total failure.
 async fn fetch_upstream_models(
     registry: &WorkerRegistry,
     client: &reqwest::Client,
     bearer_token: &str,
+    router: ExternalRouterSpec,
 ) -> Vec<ModelCard> {
     let unique_urls: Vec<_> = registry
         .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
         .iter()
+        .filter(|w| router.takes(provider_support::provider_of(&w.metadata().spec).as_ref()))
         .map(|w| w.url().to_string())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -341,10 +364,11 @@ async fn fetch_models_from(
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use axum::http::{Request, StatusCode};
+    use openai_protocol::worker::WorkerSpec;
 
     use super::*;
     use crate::{
@@ -478,6 +502,123 @@ mod tests {
             hit_count.load(Ordering::SeqCst),
             1,
             "an unrecognized token should still fan out to upstream providers"
+        );
+    }
+
+    /// A stub provider at a loopback address: it records the credential
+    /// headers of every request it gets and answers a one-model catalogue
+    /// named after `label`.
+    #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
+    async fn recording_provider(label: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_app = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let seen = seen_by_app.clone();
+                async move {
+                    let credentials: Vec<String> = ["authorization", "x-api-key"]
+                        .iter()
+                        .filter_map(|name| {
+                            headers
+                                .get(*name)
+                                .and_then(|value| value.to_str().ok())
+                                .map(|value| format!("{name}={value}"))
+                        })
+                        .collect();
+                    seen.lock().unwrap().push(credentials.join(" "));
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": format!("{label}-model"), "object": "model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An external worker built from the spec a registration would carry.
+    fn external_worker(spec: Value) -> Arc<dyn Worker> {
+        let spec: WorkerSpec = serde_json::from_value(spec).unwrap();
+        Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// A caller's own credential reaches the providers of the API family the
+    /// caller speaks and no other: an OpenAI-style bearer goes to the
+    /// OpenAI-compatible upstreams, a Messages-style key to the Anthropic
+    /// ones, so a key for one provider is never presented to another family's
+    /// provider by the listing, and each caller is listed its own family's
+    /// catalogue.
+    #[tokio::test]
+    async fn a_callers_credential_reaches_the_providers_of_its_api_family_alone() {
+        let (unnamed_url, seen_by_unnamed) = recording_provider("open").await;
+        let (anthropic_url, seen_by_anthropic) = recording_provider("claude").await;
+        let registry = WorkerRegistry::new();
+        // An address naming no provider: the OpenAI-compatible router's
+        // fallback, as an OpenAI-compatible endpoint registers.
+        registry.register(external_worker(serde_json::json!({
+            "url": unnamed_url,
+            "runtime_type": "external",
+        })));
+        registry.register(external_worker(serde_json::json!({
+            "url": anthropic_url,
+            "runtime_type": "external",
+            "provider": "anthropic",
+        })));
+        let client = crate::clients::http_client();
+        let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
+
+        let mut openai_style = HeaderMap::new();
+        openai_style.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer key-for-one-provider"),
+        );
+        let listed = json_body(
+            list_models_with(&registry, &client, &gateway_auth, &openai_style, rid()).await,
+        )
+        .await;
+        assert_eq!(listed_ids(&listed), ["open-model"], "{listed}");
+        assert_eq!(
+            *seen_by_unnamed.lock().unwrap(),
+            ["authorization=Bearer key-for-one-provider"],
+            "the OpenAI-compatible upstream is asked with the caller's credential"
+        );
+        assert!(
+            seen_by_anthropic.lock().unwrap().is_empty(),
+            "an OpenAI-style credential reached the Anthropic upstream: {:?}",
+            seen_by_anthropic.lock().unwrap()
+        );
+
+        let mut messages_style = HeaderMap::new();
+        messages_style.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        messages_style.insert(
+            "x-api-key",
+            HeaderValue::from_static("key-for-one-provider"),
+        );
+        let listed = json_body(
+            list_models_with(&registry, &client, &gateway_auth, &messages_style, rid()).await,
+        )
+        .await;
+        assert_eq!(listed_ids(&listed), ["claude-model"], "{listed}");
+        assert_eq!(
+            *seen_by_anthropic.lock().unwrap(),
+            ["authorization=Bearer key-for-one-provider"],
+            "the Anthropic upstream is asked with the caller's credential"
+        );
+        assert_eq!(
+            seen_by_unnamed.lock().unwrap().len(),
+            1,
+            "a Messages-style credential reached the OpenAI-compatible upstream: {:?}",
+            seen_by_unnamed.lock().unwrap()
         );
     }
 
