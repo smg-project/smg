@@ -30,6 +30,8 @@ It reuses the per-modality preprocessing pipeline and preserves each batch's
 patch offsets, grids and tensors. The first batch uses `GenerateRequest.mm_inputs`;
 `extra_mm_inputs` carries additional batches, following the vLLM protocol layout.
 Upgrade the gateway, servicer and proto package together before using mixed inputs.
+Older proto packages remain usable for text and single-modality requests; they do
+not expose the additional batches needed for mixed inputs.
 
 Mixed references are processed on both PD sides; the single-modality media identity
 optimization is not used. Router-side video capability remains unchanged.

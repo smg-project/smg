@@ -941,7 +941,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
 
-        if grpc_req.extra_mm_inputs and not (
+        # Older proto packages remain usable for text and single-modality requests.
+        extra_mm_inputs = getattr(grpc_req, "extra_mm_inputs", ())
+        if extra_mm_inputs and not (
             grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values")
         ):
             raise ValueError("SGLang extra_mm_inputs requires primary preprocessed inputs")
@@ -980,7 +982,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Parse multimodal inputs if present
         mm_inputs = None
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
-            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, grpc_req.extra_mm_inputs)
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
@@ -1019,7 +1021,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Decode a proto TensorData message into a torch.Tensor."""
         return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
-    def _parse_mm_inputs(self, mm_proto, extra_mm_inputs=()) -> MultimodalProcessorOutput:
+    def _parse_mm_inputs(self, mm_proto, extra_mm_inputs, prompt_len) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
         mm_items = []
         im_token_id = video_token_id = None
@@ -1042,7 +1044,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 video_token_id = token
             else:
                 im_token_id = token
-            offsets = [(p.offset, p.offset + p.length - 1) for p in batch.mm_placeholders]
+            offsets = []
+            for placeholder in batch.mm_placeholders:
+                start, length = placeholder.offset, placeholder.length
+                if length == 0:
+                    raise ValueError(f"multimodal placeholder at offset {start} has zero length")
+                end = start + length - 1
+                if end >= prompt_len:
+                    raise ValueError(
+                        f"multimodal placeholder {start}..={end} lies outside the prompt "
+                        f"of {prompt_len} tokens"
+                    )
+                offsets.append((start, end))
             if not offsets:
                 logger.warning(
                     "No mm_placeholders from Rust gateway — token expansion may have "
