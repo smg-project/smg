@@ -39,6 +39,7 @@ from .constants import (
     host_port,
     moriio_host,
     sglang_transfer_backend,
+    trtllm_runs_engines_own_servicer,
     vllm_kv_backend,
     vllm_moriio_backend,
     vllm_moriio_mode,
@@ -77,9 +78,12 @@ _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 # The engines whose gRPC server carries no ``grpc.health.v1`` service:
 # TRT-LLM, whose upstream server registers its own service and no standard
 # health (it answers its own proto's HealthCheck, the one the gateway
-# probes). For these alone a ready channel that answers UNIMPLEMENTED counts
-# as the worker, until the harness asks their own HealthCheck instead. The
-# scripted mock worker hosts the standard service like the engine servicers.
+# probes). For these alone, and only while the worker is that server (the
+# Rust servicer a lane may run for TRT-LLM instead hosts the standard service
+# like every engine servicer of this repository), a ready channel that answers
+# UNIMPLEMENTED counts as the worker, until the harness asks their own
+# HealthCheck instead. The scripted mock worker hosts the standard service
+# like the engine servicers.
 ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
 
 
@@ -840,16 +844,39 @@ class Worker:
         return cmd
 
     def _build_trtllm_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
-        """Build TensorRT-LLM gRPC server command."""
-        # Create config file to enable xgrammar guided decoding
-        config_path = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
-        )
-        config = {"guided_decoding_backend": "xgrammar"}
-        config.update(spec.get("trtllm_extra_config", {}))
-        yaml.dump(config, config_path, default_flow_style=False)
-        config_path.close()
+        """Build the TensorRT-LLM gRPC worker command: this repository's
+        launcher serving the Rust servicer when the lane says ``rust``
+        (``E2E_TRTLLM_SERVICER_IMPL``), else the engine's own gRPC server.
 
+        The engine release the lane pins carries no servicer switch, so for
+        this engine the choice is the command, not a variable the engine's
+        entrypoint reads (``_build_env`` exports it all the same, for the
+        launcher). Both commands take the same LLM API options, xgrammar
+        guided decoding and the spec's ``trtllm_extra_config``, from a YAML
+        file.
+        """
+        options = {"guided_decoding_backend": "xgrammar"}
+        options.update(spec.get("trtllm_extra_config", {}))
+        if trtllm_runs_engines_own_servicer():
+            return self._build_trtllm_engine_cmd(model_path, tp_size, spec, options)
+        return self._build_trtllm_launcher_cmd(model_path, tp_size, spec, options)
+
+    @staticmethod
+    def _write_trtllm_options(options: dict) -> str:
+        """Write the LLM API options to a YAML file (the shape of the engine's
+        ``--extra_llm_api_options``, which the launcher's ``--llm-args @file``
+        reads as well) and return its path."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
+        ) as options_file:
+            yaml.dump(options, options_file, default_flow_style=False)
+        return options_file.name
+
+    def _build_trtllm_engine_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """The engine's own gRPC server (``tensorrt_llm.commands.serve``),
+        with the spec's ``trtllm_args`` as its CLI's flags."""
         cmd = [
             "python3",
             "-m",
@@ -866,12 +893,52 @@ class Worker:
             "--tp_size",
             str(tp_size),
             "--extra_llm_api_options",
-            config_path.name,
+            self._write_trtllm_options(options),
         ]
         extra = spec.get("trtllm_args", [])
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_trtllm_launcher_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """This repository's launcher (``smg_grpc_servicer.trtllm``) with the
+        Rust servicer. The LLM API's keywords ride ``--llm-args``, the
+        parallel size among them: the launcher has no engine flags of its
+        own and hands none through, so a spec's ``trtllm_args`` (the engine
+        CLI's flags) are refused by name rather than dropped."""
+        extra = spec.get("trtllm_args", [])
+        if extra:
+            raise ValueError(
+                f"the spec's trtllm_args {extra} are the engine CLI's flags, which the "
+                "launcher does not take; name the LLM API keyword in trtllm_extra_config"
+            )
+        options = {**options, "tensor_parallel_size": tp_size}
+        return [
+            "python3",
+            "-m",
+            "smg_grpc_servicer.trtllm",
+            "--model",
+            model_path,
+            "--host",
+            DEFAULT_HOST,
+            "--port",
+            str(self.port),
+            "--servicer-impl",
+            "rust",
+            "--llm-args",
+            f"@{self._write_trtllm_options(options)}",
+        ]
+
+    def _serves_no_standard_health(self) -> bool:
+        """Whether this worker's server is one without ``grpc.health.v1``
+        (``ENGINES_WITHOUT_GRPC_HEALTH``): the engine's own server, not the
+        Rust servicer the lane may run for TRT-LLM instead, which hosts the
+        service like every engine servicer of this repository."""
+        if self.engine not in ENGINES_WITHOUT_GRPC_HEALTH:
+            return False
+        return self.engine != "trtllm" or trtllm_runs_engines_own_servicer()
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the worker process."""
@@ -1108,7 +1175,8 @@ class Worker:
         stranger's, which the nightly PD sweep once certified as a decode
         worker. One engine's server carries no such service, TRT-LLM
         (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
-        HealthCheck, the one the gateway probes); for it alone a ready
+        HealthCheck, the one the gateway probes); for it alone, while the
+        worker is that server (``_serves_no_standard_health``), a ready
         channel that answers UNIMPLEMENTED counts.
         """
         try:
@@ -1128,7 +1196,7 @@ class Worker:
                 return response.status == health_pb2.HealthCheckResponse.SERVING
             except grpc.RpcError as e:
                 if (
-                    self.engine in ENGINES_WITHOUT_GRPC_HEALTH
+                    self._serves_no_standard_health()
                     and hasattr(e, "code")
                     and e.code() == grpc.StatusCode.UNIMPLEMENTED
                 ):
