@@ -309,6 +309,18 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "Worker Configuration")]
+    worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "Worker Configuration")]
+    worker_startup_delay: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "Worker Configuration")]
+    worker_startup_check_interval: u64,
+
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
@@ -709,18 +721,6 @@ struct WorkerArgs {
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
-
-    /// Timeout in seconds for worker startup and registration
-    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
-    worker_startup_timeout_secs: u64,
-
-    /// Grace period in seconds before the first worker startup check
-    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
-    worker_startup_delay: u64,
-
-    /// Interval in seconds between worker startup checks
-    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
-    worker_startup_check_interval: u64,
 
     // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
@@ -5071,5 +5071,30 @@ mod tests {
             assert!(help.contains(named), "{named} missing from the help");
         }
         assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
+    }
+
+    /// The three start-up bounds hold for every worker the gateway starts
+    /// with, so the help lists them with the worker settings and not under
+    /// the disaggregation heading.
+    #[test]
+    fn the_worker_start_up_bounds_are_listed_under_worker_configuration() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for id in [
+            "worker_startup_timeout_secs",
+            "worker_startup_delay",
+            "worker_startup_check_interval",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert_eq!(
+                arg.get_help_heading(),
+                Some("Worker Configuration"),
+                "{id} is listed under another heading"
+            );
+        }
     }
 }
