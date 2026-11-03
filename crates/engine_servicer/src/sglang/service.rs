@@ -149,10 +149,19 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        let request = request.into_inner();
+        // The load records alone are the servicer's own figures, served
+        // with or without a relay: an engine whose events are off streams
+        // its load all the same.
+        if request.loads_only {
+            return Ok(Response::new(crate::load_stream::load_records_of(
+                &self.state,
+            )));
+        }
         let Some(relay) = &self.state.shared.kv_relay else {
             return Err(Status::unimplemented(kv_events::SGLANG_DISABLED_MESSAGE));
         };
-        relay.subscribe(request.into_inner()).map(Response::new)
+        relay.subscribe(request).map(Response::new)
     }
 
     async fn load_lo_ra_adapter(

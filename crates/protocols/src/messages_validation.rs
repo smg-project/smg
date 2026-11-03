@@ -17,7 +17,10 @@
 //! and Responses APIs apply to the same fields and the engines behind it
 //! enforce, because their wires cannot carry either zero as the request
 //! meant it and carry `top_k` as a signed 32-bit integer, which a larger
-//! value would wrap (`validate_sampling`).
+//! value would wrap (`validate_sampling`). The Chat and Responses field is
+//! signed and takes -1 as "disabled"; the Messages field is unsigned, so -1
+//! is a type error there, refused by the deserializer before this validation
+//! runs.
 
 use std::collections::HashSet;
 

@@ -53,6 +53,8 @@ kv-index.workspace = true
 rmpv.workspace = true
 portpicker = "0.1"
 tempfile = "3"
+# Paused time for the load-record stream's cadence tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "kv_relay_apply"

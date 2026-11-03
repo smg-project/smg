@@ -4,11 +4,11 @@ floor on startup waits."""
 import ast
 import importlib
 import os
-import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from infra import worker as worker_module
 from infra.constants import (
     DEFAULT_STARTUP_TIMEOUT,
@@ -510,23 +510,15 @@ def test_profile_ci_budgets_include_startups_and_prior_test_allowance():
     from infra.constants import _STARTUP_PROFILES
 
     workflow = Path(__file__).resolve().parents[2] / ".github/workflows/pr-test-rust.yml"
-    jobs = dict(
-        re.findall(
-            r"^  ([a-z0-9_-]+):\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
-            workflow.read_text(),
-            re.M | re.S,
-        )
-    )
+    jobs = yaml.safe_load(workflow.read_text())["jobs"]
     for profile, job, test_allowance, job_gap in [
         ("vllm-zmq-dp2-chat", "e2e-2gpu-chat-zmq-dp-vllm-amd", 40, 6),
         ("vllm-4gpu-chat", "e2e-4gpu-chat-vllm-amd", 25, 5),
     ]:
         startup_seconds = sum(bound for bound, _tp in _STARTUP_PROFILES[profile].models.values())
-        step_match = re.search(r"^      test_timeout: (\d+)$", jobs[job], re.M)
-        job_match = re.search(r"^      timeout: (\d+)$", jobs[job], re.M)
-        assert step_match is not None and job_match is not None
-        step_minutes = int(step_match.group(1))
-        job_minutes = int(job_match.group(1))
+        job_inputs = jobs[job]["with"]
+        step_minutes = int(job_inputs["test_timeout"])
+        job_minutes = int(job_inputs["timeout"])
         assert step_minutes >= (startup_seconds + 59) // 60 + test_allowance
         assert job_minutes >= step_minutes + job_gap
 

@@ -28,6 +28,13 @@ message SubscribeKvEventsRequest {
   // before: it would take that batch for a duplicate of a heartbeat
   // numbered 0.
   bool load_records_before_first_batch = 2;
+  // The subscriber wants the load records alone: no history, snapshot or
+  // events, only `load_only` batches (numbered 0; it admits nothing), one
+  // per data-parallel rank whose record changed or whose heartbeat is due,
+  // each stamped with its `dp_rank`. What a gateway asks for when it routes
+  // by load and keeps no KV index. A servicer that predates the field
+  // streams its events too; such a subscriber drops them.
+  bool loads_only = 3;
 }
 
 message KvEventBatch {
