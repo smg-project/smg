@@ -28,7 +28,9 @@
 #                                          owner fills (the four model-provider verifiers)
 #
 # No push publishes anything: a bump on a release branch runs CI; the artifacts (wheels, crates, images, the chart)
-# come from the release-* workflows dispatched by hand against the release tag, as publish-plan lists them.
+# come from the release-* workflows dispatched by hand against the release tag, as publish-plan lists them. A candidate
+# (X.Y.Z-rc.N) is never published to PyPI or crates.io: publish-plan leaves those dispatches out, and release-pypi,
+# release-crates and release-grpc refuse a ref named -rc.
 #
 # <version> is X.Y.Z or X.Y.Z-rc.N; the release branch is release/X.Y. Every version file carries the one
 # string as written (Python tooling normalizes 1.14.0-rc.1 to 1.14.0rc1 on its own). Between cuts main reads
@@ -74,6 +76,7 @@ release_of() { # 1.14.0-rc.1 -> 1.14
 }
 release_ok() { [[ $1 =~ $RELEASE_RE ]] || die "not a release: '$1' (X.Y, the minor version of release/X.Y)"; }
 is_final() { [[ $1 != *-* ]]; }
+is_candidate() { [[ $1 == *-rc.* ]]; } # a version or a tag, X.Y.Z-rc.N with or without the v: never published to PyPI or crates.io
 # Under sort -V a `~` sorts before the end of the string, so a pre-release spelled with it sorts below its final,
 # as cargo and PEP 440 order them: 1.14.0 < 1.15.0-dev < 1.15.0-rc.1 < 1.15.0 (main reads X.Y.Z-dev between cuts).
 sortable() { sed 's/-rc\./~rc./; s/-dev$/~dev/'; }
@@ -853,7 +856,7 @@ cmd_publish_plan() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh publish-plan <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref latest proto servicer list marks crate_name crate_version
+  local release tagname ref latest proto servicer list marks crate_name crate_version n=0
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
@@ -869,31 +872,40 @@ cmd_publish_plan() {
   say "Publishing v$version: nothing below runs by itself. A maintainer dispatches each workflow against the tag"
   say "$tagname (pushed by release.sh tag $version); every run reads its versions from that ref."
   say ""
-  say "1. Python package (PyPI: smg==$(pep440 "$version"), wheels + sdist)"
-  say "   gh workflow run release-pypi.yml --ref $tagname"
-  say "2. Rust crates (crates.io: every workspace crate whose version at $tagname is not published yet; smg $version)"
-  say "   gh workflow run release-crates.yml --ref $tagname"
-  say "   crate versions at $tagname (a crate whose manifest says publish = false or publish = [] is never published and not listed; a version crates.io holds already is skipped by the dispatch and marked):"
-  list=$(mktemp); marks=$(mktemp)
-  component_list "$ref" "$list" || die "publish-plan: the crates and packages at $ref are unknown; nothing listed"
-  registry_report "$ref" "$list" > "$marks"
-  while read -r crate_name crate_version; do
-    say "     $crate_name $crate_version$(registry_mark "$marks" "$crate_name" crates.io)"
-  done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
-  [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
-  say "3. Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
+  # A candidate is never published to PyPI or crates.io: its plan leaves the three registry dispatches out and says so once;
+  # the workflows refuse such a ref on their own. The items count themselves, so neither plan has a gap.
+  if is_candidate "$version"; then
+    say "A candidate is never published to PyPI or crates.io: the Python package, the Rust crates and the gRPC Python packages wait for the final (their workflows, release-pypi.yml, release-crates.yml and release-grpc.yml, refuse a ref named -rc.; this plan leaves their dispatches out)."
+    say ""
+  else
+    say "$((n += 1)). Python package (PyPI: smg==$(pep440 "$version"), wheels + sdist)"
+    say "   gh workflow run release-pypi.yml --ref $tagname"
+    say "$((n += 1)). Rust crates (crates.io: every workspace crate whose version at $tagname is not published yet; smg $version)"
+    say "   gh workflow run release-crates.yml --ref $tagname"
+    say "   crate versions at $tagname (a crate whose manifest says publish = false or publish = [] is never published and not listed; a version crates.io holds already is skipped by the dispatch and marked):"
+    list=$(mktemp); marks=$(mktemp)
+    component_list "$ref" "$list" || die "publish-plan: the crates and packages at $ref are unknown; nothing listed"
+    registry_report "$ref" "$list" > "$marks"
+    while read -r crate_name crate_version; do
+      say "     $crate_name $crate_version$(registry_mark "$marks" "$crate_name" crates.io)"
+    done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
+    [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
+  fi
+  say "$((n += 1)). Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
   say "   gh workflow run release-docker.yml --ref $tagname"
-  say "4. Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
+  say "$((n += 1)). Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
   say "   gh workflow run release-helm.yml --ref $tagname"
-  say "5. Engine images (ghcr.io/smg-project/smg:$version-<engine>-<engine version>, built from SMG_RELEASE_TAG = $tagname at that ref;"
+  say "$((n += 1)). Engine images (ghcr.io/smg-project/smg:$version-<engine>-<engine version>, built from SMG_RELEASE_TAG = $tagname at that ref;"
   say "   one dispatch per engine and release base, the table of .github/workflows/release-engine-docker.yml at $tagname: a dispatch"
   say "   without base_image_ref builds the engine's first base only, so every other base is a dispatch of its own)"
   engine_dispatches "$ref" "$tagname" | sed 's/^/   /'
-  say "6. gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}$(registry_mark "$marks" smg-grpc-proto PyPI), smg-grpc-servicer==${servicer:-?}$(registry_mark "$marks" smg-grpc-servicer PyPI); versions already on PyPI are skipped)"
-  say "   gh workflow run release-grpc.yml --ref $tagname"
-  say "7. Go module tag (crates/grpc_client/go/v$version)"
+  if ! is_candidate "$version"; then
+    say "$((n += 1)). gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}$(registry_mark "$marks" smg-grpc-proto PyPI), smg-grpc-servicer==${servicer:-?}$(registry_mark "$marks" smg-grpc-servicer PyPI); versions already on PyPI are skipped)"
+    say "   gh workflow run release-grpc.yml --ref $tagname"
+  fi
+  say "$((n += 1)). Go module tag (crates/grpc_client/go/v$version)"
   say "   gh workflow run release-go.yml --ref $tagname -f version=$version"
-  say "8. The GitHub release: release.sh notes $version > notes.md, then the gh release create line it prints."
+  say "$((n += 1)). The GitHub release: release.sh notes $version > notes.md, then the gh release create line it prints."
   say ""
   say "Watch a dispatch: gh run list --workflow <file> --branch $tagname"
 }
@@ -917,6 +929,14 @@ gate_section() { # <version> <ref>: the release gate as a pull request body sect
   for family in $VERIFIER_FAMILIES; do
     say "  - [ ] $family provider verifier: <record link>"
   done
+}
+
+publish_rule() { # <version>: the gate's line on what the registries take: a candidate never, the final by its dispatches
+  if is_candidate "$1"; then
+    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub pre-release"
+  else
+    say "[note] publish: the final publishes to PyPI and crates.io by its dispatches (release.sh publish-plan $1 lists them; a candidate never does)"
+  fi
 }
 
 cmd_check() {
@@ -980,6 +1000,7 @@ cmd_check() {
     fi
     [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
   fi
+  publish_rule "$version"
   # 2. CI on the head
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
     local ok=0 bad=0 pending=0 line read_rc=0 error
