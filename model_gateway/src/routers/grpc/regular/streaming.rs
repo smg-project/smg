@@ -157,6 +157,78 @@ impl ChatStreamUsage {
     }
 }
 
+/// The generate stream's usage, tallied the same way by its two loops (with
+/// and without logprobs): each index's running completion count, which every
+/// chunk of that index reports as its `completion_tokens`; the prompt and its
+/// cache hit, shared by every index (the last `Complete`'s prompt, the
+/// greatest hit); each index's reasoning tokens; and the indices whose
+/// `Complete` arrived, the only authority for settling the reservation. The
+/// completion count is the tokens the chunks carried, on every stream shape,
+/// as the loops counted them; `CompletionTokenTracker` and `ChatStreamUsage`
+/// read the engine's own count on a cumulative stream instead, and moving the
+/// generate loops onto them is a behaviour question, not this tally's.
+#[derive(Default)]
+struct GenerateStreamUsage {
+    completion: HashMap<u32, u32>,
+    prompt: u32,
+    cached: u32,
+    reasoning: HashMap<u32, u32>,
+    completed: HashSet<u32>,
+}
+
+impl GenerateStreamUsage {
+    /// Counts a chunk's tokens for its index; the index's count so far.
+    fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) -> u32 {
+        let count = self.completion.entry(chunk.index()).or_insert(0);
+        *count += chunk.token_ids().len() as u32;
+        *count
+    }
+
+    /// Records an index's `Complete`; the index's completion count.
+    fn record_complete(&mut self, complete: &ProtoGenerateComplete) -> u32 {
+        let index = complete.index();
+        self.prompt = complete.prompt_tokens();
+        self.cached = self.cached.max(complete.cached_tokens());
+        self.reasoning.insert(index, complete.reasoning_tokens());
+        self.completed.insert(index);
+        self.completion.get(&index).copied().unwrap_or(0)
+    }
+
+    /// The completion tokens counted so far across every index.
+    fn completion_total(&self) -> u32 {
+        self.completion.values().sum()
+    }
+
+    /// The tally as the counters every usage reads; a generate stream carries
+    /// no speculative counts.
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt,
+            completion: self.completion_total(),
+            cached: self.cached,
+            reasoning: self.reasoning.values().sum(),
+            spec_accepted: 0,
+            spec_drafted: 0,
+        }
+    }
+
+    /// Settles the reservation with the request's usage once every expected
+    /// choice completed; a stream that ended with fewer `Complete`s has only
+    /// partial usage and closes the reservation as reserved.
+    async fn settle(
+        &self,
+        reservation: Option<Arc<SharedReservationHandle>>,
+        expected_choices: u32,
+    ) {
+        let Some(handle) = reservation else { return };
+        if self.completed.len() as u32 >= expected_choices {
+            handle.settle_success(self.counts().settlement()).await;
+        } else {
+            handle.close_reserved_only().await;
+        }
+    }
+}
+
 /// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
 pub(crate) struct StreamingProcessor {
@@ -619,24 +691,13 @@ impl StreamingProcessor {
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Same prompt for every index; the last Complete's value is as good as any.
-        let mut prompt_tokens: u32 = 0;
-        // The cache hit is a property of that shared prompt too (max, not sum);
-        // reasoning is each choice's own, one entry per index.
-        let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Indices that received a `Complete` message -- the only source of
-        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
-        // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
-            })?;
+            let gen_response = response
+                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -647,10 +708,7 @@ impl StreamingProcessor {
 
                     let index = chunk.index();
 
-                    // Both backends send delta token_ids, so accumulate for both
-                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
-                    let current_completion_tokens = *completion_tokens;
+                    let current_completion_tokens = usage.record_chunk(&chunk);
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
                     let chunk_text = tokenizer
@@ -691,13 +749,9 @@ impl StreamingProcessor {
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
-                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let completion_tokens = usage.record_complete(&complete);
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
-                    prompt_tokens = complete.prompt_tokens();
-                    cached_tokens = cached_tokens.max(complete.cached_tokens());
-                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
-                    completed_indices.insert(index);
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -705,7 +759,7 @@ impl StreamingProcessor {
                         "output_ids": complete.output_ids()[complete.output_ids().len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
                             "id": index_id,
-                            "finish_reason": complete.finish_reason(),
+                            "finish_reason": utils::parse_finish_reason(complete.finish_reason(), complete.completion_tokens()),
                             "prompt_tokens": complete.prompt_tokens(),
                             "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
                             "completion_tokens": completion_tokens,
@@ -733,21 +787,8 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
-        if let Some(handle) = reservation {
-            if completed_indices.len() as u32 >= ctx.expected_choices {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: prompt_tokens,
-                        completion_tokens: total_completion,
-                        cached_input_tokens: cached_tokens,
-                        reasoning_tokens: reasoning_tokens_map.values().sum(),
-                    })
-                    .await;
-            } else {
-                handle.close_reserved_only().await;
-            }
-        }
+        let total_completion = usage.completion_total();
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -841,24 +882,13 @@ impl StreamingProcessor {
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Same prompt for every index; the last Complete's value is as good as any.
-        let mut prompt_tokens: u32 = 0;
-        // The cache hit is a property of that shared prompt too (max, not sum);
-        // reasoning is each choice's own, one entry per index.
-        let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Indices that received a `Complete` message -- the only source of
-        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
-        // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
-            })?;
+            let gen_response = response
+                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -872,10 +902,7 @@ impl StreamingProcessor {
 
                     let index = chunk.index();
 
-                    // Both backends send delta token_ids, so accumulate for both
-                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
-                    let current_completion_tokens = *completion_tokens;
+                    let current_completion_tokens = usage.record_chunk(&chunk);
 
                     // Decode tokens to text
                     let chunk_text = tokenizer
@@ -942,18 +969,13 @@ impl StreamingProcessor {
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
 
-                    // Use accumulated count (we tracked deltas from both backends)
-                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let completion_tokens = usage.record_complete(&complete);
 
                     let final_output_logprobs = accumulated_output_logprobs
                         .get(&index)
                         .and_then(|o| o.as_ref());
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
-                    prompt_tokens = complete.prompt_tokens();
-                    cached_tokens = cached_tokens.max(complete.cached_tokens());
-                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
-                    completed_indices.insert(index);
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -997,21 +1019,8 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
-        if let Some(handle) = reservation {
-            if completed_indices.len() as u32 >= ctx.expected_choices {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: prompt_tokens,
-                        completion_tokens: total_completion,
-                        cached_input_tokens: cached_tokens,
-                        reasoning_tokens: reasoning_tokens_map.values().sum(),
-                    })
-                    .await;
-            } else {
-                handle.close_reserved_only().await;
-            }
-        }
+        let total_completion = usage.completion_total();
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -2606,8 +2615,12 @@ impl<'a> ChatStream<'a> {
             })
             .map(|_| ChatStreamUsage::default());
 
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Where a Symphony table reads the response its reader takes the thought, and no
         // legacy parser is built to be asked whether one is available.
@@ -2638,6 +2651,7 @@ impl<'a> ChatStream<'a> {
             used_json_schema && matches!(spec.tool_choice, Some(ToolChoice::Function { .. }));
 
         let tool_parser_available = spec.tools.is_some()
+            && spec.symphony.is_none()
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -2651,7 +2665,7 @@ impl<'a> ChatStream<'a> {
             );
         }
 
-        if spec.tools.is_some() && !tool_parser_available {
+        if spec.tools.is_some() && spec.symphony.is_none() && !tool_parser_available {
             debug!(
                 "No tool parser found for model '{}', skipping tool call parsing",
                 model
@@ -4061,9 +4075,14 @@ impl<'a> MessagesStream<'a> {
             )
         };
 
-        // Per-request effective parser names (model-card override → configured).
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        // The request's parser names as its preparation resolved them (the spec carries
+        // them); resolved here only where the spec carries none.
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Check parser availability once upfront. Run parser when the user explicitly
         // enabled thinking, or when the selected parser needs structural special tokens.
@@ -4092,6 +4111,7 @@ impl<'a> MessagesStream<'a> {
 
         let tool_parser_available = has_tools
             && tool_choice_enabled
+            && legacy_reads
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -4909,321 +4929,4 @@ impl<'a> MessagesStream<'a> {
 }
 
 #[cfg(test)]
-pub(crate) mod eof_tests;
-#[cfg(test)]
-mod failure_tests;
-#[cfg(test)]
-mod isolation_tests;
-#[cfg(test)]
-mod local_stop_tests;
-#[cfg(test)]
-mod pd_anchor_tests;
-#[cfg(test)]
-mod pd_usage_tests;
-#[cfg(test)]
-mod symphony_tests;
-#[cfg(test)]
-mod thinking_display_tests;
-#[cfg(test)]
-mod usage_chunk_tests;
-
-#[cfg(test)]
-mod delta_slicing_tests;
-#[cfg(test)]
-mod sse_bytes_tests;
-#[cfg(test)]
-mod usage_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The frames write exactly the bytes of the serialized whole chunk
-    /// structs, so a field added to a struct turns up here, not on the wire
-    /// of the per-token chunks alone.
-    #[test]
-    fn chunk_frames_write_the_bytes_of_the_whole_structs() {
-        fn event(frame: &BytesMut) -> Vec<u8> {
-            frame
-                .strip_prefix(b"data: ")
-                .and_then(|body| body.strip_suffix(b"\n\n"))
-                .expect("one SSE data event")
-                .to_vec()
-        }
-        for fingerprint in [None, Some("v7")] {
-            let choice = CompletionStreamChoice {
-                text: "he said \"hi\"\n".to_string(),
-                index: 1,
-                logprobs: None,
-                finish_reason: Some("stop".to_string()),
-            };
-            let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
-            let mut buffer = BytesMut::new();
-            frame.write_chunk(&mut buffer, &choice);
-            let whole = CompletionStreamResponse {
-                id: "cmpl-1".to_string(),
-                object: "text_completion".to_string(),
-                created: 1_700_000_000,
-                choices: vec![choice],
-                model: "model-x".to_string(),
-                system_fingerprint: fingerprint.map(str::to_string),
-                usage: None,
-            };
-            assert_eq!(
-                event(&buffer),
-                serde_json::to_vec(&whole).unwrap(),
-                "completion, fingerprint {fingerprint:?}"
-            );
-
-            let choice = assistant_choice(0, Some("tok".to_string()), None, None);
-            let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
-            for (usage, emit_usage_null) in [
-                (None, false),
-                (None, true),
-                (Some(Usage::from_counts(3, 2)), false),
-            ] {
-                let mut buffer = BytesMut::new();
-                frame.write_chunk(&mut buffer, &choice, usage.as_ref(), emit_usage_null);
-                let whole = ChatCompletionStreamResponse {
-                    id: "chatcmpl-1".to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: 1_700_000_000,
-                    model: "model-x".to_string(),
-                    system_fingerprint: fingerprint.map(str::to_string),
-                    choices: vec![choice.clone()],
-                    usage: usage.clone(),
-                };
-                assert_eq!(
-                    event(&buffer),
-                    serde_json::to_vec(&ChatChunkWithUsage::new(&whole, emit_usage_null)).unwrap(),
-                    "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}",
-                    usage.is_some()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
-        use smg_grpc_client::sglang_proto as proto;
-
-        let mut tracker = ChatStreamUsage::default();
-        for (index, completion_tokens, reasoning_tokens) in [(0, 2, 1), (0, 5, 3), (1, 4, 2)] {
-            tracker.record_chunk(&ProtoGenerateStreamChunk::Sglang(
-                proto::GenerateStreamChunk {
-                    index,
-                    prompt_tokens: 10,
-                    cached_tokens: 8,
-                    completion_tokens,
-                    reasoning_tokens,
-                    token_ids: vec![1], // Incremental IDs must not replace cumulative counts.
-                    ..Default::default()
-                },
-            ));
-        }
-        let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
-        assert_eq!(usage["prompt_tokens"], 10);
-        assert_eq!(usage["completion_tokens"], 9);
-        assert_eq!(usage["total_tokens"], 19);
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 8);
-        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 5);
-
-        tracker.record_complete(&ProtoGenerateComplete::Sglang(proto::GenerateComplete {
-            index: 0,
-            prompt_tokens: 10,
-            cached_tokens: 8,
-            completion_tokens: 6,
-            reasoning_tokens: 3,
-            spec_accepted_tokens: 2,
-            spec_draft_tokens: 3,
-            ..Default::default()
-        }));
-        let usage = tracker.snapshot(0);
-        assert_eq!(usage.completion_tokens, 10);
-        let details = usage.completion_tokens_details.unwrap();
-        assert_eq!(details.accepted_prediction_tokens, Some(2));
-        assert_eq!(details.rejected_prediction_tokens, Some(1));
-    }
-
-    #[test]
-    fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete() {
-        use smg_grpc_client::vllm_proto as proto;
-
-        let mut tracker = ChatStreamUsage::default();
-        for ids in [vec![1, 2], vec![3]] {
-            tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(
-                proto::GenerateStreamChunk {
-                    prompt_tokens: 10,
-                    token_ids: ids,
-                    ..Default::default()
-                },
-            ));
-        }
-        assert_eq!(tracker.snapshot(0).completion_tokens, 3);
-        tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
-            proto::GenerateComplete {
-                prompt_tokens: 10,
-                completion_tokens: 3,
-                ..Default::default()
-            },
-        )));
-        assert_eq!(tracker.snapshot(0).completion_tokens, 3);
-    }
-
-    /// Wire contract: cache counters serialize as integer zeros, never null,
-    /// in both the message_start skeleton and the final message_delta usage.
-    #[test]
-    fn messages_usage_cache_counters_serialize_as_integer_zeros() {
-        let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
-        assert_eq!(start["input_tokens"], 0);
-        assert_eq!(start["output_tokens"], 0);
-        assert_eq!(start["cache_creation_input_tokens"], 0);
-        assert_eq!(start["cache_read_input_tokens"], 0);
-
-        let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-            15,
-            Some(25),
-            None,
-        ))
-        .unwrap();
-        assert_eq!(delta["output_tokens"], 15);
-        assert_eq!(delta["input_tokens"], 25);
-        assert_eq!(delta["cache_creation_input_tokens"], 0);
-        assert_eq!(delta["cache_read_input_tokens"], 0);
-    }
-
-    /// The `message_start` skeleton carries every key the public API writes
-    /// on a message's usage; the final delta carries the thinking tokens of a
-    /// turn that ran with thinking and no such key otherwise.
-    #[test]
-    fn messages_usage_always_present_keys_and_thinking_tokens() {
-        let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
-        assert_eq!(
-            start["cache_creation"],
-            serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
-        );
-        assert_eq!(start["service_tier"], "standard");
-        assert_eq!(start["inference_geo"], "not_available");
-
-        let plain = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-            15,
-            Some(25),
-            None,
-        ))
-        .unwrap();
-        assert!(plain.get("output_tokens_details").is_none());
-        let thinking = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-            15,
-            Some(25),
-            Some(9),
-        ))
-        .unwrap();
-        assert_eq!(thinking["output_tokens_details"]["thinking_tokens"], 9);
-    }
-
-    /// A clean EOF without a `Complete` message has no authoritative prompt
-    /// count: `input_tokens` must serialize as null, not a fabricated zero.
-    #[test]
-    fn message_delta_input_tokens_null_without_authoritative_usage() {
-        let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-            15, None, None,
-        ))
-        .unwrap();
-        assert!(delta.get("input_tokens").is_some_and(Value::is_null));
-        assert_eq!(delta["cache_creation_input_tokens"], 0);
-    }
-
-    /// Tokenizer whose decode always fails, simulating a broken deployment
-    /// (corrupt or mismatched tokenizer files).
-    struct FailingTokenizer {
-        special_tokens: llm_tokenizer::SpecialTokens,
-    }
-
-    impl llm_tokenizer::Encoder for FailingTokenizer {
-        fn encode(
-            &self,
-            _input: &str,
-            _add_special_tokens: bool,
-        ) -> anyhow::Result<llm_tokenizer::Encoding> {
-            Err(anyhow::anyhow!("encode is not supported"))
-        }
-
-        fn encode_batch(
-            &self,
-            _inputs: &[&str],
-            _add_special_tokens: bool,
-        ) -> anyhow::Result<Vec<llm_tokenizer::Encoding>> {
-            Err(anyhow::anyhow!("encode_batch is not supported"))
-        }
-    }
-
-    impl llm_tokenizer::Decoder for FailingTokenizer {
-        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
-            Err(anyhow::anyhow!("tokenizer decode failed"))
-        }
-
-        fn finish_decode(
-            &self,
-            _ids: &mut Vec<u32>,
-            _prefix: &mut String,
-            _prefix_index: &mut usize,
-            _skip_special_tokens: bool,
-        ) -> anyhow::Result<llm_tokenizer::DecodeStep> {
-            Err(anyhow::anyhow!("pending token decode failed"))
-        }
-    }
-
-    impl Tokenizer for FailingTokenizer {
-        fn vocab_size(&self) -> usize {
-            0
-        }
-
-        fn get_special_tokens(&self) -> &llm_tokenizer::SpecialTokens {
-            &self.special_tokens
-        }
-
-        fn token_to_id(&self, _token: &str) -> Option<u32> {
-            None
-        }
-
-        fn id_to_token(&self, _id: u32) -> Option<String> {
-            None
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    #[test]
-    fn process_chunk_tokens_propagates_decode_errors() {
-        // A decode error must surface instead of being swallowed as `Held`,
-        // which would drop the text and let a configured stop silently miss.
-        let tokenizer = Arc::new(FailingTokenizer {
-            special_tokens: llm_tokenizer::SpecialTokens::default(),
-        });
-        let config = llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("STOP");
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        let result = StreamingProcessor::process_chunk_tokens(&mut decoder, &[1, 2]);
-
-        let err = result.expect_err("decode failure must propagate");
-        assert!(err.contains("Stop decoder failed to process token"));
-    }
-
-    #[test]
-    fn finish_preserves_pending_decode_errors() {
-        let tokenizer = Arc::new(FailingTokenizer {
-            special_tokens: llm_tokenizer::SpecialTokens::default(),
-        });
-        let mut decoder = StopSequenceDecoder::new(
-            tokenizer,
-            llm_tokenizer::StopSequenceConfig::default(),
-            false,
-        );
-        let error = decoder
-            .finish()
-            .expect_err("EOF decode error must propagate");
-        assert!(error.to_string().contains("pending token decode failed"));
-    }
-}
+pub(crate) mod tests;

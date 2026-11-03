@@ -578,9 +578,7 @@ pub(crate) fn restamp_plan_for_attempt(
 /// In PD mode the decode worker is authoritative because it produces visible
 /// output tokens. The resolved request is then sent through the existing PD
 /// flow unchanged.
-pub(crate) fn sampling_defaults_for_request(
-    workers: Option<&WorkerSelection>,
-) -> Option<SamplingDefaults> {
+fn sampling_defaults_for_request(workers: Option<&WorkerSelection>) -> Option<SamplingDefaults> {
     let worker = match workers? {
         WorkerSelection::Single { worker } => worker,
         WorkerSelection::Disaggregated { decode, .. } => decode,
@@ -990,13 +988,13 @@ pub(crate) fn finish_generate_request(
         if builder.is_zmq() {
             return Err(error::bad_request(
                 "multimodal_not_supported",
-                "media references require a gRPC vLLM worker",
+                "media references require a supported gRPC worker",
             ));
         }
         let refs =
             assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
-            .set_vllm_media_refs(refs)
+            .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
         ctx.state.media_refs_forwarded = true;
     }

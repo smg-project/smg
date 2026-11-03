@@ -45,7 +45,7 @@ use crate::{
         sglang::{
             multimodal::{
                 DATA_ITEM_WIRE_FIELDS, MULTIMODAL_DATA_ITEM_NAME, MULTIMODAL_PROCESSOR_OUTPUT_NAME,
-                PROCESSOR_OUTPUT_WIRE_FIELDS,
+                VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS,
             },
             output::{decode_slim_batch, SglangOutput},
             request::{
@@ -163,7 +163,7 @@ impl EngineProtocol for SglangProtocol {
         // them compared too.
         check_prefix(
             MULTIMODAL_PROCESSOR_OUTPUT_NAME,
-            &PROCESSOR_OUTPUT_WIRE_FIELDS,
+            &VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS,
             &ready.positional_layouts,
         )?;
         check_prefix(
@@ -504,7 +504,7 @@ mod tests {
 
     /// The multimodal structs at the handshake: the processor output is
     /// compared as the prefix this side sends (a field a release adds after
-    /// `im_token_id` passes), the data item whole; a field moved or inserted
+    /// `video_token_id` passes), the data item whole; a field moved or inserted
     /// inside what is sent is refused by name.
     #[test]
     fn check_layouts_reads_the_multimodal_structs_as_sent() {
@@ -525,10 +525,13 @@ mod tests {
         let output = multimodal::PROCESSOR_OUTPUT_FIELDS_0_5_22;
         let item = multimodal::DATA_ITEM_FIELDS_0_5_22;
         assert!(SglangProtocol::check_layouts(&ready(&output, &item)).is_ok());
-        // A release that adds a token id after `im_end_id`: past the prefix.
+        // A release that adds a token id after `video_token_id`: past the prefix.
         let mut appended = output.to_vec();
-        appended.insert(6, "video_start_id");
+        appended.insert(9, "video_start_id");
         assert!(SglangProtocol::check_layouts(&ready(&appended, &item)).is_ok());
+        let mut moved_video = output.to_vec();
+        moved_video.swap(8, 9);
+        assert!(SglangProtocol::check_layouts(&ready(&moved_video, &item)).is_err());
         // A release that put a field before `input_ids`: inside the prefix.
         let mut inserted = output.to_vec();
         inserted.insert(1, "input_embeds");
@@ -566,6 +569,7 @@ mod tests {
         assert_eq!(decoded, vec!["req-1".to_string()]);
     }
 
+    /// Construct a native multimodal request to verify positional MessagePack compatibility.
     fn media_request(feature_bytes: usize) -> TokenizedGenerateReqInput {
         use crate::protocol::sglang::multimodal::{
             SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor,
@@ -577,6 +581,7 @@ mod tests {
             mm_inputs: Some(SglangWireMmInputs {
                 mm_items: vec![SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: Some(vec![(1, 3)]),
                     feature: Some(
                         SglangWireTensor::new(
@@ -592,6 +597,7 @@ mod tests {
                     )]),
                 }],
                 im_token_id: Some(7),
+                video_token_id: None,
             }),
             ..TokenizedGenerateReqInput::default()
         }

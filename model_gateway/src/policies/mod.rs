@@ -115,6 +115,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether this policy places `info`'s request on the owner of its
+    /// explicit session key (a routing key, or the rid-derived key under the
+    /// routing-key override) rather than by load: consistent hashing's ring
+    /// owner. Single-worker placement over regular workers then leaves the
+    /// absolute overload veto off the selection instead of moving the session
+    /// off the worker holding its cache each time that worker crosses a
+    /// threshold (see `placement::select_from`).
+    fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
+        false
+    }
+
     /// Drop the state this policy keeps on a removed worker (a load-aware
     /// policy's dispatch tally), so it does not accumulate under worker
     /// churn (autoscaling, rolling updates). Default is a no-op for
@@ -405,7 +416,9 @@ pub struct SelectWorkerInfo<'a> {
     /// when every worker is over them (health, the circuit breaker and the
     /// liveness veto still apply). Set by disaggregated pair placement for
     /// such a prefill pool (see `placement::select_pair`); every other pool
-    /// keeps the veto and the least-loaded steering default.
+    /// keeps the veto and the least-loaded steering default. Single-worker
+    /// placement over regular workers also sets it for a request its policy
+    /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
 }
 

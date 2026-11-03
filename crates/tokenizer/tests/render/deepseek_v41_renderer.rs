@@ -45,8 +45,11 @@ enum ThinkingMode {
 /// Which encoder recorded a case's text: the checkpoint's own `encoding.py`
 /// (`hf`) or the serving engine's port (`vllm_python`), for a shape the
 /// reference cannot render. A `developer` message is not one: the generator
-/// rewrites it as the engine's renderer does before either encoder sees the
-/// conversation (a system message, merged), as the shim under test does.
+/// rewrote it as a system message before either encoder saw the conversation,
+/// which the engine's renderer does not (it hands the role to its encoder as
+/// written; the crate's unit tests pin what the shim renders for it), so the
+/// three developer cases describe the system path they were recorded on and
+/// the test hands the shim that path ([`as_the_generator_folded`]).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Oracle {
@@ -102,6 +105,22 @@ struct IdCase {
 struct IdFixtures {
     tokenizer_sha256: String,
     cases: Vec<IdCase>,
+}
+
+/// The generator's rewrite the three developer cases were recorded with: the
+/// developer message, first in each of them, as a system message (none has a
+/// second system message to merge with, nor developer `tools`).
+fn as_the_generator_folded(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if message["role"] == "developer" {
+                message["role"] = json!("system");
+            }
+            message
+        })
+        .collect()
 }
 
 /// The template kwargs the gateway forwards for a case. `reasoning_effort`
@@ -229,6 +248,7 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
                 panic!("case {name}: encoder_revision {revision} is neither revision nor current_revision")
             });
         let kwargs = template_kwargs(case);
+        let messages = as_the_generator_folded(&case.messages);
         let render = |kwargs: &HashMap<String, Value>| {
             let params = ChatTemplateParams {
                 // A case recorded with `wo_eos` on its final assistant message
@@ -243,7 +263,7 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
                 template_kwargs: Some(kwargs),
                 ..Default::default()
             };
-            tok.apply_chat_template_with_encoding(&case.messages, params, None)
+            tok.apply_chat_template_with_encoding(&messages, params, None)
                 .unwrap_or_else(|e| panic!("case {name}: render failed: {e}"))
         };
 

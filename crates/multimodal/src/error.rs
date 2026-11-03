@@ -43,6 +43,8 @@ pub enum MediaConnectorError {
     },
     #[error("image max_long_side_pixel must be positive, got {value}")]
     InvalidImageLongSideCap { value: u32 },
+    #[error("SGLang MiniMax max_long_side_pixel must be a multiple of 28 within 112..=3584, got {value}")]
+    InvalidSglangLongSideCap { value: u32 },
     #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
     InvalidMaxLongSidePixel { value: u32, factor: u32 },
     #[error("fps must be between {min} and {max}, got {value}")]
@@ -233,6 +235,7 @@ impl MediaConnectorError {
             | Self::DecodedTooLarge { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
             Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
             | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
@@ -271,6 +274,7 @@ impl MediaConnectorError {
                 MediaFault::Internal
             }
             Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
             | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }

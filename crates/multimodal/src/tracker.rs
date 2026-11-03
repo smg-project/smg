@@ -204,6 +204,8 @@ pub struct AsyncMultiModalTracker {
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
     minimax_image_resize: bool,
+    minimax_sglang_resize: bool,
+    drain_on_error: bool,
 }
 
 impl AsyncMultiModalTracker {
@@ -218,7 +220,16 @@ impl AsyncMultiModalTracker {
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
             minimax_image_resize: false,
+            minimax_sglang_resize: false,
+            drain_on_error: false,
         }
+    }
+
+    /// Keep worker admission until sibling fetches finish, including blocking decode.
+    /// Disabled by default to preserve the router's fail-fast error response.
+    pub fn with_drain_on_error(mut self, enabled: bool) -> Self {
+        self.drain_on_error = enabled;
+        self
     }
 
     /// Decode the request's image frames under `policy` (the destination
@@ -232,6 +243,12 @@ impl AsyncMultiModalTracker {
     /// Video fetching and other model families retain their existing policy.
     pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
         self.minimax_image_resize = enabled;
+        self
+    }
+
+    /// Select SGLang's MiniMax image geometry and Pillow resize kernel.
+    pub fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
         self
     }
 
@@ -319,24 +336,40 @@ impl AsyncMultiModalTracker {
         Ok(())
     }
 
+    /// Collect fetched media, optionally draining siblings before returning an error.
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
+        let mut first_error = None;
         for (modality, slots) in self.pending.drain() {
             let mut items: Vec<TrackedMedia> = Vec::with_capacity(slots.len());
             for slot in slots {
                 let media = match slot {
-                    Slot::Fetch(task) => task.await??,
+                    Slot::Fetch(task) => task
+                        .await
+                        .map_err(MultiModalError::from)
+                        .and_then(|media| media),
                     Slot::SameAs(first) => items.get(first).cloned().ok_or_else(|| {
                         MultiModalError::Validation(format!(
                             "{modality} slot refers to a slot that was never fetched"
                         ))
-                    })?,
+                    }),
                 };
-                items.push(media);
+                match media {
+                    Ok(media) => items.push(media),
+                    Err(error) => {
+                        if !self.drain_on_error {
+                            return Err(error);
+                        }
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
             data.insert(modality, items);
         }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(TrackerOutput {
             data,
             uuids: self.uuids,
@@ -398,7 +431,8 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
-        let minimax_cap = self.minimax_image_resize.then_some(
+        let sglang = self.minimax_sglang_resize;
+        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
             max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
         );
         let config = ImageFetchConfig {
@@ -413,12 +447,20 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}/{minimax_cap:?}"),
+            if sglang {
+                format!("{config:?}/{minimax_cap:?}/sglang")
+            } else {
+                format!("{config:?}/{minimax_cap:?}")
+            },
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
                 let frame = if let Some(cap) = minimax_cap {
-                    crate::minimax_resize::image(frame, cap)?
+                    if sglang {
+                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                    } else {
+                        crate::minimax_resize::image(frame, cap)?
+                    }
                 } else {
                     frame
                 };
@@ -434,19 +476,40 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let cfg = video_fetch_config(
+        let mut cfg = video_fetch_config(
             fps,
             max_long_side_pixel,
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
+        let sglang = self.minimax_sglang_resize;
+        let key = if sglang {
+            format!("{cfg:?}/sglang")
+        } else {
+            format!("{cfg:?}")
+        };
+        if sglang {
+            // Native MiniMax applies Pillow once, after source-resolution decode.
+            cfg.max_long_side_pixel = None;
+        }
         self.enqueue(
             Modality::Video,
             uuid,
-            format!("{cfg:?}"),
+            key,
             source,
             move |connector, source| async move {
-                let clip = connector.fetch_video_from(&source, cfg).await?;
+                let mut clip = connector.fetch_video_from(&source, cfg).await?;
+                if sglang {
+                    let clip = Arc::make_mut(&mut clip);
+                    clip.max_long_side_pixel = max_long_side_pixel;
+                    // Decode hashed source bytes and sampling without a resize cap.
+                    // Domain-separate Pillow pixels and include the deferred cap.
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(b"minimax-sglang-video-pillow-day0");
+                    hash.update(clip.hash.as_bytes());
+                    hash.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
+                    clip.hash = hash.finalize().to_hex().to_string();
+                }
                 Ok(TrackedMedia::Video(clip))
             },
         );
@@ -752,6 +815,67 @@ mod repeat_tests {
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 
+    /// Workers drain failed siblings; default router processing still returns errors promptly.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test waits for both fetch tasks via finalize and a completion channel"
+    )]
+    async fn failed_fetch_obeys_drain_policy() {
+        use tokio::sync::oneshot;
+        for drain in [false, true] {
+            for panic in [false, true] {
+                let mut tracker = tracker().with_drain_on_error(drain);
+                let (release, wait) = oneshot::channel();
+                let (finished, done) = oneshot::channel();
+                tracker.pending.insert(
+                    Modality::Video,
+                    vec![
+                        Slot::Fetch(tokio::spawn(async move {
+                            assert!(!panic, "fetch panic");
+                            Err(MultiModalError::Validation("first fetch failed".into()))
+                        })),
+                        Slot::Fetch(tokio::spawn(async move {
+                            wait.await.unwrap();
+                            finished.send(()).unwrap();
+                            Err(MultiModalError::Validation("sibling finished".into()))
+                        })),
+                    ],
+                );
+                let finalize = tracker.finalize();
+                tokio::pin!(finalize);
+                let error = if drain {
+                    assert!(tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        &mut finalize
+                    )
+                    .await
+                    .is_err());
+                    release.send(()).unwrap();
+                    finalize.await.unwrap_err()
+                } else {
+                    let error =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), &mut finalize)
+                            .await
+                            .unwrap()
+                            .unwrap_err();
+                    release.send(()).unwrap();
+                    error
+                };
+                done.await.unwrap();
+                let error = error.to_string();
+                assert!(
+                    error.contains(if panic {
+                        "fetch panic"
+                    } else {
+                        "first fetch failed"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     /// The plan side classifies a URL part as the fetch will: the scheme as
     /// the URL parser reads it, whatever its case, is a data URL.
     #[test]
@@ -815,6 +939,79 @@ mod repeat_tests {
             .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
             .expect("the failed fetch");
         assert_eq!(failed.1.bytes, 0, "{:?}", failed.1);
+    }
+
+    /// Only native SGLang defers the cap to its Pillow processor; vLLM still
+    /// receives decoder-scaled frames. Explicit caps survive both paths.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; run explicitly for MiniMax validation"]
+    async fn minimax_video_cap_is_deferred_only_for_sglang() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=8",
+                "-t",
+                "1",
+                "-filter_threads",
+                "1",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(path).unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for sglang in [false, true] {
+            for cap in [None, Some(168), Some(224)] {
+                let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+                tracker
+                    .push_part(MediaContentPart::VideoUrl {
+                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                        uuid: None,
+                        fps: Some(1.0),
+                        max_long_side_pixel: cap,
+                    })
+                    .unwrap();
+                let output = tracker.finalize().await.unwrap();
+                let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
+                    panic!("video expected");
+                };
+                assert_eq!(clip.max_long_side_pixel(), cap);
+                assert!(
+                    identities.insert(clip.hash.clone()),
+                    "runtime and cap identify different pixels"
+                );
+                if !sglang {
+                    assert_eq!(
+                        clip.hash,
+                        crate::hasher::hash_video_with_sampling(
+                            &bytes,
+                            1.0,
+                            cap,
+                            FrameSampling::default()
+                        )
+                    );
+                }
+                let frame = &clip.rgb_video().unwrap().frames[0];
+                let expected = if sglang {
+                    (320, 240)
+                } else {
+                    cap.map_or((320, 240), |cap| (cap, cap * 3 / 4))
+                };
+                assert_eq!((frame.width, frame.height), expected);
+            }
+        }
     }
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {

@@ -6,6 +6,7 @@ use smg_grpc_client::sglang_proto as proto;
 /// Parse a JSON value into a proto::GenerateResponse
 pub fn parse_proto_response(json_value: &Value) -> Result<proto::GenerateResponse, &'static str> {
     let mut proto_response = proto::GenerateResponse {
+        media_identity: None,
         request_id: string_at(json_value, "request_id"),
         response: None,
     };

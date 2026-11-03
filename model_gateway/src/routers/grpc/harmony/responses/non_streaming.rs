@@ -33,8 +33,12 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed, utils::resolve_function_identity, NotStored,
-                ResponsesContext,
+                persist_response_if_needed,
+                utils::{
+                    function_call_status, generation_failure_error, resolve_function_identity,
+                    response_status,
+                },
+                NotStored, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -197,6 +201,7 @@ async fn execute_with_mcp_loop(
                 partial_text,
                 usage,
                 request_id,
+                finish_reason,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
@@ -250,6 +255,7 @@ async fn execute_with_mcp_loop(
                         vec![],         // No MCP tools executed
                         vec![],         // No MCP results
                         all_tool_calls, // All tools returned as function calls (not executed)
+                        finish_reason.as_deref(),
                         analysis,
                         partial_text,
                         usage,
@@ -262,8 +268,10 @@ async fn execute_with_mcp_loop(
                     // Per the design, exhausting `max_tool_calls` is a `failed`
                     // status with an `error` payload (truncation
                     // `incomplete_details` is reserved for `max_output_tokens` /
-                    // `content_filter`).
+                    // `content_filter`); a truncation the builder read from the
+                    // finish is cleared, as the streamed exit clears it.
                     response.status = ResponseStatus::Failed;
+                    response.incomplete_details = None;
                     response.error = Some(json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!(
@@ -321,6 +329,7 @@ async fn execute_with_mcp_loop(
                         mcp_tool_calls,
                         mcp_results,
                         function_tool_calls,
+                        finish_reason.as_deref(),
                         analysis,
                         partial_text,
                         usage,
@@ -408,6 +417,7 @@ async fn execute_without_mcp_loop(
             partial_text,
             usage,
             request_id,
+            finish_reason,
         } => {
             // Function tool calls found - return to caller for execution
             debug!(
@@ -419,6 +429,7 @@ async fn execute_without_mcp_loop(
                 vec![],
                 vec![],
                 tool_calls,
+                finish_reason.as_deref(),
                 analysis,
                 partial_text,
                 usage,
@@ -434,12 +445,15 @@ async fn execute_without_mcp_loop(
     }
 }
 
-/// Build ResponsesResponse with tool calls (MCP and/or function tools)
+/// Build ResponsesResponse with tool calls (MCP and/or function tools). The
+/// function calls' status and the response's are read under `finish_reason`,
+/// the turn's as the parser reads it.
 #[expect(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
     mcp_results: Vec<ToolResult>,
     function_tool_calls: Vec<ToolCall>,
+    finish_reason: Option<&str>,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
     usage: Usage,
@@ -498,12 +512,17 @@ fn build_tool_response(
         });
     }
 
-    // Add function tool calls WITHOUT output (need caller execution)
+    // Add function tool calls WITHOUT output (need caller execution): each
+    // call's status under the turn's finish, which a cut call reads as
+    // incomplete, and the response as cut.
+    let mut cut_call = false;
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
         let (name, namespace) =
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
+        let status = function_call_status(finish_reason, &arguments);
+        cut_call |= status == "incomplete";
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id),
             call_id,
@@ -511,23 +530,32 @@ fn build_tool_response(
             namespace,
             arguments,
             output: None, // No output = needs execution
-            status: "completed".to_string(),
+            status: status.to_string(),
         });
     }
 
-    // Build ResponsesResponse with Completed status
+    // The status is read where every Responses object reads it: a `length`
+    // finish is incomplete with `max_output_tokens`, a cut call incomplete
+    // without a reason, a failed generation failed with its error.
+    let (status, incomplete_details) = response_status(finish_reason, cut_call);
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    ResponsesResponse::builder(&request_id, &responses_request.model)
+    let mut builder = ResponsesResponse::builder(&request_id, &responses_request.model)
         .copy_from_request(&responses_request)
         .created_at(created_at)
-        .status(ResponseStatus::Completed)
+        .status(status)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
-        .build()
+        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+    if let Some(details) = incomplete_details {
+        builder = builder.incomplete_details(details);
+    }
+    if let Some(error) = generation_failure_error(finish_reason) {
+        builder = builder.error(error);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
@@ -547,6 +575,7 @@ mod namespace_tests {
             vec![],
             vec![],
             vec![call],
+            Some("tool_calls"),
             None,
             String::new(),
             Usage::from_counts(1, 1),
@@ -556,5 +585,71 @@ mod namespace_tests {
         let wire = serde_json::to_value(response).unwrap();
         assert_eq!(wire["output"][0]["name"], "lookup");
         assert_eq!(wire["output"][0]["namespace"], "weather");
+    }
+}
+
+/// The status of the non-streamed response of a turn that returns its calls
+/// to the caller is read from the turn's finish, as every Responses object's
+/// is: a `length` finish is incomplete with `max_output_tokens`, a call cut
+/// by anything else leaves it incomplete without a reason, and a turn that
+/// ended on its closed calls is completed.
+#[cfg(test)]
+mod status_tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    fn call(arguments: &str) -> ToolCall {
+        serde_json::from_value(json!({
+            "id": "call_time", "type": "function",
+            "function": {"name": "time", "arguments": arguments}
+        }))
+        .unwrap()
+    }
+
+    fn wire(finish_reason: Option<&str>, arguments: &str) -> Value {
+        let response = build_tool_response(
+            vec![],
+            vec![],
+            vec![call(arguments)],
+            finish_reason,
+            None,
+            String::new(),
+            Usage::from_counts(1, 1),
+            "resp_test".into(),
+            Arc::new(ResponsesRequest::default()),
+        );
+        serde_json::to_value(response).unwrap()
+    }
+
+    #[test]
+    fn a_turn_cut_by_max_output_tokens_reads_incomplete_with_the_reason() {
+        let wire = wire(Some("length"), "{\"tz\":");
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(wire["output"][0]["status"], "incomplete");
+        assert_eq!(wire["output"][0]["arguments"], "{\"tz\":");
+    }
+
+    #[test]
+    fn a_cut_call_under_another_finish_reads_incomplete_without_a_reason() {
+        for finish_reason in [Some("abort"), Some("stop"), None] {
+            let wire = wire(finish_reason, "{\"tz\":");
+            assert_eq!(wire["status"], "incomplete", "{finish_reason:?}: {wire}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason:?}");
+            assert_eq!(
+                wire["output"][0]["status"], "incomplete",
+                "{finish_reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_its_closed_calls_reads_completed() {
+        let wire = wire(Some("tool_calls"), "{\"tz\": \"UTC\"}");
+        assert_eq!(wire["status"], "completed", "{wire}");
+        assert!(wire["incomplete_details"].is_null());
+        assert!(wire["error"].is_null());
+        assert_eq!(wire["output"][0]["status"], "completed");
     }
 }

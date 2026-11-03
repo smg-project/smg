@@ -155,7 +155,7 @@ pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
 /// overloaded router sheds instead of queueing without bound: every parked
 /// request holds its body and its encoding until it is served, so growth
 /// without a bound only ends at the memory limit.
-pub(crate) fn default_max_concurrent_requests() -> usize {
+fn default_max_concurrent_requests() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
 }
@@ -1110,11 +1110,13 @@ mod tests {
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 
-    #[tokio::test]
-    async fn unset_rate_limit_defaults_to_no_refill() {
+    /// The admission bucket of a ten-request cap under
+    /// `rate_limit_tokens_per_second` hands out its ten tokens and refills
+    /// none over 150 ms; a returned token is handed out again.
+    async fn ten_tokens_and_no_refill(rate_limit_tokens_per_second: Option<i32>) {
         let config = RouterConfig {
             max_concurrent_requests: 10,
-            rate_limit_tokens_per_second: None,
+            rate_limit_tokens_per_second,
             ..RouterConfig::default()
         };
         let bucket = AppContextBuilder::new()
@@ -1123,13 +1125,18 @@ mod tests {
             .expect("rate limiter should be enabled");
 
         assert!(bucket.try_acquire(10.0).is_ok());
-        // The old fallback refilled at max_concurrent_requests per second,
+        // An earlier fallback refilled at max_concurrent_requests per second,
         // which would restore a token during this wait.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(bucket.try_acquire(1.0).is_err());
 
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unset_rate_limit_defaults_to_no_refill() {
+        ten_tokens_and_no_refill(None).await;
     }
 
     /// With no explicit cap the admission bucket still exists, sized by the
@@ -1173,24 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_zero_rate_limit_disables_refill() {
-        let config = RouterConfig {
-            max_concurrent_requests: 10,
-            rate_limit_tokens_per_second: Some(0),
-            ..RouterConfig::default()
-        };
-        let bucket = AppContextBuilder::new()
-            .maybe_rate_limiter(&config)
-            .rate_limiter
-            .expect("rate limiter should be enabled");
-
-        assert!(bucket.try_acquire(10.0).is_ok());
-        // The previous fallback used max_concurrent_requests as the refill
-        // rate, which would add more than one token during this wait.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(bucket.try_acquire(1.0).is_err());
-
-        bucket.return_tokens_sync(1.0);
-        assert!(bucket.try_acquire(1.0).is_ok());
+        ten_tokens_and_no_refill(Some(0)).await;
     }
 
     fn config_with_policy(policy: PolicyConfig) -> RouterConfig {
@@ -1328,8 +1318,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+    #[tokio::test]
+    async fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(

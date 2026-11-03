@@ -16,10 +16,12 @@
 //! ```
 //!
 //! The template writes `<｜Assistant｜>` and the thought's opener (`<think>`, or `</think>` in chat
-//! mode) after a user message only: a conversation that ends with a system message rendered in
-//! place leaves the turn unopened, and the model, which thinks unless told not to, starts inside
-//! its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending a turn
-//! the model wrote), so `</think>` closes the thought instead of reaching the content.
+//! mode) after a user message, and after a system message that ends the conversation or that an
+//! assistant turn follows; a system message a latest reminder follows stays bare, and the
+//! checkpoint's own encoder file opens the turn after user and developer turns only, so a prompt
+//! can still leave the turn unopened, and the model, which thinks unless told not to, starts
+//! inside its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending
+//! a turn the model wrote), so `</think>` closes the thought instead of reaching the content.
 //!
 //! The block's opener is spelled as the family's reference parser spells it: the blank line the
 //! template writes before the block and the tag, `\n\n<｜DSML｜tool_calls>`, so the blank line
@@ -550,10 +552,11 @@ mod tests {
         }
     }
 
-    /// The prompt the family's template renders for a conversation that ends with a system
-    /// message, as a coding agent's client sends one (its environment notes after the user turn):
-    /// the template writes the turn opener after a user message only, so the prompt opens no turn,
-    /// and the model starts inside its thought as it would after `<｜Assistant｜><think>`.
+    /// The prompt the checkpoint's own encoder file writes for a conversation that ends with a
+    /// system message, as a coding agent's client sends one (its environment notes after the user
+    /// turn): that file writes the turn opener after user and developer turns only, so the prompt
+    /// opens no turn, and the model starts inside its thought as it would after
+    /// `<｜Assistant｜><think>`.
     const TRAILING_SYSTEM_PROMPT: &str = concat!(
         "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
         "<｜User｜>The test suite has a failing test. Find the bug under src/ and fix it.",
@@ -561,10 +564,12 @@ mod tests {
         " - Platform: linux\n\nToday's date is 2026-10-16."
     );
 
-    /// The same client's later request: the environment notes after the first user turn, the
-    /// model's turn after them, the tool's result as the template merges it into a user turn, and
-    /// a note after that, with `</think>` quoted in the result. The template wrote no opener before
-    /// the model's earlier turn either (a system message came before it), so the prompt holds none.
+    /// The prompt the checkpoint's own encoder file writes, with the thoughts kept, for the same
+    /// client's later request: the environment notes after the first user turn, the model's turn
+    /// after them, the tool's result merged into a user turn, and a note after that, with
+    /// `</think>` quoted in the result. That file wrote no opener before the model's earlier turn
+    /// either (a system message came before it, and it opens the turn after user and developer
+    /// turns only), so the prompt holds none.
     const AGENT_LATER_TURN_PROMPT: &str = concat!(
         "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
         "<｜User｜>Fix the failing test.# Environment\n - Platform: linux\n",
@@ -628,8 +633,9 @@ mod tests {
         assert_eq!(reasoning(&events), thought);
         assert_eq!(content(&events), "");
         assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
-        // An earlier turn the template opened, then a user turn and a system note: the turn's end
-        // after the last opener says the prompt opens no turn for the model.
+        // The prompt the checkpoint's own encoder file writes, with the thoughts kept, for an
+        // earlier turn it opened, then a user turn and a system note: the turn's end after the
+        // last opener says the prompt opens no turn for the model.
         let prompt = concat!(
             "<｜User｜>u1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>",
             "<｜User｜>u2# Environment\n - Platform: linux"
@@ -1062,9 +1068,9 @@ mod tests {
     fn the_turn_after_a_tool_result_reads_the_opener_as_the_turns_start_does() {
         // The template renders a tool result as a block inside a user message and opens the
         // model's turn after it, `<｜Assistant｜>` with the thought opened (thinking) or closed
-        // (chat), or leaves the turn unopened when a system note follows the result; the blank
-        // line before a block is the opener's whether or not text came before it, so no mode and
-        // no start shows it as content.
+        // (chat), a trailing system note after the result included; only a latest reminder after
+        // such a note leaves the turn unopened; the blank line before a block is the opener's
+        // whether or not text came before it, so no mode and no start shows it as content.
         let result = concat!(
             "<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the weather.</think>\n\n",
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",

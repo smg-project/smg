@@ -24,16 +24,18 @@ logger = logging.getLogger(__name__)
 REASONING_EFFORT_TIERS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestReasoningEffortTiers:
     """Each tier reaches the model and yields output; an unknown tier is rejected."""
 
     @pytest.mark.parametrize("effort", REASONING_EFFORT_TIERS)
-    def test_tier_is_accepted(self, model, api_client, effort):
+    def test_tier_is_accepted(self, model, api_client, effort, mock_answers):
+        # On the mock: a reasoning turn and the answer, whatever the tier.
+        mock_answers.enqueue_harmony(analysis="12 times 12 is 144.", final="144")
         response = api_client.responses.create(
             model=model,
             input="What is 12 times 12? Reply with the number only.",
