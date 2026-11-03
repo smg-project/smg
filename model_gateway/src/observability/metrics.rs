@@ -1407,10 +1407,13 @@ impl ReuseAgeMax {
     /// The window's maximum, starting the next window: `None` when this tree
     /// never observed a reuse age, `Some(0)` when nothing since the last take.
     pub(crate) fn take(&self) -> Option<u64> {
-        let max_plus_one = self.max_plus_one.swap(0, Ordering::Relaxed);
-        self.seen
-            .load(Ordering::Relaxed)
-            .then(|| max_plus_one.saturating_sub(1))
+        // Check publication first: the initial observe may have updated the
+        // maximum but not yet set seen. Leave that value for the next scrape.
+        self.seen.load(Ordering::Relaxed).then(|| {
+            self.max_plus_one
+                .swap(0, Ordering::Relaxed)
+                .saturating_sub(1)
+        })
     }
 }
 
