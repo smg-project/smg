@@ -1641,8 +1641,8 @@ jobs:
     secrets: inherit
 
   # Initial local Responses API coverage on AMD, intentionally partial.
-  # The ten positive pytest paths name 21 authored method bodies in the frozen
-  # source; parametrized collection and current runtime qualification are separate.
+  # The positive pytest paths below target local Responses behavior.
+  # Parametrized collection and current runtime qualification are separate.
   # This is not the full SGLang Responses row or original38 index22 acceptance.
   # Keep the full NVIDIA/CPU/vendor/Oracle/MCP lanes above and below unchanged.
   # Default OFF. Review the exact caller/callee combination and shared-host
