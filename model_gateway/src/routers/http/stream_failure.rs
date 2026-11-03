@@ -63,6 +63,14 @@ pub(crate) struct UpstreamCut {
 }
 
 impl UpstreamCut {
+    /// A worker ended generation without a valid successful stream terminal.
+    pub(crate) fn protocol(reason: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            cause: reason.to_string(),
+        }
+    }
+
     /// The class and the cause of `error`.
     pub(crate) fn of(error: &reqwest::Error) -> Self {
         let status = if error.is_timeout() {
@@ -154,6 +162,12 @@ impl RelaySource {
             worker_type,
             backend,
         }
+    }
+
+    /// Only these OpenAI APIs require the completion sentinel; Messages,
+    /// Responses and native generate keep their own terminal protocols.
+    pub(crate) fn is_completion_route(&self) -> bool {
+        matches!(self.route, "/v1/chat/completions" | "/v1/completions")
     }
 
     /// The worker the response is read from.

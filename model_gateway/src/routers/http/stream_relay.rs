@@ -21,6 +21,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
 use super::stream_failure::{mark_head_success_recorded, note_sent, RelaySource, UpstreamCut};
+
+#[path = "completion_stream.rs"]
+mod completion_stream;
+pub(crate) use completion_stream::CompletionStreamHook;
+
 use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
@@ -34,6 +39,28 @@ use crate::{
 pub(crate) struct ChunkStep {
     pub(crate) bytes: Bytes,
     pub(crate) last: bool,
+    /// A backend generation failure, distinct from transport EOF or client cancellation.
+    pub(crate) failure: Option<&'static str>,
+}
+
+/// A streaming transform that can also validate the upstream's EOF. Closure
+/// hooks retain their previous behavior and have no EOF validation.
+pub(crate) trait ChunkHook: Send {
+    fn read(&mut self, bytes: Bytes) -> ChunkStep;
+
+    fn finish(&mut self) -> ChunkStep {
+        ChunkStep {
+            bytes: Bytes::new(),
+            last: false,
+            failure: None,
+        }
+    }
+}
+
+impl<F: FnMut(Bytes) -> ChunkStep + Send> ChunkHook for F {
+    fn read(&mut self, bytes: Bytes) -> ChunkStep {
+        self(bytes)
+    }
 }
 
 /// How the relay reads each upstream chunk: as it is; through the SSE
@@ -44,7 +71,7 @@ pub(crate) struct ChunkStep {
 pub(crate) enum ChunkMode {
     Plain,
     Rechunk(Box<SseRechunker<NoopObserver>>),
-    Hook(Box<dyn FnMut(Bytes) -> ChunkStep + Send>),
+    Hook(Box<dyn ChunkHook>),
 }
 
 impl ChunkMode {
@@ -60,10 +87,19 @@ impl ChunkMode {
     }
 
     /// The re-chunker's tail at the stream's end, or nothing.
-    fn finish(&mut self) -> Bytes {
+    fn finish(&mut self) -> ChunkStep {
         match self {
-            Self::Rechunk(rechunker) => rechunker.finish(),
-            Self::Plain | Self::Hook(_) => Bytes::new(),
+            Self::Rechunk(rechunker) => ChunkStep {
+                bytes: rechunker.finish(),
+                last: false,
+                failure: None,
+            },
+            Self::Plain => ChunkStep {
+                bytes: Bytes::new(),
+                last: false,
+                failure: None,
+            },
+            Self::Hook(hook) => hook.finish(),
         }
     }
 }
@@ -151,13 +187,10 @@ where
                             // h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
-                                let (bytes, last) = match &mut mode {
-                                    ChunkMode::Plain => (bytes, false),
-                                    ChunkMode::Rechunk(rechunker) => (rechunker.feed(bytes), false),
-                                    ChunkMode::Hook(read) => {
-                                        let step = read(bytes);
-                                        (step.bytes, step.last)
-                                    }
+                                let ChunkStep { bytes, last, failure } = match &mut mode {
+                                    ChunkMode::Plain => ChunkStep { bytes, last: false, failure: None },
+                                    ChunkMode::Rechunk(rechunker) => ChunkStep { bytes: rechunker.feed(bytes), last: false, failure: None },
+                                    ChunkMode::Hook(read) => read.read(bytes),
                                 };
                                 if !bytes.is_empty() {
                                     relayed += bytes.len() as u64;
@@ -165,6 +198,15 @@ where
                                     if tx.send(Ok(bytes)).await.is_err() {
                                         break;
                                     }
+                                }
+                                if let Some(reason) = failure {
+                                    if status.is_success() && upstream_sse {
+                                        let cut = UpstreamCut::protocol(reason);
+                                        source.account(&cut, relayed);
+                                        let event = source.error_event_on_its_own_frame(&cut, &sent_tail);
+                                        let _ = tx.send(Ok(event)).await;
+                                    }
+                                    break;
                                 }
                                 // The hook ended the stream (the decode side's
                                 // sentinel), or the observer did: its error
@@ -176,9 +218,10 @@ where
                             }
                             Some(Err(e)) => {
                                 let tail = mode.finish();
-                                if !tail.is_empty() {
-                                    note_sent(&mut sent_tail, &tail);
-                                    let _ = tx.send(Ok(tail)).await;
+                                if !tail.bytes.is_empty() {
+                                    relayed += tail.bytes.len() as u64;
+                                    note_sent(&mut sent_tail, &tail.bytes);
+                                    let _ = tx.send(Ok(tail.bytes)).await;
                                 }
                                 // The observer ended the stream on its tail: its
                                 // error event was the last frame. The cut stays the
@@ -211,9 +254,22 @@ where
                                 break;
                             }
                             None => {
+                                // A client cancellation is not an upstream
+                                // protocol failure, even if EOF is also ready.
+                                if tx.is_closed() { break; }
                                 let tail = mode.finish();
-                                if !tail.is_empty() {
-                                    let _ = tx.send(Ok(tail)).await;
+                                if !tail.bytes.is_empty() {
+                                    relayed += tail.bytes.len() as u64;
+                                    note_sent(&mut sent_tail, &tail.bytes);
+                                    if tx.send(Ok(tail.bytes)).await.is_err() { break; }
+                                }
+                                if let Some(reason) = tail.failure {
+                                    if status.is_success() && upstream_sse {
+                                        let cut = UpstreamCut::protocol(reason);
+                                        source.account(&cut, relayed);
+                                        let event = source.error_event_on_its_own_frame(&cut, &sent_tail);
+                                        let _ = tx.send(Ok(event)).await;
+                                    }
                                 }
                                 break;
                             }
@@ -264,7 +320,7 @@ mod tests {
     use futures_util::stream;
     use http_body_util::BodyExt;
 
-    use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
+    use super::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay};
     use crate::{
         routers::http::stream_failure::RelaySource,
         worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
@@ -316,9 +372,10 @@ mod tests {
             ]
         );
 
-        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+        let hook: Box<dyn ChunkHook> = Box::new(|bytes: Bytes| ChunkStep {
             last: bytes.as_ref() == b"data: [DONE]\n\n",
             bytes,
+            failure: None,
         });
         let hooked = frames_through(chunks, ChunkMode::Hook(hook)).await;
         assert_eq!(hooked, plain);
@@ -327,9 +384,10 @@ mod tests {
     /// The hook's `last` ends the relay: a chunk after it is not read.
     #[tokio::test]
     async fn the_hooks_last_chunk_ends_the_relay() {
-        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+        let hook: Box<dyn ChunkHook> = Box::new(|bytes: Bytes| ChunkStep {
             last: bytes.as_ref() == b"data: [DONE]\n\n",
             bytes,
+            failure: None,
         });
         let frames = frames_through(
             vec![b"data: a\n\n", b"data: [DONE]\n\n", b"data: after\n\n"],
