@@ -945,6 +945,28 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        # gpu_ids index the parent's HIP-visible list. Keep each selected
+        # entry in the unchanged ROCR namespace, including the parent's order.
+        # Only explicit overrides of both masks replace this assignment:
+        # a single override still needs the derived value for the other mask.
+        overrides_both_masks = (
+            self.extra_env is not None
+            and "HIP_VISIBLE_DEVICES" in self.extra_env
+            and "CUDA_VISIBLE_DEVICES" in self.extra_env
+        )
+        if env.get("HIP_VISIBLE_DEVICES") and not overrides_both_masks:
+            hip_devices = env["HIP_VISIBLE_DEVICES"].split(",")
+            if any(not device.strip() for device in hip_devices):
+                raise ValueError(
+                    f"HIP_VISIBLE_DEVICES={env['HIP_VISIBLE_DEVICES']!r} has an empty entry"
+                )
+            if any(i < 0 or i >= len(hip_devices) for i in self.gpu_ids):
+                raise ValueError(
+                    f"gpu_ids {self.gpu_ids} exceed the inherited "
+                    f"HIP_VISIBLE_DEVICES={env['HIP_VISIBLE_DEVICES']!r}"
+                )
+            env["HIP_VISIBLE_DEVICES"] = ",".join(hip_devices[i] for i in self.gpu_ids)
+            env["CUDA_VISIBLE_DEVICES"] = env["HIP_VISIBLE_DEVICES"]
         if self.engine == "vllm":
             # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
             # whose auto backend picks the MNNVL kernel wherever NVLink
