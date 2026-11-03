@@ -39,6 +39,7 @@ use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
     stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
+    tenant_rate_limit::{self, TenantCharge},
 };
 use crate::{
     config::types::RetryConfig,
@@ -49,6 +50,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -170,7 +172,6 @@ impl From<PrefillAcquireError<Box<PairFailure>>> for PdSelectionFailure {
     }
 }
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -179,6 +180,21 @@ pub struct PDRouter {
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
     moriio_dp_turn: AtomicUsize,
+    /// The tenant rate limiter, when configured: every route that charges a
+    /// tenant reserves through it before its first dispatch
+    /// (`tenant_rate_limit::reserve`).
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("retry_config", &self.retry_config)
+            .field("prefill_admission", &self.prefill_admission)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Who records the prefill side's outcome for an attempt: the attempt, from
@@ -434,6 +450,7 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
@@ -506,18 +523,29 @@ impl PDRouter {
 
     /// The bootstrap rendezvous for one request, generated once so both sides
     /// carry the same rooms: one value per prompt for a batch, scalars
-    /// otherwise.
+    /// otherwise. With a selected prefill DP rank on a worker of `dp_size > 1`,
+    /// every room is congruent to that rank; otherwise the rooms are free.
     fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
+        prefill_rank: Option<isize>,
     ) -> serde_json::Result<BootstrapFields> {
         let host = prefill_worker.bootstrap_host();
         let port = prefill_worker.bootstrap_port();
+        let room_rank = match (prefill_rank, prefill_worker.dp_size()) {
+            (Some(rank), Some(dp_size)) if dp_size > 1 => usize::try_from(rank)
+                .ok()
+                .filter(|&rank| rank < dp_size)
+                .map(|rank| (rank, dp_size)),
+            _ => None,
+        };
+        let room = || match room_rank {
+            Some((rank, dp_size)) => super::pd_types::generate_room_id_for_rank(rank, dp_size),
+            None => super::pd_types::generate_room_id(),
+        };
         match batch_size {
             Some(n) => {
-                let rooms: Vec<u64> = (0..n)
-                    .map(|_| super::pd_types::generate_room_id())
-                    .collect();
+                let rooms: Vec<u64> = (0..n).map(|_| room()).collect();
                 Ok(BootstrapFields {
                     host: to_raw_value(&vec![host; n])?,
                     port: to_raw_value(&vec![port; n])?,
@@ -527,7 +555,7 @@ impl PDRouter {
             None => Ok(BootstrapFields {
                 host: to_raw_value(host)?,
                 port: to_raw_value(&port)?,
-                room: to_raw_value(&super::pd_types::generate_room_id())?,
+                room: to_raw_value(&room())?,
             }),
         }
     }
@@ -565,10 +593,12 @@ impl PDRouter {
     }
 
     /// Every PD route: the routing derivatives and the request context from
-    /// the request, then the dual dispatch.
-    async fn route_pd<R: PdRoute + Serialize>(
+    /// the request, then the dual dispatch under the tenant's reservation
+    /// (`tenant_meta`: the routes that charge a tenant).
+    async fn route_pd<R: PdRoute + TenantCharge + Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         body: R,
         model_id: &str,
     ) -> Response {
@@ -594,13 +624,19 @@ impl PDRouter {
             model_id,
             headers: headers.cloned(),
         };
-        self.execute_dual_dispatch(headers, body, routing, context)
+        self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
     }
 
-    async fn execute_dual_dispatch<T: Serialize>(
+    /// The dual dispatch of one request, retried as the model's retry config
+    /// allows. With `tenant_meta` and the tenant rate limiter on, the request
+    /// reserves its estimate once, before any dispatch, and the one answer
+    /// the dispatch paths converge on resolves the reservation once
+    /// (`tenant_rate_limit`), as the regular HTTP router's typed route does.
+    async fn execute_dual_dispatch<T: TenantCharge + Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         original_request: T,
         routing: RoutingDerivatives,
         mut context: PDRequestContext<'_>,
@@ -608,6 +644,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        let is_stream = context.is_stream;
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not.
@@ -633,6 +670,18 @@ impl PDRouter {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // The estimate reads the body, not the routing text: a text-reading
+        // policy routes a completions batch on its first prompt alone
+        // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
+        let (reservation, denial) = tenant_rate_limit::reserve(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &original_request,
+            model,
+            None,
+        )
+        .await;
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -641,7 +690,9 @@ impl PDRouter {
             ReleasePoint::from_retry_config(retry_config),
         );
 
-        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+        let response = if let Some(denied) = denial {
+            denied
+        } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
@@ -689,6 +740,18 @@ impl PDRouter {
             )
             .await
         };
+
+        // The reservation resolves on the one answer both dispatch paths
+        // converge on. A buffered answer is the decode side's body, held
+        // whole already (read without a bound), so the re-read is unbounded.
+        let response = tenant_rate_limit::resolve(
+            reservation.as_ref(),
+            route,
+            is_stream,
+            response,
+            usize::MAX,
+        )
+        .await;
 
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
@@ -964,12 +1027,6 @@ impl PDRouter {
                 // The prefill and decode workers only know the canonical name, so
                 // forward that, not the alias the client sent.
                 body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
-                let bootstrap = Self::bootstrap_fields(prefill.as_ref(), context.batch_size)
-                    .map_err(serialization_error)?;
-                Self::inject_bootstrap(&mut body, bootstrap);
-
-                let mut prefill_body = body.clone();
-                let mut decode_body = body;
 
                 let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
                 let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
@@ -1000,6 +1057,14 @@ impl PDRouter {
                         decode_rank = Some(rank);
                     }
                 }
+
+                let bootstrap =
+                    Self::bootstrap_fields(prefill.as_ref(), context.batch_size, prefill_rank)
+                        .map_err(serialization_error)?;
+                Self::inject_bootstrap(&mut body, bootstrap);
+
+                let mut prefill_body = body.clone();
+                let mut decode_body = body;
 
                 if let Some(p_rank) = prefill_rank {
                     Self::inject_dp_rank(&mut prefill_body, p_rank, "routed_dp_rank")
@@ -2621,35 +2686,42 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, super::chat_for_upstream(body), model_id)
-            .await
+        self.route_pd(
+            headers,
+            Some(tenant_meta),
+            super::chat_for_upstream(body),
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_messages_count_tokens(
@@ -2789,21 +2861,23 @@ impl RouterTrait for PDRouter {
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_rerank(
@@ -2813,7 +2887,7 @@ impl RouterTrait for PDRouter {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, None, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -3043,6 +3117,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
+            rate_limit_manager: None,
         }
     }
 
@@ -3119,7 +3194,7 @@ mod tests {
 
         let bytes = serde_json::to_vec(&request).unwrap();
         let mut body = RawBody::parse(&bytes).unwrap();
-        let fields = PDRouter::bootstrap_fields(&prefill, None).unwrap();
+        let fields = PDRouter::bootstrap_fields(&prefill, None, None).unwrap();
         PDRouter::inject_bootstrap(&mut body, fields);
         let body: Value = serde_json::from_slice(&body.to_bytes(None).unwrap()).unwrap();
 
@@ -3721,6 +3796,69 @@ mod tests {
             assert_eq!(body["temperature"], json!(0.7));
             assert_eq!(body["top_p"], json!(0.95));
             assert!(body.get("bootstrap_room").is_some());
+        }
+    }
+
+    /// SGLang's prefill side, under its default `follow_bootstrap_room`
+    /// placement, fails a request whose `bootstrap_room % dp_size` is not the
+    /// rank it runs on, so every room of a request routed to a dp-aware
+    /// prefill worker is congruent to that worker's rank, single and batched.
+    #[tokio::test]
+    async fn the_room_is_congruent_to_the_dp_aware_prefill_rank() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .dp_config(3, 4)
+            .build();
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(prefill));
+        router
+            .worker_registry
+            .register_or_replace(Arc::from(create_test_worker(
+                decode_url,
+                WorkerType::Decode,
+                true,
+            )));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        for request in [
+            json!({"text": "hi"}),
+            json!({"input_ids": [[1, 2], [3, 4], [5, 6]]}),
+        ] {
+            for _ in 0..16 {
+                let request: GenerateRequest =
+                    serde_json::from_value(request.clone()).expect("valid generate request");
+                let response = router
+                    .route_generate(None, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        let prefill_seen = taken(&prefill_seen);
+        let decode_seen = taken(&decode_seen);
+        assert_eq!(prefill_seen.len(), 32);
+        assert_eq!(decode_seen.len(), 32);
+        for ((_, prefill_body), (_, decode_body)) in prefill_seen.iter().zip(&decode_seen) {
+            assert_eq!(
+                prefill_body["bootstrap_room"],
+                decode_body["bootstrap_room"]
+            );
+            let rooms: Vec<u64> = match &prefill_body["bootstrap_room"] {
+                Value::Array(rooms) => rooms.iter().map(|r| r.as_u64().unwrap()).collect(),
+                room => vec![room.as_u64().unwrap()],
+            };
+            for room in rooms {
+                assert!(room <= i64::MAX as u64 && room % 4 == 3, "{room}");
+            }
+            assert_eq!(prefill_body["routed_dp_rank"], json!(3));
+            assert_eq!(decode_body["disagg_prefill_dp_rank"], json!(3));
+            assert_eq!(decode_body.get("routed_dp_rank"), None);
         }
     }
 
@@ -5499,11 +5637,58 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_rooms_follow_the_prefill_rank_only_on_a_multi_rank_worker() {
+        let worker = |dp: Option<(usize, usize)>| {
+            let builder =
+                BasicWorkerBuilder::new("http://prefill:8000").worker_type(WorkerType::Prefill);
+            match dp {
+                Some((rank, size)) => builder.dp_config(rank, size),
+                None => builder,
+            }
+            .build()
+        };
+        let rooms = |worker: &dyn Worker, batch_size: Option<usize>, rank: Option<isize>| {
+            let fields = PDRouter::bootstrap_fields(worker, batch_size, rank).unwrap();
+            match serde_json::from_str::<Value>(fields.room.get()).unwrap() {
+                Value::Array(rooms) => rooms.iter().map(|r| r.as_u64().unwrap()).collect(),
+                room => vec![room.as_u64().unwrap()],
+            }
+        };
+        let in_range = |room: &u64| *room <= i64::MAX as u64;
+
+        let rank1_of_4 = worker(Some((1, 4)));
+        for batch_size in [None, Some(3)] {
+            for _ in 0..64 {
+                for room in rooms(&rank1_of_4, batch_size, Some(1)) {
+                    assert!(in_range(&room) && room % 4 == 1, "{room}");
+                }
+            }
+        }
+
+        // Without a selected rank, on a single-rank worker, on a worker with no
+        // DP size, or with a rank outside the worker's DP size, the room is free.
+        let rank0_of_1 = worker(Some((0, 1)));
+        let plain = worker(None);
+        for (worker, rank) in [
+            (&rank1_of_4, None),
+            (&rank0_of_1, Some(0)),
+            (&plain, Some(1)),
+            (&rank1_of_4, Some(4)),
+            (&rank1_of_4, Some(-1)),
+        ] {
+            let free: Vec<u64> = (0..64).flat_map(|_| rooms(worker, Some(2), rank)).collect();
+            assert!(free.iter().all(in_range));
+            let residues: std::collections::HashSet<u64> = free.iter().map(|r| r % 4).collect();
+            assert!(residues.len() > 1, "{rank:?}: {residues:?}");
+        }
+    }
+
+    #[test]
     fn bootstrap_and_rank_edits_match_the_value_pipeline_bytes() {
         let prefill =
             create_test_worker("http://prefill:8000".to_string(), WorkerType::Prefill, true);
         for batch_size in [None, Some(3)] {
-            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size).unwrap();
+            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size, None).unwrap();
             let as_value = |raw: &RawValue| serde_json::from_str::<Value>(raw.get()).unwrap();
             let (host, port, room) = (
                 as_value(&fields.host),
@@ -5756,7 +5941,7 @@ mod tests {
         };
 
         let response = router
-            .execute_dual_dispatch(None, request, RoutingDerivatives::default(), context)
+            .execute_dual_dispatch(None, None, request, RoutingDerivatives::default(), context)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);

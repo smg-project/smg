@@ -156,6 +156,7 @@ impl EngineProtocol for VllmProtocol {
                     .map(|ids| ids.into_iter().collect())
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(EngineLoad::from),
+                kv_transfer: batch.kv_transfer,
                 wave: None,
                 utility: None,
             }),

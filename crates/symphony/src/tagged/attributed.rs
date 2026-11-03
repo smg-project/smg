@@ -104,7 +104,7 @@ pub enum TagEnd {
 
 impl TagEnd {
     /// The bytes that end the tail.
-    fn text(self) -> &'static str {
+    pub(crate) fn text(self) -> &'static str {
         match self {
             Self::Angle => ">",
             Self::Marker(marker) => marker,

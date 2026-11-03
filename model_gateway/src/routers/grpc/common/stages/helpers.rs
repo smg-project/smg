@@ -578,9 +578,7 @@ pub(crate) fn restamp_plan_for_attempt(
 /// In PD mode the decode worker is authoritative because it produces visible
 /// output tokens. The resolved request is then sent through the existing PD
 /// flow unchanged.
-pub(crate) fn sampling_defaults_for_request(
-    workers: Option<&WorkerSelection>,
-) -> Option<SamplingDefaults> {
+fn sampling_defaults_for_request(workers: Option<&WorkerSelection>) -> Option<SamplingDefaults> {
     let worker = match workers? {
         WorkerSelection::Single { worker } => worker,
         WorkerSelection::Disaggregated { decode, .. } => decode,

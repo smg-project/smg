@@ -94,8 +94,9 @@
 //! in a state of its own has no start to choose.
 //!
 //! An **unopened row** names the state a turn starts in when the prompt opens no turn for the
-//! model. A template that writes the turn opener after a user message only (DeepSeek's) leaves
-//! the turn unopened when the conversation ends with a system message rendered in place, and the
+//! model. A template that writes the turn opener after some messages only (DeepSeek's: not after
+//! a system message a latest reminder follows; the checkpoint's own encoder file, after user and
+//! developer turns only) leaves the turn unopened when the conversation ends there, and the
 //! model starts its turn as its default has it: DeepSeek inside its thought. The prompt opens no
 //! turn when it holds no turn opener, or when the turn's end the row names (`<｜end▁of▁sentence｜>`)
 //! follows the last one: the turn it opened is over, and nothing opened the next. Nothing of such
@@ -666,9 +667,10 @@ impl Format {
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
     /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
     /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
-    /// DeepSeek's template writes the turn opener after a user message only, so a conversation
-    /// that ends with a system message rendered in place leaves the turn unopened, and the model,
-    /// which thinks unless told not to, starts inside its thought. Nothing of such a prompt is
+    /// DeepSeek's template writes no turn opener after a system message a latest reminder
+    /// follows (the checkpoint's own encoder file, after no system message at all), so such a
+    /// conversation leaves the turn unopened, and the model, which thinks unless told not to,
+    /// starts inside its thought. Nothing of such a prompt is
     /// replayed. The state must already be in the table; the table must name a turn opener.
     #[must_use]
     pub fn unopened_turn_starts_in(mut self, state: &str, turn_end: &str) -> Self {
@@ -964,8 +966,10 @@ impl Format {
             .collect()
     }
 
-    /// The turn opener, if the table names one.
-    pub(crate) fn turn_opener(&self) -> Option<&str> {
+    /// The turn opener, if the table names one: what the template writes before the model's turn.
+    /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
+    /// turn's start on it ([`Self::unopened_turn_starts_in`]).
+    pub fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
     }
 

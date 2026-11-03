@@ -8,8 +8,9 @@
 //! tags need a layout, how the model's chat template writes a turn: it is learned by rendering the
 //! compiler's probe conversation through the tokenizer's chat template ([`layout::learn`]); a
 //! template whose renderings give no layout still parses, and a forced call or a JSON answer then
-//! has no tag ([`super::constraint`](fn@super::constraint)). The vocabulary's added tokens, as the tokenizer lists them,
-//! are the markers the tags write as tokens ([`Format::marker_tokens`]).
+//! has no tag ([`constraint_for`](super::constraint::constraint_for)). The vocabulary's added
+//! tokens, as the tokenizer lists them, are the markers the tags write as tokens
+//! ([`Format::marker_tokens`]).
 //!
 //! A table is compiled once per model and tokenizer: a tokenizer registered anew under the model
 //! compiles again. What stops a compile is kept with the model and logged once, and is the reason
