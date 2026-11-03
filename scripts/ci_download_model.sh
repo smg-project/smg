@@ -65,7 +65,7 @@ download_model() {
              { exec 200<"$lock_file"; }; then
             echo "Using existing read-only lock for ${model_id}."
         else
-            echo "ERROR: Cannot open shared lock for ${model_id}" >&2
+            echo "ERROR: Cannot open shared lock for ${model_id}: ${lock_file}" >&2
             exit 1
         fi
         # Serialize downloads across pods sharing the same volume
