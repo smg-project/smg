@@ -2310,7 +2310,7 @@ jobs:
       gpu_tier: "2"
       # The existing four-GPU AMD runner pool also hosts this two-GPU suite.
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 || '4-gpu-mi300x' }}
-      timeout: 40
+      timeout: 50 # setup/cleanup margin; pytest remains the original 34 minutes
       test_timeout: 34
       test_dirs: e2e_test/router
       min_selected: 15

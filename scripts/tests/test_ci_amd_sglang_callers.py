@@ -17,7 +17,13 @@ TARGETS = {
     ),
     "e2e-2gpu-pd-amd": (
         "SMG_RUN_AMD_SGLANG_PD",
-        {"test_dirs": "e2e_test/router", "kv_backend": "mooncake", "min_selected": 15},
+        {
+            "test_dirs": "e2e_test/router",
+            "kv_backend": "mooncake",
+            "min_selected": 15,
+            "timeout": 50,
+            "test_timeout": 34,
+        },
     ),
 }
 assert "e2e-1gpu-chat-zmq-amd" in CALLER["jobs"]
