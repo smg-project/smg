@@ -22,6 +22,7 @@ use openai_protocol::{
         ToolChoiceValue, Usage,
     },
     completion::{CompletionStreamChoice, CompletionStreamResponse},
+    generate::GenerateFinishReason,
     messages::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
@@ -227,6 +228,60 @@ impl GenerateStreamUsage {
             handle.close_reserved_only().await;
         }
     }
+}
+
+/// What a generate stream keeps per choice: the choice's whole text so far
+/// (the `/generate` protocol's `text` is cumulative, so every event of the
+/// choice carries it) and the choice's id, formatted once.
+struct GenerateChoice {
+    text: String,
+    id: String,
+}
+
+impl GenerateChoice {
+    fn new(request_id: &str, index: u32) -> Self {
+        Self {
+            text: String::new(),
+            id: format!("{request_id}-{index}"),
+        }
+    }
+}
+
+/// One event of a generate stream, serialized from what the loop holds: the
+/// text and the ids are borrowed, not copied into a JSON tree per chunk (a
+/// 2,000-token answer at four characters a token copied about 16 MB per
+/// request that way). The fields are in the order the events always had.
+#[derive(Serialize)]
+struct GenerateEvent<'a> {
+    text: &'a str,
+    output_ids: &'a [u32],
+    meta_info: GenerateMetaInfo<'a>,
+    index: u32,
+}
+
+/// The `meta_info` of a generate event: the logprob fields on the stream that
+/// carries logprobs only (`null` there when it has none), `e2e_latency` on the
+/// finish event only, as the events always had them.
+#[derive(Serialize)]
+struct GenerateMetaInfo<'a> {
+    id: &'a str,
+    finish_reason: Option<GenerateFinishReason>,
+    prompt_tokens: u32,
+    weight_version: &'a str,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    logprobs: Option<GenerateLogprobs<'a>>,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    e2e_latency: Option<f64>,
+}
+
+/// The logprob fields of a generate event on the stream that carries them.
+#[derive(Serialize)]
+struct GenerateLogprobs<'a> {
+    input_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
+    output_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -690,7 +745,7 @@ impl StreamingProcessor {
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
-        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
+        let mut choices: HashMap<u32, GenerateChoice> = HashMap::new();
         let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
@@ -716,27 +771,31 @@ impl StreamingProcessor {
                         .unwrap_or_default();
 
                     // Accumulate text for this index
-                    let accumulated_text = accumulated_texts.entry(index).or_default();
-                    accumulated_text.push_str(&chunk_text);
+                    let choice = choices
+                        .entry(index)
+                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                    choice.text.push_str(&chunk_text);
 
-                    // Generate unique ID per index
-                    let index_id = format!("{}-{}", ctx.request_id, index);
-
-                    // Build streaming response chunk (SGLang format)
-                    let chunk_response = serde_json::json!({
-                        "text": accumulated_text.clone(),
-                        "output_ids": chunk.token_ids(),
-                        "meta_info": {
-                            "id": index_id,
-                            "finish_reason": null,
-                            "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": effective_weight_version(chunk.weight_version(), Some(ctx.weight_version.as_str())),
-                            "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens(),
-                            "reasoning_tokens": chunk.reasoning_tokens()
+                    // The streaming response chunk (the engine's own format)
+                    let chunk_response = GenerateEvent {
+                        text: &choice.text,
+                        output_ids: chunk.token_ids(),
+                        meta_info: GenerateMetaInfo {
+                            id: &choice.id,
+                            finish_reason: None,
+                            prompt_tokens: chunk.prompt_tokens(),
+                            weight_version: effective_weight_version(
+                                chunk.weight_version(),
+                                Some(ctx.weight_version.as_str()),
+                            ),
+                            logprobs: None,
+                            completion_tokens: current_completion_tokens,
+                            cached_tokens: chunk.cached_tokens(),
+                            reasoning_tokens: chunk.reasoning_tokens(),
+                            e2e_latency: None,
                         },
-                        "index": index
-                    });
+                        index,
+                    };
 
                     let sse_data = sse_encoder
                         .encode_data(&chunk_response)
@@ -747,28 +806,36 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = complete.index();
-                    let accumulated_text =
-                        accumulated_texts.get(&index).cloned().unwrap_or_default();
                     let completion_tokens = usage.record_complete(&complete);
-                    let index_id = format!("{}-{}", ctx.request_id, index);
+                    let choice = choices
+                        .entry(index)
+                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Send final chunk with finish_reason
-                    let finish_response = serde_json::json!({
-                        "text": accumulated_text,
-                        "output_ids": complete.output_ids()[complete.output_ids().len().saturating_sub(1)..].to_vec(),
-                        "meta_info": {
-                            "id": index_id,
-                            "finish_reason": utils::parse_finish_reason(complete.finish_reason(), complete.completion_tokens()),
-                            "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
-                            "completion_tokens": completion_tokens,
-                            "cached_tokens": complete.cached_tokens(),
-                            "reasoning_tokens": complete.reasoning_tokens(),
-                            "e2e_latency": e2e_latency
+                    let output_ids = complete.output_ids();
+                    let finish_response = GenerateEvent {
+                        text: &choice.text,
+                        output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
+                        meta_info: GenerateMetaInfo {
+                            id: &choice.id,
+                            finish_reason: Some(utils::parse_finish_reason(
+                                complete.finish_reason(),
+                                complete.completion_tokens(),
+                            )),
+                            prompt_tokens: complete.prompt_tokens(),
+                            weight_version: effective_weight_version(
+                                complete.weight_version(),
+                                Some(ctx.weight_version.as_str()),
+                            ),
+                            logprobs: None,
+                            completion_tokens,
+                            cached_tokens: complete.cached_tokens(),
+                            reasoning_tokens: complete.reasoning_tokens(),
+                            e2e_latency: Some(e2e_latency),
                         },
-                        "index": index
-                    });
+                        index,
+                    };
 
                     let sse_data = sse_encoder
                         .encode_data(&finish_response)
@@ -879,7 +946,7 @@ impl StreamingProcessor {
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
-        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
+        let mut choices: HashMap<u32, GenerateChoice> = HashMap::new();
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut usage = GenerateStreamUsage::default();
@@ -910,8 +977,10 @@ impl StreamingProcessor {
                         .unwrap_or_default();
 
                     // Accumulate text for this index
-                    let accumulated_text = accumulated_texts.entry(index).or_default();
-                    accumulated_text.push_str(&chunk_text);
+                    let choice = choices
+                        .entry(index)
+                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                    choice.text.push_str(&chunk_text);
 
                     // Handle output logprobs by the stream's chunk semantics:
                     // cumulative chunks replace, delta chunks accumulate.
@@ -932,30 +1001,33 @@ impl StreamingProcessor {
                         }
                     }
 
-                    // Generate unique ID per index
-                    let index_id = format!("{}-{}", ctx.request_id, index);
-
-                    // Build streaming response chunk with accumulated logprobs
+                    // The streaming response chunk with the accumulated logprobs
                     let current_output_logprobs = accumulated_output_logprobs
                         .get(&index)
-                        .and_then(|o| o.as_ref());
+                        .and_then(|o| o.as_deref());
 
-                    let chunk_response = json!({
-                        "text": accumulated_text.clone(),
-                        "output_ids": chunk.token_ids(),
-                        "meta_info": {
-                            "id": index_id,
-                            "finish_reason": null,
-                            "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": effective_weight_version(chunk.weight_version(), Some(ctx.weight_version.as_str())),
-                            "input_token_logprobs": input_token_logprobs.as_ref(),
-                            "output_token_logprobs": current_output_logprobs,
-                            "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens(),
-                            "reasoning_tokens": chunk.reasoning_tokens()
+                    let chunk_response = GenerateEvent {
+                        text: &choice.text,
+                        output_ids: chunk.token_ids(),
+                        meta_info: GenerateMetaInfo {
+                            id: &choice.id,
+                            finish_reason: None,
+                            prompt_tokens: chunk.prompt_tokens(),
+                            weight_version: effective_weight_version(
+                                chunk.weight_version(),
+                                Some(ctx.weight_version.as_str()),
+                            ),
+                            logprobs: Some(GenerateLogprobs {
+                                input_token_logprobs: input_token_logprobs.as_deref(),
+                                output_token_logprobs: current_output_logprobs,
+                            }),
+                            completion_tokens: current_completion_tokens,
+                            cached_tokens: chunk.cached_tokens(),
+                            reasoning_tokens: chunk.reasoning_tokens(),
+                            e2e_latency: None,
                         },
-                        "index": index
-                    });
+                        index,
+                    };
 
                     let sse_data = sse_encoder
                         .encode_data(&chunk_response)
@@ -966,15 +1038,13 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = complete.index();
-                    let accumulated_text =
-                        accumulated_texts.get(&index).cloned().unwrap_or_default();
-
                     let completion_tokens = usage.record_complete(&complete);
-
+                    let choice = choices
+                        .entry(index)
+                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
                     let final_output_logprobs = accumulated_output_logprobs
                         .get(&index)
-                        .and_then(|o| o.as_ref());
-                    let index_id = format!("{}-{}", ctx.request_id, index);
+                        .and_then(|o| o.as_deref());
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Parse finish_reason
@@ -984,23 +1054,29 @@ impl StreamingProcessor {
                     );
 
                     // Send final chunk with finish_reason
-                    let finish_response = json!({
-                        "text": accumulated_text,
-                        "output_ids": complete.output_ids()[complete.output_ids().len().saturating_sub(1)..].to_vec(),
-                        "meta_info": {
-                            "id": index_id,
-                            "finish_reason": finish_reason,
-                            "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
-                            "input_token_logprobs": input_token_logprobs.as_ref(),
-                            "output_token_logprobs": final_output_logprobs,
-                            "completion_tokens": completion_tokens,
-                            "cached_tokens": complete.cached_tokens(),
-                            "reasoning_tokens": complete.reasoning_tokens(),
-                            "e2e_latency": e2e_latency
+                    let output_ids = complete.output_ids();
+                    let finish_response = GenerateEvent {
+                        text: &choice.text,
+                        output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
+                        meta_info: GenerateMetaInfo {
+                            id: &choice.id,
+                            finish_reason: Some(finish_reason),
+                            prompt_tokens: complete.prompt_tokens(),
+                            weight_version: effective_weight_version(
+                                complete.weight_version(),
+                                Some(ctx.weight_version.as_str()),
+                            ),
+                            logprobs: Some(GenerateLogprobs {
+                                input_token_logprobs: input_token_logprobs.as_deref(),
+                                output_token_logprobs: final_output_logprobs,
+                            }),
+                            completion_tokens,
+                            cached_tokens: complete.cached_tokens(),
+                            reasoning_tokens: complete.reasoning_tokens(),
+                            e2e_latency: Some(e2e_latency),
                         },
-                        "index": index
-                    });
+                        index,
+                    };
 
                     let sse_data = sse_encoder
                         .encode_data(&finish_response)
