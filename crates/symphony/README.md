@@ -204,6 +204,9 @@ records it: SMG's CI runs the fixture test on every change to the crate against 
 commit pinned in `.github/versions/bellwether.ref`, which holds the hand-written sets only, so CI
 guards a ready group's set once the pin moves to a commit that holds it. **Replaying the set**
 means the table is on main and bellwether's `main` holds the set, and that run has not finished.
+A group bellwether recorded under another checkpoint's slug, because that checkpoint shares its
+tokenizer, template and generation config (the group's manifest names it), replays that recording
+under its own row.
 **Awaiting fixtures** means the table is on main and bellwether has not recorded the group's set
 yet; every such table was previewed against bellwether's scale run of 2026-10-06 with no
 difference. **Pending** means no table yet.
@@ -232,8 +235,8 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-224 groups, 396 checkpoints, newest first.
-12 ready, 156 replaying a recorded set, 7 on main awaiting fixtures, 49 pending.
+224 groups, 397 checkpoints, newest first.
+12 ready, 157 replaying a recorded set, 6 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -284,7 +287,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-05-01 | [apertus-v1.1-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-v1.1-4b-instruct) | swiss-ai/Apertus-v1.1-4B-Instruct | Apertus-v1.1-0.5B-Instruct, Apertus-v1.1-1.5B-Instruct | — | 184,972 | pending | none |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 | MiMo-V2.5-Base | `qwen3`, tagged calls, the value between the tags | 589,278 | replaying the set | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 490,452 | replaying the set | none |
-| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash |  | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
+| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash | DeepSeek-V4-Pro | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-19 | [bar-2x7b-base](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-base) | allenai/BAR-2x7B-Base |  | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-code](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-code) | allenai/BAR-2x7B-Code | BAR-2x7B-Code-SFT, BAR-2x7B-Safety, BAR-2x7B-Tool-Use, BAR-5x7B | — | 328,662 | pending | none |
@@ -457,7 +460,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2024-09-18 | [llama-3.2-11b-vision-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-11b-vision-instruct) | meta-llama/Llama-3.2-11B-Vision-Instruct | Llama-3.2-90B-Vision-Instruct | `json` | 458,203 | replaying the set | `llama`, none |
 | 2024-09-18 | [llama-3.2-1b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-1b-instruct) | meta-llama/Llama-3.2-1B-Instruct | Llama-3.2-3B-Instruct | `json` | 458,185 | replaying the set | `llama`, none |
 | 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
-| 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct, Meta-Llama-3.1-8B-Instruct, Meta-Llama-3.1-70B-Instruct, Meta-Llama-3.1-405B-Instruct | `json` | — | awaiting fixtures | `json`, none |
+| 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct, Meta-Llama-3.1-8B-Instruct, Meta-Llama-3.1-70B-Instruct, Meta-Llama-3.1-405B-Instruct | `json` | 458,185 | replaying the set | `json`, none |
 | 2024-05-22 | [mistral-7b-instruct-v0.3](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-7b-instruct-v0.3) | mistralai/Mistral-7B-Instruct-v0.3 |  | `mistral` | — | awaiting fixtures | `mistral`, none |
 | 2023-12-30 | [tinyllama-1.1b-chat-v1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/tinyllama-1.1b-chat-v1.0) | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |  | `plain` | 27,865 | ready | `json`, none |
 | 2023-12-05 | [llava-1.5-7b-hf](https://github.com/smg-project/bellwether/tree/main/fixtures/llava-1.5-7b-hf) | llava-hf/llava-1.5-7b-hf |  | — | — | pending | none |

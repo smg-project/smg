@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
     },
     time::{Duration, Instant},
 };
@@ -245,6 +245,122 @@ fn generate_request(id: &str, stream: bool, stop: Vec<String>) -> vllm::Generate
         }),
         stream,
         ..Default::default()
+    }
+}
+
+/// The request line logged for every `Generate` spells the Python servicer's
+/// words, so a reader of the worker's log (the PD media placement, the rank
+/// pin) serves both servicers: the input kind by its field name, Python
+/// booleans, `None` for an unpinned request, `preprocessed_mm` true only for
+/// a batch that carries pixels or model-specific tensors (a bare identity
+/// payload of hashes alone reads false; a PD decode side built from the
+/// prefill's identity carries its grid tensors and reads true), the count of
+/// worker-side media references.
+#[test]
+fn the_request_line_spells_the_python_servicers_words() {
+    let mut req = generate_request("r-1", true, Vec::new());
+    assert_eq!(
+        generate::request_line(&req),
+        "Generate request r-1: input_type=tokenized, stream=True, preprocessed_mm=False, \
+         media_refs=0, dp_rank=None"
+    );
+    req.stream = false;
+    req.data_parallel_rank = Some(1);
+    req.media_refs = Some(vllm::MediaRefs {
+        items: vec![
+            vllm::MediaRef {
+                modality: common::Modality::Image as i32,
+                url: "https://example.test/a.jpg".to_string(),
+            },
+            vllm::MediaRef {
+                modality: common::Modality::Video as i32,
+                url: "https://example.test/b.mp4".to_string(),
+            },
+        ],
+    });
+    assert_eq!(
+        generate::request_line(&req),
+        "Generate request r-1: input_type=tokenized, stream=False, preprocessed_mm=False, \
+         media_refs=2, dp_rank=1"
+    );
+    // An identity payload (hashes only) is not a preprocessed batch; pixels or
+    // model-specific tensors in any batch are.
+    req.media_refs = None;
+    req.mm_inputs = Some(vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string()],
+        ..Default::default()
+    });
+    assert!(generate::request_line(&req).contains("preprocessed_mm=False, media_refs=0"));
+    req.extra_mm_inputs = vec![vllm::MultimodalInputs {
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            vllm::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    }];
+    assert!(generate::request_line(&req).contains("preprocessed_mm=True, media_refs=0"));
+    req.input = Some(vllm::generate_request::Input::Text("hello".to_string()));
+    assert!(generate::request_line(&req).starts_with("Generate request r-1: input_type=text,"));
+    req.input = None;
+    assert!(generate::request_line(&req).starts_with("Generate request r-1: input_type=None,"));
+}
+
+/// The line is a DEBUG event under its own target, so a worker-log reader
+/// raises that target alone and the production filter never pays for the
+/// formatting: a subscriber at DEBUG receives the line under the target, a
+/// subscriber at INFO receives nothing.
+#[test]
+fn the_request_line_is_a_debug_event_under_its_own_target() {
+    fn captured(level: tracing::Level) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(move || LockedBuffer(Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            generate::log_request_line(&generate_request("r-dbg", true, Vec::new()));
+        });
+        let bytes = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    let at_debug = captured(tracing::Level::DEBUG);
+    assert!(at_debug.contains("DEBUG"), "{at_debug}");
+    assert!(
+        at_debug.contains(generate::REQUEST_LINE_TARGET),
+        "{at_debug}"
+    );
+    assert!(
+        at_debug.contains(
+            "Generate request r-dbg: input_type=tokenized, stream=True, preprocessed_mm=False, \
+             media_refs=0, dp_rank=None"
+        ),
+        "{at_debug}"
+    );
+    assert_eq!(captured(tracing::Level::INFO), "");
+}
+
+/// A `MakeWriter` over a shared buffer for the subscriber a test installs.
+struct LockedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LockedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

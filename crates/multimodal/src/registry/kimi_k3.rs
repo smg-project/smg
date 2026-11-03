@@ -5,7 +5,8 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
-        MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        kimi_k25::MEDIA_PAD_TOKEN, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
@@ -65,7 +66,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|media_pad|>".to_string())
+        Ok(MEDIA_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {

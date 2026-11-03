@@ -746,7 +746,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "deepseek-v4-flash",
         model: "deepseek-ai/DeepSeek-V4-Flash",
-        also: &[],
+        also: &["DeepSeek-V4-Pro"],
         released: "2026-04-22",
         smg: (Some("deepseek_v4"), Some("deepseek_v4")),
         table: Some(Table::DeepSeekV4),
@@ -1389,8 +1389,8 @@ const GROUPS: &[Group] = &[
         released: "2024-07-18",
         smg: (Some("json"), None),
         table: Some(Table::Json),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(458_185),
+        status: Status::Replaying,
     },
     Group {
         slug: "llama-3.1-nemotron-8b-ultralong-1m-instruct",

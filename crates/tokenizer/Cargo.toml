@@ -62,12 +62,17 @@ tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = tr
     "wordlevel",
     "unicode-scripts",
 ] }
-unicode-normalization = "0.1"
+# The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
+# the same text (a newer crate's tables know marks and compositions the library's do not).
+unicode-normalization-alignments = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+# The hub tests build the Hub's answers to a file request: http for the response, the reqwest hf-hub binds for the error.
+http.workspace = true
+reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).

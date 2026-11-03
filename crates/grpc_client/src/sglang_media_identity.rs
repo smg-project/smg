@@ -11,15 +11,16 @@ const MAX_IDENTITY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Recognize reference-only inputs without raw media or processor tensors.
 pub fn has_media_refs(req: &GenerateRequest) -> bool {
-    req.mm_inputs.as_ref().is_some_and(|mm| {
-        mm.pixel_values.is_none()
-            && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
-            && mm.audio_urls.is_empty()
-            && mm.image_data.is_empty()
-            && mm.video_data.is_empty()
-            && mm.audio_data.is_empty()
-            && mm.model_specific_tensors.is_empty()
-    })
+    req.extra_mm_inputs.is_empty()
+        && req.mm_inputs.as_ref().is_some_and(|mm| {
+            mm.pixel_values.is_none()
+                && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+                && mm.audio_urls.is_empty()
+                && mm.image_data.is_empty()
+                && mm.video_data.is_empty()
+                && mm.audio_data.is_empty()
+                && mm.model_specific_tensors.is_empty()
+        })
 }
 
 /// Bind to the original prompt, ordered media references and KV rendezvous.
@@ -48,6 +49,10 @@ pub fn request_digest(req: &GenerateRequest) -> Vec<u8> {
 /// Limit reuse to tokenized, single-choice PD requests with immutable media references.
 pub fn reusable_request(req: &GenerateRequest) -> bool {
     has_media_refs(req)
+        && req
+            .mm_inputs
+            .as_ref()
+            .is_some_and(|mm| mm.image_urls.is_empty() || mm.video_urls.is_empty())
         && req
             .tokenized
             .as_ref()
@@ -148,6 +153,21 @@ mod tests {
     use crate::sglang_proto::{
         DisaggregatedParams, PlaceholderRange, SamplingParams, TensorData, TokenizedInput,
     };
+
+    #[test]
+    /// Mixed references must fall back to processing on both PD sides.
+    fn mixed_media_declines_identity_reuse_but_retains_references() {
+        let (mut req, mut identity) = fixture();
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .video_urls
+            .push("https://example.test/v.mp4".into());
+        assert!(has_media_refs(&req));
+        assert!(!reusable_request(&req));
+        identity.request_digest = request_digest(&req);
+        assert!(!validate(&identity, &req, &identity.processor_key));
+    }
 
     /// Construct a minimal bound image identity with valid placeholders and grid bytes.
     fn fixture() -> (GenerateRequest, MediaIdentity) {

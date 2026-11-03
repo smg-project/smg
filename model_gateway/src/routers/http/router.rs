@@ -71,14 +71,13 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
-            rate_limit_cell::RateLimitCell,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
+                is_request_timeout, is_retryable_response, is_retryable_status,
                 request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, SseRechunker},
@@ -98,7 +97,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge},
+            tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
@@ -508,8 +507,9 @@ impl Router {
         response
     }
 
-    /// The routing inputs of a typed request, derived once before the lease
-    /// takes it: the token ids when the request or a valid hint carries them
+    /// The routing inputs of a request, derived once (for a typed request,
+    /// before the lease takes it): the token ids when the request or a valid
+    /// hint carries them
     /// (the text rendering only when neither does), the request-id key and
     /// the cache namespace.
     fn routing_derivatives<T: GenerationRequest>(
@@ -542,9 +542,10 @@ impl Router {
         }
     }
 
-    /// The start of a typed route: the request counted under the metric
-    /// label of its canonical model and the route's endpoint label, which the
-    /// returned finalizers of its router metrics carry to every exit.
+    /// The start of a route (the typed route and the multipart transcription
+    /// route): the request counted under the metric label of its canonical
+    /// model and the route's endpoint label, which the returned finalizers of
+    /// its router metrics carry to every exit.
     fn begin_route<'a>(
         &self,
         route: &'static str,
@@ -571,31 +572,24 @@ impl Router {
 
     /// Reserve the tenant's estimate once per logical request, before any
     /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation
-    /// (with the request's samples per prompt, for the resolve) or the
-    /// denial, which is the request's answer, never retried; `(None, None)`
-    /// for a request outside the limiter.
+    /// the rate limiter on and a tenant to charge, either the reservation or
+    /// the denial, which is the request's answer, never retried; `(None,
+    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`).
     async fn reserve_tenant_estimate<T: TenantCharge>(
         &self,
         tenant_meta: Option<&TenantRequestMeta>,
         typed_req: &T,
         model_id: &str,
         routing_text: Option<&str>,
-    ) -> (Option<(RateLimitCell, u32)>, Option<Response>) {
-        match (&self.rate_limit_manager, tenant_meta) {
-            (Some(manager), Some(tenant_meta)) => {
-                let cell = RateLimitCell::new();
-                let estimate = typed_req.estimated_input_tokens(routing_text);
-                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
-                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
-                    Err(mut denied) => {
-                        mark_non_retryable(&mut denied);
-                        (None, Some(denied))
-                    }
-                }
-            }
-            _ => (None, None),
-        }
+    ) -> (Option<TenantReservation>, Option<Response>) {
+        tenant_rate_limit::reserve(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            typed_req,
+            model_id,
+            routing_text,
+        )
+        .await
     }
 
     /// The one dispatch of a request with retries disabled: the lease frees
@@ -669,25 +663,19 @@ impl Router {
     /// estimate. An answer outside the limiter passes through.
     async fn resolve_tenant_reservation(
         &self,
-        reservation: Option<&(RateLimitCell, u32)>,
+        reservation: Option<&TenantReservation>,
         route: &'static str,
         is_stream: bool,
         response: Response,
     ) -> Response {
-        match reservation {
-            Some((cell, samples_per_prompt)) => {
-                tenant_rate_limit::resolve(
-                    cell,
-                    route,
-                    *samples_per_prompt,
-                    is_stream,
-                    response,
-                    self.max_payload_size,
-                )
-                .await
-            }
-            None => response,
-        }
+        tenant_rate_limit::resolve(
+            reservation,
+            route,
+            is_stream,
+            response,
+            self.max_payload_size,
+        )
+        .await
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
@@ -1126,8 +1114,13 @@ impl Router {
     }
 
     /// Forward an audio transcription request to an audio-capable worker as
-    /// `multipart/form-data`. Separate from `route_typed_request` because the
-    /// endpoint is not JSON-bodied.
+    /// `multipart/form-data`, as the sequence of its stages: the prologue it
+    /// shares with `route_typed_request` (the routing derivatives, the
+    /// canonical model, the request counted under its labels), the worker and
+    /// its dispatch-time overload re-check, the form's send and the relay of
+    /// the worker's answer. Separate from `route_typed_request` because the
+    /// endpoint is not JSON-bodied: the form is sent once (no retry could
+    /// replay it) and never passes through `prepare_request`.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1138,53 +1131,104 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.is_stream();
-        // A valid x-smg-routing-tokens hint wins over body-derived text.
-        let hinted_tokens = header_utils::parse_routing_tokens_hint(headers);
-        let text = hinted_tokens
-            .is_none()
-            .then(|| body.extract_text_for_routing());
+        let routing = self.routing_derivatives(headers, body);
         // Resolve once, here, for the same reason as `route_typed_request`:
         // only `get_by_model` understands aliases, so the policy and hash ring
         // lookups below would silently fall back to router defaults on an
-        // alias. This path cannot reuse that resolution because multipart
-        // never goes through `route_typed_request`.
+        // alias.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let model_label = self.worker_registry.metric_model_label(model_id);
-        let endpoint = route_to_endpoint(route);
-
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_label,
-            endpoint,
-            bool_to_static_str(is_stream),
-        );
-
         // The finalizers of the request's router metrics: one runs at every
         // exit below.
-        let outcome = RouteOutcome {
-            model_label: Cow::Borrowed(model_label),
-            endpoint,
+        let outcome = self.begin_route(route, model_id, is_stream);
+
+        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
+            Ok(worker) => worker,
+            Err(refusal) => {
+                outcome.pre_send_error(&refusal);
+                return refusal;
+            }
         };
 
-        // Multipart transcription can't route through `worker.prepare_request`,
-        // which is the hook that injects `data_parallel_rank` for DP-aware
-        // workers. Pre-filter DP-aware workers out of the candidate pool so
-        // the policy can pick a non-DP worker when one exists; only fall back
-        // to model_not_found / 400 when every candidate is DP-aware.
+        // Same dispatch-time re-check the regular path takes. A transcription
+        // occupies its worker for far longer than a chat completion, so a
+        // report landing in the selection→dispatch window is the one case where
+        // dispatching anyway is measurably worse.
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            outcome.pre_send_error(&resp);
+            return resp;
+        }
+
+        // Streamed requests have no rid; the header is the whole sticky key.
+        let load_guard = WorkerLoadGuard::with_key(
+            worker.clone(),
+            self.policy_registry.sticky_header_key(headers),
+        );
+
+        let res = match Self::send_transcription(
+            headers,
+            body,
+            audio,
+            worker.as_ref(),
+            route,
+            canonical_model.as_deref(),
+            &outcome,
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(response) => return response,
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
+
+        events::RequestReceivedEvent {}.emit();
+
+        if is_stream {
+            relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
+        } else {
+            buffer_transcription_response(
+                res,
+                status,
+                worker.as_ref(),
+                self.max_payload_size,
+                &outcome,
+                start,
+            )
+            .await
+        }
+    }
+
+    /// The worker of a transcription, or the refusal this router answers.
+    /// Multipart transcription can't route through `worker.prepare_request`,
+    /// which is the hook that injects `data_parallel_rank` for DP-aware
+    /// workers: DP-aware workers are pre-filtered out of the candidate pool
+    /// so the policy can pick a non-DP worker when one exists, and the
+    /// request falls back to model_not_found / 400 only when the pool is
+    /// empty or every candidate is DP-aware. The verdict on a policy that
+    /// returns no worker is judged from the same pool.
+    fn select_transcription_worker(
+        &self,
+        headers: Option<&HeaderMap>,
+        model_id: &str,
+        routing: &RoutingDerivatives,
+    ) -> Result<Arc<dyn Worker>, Response> {
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
-            let resp = self.report_refusal(
+            return Err(self.report_refusal(
                 "Router::route_multipart_transcription",
                 model_id,
                 error::model_not_found(model_id),
-            );
-            outcome.pre_send_error(&resp);
-            return resp;
+            ));
         }
         let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
             .iter()
@@ -1192,12 +1236,10 @@ impl Router {
             .cloned()
             .collect();
         if non_dp_workers.is_empty() {
-            let resp = error::bad_request(
+            return Err(error::bad_request(
                 "dp_aware_not_supported",
                 "/v1/audio/transcriptions does not yet support DP-aware workers",
-            );
-            outcome.pre_send_error(&resp);
-            return resp;
+            ));
         }
         let Some(worker) = placement::select_from(
             &self.worker_registry,
@@ -1205,11 +1247,11 @@ impl Router {
             model_id,
             &non_dp_workers,
             PlacementInputs {
-                text: text.as_deref(),
-                tokens: hinted_tokens.as_deref(),
+                text: routing.text.as_deref(),
+                tokens: routing.tokens.as_deref(),
                 headers,
-                rid_key: None,
-                cache_namespace: None,
+                rid_key: routing.rid_key.as_deref(),
+                cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
             },
@@ -1238,30 +1280,29 @@ impl Router {
                     placement::no_available_workers(message)
                 }
             };
-            let resp = self.report_refusal("Router::route_multipart_transcription", model_id, resp);
-            outcome.pre_send_error(&resp);
-            return resp;
+            return Err(self.report_refusal(
+                "Router::route_multipart_transcription",
+                model_id,
+                resp,
+            ));
         };
+        Ok(worker)
+    }
 
-        // Same dispatch-time re-check the regular path takes. A transcription
-        // occupies its worker for far longer than a chat completion, so a
-        // report landing in the selection→dispatch window is the one case where
-        // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(
-            worker.as_ref(),
-            model_id,
-            self.worker_registry.overload_shed_enabled(),
-        ) {
-            outcome.pre_send_error(&resp);
-            return resp;
-        }
-
-        // Streamed requests have no rid; the header is the whole sticky key.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(headers),
-        );
-
+    /// The send of a transcription to its worker: the trace headers, the
+    /// request-sent event, the multipart form, the forwarded headers and the
+    /// one send (the form's streamed body cannot be cloned, so the
+    /// stale-connection retry never fires). A form the request cannot
+    /// build or a send that fails is the finalized error answer.
+    async fn send_transcription(
+        headers: Option<&HeaderMap>,
+        body: &TranscriptionRequest,
+        audio: AudioFile,
+        worker: &dyn Worker,
+        route: &'static str,
+        canonical_model: Option<&str>,
+        outcome: &RouteOutcome<'_>,
+    ) -> Result<reqwest::Response, Response> {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -1271,12 +1312,12 @@ impl Router {
         }
         .emit();
 
-        let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
+        let form = match build_transcription_form(body, audio, canonical_model) {
             Ok(f) => f,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
                 outcome.pre_send_error(&resp);
-                return resp;
+                return Err(resp);
             }
         };
 
@@ -1292,8 +1333,8 @@ impl Router {
         );
 
         Metrics::record_worker_request(worker.url(), worker.model_id());
-        let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+        match send_with_stale_conn_retry(request_builder).await {
+            Ok(res) => Ok(res),
             Err(e) => {
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
@@ -1302,30 +1343,9 @@ impl Router {
                     cause(&e)
                 );
                 let err_resp = convert_reqwest_error(e);
-                outcome.send_failure(worker.as_ref(), &err_resp);
-                return err_resp;
+                outcome.send_failure(worker, &err_resp);
+                Err(err_resp)
             }
-        };
-
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
-
-        events::RequestReceivedEvent {}.emit();
-
-        if is_stream {
-            relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
-        } else {
-            buffer_transcription_response(
-                res,
-                status,
-                worker.as_ref(),
-                self.max_payload_size,
-                &outcome,
-                start,
-            )
-            .await
         }
     }
 
@@ -1757,8 +1777,8 @@ fn build_transcription_form(
 /// The terminal accounting of one HTTP route: the labels its router
 /// metrics carry and the finalizers that write them, one per way the
 /// request ends. `Router::begin_route` builds it for the typed route,
-/// which ends through `answered_typed`; the multipart transcription
-/// route builds it after the same prologue.
+/// which ends through `answered_typed`, and for the multipart
+/// transcription route, which ends through `answered` and `answered_as`.
 struct RouteOutcome<'a> {
     model_label: Cow<'a, str>,
     endpoint: &'static str,

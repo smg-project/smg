@@ -17,15 +17,16 @@ pub use super::deepseek_common::DsEncodingError;
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
-// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
-// tools template are the V4.1 renderer's too, apart from the tag strings; see
-// `deepseek_common` for the shared implementation and its own doc comments.
+// The message read, message-shape preprocessing, drop-thinking, DSML argument
+// rendering, the tools template and the tools-and-response-format section are
+// the V4.1 renderer's too, apart from the tag strings; see `deepseek_common`
+// for the shared implementation and its own doc comments.
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        find_last_user_index, merge_tool_messages, render_v4_tools_template,
-        sort_tool_results_by_call_order, task_sp_token, to_json, tool_calls_from_openai_format,
-        tool_schemas, tools_from_openai_format, DsmlTags,
+        find_last_user_index, merge_tool_messages, push_tools_and_response_format,
+        render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, to_json,
+        tool_schemas, DsmlTags, Turn,
     },
     RendererProfile,
 };
@@ -141,8 +142,8 @@ fn render_tools(tools: &[Value]) -> String {
 
 // ---------------------------------------------------------------------------
 // render_message — direct port of the V4 Python function with the same name:
-// the message read into its parts, one function per role for the arms of its
-// `match role`, and the turn opener after it.
+// the message read into its parts (the family's `Turn`), one function per
+// role for the arms of its `match role`, and the turn opener after it.
 // ---------------------------------------------------------------------------
 fn render_message(
     index: usize,
@@ -151,34 +152,15 @@ fn render_message(
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<String, DsEncodingError> {
-    if index >= messages.len() {
+    let Some(msg) = messages.get(index) else {
         return Err(DsEncodingError::IndexOutOfRange {
             index,
             len: messages.len(),
         });
-    }
-    let mut prompt = String::new();
-    let msg = &messages[index];
+    };
+    let turn = Turn::read(index, msg);
     let last_user_idx = find_last_user_index(messages);
-
-    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let tools_raw = msg.get("tools").and_then(|v| v.as_array());
-    let response_format = msg.get("response_format");
-    let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
-    // The gateway's protocol takes the `reasoning` spelling as an alias of
-    // `reasoning_content`, so a history assistant's reasoning renders under
-    // either spelling for every renderer: a superset of the serving engine,
-    // whose copy of this encoder reads `reasoning` alone.
-    let reasoning_content = msg
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let wo_eos = msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false);
-    let tools_owned = tools_raw.map(|t| tools_from_openai_format(t));
-    let tools = tools_owned.as_deref();
-    let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
-    let tool_calls = tool_calls_owned.as_deref();
+    let mut prompt = String::new();
 
     // Reasoning effort prefix: index 0, thinking mode only, the table the
     // engine's copy of the encoder renders for every V4 checkpoint.
@@ -190,21 +172,21 @@ fn render_message(
         }
     }
 
-    match role {
-        "system" => render_system(&mut prompt, content, tools, response_format),
+    match turn.role {
+        "system" => render_system(&mut prompt, &turn),
         "developer" => {
-            if content.is_empty() {
+            if turn.content.is_empty() {
                 return Err(DsEncodingError::InvalidMessage {
-                    role: role.to_string(),
-                    msg: msg.to_string(),
+                    role: turn.role.to_string(),
+                    msg: turn.msg.to_string(),
                 });
             }
-            render_developer(&mut prompt, content, tools, response_format);
+            render_developer(&mut prompt, &turn);
         }
-        "user" => render_user(&mut prompt, msg, content),
+        "user" => render_user(&mut prompt, turn.msg, turn.content),
         "latest_reminder" => {
             prompt.push_str(LATEST_REMINDER);
-            prompt.push_str(content);
+            prompt.push_str(turn.content);
         }
         "tool" => {
             return Err(DsEncodingError::UnmergedToolRole(index));
@@ -218,16 +200,13 @@ fn render_message(
                     .get("task")
                     .map(Value::is_null)
                     .unwrap_or(true);
-            let assistant = AssistantParts {
-                content,
-                tool_calls,
-                reasoning_content,
-                wo_eos,
-                emits_thinking: thinking_mode == ThinkingMode::Thinking
-                    && !prev_has_task
-                    && (!drop_thinking || after_last_user(index, last_user_idx)),
-            };
-            render_assistant(&mut prompt, &assistant);
+            // The turn's thinking goes out: thinking mode, the previous
+            // message gave no task (a task output has no thinking), and the
+            // thinking is kept (not dropped, or after the last user message).
+            let emits_thinking = thinking_mode == ThinkingMode::Thinking
+                && !prev_has_task
+                && (!drop_thinking || after_last_user(index, last_user_idx));
+            render_assistant(&mut prompt, &turn, emits_thinking);
         }
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
@@ -236,7 +215,7 @@ fn render_message(
         &mut prompt,
         messages,
         index,
-        role,
+        turn.role,
         thinking_mode,
         drop_thinking,
         last_user_idx,
@@ -244,53 +223,31 @@ fn render_message(
     Ok(prompt)
 }
 
-/// The response-format section a system or developer message carries.
-fn render_response_format(prompt: &mut String, response_format: &Value) {
-    prompt.push_str("\n\n");
-    let _ = write!(
-        prompt,
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-        to_json(response_format)
-    );
-}
-
 /// A system message: its content, then the tools and the response format
 /// it carries.
-fn render_system(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
-    prompt.push_str(content);
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(rf) = response_format {
-        render_response_format(prompt, rf);
-    }
+fn render_system(prompt: &mut String, turn: &Turn<'_>) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
 /// A developer message: the user token, its content, then the tools and
 /// the response format it carries (the content is never empty: the caller
 /// refused an empty one).
-fn render_developer(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
+fn render_developer(prompt: &mut String, turn: &Turn<'_>) {
     let mut content_developer = String::new();
     content_developer.push_str(USER);
-    content_developer.push_str(content);
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        content_developer.push_str("\n\n");
-        content_developer.push_str(&render_tools(tools));
-    }
-    if let Some(rf) = response_format {
-        render_response_format(&mut content_developer, rf);
-    }
+    content_developer.push_str(turn.content);
+    push_tools_and_response_format(
+        &mut content_developer,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
     prompt.push_str(&content_developer);
 }
 
@@ -349,27 +306,14 @@ fn render_tool_result_content(content: Option<&Value>) -> String {
     }
 }
 
-/// What an assistant message renders from: its content, its tool calls,
-/// its reasoning, and the two decisions the conversation makes for it.
-struct AssistantParts<'a> {
-    content: &'a str,
-    tool_calls: Option<&'a [Value]>,
-    reasoning_content: &'a str,
-    /// The message ends without the EOS token.
-    wo_eos: bool,
-    /// The turn's thinking goes out: thinking mode, the previous message
-    /// gave no task (a task output has no thinking), and the thinking is
-    /// kept (not dropped, or after the last user message).
-    emits_thinking: bool,
-}
-
 /// An assistant message: its thinking (reasoning and the thinking end
-/// token) when the turn keeps it, its content, its tool calls as a DSML
-/// block, and the EOS token unless the message says otherwise.
-fn render_assistant(prompt: &mut String, parts: &AssistantParts<'_>) {
+/// token) when the turn keeps it (`emits_thinking`), its content, its tool
+/// calls as a DSML block, and the EOS token unless the message says
+/// otherwise.
+fn render_assistant(prompt: &mut String, turn: &Turn<'_>, emits_thinking: bool) {
     let mut thinking_part = String::new();
     let mut tc_content = String::new();
-    if let Some(tcs) = parts.tool_calls.filter(|t| !t.is_empty()) {
+    if let Some(tcs) = turn.tool_calls.as_deref() {
         let mut tc_list = Vec::with_capacity(tcs.len());
         for tc in tcs {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -386,14 +330,14 @@ fn render_assistant(prompt: &mut String, parts: &AssistantParts<'_>) {
             "\n\n<{DSML}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML}{TOOL_CALLS_BLOCK_NAME}>"
         );
     }
-    if parts.emits_thinking {
-        thinking_part.push_str(&mark_grounding_tokens(parts.reasoning_content));
+    if emits_thinking {
+        thinking_part.push_str(&mark_grounding_tokens(turn.reasoning_content));
         thinking_part.push_str(THINKING_END);
     }
     prompt.push_str(&thinking_part);
-    prompt.push_str(&mark_grounding_tokens(parts.content));
+    prompt.push_str(&mark_grounding_tokens(turn.content));
     prompt.push_str(&tc_content);
-    if !parts.wo_eos {
+    if !turn.wo_eos() {
         prompt.push_str(EOS);
     }
 }
@@ -506,15 +450,14 @@ pub(crate) fn render_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
+    // The engine's renderer hands the conversation to this encoder with a
+    // `developer` message as written (its developer-to-system rewrite belongs
+    // to its template path, which this encoder never takes), so the vendor
+    // encoding's own rules apply: dropped before the last user turn with the
+    // thinking, a user turn otherwise.
     let messages = marks::without_marks(messages);
-    // The engine's renderer rewrites a `developer` message as a `system` one
-    // (and merges the system messages when one is not first) before any
-    // tokenizer mode's own encoder sees the conversation, so the vendor
-    // encoding's developer branch is never reached there; the same rule here.
-    let developer = crate::chat_template::developer_messages_as_system(&messages);
-    let messages = developer.as_deref().unwrap_or(&messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(messages);
+    let merged = merge_tool_messages(&messages);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -908,29 +851,150 @@ mod tests {
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
     }
 
-    /// The engine's renderer hands every tokenizer mode a `developer` message
-    /// as a `system` one, so it renders as the system message does in both
-    /// modes, never with the user token the vendor branch wrote.
+    fn developer(text: &str) -> Value {
+        json!({ "role": "developer", "content": text })
+    }
+
+    /// The engine's renderer hands this encoder a `developer` message as
+    /// written (its developer-to-system rewrite is the template path's), so
+    /// the encoding's own rules apply: in thinking mode the thinking-drop
+    /// removes a developer message before the last user turn entirely; in
+    /// chat mode it is a user turn, the user token and the content. The
+    /// recorded reference of the developer-role case is the thinking render,
+    /// byte for byte; never the system message's prompt.
     #[test]
-    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
-        let msgs = [
-            json!({ "role": "developer", "content": "Answer in one word." }),
-            user("Colour of the sky?"),
-        ];
+    fn developer_message_renders_as_the_encoder_developer_turn() {
+        let msgs = [developer("Answer in one word."), user("Colour of the sky?")];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Colour of the sky?{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one word.{USER_SP_TOKEN}Colour of the sky?\
+                 {ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
         let as_system = [
             json!({ "role": "system", "content": "Answer in one word." }),
             user("Colour of the sky?"),
         ];
-        for mode in [ThinkingMode::Chat, ThinkingMode::Thinking] {
+        for mode in [ThinkingMode::Thinking, ThinkingMode::Chat] {
+            assert_ne!(
+                encode_messages(&msgs, mode, &EncodeParams::default()).unwrap(),
+                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+            );
+        }
+    }
+
+    /// Earlier in the conversation the same rule: gone with the thinking-drop,
+    /// a user turn in chat mode (the assistant turn after it closes as it does
+    /// after a user turn). An empty developer message is refused where it is
+    /// rendered and dropped where the thinking-drop reaches it first.
+    #[test]
+    fn a_developer_message_before_the_last_user_turn_goes_with_the_thinking_drop() {
+        let msgs = [
+            developer("DEV"),
+            user("q1"),
+            json!({ "role": "assistant", "content": "a1" }),
+            user("q2"),
+        ];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}q1{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}a1{EOS_TOKEN}\
+                 {USER_SP_TOKEN}q2{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}DEV{USER_SP_TOKEN}q1{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}a1\
+                 {EOS_TOKEN}{USER_SP_TOKEN}q2{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
+        let empty = [developer(""), user("q")];
+        let out =
+            encode_messages(&empty, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}q{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}")
+        );
+        let err =
+            encode_messages(&empty, ThinkingMode::Chat, &EncodeParams::default()).unwrap_err();
+        assert!(
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
+            "{err}"
+        );
+    }
+
+    /// A developer message that ends the conversation is the last user turn:
+    /// kept in both modes, the assistant header and the thinking token after
+    /// it.
+    #[test]
+    fn a_trailing_developer_message_is_the_last_user_turn() {
+        let msgs = [user("Colour of the sky?"), developer("Answer in one word.")];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
             let out = encode_messages(&msgs, mode, &EncodeParams::default()).unwrap();
             assert_eq!(
                 out,
-                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+                format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Colour of the sky?{USER_SP_TOKEN}Answer in one word.\
+                     {ASSISTANT_SP_TOKEN}{thinking_token}"
+                )
             );
+        }
+    }
+
+    /// A developer message's own tools and response format render under its
+    /// content after a blank line, as a system message's do; declared tools
+    /// keep the thinking-drop off, so the message stays in thinking mode too.
+    #[test]
+    fn a_developer_message_carries_its_tools_and_response_format() {
+        let with_tools = [json!({
+            "role": "developer",
+            "content": "Follow the policy.",
+            "tools": [{ "type": "function", "function": { "name": "lookup_weather",
+                "description": "Look up", "parameters": { "type": "object",
+                "properties": { "query": { "type": "string" } }, "required": ["query"] } } }],
+        })];
+        let with_format = [json!({
+            "role": "developer",
+            "content": "Answer in one word.",
+            "response_format": { "type": "json_object" },
+        })];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&with_tools, mode, &EncodeParams::default()).unwrap();
             assert!(
-                out.contains("Answer in one word.")
-                    && !out.contains(&format!("{USER_SP_TOKEN}Answer in one word.")),
+                out.starts_with(&format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Follow the policy.\n\n## Tools\n\n"
+                )) && out.contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "schemas to invoke tool calls.\n{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    )),
                 "{out}"
+            );
+            let out = encode_messages(&with_format, mode, &EncodeParams::default()).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one word.\n\n## Response Format:\n\n\
+                     You MUST strictly adhere to the following schema to reply:\n\
+                     {{\"type\": \"json_object\"}}{ASSISTANT_SP_TOKEN}{thinking_token}"
+                )
             );
         }
     }

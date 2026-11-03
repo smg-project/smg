@@ -20,6 +20,7 @@ from .constants import (
     get_parser,
     get_zmq_engine_count,
     host_port,
+    trtllm_runs_engines_own_servicer,
 )
 from .process_utils import (
     ProcessExitedError,
@@ -35,6 +36,17 @@ if TYPE_CHECKING:
     from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+def workers_labelled_by_hand(workers: list | None) -> list:
+    """The workers of ``workers`` whose servicer advertises no structural-tag
+    vocabulary, so the harness labels them: the TensorRT-LLM workers on the
+    engine's own gRPC server. On the Rust servicer the launcher advertises
+    the vocabulary of the xgrammar installed beside the engine itself."""
+    labelled = [w for w in workers or () if getattr(w, "engine", None) == "trtllm"]
+    if not labelled or not trtllm_runs_engines_own_servicer():
+        return []
+    return labelled
 
 
 def build_epd_mode_args(
@@ -292,12 +304,14 @@ class Gateway:
             )
             # A worker whose servicer cannot advertise which structural-tag
             # vocabulary its grammar compiler takes is labelled by its
-            # operator: the TensorRT-LLM lane runs the engine's own gRPC
+            # operator: a TensorRT-LLM worker on the engine's own gRPC
             # servicer (`tensorrt_llm.commands.serve`), which reports no such
             # fact, over the xgrammar its pinned wheel carries
             # (scripts/ci_install_trtllm.sh: 0.1.32, before the `optional`,
             # `plus`, `star` and `token` nodes), and the gateway spells that
-            # worker's structural tags in the older vocabulary.
+            # worker's structural tags in the older vocabulary. On the Rust
+            # servicer the launcher advertises the vocabulary itself
+            # (`workers_labelled_by_hand`).
             # The router is up by now (`_launch`): a label that does not land
             # within its wait takes the router down with it before the error
             # goes out, so a caller that does not shut down on failure leaves
@@ -307,8 +321,7 @@ class Gateway:
             # exits.
             try:
                 self.label_workers(
-                    [w for w in workers or () if getattr(w, "engine", None) == "trtllm"],
-                    {"structural_tag_vocabulary": "older"},
+                    workers_labelled_by_hand(workers), {"structural_tag_vocabulary": "older"}
                 )
             except Exception as e:
                 detail = self._output_tail()

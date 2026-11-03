@@ -1301,13 +1301,15 @@ async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carrie
     for id in &mut input_ids[10..14] {
         *id = 151655;
     }
+    let (mm_inputs, extra_mm_inputs) = assembled.into_protos();
     let request = sglang_proto::GenerateRequest {
         request_id: "mm-over-zmq".into(),
+        extra_mm_inputs,
         tokenized: Some(sglang_proto::TokenizedInput {
             input_ids: input_ids.clone(),
             original_text: String::new(),
         }),
-        mm_inputs: Some(Box::new(assembled.into_proto())),
+        mm_inputs: Some(Box::new(mm_inputs)),
         ..Default::default()
     };
     let BackendClient::Zmq(zmq) = &client else {

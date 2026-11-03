@@ -291,6 +291,7 @@ async fn streamed_responses_iteration(
             &tx,
             None,
             None,
+            &[],
         )
         .await;
         drop(tx);
@@ -315,6 +316,7 @@ async fn whole_responses_iteration(
             context::ExecutionResult::Single { stream },
             Arc::new(request),
             dispatch(),
+            &[],
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));

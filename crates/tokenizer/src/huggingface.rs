@@ -25,7 +25,7 @@ use tokenizers::{
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken, AddedVocabulary, Model,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     byte_fallback::PieceTable,
@@ -646,6 +646,81 @@ impl HuggingFaceTokenizer {
         Ok(tokenizer)
     }
 
+    /// Settles the added tokens matched after normalization whose normalized
+    /// spellings are equal: a letter and its compatibility form under an
+    /// NFKC normalizer, for instance. `tokenizers` matches those tokens with
+    /// an automaton of their normalized spellings built from a hash map it
+    /// iterates in a per-process order, and between equal spellings the
+    /// first wins, so the id such a text encodes to changes from one
+    /// process to the next. Here the member spelled as the normalized form
+    /// itself (the letter) keeps the normalized match, which every text
+    /// whose normalized form holds the spelling then encodes to; the lowest
+    /// id keeps it when no member spells the form. Each other member (a
+    /// compatibility form) is re-added matched on the raw text
+    /// (`normalized: false`), where its own spelling alone reaches it. The
+    /// raw match comes before normalization, so such a spelling in a text is
+    /// cut ahead of any longer normalized token that would have spanned it:
+    /// the one reading that changes beyond the choice of id, and it is
+    /// confined to the compatibility forms, never to the letter plain text
+    /// holds. Decoding is untouched: every id keeps its token. Returns how
+    /// many tokens were re-added; a vocabulary without such a group is left
+    /// as it is.
+    fn settle_normalized_added_token_ties<M: Model>(
+        tokenizer: &mut TokenizerOf<M>,
+    ) -> tokenizers::Result<usize> {
+        if tokenizer.get_normalizer().is_none() {
+            return Ok(0);
+        }
+        let added = tokenizer.get_added_vocabulary();
+        let tokens = added.get_added_tokens_decoder();
+        // The ids of every normalized spelling, `simple_id_to_token` being
+        // the spelling the automaton holds: the normalized form where it
+        // differs from the content.
+        let mut ids_of_spelling: HashMap<String, Vec<u32>> = HashMap::new();
+        for (&id, token) in tokens {
+            if token.normalized {
+                let spelling = added
+                    .simple_id_to_token(id)
+                    .unwrap_or_else(|| token.content.clone());
+                ids_of_spelling.entry(spelling).or_default().push(id);
+            }
+        }
+        let mut demoted: Vec<AddedToken> = Vec::new();
+        for (spelling, mut ids) in ids_of_spelling {
+            if ids.len() < 2 {
+                continue;
+            }
+            ids.sort_unstable();
+            let kept = ids
+                .iter()
+                .copied()
+                .find(|id| {
+                    tokens
+                        .get(id)
+                        .is_some_and(|token| token.content == spelling)
+                })
+                .unwrap_or(ids[0]);
+            demoted.extend(ids.iter().filter(|&&id| id != kept).filter_map(|id| {
+                let mut token = tokens.get(id)?.clone();
+                token.normalized = false;
+                Some(token)
+            }));
+        }
+        if demoted.is_empty() {
+            return Ok(0);
+        }
+        // A token re-added under a content the vocabulary holds keeps its id;
+        // the two automatons are rebuilt once, after the whole batch.
+        let settled = demoted.len();
+        tokenizer.add_tokens(demoted)?;
+        info!(
+            settled,
+            "added tokens with one normalized spelling: the letter keeps the normalized match, the \
+             compatibility forms match their own spelling raw"
+        );
+        Ok(settled)
+    }
+
     /// Bind checkpoint metadata, the active template, and its cached renderer policy.
     fn from_built_tokenizer(
         mut tokenizer: LoadingTokenizer,
@@ -676,6 +751,15 @@ impl HuggingFaceTokenizer {
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
         Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
+        // Two added tokens matched after normalization can share one
+        // normalized spelling, and which of them `tokenizers` matches changes
+        // from process to process. Settled before the encode path is chosen
+        // (the rule is on `settle_normalized_added_token_ties`).
+        Self::settle_normalized_added_token_ties(&mut tokenizer).map_err(|error| {
+            Error::msg(format!(
+                "Failed to load tokenizer: the added tokens with one normalized spelling did not settle: {error}"
+            ))
+        })?;
 
         let mut chat_template_str = config_result.chat_template;
         let mut tool_use_template = config_result.tool_use_chat_template;
@@ -1437,11 +1521,11 @@ impl Encoder for HuggingFaceTokenizer {
         if let Some(v1) = &self.v1 {
             return v1.encode(input, add_special_tokens);
         }
-        // The direct path accepts no post-processor that adds tokens, so a
-        // request for special tokens gets the same ids and is served too. An
-        // input it gives up is counted and encoded by `tokenizers`.
+        // The direct path frames the ids itself on a request for special
+        // tokens (what the post-processor it read at load adds). An input it
+        // gives up is counted and encoded by `tokenizers`.
         if let Some(native) = &self.core.native {
-            match native.encode(self.core.tokenizer.get_model(), input) {
+            match native.encode(self.core.tokenizer.get_model(), input, add_special_tokens) {
                 Ok(ids) => return Ok(Encoding::Plain(ids)),
                 Err(fallback) => encode_path::note_fallback(fallback),
             }
@@ -2321,11 +2405,10 @@ fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
 }
 
 /// Per DeepSeek's encoding README, preserve all reasoning when a system
-/// message declares `tools`; otherwise drop earlier reasoning. (A developer
-/// message is a system message by the time the V4 shims read the list, see
-/// [`developer_messages_as_system_first`]; the V3.2 shim reads the list with
-/// the developer role as written, and a request's tools ride on the system
-/// message [`inject_tools_into_messages`] attaches them to.)
+/// message declares `tools`; otherwise drop earlier reasoning. (The shims read
+/// the list with the developer role as written, as the engine's renderers
+/// hand it to their tokenizer wrappers, and a request's tools ride on the
+/// system message [`inject_tools_into_messages`] attaches them to.)
 fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
     !messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("system")
@@ -2334,23 +2417,6 @@ fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
                 .is_some_and(|arr| !arr.is_empty())
     })
 }
-/// The messages as the engine's V4 and V4.1 renderers hand them to their
-/// tokenizer wrapper: the developer messages rewritten as system ones and
-/// merged ([`crate::chat_template::developer_messages_as_system`]) BEFORE the
-/// wrapper attaches the request's tools to a system message, so the attached
-/// tools survive the merge. Those encoders repeat the rewrite at their own
-/// entry for direct callers; after this it finds nothing to do. The V3.2
-/// renderer hands its encoder the developer role as written, so the V3.2
-/// shim never calls this.
-fn developer_messages_as_system_first(
-    messages: &[serde_json::Value],
-) -> std::borrow::Cow<'_, [serde_json::Value]> {
-    match crate::chat_template::developer_messages_as_system(messages) {
-        Some(rewritten) => std::borrow::Cow::Owned(rewritten),
-        None => std::borrow::Cow::Borrowed(messages),
-    }
-}
-
 /// Attach `tools` to a leading system message so the V3.2/V4
 /// encoder can render the tools block. Mirrors the wrapper step in
 /// one engine's `tokenizers/deepseek_v32.py` and another engine's V4 serving path.
@@ -2445,9 +2511,16 @@ fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
-    let messages = developer_messages_as_system_first(messages);
-    let owned = inject_tools_into_messages(&messages, params.tools);
-    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(&messages);
+    // A developer message reaches the encoder as written, as the engine's
+    // renderer hands it to its tokenizer wrapper (no developer-to-system
+    // rewrite on this path): the encoder drops one before the last user turn
+    // with the thinking and renders it as a user turn otherwise. The
+    // request's tools ride on the system message the wrapper step attaches
+    // them to. (The gateway's Responses path is unlike the chat path here: it
+    // folds a developer item into the system prompt before any renderer sees
+    // the conversation, so the drop is the chat path's alone.)
+    let owned = inject_tools_into_messages(messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
     let effort_kwarg = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
@@ -2631,9 +2704,12 @@ fn apply_deepseek_v41(
     // (structured output is enforced by the constraint), so the gateway's
     // projected kwarg is ignored here too. The encoder still renders a
     // per-message `response_format` for direct callers.
-    let messages = developer_messages_as_system_first(messages);
-    let owned = inject_tools_into_first_system_message(&messages, params.tools);
-    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.into_owned());
+    // A developer message reaches the encoder as written, as the engine's
+    // renderer hands it to its tokenizer wrapper (no developer-to-system
+    // rewrite on this path, see `apply_deepseek_v4`); the request's tools
+    // ride on the system message the wrapper step attaches them to.
+    let owned = inject_tools_into_first_system_message(messages, params.tools);
+    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
 
     let effort_kwarg = params
         .template_kwargs
@@ -2748,6 +2824,23 @@ mod tests {
     /// encodes run in `tokenizers`.
     const WORD_LEVEL_TOKENIZER_JSON: &str = r#"{
         "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+    }"#;
+
+    /// The word-level vocabulary with two added tokens matched after
+    /// normalization that share one normalized spelling: a letter (U+05D0)
+    /// and its compatibility form (U+FB21) under NFKC, their ids past the
+    /// model's vocabulary as a checkpoint's added tokens are.
+    const NORMALIZED_TIE_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 3, "content": "\u05d0", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false},
+            {"id": 4, "content": "\ufb21", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false}
+        ],
+        "normalizer": {"type": "NFKC"},
         "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
         "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
     }"#;
@@ -3388,6 +3481,144 @@ mod tests {
         }
     }
 
+    /// A checkpoint's own tokenizer gives the letter one of the two ids per
+    /// process; the loader settles the pair, so every process gives the
+    /// letter, and any text whose normalized form is the letter, the lowest
+    /// id, and the compatibility form spelled as such its own.
+    #[test]
+    fn two_added_tokens_with_one_normalized_spelling_encode_the_same_in_every_process() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, NORMALIZED_TIE_TOKENIZER_JSON).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.encode_path(), EncodePath::Tokenizers);
+        for (text, ids) in [
+            ("\u{5d0}", &[3][..]),
+            ("\u{fb21}", &[4][..]),
+            ("a \u{fb21} \u{5d0} b", &[0, 4, 3, 1][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The letter keeps the normalized match whichever id the pair gave it,
+    /// so plain text reads as before, longer normalized tokens included; the
+    /// compatibility form is matched by its own spelling, before
+    /// normalization, so a longer normalized token no longer spans it (the
+    /// one reading that changes beyond the choice of id).
+    #[test]
+    fn the_letter_keeps_the_normalized_match_whichever_id_is_lower() {
+        // The compatibility form at the lower id, and a two-letter normalized
+        // token that holds the letter.
+        let definition = r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id": 3, "content": "\ufb21", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 4, "content": "\u05d0", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 5, "content": "\u05d0\u05d1", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false}
+            ],
+            "normalizer": {"type": "NFKC"},
+            "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+        }"#;
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, definition).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        for (text, ids) in [
+            ("\u{5d0}", &[4][..]),
+            ("\u{5d0}\u{5d1}", &[5][..]),
+            ("\u{fb21}", &[3][..]),
+            ("\u{fb21}\u{5d1}", &[3, 2][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Two compatibility forms of a letter the vocabulary has no token for,
+    /// so no member spells the normalized form: the lowest id keeps the
+    /// normalized match, as the fallback.
+    #[test]
+    fn the_lowest_id_keeps_the_normalized_match_when_no_member_spells_the_form() {
+        let definition = r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id": 3, "content": "\uff46\uff49", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 4, "content": "\ufb01", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false}
+            ],
+            "normalizer": {"type": "NFKC"},
+            "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+        }"#;
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, definition).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        for (text, ids) in [
+            ("fi", &[3][..]),
+            ("\u{ff46}\u{ff49}", &[3][..]),
+            ("\u{fb01}", &[4][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Settling re-adds the compatibility form of a pair matched on the raw
+    /// text and nothing else: the ids decode as before, a second pass finds
+    /// nothing to settle, and a vocabulary without such a pair is not touched.
+    #[test]
+    fn settling_a_normalized_tie_keeps_decoding_and_leaves_other_vocabularies_alone() {
+        let mut tokenizer =
+            tokenizers::Tokenizer::from_bytes(NORMALIZED_TIE_TOKENIZER_JSON).unwrap();
+        let decoded = |tokenizer: &tokenizers::Tokenizer| -> Vec<String> {
+            [3, 4]
+                .iter()
+                .map(|&id| tokenizer.decode(&[id], false).unwrap())
+                .collect()
+        };
+        let before = decoded(&tokenizer);
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut tokenizer).unwrap(),
+            1
+        );
+        assert_eq!(decoded(&tokenizer), before);
+        let added = tokenizer.get_added_vocabulary().get_added_tokens_decoder();
+        assert!(
+            added.get(&3).unwrap().normalized,
+            "the letter keeps the normalized match"
+        );
+        assert!(
+            !added.get(&4).unwrap().normalized,
+            "the compatibility form is matched on the raw text"
+        );
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut tokenizer).unwrap(),
+            0
+        );
+        let mut plain = tokenizers::Tokenizer::from_bytes(WORD_LEVEL_TOKENIZER_JSON).unwrap();
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut plain).unwrap(),
+            0
+        );
+    }
+
     /// The DeepSeek V4 encoder port stands in for the encoder module those
     /// checkpoints ship in place of a chat template. A checkpoint of the
     /// architecture that ships a template of its own renders through the
@@ -3824,13 +4055,13 @@ mod segment_tests {
         wrapped
     }
 
-    /// The V4 and V4.1 engine renderers rewrite a developer message as the
-    /// system message BEFORE their tokenizer wrapper attaches the request's
-    /// tools, so a request with both keeps its tools block; the shims keep
-    /// that order and render the request as its system-message twin. The
-    /// V3.2 renderer hands the developer role to its encoder as written: the
-    /// tools ride on the system message the wrapper step inserts and the
-    /// developer message is the encoder's user turn under its heading.
+    /// The engines' tokenizer wrappers attach the request's tools to a system
+    /// message and hand the developer role to their encoders as written, so a
+    /// request with both keeps its tools block and, the declared tools keeping
+    /// the thinking-drop off, its developer message as the encoder's user turn
+    /// (V4 and V4.1: the user token and the content, never the system-message
+    /// twin; V3.2: a user turn under its heading, the tools on the system
+    /// message the wrapper step inserts).
     #[test]
     fn a_developer_message_with_request_tools_keeps_the_tools_block_on_the_gateway_path() {
         let tools = [
@@ -3855,16 +4086,18 @@ mod segment_tests {
             let rendered = tok
                 .apply_chat_template_with_encoding(&developer, params(), None)
                 .expect("the renderer renders the conversation");
-            let twin = tok
-                .apply_chat_template_with_encoding(&system, params(), None)
-                .expect("the renderer renders the conversation");
-            assert_eq!(rendered.text, twin.text);
             assert!(
                 rendered.text.contains("lookup_weather")
-                    && rendered.text.contains("Follow the policy."),
+                    && rendered.text.ends_with(
+                        "<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
+                    ),
                 "{}",
                 rendered.text
             );
+            let twin = tok
+                .apply_chat_template_with_encoding(&system, params(), None)
+                .expect("the renderer renders the conversation");
+            assert_ne!(rendered.text, twin.text);
         }
         let rendered = v32_like(&ADDED)
             .apply_chat_template_with_encoding(&developer, params(), None)
@@ -4057,9 +4290,11 @@ mod segment_tests {
             .expect("the renderer renders the conversation");
         assert!(rendered.text.ends_with("Be brief."), "{}", rendered.text);
         assert!(!rendered.generation_prompt);
-        // A developer message is rewritten as a system one and merged with
-        // the system message after it: one system turn, both texts, no
-        // header; the report reads the render, not the request's message list.
+        // A developer message before a system message that ends the
+        // conversation goes with the thinking-drop (that system message is the
+        // last user-like turn under this encoder's rule), and the one system
+        // message left is the conversation's first: bare text, no header; the
+        // report reads the render, not the request's message list.
         let developer_then_system = [
             json!({"role": "developer", "content": "Be terse."}),
             json!({"role": "system", "content": "Answer in French."}),
@@ -4068,7 +4303,8 @@ mod segment_tests {
             .apply_chat_template_with_encoding(&developer_then_system, params(), None)
             .expect("the renderer renders the conversation");
         assert!(
-            rendered.text.ends_with("Be terse.\n\nAnswer in French."),
+            rendered.text.ends_with("\n\nAnswer in French.")
+                && !rendered.text.contains("Be terse."),
             "{}",
             rendered.text
         );
@@ -4399,8 +4635,16 @@ mod segment_tests {
                 _ => &fixtures.effort_tiers,
             };
             tok.renderer = Renderer::DeepseekV41(effort_table_of(tiers));
+            // Three cases were recorded with the recording script's
+            // developer-to-system rewrite, which the engine's renderer does
+            // not make (it hands the role to its encoder as written; the
+            // encoder tests pin that); they are rendered as the system path
+            // they describe, through the crate's own fold as the encoder's
+            // replay of the same recordings does.
+            let messages = crate::chat_template::developer_messages_as_system(&case.messages)
+                .unwrap_or_else(|| case.messages.clone());
             let marked = tok
-                .render_marked(&case.messages, params)
+                .render_marked(&messages, params)
                 .unwrap_or_else(|e| panic!("case {}: {e}", case.name));
             let segments = marks::segments(&marked).expect("paired marks");
             let (text, controls) = marks::flatten(&marked).expect("paired marks");

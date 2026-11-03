@@ -80,6 +80,7 @@ ENV_ZMQ_ENGINE_COUNT = (
 ENV_VLLM_SERVICER_IMPL = "E2E_VLLM_SERVICER_IMPL"
 ENV_SGLANG_SERVICER_IMPL = "E2E_SGLANG_SERVICER_IMPL"
 ENV_TOKENSPEED_SERVICER_IMPL = "E2E_TOKENSPEED_SERVICER_IMPL"
+ENV_TRTLLM_SERVICER_IMPL = "E2E_TRTLLM_SERVICER_IMPL"
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
@@ -91,6 +92,11 @@ ENV_STARTUP_TIMEOUT = (
 ENV_STARTUP_PROFILE = "E2E_STARTUP_PROFILE"  # Declared worker startup profile
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
+# A tracing filter for the Rust servicer in every worker a lane starts (the worker
+# process's RUST_LOG; the gateway's own logging is untouched). Empty or unset leaves
+# the servicer's default. A lane whose tests read the servicer's per-request line
+# raises that line's target: "info,engine_servicer::request=debug".
+ENV_WORKER_RUST_LOG = "E2E_WORKER_RUST_LOG"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 
@@ -212,6 +218,7 @@ SERVICER_IMPL_VARIABLES = {
     "vllm": (ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL"),
     "sglang": (ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL"),
     "tokenspeed": (ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL"),
+    "trtllm": (ENV_TRTLLM_SERVICER_IMPL, "SMG_TRTLLM_SERVICER_IMPL"),
 }
 VLLM_MM_PROCESSORS = ("inprocess", "smg")
 
@@ -266,9 +273,12 @@ def get_servicer_impl_setting(engine: str) -> str | None:
     None when the variable is unset or blank and the lane leaves the choice to
     the servicer package's default. A set-but-unrecognized value raises.
 
-    The worker command never changes: the choice travels to the engine's own
-    entrypoint as ``SMG_<ENGINE>_SERVICER_IMPL`` in the worker's environment
+    For vLLM, SGLang and TokenSpeed the worker command never changes: the
+    choice travels to the engine's own entrypoint as
+    ``SMG_<ENGINE>_SERVICER_IMPL`` in the worker's environment
     (``infra.worker``), and the Router and every test case stay the same.
+    For TensorRT-LLM the choice is the command itself
+    (:func:`trtllm_runs_engines_own_servicer`).
     """
     setting, _variable = SERVICER_IMPL_VARIABLES[engine]
     value = os.environ.get(setting, "").strip().lower()
@@ -319,6 +329,17 @@ def get_servicer_impl(engine: str) -> str | None:
     if setting is not None:
         return setting
     return get_servicer_impl_default(engine)
+
+
+def trtllm_runs_engines_own_servicer() -> bool:
+    """Whether this lane's TensorRT-LLM gRPC workers are the engine's own gRPC
+    server (``tensorrt_llm.commands.serve``) rather than this repository's
+    Rust servicer: every choice but ``rust`` (the package's Python default
+    and an absent package included), since the engine release the lane pins
+    has no servicer switch of its own. The worker command, its health probe
+    and the gateway's hand-set label all read this, so the three agree.
+    """
+    return get_servicer_impl("trtllm") != "rust"
 
 
 def get_zmq_engine_count() -> int:
