@@ -20,7 +20,13 @@ from concurrent import futures
 from contextlib import contextmanager
 
 import pytest
-from infra.constants import DEFAULT_HOST, ENV_SHOW_WORKER_LOGS, ConnectionMode, host_port
+from infra.constants import (
+    DEFAULT_HOST,
+    ENV_SHOW_WORKER_LOGS,
+    ENV_TRTLLM_SERVICER_IMPL,
+    ConnectionMode,
+    host_port,
+)
 from infra.worker import ENGINES_WITHOUT_GRPC_HEALTH, Worker
 
 pytest.importorskip("grpc")
@@ -172,6 +178,17 @@ def test_an_engine_without_the_health_service_passes_on_a_ready_channel(engine):
     harness keeps taking its ready channel."""
     with grpc_listener(None) as port:
         assert _worker(port, engine=engine).grpc_serving() is True
+
+
+def test_a_trtllm_worker_on_the_rust_servicer_needs_the_health_service(monkeypatch):
+    """On the Rust servicer (``E2E_TRTLLM_SERVICER_IMPL=rust``) the worker
+    hosts grpc.health.v1 like every engine servicer, so a ready channel
+    without it is a stranger on the port, not this worker."""
+    monkeypatch.setenv(ENV_TRTLLM_SERVICER_IMPL, "rust")
+    with grpc_listener(None) as port:
+        assert _worker(port, engine="trtllm").grpc_serving() is False
+    with grpc_listener("SERVING") as port:
+        assert _worker(port, engine="trtllm").grpc_serving() is True
 
 
 # The log of a worker that found its port taken when it came to bind it: the

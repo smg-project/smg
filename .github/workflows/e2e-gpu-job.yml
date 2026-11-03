@@ -115,7 +115,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default. For trtllm, rust starts this repository's launcher and anything else the engine's own gRPC server"
         required: false
         type: string
         default: ""
@@ -166,6 +166,7 @@ jobs:
       E2E_SGLANG_SERVICER_IMPL: ${{ inputs.engine == 'sglang' && inputs.servicer_impl || '' }}
       E2E_VLLM_SERVICER_IMPL: ${{ inputs.engine == 'vllm' && inputs.servicer_impl || '' }}
       E2E_TOKENSPEED_SERVICER_IMPL: ${{ inputs.engine == 'tokenspeed' && inputs.servicer_impl || '' }}
+      E2E_TRTLLM_SERVICER_IMPL: ${{ inputs.engine == 'trtllm' && inputs.servicer_impl || '' }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
