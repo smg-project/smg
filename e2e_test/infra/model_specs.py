@@ -55,6 +55,14 @@ MODEL_SPECS: dict[str, dict] = {
         "features": [],
         "skip_tier_download": True,
     },
+    # The primary chat model's tokenizer and chat template from an ungated
+    # repository, for the classes on the mock engine (as above).
+    "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
+    },
     # Function calling specialist
     "Qwen/Qwen2.5-7B-Instruct": {
         "model": _resolve_model_path("Qwen/Qwen2.5-7B-Instruct"),

@@ -813,7 +813,7 @@ impl Format {
             CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
                 let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                (xtml::calls(markers, &ways_in, &named, count)?, false)
+                (xtml::calls(markers, &ways_in, tags, &named, count)?, false)
             }
             CallSyntax::Attributed(tags) => {
                 (attributed::calls(markers?, tags, &named, count)?, true)

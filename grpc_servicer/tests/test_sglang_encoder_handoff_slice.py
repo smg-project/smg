@@ -13,14 +13,16 @@ from smg_grpc_proto.generated import sglang_scheduler_pb2 as proto
 servicer_mod = test_sglang_server_info.servicer_mod
 
 
-def test_field21_preserves_existing_media_identity_numbers():
+def test_field22_preserves_existing_media_identity_and_modality_numbers():
     fields = proto.GenerateRequest.DESCRIPTOR.fields_by_name
     assert fields["return_media_identity"].number == 19
     assert fields["media_identity"].number == 20
-    assert fields["encode_handoff"].number == 21
+    assert fields["extra_mm_inputs"].number == 21
+    assert fields["encode_handoff"].number == 22
     value = proto.GenerateRequest(request_id="wire", return_media_identity=True)
     value.media_identity.version = 1
     value.media_identity.processor_key = "original-identity"
+    value.extra_mm_inputs.add().audio_urls.append("https://example.test/audio.wav")
     value.encode_handoff.request_id = "wire"
     value.encode_handoff.encoder_urls.extend(["grpc://encoder-0:5001"])
     value.encode_handoff.num_items_assigned.extend([1])
@@ -90,7 +92,7 @@ def _legacy_generate_request_type():
                 message for message in file_proto.message_type if message.name == "GenerateRequest"
             )
             field_index = next(
-                index for index, field in enumerate(request_proto.field) if field.number == 21
+                index for index, field in enumerate(request_proto.field) if field.number == 22
             )
             assert request_proto.field[field_index].name == "encode_handoff"
             del request_proto.field[field_index]
@@ -102,12 +104,13 @@ def _legacy_generate_request_type():
     return message_factory.GetMessageClass(descriptor)
 
 
-def test_legacy_protobuf_without_field21_keeps_conversion_and_dispatch(servicer_mod):
+def test_legacy_protobuf_without_field22_keeps_conversion_and_dispatch(servicer_mod):
     legacy_request = _legacy_generate_request_type()
     assert legacy_request is not proto.GenerateRequest
     assert "encode_handoff" not in legacy_request.DESCRIPTOR.fields_by_name
     assert legacy_request.DESCRIPTOR.fields_by_name["return_media_identity"].number == 19
     assert legacy_request.DESCRIPTOR.fields_by_name["media_identity"].number == 20
+    assert legacy_request.DESCRIPTOR.fields_by_name["extra_mm_inputs"].number == 21
     value = legacy_request(request_id="ordinary-legacy")
     with pytest.raises(ValueError, match="encode_handoff"):
         value.HasField("encode_handoff")

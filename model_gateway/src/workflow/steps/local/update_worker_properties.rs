@@ -854,6 +854,29 @@ mod tests {
             .collect()
     }
 
+    /// A gRPC decode worker over `labels`, with `discovered` on record as the
+    /// engine's read, and `dp` its rank and size when it is a DP rank.
+    fn grpc_decode_worker(
+        dp: Option<(usize, usize)>,
+        labels: HashMap<String, String>,
+        discovered: HashMap<String, String>,
+    ) -> Arc<dyn Worker> {
+        let builder = BasicWorkerBuilder::new("grpc://decode:8000")
+            .worker_type(WorkerType::Decode)
+            .connection_mode(ConnectionMode::Grpc);
+        let builder = match dp {
+            Some((rank, size)) => builder.dp_config(rank, size),
+            None => builder,
+        };
+        Arc::new(
+            builder
+                .labels(labels)
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        )
+    }
+
     /// A DP flag only the operator set still sizes the engine's share on a
     /// refresh: the fresh window is mapped with the width the worker's labels
     /// use, so the rank follows the engine's new window and the record keeps
@@ -863,18 +886,13 @@ mod tests {
         // Registered dp-aware over an engine that reports no DP label, with
         // `enable_dp_attention` set in the worker's config: the rank carries
         // the share of the engine's 256, and the record has it in rank space.
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .dp_config(2, 8)
-                .labels(labels_of(&[
-                    ("max_running_requests", "32"),
-                    ("enable_dp_attention", "true"),
-                ]))
-                .discovered_labels(labels_of(&[("max_running_requests", "32")]))
-                .status(WorkerStatus::Ready)
-                .build(),
+        let worker = grpc_decode_worker(
+            Some((2, 8)),
+            labels_of(&[
+                ("max_running_requests", "32"),
+                ("enable_dp_attention", "true"),
+            ]),
+            labels_of(&[("max_running_requests", "32")]),
         );
         assert_eq!(worker.max_running_requests(), Some(32));
         let app_ctx = make_app_context(std::slice::from_ref(&worker));
@@ -924,15 +942,7 @@ mod tests {
         let discovered = labels_of(&[("max_num_seqs", "256"), ("page_size", "128")]);
         let mut labels = discovered.clone();
         labels.insert("tier".to_string(), "gold".to_string());
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .labels(labels)
-                .discovered_labels(discovered)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
+        let worker = grpc_decode_worker(None, labels, discovered);
         assert_eq!(worker.max_running_requests(), Some(256));
         let app_ctx = make_app_context(std::slice::from_ref(&worker));
 
@@ -1093,15 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn a_label_refresh_refuses_a_constrained_decoding_that_names_no_policy() {
         let discovered = labels_of(&[("max_num_seqs", "256"), ("constrained_decoding", "always")]);
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .labels(discovered.clone())
-                .discovered_labels(discovered)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
+        let worker = grpc_decode_worker(None, discovered.clone(), discovered);
         let app_ctx = make_app_context(std::slice::from_ref(&worker));
         let revision = worker.revision();
         let mut refresh = make_refresh_context(
@@ -1135,15 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
         let discovered = labels_of(&[("max_num_seqs", "256"), ("page_size", "128")]);
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .labels(discovered.clone())
-                .discovered_labels(discovered)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
+        let worker = grpc_decode_worker(None, discovered.clone(), discovered);
         let app_ctx = make_app_context(std::slice::from_ref(&worker));
         // The update sets the window to the very value the engine had reported.
         let mut update = make_context(
@@ -1256,28 +1250,14 @@ mod tests {
             discovered.get("max_running_requests").map(String::as_str),
             Some("32")
         );
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .dp_config(0, 8)
-                .labels(discovered.clone())
-                .discovered_labels(discovered.clone())
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
+        let worker = grpc_decode_worker(Some((0, 8)), discovered.clone(), discovered.clone());
         assert_eq!(worker.max_running_requests(), Some(32));
         // The operator pinned another rank's window by hand: registration kept
         // only the hand-set key (`labels_for_rank` with the operator's labels).
-        let pinned: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:8000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .dp_config(1, 8)
-                .labels(labels_of(&[("max_num_seqs", "16"), ("attn_dp_size", "8")]))
-                .discovered_labels(discovered)
-                .status(WorkerStatus::Ready)
-                .build(),
+        let pinned = grpc_decode_worker(
+            Some((1, 8)),
+            labels_of(&[("max_num_seqs", "16"), ("attn_dp_size", "8")]),
+            discovered,
         );
         assert_eq!(pinned.max_running_requests(), Some(16));
         let app_ctx = make_app_context(&[Arc::clone(&worker), Arc::clone(&pinned)]);

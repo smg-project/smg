@@ -165,7 +165,7 @@ pub(crate) fn current_input_items(input: &ResponseInput) -> Vec<ResponseInputOut
 
 /// The items a stored response replays as: its input items, then its output
 /// items, each as it was stored.
-pub(crate) fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInputOutputItem> {
+fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInputOutputItem> {
     let output = stored.raw_response.get("output").and_then(Value::as_array);
     stored
         .input
@@ -265,9 +265,7 @@ pub(crate) fn hosted_call_result(
 /// through the conversations API from the bare content it stores, any other
 /// row from the whole item it stores. `None` for a row that has no input form
 /// (a built-in tool call, an older schema), which is left out.
-pub(crate) fn conversation_item_as_input(
-    item: &ConversationItem,
-) -> Option<ResponseInputOutputItem> {
+fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOutputItem> {
     match item.item_type.as_str() {
         "message" => {
             let (content, phase) = split_stored_message_content(item.content.clone());
@@ -405,7 +403,7 @@ async fn conversation_items(
 /// conversation history) or an output item of a stored response the caller's
 /// `tenant` may see. An unknown id answers 404, as the public API does, and
 /// so does an item of another tenant's response.
-pub(crate) async fn resolve_item_references(
+async fn resolve_item_references(
     storage: &dyn ResponseStorage,
     items: Vec<ResponseInputOutputItem>,
     tenant: Option<&str>,

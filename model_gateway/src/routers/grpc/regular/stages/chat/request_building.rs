@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use openai_protocol::profile::ProviderProfile;
 
 use crate::routers::{
     error,
@@ -39,18 +40,21 @@ impl ChatRequestBuildingStage {
 }
 
 /// [`reading::reasoning_decision`] with a chat request's tokenizer-driven
-/// switch (`utils::chat_reasoning_starts_in_rendered_prefill`);
+/// switch (`utils::chat_reasoning_starts_in_rendered_prefill_for`, over
+/// `provider`, the model's profile as the request's preparation derived it);
 /// `generation_prompt` and `continued_final_message` are the rendered prompt's.
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
+    provider: ProviderProfile,
     processed_text: &str,
     generation_prompt: bool,
     continued_final_message: bool,
 ) -> (bool, bool) {
     reading::reasoning_decision(ctx, &chat_request.model, processed_text, |tokenizer| {
-        utils::chat_reasoning_starts_in_rendered_prefill(
+        utils::chat_reasoning_starts_in_rendered_prefill_for(
             chat_request,
+            provider,
             generation_prompt,
             continued_final_message,
             tokenizer,
@@ -64,8 +68,10 @@ fn reasoning_decision(
 /// Messages stages share ([`backed_plan::build`]) with the chat request's
 /// client builder and sampling mask. Returns the plan, the attempt stamp and
 /// the rendered reasoning state; the caller supplies the `ResponseSpec`.
-/// `generation_prompt` and `continued_final_message` are the rendered
-/// prompt's (`ProcessedMessages`). `table_tag` derives the
+/// `provider` is the model's profile as the request's preparation derived it
+/// (`ProcessingState::provider`); `generation_prompt` and
+/// `continued_final_message` are the rendered prompt's (`ProcessedMessages`).
+/// `table_tag` derives the
 /// table's tag for a worker's grammar start when `tool_constraints` is one
 /// the table shapes by the start, the `auto` tag or a JSON answer's
 /// (`regular::symphony::constraint::WorkerConstraint::table_tag`).
@@ -73,6 +79,7 @@ fn reasoning_decision(
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
+    provider: ProviderProfile,
     processed_text: String,
     generation_prompt: bool,
     continued_final_message: bool,
@@ -91,6 +98,7 @@ pub(crate) async fn build_chat_backed_plan(
     let (require_reasoning, _thought_closed) = reasoning_decision(
         ctx,
         chat_request,
+        provider,
         &processed_text,
         generation_prompt,
         continued_final_message,
@@ -152,6 +160,12 @@ impl ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        // The model's profile as preparation derived it, read by the
+        // reasoning decision, the plan and the response spec below.
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(&chat_request.model));
         // What constrains the output on the selected worker, and Symphony's
         // assignment, decided as for a Messages request (`reading::decide`):
         // the `auto` tag derives for the request over the tools its
@@ -174,6 +188,7 @@ impl ChatRequestBuildingStage {
                 let (reasoning_open, thought_closed) = reasoning_decision(
                     ctx,
                     &chat_request,
+                    provider,
                     &processed_messages.text,
                     processed_messages.generation_prompt,
                     processed_messages.continued_final_message,
@@ -212,6 +227,7 @@ impl ChatRequestBuildingStage {
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
             engine_request,
+            provider,
             processed_messages.text,
             generation_prompt,
             continued_final_message,
@@ -226,10 +242,11 @@ impl ChatRequestBuildingStage {
         .await?;
 
         // Only the client-facing usage drops them; settlement keeps the engine's count.
-        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
+        let mut spec = ChatResponseSpec::for_request(chat_request.as_ref(), provider);
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
 
         Ok(BuildOutput {
             plan,
@@ -285,6 +302,7 @@ mod tests {
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             &mut ctx,
             &chat,
+            ProviderProfile::for_model(MODEL),
             "<prompt>".to_string(),
             true,
             false,

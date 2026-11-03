@@ -43,12 +43,14 @@ def anthropic_client(setup_backend):
 
 
 class MessagesOverPD:
-    """Shared test bodies; subclasses pin the backend mode via markers."""
+    """Shared test bodies; subclasses pin the backend mode via markers. On the
+    mock engine each test states the decode side's answer first."""
 
-    def test_non_streaming_message(self, model, anthropic_client):
+    def test_non_streaming_message(self, model, anthropic_client, mock_answers):
         """Basic message creation through PD dual dispatch."""
+        mock_answers.enqueue("Hello, it is good to meet you.")
         # Qwen3.5 thinks by default and can spend all 64 tokens on reasoning; this test
-        # requires answer text, so thinking is off on that engine's leg (as the PD
+        # requires answer text, so thinking is off on that engine's side (as the PD
         # Responses test does); the gateway's thinking toggle reads the field.
         kwargs = {"thinking": {"type": "disabled"}} if is_tokenspeed() else {}
         response = anthropic_client.messages.create(
@@ -70,8 +72,9 @@ class MessagesOverPD:
         assert response.usage is not None
         assert response.usage.output_tokens > 0
 
-    def test_streaming_message(self, model, anthropic_client):
+    def test_streaming_message(self, model, anthropic_client, mock_answers):
         """Streaming events arrive and deltas concatenate to a full message."""
+        mock_answers.enqueue("1, 2, 3.")
         expected_event_types = {
             "message_start",
             "content_block_delta",
@@ -110,9 +113,13 @@ class TestPDMessagesHttp(MessagesOverPD):
     """Messages API through the HTTP PD router's dual dispatch."""
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(2)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    tokenspeed="Qwen/Qwen3.5-9B",
+    mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+)
 @pytest.mark.e2e
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 class TestPDMessagesGrpc(MessagesOverPD):

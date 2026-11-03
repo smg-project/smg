@@ -822,19 +822,20 @@ class TestToolCallingCloud:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceGptOss:
     """Tool choice tests against local gRPC backend with Harmony model."""
 
-    def test_tool_choice_auto(self, model, api_client):
+    def test_tool_choice_auto(self, model, api_client, mock_answers):
         """Test tool_choice="auto" allows model to decide whether to use tools."""
-
+        # On the mock: the model's call, on the commentary channel.
+        mock_answers.enqueue_harmony(tool_call=("get_weather", {"location": "Seattle"}))
         tools = [GET_WEATHER_FUNCTION]
 
         resp = api_client.responses.create(
@@ -856,9 +857,9 @@ class TestToolChoiceGptOss:
             "Model should choose to call function with tool_choice='auto'"
         )
 
-    def test_tool_choice_required(self, model, api_client):
+    def test_tool_choice_required(self, model, api_client, mock_answers):
         """Test tool_choice="required" forces the model to call at least one tool."""
-
+        mock_answers.enqueue_harmony(tool_call=("calculate", {"expression": "15 * 23"}))
         tools = [CALCULATE_FUNCTION]
 
         resp = api_client.responses.create(
@@ -878,9 +879,9 @@ class TestToolChoiceGptOss:
             "tool_choice='required' must force at least one function call"
         )
 
-    def test_tool_choice_specific_function(self, model, api_client):
+    def test_tool_choice_specific_function(self, model, api_client, mock_answers):
         """Test tool_choice with specific function name forces that function to be called."""
-
+        mock_answers.enqueue_harmony(tool_call=("search_web", {"query": "news today"}))
         tools = [SEARCH_WEB_FUNCTION, GET_WEATHER_FUNCTION]
 
         resp = api_client.responses.create(
@@ -901,9 +902,9 @@ class TestToolChoiceGptOss:
             "Must call the function specified in tool_choice"
         )
 
-    def test_tool_choice_streaming(self, model, api_client):
+    def test_tool_choice_streaming(self, model, api_client, mock_answers):
         """Test tool_choice parameter works correctly with streaming."""
-
+        mock_answers.enqueue_harmony(tool_call=("calculate", {"expression": "42 * 17"}))
         tools = [CALCULATE_FUNCTION]
 
         resp = api_client.responses.create(
@@ -927,7 +928,7 @@ class TestToolChoiceGptOss:
         function_calls = [item for item in output if item.type == "function_call"]
         assert len(function_calls) > 0
 
-    def test_tool_choice_with_mcp_tools(self, model, api_client, mock_mcp_server):
+    def test_tool_choice_with_mcp_tools(self, model, api_client, mock_mcp_server, mock_answers):
         """Test tool_choice parameter works with MCP tools.
 
         The MCP server is the suite's in-process ``MockMcpServer`` (its one
@@ -940,7 +941,10 @@ class TestToolChoiceGptOss:
         an MCP tool and that the gateway runs the call, does not depend on
         which server answers.
         """
-
+        # On the mock: the model calls the server's tool (an MCP tool is a
+        # function to the model), then answers once the gateway ran it.
+        mock_answers.enqueue_harmony(tool_call=("image_generation", {"prompt": "a cat"}))
+        mock_answers.enqueue("Here is your cat.")
         tools = [
             {
                 "type": "mcp",
@@ -966,6 +970,7 @@ class TestToolChoiceGptOss:
         assert len(mcp_calls) > 0, "tool_choice='auto' should allow MCP tool calls"
         assert all(call.server_label == "mock" for call in mcp_calls)
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_tool_choice_mixed_function_and_mcp(self, model, api_client):
         """Test tool_choice with mixed function and MCP tools."""
 
@@ -990,9 +995,9 @@ class TestToolChoiceGptOss:
         mcp_calls = [item for item in output if item.type == "mcp_call"]
         assert len(mcp_calls) == 0, "Should only call specified function, not MCP tools"
 
-    def test_basic_function_call(self, model, api_client):
+    def test_basic_function_call(self, model, api_client, mock_answers):
         """Test basic function calling workflow."""
-
+        mock_answers.enqueue_harmony(tool_call=("get_horoscope", {"sign": "Aquarius"}))
         tools = [GET_HOROSCOPE_FUNCTION]
         system_prompt = (
             "You are a helpful assistant that can call functions. "
@@ -1022,6 +1027,7 @@ class TestToolChoiceGptOss:
         assert "sign" in args
         assert args["sign"].lower() == "aquarius"
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mcp_basic_tool_call(self, model, api_client):
         """Test basic MCP tool call (non-streaming)."""
 
@@ -1053,6 +1059,7 @@ class TestToolChoiceGptOss:
             assert mcp_call.status == "completed"
             assert mcp_call.server_label == "brave"
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mcp_basic_tool_call_streaming(self, model, api_client):
         """Test basic MCP tool call (streaming)."""
 
@@ -1076,6 +1083,7 @@ class TestToolChoiceGptOss:
         assert "response.mcp_list_tools.completed" in event_types
         assert "response.mcp_call.completed" in event_types
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mixed_mcp_and_function_tools(self, model, api_client):
         """Test mixed MCP and function tools (non-streaming)."""
 
@@ -1103,6 +1111,7 @@ class TestToolChoiceGptOss:
         assert "system_name" in args
         assert "astra-7" in args["system_name"].lower()
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mixed_mcp_and_function_tools_streaming(self, model, api_client):
         """Test mixed MCP and function tools (streaming)."""
 
@@ -1130,6 +1139,7 @@ class TestToolChoiceGptOss:
         full_delta_event = "".join(e.delta for e in func_arg_deltas)
         assert "system_name" in full_delta_event.lower() and "astra-7" in full_delta_event.lower()
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mcp_multi_server_tool_call(self, model, api_client):
         """Test MCP tool call with multiple MCP servers (non-streaming)."""
 
@@ -1159,6 +1169,7 @@ class TestToolChoiceGptOss:
         for mcp_call in mcp_calls:
             assert mcp_call.server_label == "brave"
 
+    @pytest.mark.skip_for_runtime("mock", reason="the case calls a live MCP server")
     def test_mcp_multi_server_tool_call_streaming(self, model, api_client):
         """Test MCP tool call with multiple MCP servers (streaming)."""
 

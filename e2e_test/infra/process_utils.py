@@ -79,6 +79,12 @@ def reserve_port(port: int) -> None:
 
 
 _LOW_PORT_FLOOR = 20000
+# Kubernetes keeps 30000-32767 for its node ports. A runner that shares its
+# node's network namespace binds one without an error, yet the node's service
+# proxy answers every connection to it, on the loopback address too: an engine
+# listened on such a port, its own warm-up client was refused, and the harness
+# waited out the whole start-up bound before it respawned the engine elsewhere.
+_NODE_PORT_RANGE = range(30000, 32768)
 
 
 def _ephemeral_port_floor() -> int:
@@ -91,15 +97,17 @@ def _ephemeral_port_floor() -> int:
 
 
 def get_open_port_block(count: int, max_attempts: int = 50) -> int:
-    """Reserve ``count`` consecutive free ports below the kernel's ephemeral range; return the first.
+    """Reserve ``count`` consecutive free ports below the kernel's ephemeral
+    range and below the node-port range; return the first.
 
     For ports an engine binds long after they are chosen (MoRI-IO's listeners
     bind once the engine has loaded its model), one per rank from a base. The
     kernel gives ports in its ephemeral range to any process on the host, so
-    one picked there can be taken before its owner binds it. Release each of
-    the ports with release_port().
+    one picked there can be taken before its owner binds it; a node port binds
+    but is never reached (``_NODE_PORT_RANGE``), whichever branch drew it.
+    Release each of the ports with release_port().
     """
-    ceiling = _ephemeral_port_floor()
+    ceiling = min(_ephemeral_port_floor(), _NODE_PORT_RANGE.start)
     for _ in range(max_attempts):
         if ceiling - _LOW_PORT_FLOOR > count:
             base = random.randrange(_LOW_PORT_FLOOR, ceiling - count)
@@ -108,7 +116,13 @@ def get_open_port_block(count: int, max_attempts: int = 50) -> int:
             release_port(base)
         block = range(base, base + count)
         # MoRI-IO's listeners bind every address, so check every address.
-        if all(p < 65536 and p not in _reserved_ports and port_is_free(p, "") for p in block):
+        if all(
+            p < 65536
+            and p not in _NODE_PORT_RANGE
+            and p not in _reserved_ports
+            and port_is_free(p, "")
+            for p in block
+        ):
             _reserved_ports.update(block)
             return base
     raise RuntimeError(

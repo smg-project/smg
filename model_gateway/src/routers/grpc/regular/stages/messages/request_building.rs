@@ -4,6 +4,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::profile::ProviderProfile;
 
 use crate::routers::{
     error,
@@ -121,13 +122,18 @@ impl BuildStage for MessageRequestBuildingStage {
         };
 
         let continued_final_message = processed_messages.continued_final_message;
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(&messages_request.model));
         let (require_reasoning, thought_closed) = reading::reasoning_decision(
             ctx,
             &messages_request.model,
             &processed_messages.text,
             |tokenizer| {
-                utils::messages_reasoning_starts_in_prefill(
+                utils::messages_reasoning_starts_in_prefill_for(
                     &messages_request,
+                    provider,
                     continued_final_message,
                     tokenizer,
                 )
@@ -195,6 +201,7 @@ impl BuildStage for MessageRequestBuildingStage {
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
             plan,
             spec: ResponseSpec::Messages(spec),

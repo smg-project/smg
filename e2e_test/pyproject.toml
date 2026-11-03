@@ -21,6 +21,8 @@ dependencies = [
   # infra.worker imports yaml at module level (the TRT-LLM config dump)
   "pyyaml",
   "requests",
+  # fixtures.mock_answers encodes a scripted answer with the model's tokenizer.json
+  "tokenizers",
   "tqdm",
   "uvicorn>=0.30",
   "websockets",

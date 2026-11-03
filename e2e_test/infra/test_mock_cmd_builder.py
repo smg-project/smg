@@ -6,7 +6,14 @@ import os
 from unittest.mock import patch
 
 import pytest
-from infra.constants import DEFAULT_HOST, LOCAL_RUNTIMES, RUNTIME_LABELS, ConnectionMode, Runtime
+from infra.constants import (
+    DEFAULT_HOST,
+    LOCAL_RUNTIMES,
+    RUNTIME_LABELS,
+    ConnectionMode,
+    Runtime,
+    WorkerType,
+)
 from infra.worker import Worker
 
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -74,3 +81,33 @@ def test_an_admin_port_given_to_the_worker_is_kept():
 def test_an_engine_without_an_admin_api_has_no_admin_url():
     worker = Worker(model_id=MODEL, engine="vllm", port=31001, gpu_ids=[0])
     assert worker.admin_url is None
+
+
+def test_the_prefill_and_decode_roles_reach_the_grpc_command_with_the_bootstrap_port():
+    prefill = _worker(ConnectionMode.GRPC, worker_type=WorkerType.PREFILL, bootstrap_port=31900)
+    cmd = prefill._build_cmd()
+    assert _flag(cmd, "--worker-type") == "prefill"
+    assert _flag(cmd, "--bootstrap-base-port") == "31900", "the port the gateway is told of"
+    decode = _worker(ConnectionMode.GRPC, worker_type=WorkerType.DECODE)
+    cmd = decode._build_cmd()
+    assert _flag(cmd, "--worker-type") == "decode"
+    assert "--bootstrap-base-port" not in cmd, "a decode worker binds no bootstrap port"
+    assert "--worker-type" not in _worker(ConnectionMode.GRPC)._build_cmd(), "a regular worker"
+
+
+def test_a_role_on_another_wire_or_an_encode_role_is_refused():
+    with pytest.raises(ValueError, match="gRPC workers"):
+        _worker(ConnectionMode.HTTP, worker_type=WorkerType.DECODE)._build_cmd()
+    with pytest.raises(ValueError, match="no encode role"):
+        _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE)._build_cmd()
+
+
+def test_the_mock_is_paired_on_its_wires_one_transport():
+    # The mock moves no KV; the gateway pairs it as a worker of the scheduler
+    # wire it speaks, whose one transport is Mooncake, whatever the lane's
+    # setting for the engines that have a choice.
+    with patch.dict(os.environ, {"E2E_VLLM_KV_BACKEND": "nixl"}):
+        assert (
+            _worker(ConnectionMode.GRPC, worker_type=WorkerType.PREFILL).effective_kv_backend()
+            == "mooncake"
+        )
