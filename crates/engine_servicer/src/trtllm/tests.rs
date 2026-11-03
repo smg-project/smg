@@ -615,6 +615,105 @@ async fn the_unimplemented_rpcs_say_why() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The record of a connected rank before any batch has carried a load tail
+/// is zero-filled (an idle scheduler, as on the other wires), what the
+/// records-only stream reads for it from its first tick; a rank past the
+/// connected ones has none.
+#[tokio::test]
+async fn a_connected_ranks_record_is_zero_filled_before_its_first_load_tail() {
+    let h = harness(model_info()).await;
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(
+        (
+            record.running_requests,
+            record.waiting_requests,
+            record.token_usage
+        ),
+        (0, 0, 0.0)
+    );
+    assert_eq!(
+        kv_events::LoadSource::load(&source, None).map(|record| record.running_requests),
+        Some(0)
+    );
+    assert!(kv_events::LoadSource::load(&source, Some(1)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two connected shims, one of which has reported a load tail: the record
+/// of the other stays zero-filled (an idle scheduler, not a gone one), never
+/// the sibling's figures; a rank past the connected ones has none.
+#[tokio::test]
+async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut config = config(dir.path(), &handshake, model);
+    config.servicer.engine_count = 2;
+    let server = TrtllmServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..ready_response()
+    };
+    let (first, second) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(0)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(1)),
+    );
+    let (mut rank0_in, mut rank0_out) = first.expect("shim 0 handshake").split();
+    let (mut rank1_in, mut rank1_out) = second.expect("shim 1 handshake").split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TrtllmServiceClient::new(grpc_channel(server.address()).await);
+
+    // The servicer places the request on either shim; that shim answers with
+    // a load tail (one running request) and the other stays silent.
+    let mut stream = client
+        .generate(generate_request("r0", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    let served: u32 = tokio::select! {
+        _ = recv_add(&mut rank0_in) => 0,
+        _ = recv_add(&mut rank1_in) => 1,
+    };
+    let out = if served == 0 {
+        &mut rank0_out
+    } else {
+        &mut rank1_out
+    };
+    send(
+        out,
+        &BatchTokenIDSlimOutput {
+            engine_index: served,
+            ..batch("r0", vec![10], 1, None, None)
+        },
+    )
+    .await;
+    stream.message().bounded().await.unwrap().unwrap();
+    let source = kv_events::LoadFromState(Arc::downgrade(&server.state));
+    let served_rank = i32::try_from(served).unwrap();
+    wait_until(|| {
+        kv_events::LoadSource::load(&source, Some(served_rank))
+            .is_some_and(|record| record.running_requests == 1)
+    })
+    .await;
+    let idle = kv_events::LoadSource::load(&source, Some(1 - served_rank))
+        .expect("the idle shim's record");
+    assert_eq!(
+        (
+            idle.running_requests,
+            idle.waiting_requests,
+            idle.token_usage
+        ),
+        (0, 0, 0.0),
+        "{idle:?}"
+    );
+    assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    drop(stream);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// An `abort` from the engine side (the shim refused the request while it
 /// built the engine's parameters) is the caller's error with the status its
 /// HTTP code means.

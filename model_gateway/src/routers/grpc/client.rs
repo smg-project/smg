@@ -318,6 +318,25 @@ impl GrpcClient {
         }
     }
 
+    /// The servicer's load records alone, no events (`SubscribeKvEvents`
+    /// with `loads_only`): what a worker streams when routing reads its load
+    /// and keeps no KV index. A servicer that predates the field streams its
+    /// events too; the subscriber drops them. `Unimplemented` on backends
+    /// without the stream.
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.subscribe_load_records().await,
+            Self::Vllm(client) => client.subscribe_load_records().await,
+            Self::Trtllm(client) => client.subscribe_load_records().await,
+            Self::TokenSpeed(client) => client.subscribe_load_records().await,
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Sglang(client) => Ok(ServerInfo::Sglang(Box::new(
