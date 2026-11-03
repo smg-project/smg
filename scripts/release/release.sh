@@ -1020,7 +1020,7 @@ registry_rows() { # <ref> <branch>: the gate's registry rows for the crates and 
 ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, and the test matrix on this very commit (a
   # documentation-only merge runs none, the push trigger's paths-ignore, and the pull request's run was for the merge ref,
   # not the branch head, so a run is required by head sha). 0 when green; 1 when a row is red (a failed or cancelled run,
-  # a read that failed); 2 when a row is pending, absent, or the head is not on the repository gh reads.
+  # no run of the matrix at all, a read that failed); 2 when a row is pending or the head is not on the repository gh reads.
   local head=$1 branch=$2 slug checks runs ok=0 bad=0 pending=0 line read_rc=0 error state=0
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
     # On an API error gh leaves the error body on stdout ({"message": ...}) and exits non-zero: the read is reported
@@ -1063,8 +1063,9 @@ ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, an
         say "[FAIL] PR Test (SMG): the workflow-runs read failed (${error:-gh exited $read_rc}); the runs of $(git rev-parse --short "$head") are at https://github.com/$slug/actions/workflows/pr-test-rust.yml"
         state=1
       elif [ -z "$runs" ]; then
+        # an absent matrix is not a queued one: nothing arrives by waiting
         say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
-        [ "$state" -eq 1 ] || state=2
+        state=1
       elif grep -q '^success ' <<< "$runs"; then
         say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
       else
@@ -1168,6 +1169,7 @@ cmd_ship() {
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   case " $SHIP_STEPS " in *" $from "*) ;; *) die "unknown step '$from': --from takes one of: $SHIP_STEPS" ;; esac
   command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
+  "$GH" auth status >/dev/null 2>&1 || die "'$GH' is not logged in (gh auth login, or GH_TOKEN): the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
   ship_version=$version; ship_release=$(release_of "$version"); ship_branch="release/$ship_release"; ship_tag="v$version"
   [ "$ship_dry" -eq 1 ] || require_identity
   fetch
@@ -1198,7 +1200,7 @@ ship_preflight() { # the CI of the commit the bump builds on: the bump moves ver
   fi
   ci_rows "$parent" "$ship_branch" || ci=$?
   case $ci in
-    1) die "a CI row of $(git rev-parse --short "$parent") is red (above): fix it, or run the matrix again (gh workflow run pr-test-rust.yml --ref $ship_branch), then rerun the ship; --from bump skips this preflight once the state is read by hand" ;;
+    1) die "a CI row of $(git rev-parse --short "$parent") is red (above): fix it, or run the matrix (gh workflow run pr-test-rust.yml --ref $ship_branch), then rerun the ship; --from bump skips this preflight once the state is read by hand" ;;
     2) ship_say "preflight: the pending rows above do not hold the ship (the bump changes version files only and ships on its parent's run)" ;;
   esac
   verifier_rows
@@ -1364,7 +1366,9 @@ ship_notes() { # the notes file the GitHub release carries: NOTES when given, el
     return 0
   else
     mkdir -p "$(dirname "$ship_notes_file")"
-    cmd_notes "$ship_version" > "$ship_notes_file"
+    # rendered beside its place and moved there once whole: a render that stops halfway leaves no file a rerun would keep
+    cmd_notes "$ship_version" > "$ship_notes_file.partial"
+    mv "$ship_notes_file.partial" "$ship_notes_file"
     ship_say "notes: rendered into $ship_notes_file ($(grep -c . "$ship_notes_file") lines)"
   fi
   unfilled=$(notes_unfilled "$ship_notes_file")

@@ -154,9 +154,11 @@ skips what is there, so the same command is run again after an interruption, and
 
 1. `preflight`: the gate's CI rows for the commit the bump builds on (the branch head, or the
    bump's parent when the branch reads the version already). A red row (a failed or cancelled
-   run, a read that failed, a matrix that ended without a success) stops the ship; pending rows
-   are printed and do not hold it: the bump changes version files only and ships on its
-   parent's run. The four verifier lines are printed for the release owner.
+   run, a read that failed, a matrix that ended without a success or never ran on that commit)
+   stops the ship; pending rows are printed and do not hold it: the bump changes version files
+   only and ships on its parent's run. `--from bump` skips the preflight once the state was read
+   by hand. The four verifier lines are printed for the release owner. The ship needs `gh`
+   logged in from its first step: it reads the rules and the runs and opens the release with it.
 2. `bump`: the bump commit (as `release-bump` makes it) on `chore/release-<version>`, the
    versions and the registries checked at it before anything leaves the clone; then the branch
    moves to it. By a push when the repository's rules allow the caller one: no branch protection

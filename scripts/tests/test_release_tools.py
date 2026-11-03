@@ -85,6 +85,7 @@ case "$1 $2" in
     else
       echo "${GH_STUB_PR_STATE:-OPEN}"
     fi ;;
+  "auth status") [ -z "${GH_STUB_AUTH_ERROR-}" ] || { echo "You are not logged into any GitHub hosts." >&2; exit 1; } ;;
   "api user") echo 1 ;;
   "api repos/example/repo/branches/"*) echo "${GH_STUB_PROTECTED:-false}" ;;
   "api repos/example/repo/rules/branches/"*) [ -z "${GH_STUB_RULES-}" ] || printf '%b\n' "$GH_STUB_RULES" ;;
@@ -2158,6 +2159,13 @@ def test_ship_stops_on_a_red_ci_row_and_goes_on_past_a_pending_one(repo: Sandbox
         GH_STUB_RUNS="cancelled https://example.invalid/runs/3",
     )
     assert ended.returncode == 1, "a matrix that ended without a success is red, not pending"
+    absent = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_RUNS="none")
+    assert absent.returncode == 1 and "[FAIL] PR Test (SMG): no run on" in absent.stdout, (
+        "a matrix that never ran is red, not pending: nothing arrives by waiting"
+    )
+    logged_out = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_AUTH_ERROR="1")
+    assert logged_out.returncode == 1 and "is not logged in" in logged_out.stderr
+    assert "preflight" not in logged_out.stdout, "nothing is read before gh is known to answer"
 
 
 def test_ship_refuses_a_tag_elsewhere_and_a_topic_of_a_bump_that_did_not_land(
@@ -2241,6 +2249,29 @@ def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo
     assert broken.returncode == 1
     assert "the publish plan of v1.14.0-rc.2 could not be read" in broken.stderr
     assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+
+
+def test_ship_leaves_no_notes_file_behind_when_the_render_fails(repo: Sandbox) -> None:
+    """The notes are rendered beside their place and moved there once whole: a render that stops halfway
+    leaves no file a rerun would keep as "rendered by an earlier run"."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    first_final = repo.git("rev-parse", "v1.13.0^{commit}")
+    repo.git("push", "--quiet", "origin", ":refs/tags/v1.13.0")
+    repo.git("tag", "-d", "v1.13.0")
+    failed = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", check=False)
+    assert failed.returncode == 1 and "no final release tag below v1.14.0-rc.2" in failed.stderr
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    assert not notes.exists()
+    repo.git("tag", "v1.13.0", first_final)
+    repo.git("push", "--quiet", "origin", "refs/tags/v1.13.0")
+    again = repo.tool("ship", "1.14.0-rc.2", "--from", "notes").stdout
+    assert f"notes: rendered into {notes}" in again
+    assert notes.read_text().startswith("## SMG v1.14.0-rc.2\n")
+    assert not notes.with_name(notes.name + ".partial").exists()
 
 
 # --- a rehearsal: the cut before its push ------------------------------------------------------------
