@@ -337,6 +337,12 @@ jobs:
           if [ -n "$MODE" ]; then
             SUFFIX="${SUFFIX}-${MODE}"
           fi
+          # A grouped ZMQ lane runs the same suite over the same wire with
+          # several engines per worker; its logs are its own.
+          DP="${{ inputs.zmq_engine_count }}"
+          if [ -n "$DP" ] && [ "$DP" -gt 1 ]; then
+            SUFFIX="${SUFFIX}-dp${DP}"
+          fi
           # The worker-side media lane reuses the multimodal test files.
           MM="${{ inputs.mm_processing }}"
           if [ -n "$MM" ]; then
