@@ -115,17 +115,21 @@ jobs:
                  registry/HF download failure, upstream API 5xx
                - regression: assertion/score threshold failures (bfcl/tau2
                  score drops, benchmark deltas), build breaks in our code,
-                 a fuzz campaign row with crashes > 0 or a named breach
-                 class (symphony-fuzz, radix-tree-fuzz), a stress bed
-                 report over its bounds (nightly-grpc-stress)
+                 a symphony-fuzz runner row with crashes > 0 or a named
+                 breach class, a radix-tree-fuzz divergence panic (seed and
+                 op), a gRPC stress bed whose gateway did not come up,
+                 failed its probe or died mid-cell (nightly-grpc-stress)
                - config/env: version conflicts, missing secrets, disk full
             4. Rerun policy (conservative): if AND ONLY IF the failure is a
                clear infra/flake and the run's attempt == 1, rerun it once:
                `gh run rerun <run_id> --repo ${{ github.repository }} --failed`.
                Never rerun regressions or second attempts, and never a fuzz
-               or stress red: a fuzzer is nondeterministic, so a green second
-               attempt proves nothing and would turn the run's conclusion
-               green, hiding the breach from the next day's gather.
+               campaign red: symphony-fuzz is a random search, so a green
+               second attempt proves nothing and would turn the run's
+               conclusion green, hiding the breach from the next day's
+               gather; radix-tree-fuzz is seeded, so a second attempt repeats
+               the divergence. A stress bed red whose cause is a download or
+               the runner is an infra/flake like any other.
             5. Report per workflow in the rolling issue:
                - If it exists, add a comment titled with today's date holding
                  the day's triage (classification, key log lines, action
