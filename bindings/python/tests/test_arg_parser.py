@@ -13,8 +13,12 @@ from unittest.mock import patch
 
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
-from smg.router import Router, policy_from_str
-from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
+from smg.router import Router, backend_from_str, policy_from_str
+from smg.smg_rs import (
+    BackendType,
+    get_available_reasoning_parsers,
+    get_available_tool_call_parsers,
+)
 
 
 class TestRouterArgs:
@@ -595,6 +599,18 @@ class TestPolicyFromStr:
         """Test conversion of invalid policy string."""
         with pytest.raises(KeyError):
             policy_from_str("invalid_policy")
+
+
+class TestBackendChoices:
+    """``--backend`` takes the Rust CLI's seven names, so the Gemini provider
+    route and the TensorRT-LLM label can be chosen from Python and the chart."""
+
+    @pytest.mark.parametrize(
+        "name", ["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"]
+    )
+    def test_every_cli_backend_parses_and_converts(self, name):
+        assert parse_router_args(["--backend", name]).backend == name
+        assert backend_from_str(name) == getattr(BackendType, name.capitalize())
 
 
 class TestParseRouterArgs:

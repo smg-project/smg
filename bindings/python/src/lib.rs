@@ -59,6 +59,12 @@ pub enum BackendType {
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
+    /// TensorRT-LLM engine, as the CLI's `--backend trtllm`: routing behaves
+    /// like the default and no wire is pinned (its servicer speaks gRPC).
+    Trtllm,
+    /// The Gemini provider route (`RoutingMode::Gemini`), as the CLI's
+    /// `--backend gemini`.
+    Gemini,
 }
 
 #[pyclass(eq, from_py_object)]
@@ -951,6 +957,10 @@ impl Router {
             }
         } else if matches!(self.backend, BackendType::Anthropic) {
             RoutingMode::Anthropic {
+                worker_urls: self.worker_urls.clone(),
+            }
+        } else if matches!(self.backend, BackendType::Gemini) {
+            RoutingMode::Gemini {
                 worker_urls: self.worker_urls.clone(),
             }
         } else if self.epd_disaggregation {
