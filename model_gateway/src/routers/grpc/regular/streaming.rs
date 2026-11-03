@@ -765,10 +765,15 @@ impl StreamingProcessor {
 
                     let current_completion_tokens = usage.record_chunk(&chunk);
 
-                    // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
+                    // Decode tokens to text (skip_special_tokens=true to handle
+                    // newlines correctly). A piece the tokenizer cannot decode
+                    // fails the stream, as it does the chat stream and the
+                    // collected generate answer: an empty piece would reach the
+                    // client as the model's own text, with nothing logged or
+                    // counted.
                     let chunk_text = tokenizer
                         .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                        .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
 
                     // Accumulate text for this index
                     let choice = choices
@@ -971,10 +976,11 @@ impl StreamingProcessor {
 
                     let current_completion_tokens = usage.record_chunk(&chunk);
 
-                    // Decode tokens to text
+                    // Decode tokens to text; a piece the tokenizer cannot decode
+                    // fails the stream (see `process_generate_streaming`).
                     let chunk_text = tokenizer
                         .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                        .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
 
                     // Accumulate text for this index
                     let choice = choices
