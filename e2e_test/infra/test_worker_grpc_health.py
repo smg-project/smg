@@ -21,8 +21,15 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from infra import constants
 from infra import worker as worker_module
-from infra.constants import DEFAULT_HOST, ENV_SHOW_WORKER_LOGS, ConnectionMode, host_port
+from infra.constants import (
+    DEFAULT_HOST,
+    ENV_SHOW_WORKER_LOGS,
+    ENV_TRTLLM_SERVICER_IMPL,
+    ConnectionMode,
+    host_port,
+)
 from infra.worker import Worker
 
 pytest.importorskip("grpc")
@@ -34,6 +41,14 @@ _SETTINGS, _HEADERS = 0x4, 0x1
 _ACK, _END_STREAM, _END_HEADERS = 0x1, 0x1, 0x4
 # HPACK indexed header field: static table entry 13 is ``:status: 404``.
 _STATUS_404 = b"\x8d"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_trt_lane(monkeypatch):
+    """Native TRT unless this test selects a lane or package default."""
+    monkeypatch.delenv(ENV_TRTLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.delenv("SMG_TRTLLM_SERVICER_IMPL", raising=False)
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: None)
 
 
 def _frame(kind: int, flags: int, stream_id: int, payload: bytes = b"") -> bytes:
@@ -468,6 +483,39 @@ def test_trt_startup_sleep_cannot_extend_original_budget(monkeypatch):
     assert probes == [(0.125, 100.125)]
     assert sleeps == pytest.approx([0.1])
     assert clock.now == 100.125
+
+
+def test_a_trtllm_worker_on_the_rust_servicer_needs_the_health_service(monkeypatch):
+    """On the Rust servicer (``E2E_TRTLLM_SERVICER_IMPL=rust``) the worker
+    hosts grpc.health.v1 like every engine servicer, so a ready channel
+    without it is a stranger on the port, not this worker."""
+    monkeypatch.setenv(ENV_TRTLLM_SERVICER_IMPL, "rust")
+    with grpc_listener(None) as port:
+        assert _worker(port, engine="trtllm").grpc_serving() is False
+    with grpc_listener("SERVING") as port:
+        assert _worker(port, engine="trtllm").grpc_serving() is True
+
+
+def test_a_trtllm_rust_servicer_rejects_native_health_only(trt_model, monkeypatch):
+    monkeypatch.setenv(ENV_TRTLLM_SERVICER_IMPL, "rust")
+    with trt_listener() as (port, calls):
+        assert _trt_worker(port).grpc_serving() is False
+        assert calls == []
+
+
+def test_a_trtllm_package_rust_default_uses_standard_health(monkeypatch):
+    monkeypatch.setattr(
+        constants,
+        "_package_servicer_switch",
+        lambda: lambda variable, environ=None, **_: ("rust", "default"),
+    )
+
+    def unexpected_model_lookup(_model_id):
+        raise AssertionError("the Rust health service needs no native model lookup")
+
+    monkeypatch.setattr(worker_module, "get_model_spec", unexpected_model_lookup)
+    with grpc_listener("SERVING") as port:
+        assert _worker(port, engine="trtllm").grpc_serving() is True
 
 
 # The log of a worker that found its port taken when it came to bind it: the

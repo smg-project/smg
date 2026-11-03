@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
     ENV_VLLM_SERVICER_IMPL,
+    ENV_WORKER_RUST_LOG,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
@@ -38,6 +39,7 @@ from .constants import (
     host_port,
     moriio_host,
     sglang_transfer_backend,
+    trtllm_runs_engines_own_servicer,
     vllm_kv_backend,
     vllm_moriio_backend,
     vllm_moriio_mode,
@@ -833,16 +835,39 @@ class Worker:
         return cmd
 
     def _build_trtllm_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
-        """Build TensorRT-LLM gRPC server command."""
-        # Create config file to enable xgrammar guided decoding
-        config_path = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
-        )
-        config = {"guided_decoding_backend": "xgrammar"}
-        config.update(spec.get("trtllm_extra_config", {}))
-        yaml.dump(config, config_path, default_flow_style=False)
-        config_path.close()
+        """Build the TensorRT-LLM gRPC worker command: this repository's
+        launcher serving the Rust servicer when the lane says ``rust``
+        (``E2E_TRTLLM_SERVICER_IMPL``), else the engine's own gRPC server.
 
+        The engine release the lane pins carries no servicer switch, so for
+        this engine the choice is the command, not a variable the engine's
+        entrypoint reads (``_build_env`` exports it all the same, for the
+        launcher). Both commands take the same LLM API options, xgrammar
+        guided decoding and the spec's ``trtllm_extra_config``, from a YAML
+        file.
+        """
+        options = {"guided_decoding_backend": "xgrammar"}
+        options.update(spec.get("trtllm_extra_config", {}))
+        if trtllm_runs_engines_own_servicer():
+            return self._build_trtllm_engine_cmd(model_path, tp_size, spec, options)
+        return self._build_trtllm_launcher_cmd(model_path, tp_size, spec, options)
+
+    @staticmethod
+    def _write_trtllm_options(options: dict) -> str:
+        """Write the LLM API options to a YAML file (the shape of the engine's
+        ``--extra_llm_api_options``, which the launcher's ``--llm-args @file``
+        reads as well) and return its path."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
+        ) as options_file:
+            yaml.dump(options, options_file, default_flow_style=False)
+        return options_file.name
+
+    def _build_trtllm_engine_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """The engine's own gRPC server (``tensorrt_llm.commands.serve``),
+        with the spec's ``trtllm_args`` as its CLI's flags."""
         cmd = [
             "python3",
             "-m",
@@ -859,12 +884,48 @@ class Worker:
             "--tp_size",
             str(tp_size),
             "--extra_llm_api_options",
-            config_path.name,
+            self._write_trtllm_options(options),
         ]
         extra = spec.get("trtllm_args", [])
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_trtllm_launcher_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """This repository's launcher (``smg_grpc_servicer.trtllm``) with the
+        Rust servicer. The LLM API's keywords ride ``--llm-args``, the
+        parallel size among them: the launcher has no engine flags of its
+        own and hands none through, so a spec's ``trtllm_args`` (the engine
+        CLI's flags) are refused by name rather than dropped."""
+        extra = spec.get("trtllm_args", [])
+        if extra:
+            raise ValueError(
+                f"the spec's trtllm_args {extra} are the engine CLI's flags, which the "
+                "launcher does not take; name the LLM API keyword in trtllm_extra_config"
+            )
+        options = {**options, "tensor_parallel_size": tp_size}
+        return [
+            "python3",
+            "-m",
+            "smg_grpc_servicer.trtllm",
+            "--model",
+            model_path,
+            "--host",
+            DEFAULT_HOST,
+            "--port",
+            str(self.port),
+            "--servicer-impl",
+            "rust",
+            "--llm-args",
+            f"@{self._write_trtllm_options(options)}",
+        ]
+
+    def _serves_no_standard_health(self) -> bool:
+        """Only TRT's own server uses native health RPCs; its Rust servicer
+        hosts ``grpc.health.v1`` like the other repository servicers."""
+        return self.engine == "trtllm" and trtllm_runs_engines_own_servicer()
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the worker process."""
@@ -989,6 +1050,12 @@ class Worker:
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
 
+        # The lane's tracing filter for the Rust servicer this worker hosts (the
+        # per-request line's target, say); the shell's own RUST_LOG yields to it,
+        # the worker's extra_env below still wins.
+        if worker_rust_log := os.environ.get(ENV_WORKER_RUST_LOG, "").strip():
+            env["RUST_LOG"] = worker_rust_log
+
         if self.extra_env:
             env.update(self.extra_env)
         return env
@@ -1085,12 +1152,12 @@ class Worker:
     def grpc_serving(self, timeout: float = 5.0, *, _deadline: float | None = None) -> bool:
         """Require the engine's health answer, within one probe deadline.
 
-        TRT-LLM has its own HealthCheck, without ``grpc.health.v1``. It must
-        also name the model passed to its launcher: a ready channel, another
-        service's UNIMPLEMENTED, or a different model on the chosen port is
-        not this worker. Other engines require the standard SERVING answer.
+        TRT's own server must answer its HealthCheck and name the launched
+        model. The Rust TRT servicer and other repository servicers require
+        the standard SERVING answer.
         """
-        if self.engine == "trtllm":
+        native_trt = self._serves_no_standard_health()
+        if native_trt:
             deadline = time.monotonic() + timeout
             if _deadline is not None:
                 deadline = min(deadline, _deadline)
@@ -1104,7 +1171,7 @@ class Worker:
 
         channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
-            if self.engine == "trtllm":
+            if native_trt:
                 try:
                     from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
                 except ImportError as error:
