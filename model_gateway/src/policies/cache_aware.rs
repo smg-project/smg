@@ -3444,14 +3444,12 @@ impl CacheAwarePolicy {
             let entries = placements.len();
             total += entries;
             Metrics::set_cache_placement_entries(&model_id, entries);
-            if let Some(oldest) = oldest {
-                Metrics::set_cache_tree_retention_seconds(
-                    &model_id,
-                    "hash",
-                    role,
-                    oldest.as_secs(),
-                );
-            }
+            Metrics::set_cache_tree_retention_seconds(
+                &model_id,
+                "hash",
+                role,
+                oldest.map_or(0, |age| age.as_secs()),
+            );
         }
         total
     }
