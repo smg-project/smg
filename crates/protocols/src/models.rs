@@ -78,6 +78,7 @@ mod tests {
 
     use super::*;
 
+    /// Representative engine object, including nullable and unknown extensions.
     fn engine_model() -> Value {
         json!({
             "id": "served-model", "object": "model", "created": 123,
@@ -88,6 +89,7 @@ mod tests {
         })
     }
 
+    /// List and single-model responses retain the complete public engine object.
     #[test]
     fn discovered_model_preserves_engine_fields_and_unknown_extensions() {
         let expected = engine_model();
@@ -101,6 +103,7 @@ mod tests {
         );
     }
 
+    /// Cards without discovery keep the old shape without leaking operator metadata.
     #[test]
     fn undiscovered_card_keeps_existing_shape_and_private_metadata_private() {
         let card = ModelCard::new("local").with_metadata(json!({"internal": "operator-only"}));
@@ -112,6 +115,7 @@ mod tests {
         );
     }
 
+    /// Aliases and reserved keys cannot replace the registry identity.
     #[test]
     fn registry_identity_wins_for_aliases_and_reserved_extension_keys() {
         let mut card = ModelCard::new("friendly-alias");
@@ -128,6 +132,7 @@ mod tests {
         assert_eq!(raw.matches("\"id\":").count(), 2); // model plus permission id
     }
 
+    /// Replica deduplication chooses a complete first card without mixing fields.
     #[test]
     fn replica_deduplication_keeps_one_complete_object_not_a_fieldwise_merge() {
         let mut first = ModelCard::new("served-model");

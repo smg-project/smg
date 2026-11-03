@@ -668,8 +668,10 @@ pub(super) fn model_card_for_labels(
     labels_before: &HashMap<String, String>,
     labels_now: &HashMap<String, String>,
 ) -> (ModelCard, Vec<&'static str>) {
-    let before = card_from_labels(None, &card.id, labels_before);
-    let now = card_from_labels(None, &card.id, labels_now);
+    let mut before = card_from_labels(None, &card.id, labels_before);
+    let mut now = card_from_labels(None, &card.id, labels_now);
+    before.upstream_model = model_object_from_labels(&card.id, labels_before, card.owned_by());
+    now.upstream_model = model_object_from_labels(&card.id, labels_now, card.owned_by());
     let mut next = card.clone();
     let mut changed = Vec::new();
     macro_rules! follow {
@@ -695,6 +697,36 @@ pub(super) fn model_card_for_labels(
     (next, changed)
 }
 
+/// Read only the requested model, defaulting absent/null core fields from its card.
+/// Invalid sibling objects and oversized labels cannot affect the selected model.
+fn model_object_from_labels(
+    model_id: &str,
+    labels: &HashMap<String, String>,
+    owned_by: &str,
+) -> Option<openai_protocol::models::ModelObject> {
+    labels
+        .get(super::discover_metadata::MODEL_OBJECTS_LABEL)
+        .filter(|raw| raw.len() <= super::discover_metadata::MAX_MODEL_OBJECTS_BYTES)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|mut models| models.as_object_mut()?.remove(model_id))
+        .and_then(|mut model| {
+            // Normalize only the selected object: an invalid sibling must not
+            // discard its metadata, and null core fields mean unspecified.
+            let fields = model.as_object_mut()?;
+            for (key, default) in [
+                ("object", serde_json::json!("model")),
+                ("created", serde_json::json!(0)),
+                ("owned_by", serde_json::json!(owned_by)),
+            ] {
+                let value = fields.entry(key).or_insert(serde_json::Value::Null);
+                if value.is_null() {
+                    *value = default;
+                }
+            }
+            serde_json::from_value(model).ok()
+        })
+}
+
 /// `operator_card` completed from the labels, or a card from the labels alone.
 fn card_from_labels(
     operator_card: Option<&ModelCard>,
@@ -707,13 +739,7 @@ fn card_from_labels(
         .unwrap_or_else(|| ModelCard::new(model_id));
 
     if card.upstream_model.is_none() {
-        card.upstream_model = labels
-            .get(super::discover_metadata::MODEL_OBJECTS_LABEL)
-            .and_then(|raw| {
-                serde_json::from_str::<HashMap<String, openai_protocol::models::ModelObject>>(raw)
-                    .ok()
-            })
-            .and_then(|mut models| models.remove(model_id));
+        card.upstream_model = model_object_from_labels(model_id, labels, card.owned_by());
     }
 
     if let Some(mt) = labels.get("model_type") {
@@ -1163,6 +1189,54 @@ fn validate_zmq_dp(
 mod tests {
     use super::*;
     use crate::test_support::RefusedAddress;
+
+    /// Missing/null core fields retain extensions and use the card's provider;
+    /// invalid siblings are isolated, and refresh preserves these defaults.
+    #[test]
+    fn model_metadata_defaults_and_refresh_are_provider_aware() {
+        use openai_protocol::worker::ProviderType;
+        use serde_json::json;
+
+        use super::super::discover_metadata::{MAX_MODEL_OBJECTS_BYTES, MODEL_OBJECTS_LABEL};
+
+        for core in [
+            json!({}),
+            json!({"object": null, "created": null, "owned_by": null}),
+        ] {
+            let mut model = json!({"id": "served", "parent": null, "extra": [1, 2]});
+            model
+                .as_object_mut()
+                .unwrap()
+                .extend(core.as_object().unwrap().clone());
+            let labels = HashMap::from([(
+                MODEL_OBJECTS_LABEL.into(),
+                json!({"served": model, "broken": {"id": 42}}).to_string(),
+            )]);
+            let operator = ModelCard::new("served").with_provider(ProviderType::OpenAI);
+            let card = card_from_labels(Some(&operator), "served", &labels);
+            let object = serde_json::to_value(card.clone().into_model_object()).unwrap();
+            assert_eq!(
+                object,
+                json!({"id": "served", "object": "model", "created": 0,
+                "owned_by": "openai", "parent": null, "extra": [1, 2]})
+            );
+            let after = HashMap::from([(
+                MODEL_OBJECTS_LABEL.into(),
+                json!({"served": {"id": "served", "owned_by": "engine", "extra": 3}}).to_string(),
+            )]);
+            let (refreshed, changed) = model_card_for_labels(&card, &labels, &after);
+            assert!(changed.contains(&"upstream_model"));
+            assert_eq!(refreshed.into_model_object().owned_by, "engine");
+        }
+        let oversized = HashMap::from([(
+            MODEL_OBJECTS_LABEL.into(),
+            json!({"served": {"id": "served", "extra": "x".repeat(MAX_MODEL_OBJECTS_BYTES)}})
+                .to_string(),
+        )]);
+        assert!(card_from_labels(None, "served", &oversized)
+            .upstream_model
+            .is_none());
+    }
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it
