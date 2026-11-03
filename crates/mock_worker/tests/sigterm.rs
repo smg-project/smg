@@ -120,23 +120,8 @@ impl Mock {
 
     /// Wait up to `limit` for the exit; a process still alive by then is
     /// killed and the test fails. Returns the exit status, when it happened
-    /// and the process's log.
-    ///
-    /// The wait blocks the calling thread. A test that holds a client of the
-    /// process open on a tokio runtime calls it on the multi-thread flavor,
-    /// where the client's connection task keeps running on a worker thread:
-    /// the process's gRPC server closes a connection only after the client
-    /// answers the PING of its graceful shutdown, so a client stopped by this
-    /// wait would hold the connection, and with it the drain, to the deadline.
-    fn exit(mut self, limit: Duration) -> (ExitStatus, Instant, String) {
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            assert_eq!(
-                runtime.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread,
-                "the wait for the exit blocks this thread: a test on a tokio runtime \
-                 runs on the multi-thread flavor so its client stays served"
-            );
-        }
+    /// and the process's log. Async polling keeps connection tasks scheduled.
+    async fn exit(mut self, limit: Duration) -> (ExitStatus, Instant, String) {
         let deadline = Instant::now() + limit;
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait") {
@@ -150,23 +135,31 @@ impl Mock {
                 let log = self.stdout.join().expect("stdout reader");
                 panic!("the mock worker did not exit within {limit:?}; log:\n{log}");
             }
-            thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 }
 
 /// The ports stop accepting connections soon after the signal.
-fn assert_refuses_connections(port: u16) {
+async fn assert_refuses_connections(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if TcpStream::connect_timeout(&addr(port), Duration::from_millis(200)).is_err() {
+        let accepts = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(addr(port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !accepts {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "port {port} still accepted connections 3 s after the signal"
         );
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -215,11 +208,11 @@ async fn drain_generate(
     delivered
 }
 
-#[test]
-fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
+#[tokio::test]
+async fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
     let mock = Mock::start(&[]);
     let sent = mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(2),
@@ -233,11 +226,11 @@ fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
     assert!(log.contains("drained; exiting"), "log:\n{log}");
 }
 
-#[test]
-fn sigint_is_handled_the_same_way() {
+#[tokio::test]
+async fn sigint_is_handled_the_same_way() {
     let mock = Mock::start(&[]);
     let sent = mock.signal("INT");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(2),
@@ -292,8 +285,8 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
 
     let sent = mock.signal("TERM");
     // No new connection from the signal on, on either worker.
-    assert_refuses_connections(mock.grpc_port);
-    assert_refuses_connections(mock.http_port);
+    assert_refuses_connections(mock.grpc_port).await;
+    assert_refuses_connections(mock.http_port).await;
 
     // The streams already running are served to their end.
     let delivered = drain_generate(
@@ -324,7 +317,7 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
         "the HTTP stream ended with its finish frame and [DONE]:\n{body}"
     );
 
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(4),
@@ -361,7 +354,7 @@ async fn the_drain_deadline_bounds_the_exit() {
     grpc.next().await.expect("a first frame").expect("ok");
 
     let sent = mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     let took = exited - sent;
     assert!(
@@ -420,7 +413,7 @@ async fn sigterm_ends_a_kv_event_subscription_held_open() {
     })
     .await;
     assert!(ended.is_ok(), "the subscription ends at the stop");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     eprintln!(
         "kv subscription held open: exit {:?} after SIGTERM",
@@ -450,9 +443,9 @@ async fn a_second_signal_during_the_drain_exits_at_once() {
     grpc.next().await.expect("a first frame").expect("ok");
 
     let first = mock.signal("TERM");
-    thread::sleep(Duration::from_millis(300));
+    tokio::time::sleep(Duration::from_millis(300)).await;
     mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - first < Duration::from_secs(2),
@@ -552,7 +545,7 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     let sent = mock.signal("TERM");
     // The stop is in effect once a port refuses connections: the drain's
     // count is logged before anything else of this test reaches the rank.
-    assert_refuses_connections(mock.grpc_port);
+    assert_refuses_connections(mock.grpc_port).await;
     // The frontend gives the long request up during the drain: its Abort
     // reaches the rank, whose forwarder for it is cancelled, and the queued
     // request takes its place in the engine.
@@ -579,7 +572,7 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     );
     assert_eq!(tokens, 40, "every token of the drained request arrived");
 
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(4),
