@@ -9,6 +9,11 @@ use crate::{
     vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
 
+/// The image placeholder the chat template writes once per image, the one
+/// token the expansion repeats; `image_token_id` in the config names its id.
+/// Qwen3-Omni (`super::qwen3_omni`) answers the same spelling.
+pub(super) const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+
 pub(super) struct QwenVLVisionSpec;
 
 impl QwenVLVisionSpec {
@@ -36,7 +41,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|image_pad|>".to_string())
+        Ok(IMAGE_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
