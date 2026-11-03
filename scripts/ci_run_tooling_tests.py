@@ -23,6 +23,8 @@ REGRESSIONS = (
     ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
     ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_startup_timeout.py"),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_parallel_start.py"),
     ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
 )
 
