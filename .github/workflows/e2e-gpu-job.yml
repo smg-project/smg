@@ -44,6 +44,11 @@ on:
         type: string
         default: ""
         description: "Extra model ids to download by id (space-separated), for skip_tier_download models"
+      startup_profile:
+        required: false
+        type: string
+        default: ""
+        description: "Optional declared startup profile; blank preserves ordinary startup behavior"
       parser:
         required: false
         type: string
@@ -151,6 +156,7 @@ jobs:
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
+      E2E_STARTUP_PROFILE: ${{ inputs.startup_profile }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_VLLM_MORIIO_MODE: ${{ inputs.vllm_moriio_mode }}
