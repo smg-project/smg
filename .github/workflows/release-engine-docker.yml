@@ -61,7 +61,7 @@ on:
 env:
   # The SMG release the images are built from on a dispatch that names no commit.
   # scripts/check_release_versions.py reads and bumps this line.
-  SMG_RELEASE_TAG: v1.14.0-rc.2
+  SMG_RELEASE_TAG: v1.14.0
 
 permissions:
   contents: read
