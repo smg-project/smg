@@ -138,11 +138,13 @@ struct InFlight<O> {
     prompt_tokens: u64,
     handed: bool,
     started: bool,
-    /// A lockstep group that drained while this prompt was still unanswered
-    /// was woken again on its behalf ([`RequestRegistry::rewake_due`]): once
-    /// per prompt, so a prompt the holder never schedules ends by the
+    /// How many times a lockstep group that drained while this prompt was
+    /// still unanswered was woken again on its behalf
+    /// ([`RequestRegistry::take_rewake`]): [`DRAIN_REWAKES_PER_PROMPT`] at
+    /// most, so a holder whose add is late through more than one wave is
+    /// still served and a prompt the holder never schedules ends by the
     /// silence watchdog instead of cycling waves.
-    rewoken: bool,
+    rewakes: u8,
     every_step: bool,
 }
 
@@ -210,7 +212,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 prompt_tokens,
                 handed: false,
                 started: false,
-                rewoken: false,
+                rewakes: 0,
                 every_step,
             },
         );
@@ -371,17 +373,17 @@ impl<O: EngineOutput> RequestRegistry<O> {
         self.prefill_pending
     }
 
-    /// Whether a prompt the engine was handed is still unanswered and has not
-    /// had the drain re-wake yet: a request whose add frame the engine
-    /// accepted, whose first output has not come, and on whose behalf no
-    /// wake went out after a drain. Every such prompt is marked as woken
-    /// here, so one wake covers them all and a prompt never answered buys
-    /// one re-wake and no more.
-    fn rewake_due(&mut self) -> bool {
+    /// Whether a prompt the engine was handed is still unanswered with a
+    /// drain re-wake left to spend: a request whose add frame the engine
+    /// accepted, whose first output has not come, and on whose behalf fewer
+    /// than [`DRAIN_REWAKES_PER_PROMPT`] wakes went out after a drain. Every
+    /// such prompt spends one here, so one wake covers them all and a prompt
+    /// never answered buys that many re-wakes and no more.
+    fn take_rewake(&mut self) -> bool {
         let mut due = false;
         for entry in self.requests.values_mut() {
-            if entry.handed && !entry.started && !entry.rewoken {
-                entry.rewoken = true;
+            if entry.handed && !entry.started && entry.rewakes < DRAIN_REWAKES_PER_PROMPT {
+                entry.rewakes += 1;
                 due = true;
             }
         }
@@ -1080,15 +1082,18 @@ impl<P: EngineProtocol> ClientInner<P> {
                 // wakes its peers again, and the silence watchdog ends the
                 // group. So the group is woken once more, at a fresh wave.
                 // Every rank reports the drain: the report that moves the
-                // clock wakes, the rest find it moved. Once per prompt: a
-                // prompt the holder never schedules (an add the engine
-                // dropped while staying alive) buys one extra round, then
-                // the group stays parked and the silence watchdog ends it as
-                // it did before; every frame of the round would otherwise
-                // reset the watchdog and the group would cycle waves for
-                // good. Nothing pending, nothing sent: an idle group stays
-                // parked.
-                if advanced && self.registry.lock().rewake_due() {
+                // clock wakes, the rest find it moved. A few times per
+                // prompt (`DRAIN_REWAKES_PER_PROMPT`): the holder's add can
+                // still be unread at the re-woken wave's first finish-sync
+                // (a large add slowly preprocessed, the input thread starved
+                // by the dummy steps), and the group parks again; a prompt
+                // the holder never schedules (an add the engine dropped
+                // while staying alive) buys those extra rounds, then the
+                // group stays parked and the silence watchdog ends it as it
+                // did before; every frame of a round would otherwise reset
+                // the watchdog and the group would cycle waves for good.
+                // Nothing pending, nothing sent: an idle group stays parked.
+                if advanced && self.registry.lock().take_rewake() {
                     self.queue_wake(wave, "a prompt pending through a drained wave");
                 }
             }
@@ -1783,6 +1788,20 @@ fn far_future() -> Instant {
 /// the prompt it was handed: 500 s per million pending prompt tokens on top of
 /// the window, nothing with nothing pending.
 pub const ENGINE_PREFILL_TOKENS_PER_SEC: u64 = 2_000;
+
+/// How many times a lockstep group that drains while a prompt it was handed
+/// is still unanswered is woken again on that prompt's behalf
+/// (`ClientInner::observe_wave`, `RequestRegistry::take_rewake`). One round
+/// covers the drain racing the submit's wake; the holder's input thread can
+/// hand a large or slowly preprocessed add to its loop later still, past the
+/// first finish-sync of the re-woken wave, and each wave the add is late
+/// through costs one more. The cap keeps a prompt the holder never schedules
+/// (an add the engine dropped while staying alive) to this many rounds of a
+/// dummy wave before the group stays parked and the silence watchdog ends
+/// it, as it did before the re-wake existed; each round's reports reset the
+/// watchdog, so a larger cap defers that verdict by as many sync periods and
+/// a smaller one gives up on a late add sooner.
+const DRAIN_REWAKES_PER_PROMPT: u8 = 3;
 
 /// How long local admission to a full zeromq peer queue may stall before the
 /// engine is treated as dead. A pause the send window outlasts fails the

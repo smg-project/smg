@@ -1291,46 +1291,121 @@ async fn wave_complete_updates_the_clock_without_waking() {
 #[tokio::test]
 async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_again() {
     let (client, mut engines, _ns) = connect_ranks(2, true).await;
-
-    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
-    match engines[0].recv().await.unwrap() {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
-        other => panic!("rank 0 expected the Add, got {other:?}"),
-    }
-    let first = next_wake(&mut engines[0]).await;
-    assert_eq!(next_wake(&mut engines[1]).await, first);
+    let (mut stream, first) = submitted_to_the_group(&client, &mut engines, "req-1", 0).await;
 
     // Both ranks report the wave drained: they parked before the holder's
     // loop read the add, the prompt still unanswered.
+    let again = drained_then_woken_again(&mut engines, first, "its drain").await;
+
+    // The holder answers and finishes the prompt: the next drain is
+    // bookkeeping again, and the group stays parked.
+    answered_prompt_leaves_the_group_parked(&client, &mut engines, &mut stream, "req-1", 0, again)
+        .await;
+
+    // A later prompt is owed its own re-wake: the bound is per prompt, not
+    // per group.
+    let (_second, second) = submitted_to_the_group(&client, &mut engines, "req-2", 1).await;
+    drained_then_woken_again(&mut engines, second, "the second prompt's drain").await;
+}
+
+/// The holder's add can be late through more than one wave: its input
+/// thread is still preprocessing the add while the re-woken group runs its
+/// dummy steps (a large add, or the thread starved by those steps), so the
+/// group reaches its next finish-sync with the add unread, parks a second
+/// time and reports a second drain. The re-wake is owed again then, a few
+/// times per prompt, so the add is served when the holder's loop reads it at
+/// last; answered, the prompt leaves a drained wave the bookkeeping it is.
+#[tokio::test]
+async fn a_holder_whose_add_is_still_unread_after_the_rewoken_wave_is_woken_again() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let (mut stream, first) = submitted_to_the_group(&client, &mut engines, "req-1", 0).await;
+
+    // Two parks in a row with the add unread through both: each drain pair
+    // is answered by one wake on every rank, above the wave the ranks
+    // parked on. The second park is the one a single re-wake per prompt
+    // left to the silence watchdog.
+    let again = drained_then_woken_again(&mut engines, first, "the first park's drain").await;
+    let once_more = drained_then_woken_again(&mut engines, again, "the second park's drain").await;
+
+    // The holder's loop reads the add at last and answers it: the next
+    // drain is bookkeeping again, and the group stays parked.
+    answered_prompt_leaves_the_group_parked(
+        &client,
+        &mut engines,
+        &mut stream,
+        "req-1",
+        0,
+        once_more,
+    )
+    .await;
+}
+
+/// Submit `request_id` pinned to `rank` on a two-rank lockstep group: the
+/// rank reads its add and every rank the wake, whose wave is returned with
+/// the request's stream.
+async fn submitted_to_the_group(
+    client: &EngineCoreClient,
+    engines: &mut [MockEngine],
+    request_id: &str,
+    rank: u32,
+) -> (EngineCoreStream, u64) {
+    let stream = client.submit(request_for(request_id, rank)).await.unwrap();
+    match engines[rank as usize].recv().await.unwrap() {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+        other => panic!("rank {rank} expected the Add, got {other:?}"),
+    }
+    let wave = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wave);
+    (stream, wave)
+}
+
+/// Both ranks report the wave they `parked` on drained while the handed
+/// prompt is still unanswered: the group is woken again, once for the park,
+/// above that wave on every rank. Returns the wave of the wake; `drain`
+/// names the report in the failure messages.
+async fn drained_then_woken_again(engines: &mut [MockEngine], parked: u64, drain: &str) -> u64 {
     for rank in 0..2u32 {
         engines[rank as usize]
-            .send_output(wave_control(rank, DpControlMessage::WaveComplete(first)))
+            .send_output(wave_control(rank, DpControlMessage::WaveComplete(parked)))
             .await
             .unwrap();
     }
     let again = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
         .await
-        .expect("the group was not woken again after its drain");
+        .unwrap_or_else(|_| panic!("the group was not woken again after {drain}"));
     assert!(
-        again > first,
-        "the second wake {again} does not outrank the parked ranks at {}",
-        first + 1
+        again > parked,
+        "wake {again} after {drain} does not outrank the parked ranks at {}",
+        parked + 1
     );
     assert_eq!(
         tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
             .await
-            .expect("rank 1 was not woken again after its drain"),
-        again
+            .unwrap_or_else(|_| panic!("rank 1 was not woken again after {drain}")),
+        again,
+        "the ranks of one park share one wake"
     );
+    again
+}
 
-    // The holder answers and finishes the prompt: the next drain is
-    // bookkeeping again, and the group stays parked. Nothing else may have
-    // reached a rank meanwhile: the two reports of one park were one wake.
-    engines[0]
+/// The holder, `rank`, answers and finishes `request_id`: the next drain, of
+/// the wave the group `parked` on, is bookkeeping again and the group stays
+/// parked. Nothing else may have reached the other rank meanwhile: the
+/// reports of one park were one wake.
+async fn answered_prompt_leaves_the_group_parked(
+    client: &EngineCoreClient,
+    engines: &mut [MockEngine],
+    stream: &mut EngineCoreStream,
+    request_id: &str,
+    rank: u32,
+    parked: u64,
+) {
+    let other = (1 - rank) as usize;
+    engines[rank as usize]
         .send_output(batch(
-            0,
+            rank,
             EngineCoreOutput {
-                request_id: "req-1".into(),
+                request_id: request_id.into(),
                 new_token_ids: vec![10],
                 finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..Default::default()
@@ -1344,60 +1419,35 @@ async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_agai
         .unwrap()
         .is_ok());
     assert!(stream.next().await.is_none());
-    engines[0]
-        .send_output(wave_control(0, DpControlMessage::WaveComplete(again)))
+    engines[rank as usize]
+        .send_output(wave_control(rank, DpControlMessage::WaveComplete(parked)))
         .await
         .unwrap();
     tokio::time::timeout(TIMEOUT, async {
-        while *client.inner.wave.as_ref().unwrap().lock() <= again {
+        while *client.inner.wave.as_ref().unwrap().lock() <= parked {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .expect("the drained wave never reached the clock");
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), engines[1].recv())
+        tokio::time::timeout(Duration::from_millis(100), engines[other].recv())
             .await
             .is_err(),
         "a drained wave with nothing pending woke the group"
     );
-
-    // A later prompt is owed its own re-wake: the bound is per prompt, not
-    // per group.
-    let _second = client.submit(request_for("req-2", 1)).await.unwrap();
-    match engines[1].recv().await.unwrap() {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "req-2"),
-        other => panic!("rank 1 expected the Add, got {other:?}"),
-    }
-    let second = next_wake(&mut engines[0]).await;
-    assert_eq!(next_wake(&mut engines[1]).await, second);
-    for rank in 0..2u32 {
-        engines[rank as usize]
-            .send_output(wave_control(rank, DpControlMessage::WaveComplete(second)))
-            .await
-            .unwrap();
-    }
-    let rewoken = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
-        .await
-        .expect("the group was not woken again for the second prompt");
-    assert!(rewoken > second);
-    assert_eq!(
-        tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
-            .await
-            .expect("rank 1 was not woken again for the second prompt"),
-        rewoken
-    );
 }
 
-/// The re-wake is bounded, once per handed prompt, so the silence watchdog
-/// stays the last resort: a prompt the holder never schedules (an add the
-/// engine dropped while every rank stays healthy and answers each wake with
-/// a drain) buys one extra round, after which the group stays parked and the
-/// client declares the engine dead at the window, as it did before the
-/// re-wake existed. Unbounded, every drain would wake the group again and
-/// every report of the round would reset the watchdog, for good.
+/// The re-wake is bounded, a few times per handed prompt, so the silence
+/// watchdog stays the last resort: a prompt the holder never schedules (an
+/// add the engine dropped while every rank stays healthy and answers each
+/// wake with a drain) buys `DRAIN_REWAKES_PER_PROMPT` extra rounds, after
+/// which the group stays parked and the client declares the engine dead at
+/// the window, as it did before the re-wake existed. Unbounded, every drain
+/// would wake the group again and every report of the round would reset the
+/// watchdog, for good.
 #[tokio::test]
-async fn a_prompt_the_holder_never_schedules_is_rewoken_once_and_then_given_up_on() {
+async fn a_prompt_the_holder_never_schedules_is_rewoken_a_few_times_and_then_given_up_on() {
     let (client, mut engines, _ns) = connect_ranks(2, true).await;
     let window = Duration::from_millis(600);
     client.set_silence_death_timeout(window);
@@ -1440,8 +1490,12 @@ async fn a_prompt_the_holder_never_schedules_is_rewoken_once_and_then_given_up_o
     );
     assert!(started.elapsed() >= window, "given up on before the window");
     assert!(!client.is_alive());
-    // The submit's wake and one re-wake, on each of the two ranks.
-    assert_eq!(wakes.load(Ordering::SeqCst), 4);
+    // The submit's wake and the capped re-wakes, on each of the two ranks.
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2 * (1 + usize::from(DRAIN_REWAKES_PER_PROMPT)),
+        "wakes per rank = the submit's and one per re-wake round"
+    );
     for responder in responders {
         responder.abort();
     }
