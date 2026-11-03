@@ -2651,6 +2651,7 @@ impl<'a> ChatStream<'a> {
             used_json_schema && matches!(spec.tool_choice, Some(ToolChoice::Function { .. }));
 
         let tool_parser_available = spec.tools.is_some()
+            && spec.symphony.is_none()
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -2664,7 +2665,7 @@ impl<'a> ChatStream<'a> {
             );
         }
 
-        if spec.tools.is_some() && !tool_parser_available {
+        if spec.tools.is_some() && spec.symphony.is_none() && !tool_parser_available {
             debug!(
                 "No tool parser found for model '{}', skipping tool call parsing",
                 model
@@ -4110,6 +4111,7 @@ impl<'a> MessagesStream<'a> {
 
         let tool_parser_available = has_tools
             && tool_choice_enabled
+            && legacy_reads
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),
