@@ -54,11 +54,21 @@ on:
         type: boolean
         default: false
         description: "Set up Oracle DB and Brave MCP for agentic tests"
+      provider_api_keys:
+        required: false
+        type: boolean
+        default: false
+        description: "Export provider API keys for mixed local/external worker tests"
       amd_responses:
         required: false
         type: boolean
         default: false
-        description: "AMD SGLang original full Responses suite (>=128): job-local services and strict JUnit"
+        description: "Opt in to full AMD SGLang Responses with real job-local providers"
+      responses_evidence:
+        required: false
+        type: boolean
+        default: false
+        description: "Verify original Responses identities and all selected phase/JUnit evidence"
       vllm_kv_backend:
         required: false
         type: string
@@ -134,6 +144,11 @@ on:
         required: false
         type: string
         default: ""
+      final_environment_check:
+        description: "Opt in to fixed-image AMD SGLang setup, live JUnit/log capture and prepared/final pip/cohort verification"
+        required: false
+        type: boolean
+        default: false
       enabled:
         description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
         required: false
@@ -148,8 +163,6 @@ jobs:
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
-    # AMD Responses uses the same real providers as the shared NV deployment.
-    # Actions owns their bridge/aliases and cleanup; no Docker socket in the job.
     services:
       oracle-db:
         image: ${{ inputs.amd_responses && 'gvenzl/oracle-free:23-slim-faststart@sha256:d86d09794ae138a8951e97d7ee010778dcd43088e8d0f83a51002abab8c6d7fd' || '' }}
@@ -204,43 +217,6 @@ jobs:
       - name: Mark this job's processes
         run: echo "E2E_JOB_MARKER=e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
 
-      # Actions has already created services; validate configuration before installation or tests.
-      - name: Validate AMD Responses configuration
-        if: >-
-          inputs.amd_responses
-          || (inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
-              && inputs.setup_agentic_deps
-              && (inputs.test_dirs == 'e2e_test/responses' || inputs.test_dirs == 'e2e_test/responses/'))
-        env:
-          CHECK_AMD_RESPONSES: ${{ inputs.amd_responses }}
-          CHECK_GPU_VENDOR: ${{ inputs.gpu_vendor }}
-          CHECK_ENGINE: ${{ inputs.engine }}
-          CHECK_SETUP_AGENTIC: ${{ inputs.setup_agentic_deps }}
-          CHECK_TEST_DIRS: ${{ inputs.test_dirs }}
-          CHECK_TEST_FILTER: ${{ inputs.test_filter }}
-          CHECK_MIN_SELECTED: ${{ inputs.min_selected }}
-        run: |
-          if [ "$CHECK_AMD_RESPONSES" != true ]; then
-            echo "AMD SGLang full Responses requires amd_responses: true" >&2
-            exit 1
-          fi
-          if [ "$CHECK_GPU_VENDOR" != amd ] || [ "$CHECK_ENGINE" != sglang ] || [ "$CHECK_SETUP_AGENTIC" != true ]; then
-            echo "amd_responses requires gpu_vendor=amd, engine=sglang and setup_agentic_deps=true" >&2
-            exit 1
-          fi
-          case "$CHECK_TEST_DIRS" in
-            e2e_test/responses|e2e_test/responses/) ;;
-            *) echo "amd_responses requires the complete e2e_test/responses directory" >&2; exit 1 ;;
-          esac
-          if [ -n "$CHECK_TEST_FILTER" ]; then
-            echo "amd_responses requires an empty test_filter for the full suite" >&2
-            exit 1
-          fi
-          if ! [ "$CHECK_MIN_SELECTED" -ge 128 ] 2>/dev/null; then
-            echo "amd_responses requires an integer min_selected >=128" >&2
-            exit 1
-          fi
-
       # The cluster runners share one NAT egress IP and GitHub intermittently
       # 401s anonymous git from it, even for public repos — the TokenSpeed
       # source fetch dies on "could not read Username". Carry the workflow
@@ -253,13 +229,48 @@ jobs:
             url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
 
+      - name: Validate AMD Responses configuration
+        if: >-
+          inputs.amd_responses
+          || (inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+              && (inputs.test_dirs == 'e2e_test/responses' || inputs.test_dirs == 'e2e_test/responses/'))
+        env:
+          CHECK_AMD_RESPONSES: ${{ inputs.amd_responses }}
+          CHECK_RESPONSES_EVIDENCE: ${{ inputs.responses_evidence }}
+          CHECK_FINAL_ENV: ${{ inputs.final_environment_check }}
+          CHECK_GPU_VENDOR: ${{ inputs.gpu_vendor }}
+          CHECK_GPU_TIER: ${{ inputs.gpu_tier }}
+          CHECK_ENGINE: ${{ inputs.engine }}
+          CHECK_SETUP_AGENTIC: ${{ inputs.setup_agentic_deps }}
+          CHECK_TEST_DIRS: ${{ inputs.test_dirs }}
+          CHECK_TEST_FILTER: ${{ inputs.test_filter }}
+          CHECK_WIRE: ${{ inputs.connection_mode }}
+          CHECK_MIN_SELECTED: ${{ inputs.min_selected }}
+        run: bash scripts/ci_validate_amd_responses.sh
+
+      - name: Check final-environment verification scope
+        if: inputs.final_environment_check
+        env:
+          CHECK_ENGINE: ${{ inputs.engine }}
+          CHECK_VENDOR: ${{ inputs.gpu_vendor }}
+          CHECK_IMAGE: ${{ inputs.container_image }}
+        shell: bash
+        run: |
+          test "$CHECK_ENGINE" = sglang
+          test "$CHECK_VENDOR" = amd
+          test "$CHECK_IMAGE" = 'lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d'
+          test -s scripts/ci_setup_sglang_rocm_image.sh
+          test -s scripts/ci_verify_sglang_rocm_cohort.py
+          test -s scripts/ci_setup_sglang_rocm_e2e.sh
+          test -s scripts/ci_verify_sglang_rocm_e2e.py
+
       # Engine-specific setup
       - name: Setup SGLang backend
-        if: inputs.engine == 'sglang' && inputs.gpu_vendor != 'amd'
+        if: inputs.engine == 'sglang' && !inputs.final_environment_check
         uses: ./.github/actions/setup-sglang
 
-      - name: Setup SGLang backend (in SGLang's ROCm image)
-        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+      - name: Setup AMD SGLang in its fixed ROCm image
+        if: inputs.final_environment_check
         env:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: bash scripts/ci_setup_sglang_rocm_e2e.sh
@@ -286,6 +297,39 @@ jobs:
           wasm-fixtures: 'true'
           client-types: 'true'
 
+      - name: Prepare full Responses evidence
+        id: responses-evidence
+        if: inputs.responses_evidence
+        env:
+          CHECK_ENGINE: ${{ inputs.engine }}
+          CHECK_GPU_TIER: ${{ inputs.gpu_tier }}
+          CHECK_DIRS: ${{ inputs.test_dirs }}
+          CHECK_FILTER: ${{ inputs.test_filter }}
+          CHECK_WIRE: ${{ inputs.connection_mode }}
+          CHECK_SERVICES: ${{ inputs.setup_agentic_deps }}
+        run: |
+          case "$CHECK_DIRS" in
+            e2e_test/responses|e2e_test/responses/) ;;
+            *) echo "Responses evidence requires the complete Responses directory" >&2; exit 1 ;;
+          esac
+          if [ "$CHECK_ENGINE" != sglang ] || [ "$CHECK_GPU_TIER" != 1 ] || [ "$CHECK_SERVICES" != true ] || [ -n "$CHECK_FILTER" ] || [ -n "$CHECK_WIRE" ]; then
+            echo "Responses evidence requires the original SGLang/tier1/default-wire/service profile without a filter" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from uuid import uuid4
+          token = uuid4().hex
+          directory = Path("e2e-logs") / ("responses-" + token)
+          directory.mkdir(parents=True, exist_ok=False)
+          context = {key: os.environ.get(key) for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "E2E_ENGINE", "E2E_GPU_TIER")}
+          (directory / "workflow-context.json").write_text(json.dumps({"declared_workflow_context": context}, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"directory={directory}\nartifact=responses-evidence-{token}\n")
+          PY
+
       # Agentic service dependencies (Oracle DB, Brave MCP)
       - name: Check shared services
         if: inputs.setup_agentic_deps
@@ -298,32 +342,51 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
+      - name: Check prepared AMD SGLang environment
+        if: inputs.final_environment_check
+        timeout-minutes: 2
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          mkdir -p e2e-logs
+          pip_status=0
+          python3 -m pip check >e2e-logs/prepared-pip.stdout 2>e2e-logs/prepared-pip.stderr || pip_status=$?
+          cohort_status=0
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-prepared.json \
+            >e2e-logs/prepared-cohort.stdout 2>e2e-logs/prepared-cohort.stderr || cohort_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/prepared-environment-status.json
+          test "$pip_status" -eq 0
+          test "$cohort_status" -eq 0
+
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
       - name: Run engine-gated servicer unit tests
+        id: engine-units
         if: inputs.servicer_unit_tests
         env:
-          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          UNIT_ENGINE: ${{ inputs.engine }}
+          UNIT_VENDOR: ${{ inputs.gpu_vendor }}
+          UNIT_FINAL_ENV: ${{ inputs.final_environment_check }}
+          UNIT_SGLANG_IMAGE: ${{ inputs.container_image }}
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          if [ "${{ inputs.gpu_vendor }}" = amd ] && [ "${{ inputs.engine }}" = sglang ]; then
-            mkdir -p unit-junit
-            python3 scripts/ci_repair_sglang_rocm_native.py --verify-only unit-junit/native-environment.json
-            timeout --signal=INT --kill-after=30s 600s \
-              pytest -vv grpc_servicer/tests -p no:cacheprovider -rs \
-                -o faulthandler_timeout=120 --junitxml=unit-junit/sglang.xml
-            test -s unit-junit/sglang.xml
+          if [ "$UNIT_VENDOR" = amd ] && [ "$UNIT_ENGINE" = sglang ] && [ "$UNIT_FINAL_ENV" = true ]; then
+            SMG_SGLANG_ROCM_IMAGE="$UNIT_SGLANG_IMAGE" bash scripts/ci_run_sglang_rocm_units.sh
           else
             pytest -q grpc_servicer/tests -p no:cacheprovider -rs
           fi
 
       - name: Upload AMD SGLang unit results
-        if: always() && inputs.servicer_unit_tests && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+        if: >-
+          always() && inputs.servicer_unit_tests && inputs.final_environment_check
+          && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+          && steps.engine-units.outputs.artifact != ''
         uses: actions/upload-artifact@v7
         with:
-          name: sglang-unit-results-gpu${{ inputs.gpu_tier }}-${{ inputs.connection_mode }}
+          name: ${{ steps.engine-units.outputs.artifact }}
           path: unit-junit/
           if-no-files-found: ignore
 
@@ -347,18 +410,32 @@ jobs:
           EXTRA_MODELS: ${{ inputs.extra_models }}
         run: bash scripts/ci_download_model.sh $EXTRA_MODELS
 
+      - name: Recheck AMD SGLang cohort before E2E
+        if: inputs.final_environment_check
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          mkdir -p e2e-logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment.json
+
       # Run tests
       - name: Run E2E tests
+        id: e2e_tests
         timeout-minutes: ${{ inputs.test_timeout }}
+        shell: bash
         env:
-          CI_AMD_RESPONSES: ${{ inputs.amd_responses }}
+          SMG_PROVIDER_OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
+          SMG_PROVIDER_XAI_API_KEY: ${{ inputs.provider_api_keys && secrets.XAI_API_KEY || '' }}
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
-          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
           E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
+          FINAL_ENVIRONMENT_CHECK: ${{ inputs.final_environment_check && '1' || '0' }}
+          RESPONSES_EVIDENCE_ENABLED: ${{ inputs.responses_evidence && '1' || '0' }}
+          RESPONSES_EVIDENCE_DIRECTORY: ${{ steps.responses-evidence.outputs.directory }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -377,59 +454,119 @@ jobs:
           SMG_SGLANG_SERVICER_WARMUP: fast
           SMG_TOKENSPEED_SERVICER_WARMUP: fast
         run: |
-          set --
-          if [ "$CI_AMD_RESPONSES" = true ]; then
-            mkdir -p e2e-logs
-            set -- --junitxml=e2e-logs/responses-amd.xml
+          if [ "${{ inputs.provider_api_keys }}" = true ]; then
+            if [ -n "$SMG_PROVIDER_OPENAI_API_KEY" ]; then
+              export OPENAI_API_KEY="$SMG_PROVIDER_OPENAI_API_KEY"
+            fi
+            if [ -n "$SMG_PROVIDER_XAI_API_KEY" ]; then
+              export XAI_API_KEY="$SMG_PROVIDER_XAI_API_KEY"
+            fi
           fi
+          unset SMG_PROVIDER_OPENAI_API_KEY SMG_PROVIDER_XAI_API_KEY
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
-            if [ "${{ inputs.engine }}" = sglang ]; then
-              mkdir -p e2e-logs
-              python3 scripts/ci_repair_sglang_rocm_native.py --verify-only e2e-logs/sglang-native-environment.json
-            fi
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
-          pytest ${{ inputs.test_dirs }} \
-            --ignore=e2e_test/benchmarks \
-            --ignore=e2e_test/bindings_go \
-            ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
-            "$@" \
+          pytest_args=(
+            ${{ inputs.test_dirs }}
+            --ignore=e2e_test/benchmarks
+            --ignore=e2e_test/bindings_go
+            ${{ inputs.test_filter }}
+            --reruns 2 --reruns-delay 5
             -s -vv
-          if [ "$CI_AMD_RESPONSES" = true ]; then
-            python3 - <<'PY_RESPONSES_JUNIT'
-          from pathlib import Path
-          import os
-          import xml.etree.ElementTree as ET
-          path = Path("e2e-logs/responses-amd.xml")
-          if not path.is_file() or path.is_symlink():
-              raise SystemExit("AMD Responses: actual JUnit file is required")
-          root = ET.parse(path).getroot()
-          cases = root.findall(".//testcase")
-          identities = {(case.get("classname"), case.get("name")) for case in cases}
-          minimum = int(os.environ["E2E_MIN_SELECTED"])
-          if minimum < 128:
-              raise SystemExit("AMD Responses: min_selected must preserve the original >=128 minimum")
-          if len(identities) < minimum:
-              raise SystemExit(f"AMD Responses: only {len(identities)} unique tests; need >={minimum}")
-          bad = [case for case in cases
-                 if any(case.find(tag) is not None for tag in ("skipped", "failure", "error"))]
-          if bad:
-              raise SystemExit(f"AMD Responses: {len(bad)} skipped/failed/error testcase records")
-          print(f"AMD Responses JUnit: {len(identities)} unique tests / {len(cases)} records; zero skip/failure/error. Original IDs and full current selection still require independent audit.")
-          PY_RESPONSES_JUNIT
+          )
+          pytest_command=(pytest)
+          if [ "$RESPONSES_EVIDENCE_ENABLED" = 1 ]; then
+            pytest_command=(python3 -m pytest)
+            export RESPONSES_EVIDENCE_DIR="${RESPONSES_EVIDENCE_DIRECTORY:?Responses evidence directory was not prepared}"
+            pytest_args+=(-p scripts.ci_responses_evidence --junitxml="$RESPONSES_EVIDENCE_DIR/junit.xml")
+          elif [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then
+            pytest_args+=(--junitxml=e2e-logs/sglang-pd.xml)
           fi
+          if [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then
+            mkdir -p e2e-logs
+            # Descendants may keep writing after pytest exits. They inherit
+            # regular spool files, never the live pumps' pipes.
+            : >e2e-logs/pytest.stdout.source
+            : >e2e-logs/pytest.stderr.source
+            set +e
+            "${pytest_command[@]}" "${pytest_args[@]}" \
+              >e2e-logs/pytest.stdout.source 2>e2e-logs/pytest.stderr.source &
+            pytest_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stdout.source \
+                | tee e2e-logs/pytest.stdout
+            ) &
+            stdout_pump_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stderr.source \
+                | tee e2e-logs/pytest.stderr >&2
+            ) &
+            stderr_pump_pid=$!
+            wait "$pytest_pid"
+            pytest_status=$?
+            wait "$stdout_pump_pid"
+            stdout_status=$?
+            wait "$stderr_pump_pid"
+            stderr_status=$?
+            set -e
+            # Preserve pytest's failure; either live-copy failure also rejects green.
+            if [ "$pytest_status" -ne 0 ]; then
+              exit "$pytest_status"
+            fi
+            if [ "$stdout_status" -ne 0 ]; then
+              exit "$stdout_status"
+            fi
+            exit "$stderr_status"
+          fi
+          "${pytest_command[@]}" "${pytest_args[@]}"
 
-      - name: Upload AMD Responses complete JUnit
-        if: ${{ always() && inputs.amd_responses }}
+      # This is deliberately after pytest and before marker-based process cleanup.
+      # Keep both return codes and streams even when pytest or either check fails.
+      - name: Check final AMD SGLang environment
+        id: final-environment
+        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          python3 -c 'import os, uuid; print("artifact=sglang-complete-results-gpu{}-{}-{}".format(int(os.environ["E2E_GPU_TIER"]), int(os.environ["GITHUB_RUN_ATTEMPT"]), uuid.uuid4().hex))' >> "$GITHUB_OUTPUT"
+          mkdir -p e2e-logs
+          pip_status=0
+          python3 -m pip check >e2e-logs/final-pip.stdout 2>e2e-logs/final-pip.stderr || pip_status=$?
+          cohort_status=0
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-final.json \
+            >e2e-logs/final-cohort.stdout 2>e2e-logs/final-cohort.stderr || cohort_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/final-environment-status.json
+          test "$pip_status" -eq 0
+          test "$cohort_status" -eq 0
+
+      - name: Upload AMD SGLang complete test and final-environment evidence
+        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         uses: actions/upload-artifact@v7
         with:
-          name: responses-amd-junit
-          path: e2e-logs/responses-amd.xml
+          name: ${{ steps.final-environment.outputs.artifact }}
+          path: e2e-logs/
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error
+
+      - name: Verify complete Responses business evidence
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success' && steps.e2e_tests.outcome != 'skipped'
+        env:
+          RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
+        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json
+
+      - name: Upload Responses evidence
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.responses-evidence.outputs.artifact }}
+          path: ${{ steps.responses-evidence.outputs.directory }}/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()

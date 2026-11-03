@@ -1,0 +1,251 @@
+//! The paths a cell drives: the client's arguments (a deterministic prompt set per seed)
+//! and the scripted answer every request of the cell gets. Rates are per second at
+//! scale 1.
+
+use std::sync::LazyLock;
+
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
+
+use crate::SIDES;
+
+const WORDS: [&str; 9] = [
+    "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
+];
+
+/// `n` words of the pangram, cycled.
+pub fn words(n: usize) -> String {
+    (0..n)
+        .map(|i| WORDS[i % WORDS.len()])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub const TOOL_CALL_ANSWER: &str =
+    r#"{"name": "lookup_1", "parameters": {"key": "k1-0", "fields": ["a", "b"], "limit": 10}}"#;
+pub const JSON_ANSWER: &str =
+    r#"{"answer": "the record is open", "confidence": 42, "status": "ok"}"#;
+
+/// One path: its name, its offered rate at scale 1, the load client's flags, the
+/// scripted answer, the finish reason, and the label the tables print.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathSpec {
+    pub name: &'static str,
+    pub rate: f64,
+    pub client: &'static [&'static str],
+    pub answer: String,
+    pub finish: &'static str,
+    pub label: &'static str,
+}
+
+pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
+    vec![
+        PathSpec {
+            name: "chat",
+            rate: 500.0,
+            client: &["--mode", "chat", "--max-tokens", "8", "--seed", "101"],
+            answer: words(8),
+            finish: "stop",
+            label: "chat, non-stream, 64-word prompt, 8 output tokens",
+        },
+        PathSpec {
+            name: "stream",
+            rate: 250.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--seed",
+                "102",
+            ],
+            answer: words(128),
+            finish: "length",
+            label: "chat stream, 128 deltas of one token",
+        },
+        PathSpec {
+            name: "tools",
+            rate: 500.0,
+            client: &[
+                "--mode",
+                "tools",
+                "--turns",
+                "2",
+                "--tools",
+                "4",
+                "--max-tokens",
+                "64",
+                "--seed",
+                "103",
+            ],
+            answer: TOOL_CALL_ANSWER.to_string(),
+            finish: "stop",
+            label: "tool call: 4 schemas, 2 earlier rounds, the answer parsed into tool_calls",
+        },
+        PathSpec {
+            name: "json",
+            rate: 500.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--json-schema",
+                "--max-tokens",
+                "64",
+                "--seed",
+                "104",
+            ],
+            answer: JSON_ANSWER.to_string(),
+            finish: "stop",
+            label: "json_schema answer",
+        },
+        PathSpec {
+            name: "messages",
+            rate: 500.0,
+            client: &["--mode", "messages", "--max-tokens", "8", "--seed", "105"],
+            answer: words(8),
+            finish: "stop",
+            label: "Messages API, non-stream, 8 output tokens",
+        },
+    ]
+});
+
+pub const DEFAULT_PATHS: &str = "chat,stream,tools,json,messages";
+pub const DEFAULT_GW_ARGS: &str = "--parser symphony --tool-call-parser json";
+
+/// The path by name.
+pub fn path_named(name: &str) -> Option<&'static PathSpec> {
+    PATHS.iter().find(|p| p.name == name)
+}
+
+/// The comma-separated path list, checked and in the given order.
+pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
+    let names: Vec<&str> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    let unknown: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| path_named(n).is_none())
+        .collect();
+    if !unknown.is_empty() {
+        let known: Vec<&str> = PATHS.iter().map(|p| p.name).collect();
+        bail!("unknown path(s) {unknown:?}; known: {}", known.join(", "));
+    }
+    if names.is_empty() {
+        bail!("no path given");
+    }
+    Ok(names
+        .iter()
+        .filter_map(|n| path_named(n).cloned())
+        .collect())
+}
+
+/// The scripted answers of one cell: `count` copies, served in order to the next
+/// requests of every worker (the mock worker's shared queue), the text encoded by the
+/// worker with the bed's tokenizer; one token per streamed frame, no pause.
+pub fn answers(spec: &PathSpec, count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|_| {
+            json!({
+                "output_text": spec.answer,
+                "finish_reason": spec.finish,
+                "chunk_tokens": 1,
+                "delay_ms": 0,
+            })
+        })
+        .collect()
+}
+
+/// Repeat i alternates which side goes first (as scripts/bench_gate.py does).
+pub fn interleaved_order(repeats: usize) -> Vec<(usize, &'static str)> {
+    let mut order = Vec::with_capacity(repeats * 2);
+    for i in 1..=repeats {
+        if i % 2 == 1 {
+            order.extend(SIDES.iter().map(|side| (i, *side)));
+        } else {
+            order.extend(SIDES.iter().rev().map(|side| (i, *side)));
+        }
+    }
+    order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_checked_and_ordered() {
+        let names: Vec<&str> = parse_paths("stream, chat")
+            .unwrap()
+            .iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["stream", "chat"]);
+        let err = parse_paths("chat,nosuch").unwrap_err().to_string();
+        assert!(err.contains("unknown path"), "{err}");
+        let err = parse_paths(" , ").unwrap_err().to_string();
+        assert!(err.contains("no path"), "{err}");
+    }
+
+    #[test]
+    fn every_path_has_a_rate_a_client_mode_and_an_answer() {
+        for spec in &*PATHS {
+            assert!(spec.rate > 0.0);
+            assert!(spec.client.contains(&"--mode"));
+            assert!(spec.client.contains(&"--seed"));
+            assert!(!spec.answer.is_empty());
+            assert!(spec.finish == "stop" || spec.finish == "length");
+        }
+        let stream = path_named("stream").unwrap();
+        assert_eq!(stream.finish, "length");
+        assert!(stream.client.contains(&"--stream"));
+        let tools: Value = serde_json::from_str(&path_named("tools").unwrap().answer).unwrap();
+        assert!(tools["name"].as_str().unwrap().starts_with("lookup_"));
+        let json: Value = serde_json::from_str(&path_named("json").unwrap().answer).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["answer", "confidence", "status"]);
+    }
+
+    #[test]
+    fn answers_are_one_per_request_served_one_token_a_frame() {
+        let stream = path_named("stream").unwrap();
+        let items = answers(stream, 12);
+        assert_eq!(items.len(), 12);
+        assert_eq!(
+            items[0],
+            json!({
+                "output_text": stream.answer,
+                "finish_reason": "length",
+                "chunk_tokens": 1,
+                "delay_ms": 0,
+            })
+        );
+        assert_eq!(stream.answer.split_whitespace().count(), 128);
+        assert_eq!(
+            path_named("chat")
+                .unwrap()
+                .answer
+                .split_whitespace()
+                .count(),
+            8
+        );
+    }
+
+    #[test]
+    fn interleaving_alternates_which_side_goes_first() {
+        assert_eq!(
+            interleaved_order(3),
+            [
+                (1, "base"),
+                (1, "pr"),
+                (2, "pr"),
+                (2, "base"),
+                (3, "base"),
+                (3, "pr")
+            ]
+        );
+    }
+}

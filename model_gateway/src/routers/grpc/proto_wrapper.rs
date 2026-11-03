@@ -3106,7 +3106,7 @@ mod watched_tests {
     use crate::{
         routers::{
             common::sse::{sse_channel, SseReceiver},
-            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream, staged_stream},
+            grpc::regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
         },
         worker::{BasicWorkerBuilder, Worker},
     };
