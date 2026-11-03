@@ -7,7 +7,17 @@
       "properties": {
         "policy": {
           "type": "string",
-          "enum": ["cache_aware", "round_robin", "power_of_two", "manual", "random", "prefix_hash"]
+          "enum": [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash"
+          ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },

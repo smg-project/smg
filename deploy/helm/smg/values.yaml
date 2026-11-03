@@ -27,7 +27,10 @@ router:
   #    Deadlines). The mesh StatefulSet has no such field.
   progressDeadlineSeconds: 1920
 
-  # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
+  # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
+  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
+  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
+  #    --prefill-policy bucket through extraArgs.
   policy: cache_aware
 
   # -- Enable IGW (Inference Gateway) mode for multi-model support
