@@ -768,6 +768,7 @@ impl PyVllmGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -822,6 +823,7 @@ impl PyVllmGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -888,6 +890,7 @@ impl PyVllmGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let mut config = VllmServicerConfig {
             servicer,
@@ -997,7 +1000,8 @@ impl PyVllmGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
@@ -1082,6 +1086,7 @@ impl PyTokenSpeedGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1127,6 +1132,7 @@ impl PyTokenSpeedGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1172,6 +1178,7 @@ impl PyTokenSpeedGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
@@ -1235,7 +1242,8 @@ impl PyTokenSpeedGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
@@ -1447,6 +1455,7 @@ impl PyTrtllmGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1484,6 +1493,7 @@ impl PyTrtllmGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         let model = TrtllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1521,6 +1531,7 @@ impl PyTrtllmGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let config = TrtllmServicerConfig { servicer, model };
         let inner = py
@@ -1662,6 +1673,7 @@ impl PySglangGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1704,6 +1716,7 @@ impl PySglangGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         // The language side's encode dispatch, behind the launcher's bridge
         // object; absent on every other worker.
@@ -1759,6 +1772,7 @@ impl PySglangGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let mut config = SglangServicerConfig {
             servicer,
@@ -1867,7 +1881,8 @@ impl PySglangGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
