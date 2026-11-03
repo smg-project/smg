@@ -25,7 +25,7 @@ use tokenizers::{
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken, AddedVocabulary, Model,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     byte_fallback::PieceTable,
@@ -646,6 +646,81 @@ impl HuggingFaceTokenizer {
         Ok(tokenizer)
     }
 
+    /// Settles the added tokens matched after normalization whose normalized
+    /// spellings are equal: a letter and its compatibility form under an
+    /// NFKC normalizer, for instance. `tokenizers` matches those tokens with
+    /// an automaton of their normalized spellings built from a hash map it
+    /// iterates in a per-process order, and between equal spellings the
+    /// first wins, so the id such a text encodes to changes from one
+    /// process to the next. Here the member spelled as the normalized form
+    /// itself (the letter) keeps the normalized match, which every text
+    /// whose normalized form holds the spelling then encodes to; the lowest
+    /// id keeps it when no member spells the form. Each other member (a
+    /// compatibility form) is re-added matched on the raw text
+    /// (`normalized: false`), where its own spelling alone reaches it. The
+    /// raw match comes before normalization, so such a spelling in a text is
+    /// cut ahead of any longer normalized token that would have spanned it:
+    /// the one reading that changes beyond the choice of id, and it is
+    /// confined to the compatibility forms, never to the letter plain text
+    /// holds. Decoding is untouched: every id keeps its token. Returns how
+    /// many tokens were re-added; a vocabulary without such a group is left
+    /// as it is.
+    fn settle_normalized_added_token_ties<M: Model>(
+        tokenizer: &mut TokenizerOf<M>,
+    ) -> tokenizers::Result<usize> {
+        if tokenizer.get_normalizer().is_none() {
+            return Ok(0);
+        }
+        let added = tokenizer.get_added_vocabulary();
+        let tokens = added.get_added_tokens_decoder();
+        // The ids of every normalized spelling, `simple_id_to_token` being
+        // the spelling the automaton holds: the normalized form where it
+        // differs from the content.
+        let mut ids_of_spelling: HashMap<String, Vec<u32>> = HashMap::new();
+        for (&id, token) in tokens {
+            if token.normalized {
+                let spelling = added
+                    .simple_id_to_token(id)
+                    .unwrap_or_else(|| token.content.clone());
+                ids_of_spelling.entry(spelling).or_default().push(id);
+            }
+        }
+        let mut demoted: Vec<AddedToken> = Vec::new();
+        for (spelling, mut ids) in ids_of_spelling {
+            if ids.len() < 2 {
+                continue;
+            }
+            ids.sort_unstable();
+            let kept = ids
+                .iter()
+                .copied()
+                .find(|id| {
+                    tokens
+                        .get(id)
+                        .is_some_and(|token| token.content == spelling)
+                })
+                .unwrap_or(ids[0]);
+            demoted.extend(ids.iter().filter(|&&id| id != kept).filter_map(|id| {
+                let mut token = tokens.get(id)?.clone();
+                token.normalized = false;
+                Some(token)
+            }));
+        }
+        if demoted.is_empty() {
+            return Ok(0);
+        }
+        // A token re-added under a content the vocabulary holds keeps its id;
+        // the two automatons are rebuilt once, after the whole batch.
+        let settled = demoted.len();
+        tokenizer.add_tokens(demoted)?;
+        info!(
+            settled,
+            "added tokens with one normalized spelling: the letter keeps the normalized match, the \
+             compatibility forms match their own spelling raw"
+        );
+        Ok(settled)
+    }
+
     /// Bind checkpoint metadata, the active template, and its cached renderer policy.
     fn from_built_tokenizer(
         mut tokenizer: LoadingTokenizer,
@@ -676,6 +751,15 @@ impl HuggingFaceTokenizer {
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
         Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
+        // Two added tokens matched after normalization can share one
+        // normalized spelling, and which of them `tokenizers` matches changes
+        // from process to process. Settled before the encode path is chosen
+        // (the rule is on `settle_normalized_added_token_ties`).
+        Self::settle_normalized_added_token_ties(&mut tokenizer).map_err(|error| {
+            Error::msg(format!(
+                "Failed to load tokenizer: the added tokens with one normalized spelling did not settle: {error}"
+            ))
+        })?;
 
         let mut chat_template_str = config_result.chat_template;
         let mut tool_use_template = config_result.tool_use_chat_template;
@@ -2752,6 +2836,23 @@ mod tests {
         "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
     }"#;
 
+    /// The word-level vocabulary with two added tokens matched after
+    /// normalization that share one normalized spelling: a letter (U+05D0)
+    /// and its compatibility form (U+FB21) under NFKC, their ids past the
+    /// model's vocabulary as a checkpoint's added tokens are.
+    const NORMALIZED_TIE_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 3, "content": "\u05d0", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false},
+            {"id": 4, "content": "\ufb21", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false}
+        ],
+        "normalizer": {"type": "NFKC"},
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+    }"#;
+
     /// The added tokens a prefix cache may match are those of the raw pass
     /// (`normalized: false`); the tokens matched after normalization, special
     /// or not, are reported apart, so the cache does not split at any of them.
@@ -3386,6 +3487,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A checkpoint's own tokenizer gives the letter one of the two ids per
+    /// process; the loader settles the pair, so every process gives the
+    /// letter, and any text whose normalized form is the letter, the lowest
+    /// id, and the compatibility form spelled as such its own.
+    #[test]
+    fn two_added_tokens_with_one_normalized_spelling_encode_the_same_in_every_process() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, NORMALIZED_TIE_TOKENIZER_JSON).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.encode_path(), EncodePath::Tokenizers);
+        for (text, ids) in [
+            ("\u{5d0}", &[3][..]),
+            ("\u{fb21}", &[4][..]),
+            ("a \u{fb21} \u{5d0} b", &[0, 4, 3, 1][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The letter keeps the normalized match whichever id the pair gave it,
+    /// so plain text reads as before, longer normalized tokens included; the
+    /// compatibility form is matched by its own spelling, before
+    /// normalization, so a longer normalized token no longer spans it (the
+    /// one reading that changes beyond the choice of id).
+    #[test]
+    fn the_letter_keeps_the_normalized_match_whichever_id_is_lower() {
+        // The compatibility form at the lower id, and a two-letter normalized
+        // token that holds the letter.
+        let definition = r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id": 3, "content": "\ufb21", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 4, "content": "\u05d0", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 5, "content": "\u05d0\u05d1", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false}
+            ],
+            "normalizer": {"type": "NFKC"},
+            "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+        }"#;
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, definition).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        for (text, ids) in [
+            ("\u{5d0}", &[4][..]),
+            ("\u{5d0}\u{5d1}", &[5][..]),
+            ("\u{fb21}", &[3][..]),
+            ("\u{fb21}\u{5d1}", &[3, 2][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Two compatibility forms of a letter the vocabulary has no token for,
+    /// so no member spells the normalized form: the lowest id keeps the
+    /// normalized match, as the fallback.
+    #[test]
+    fn the_lowest_id_keeps_the_normalized_match_when_no_member_spells_the_form() {
+        let definition = r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id": 3, "content": "\uff46\uff49", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false},
+                {"id": 4, "content": "\ufb01", "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": true, "special": false}
+            ],
+            "normalizer": {"type": "NFKC"},
+            "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+        }"#;
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, definition).unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        for (text, ids) in [
+            ("fi", &[3][..]),
+            ("\u{ff46}\u{ff49}", &[3][..]),
+            ("\u{fb01}", &[4][..]),
+        ] {
+            assert_eq!(
+                tokenizer.encode(text, false).unwrap().token_ids(),
+                ids,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Settling re-adds the compatibility form of a pair matched on the raw
+    /// text and nothing else: the ids decode as before, a second pass finds
+    /// nothing to settle, and a vocabulary without such a pair is not touched.
+    #[test]
+    fn settling_a_normalized_tie_keeps_decoding_and_leaves_other_vocabularies_alone() {
+        let mut tokenizer =
+            tokenizers::Tokenizer::from_bytes(NORMALIZED_TIE_TOKENIZER_JSON).unwrap();
+        let decoded = |tokenizer: &tokenizers::Tokenizer| -> Vec<String> {
+            [3, 4]
+                .iter()
+                .map(|&id| tokenizer.decode(&[id], false).unwrap())
+                .collect()
+        };
+        let before = decoded(&tokenizer);
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut tokenizer).unwrap(),
+            1
+        );
+        assert_eq!(decoded(&tokenizer), before);
+        let added = tokenizer.get_added_vocabulary().get_added_tokens_decoder();
+        assert!(
+            added.get(&3).unwrap().normalized,
+            "the letter keeps the normalized match"
+        );
+        assert!(
+            !added.get(&4).unwrap().normalized,
+            "the compatibility form is matched on the raw text"
+        );
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut tokenizer).unwrap(),
+            0
+        );
+        let mut plain = tokenizers::Tokenizer::from_bytes(WORD_LEVEL_TOKENIZER_JSON).unwrap();
+        assert_eq!(
+            HuggingFaceTokenizer::settle_normalized_added_token_ties(&mut plain).unwrap(),
+            0
+        );
     }
 
     /// The DeepSeek V4 encoder port stands in for the encoder module those

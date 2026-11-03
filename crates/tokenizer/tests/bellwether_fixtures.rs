@@ -66,7 +66,8 @@
 //! that the loaded fixtures no longer contain, so the list cannot rot.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     num::NonZeroUsize,
@@ -418,6 +419,10 @@ struct Tally {
     differ: usize,
     /// How many of the differing cases [`KNOWN_DIFFERENCES`] lists.
     listed: usize,
+    /// How many of the matching cases match only once the ids inside a
+    /// normalized added-token tie of the checkpoint stand for one id (see
+    /// [`NormalizedTies`]).
+    settled: usize,
 }
 
 impl fmt::Display for Tally {
@@ -434,8 +439,82 @@ impl fmt::Display for Tally {
             self.differ,
             self.listed,
             self.differ - self.listed
-        )
+        )?;
+        if self.settled > 0 {
+            write!(
+                f,
+                " ({} match inside a normalized added-token tie)",
+                self.settled
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// The ids of a checkpoint's added tokens that are matched after
+/// normalization and share one normalized spelling (a letter and its
+/// compatibility form under NFKC), each mapped to one id that stands for
+/// its whole group (the lowest, as a name). The checkpoint's own tokenizer
+/// encodes a text that holds such a spelling to one id of the group per
+/// process (`tokenizers` builds the automaton of normalized spellings from
+/// a hash map it iterates in a per-process order and keeps the first of two
+/// equal spellings), so a reference recorded with it carries the recording
+/// process's pick, and the crate's loader settles the group on one member
+/// (the one spelled as the normalized form, else the lowest id): a case
+/// whose ids differ only inside such groups matches, and is counted apart
+/// (`Tally::settled`). Read once per model, from the checkpoint's
+/// `tokenizer.json`, the first time a case differs; a checkpoint without the
+/// file (a tiktoken or `vocab.json` one) has no such group.
+struct NormalizedTies(HashMap<u32, u32>);
+
+impl NormalizedTies {
+    fn read(tokenizer_dir: &str) -> Self {
+        let path = Path::new(tokenizer_dir).join("tokenizer.json");
+        let Ok(tokenizer) = tokenizers::Tokenizer::from_file(path) else {
+            return Self(HashMap::new());
+        };
+        let added = tokenizer.get_added_vocabulary();
+        let mut ids_of_spelling: HashMap<String, Vec<u32>> = HashMap::new();
+        for (&id, token) in added.get_added_tokens_decoder() {
+            if token.normalized {
+                let spelling = added
+                    .simple_id_to_token(id)
+                    .unwrap_or_else(|| token.content.clone());
+                ids_of_spelling.entry(spelling).or_default().push(id);
+            }
+        }
+        let mut lowest_of = HashMap::new();
+        for mut ids in ids_of_spelling.into_values() {
+            if ids.len() > 1 {
+                ids.sort_unstable();
+                for &id in &ids {
+                    lowest_of.insert(id, ids[0]);
+                }
+            }
+        }
+        Self(lowest_of)
+    }
+
+    /// Whether `got` and `want` are one sequence once every id of a group
+    /// stands for the group's lowest.
+    fn settle(&self, got: &[u32], want: &[u32]) -> bool {
+        got.len() == want.len()
+            && got.iter().zip(want).all(|(got, want)| {
+                got == want
+                    || self
+                        .0
+                        .get(got)
+                        .is_some_and(|lowest| self.0.get(want) == Some(lowest))
+            })
+    }
+}
+
+/// How a case's ids agree with the reference: exactly, or once the ids
+/// inside a normalized added-token tie stand for one id.
+#[derive(Debug, PartialEq, Eq)]
+enum Agreement {
+    Exact,
+    SettledTie,
 }
 
 /// The first unlisted differences of a model, as stdout shows them.
@@ -1050,6 +1129,7 @@ where
     let mut encode = Tally::default();
     let mut decode = Tally::default();
     let mut read = BTreeMap::new();
+    let ties = OnceCell::new();
     for (kind, set, path) in &sets {
         report.loaded_dirs.insert(format!("{slug}/{kind}"));
         let set_path = format!("{slug}/{set}");
@@ -1065,14 +1145,23 @@ where
                     case.id
                 );
                 tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
-                let outcome = check_encode(tok.as_ref(), &case.reference);
+                let outcome = check_encode(tok.as_ref(), &case.reference, || {
+                    ties.get_or_init(|| NormalizedTies::read(&from))
+                });
+                if outcome == Ok(Agreement::SettledTie) {
+                    encode.settled += 1;
+                    lines.push_str(&format!(
+                        "  settled {}: the ids differ only inside a normalized added-token tie\n",
+                        case.id
+                    ));
+                }
                 let ids = case.reference.input_ids.len();
                 let read = CaseRead {
                     id: case.id,
                     set: &set_path,
                     ids,
                 };
-                report.record(read, outcome, &mut encode, known, &mut lines);
+                report.record(read, outcome.map(|_| ()), &mut encode, known, &mut lines);
             })?
         } else {
             decode.loaded = true;
@@ -1204,14 +1293,21 @@ impl Drop for StopOnPanic<'_> {
 
 /// Encode the reference text as the gateway encodes a rendered prompt, without
 /// adding special tokens, and compare the ids with the reference.
-fn check_encode(tok: &dyn Tokenizer, reference: &RenderReference) -> Result<(), String> {
+fn check_encode<'t>(
+    tok: &dyn Tokenizer,
+    reference: &RenderReference,
+    ties: impl FnOnce() -> &'t NormalizedTies,
+) -> Result<Agreement, String> {
     let encoding = tok
         .encode(&reference.text, false)
         .map_err(|e| format!("encode failed: {e}"))?;
     let got = encoding.token_ids();
     let want = reference.input_ids.as_slice();
     if got == want {
-        return Ok(());
+        return Ok(Agreement::Exact);
+    }
+    if ties().settle(got, want) {
+        return Ok(Agreement::SettledTie);
     }
     let at = first_difference(got, want);
     Err(format!(
@@ -2206,6 +2302,92 @@ fn a_set_entry_covers_the_set_whole_and_must_cover_a_difference() {
             && !failures[0].contains("glaive")
             && !failures[0].contains("gsm8k"),
         "{failures:#?}"
+    );
+}
+
+/// A checkpoint whose added tokens hold a letter and its compatibility form
+/// under NFKC, both matched after normalization: its own tokenizer gives the
+/// letter one of the two ids per process, so a reference carries the
+/// recording process's pick, while the crate's loader always gives the
+/// letter the letter's id and the compatibility form, spelled as such, its
+/// own. A case whose ids differ only inside the pair matches, counted apart
+/// in the summary; one whose id is outside the pair differs as any other.
+#[test]
+fn ids_that_differ_only_inside_a_normalized_added_token_tie_match() {
+    const TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 3, "content": "\u05d0", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false},
+            {"id": 4, "content": "\ufb21", "single_word": false, "lstrip": false, "rstrip": false,
+             "normalized": true, "special": false}
+        ],
+        "normalizer": {"type": "NFKC"},
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
+    }"#;
+    let model = "org/t";
+    let line = |id: &str, text: &str, ids: &str| {
+        format!(
+            "{{\"id\":\"{id}\",\"kind\":\"render\",\"model\":\"{model}\",\
+             \"reference\":{{\"input_ids\":{ids},\"text\":\"{text}\"}}}}\n"
+        )
+    };
+    let root = tree(&[
+        ("t/manifest.toml", &manifest(model)),
+        ("t/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "t/render/common.jsonl",
+            // The letter recorded as the other id of the pair, the
+            // compatibility form as the letter's id, and the letter as an
+            // id outside the pair.
+            &(line("t/render/common-0", "a \\u05d0 b", "[0, 4, 1]")
+                + &line("t/render/common-1", "\\ufb21", "[3]")
+                + &line("t/render/common-2", "\\u05d0", "[0]")),
+        ),
+    ])
+    .unwrap();
+    let checkpoint = tree(&[("tokenizer.json", TOKENIZER_JSON)]).unwrap();
+    let dir = checkpoint.path().to_str().unwrap().to_string();
+    let manifests = read_manifests(root.path()).unwrap();
+    let (mut stdout, mut written) = (Vec::new(), Vec::new());
+    let report = compare(
+        root.path(),
+        &manifests,
+        &BTreeMap::new(),
+        |_, _| {
+            create_tokenizer(&dir)
+                .map(|tok| (tok, dir.clone()))
+                .map_err(|e| e.to_string())
+        },
+        &mut Output {
+            stdout: &mut stdout,
+            report: &mut written,
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.seen.len(), 3);
+    assert_eq!(
+        report.differences.keys().collect::<Vec<_>>(),
+        ["t/render/common-2"],
+        "{:#?}",
+        report.differences
+    );
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(
+        stdout.contains(
+            "3 cases (5 ids) compared, 2 match, 1 differ, 0 listed, 1 unlisted \
+                         (2 match inside a normalized added-token tie)"
+        ),
+        "{stdout}"
+    );
+    let written = String::from_utf8(written).unwrap();
+    assert!(
+        written.contains("settled t/render/common-0:")
+            && written.contains("settled t/render/common-1:")
+            && !written.contains("settled t/render/common-2:"),
+        "{written}"
     );
 }
 
