@@ -15,6 +15,9 @@ pytest_plugins = ["pytester"]
     "stage", ["worker", "gateway", "client", "ok", "runtime-skip", "model-skip"]
 )
 def test_required_responses_backend_errors_are_not_skips(pytester, monkeypatch, engine, stage):
+    # model-skip targets the TEMPORARY gpt-oss/TokenSpeed exclusion in hooks.py.
+    # Update it when TOKENSPEED_REF includes the fix for tokenspeed#1036;
+    # runtime-skip independently checks an explicit unsupported runtime.
     monkeypatch.setenv("E2E_RUNTIME", "tokenspeed" if stage == "model-skip" else engine)
     monkeypatch.setattr(constants, "_RUNTIME_CACHE", None)
     events = pytester.path / "events.json"
