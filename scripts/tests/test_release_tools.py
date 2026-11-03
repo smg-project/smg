@@ -9,6 +9,7 @@ real repository or the network.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -109,6 +110,26 @@ case "$1 $2" in
       else printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$file" "$status" "$conclusion" "$title"; fi
     done <<< "${GH_STUB_TAG_RUNS-}" ;;
   "repo view") echo "example/repo" ;;
+  "api graphql") # the notes' batch read of pull request bodies: GH_STUB_PULLS/<number>.md is a body, no file a null
+    [ -z "${GH_STUB_GRAPHQL_ERROR-}" ] || { echo "gh: $GH_STUB_GRAPHQL_ERROR" >&2; exit 1; }
+    python3 - "${GH_STUB_PULLS:-/nonexistent}" "$*" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+pulls, query = Path(sys.argv[1]), sys.argv[2]
+data = {}
+for alias, number in re.findall(r"(p\d+): pullRequest\(number: (\d+)\)", query):
+    body = pulls / f"{number}.md"
+    data[alias] = (
+        {"number": int(number), "title": "", "body": body.read_text(), "author": {"login": "someone"}}
+        if body.is_file()
+        else None
+    )
+print(json.dumps({"data": {"repository": data}}))
+PY
+    ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
     printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
@@ -349,7 +370,7 @@ class Sandbox:
         shutil.copy(ROOT / "Makefile", self.work / "Makefile")
         (self.work / "scripts" / "release").mkdir(parents=True)
         shutil.copy(ROOT / "scripts" / "check_release_versions.py", self.work / "scripts")
-        for name in ("release.sh", "sync_versions.py"):
+        for name in ("release.sh", "sync_versions.py", "notes.py", "NOTES-TEMPLATE.md"):
             shutil.copy(ROOT / "scripts" / "release" / name, self.work / "scripts" / "release")
         self.put("scripts/release_docker_notes.sh", DOCKER_NOTES_STUB)
         (self.work / "scripts" / "release_docker_notes.sh").chmod(0o755)
@@ -1395,9 +1416,10 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     repo.tool("tag", "1.14.0", PUSH="1")
     # The release's own notes name the two fixes, under Fixes, not the squash commit's subject under Maintenance.
     notes = repo.tool("notes", "1.14.0").stdout
-    assert "- fix(router): three (#123)\n" in notes and "- fix(router): four (#126)\n" in notes
+    changed = notes[notes.index("## What's Changed") :]
+    assert "- fix(router): three (#123)\n" in changed and "- fix(router): four (#126)\n" in changed
     assert "chore(release): pick 2 commits" not in notes
-    assert notes.index("### Fixes") < notes.index("- fix(router): three (#123)")
+    assert changed.index("### Fixes") < changed.index("- fix(router): three (#123)")
     assert "6 commits since v1.13.0" in notes, "the two originals count, the squash commit does not"
     repo.tool("bump-main", "1.14.0")
     repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
@@ -1464,7 +1486,7 @@ def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sand
     finished_release(repo)
     done = repo.tool("notes", "1.14.0")
     out = done.stdout
-    assert out.startswith("## SMG v1.14.0\n")
+    assert out.startswith("# Shepherd Model Gateway v1.14.0\n")
     assert "commits since v1.13.0 on `release/1.14`" in out
     assert "### Features\n\n- feat(tool_parser): more\n" in out
     assert "### Fixes\n\n- fix(router): three (#123)\n- fix(router): two\n" in out
@@ -1476,6 +1498,386 @@ def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sand
     assert "gh release create v1.14.0-rc.1 --verify-tag --prerelease" in candidate.stderr
     since = repo.tool("notes", "1.14.0", "v1.14.0-rc.1").stdout
     assert "fix(router): two" not in since and "fix(router): three (#123)" in since
+
+
+# A dozen-and-three merged pull requests, one per bucket of the notes: the squash subjects and the bodies GH_STUB_PULLS
+# serves (None: a number the repository has no pull request for).
+NOTED_PULLS: tuple[tuple[str, str | None], ...] = (
+    (
+        "feat(health): the readiness body names each served model (#201)",
+        "## Description\n\nx\n\n## Release note\n\nThe readiness body names each served model with a reason.\n\n"
+        "## Numbers\n\n| a | b |\n",
+    ),
+    (
+        "perf(tokenizer): native encode for byte-level vocabularies (#202)",
+        "## Release note\n\nEncoding a 32k-token prompt takes a sixth of the CPU it took.\n",
+    ),
+    (
+        "feat(symphony): Llama 3.1 reads with the json table (#203)",
+        "## Release notes\n\n- Symphony reads the Llama 3.1 tool syntax.\n- Under its own id.\n",
+    ),
+    (
+        "fix(servicer): the start deadline follows the engine's liveness (#204)",
+        "**Release note:** an engine that takes an hour to load no longer restarts from zero.\n\nMore text.\n",
+    ),
+    (
+        "fix(multimodal): an image to a text-only worker is refused up front (#205)",
+        "## Release note\n\nAn image sent to a model without a vision encoder is refused with 400.\n",
+    ),
+    (
+        "fix(metrics): the KV event lag is a histogram (#206)",
+        "## Release note\n\n`smg_kv_event_lag_seconds` is a histogram;"
+        " the `smg_kv_event_tail_depth` metric is removed.\n",
+    ),
+    (
+        "feat(python): Router takes parser (#207)",
+        "## Release note\n\n`Router(...)` takes `parser=`.\n",
+    ),
+    (
+        "feat(helm)!: the router runs as UID 65532 (#208)",
+        "## Release note\n\nThe chart runs the router as UID 65532.\n\n## Upgrade\n\n"
+        "BREAKING CHANGE: a custom image must run as that user.\n",
+    ),
+    (
+        "fix(config): a malformed control-plane key list is a start-up error (#209)",
+        "## Release note\n\nA malformed `--control-plane-api-keys` entry refuses to start instead of being dropped.\n",
+    ),
+    (
+        "feat(gateway): admission is bounded by default (#210)",
+        "## Release note\n\nAn unset `--max-concurrent-requests` now defaults to 1,024 in-flight requests per core.\n",
+    ),
+    ("docs(readme): the upgrade page (#211)", "## Release note\n\nnone\n"),
+    (
+        "fix(router): the retry charge is one per request (#212)",
+        "## Description\n\nno release-note section here\n",
+    ),
+    ("chore(ci): pin the runner image (#213)", None),
+    (
+        "fix(storage): the memory backend is bounded (#214)",
+        "## Release note\n\nThe memory history backend is bounded at 10,000 responses.\n\n"
+        "## Compatibility\n\nBREAKING CHANGE: an evicted id answers 404.\n",
+    ),
+    ("feat(gateway): a test-only change (#215)", "## Release note\n\nNone: a test-only change.\n"),
+)
+SKELETON = (
+    "# Shepherd Model Gateway v1.14.0",
+    "## Before you upgrade",
+    "## Highlights",
+    "### How this release was validated",
+    "## Notable fixes",
+    "## Upgrade notes",
+    "### Storage",
+    "### Configuration that now refuses to start",
+    "### Changed defaults",
+    "### API behavior",
+    "### Metrics, logs and traces",
+    "### Engine side",
+    "### Bindings and Rust crates",
+    "## Packages and engines",
+    "## Known limits",
+    "## What's Changed",
+)
+
+
+def noted_release(repo: Sandbox, pulls: Path) -> None:
+    """The fifteen pull requests merged on main, their bodies where GH_STUB_PULLS serves them, v1.14.0 tagged."""
+    pulls.mkdir()
+    for index, (subject, body) in enumerate(NOTED_PULLS):
+        repo.commit_main(subject, f"model_gateway/src/change_{index}.rs", f"// {index}\n")
+        if body is not None:
+            (pulls / f"{subject.rsplit('#', 1)[1].rstrip(')')}.md").write_text(body)
+    repo.cut()
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+
+
+def section(text: str, heading: str, until: str) -> str:
+    return text[text.index(heading) : text.index(until)]
+
+
+def subsection(text: str, heading: str) -> str:
+    """A ### subsection: from its heading to the next heading of any level, or to the unsorted candidates."""
+    start = text.index(heading) + len(heading)
+    rest = text[start:]
+    next_heading = re.search(
+        r"^#{2,3} |^<!-- AUTHOR: candidates with no obvious subsection", rest, re.M
+    )
+    return rest[: next_heading.start()] if next_heading else rest
+
+
+def load_notes_module():
+    spec = importlib.util.spec_from_file_location(
+        "release_notes", ROOT / "scripts" / "release" / "notes.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["release_notes"] = (
+        module  # the dataclass resolves its string annotations through sys.modules
+    )
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_notes_render_the_template_seeded_by_the_pull_requests_release_notes(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    done = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls))
+    out = done.stdout
+    headings = [line for line in out.splitlines() if line.startswith("#")]
+    assert tuple(line for line in headings if line in SKELETON) == SKELETON, (
+        "every section, in the published order"
+    )
+    assert "{{" not in out
+    assert "chore(release): bump versions" not in out
+    highlights = section(out, "## Highlights", "### How this release was validated")
+    assert "**Gateway**\n\n" in highlights
+    assert "- The readiness body names each served model with a reason. (#201)\n" in highlights
+    assert (
+        "- An unset `--max-concurrent-requests` now defaults to 1,024 in-flight requests per core. (#210)"
+        in highlights
+    )
+    assert (
+        "**Tokenizer**\n\n- Encoding a 32k-token prompt takes a sixth of the CPU it took. (#202)"
+        in highlights
+    )
+    assert "- Symphony reads the Llama 3.1 tool syntax. Under its own id. (#203)" in highlights, (
+        "the list joined"
+    )
+    assert "**Bindings and crates**\n\n- `Router(...)` takes `parser=`. (#207)" in highlights
+    assert "**Helm and deploy**\n\n- The chart runs the router as UID 65532. (#208)" in highlights
+    assert (
+        "- feat(tool_parser): more <!-- AUTHOR: no pull request number in the subject: write the sentence or drop"
+        in highlights
+    )
+    assert "#215" not in highlights, "a note that says none seeds nothing"
+    assert "#211" not in highlights, "documentation seeds nothing"
+    assert "#204" not in highlights and "#212" not in highlights, "fixes are not highlights"
+    fixes = section(out, "## Notable fixes", "## Upgrade notes")
+    assert "These bugs shipped in v1.13.0." in fixes
+    assert (
+        "- fix(router): the retry charge is one per request (#212) <!-- AUTHOR: no release note in the pull request:"
+        " write the sentence or drop the line -->" in fixes
+    )
+    assert (
+        "**Servicers and engines**\n\n- an engine that takes an hour to load no longer restarts from zero. (#204)"
+        in fixes
+    )
+    assert (
+        "**Multimodal**\n\n- An image sent to a model without a vision encoder is refused with 400. (#205)"
+        in fixes
+    )
+    assert "**Metrics and observability**\n\n- `smg_kv_event_lag_seconds` is a histogram;" in fixes
+    assert "- fix(router): two <!-- AUTHOR: no pull request number in the subject" in fixes
+    assert "#201" not in fixes
+    changed = out[out.index("## What's Changed") :]
+    assert "commits since v1.13.0 on `release/1.14` (the merged pull requests, by type):" in changed
+    assert (
+        "### Features\n\n" in changed and "- feat(gateway): a test-only change (#215)\n" in changed
+    )
+    assert "### Documentation\n\n- docs(readme): the upgrade page (#211)\n" in changed
+    assert "### Maintenance\n\n- chore(ci): pin the runner image (#213)\n" in changed
+    assert (
+        "17 pull requests: 11 carry a release note, 2 declare none, 1 have no release-note section, 1 could not be"
+        " read, 2 subjects name no pull request" in done.stderr
+    )
+    assert "release.sh notes --check <file>" in done.stderr
+    assert (
+        "gh release create v1.14.0 --verify-tag --title 'SMG v1.14.0' --notes-file <file>"
+        in done.stderr
+    )
+
+
+def test_notes_seed_upgrade_notes_from_what_the_pull_requests_declare(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    upgrade = section(out, "## Upgrade notes", "## Packages and engines")
+    declared = "<!-- AUTHOR: declared: {}; keep it here, move it or drop it -->"
+    assert "- The memory history backend is bounded at 10,000 responses. (#214) " + declared.format(
+        "a breaking change"
+    ) in subsection(upgrade, "### Storage")
+    assert "(#209) " + declared.format("a configuration that now refuses to start") in subsection(
+        upgrade, "### Configuration that now refuses to start"
+    )
+    assert "(#210) " + declared.format("a changed default") in subsection(
+        upgrade, "### Changed defaults"
+    )
+    assert "(#206) " + declared.format("a removed or renamed flag or setting") in subsection(
+        upgrade, "### Metrics, logs and traces"
+    )
+    empty = "<!-- AUTHOR: nothing declared by the pull requests under this heading: write it or delete the heading. -->"
+    for heading in ("### API behavior", "### Engine side", "### Bindings and Rust crates"):
+        assert subsection(upgrade, heading).strip() == empty, heading
+    unsorted = upgrade[upgrade.index("<!-- AUTHOR: candidates with no obvious subsection") :]
+    assert (
+        "- The chart runs the router as UID 65532. (#208) " + declared.format("a breaking change")
+        in unsorted
+    )
+    assert "#201" not in upgrade and "#205" not in upgrade, "nothing declared, nothing seeded"
+
+
+def test_notes_name_the_packages_and_engines_at_the_tag(repo: Sandbox, tmp_path: Path) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    packages = section(out, "## Packages and engines", "## Known limits")
+    assert (
+        "- `smg` 1.14.0 on PyPI and crates.io, with container images and Helm chart 1.14.0. Release images build on"
+        " vLLM (vllm/vllm-openai:v0.31.0 and vllm/vllm-openai:v0.27.1), SGLang (lmsysorg/sglang:v0.5.21) and"
+        " TokenSpeed (the latest nightly carrier).\n" in packages
+    )
+    assert (
+        "- `smg-grpc-servicer` 0.14.0. <!-- AUTHOR: the upgrade order between gateways and engine pods"
+        in packages
+    )
+    assert (
+        "- The library crates moved to new versions: `tool-parser` 0.6.0 (from 0.5.0). <!-- AUTHOR: name"
+        in packages
+    )
+    assert "Building from source" not in packages, "no rust-version in this tree: no line"
+    assert "### Docker images\n\n- stub images for v1.14.0" in packages
+    assert "[Full changelog](https://github.com/example/repo/compare/v1.13.0...v1.14.0)" in out
+
+
+def test_notes_read_each_pull_request_body_once(repo: Sandbox, tmp_path: Path) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    first = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert (
+        len(reads) == 1 and "p201: pullRequest(number: 201)" in reads[0] and "p215:" in reads[0]
+    ), "one batch"
+    second = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    assert second == first
+    assert len([call for call in repo.gh_calls() if call.startswith("gh api graphql")]) == 1, (
+        "the cache answered"
+    )
+
+
+def test_notes_render_without_the_bodies_when_gh_cannot_read_them(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    offline = repo.tool(
+        "notes",
+        "1.14.0",
+        GH_STUB_PULLS=str(pulls),
+        GH_STUB_GRAPHQL_ERROR="boom",
+        NOTES_CACHE=str(tmp_path / "c1"),
+    )
+    assert (
+        "the read of 15 pull request bodies failed (gh: boom); they fall back to their subjects"
+        in offline.stderr
+    )
+    assert "0 carry a release note" in offline.stderr
+    assert (
+        "- feat(health): the readiness body names each served model (#201) <!-- AUTHOR: no release note in the pull"
+        " request: write the sentence or drop the line -->" in offline.stdout
+    )
+    assert (
+        "[Full changelog](https://github.com/example/repo/compare/v1.13.0...v1.14.0)"
+        in offline.stdout
+    )
+    without_gh = repo.tool(
+        "notes", "1.14.0", GH="/nonexistent/gh", NOTES_CACHE=str(tmp_path / "c2")
+    )
+    assert "the repository is unknown" in without_gh.stderr
+    assert (
+        "<!-- AUTHOR: the compare link of the previous final and this tag -->" in without_gh.stdout
+    )
+    assert "## What's Changed" in without_gh.stdout
+
+
+def test_notes_check_refuses_a_placeholder_and_passes_a_filled_draft(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    draft = tmp_path / "notes.md"
+    draft.write_text(out)
+    refused = repo.tool("notes", "--check", str(draft), check=False)
+    assert refused.returncode == 1
+    assert (
+        "still carries" in refused.stderr
+        and "author comment(s), 0 template token(s)" in refused.stderr
+    )
+    assert "  line 3: <!-- AUTHOR: the opening paragraph" in refused.stderr
+    filled = re.sub(r"<!--\s*AUTHOR:.*?-->", "written", out, flags=re.S)
+    draft.write_text(filled)
+    assert "carries no placeholder" in repo.tool("notes", "--check", str(draft)).stderr
+    draft.write_text(filled + "\n{{highlights}}\n")
+    token = repo.tool("notes", "--check", str(draft), check=False)
+    assert token.returncode == 1 and "0 author comment(s), 1 template token(s)" in token.stderr
+    draft.write_text("")
+    assert "is empty" in repo.tool("notes", "--check", str(draft), check=False).stderr
+    missing = repo.tool("notes", "--check", str(tmp_path / "nope.md"), check=False)
+    assert missing.returncode == 1 and "no such file" in missing.stderr
+    usage = repo.tool("notes", "--check", check=False)
+    assert usage.returncode == 1 and "usage: release.sh notes --check <file>" in usage.stderr
+
+
+def test_notes_refuse_a_template_token_the_render_does_not_fill(repo: Sandbox) -> None:
+    finished_release(repo)
+    repo.put("scripts/release/NOTES-TEMPLATE.md", "# v{{version}}\n\n{{nope}}\n")
+    refused = repo.tool("notes", "1.14.0", check=False)
+    assert refused.returncode == 1
+    assert "the template names {{nope}}, which the render does not fill" in refused.stderr
+    assert "the draft was not rendered" in refused.stderr and refused.stdout == ""
+
+
+def test_the_release_note_of_a_pull_request_body() -> None:
+    notes = load_notes_module()
+    assert (
+        notes.release_note("## Release note\n\nOne sentence.\n\n## Numbers\n\nx") == "One sentence."
+    )
+    assert notes.release_note("### Release notes\n\n- a\n- b\n") == "a b"
+    assert notes.release_note("**Release note:** inline.\nstill.\n\nnot this\n") == "inline. still."
+    assert (
+        notes.release_note("## Release note: on the heading\n\nand below\n")
+        == "on the heading and below"
+    )
+    assert notes.release_note("## Release note\n\n<!-- a comment -->\nkept\n") == "kept"
+    for none in (
+        "none",
+        "N/A",
+        "No user-visible change.",
+        "None: a test-only change.",
+        "(none)",
+        "nothing",
+    ):
+        assert notes.release_note(f"## Release note\n\n{none}\n") == "", none
+    assert (
+        notes.release_note(
+            "## Release note\n\nNone of the flags change, but the metric is renamed.\n"
+        )
+        != ""
+    )
+    assert notes.release_note("## Description\n\nno section\n") is None
+    assert notes.release_note("") is None
+    pull = notes.Pull.of("feat(gateway, python)!: x (#7)")
+    assert (pull.number, pull.type, pull.scope, pull.bang, pull.area) == (
+        7,
+        "feat",
+        "gateway, python",
+        True,
+        "Gateway",
+    )
+    assert notes.Pull.of("docs(gateway): x (#8)").area is None
+    assert notes.Pull.of("fix(e2e): x (#9)").area is None
+    assert notes.Pull.of("fix(whatever): x (#9)").area == "Other areas"
+    unparsed = notes.Pull.of("Add a thing")
+    assert (unparsed.number, unparsed.type, unparsed.area) == (None, "", "Other areas")
+    assert notes.placeholders("a\n<!-- AUTHOR: x -->\n{{t}}\n<!-- not one -->") == [
+        (2, "<!-- AUTHOR: x -->"),
+        (3, "{{t}}"),
+    ]
 
 
 # --- publish-plan ----------------------------------------------------------------------------
@@ -2325,7 +2727,7 @@ def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) 
         and "gh workflow run release-docker.yml --ref v1.14.0-rc.1" in plan.stdout
     )
     notes = repo.tool("notes", "1.14.0-rc.1")
-    assert said in notes.stderr and "## SMG v1.14.0-rc.1" in notes.stdout
+    assert said in notes.stderr and "# Shepherd Model Gateway v1.14.0-rc.1" in notes.stdout
     assert repo.origin_ref("refs/heads/release/1.14") is None, "a read pushes nothing"
     on_main = repo.git("rev-parse", "origin/main")
     for command in (("bump", "1.14.0-rc.2"), ("pick", "1.14", on_main), ("tag", "1.14.0-rc.1")):
