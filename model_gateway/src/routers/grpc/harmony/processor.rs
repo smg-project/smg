@@ -16,6 +16,7 @@ use tracing::error;
 use super::{
     builder::{convert_harmony_logprobs, try_harmony_encoding},
     stop::TextStopScanner,
+    types::HarmonyChannelOutput,
     HarmonyParserAdapter,
 };
 use crate::{
@@ -55,6 +56,44 @@ pub(super) fn iteration_usage(
     parsed_reasoning_tokens: u32,
 ) -> Usage {
     response_formatting::with_parsed_reasoning_tokens(counts.usage(), Some(parsed_reasoning_tokens))
+}
+
+/// The router's own enforcement of the string `stop`s its engine cannot
+/// match, on one parsed turn: the channel text is scanned in emission order
+/// (analysis before final) and cut after the first match, which stays as the
+/// suffix, as the token-forwarding gRPC path yields it for these models;
+/// everything the model wrote past the match, calls included, is dropped,
+/// and the turn's finish is `stop`. Answers the stop that matched; none when
+/// no stop did (the turn stands as parsed), and nothing is scanned when the
+/// router has no stops to enforce.
+fn enforce_router_stops(
+    router_stop_strings: &[String],
+    turn: &mut HarmonyChannelOutput,
+) -> Option<String> {
+    if router_stop_strings.is_empty() {
+        return None;
+    }
+    let mut scanner = TextStopScanner::new(router_stop_strings.to_vec());
+    if let Some(text) = turn.analysis.take() {
+        let (out, stopped) = scanner.scan_complete(&text);
+        turn.analysis = (!out.is_empty()).then_some(out);
+        if stopped {
+            turn.final_text.clear();
+            turn.commentary = None;
+        }
+    }
+    if scanner.matched().is_none() && !turn.final_text.is_empty() {
+        let (out, stopped) = scanner.scan_complete(&turn.final_text);
+        turn.final_text = out;
+        if stopped {
+            turn.commentary = None;
+        }
+    }
+    let matched = scanner.matched().map(str::to_string);
+    if matched.is_some() {
+        turn.finish_reason = "stop".to_string();
+    }
+    matched
 }
 
 /// Processor for non-streaming Harmony responses
@@ -119,7 +158,7 @@ impl HarmonyResponseProcessor {
             })?;
 
             // Parse Harmony channels with finish_reason
-            let parsed = parser
+            let mut parsed = parser
                 .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
                 .map_err(|e| {
                     error!(
@@ -145,47 +184,21 @@ impl HarmonyResponseProcessor {
                 None
             };
 
-            let mut analysis = parsed.analysis;
-            let mut final_text = parsed.final_text;
-            let mut tool_calls = parsed.commentary;
-            let mut finish_reason = parsed.finish_reason;
-            let mut matched_stop = matched_stop;
-
-            // Router-enforced string stops: scan channel text in emission
-            // order (analysis before final), truncate after the first match
-            // (retaining the stop as suffix, like the token-forwarding gRPC
-            // path), and drop everything generated past it.
-            if !router_stop_strings.is_empty() {
-                let mut scanner = TextStopScanner::new(router_stop_strings.to_vec());
-                if let Some(text) = analysis.take() {
-                    let (out, stopped) = scanner.scan_complete(&text);
-                    analysis = (!out.is_empty()).then_some(out);
-                    if stopped {
-                        final_text.clear();
-                        tool_calls = None;
-                    }
-                }
-                if scanner.matched().is_none() && !final_text.is_empty() {
-                    let (out, stopped) = scanner.scan_complete(&final_text);
-                    final_text = out;
-                    if stopped {
-                        tool_calls = None;
-                    }
-                }
-                if let Some(stop) = scanner.matched() {
-                    finish_reason = "stop".to_string();
-                    matched_stop = Some(serde_json::Value::String(stop.to_string()));
-                }
-            }
+            // The router's own stops, where the engine cannot match them: the
+            // turn is cut at the first match, and that stop is the choice's.
+            let matched_stop = match enforce_router_stops(router_stop_strings, &mut parsed) {
+                Some(stop) => Some(serde_json::Value::String(stop)),
+                None => matched_stop,
+            };
 
             // Build response message (assistant)
             let message = ChatCompletionMessage {
                 role: "assistant".to_string(),
-                content: (!final_text.is_empty()).then_some(final_text),
+                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
                 refusal: None,
                 annotations: Vec::new(),
-                tool_calls,
-                reasoning_content: analysis,
+                tool_calls: parsed.commentary,
+                reasoning_content: parsed.analysis,
             };
 
             // Accumulate reasoning tokens across all responses
@@ -195,7 +208,7 @@ impl HarmonyResponseProcessor {
                 index: index as u32,
                 message,
                 logprobs,
-                finish_reason: Some(finish_reason),
+                finish_reason: Some(parsed.finish_reason),
                 matched_stop,
                 hidden_states: None,
             });
@@ -274,6 +287,9 @@ impl HarmonyResponseProcessor {
     /// * `execution_result` - The execution result from the model
     /// * `responses_request` - The original Responses API request
     /// * `dispatch` - Dispatch metadata for request tracking
+    /// * `router_stop_strings` - The string `stop`s the router must enforce
+    ///   itself, non-empty only where the engine sees token ids and cannot
+    ///   match them: the turn is cut at the first match, as a chat turn is
     ///
     /// # Returns
     ///
@@ -286,6 +302,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
+        router_stop_strings: &[String],
     ) -> Result<(ResponsesIterationResult, response_formatting::TokenCounts), Response> {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
@@ -317,7 +334,7 @@ impl HarmonyResponseProcessor {
             )
         })?;
 
-        let parsed = parser
+        let mut parsed = parser
             .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
             .map_err(|e| {
                 error!(
@@ -346,6 +363,10 @@ impl HarmonyResponseProcessor {
                 This is a model hallucination bug where it copies tool result format."
             );
         }
+
+        // The router's own stops, where the engine cannot match them: the
+        // turn is cut at the first match, the calls past it dropped.
+        enforce_router_stops(router_stop_strings, &mut parsed);
 
         // The engine's counts of the iteration and the usage they make, as
         // the streamed iteration builds it (needed for both ToolCallsFound
