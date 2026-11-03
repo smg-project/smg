@@ -73,6 +73,7 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 
+
 def _excerpt(line: str) -> str:
     if len(line) <= LOG_EXCERPT_CHARS:
         return line
