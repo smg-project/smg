@@ -40,8 +40,9 @@
 //! the same spelling, with the `kimi_thinking` and `kimi_k25` thought parsers; one departure from
 //! `kimi_thinking`, which read everything before `</think>` as the thought whether or not `<think>`
 //! came first: this table starts K2 Thinking in content, so an output that closes a thought it
-//! never opened is content as written, the marker included (the templates always write the
-//! opener; the tests pin it).
+//! never opened is content as written, the marker included (a thought's opener comes first, from
+//! the model on K2 Thinking and from the prompt on K2.5, K2.6 and K2.7-Code, and K2 Instruct
+//! writes none; the tests pin it).
 //!
 //! The structural tag of a forced or required call is written from the table's layout
 //! (`layout`, [`Format::grammar_for`]), which spells a call as the templates render one: the
