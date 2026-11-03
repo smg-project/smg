@@ -506,15 +506,14 @@ pub(crate) fn render_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
+    // The engine's renderer hands the conversation to this encoder with a
+    // `developer` message as written (its developer-to-system rewrite belongs
+    // to its template path, which this encoder never takes), so the vendor
+    // encoding's own rules apply: dropped before the last user turn with the
+    // thinking, a user turn otherwise.
     let messages = marks::without_marks(messages);
-    // The engine's renderer rewrites a `developer` message as a `system` one
-    // (and merges the system messages when one is not first) before any
-    // tokenizer mode's own encoder sees the conversation, so the vendor
-    // encoding's developer branch is never reached there; the same rule here.
-    let developer = crate::chat_template::developer_messages_as_system(&messages);
-    let messages = developer.as_deref().unwrap_or(&messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(messages);
+    let merged = merge_tool_messages(&messages);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -908,29 +907,150 @@ mod tests {
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
     }
 
-    /// The engine's renderer hands every tokenizer mode a `developer` message
-    /// as a `system` one, so it renders as the system message does in both
-    /// modes, never with the user token the vendor branch wrote.
+    fn developer(text: &str) -> Value {
+        json!({ "role": "developer", "content": text })
+    }
+
+    /// The engine's renderer hands this encoder a `developer` message as
+    /// written (its developer-to-system rewrite is the template path's), so
+    /// the encoding's own rules apply: in thinking mode the thinking-drop
+    /// removes a developer message before the last user turn entirely; in
+    /// chat mode it is a user turn, the user token and the content. The
+    /// recorded reference of the developer-role case is the thinking render,
+    /// byte for byte; never the system message's prompt.
     #[test]
-    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
-        let msgs = [
-            json!({ "role": "developer", "content": "Answer in one word." }),
-            user("Colour of the sky?"),
-        ];
+    fn developer_message_renders_as_the_encoder_developer_turn() {
+        let msgs = [developer("Answer in one word."), user("Colour of the sky?")];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Colour of the sky?{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one word.{USER_SP_TOKEN}Colour of the sky?\
+                 {ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
         let as_system = [
             json!({ "role": "system", "content": "Answer in one word." }),
             user("Colour of the sky?"),
         ];
-        for mode in [ThinkingMode::Chat, ThinkingMode::Thinking] {
+        for mode in [ThinkingMode::Thinking, ThinkingMode::Chat] {
+            assert_ne!(
+                encode_messages(&msgs, mode, &EncodeParams::default()).unwrap(),
+                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+            );
+        }
+    }
+
+    /// Earlier in the conversation the same rule: gone with the thinking-drop,
+    /// a user turn in chat mode (the assistant turn after it closes as it does
+    /// after a user turn). An empty developer message is refused where it is
+    /// rendered and dropped where the thinking-drop reaches it first.
+    #[test]
+    fn a_developer_message_before_the_last_user_turn_goes_with_the_thinking_drop() {
+        let msgs = [
+            developer("DEV"),
+            user("q1"),
+            json!({ "role": "assistant", "content": "a1" }),
+            user("q2"),
+        ];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}q1{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}a1{EOS_TOKEN}\
+                 {USER_SP_TOKEN}q2{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}DEV{USER_SP_TOKEN}q1{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}a1\
+                 {EOS_TOKEN}{USER_SP_TOKEN}q2{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
+        let empty = [developer(""), user("q")];
+        let out =
+            encode_messages(&empty, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}q{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}")
+        );
+        let err =
+            encode_messages(&empty, ThinkingMode::Chat, &EncodeParams::default()).unwrap_err();
+        assert!(
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
+            "{err}"
+        );
+    }
+
+    /// A developer message that ends the conversation is the last user turn:
+    /// kept in both modes, the assistant header and the thinking token after
+    /// it.
+    #[test]
+    fn a_trailing_developer_message_is_the_last_user_turn() {
+        let msgs = [user("Colour of the sky?"), developer("Answer in one word.")];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
             let out = encode_messages(&msgs, mode, &EncodeParams::default()).unwrap();
             assert_eq!(
                 out,
-                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+                format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Colour of the sky?{USER_SP_TOKEN}Answer in one word.\
+                     {ASSISTANT_SP_TOKEN}{thinking_token}"
+                )
             );
+        }
+    }
+
+    /// A developer message's own tools and response format render under its
+    /// content after a blank line, as a system message's do; declared tools
+    /// keep the thinking-drop off, so the message stays in thinking mode too.
+    #[test]
+    fn a_developer_message_carries_its_tools_and_response_format() {
+        let with_tools = [json!({
+            "role": "developer",
+            "content": "Follow the policy.",
+            "tools": [{ "type": "function", "function": { "name": "lookup_weather",
+                "description": "Look up", "parameters": { "type": "object",
+                "properties": { "query": { "type": "string" } }, "required": ["query"] } } }],
+        })];
+        let with_format = [json!({
+            "role": "developer",
+            "content": "Answer in one word.",
+            "response_format": { "type": "json_object" },
+        })];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&with_tools, mode, &EncodeParams::default()).unwrap();
             assert!(
-                out.contains("Answer in one word.")
-                    && !out.contains(&format!("{USER_SP_TOKEN}Answer in one word.")),
+                out.starts_with(&format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Follow the policy.\n\n## Tools\n\n"
+                )) && out.contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "schemas to invoke tool calls.\n{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    )),
                 "{out}"
+            );
+            let out = encode_messages(&with_format, mode, &EncodeParams::default()).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one word.\n\n## Response Format:\n\n\
+                     You MUST strictly adhere to the following schema to reply:\n\
+                     {{\"type\": \"json_object\"}}{ASSISTANT_SP_TOKEN}{thinking_token}"
+                )
             );
         }
     }
