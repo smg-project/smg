@@ -544,7 +544,7 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content; not such a marker in an output the request ran past the model's own end with ignore_eos, which counts as nothing), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
@@ -578,7 +578,7 @@ pub(crate) fn init_metrics() {
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
     describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
     describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
-    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: not_nfc (text not in NFC under an NFC normalizer) or piece_declined (the model declined a piece)");
+    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: piece_declined (the model declined a piece)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -972,7 +972,8 @@ pub(crate) fn init_metrics() {
         "smg_worker_overload_fallback_total",
         "Requests placed although every worker they could use is overloaded and shedding is \
          off, by stage: routed to the least-loaded worker, or, for a cache-aware prefill pool \
-         of a prefill/decode pair, placed by that policy"
+         of a prefill/decode pair or a regular request that consistent_hashing places by \
+         its routing key, placed by that policy"
     );
     describe_counter!(
         "smg_worker_liveness_fallback_total",
@@ -2575,8 +2576,9 @@ impl Metrics {
 
     /// Record a request placed although every worker it could use is
     /// overloaded and shedding is off: steered to the least-loaded worker,
-    /// or, for a cache-aware prefill pool of a prefill/decode pair, placed by
-    /// that policy (which counts the pick as a selection too).
+    /// or, for a cache-aware prefill pool of a prefill/decode pair or a
+    /// regular request that consistent_hashing places by its routing key,
+    /// placed by that policy (which counts the pick as a selection too).
     pub fn record_worker_overload_fallback(stage: &'static str) {
         counter!(
             "smg_worker_overload_fallback_total",

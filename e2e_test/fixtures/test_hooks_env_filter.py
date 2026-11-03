@@ -5,11 +5,16 @@ Mirrors the ``_FakeItem`` harness in ``test_hooks_zmq_filter.py``.
 
 from __future__ import annotations
 
+import os
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fixtures import hooks
 from infra import constants
+
+pytest_plugins = ["pytester"]
 
 
 class _FakeItem:
@@ -69,6 +74,7 @@ def _clean_env(monkeypatch):
         "E2E_SGLANG_SERVICER_IMPL",
         "E2E_TOKENSPEED_SERVICER_IMPL",
         "E2E_VLLM_SERVICER_IMPL",
+        "E2E_AMD_REQUIRE_PASSING_CALL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -301,14 +307,31 @@ def test_sglang_zmq_lane_runs_multimodal_and_keeps_http_error_shapes_off_the_wir
     assert kept == [mm, text] and deselected == [shape]
 
 
-def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_ops():
-    """The TokenSpeed Rust servicer serves the prefill/decode topologies and
-    refuses the encode role: a Rust lane keeps the PD cases, drops the
-    encode-prefill-decode ones, the admin operations the wire has no control
-    message for, and a fleet of plain workers."""
+def test_tokenspeed_rust_lane_drops_only_unserved_wires_and_plain_fleets():
+    """The TokenSpeed Rust servicer serves what the engine's handshake declares
+    (control messages, the encode role, the logprob columns): a Rust lane keeps
+    the PD and EPD cases and the admin operations, and drops a fleet of plain
+    workers and a wire it does not serve."""
     workers = lambda **kwargs: SimpleNamespace(kwargs=kwargs)  # noqa: E731
     pd = _FakeItem(
         "router/test_pd_topologies.py::T::t[1p1d]", params={"setup_backend": ("pd_grpc", (1, 1))}
+    )
+    # A topology whose pools carry a dict (per-pool transports or environment):
+    # the whole param cannot be hashed, its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "router/test_pd_topologies.py::T::t[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
+    )
+    pd_env = _FakeItem(
+        "router/test_pd_topologies.py::T::t[1p1d-env]",
+        params={
+            "setup_backend": ("pd_grpc", (1, 1, {"prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"}}))
+        },
     )
     pd_workers = _FakeItem(
         "router/test_pd_responses.py::t", markers={"workers": workers(prefill=1, decode=1)}
@@ -322,15 +345,18 @@ def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_op
     plain = _FakeItem("chat_completions/test_openai_server.py::t", params={"setup_backend": "grpc"})
     other = _FakeItem("router/test_other_wire.py::t", params={"setup_backend": "mesh_grpc"})
     kept, deselected = hooks._filter_tokenspeed_rust_items(
-        [pd, pd_workers, epd, admin, fleet, plain, other]
+        [pd, pd_mixed, pd_env, pd_workers, epd, admin, fleet, plain, other]
     )
-    assert [item.nodeid for item in kept] == [pd.nodeid, pd_workers.nodeid, plain.nodeid]
-    assert [item.nodeid for item in deselected] == [
+    assert [item.nodeid for item in kept] == [
+        pd.nodeid,
+        pd_mixed.nodeid,
+        pd_env.nodeid,
+        pd_workers.nodeid,
         epd.nodeid,
         admin.nodeid,
-        fleet.nodeid,
-        other.nodeid,
+        plain.nodeid,
     ]
+    assert [item.nodeid for item in deselected] == [fleet.nodeid, other.nodeid]
 
 
 def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
@@ -340,6 +366,17 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     pd = _FakeItem(
         "e2e_test/chat_completions/test_pd.py::test_pd[pd_mooncake]",
         params={"setup_backend": "pd_mooncake"},
+    )
+    # A topology whose pools carry a dict: the whole param cannot be hashed,
+    # its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "e2e_test/router/test_pd_topologies.py::test_pd[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
     )
     epd = _FakeItem(
         "e2e_test/chat_completions/test_epd.py::test_epd[1e1p1d]",
@@ -356,11 +393,11 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     embed = _FakeItem(
         "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
     )
-    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, epd, mm, admin, embed])
+    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, pd_mixed, epd, mm, admin, embed])
     # Prefill/decode topologies, multimodal payloads, admin ops and embeddings
     # ride the wire (the bootstrap slots, the scheduler's processor output,
     # control calls, embedding requests); the EPD encode dispatch does not.
-    assert kept == [chat, pd, mm, admin, embed] and deselected == [epd]
+    assert kept == [chat, pd, pd_mixed, mm, admin, embed] and deselected == [epd]
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +426,11 @@ def _rust_lane_items(runtime: str):
     """One case the Rust path serves and one it does not, for ``runtime``."""
     plain = _FakeItem(f"{runtime}/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"})
     if runtime == "tokenspeed":
+        # The engine declares control, encode and logprobs on its handshake;
+        # what the lane still drops is a fleet of plain workers.
         refused = _FakeItem(
-            "router/test_admin_ops.py::test_flush", params={"setup_backend": "grpc"}
+            "router/test_loads.py::test_fleet",
+            markers={"workers": SimpleNamespace(kwargs={"count": 2})},
         )
     else:
         refused = _FakeItem(
@@ -428,3 +468,134 @@ def test_rust_path_filters_follow_the_effective_servicer(
         )
         assert config.deselected == []
         assert "rust-servicer" not in _summary(config)
+
+
+@pytest.mark.parametrize(
+    "body, enabled, exit_code, gate_signal, xml_counts",
+    [
+        pytest.param(
+            "import pytest\ndef test_case(): pytest.skip('optional')",
+            False,
+            0,
+            False,
+            (1, 0, 0),
+            id="default-off",
+        ),
+        pytest.param(
+            "import pytest\ndef test_case(): pytest.skip('optional')",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="call-skip",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.fixture\ndef missing(): pytest.skip('unavailable')\n"
+            "def test_case(missing): pass",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="setup-skip",
+        ),
+        pytest.param("def test_case(): assert True", True, 0, False, (0, 0, 0), id="pass"),
+        pytest.param(
+            "import pytest\ndef test_a(): assert True\ndef test_b(): pytest.skip('optional')",
+            True,
+            0,
+            False,
+            (1, 0, 0),
+            id="pass-and-skip",
+        ),
+        pytest.param("def test_case(): assert False", True, 1, False, (0, 1, 0), id="failure"),
+        pytest.param(
+            "import pytest\n@pytest.fixture\ndef broken(): raise RuntimeError('setup')\n"
+            "def test_case(broken): pass",
+            True,
+            1,
+            False,
+            (0, 0, 1),
+            id="setup-error",
+        ),
+        pytest.param("value = 1", True, 5, False, (0, 0, 0), id="no-tests"),
+        pytest.param(
+            "def test_case(): raise KeyboardInterrupt()",
+            True,
+            2,
+            False,
+            (0, 0, 0),
+            id="interrupted",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known', strict=True)\n"
+            "def test_case(): assert True",
+            True,
+            1,
+            False,
+            (0, 1, 0),
+            id="strict-xpass",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known')\ndef test_case(): assert False",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="xfail",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known')\ndef test_case(): assert True",
+            True,
+            0,
+            False,
+            (0, 0, 0),
+            id="xpass",
+        ),
+    ],
+)
+def test_passing_call_real_sessions(
+    pytester, monkeypatch, body, enabled, exit_code, gate_signal, xml_counts
+):
+    """Exercise the actual complete plugin in isolated pytest processes."""
+    for key in list(os.environ):
+        if key.startswith(("PYTEST_", "E2E_")):
+            monkeypatch.delenv(key)
+    hook = Path(__file__).with_name("hooks.py").resolve()
+    monkeypatch.setenv("PYTHONPATH", str(hook.parent.parent))
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    if enabled:
+        monkeypatch.setenv("E2E_AMD_REQUIRE_PASSING_CALL", "1")
+    config = pytester.makeini("[pytest]\n")
+    pytester.makeconftest(
+        f"""
+        from pathlib import Path
+        pytest_plugins = ["fixtures.hooks"]
+        def pytest_configure(config):
+            from fixtures import hooks
+            actual = Path(hooks.__file__).resolve()
+            if actual != Path({str(hook)!r}):
+                raise RuntimeError("wrong hooks module: " + str(actual))
+            Path("loaded-hook.txt").write_text(str(actual))
+        """
+    )
+    case = pytester.makepyfile(test_case=body)
+    xml_path = pytester.path / "result.xml"
+    result = pytester.runpytest_subprocess(
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(pytester.path),
+        "--junitxml",
+        str(xml_path),
+        str(case),
+        timeout=10,
+    )
+    assert result.ret == exit_code
+    assert ("AMD_E2E_NO_PASSING_CALL" in result.stdout.str() + result.stderr.str()) is gate_signal
+    assert (pytester.path / "loaded-hook.txt").read_text() == str(hook)
+    xml = ET.parse(xml_path).getroot()
+    assert tuple(len(list(xml.iter(tag))) for tag in ("skipped", "failure", "error")) == xml_counts

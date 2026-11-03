@@ -667,6 +667,7 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
         outputs,
         finished_request_ids,
         load,
+        kv_transfer: None,
         wave: None,
         utility: None,
     })

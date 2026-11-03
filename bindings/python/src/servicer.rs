@@ -561,20 +561,17 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                 if mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
                     || !mm.image_data.is_empty() || !mm.video_data.is_empty()
                     || !mm.audio_urls.is_empty() || !mm.audio_data.is_empty()
-                    || (!mm.image_urls.is_empty() && !mm.video_urls.is_empty()) {
-                    return Err(tonic::Status::invalid_argument("SGLang references require one image or video modality without tensors or raw media"));
+                    || !request.extra_mm_inputs.is_empty() {
+                    return Err(tonic::Status::invalid_argument("SGLang references require images or videos without tensors or raw media"));
                 }
-                let (modality, urls) = if mm.video_urls.is_empty() {
-                    (Modality::Image, mm.image_urls)
-                } else {
-                    (Modality::Video, mm.video_urls)
-                };
-                let items = urls.into_iter().map(|url| WorkerMediaItem {
-                    modality, url,
-                }).collect::<Vec<_>>();
+                // The shared pipeline matches anchors per modality, preserving URL order.
+                let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
+                    .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
+                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .collect::<Vec<_>>();
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
-                let (tokens, inputs) = pipeline.process_sglang(
+                let (tokens, inputs, extras) = pipeline.process_sglang(
                     std::mem::take(&mut tokenized.input_ids), &items,
                 ).await.map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
@@ -589,7 +586,8 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                     }
                 })?;
                 tokenized.input_ids = tokens;
-                request.mm_inputs = Some(inputs);
+                request.mm_inputs = Some(Box::new(inputs));
+                request.extra_mm_inputs = extras;
                 Ok(request)
             }, span)).await.map_err(|error| tonic::Status::internal(format!("media task: {error}")))?
         })

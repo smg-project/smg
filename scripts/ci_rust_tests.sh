@@ -39,7 +39,7 @@ GATEWAY_SHARDS=3
 
 # shard | path filter | extra setup (comma-separated: golden, ffmpeg, postgres, wasm-fixtures) | test step timeout (minutes)
 SHARDS='
-gateway-unit rust-gateway    -                      20
+gateway-unit rust-gateway    ffmpeg                 20
 gateway-1    rust-gateway    -                      20
 gateway-2    rust-gateway    -                      20
 gateway-3    rust-gateway    -                      20
@@ -77,7 +77,7 @@ packages_of() {
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
-        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker ;;
+        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
         kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
@@ -151,6 +151,8 @@ commands_of() {
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
             echo "-p smg -p smg-test-harness --lib --bin smg"
+            # Reuse the gateway unit-test build for the opt-in mixed-media video regression.
+            echo "-p smg -p smg-test-harness --lib sglang_mixed_media_preserves_interleaved_anchors :: --ignored"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
@@ -175,7 +177,7 @@ commands_of() {
         protocols)
             echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker --features engine-zmq-client/mock-engine" ;;
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma"

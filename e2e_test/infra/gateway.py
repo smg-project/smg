@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ from .constants import (
     get_parser,
     get_zmq_engine_count,
     host_port,
+    trtllm_runs_engines_own_servicer,
 )
 from .process_utils import (
     ProcessExitedError,
@@ -35,6 +37,17 @@ if TYPE_CHECKING:
     from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+def workers_labelled_by_hand(workers: list | None) -> list:
+    """The workers of ``workers`` whose servicer advertises no structural-tag
+    vocabulary, so the harness labels them: the TensorRT-LLM workers on the
+    engine's own gRPC server. On the Rust servicer the launcher advertises
+    the vocabulary of the xgrammar installed beside the engine itself."""
+    labelled = [w for w in workers or () if getattr(w, "engine", None) == "trtllm"]
+    if not labelled or not trtllm_runs_engines_own_servicer():
+        return []
+    return labelled
 
 
 def build_epd_mode_args(
@@ -292,12 +305,14 @@ class Gateway:
             )
             # A worker whose servicer cannot advertise which structural-tag
             # vocabulary its grammar compiler takes is labelled by its
-            # operator: the TensorRT-LLM lane runs the engine's own gRPC
+            # operator: a TensorRT-LLM worker on the engine's own gRPC
             # servicer (`tensorrt_llm.commands.serve`), which reports no such
             # fact, over the xgrammar its pinned wheel carries
             # (scripts/ci_install_trtllm.sh: 0.1.32, before the `optional`,
             # `plus`, `star` and `token` nodes), and the gateway spells that
-            # worker's structural tags in the older vocabulary.
+            # worker's structural tags in the older vocabulary. On the Rust
+            # servicer the launcher advertises the vocabulary itself
+            # (`workers_labelled_by_hand`).
             # The router is up by now (`_launch`): a label that does not land
             # within its wait takes the router down with it before the error
             # goes out, so a caller that does not shut down on failure leaves
@@ -307,8 +322,7 @@ class Gateway:
             # exits.
             try:
                 self.label_workers(
-                    [w for w in workers or () if getattr(w, "engine", None) == "trtllm"],
-                    {"structural_tag_vocabulary": "older"},
+                    workers_labelled_by_hand(workers), {"structural_tag_vocabulary": "older"}
                 )
             except Exception as e:
                 detail = self._output_tail()
@@ -753,12 +767,15 @@ def launch_cloud_gateway(
     timeout: float = 60,
     show_output: bool | None = None,
     max_attempts: int = 3,
+    post_start: Callable[[Gateway, float], None] | None = None,
 ) -> Gateway:
     """Launch gateway with a cloud API runtime (openai, xai, anthropic).
 
     Retries up to max_attempts because the AddWorker workflow can fail
     intermittently due to a race condition in the workflow engine's
-    parallel step context handling.
+    parallel step context handling. An optional post_start barrier receives
+    the same attempt's absolute deadline; its TimeoutError uses these existing
+    attempts, while other failures are cleaned up and propagated without retry.
     """
     from .model_specs import THIRD_PARTY_MODELS
 
@@ -770,7 +787,9 @@ def launch_cloud_gateway(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         gateway = Gateway()
+        barrier_started = False
         try:
+            deadline = time.monotonic() + timeout
             gateway.start(
                 cloud_backend=runtime,
                 history_backend=history_backend,
@@ -778,14 +797,28 @@ def launch_cloud_gateway(
                 show_output=show_output,
                 extra_args=extra_args,
             )
+            if post_start is not None:
+                barrier_started = True
+                post_start(gateway, deadline)
             return gateway
-        except TimeoutError as e:
-            last_error = e
+        except BaseException as error:
+            if barrier_started:
+                gateway._started = False
+                if gateway.log_path is not None:
+                    error.add_note(f"Gateway setup log retained at {gateway.log_path}")
+            if not isinstance(error, TimeoutError):
+                if barrier_started:
+                    gateway.shutdown()
+                raise
+            last_error = error
             logger.warning(
-                "Cloud gateway startup attempt %d/%d timed out: %s",
+                "Cloud gateway startup attempt %d/%d timed out: %s (log: %s)",
                 attempt,
                 max_attempts,
-                e,
+                error,
+                gateway.log_path,
             )
+            # Cleanup failures propagate from here, never becoming another
+            # startup attempt with ownership of the previous router uncertain.
             gateway.shutdown()
     raise last_error  # type: ignore[misc]

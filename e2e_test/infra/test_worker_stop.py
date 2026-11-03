@@ -18,7 +18,6 @@ PORTS = {
     "bootstrap_port": 31002,
     "nixl_port": 31003,
     "dist_init_port": 31004,
-    "rl_control_port": 31005,
     "admin_port": 31006,
 }
 MORIIO_PORTS = [31007, 31008]

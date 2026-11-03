@@ -758,32 +758,18 @@ mod tests {
         pod
     }
 
+    /// A running, ready pod of the PD deployment: the `app` and `component`
+    /// labels the selectors read, and the bootstrap-port annotation when the
+    /// role has one (an empty, not absent, annotation map otherwise).
     fn create_pd_k8s_pod(name: &str, ip: &str, pod_type: &str, bootstrap_port: Option<u16>) -> Pod {
-        let mut labels = BTreeMap::new();
-        labels.insert("app".to_string(), "sglang".to_string());
-        labels.insert("component".to_string(), pod_type.to_string());
-
-        let mut annotations = BTreeMap::new();
-        if let Some(port) = bootstrap_port {
-            annotations.insert("sglang.ai/bootstrap-port".to_string(), port.to_string());
-        }
-
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                uid: Some(format!("uid-{name}")),
-                labels: Some(labels),
-                annotations: Some(annotations),
-                ..Default::default()
-            },
-            spec: Some(PodSpec::default()),
-            status: Some(PodStatus {
-                pod_ip: Some(ip.to_string()),
-                phase: Some("Running".to_string()),
-                conditions: Some(vec![ready_condition("True")]),
-                ..Default::default()
-            }),
-        }
+        let mut pod = make_labeled_pod(name, ip, &[("app", "sglang"), ("component", pod_type)]);
+        pod.metadata.annotations = Some(
+            bootstrap_port
+                .into_iter()
+                .map(|port| ("sglang.ai/bootstrap-port".to_string(), port.to_string()))
+                .collect(),
+        );
+        pod
     }
 
     fn create_pd_config() -> ServiceDiscoveryConfig {

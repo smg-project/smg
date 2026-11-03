@@ -7,6 +7,7 @@ on:
       - e2e_test/infra/test_mock_mcp_server.py
       - e2e_test/pyproject.toml
       - scripts/ci_install_e2e_deps.sh
+      - scripts/ci_setup_sglang_rocm_image.sh
       - scripts/tests/test_ci_engine_http_dependencies.py
       - .github/workflows/e2e-mcp-mock.yml
 

@@ -12,7 +12,7 @@ use tracing::warn;
 /// (a secret volume with a group, a `root:ssl-cert` key) may be readable by
 /// the gateway's group, since that is how the gateway reads it at all, but
 /// not writable by it and not open to others (see [`shared_mode`]).
-pub(crate) fn shared_private_key_mode(path: &Path) -> Option<u32> {
+fn shared_private_key_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -31,7 +31,7 @@ pub(crate) fn shared_private_key_mode(path: &Path) -> Option<u32> {
 /// any group or other bit on a file the gateway owns (`owned`), group write
 /// or any other bit on a file another user owns (group read is how the
 /// gateway reads such a file). Answers the mode when it does.
-pub(crate) fn shared_mode(mode: u32, owned: bool) -> Option<u32> {
+fn shared_mode(mode: u32, owned: bool) -> Option<u32> {
     let shared = if owned { 0o077 } else { 0o027 };
     (mode & shared != 0).then_some(mode)
 }

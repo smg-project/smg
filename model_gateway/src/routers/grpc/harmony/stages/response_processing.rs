@@ -143,8 +143,9 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 Ok(None)
             }
             HarmonyResponseSpec::Responses(responses_request) => {
-                // For streaming Responses API, leave execution_result in context
-                // for external streaming processor (serve_harmony_responses_stream)
+                // For streaming Responses API, leave execution_result (and the
+                // router's stop obligations beside it) in context for the
+                // external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
                     // Don't take execution_result - let the caller handle it
                     return Ok(None);
@@ -171,7 +172,12 @@ impl ProcessStage for HarmonyResponseProcessingStage {
 
                 let (iteration_result, counts) = self
                     .processor
-                    .process_responses_iteration(execution_result, responses_request, dispatch)
+                    .process_responses_iteration(
+                        execution_result,
+                        responses_request,
+                        dispatch,
+                        &router_stops,
+                    )
                     .await?;
 
                 ctx.response.responses_iteration_result = Some(iteration_result);

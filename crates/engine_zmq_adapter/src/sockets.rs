@@ -132,7 +132,14 @@ fn tcp_socket_addresses(
     }
     let (host, _port) = authority
         .rsplit_once(':')
-        .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0))
+        .filter(|(host, port)| {
+            // An IPv6 literal rides in brackets: a bare one cannot be told
+            // apart from its port, since the split is at the last colon.
+            let bracketed = host.starts_with('[') && host.ends_with(']');
+            !host.is_empty()
+                && (bracketed || !host.contains(':'))
+                && port.parse::<u16>().is_ok_and(|p| p != 0)
+        })
         .ok_or_else(|| format!("ZMQ worker URL must be tcp://<host>:<port>, got '{base_url}'"))?;
     let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
     if unbracketed
@@ -442,7 +449,8 @@ mod tests {
     }
 
     /// The INIT hands the engines the bound addresses, so a wildcard host (no
-    /// engine can dial it), a missing port, and a second handshake address
+    /// engine can dial it), a missing port, a bare IPv6 host without brackets
+    /// (it cannot be told apart from its port), and a second handshake address
     /// are each refused.
     #[test]
     fn a_tcp_worker_refuses_a_wildcard_host_a_missing_port_and_an_override() {
@@ -455,6 +463,8 @@ mod tests {
             "tcp://10.0.0.5:0",
             "tcp://:31000",
             "tcp://10.0.0.5:x",
+            "tcp://fd00::5",
+            "tcp://fd00::5:31000",
         ] {
             let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
             assert!(err.contains("tcp://<host>:<port>"), "{url}: {err}");

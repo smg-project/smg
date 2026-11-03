@@ -45,7 +45,67 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    log_request_line(&req);
     submit(state, client, req, trace_headers, arrival).await
+}
+
+/// The tracing target of the per-request line: a reader that wants it raises
+/// this target alone (`RUST_LOG=info,engine_servicer::request=debug`); the
+/// production filter leaves it off, and an event below the filter costs the
+/// enabled check and nothing else.
+pub(super) const REQUEST_LINE_TARGET: &str = "engine_servicer::request";
+
+/// Log the request as received, at DEBUG under [`REQUEST_LINE_TARGET`], in the
+/// words the Python servicer logs for every `Generate` at INFO: what a reader
+/// of a worker's log greps for (a PD side's media placement, the rank the
+/// gateway pinned). The line is formatted only when that target is enabled.
+pub(super) fn log_request_line(req: &vllm::GenerateRequest) {
+    if tracing::enabled!(target: REQUEST_LINE_TARGET, tracing::Level::DEBUG) {
+        tracing::debug!(target: REQUEST_LINE_TARGET, "{}", request_line(req));
+    }
+}
+
+/// One line describing a `Generate` request as received, in the Python
+/// servicer's words: the input kind by its field name, whether it streams,
+/// whether a multimodal batch carries tensors the preprocessed path can use
+/// (pixels or model-specific tensors; a PD decode side built from the
+/// prefill's identity carries its grid tensors and so reads
+/// `preprocessed_mm=True, media_refs=0`, while a bare payload of hashes alone
+/// does not count), the count of worker-side media references, and the
+/// data-parallel rank the
+/// gateway pinned (`None` when it pinned none). Booleans and the absent rank
+/// spell as Python does, so the same log readers serve both servicers.
+pub(super) fn request_line(req: &vllm::GenerateRequest) -> String {
+    let input_type = match req.input {
+        Some(vllm::generate_request::Input::Tokenized(_)) => "tokenized",
+        Some(vllm::generate_request::Input::Text(_)) => "text",
+        None => "None",
+    };
+    let preprocessed_mm = req
+        .mm_inputs
+        .iter()
+        .chain(req.extra_mm_inputs.iter())
+        .any(|batch| batch.pixel_values.is_some() || !batch.model_specific_tensors.is_empty());
+    let media_refs = req.media_refs.as_ref().map_or(0, |refs| refs.items.len());
+    let dp_rank = req
+        .data_parallel_rank
+        .map_or_else(|| "None".to_string(), |rank| rank.to_string());
+    format!(
+        "Generate request {}: input_type={input_type}, stream={}, preprocessed_mm={}, \
+         media_refs={media_refs}, dp_rank={dp_rank}",
+        req.request_id,
+        python_bool(req.stream),
+        python_bool(preprocessed_mm),
+    )
+}
+
+/// A boolean as Python's logger spells it.
+fn python_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 /// The rejection notice a refused PD decode side owes its prefill side, so the

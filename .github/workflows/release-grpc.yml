@@ -1,7 +1,8 @@
 name: Release gRPC packages to PyPI
 
 # Published only on a maintainer's dispatch against a release tag (scripts/release/README.md):
-# no push publishes, and the first step refuses a dispatch whose ref is not a tag.
+# no push publishes, a release candidate (a ref named -rc.) is refused since candidates never reach
+# PyPI, and the selection refuses a dispatch whose ref is not a tag.
 on:
   workflow_dispatch:
     inputs:
@@ -20,11 +21,25 @@ jobs:
   # ── The packages whose version at the dispatched ref is not complete on PyPI (or the ones named) build and upload; --skip-existing passes the files PyPI has ──
   detect:
     name: Select packages
+    # A candidate never reaches PyPI: its dispatch is a no-op (every other job reads this one's selection, empty when
+    # it is skipped), and the first step says why when the job is reached anyway.
+    if: ${{ !contains(github.ref_name, '-rc.') }}
     runs-on: ubuntu-latest
     outputs:
       proto: ${{ steps.changes.outputs.proto }}
       servicer: ${{ steps.changes.outputs.servicer }}
     steps:
+      - name: Refuse a release candidate
+        shell: bash
+        run: |
+          # A release candidate never reaches PyPI (scripts/release/README.md): the job's if makes an -rc. dispatch
+          # a no-op, and this step holds the rule, with the reason, when the job is reached anyway.
+          case "${GITHUB_REF_NAME:-}" in
+            *-rc.*)
+              echo "${GITHUB_REF_NAME} is a release candidate: candidates are never published to PyPI (the images, the chart and the GitHub pre-release carry a candidate); dispatch this workflow against a final's tag" >&2
+              exit 1 ;;
+          esac
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
