@@ -8,9 +8,10 @@
 //! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
 //! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
 //! output's bytes across its events, give its calls the ids the table's source does (counting
-//! from the engine's nonce, or the header the reference recorded with the call) and agree with
-//! the whole one, and a streamed replay's content deltas have to carry the whole answer's content
-//! and nothing else: the template's spacing
+//! from the engine's nonce, or the header the reference recorded with the call, a repeated header
+//! falling back to a minted id as the table does) and agree with the whole one, and a streamed
+//! replay's content deltas have to carry the whole answer's content and nothing else: the
+//! template's spacing
 //! before a call, shown as content before the call arrived, is what a client of the stream would
 //! see and a client of the whole answer would not. An output of at most 256 bytes
 //! also replays at every two-way split; past that the set is linear in the output's length, so
@@ -82,7 +83,7 @@
 mod common;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader, BufWriter, Write},
     num::NonZeroUsize,
@@ -2698,21 +2699,21 @@ fn checked(
         ));
     }
     let mut index = 0;
-    let mut first = None;
+    let mut nonce = None;
+    let mut given = HashSet::new();
     for event in events {
         if let Event::ToolCallStart { index: i, id, .. } = event {
             let as_the_source_gives = match call_id {
-                // The ids count from a nonce of the engine's own, `call_` and 24 hex characters.
-                CallId::Minted => {
-                    let number = common::minted_id(id);
-                    let origin = *first.get_or_insert(number);
-                    number.is_some() && number == origin.map(|f| f + u128::from(index))
-                }
+                CallId::Minted => counts_from_the_nonce(id, index, &mut nonce),
                 // The id the model wrote, which the reference keeps with the call: the template
-                // renders it back into the prompt, so the replay has to keep it as recorded.
-                CallId::Header => {
-                    recorded_id(&fixture.reference.message.tool_calls, index) == Some(id.as_str())
-                }
+                // renders it back into the prompt, so the replay has to keep it as recorded. A
+                // header whose id repeats one the replay gave already takes a minted id instead,
+                // as the table does (`CallId::Header`), so a response's ids stay distinct.
+                CallId::Header => match recorded_id(&fixture.reference.message.tool_calls, index) {
+                    Some(recorded) if !given.contains(recorded) => id == recorded,
+                    Some(_) => counts_from_the_nonce(id, index, &mut nonce),
+                    None => false,
+                },
             };
             if *i != index || !as_the_source_gives {
                 failures.push(format!(
@@ -2720,14 +2721,25 @@ fn checked(
                     fixture.id
                 ));
             }
+            given.insert(id.as_str());
             index += 1;
         }
     }
     Said::of(events)
 }
 
+/// Whether a minted id is the engine's: `call_` and 24 hex characters, counting through the
+/// replay from one nonce, which the replay's first minted id fixes (`nonce` keeps it, or that the
+/// first had none).
+fn counts_from_the_nonce(id: &str, index: u32, nonce: &mut Option<Option<u128>>) -> bool {
+    let number = common::minted_id(id);
+    let start = *nonce.get_or_insert(number.and_then(|n| n.checked_sub(u128::from(index))));
+    number.is_some() && number == start.and_then(|s| s.checked_add(u128::from(index)))
+}
+
 /// The id the reference recorded with the call at `index`, as the model wrote it; none for a call
-/// the reference lacks or recorded without one, which no replay's id can match.
+/// the reference lacks or recorded without one, which no replay's id can match. A recorded id
+/// that repeats an earlier call's is expected as a minted id, the table's fallback.
 fn recorded_id(calls: &[ReferenceCall], index: u32) -> Option<&str> {
     calls.get(usize::try_from(index).ok()?)?.id.as_deref()
 }
@@ -3870,32 +3882,46 @@ fn a_reference_is_unreadable_between_quotes_by_a_quote_at_any_depth_or_a_nested_
 
 #[test]
 fn a_replays_call_id_is_the_header_the_reference_recorded_or_counts_from_the_minted_nonce() {
-    let fixture = |recorded_id: Option<&str>| -> Fixture {
-        let id = recorded_id.map_or(String::new(), |id| format!(r#""id": "{id}", "#));
+    // One `get_weather` call per recorded id (`None`: recorded without one), each rendered as the
+    // same header, so a replay of as many `ToolCallStart` events conserves the bytes.
+    const HEADER: &str = "<|call|>functions.get_weather:0";
+    let fixture = |recorded: &[Option<&str>]| -> Fixture {
+        let calls: Vec<String> = recorded
+            .iter()
+            .map(|id| {
+                let id = id.map_or(String::new(), |id| format!(r#""id": "{id}", "#));
+                format!(r#"{{{id}"function": {{"name": "get_weather", "arguments": "{{}}"}}}}"#)
+            })
+            .collect();
         serde_json::from_str(&format!(
-            r#"{{"id": "a-group/parse/call", "reference": {{"text": "<|call|>functions.get_weather:0",
-            "message": {{"tool_calls": [{{{id}"function": {{"name": "get_weather", "arguments": "{{}}"}}}}]}},
-            "finish_reason": "tool_calls"}}}}"#
+            r#"{{"id": "a-group/parse/call", "reference": {{"text": "{}", "message": {{"tool_calls":
+            [{}]}}, "finish_reason": "tool_calls"}}}}"#,
+            HEADER.repeat(recorded.len()),
+            calls.join(", ")
         ))
         .expect("a fixture")
     };
-    let replay = |id: &str| {
-        vec![Event::ToolCallStart {
-            index: 0,
-            id: id.to_string(),
-            name: "get_weather".to_string(),
-            source: Text::new("<|call|>functions.get_weather:0", 0),
-        }]
+    let replay = |ids: &[&str]| -> Vec<Event> {
+        ids.iter()
+            .zip(0u32..)
+            .map(|(id, index)| Event::ToolCallStart {
+                index,
+                id: (*id).to_string(),
+                name: "get_weather".to_string(),
+                source: Text::new(HEADER, 0),
+            })
+            .collect()
     };
     let failures = |fixture: &Fixture, events: &[Event], call_id: CallId| {
         let mut failures = Vec::new();
         checked(fixture, "whole", events, call_id, &mut failures);
         failures
     };
-    let recorded = fixture(Some("functions.get_weather:0"));
-    let header = replay("functions.get_weather:0");
-    let other_header = replay("functions.get_weather:1");
-    let minted = replay("call_000000000000000000000000");
+    let recorded = fixture(&[Some("functions.get_weather:0")]);
+    let unrecorded = fixture(&[None]);
+    let header = replay(&["functions.get_weather:0"]);
+    let other_header = replay(&["functions.get_weather:1"]);
+    let minted = replay(&["call_000000000000000000000000"]);
     // A table that keeps the header's id: the replay's is the one the reference recorded, not a
     // minted one, not the header of another call, and nothing when the reference recorded none.
     assert!(failures(&recorded, &header, CallId::Header).is_empty());
@@ -3904,7 +3930,15 @@ fn a_replays_call_id_is_the_header_the_reference_recorded_or_counts_from_the_min
         ["a-group/parse/call: call index 0 / id call_000000000000000000000000 on the whole replay"]
     );
     assert_eq!(failures(&recorded, &other_header, CallId::Header).len(), 1);
-    assert_eq!(failures(&fixture(None), &header, CallId::Header).len(), 1);
+    assert_eq!(failures(&unrecorded, &header, CallId::Header).len(), 1);
+    // The table's fallback: a header that repeats an id the replay gave already takes a minted id,
+    // so the second of two calls recorded under one id is expected minted, counting from the
+    // replay's nonce, and not under the header again.
+    let repeated = fixture(&[Some("functions.get_weather:0"); 2]);
+    let minted_second = replay(&["functions.get_weather:0", "call_000000000000000000000001"]);
+    let header_twice = replay(&["functions.get_weather:0", "functions.get_weather:0"]);
+    assert!(failures(&repeated, &minted_second, CallId::Header).is_empty());
+    assert_eq!(failures(&repeated, &header_twice, CallId::Header).len(), 1);
     // A table whose ids are minted: they count from the engine's nonce, whatever the reference
     // recorded with the call.
     assert!(failures(&recorded, &minted, CallId::Minted).is_empty());
