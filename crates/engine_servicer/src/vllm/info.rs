@@ -9,7 +9,7 @@ use tonic::Status;
 use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
-use crate::load_report::{rank_ids, RankFigures};
+use crate::load_report::{unreported_ranks, RankFigures};
 
 /// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
 /// default).
@@ -192,7 +192,6 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let max_running_requests = state.shared.running_window(state.model.max_num_seqs);
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let snapshot = client.get_loads();
-    let mut dp_rank_count = snapshot.dp_rank_count;
     let mut loads: Vec<vllm::SchedulerLoad> = snapshot
         .loads
         .into_iter()
@@ -215,35 +214,31 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
             }
         })
         .collect();
-    if loads.is_empty() {
-        // No output batch has carried a snapshot yet. The Python servicer
-        // reports a zero-filled entry per rank, and the Router reads an
-        // empty list as no report at all.
-        let ranks = state.shared.rank_count(state.model.data_parallel_size);
-        loads = rank_ids(ranks)
-            .map(|dp_rank| {
-                // The servicer's own figures do not wait for the engine's
-                // first snapshot: what this rank cached and streamed so far,
-                // and the token-work queued to it. The engine has not said
-                // how many requests it holds waiting, and before its first
-                // snapshot that is every request submitted to the rank and
-                // not started, so all of them count (an overestimate by
-                // what is already in prefill, better than a zero that reads
-                // as known-empty).
-                let estimate = state.loads.estimate(dp_rank, i32::MAX);
-                vllm::SchedulerLoad {
-                    dp_rank,
-                    max_running_requests,
-                    max_total_num_tokens,
-                    num_waiting_uncached_tokens: estimate.queued_token_work,
-                    gen_throughput: estimate.gen_throughput,
-                    cache_hit_rate: estimate.cache_hit_rate,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        dp_rank_count = loads.len().try_into().unwrap_or_default();
-    }
+    // A connected rank no output batch has carried a snapshot for yet gets a
+    // zero-filled entry (see `unreported_ranks`; the Router reads an empty
+    // list as no report at all). The servicer's own figures do not wait for
+    // the engine's first snapshot: what this rank cached and streamed so far,
+    // and the token-work queued to it. The engine has not said how many
+    // requests it holds waiting, and before its first snapshot that is every
+    // request submitted to the rank and not started, so all of them count
+    // (an overestimate by what is already in prefill, better than a zero
+    // that reads as known-empty).
+    let reported: Vec<i32> = loads.iter().map(|load| load.dp_rank).collect();
+    let ranks = state.shared.rank_count(state.model.data_parallel_size);
+    loads.extend(unreported_ranks(ranks, &reported).map(|dp_rank| {
+        let estimate = state.loads.estimate(dp_rank, i32::MAX);
+        vllm::SchedulerLoad {
+            dp_rank,
+            max_running_requests,
+            max_total_num_tokens,
+            num_waiting_uncached_tokens: estimate.queued_token_work,
+            gen_throughput: estimate.gen_throughput,
+            cache_hit_rate: estimate.cache_hit_rate,
+            ..Default::default()
+        }
+    }));
+    loads.sort_by_key(|load| load.dp_rank);
+    let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
     Ok(vllm::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         // The engine's version, as the Python servicer reports vLLM's.
