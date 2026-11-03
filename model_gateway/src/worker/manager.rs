@@ -2440,6 +2440,26 @@ mod tests {
         }
     }
 
+    /// Registers `worker` demoted under the running manager and waits for the
+    /// registration's probe to read the health stub (`hits`), which is held:
+    /// the worker is still demoted once that read has landed.
+    async fn registered_and_held(
+        registry: &WorkerRegistry,
+        worker: &Arc<dyn Worker>,
+        hits: &AtomicUsize,
+    ) {
+        worker.set_status(WorkerStatus::NotReady);
+        registry.register(worker.clone()).unwrap();
+        let registered = tokio::time::Instant::now();
+        wait_until(
+            registered + Duration::from_secs(5),
+            "the registration's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+    }
+
     /// Through the running loop, against a `/health` that is held: the probe
     /// the contact brings forward reads the hold and the worker stays
     /// demoted; the contact's probe re-arms the deadline an interval out: no
@@ -2523,16 +2543,7 @@ mod tests {
 
         // Registered under the running manager: probed at once, and held.
         let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
-        worker.set_status(WorkerStatus::NotReady);
-        registry.register(worker.clone()).unwrap();
-        let registered = tokio::time::Instant::now();
-        wait_until(
-            registered + Duration::from_secs(5),
-            "the registration's probe did not read the health in time",
-            || hits.load(Ordering::SeqCst) > 0,
-        )
-        .await;
-        assert_eq!(worker.status(), WorkerStatus::NotReady);
+        registered_and_held(&registry, &worker, &hits).await;
 
         // The engine is back; the next probe is a whole interval away.
         serving.store(true, Ordering::SeqCst);
@@ -2573,16 +2584,7 @@ mod tests {
         let mut manager = manager_over(&registry);
 
         let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
-        worker.set_status(WorkerStatus::NotReady);
-        registry.register(worker.clone()).unwrap();
-        let registered = tokio::time::Instant::now();
-        wait_until(
-            registered + Duration::from_secs(5),
-            "the registration's probe did not read the health in time",
-            || hits.load(Ordering::SeqCst) > 0,
-        )
-        .await;
-        assert_eq!(worker.status(), WorkerStatus::NotReady);
+        registered_and_held(&registry, &worker, &hits).await;
 
         serving.store(true, Ordering::SeqCst);
         let back = tokio::time::Instant::now();

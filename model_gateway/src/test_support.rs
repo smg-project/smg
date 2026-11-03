@@ -3,8 +3,15 @@
 //! only (`cfg(test)`, or the `test-util` feature the self dev-dependency
 //! turns on for them), never into a production build.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
+};
 
+use k8s_openapi::{
+    api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use tokio::net::TcpSocket;
 
 /// A loopback address nothing answers at, refused for as long as this value
@@ -57,6 +64,38 @@ impl RefusedAddress {
     /// The address as a plain HTTP URL, `http://127.0.0.1:<port>`.
     pub fn http_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+/// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
+/// the Kubernetes watchers' tests feed to their label selectors.
+pub fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
+    let mut label_map = BTreeMap::new();
+    for &(k, v) in labels {
+        label_map.insert(k.to_string(), v.to_string());
+    }
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            uid: Some(format!("uid-{name}")),
+            labels: Some(label_map),
+            ..Default::default()
+        },
+        spec: Some(PodSpec::default()),
+        status: Some(PodStatus {
+            pod_ip: Some(ip.to_string()),
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        }),
     }
 }
 

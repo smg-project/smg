@@ -81,18 +81,24 @@ class TestPDResponsesHttp:
         assert completed_events[0].response.status == "completed"
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(2)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    tokenspeed="Qwen/Qwen3.5-9B",
+    mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+)
 @pytest.mark.e2e
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestPDResponsesGrpc:
-    """Responses API tests using PD disaggregation (gRPC mode)."""
+    """Responses API tests using PD disaggregation (gRPC mode). On the mock
+    engine each test states the decode side's answers first."""
 
-    def test_basic_response_creation(self, model, api_client):
+    def test_basic_response_creation(self, model, api_client, mock_answers):
         """Test basic response creation."""
+        mock_answers.enqueue("2 + 2 = 4.")
         resp = api_client.responses.create(model=model, input="What is 2+2?")
 
         assert resp.id is not None
@@ -101,8 +107,9 @@ class TestPDResponsesGrpc:
         assert len(resp.output_text) > 0
         assert resp.usage is not None
 
-    def test_streaming_response(self, model, api_client):
+    def test_streaming_response(self, model, api_client, mock_answers):
         """Test streaming response."""
+        mock_answers.enqueue("1, 2, 3, 4, 5.")
         # Qwen3.5 thinks by default and can spend all 50 tokens on reasoning.
         # This test requires answer text and a completed response.
         kwargs = {"reasoning": {"effort": "none"}} if is_tokenspeed() else {}
@@ -123,8 +130,14 @@ class TestPDResponsesGrpc:
         assert len(completed_events) == 1
         assert completed_events[0].response.status == "completed"
 
-    def test_previous_response_id_chaining(self, model, api_client):
+    def test_previous_response_id_chaining(self, model, api_client, mock_answers):
         """Test chaining responses using previous_response_id."""
+        for answer in (
+            "Noted: you are Alice, your friend is Bob.",
+            "Your name is Alice.",
+            "Your friend is Bob.",
+        ):
+            mock_answers.enqueue(answer)
         # First response
         resp1 = api_client.responses.create(
             model=model, input="My name is Alice and my friend is Bob. Remember it."
@@ -150,8 +163,9 @@ class TestPDResponsesGrpc:
         assert resp3.status == "completed"
         assert "Bob" in resp3.output_text
 
-    def test_store_false_not_retrievable(self, model, api_client):
+    def test_store_false_not_retrievable(self, model, api_client, mock_answers):
         """Test that store=false responses cannot be retrieved."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
         assert resp.status == "completed"

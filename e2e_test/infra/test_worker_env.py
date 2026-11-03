@@ -11,6 +11,7 @@ from infra import worker as worker_module
 from infra.constants import (
     ENV_SGLANG_SERVICER_IMPL,
     ENV_TOKENSPEED_SERVICER_IMPL,
+    ENV_TRTLLM_SERVICER_IMPL,
     ENV_VLLM_SERVICER_IMPL,
     ConnectionMode,
 )
@@ -20,6 +21,7 @@ ENGINES = [
     ("vllm", ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL", True),
     ("tokenspeed", ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL", False),
     ("sglang", ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL", False),
+    ("trtllm", ENV_TRTLLM_SERVICER_IMPL, "SMG_TRTLLM_SERVICER_IMPL", False),
 ]
 
 
@@ -55,6 +57,25 @@ def test_an_unset_lane_exports_nothing_and_follows_the_package_default(
     monkeypatch.setenv(variable, "python")  # inherited from the shell: not the lane's word
     assert variable not in _worker(engine, ConnectionMode.GRPC)._build_env()
     assert hook_checks == ([True] if needs_hook and package_default == "rust" else [])
+
+
+def test_the_lanes_worker_log_filter_becomes_the_workers_rust_log(monkeypatch, hook_checks):
+    """A lane's E2E_WORKER_RUST_LOG is the worker process's RUST_LOG (the
+    tracing filter of the Rust servicer it hosts; the shell's own value yields
+    to it); unset or blank, the worker keeps whatever the shell exported."""
+    _package_default(monkeypatch, "rust")
+    monkeypatch.setenv("RUST_LOG", "warn")
+    monkeypatch.delenv(constants.ENV_WORKER_RUST_LOG, raising=False)
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == "warn"
+    monkeypatch.setenv(constants.ENV_WORKER_RUST_LOG, " ")
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == "warn"
+    monkeypatch.setenv(constants.ENV_WORKER_RUST_LOG, "info,engine_servicer::request=debug")
+    env = _worker("vllm", ConnectionMode.GRPC)._build_env()
+    assert env["RUST_LOG"] == "info,engine_servicer::request=debug"
+    monkeypatch.delenv("RUST_LOG")
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == (
+        "info,engine_servicer::request=debug"
+    )
 
 
 @pytest.mark.parametrize(("engine", "lane_setting", "variable", "needs_hook"), ENGINES)
@@ -117,11 +138,9 @@ def test_nonempty_hip_mask_follows_worker_logical_devices(monkeypatch, gpu_ids, 
 def test_absent_or_empty_hip_mask_is_preserved(monkeypatch, engine, inherited_hip):
     if inherited_hip is None:
         monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
-    else:
-        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3,1")
-    if inherited_hip is None:
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
     else:
+        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3,1")
         monkeypatch.setenv("HIP_VISIBLE_DEVICES", inherited_hip)
     worker = _worker(engine, ConnectionMode.HTTP)
     worker.gpu_ids = [1]
@@ -199,3 +218,15 @@ def test_worker_selects_entries_from_the_parent_hip_mask(
             child.setenv(variable, env[variable])
         child_used = process_utils._amd_smi_used_mib(list(range(len(gpu_ids))))
     assert list(child_used.values()) == [parent_used[gpu] for gpu in gpu_ids]
+
+
+@pytest.mark.parametrize("gpu_ids", [[2], [-1], [0, 2], [-1, 0]])
+def test_out_of_range_gpu_ids_explain_the_inherited_hip_slice(monkeypatch, gpu_ids):
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    worker = _worker("sglang", ConnectionMode.HTTP)
+    worker.gpu_ids = gpu_ids
+
+    with pytest.raises(ValueError, match="exceed the inherited HIP_VISIBLE_DEVICES='2,3'"):
+        worker._build_env()
+
+    assert worker_module.os.environ["HIP_VISIBLE_DEVICES"] == "2,3"

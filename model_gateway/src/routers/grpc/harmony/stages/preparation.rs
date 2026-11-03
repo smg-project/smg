@@ -421,9 +421,7 @@ impl HarmonyPreparationStage {
 /// channel tokens (otherwise xgrammar blocks all non-trigger-prefix tokens).
 ///
 /// This is used for the Responses API text.format field (json_object or json_schema).
-pub(crate) fn build_text_format_structural_tag(
-    schema: &serde_json::Value,
-) -> Result<String, String> {
+fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",

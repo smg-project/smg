@@ -3,6 +3,10 @@
 These tests run a real SGLang worker and a real gateway. Qwen's published
 generation_config.json includes sampling defaults, which should be surfaced
 through worker metadata and usable for regular omitted-sampling requests.
+
+On the mock engine the worker reads the same defaults from the model files of
+an ungated Qwen repository with the same generation config, and the chat
+request's answer is stated first (``mock_answers``, a no-op on a real engine).
 """
 
 from __future__ import annotations
@@ -27,10 +31,10 @@ def _worker_sampling_defaults(gateway) -> dict:
     raise AssertionError(f"missing {DEFAULT_SAMPLING_PARAMS_LABEL} label")
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("Qwen/Qwen2.5-7B-Instruct")
+@pytest.mark.model("Qwen/Qwen2.5-7B-Instruct", mock="Qwen/Qwen2.5-14B-Instruct")
 @pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSamplingDefaultsGrpc:
@@ -47,12 +51,13 @@ class TestSamplingDefaultsGrpc:
         assert defaults["repetition_penalty"] == pytest.approx(1.05)
 
     def test_omitted_chat_sampling_params_complete_with_discovered_defaults(
-        self, setup_backend, api_client
+        self, setup_backend, api_client, mock_answers
     ):
         _, model, _, gateway = setup_backend
         defaults = _worker_sampling_defaults(gateway)
         assert defaults["top_k"] == 20
 
+        mock_answers.enqueue("Nebula Latte")
         response = api_client.chat.completions.create(
             model=model,
             messages=[

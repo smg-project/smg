@@ -462,7 +462,9 @@ fn build_zmq_request<B>(
         // flag; the gateway's parser fills in the count where it runs.
         ZmqDialect::Sglang => {
             let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
-            let req = sglang(
+            let (sglang_mm, extras) =
+                sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+            let mut req = sglang(
                 request_id,
                 body,
                 processed_text,
@@ -473,6 +475,7 @@ fn build_zmq_request<B>(
                     require_reasoning: options.require_reasoning && !options.first_token_grammar,
                 },
             )?;
+            req.extra_mm_inputs = extras;
             Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
         }
         ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
@@ -564,10 +567,16 @@ fn zmq_tokenspeed_mm(
 /// [`zmq_vllm_mm`] for the mismatch semantics.
 fn zmq_sglang_mm(
     inputs: Option<MultimodalData>,
-) -> Result<Option<sglang_proto::MultimodalInputs>, String> {
+) -> Result<
+    Option<(
+        sglang_proto::MultimodalInputs,
+        Vec<sglang_proto::MultimodalInputs>,
+    )>,
+    String,
+> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::Sglang(data) => Ok(data.into_proto()),
+            MultimodalData::Sglang(data) => Ok(data.into_protos()),
             other => Err(mm_variant_mismatch("SGLang", &other)),
         })
         .transpose()

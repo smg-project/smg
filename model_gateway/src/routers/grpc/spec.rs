@@ -21,8 +21,9 @@ use openai_protocol::{
     responses::ResponsesRequest,
 };
 
-use crate::routers::grpc::regular::{
-    stages::decisions::scoring::DecisionScoring, symphony::Assignment,
+use crate::routers::grpc::{
+    regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
+    utils::Names,
 };
 
 /// Response-phase contract for one request, handed on by request building.
@@ -104,6 +105,12 @@ pub(crate) struct ChatResponseSpec {
     /// Set by request building when Symphony reads the response (`regular::symphony`):
     /// the table, and the part of the rendered prompt the engine replays.
     pub symphony: Option<Assignment>,
+    /// The parser names the request's preparation resolved once from the model's
+    /// cards (`ProcessingState::parser_names`), handed on by request building for
+    /// the response's two readers (the reasoning parser's and the tool-call
+    /// parser's names); `None` when no resolution was made (a spec built from the
+    /// request alone), and the readers resolve them as before.
+    pub parser_names: Option<Names>,
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -112,16 +119,27 @@ pub(crate) struct ChatResponseSpec {
 /// ([`ProviderProfile::parses_tool_calls_without_tools`]). A `tool_choice`
 /// of `none` is the drivers' to check. [`ChatResponseSpec::tools`] is `Some`
 /// exactly then, and Symphony keeps a table's calls exactly then
-/// (`regular::symphony::assign`), so a call the conversation established
-/// without a tool inventory comes back as a call under either parser.
-pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
-    request.declares_tools()
-        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+/// (`regular::symphony::assign_for`), so a call the conversation established
+/// without a tool inventory comes back as a call under either parser. `provider`
+/// is the model's profile as the request's preparation derived it once.
+pub(crate) fn scans_for_tool_calls_for(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+) -> bool {
+    request.declares_tools() || provider.parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
-        let provider = ProviderProfile::for_model(&request.model);
+        Self::for_request(request, ProviderProfile::for_model(&request.model))
+    }
+}
+
+impl ChatResponseSpec {
+    /// The spec of `request` under `provider`, its model's profile as the
+    /// request's preparation derived it once; `From` derives the profile for
+    /// a request that carries none.
+    pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
         Self {
             provider,
             separate_reasoning: request.separate_reasoning,
@@ -132,8 +150,8 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             // not scanned for tool calls: the request declares no tools anywhere
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
-            // them (`scans_for_tool_calls`).
-            tools: scans_for_tool_calls(request).then(|| request.shared_tool_list()),
+            // them (`scans_for_tool_calls_for`).
+            tools: scans_for_tool_calls_for(request, provider).then(|| request.shared_tool_list()),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -148,6 +166,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             unbilled_prompt_tokens: 0,
             reasoning_in_prefill: false,
             symphony: None,
+            parser_names: None,
         }
     }
 }
@@ -196,6 +215,12 @@ pub(crate) struct MessagesResponseSpec {
     /// `disable_parallel_tool_use: true`: only the first tool call is
     /// returned.
     pub first_tool_call_only: bool,
+    /// The parser names the request's preparation resolved once from the model's
+    /// cards (`ProcessingState::parser_names`), handed on by request building for
+    /// the response's two readers (the reasoning parser's and the tool-call
+    /// parser's names); `None` when no resolution was made (a spec built from the
+    /// request alone), and the readers resolve them as before.
+    pub parser_names: Option<Names>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -213,6 +238,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
+            parser_names: None,
         }
     }
 }

@@ -64,7 +64,7 @@ use crate::{
 /// built in the protocols crate, outside the builder), else `""` (a success,
 /// or an upstream body: an upstream's `X-SMG-Error-Code` header is never read,
 /// so forged codes cannot grow the label set).
-pub(crate) fn error_code_label(response: &Response) -> &str {
+fn error_code_label(response: &Response) -> &str {
     let code = extract_error_code_from_response(response);
     if !code.is_empty() {
         return code;

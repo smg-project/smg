@@ -214,11 +214,17 @@ impl MultimodalConfigRegistry {
             "multimodal config cache miss, loading"
         );
 
-        let base_dir = llm_multimodal::hub::resolve_model_config_dir(tokenizer_source)
-            .await
-            .with_context(|| {
-                format!("Failed to resolve model config directory for '{tokenizer_source}'")
-            })?;
+        // The load runs once per tokenizer and is the largest future this
+        // path may await; boxed, so the per-request futures that may reach a
+        // miss carry a pointer to it, not its state (a jemalloc size class per
+        // request on every path, two on Messages, when the loader grows).
+        let base_dir = Box::pin(llm_multimodal::hub::resolve_model_config_dir(
+            tokenizer_source,
+        ))
+        .await
+        .with_context(|| {
+            format!("Failed to resolve model config directory for '{tokenizer_source}'")
+        })?;
 
         let config_path = base_dir.join("config.json");
         let config: serde_json::Value = std::fs::read_to_string(&config_path)
