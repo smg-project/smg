@@ -1,6 +1,6 @@
 [package]
 name = "smg-python"
-version = "1.13.0"
+version = "1.15.0-dev"
 edition = "2021"
 rust-version.workspace = true
 

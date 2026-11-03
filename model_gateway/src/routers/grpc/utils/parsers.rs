@@ -552,13 +552,8 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
     )
 }
 
-/// [`reasoning_starts_in_prefill`] for a Messages API request: the
-/// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default), and
-/// `continued_final_message` is the rendered prompt's (a trailing assistant
-/// message with text and no tool call is continued where the template can).
-/// `output_config.effort` is the `reasoning_effort` the template renders, as
-/// a Chat request's effective effort is.
+/// [`messages_reasoning_starts_in_prefill_for`] with the model's provider
+/// profile derived here, as the tests ask it.
 #[cfg(test)]
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
@@ -573,8 +568,16 @@ pub fn messages_reasoning_starts_in_prefill(
     )
 }
 
-/// [`messages_reasoning_starts_in_prefill`] with the model's provider profile
-/// already derived (the preparation stage derives it once per request).
+/// [`reasoning_starts_in_prefill`] for a Messages API request, with the
+/// model's provider profile already derived (the preparation stage derives it
+/// once per request): the `thinking` block is the user's preference
+/// (`enabled`/`adaptive` on, `disabled` off, absent → the template's default),
+/// and `continued_final_message` is the rendered prompt's (a trailing
+/// assistant message with text and no tool call is continued where the
+/// template can). `output_config.effort` is the `reasoning_effort` the
+/// template renders, as a Chat request's effective effort is. The tests ask
+/// through `messages_reasoning_starts_in_prefill`, which derives the profile
+/// first.
 pub fn messages_reasoning_starts_in_prefill_for(
     request: &openai_protocol::messages::CreateMessageRequest,
     provider: ProviderProfile,

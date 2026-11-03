@@ -157,6 +157,78 @@ impl ChatStreamUsage {
     }
 }
 
+/// The generate stream's usage, tallied the same way by its two loops (with
+/// and without logprobs): each index's running completion count, which every
+/// chunk of that index reports as its `completion_tokens`; the prompt and its
+/// cache hit, shared by every index (the last `Complete`'s prompt, the
+/// greatest hit); each index's reasoning tokens; and the indices whose
+/// `Complete` arrived, the only authority for settling the reservation. The
+/// completion count is the tokens the chunks carried, on every stream shape,
+/// as the loops counted them; `CompletionTokenTracker` and `ChatStreamUsage`
+/// read the engine's own count on a cumulative stream instead, and moving the
+/// generate loops onto them is a behaviour question, not this tally's.
+#[derive(Default)]
+struct GenerateStreamUsage {
+    completion: HashMap<u32, u32>,
+    prompt: u32,
+    cached: u32,
+    reasoning: HashMap<u32, u32>,
+    completed: HashSet<u32>,
+}
+
+impl GenerateStreamUsage {
+    /// Counts a chunk's tokens for its index; the index's count so far.
+    fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) -> u32 {
+        let count = self.completion.entry(chunk.index()).or_insert(0);
+        *count += chunk.token_ids().len() as u32;
+        *count
+    }
+
+    /// Records an index's `Complete`; the index's completion count.
+    fn record_complete(&mut self, complete: &ProtoGenerateComplete) -> u32 {
+        let index = complete.index();
+        self.prompt = complete.prompt_tokens();
+        self.cached = self.cached.max(complete.cached_tokens());
+        self.reasoning.insert(index, complete.reasoning_tokens());
+        self.completed.insert(index);
+        self.completion.get(&index).copied().unwrap_or(0)
+    }
+
+    /// The completion tokens counted so far across every index.
+    fn completion_total(&self) -> u32 {
+        self.completion.values().sum()
+    }
+
+    /// The tally as the counters every usage reads; a generate stream carries
+    /// no speculative counts.
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt,
+            completion: self.completion_total(),
+            cached: self.cached,
+            reasoning: self.reasoning.values().sum(),
+            spec_accepted: 0,
+            spec_drafted: 0,
+        }
+    }
+
+    /// Settles the reservation with the request's usage once every expected
+    /// choice completed; a stream that ended with fewer `Complete`s has only
+    /// partial usage and closes the reservation as reserved.
+    async fn settle(
+        &self,
+        reservation: Option<Arc<SharedReservationHandle>>,
+        expected_choices: u32,
+    ) {
+        let Some(handle) = reservation else { return };
+        if self.completed.len() as u32 >= expected_choices {
+            handle.settle_success(self.counts().settlement()).await;
+        } else {
+            handle.close_reserved_only().await;
+        }
+    }
+}
+
 /// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
 pub(crate) struct StreamingProcessor {
@@ -619,24 +691,13 @@ impl StreamingProcessor {
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Same prompt for every index; the last Complete's value is as good as any.
-        let mut prompt_tokens: u32 = 0;
-        // The cache hit is a property of that shared prompt too (max, not sum);
-        // reasoning is each choice's own, one entry per index.
-        let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Indices that received a `Complete` message -- the only source of
-        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
-        // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
-            })?;
+            let gen_response = response
+                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -647,10 +708,7 @@ impl StreamingProcessor {
 
                     let index = chunk.index();
 
-                    // Both backends send delta token_ids, so accumulate for both
-                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
-                    let current_completion_tokens = *completion_tokens;
+                    let current_completion_tokens = usage.record_chunk(&chunk);
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
                     let chunk_text = tokenizer
@@ -691,13 +749,9 @@ impl StreamingProcessor {
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
-                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let completion_tokens = usage.record_complete(&complete);
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
-                    prompt_tokens = complete.prompt_tokens();
-                    cached_tokens = cached_tokens.max(complete.cached_tokens());
-                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
-                    completed_indices.insert(index);
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -705,7 +759,7 @@ impl StreamingProcessor {
                         "output_ids": complete.output_ids()[complete.output_ids().len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
                             "id": index_id,
-                            "finish_reason": complete.finish_reason(),
+                            "finish_reason": utils::parse_finish_reason(complete.finish_reason(), complete.completion_tokens()),
                             "prompt_tokens": complete.prompt_tokens(),
                             "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
                             "completion_tokens": completion_tokens,
@@ -733,21 +787,8 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
-        if let Some(handle) = reservation {
-            if completed_indices.len() as u32 >= ctx.expected_choices {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: prompt_tokens,
-                        completion_tokens: total_completion,
-                        cached_input_tokens: cached_tokens,
-                        reasoning_tokens: reasoning_tokens_map.values().sum(),
-                    })
-                    .await;
-            } else {
-                handle.close_reserved_only().await;
-            }
-        }
+        let total_completion = usage.completion_total();
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -841,24 +882,13 @@ impl StreamingProcessor {
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Same prompt for every index; the last Complete's value is as good as any.
-        let mut prompt_tokens: u32 = 0;
-        // The cache hit is a property of that shared prompt too (max, not sum);
-        // reasoning is each choice's own, one entry per index.
-        let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
-        // Indices that received a `Complete` message -- the only source of
-        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
-        // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
-            })?;
+            let gen_response = response
+                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -872,10 +902,7 @@ impl StreamingProcessor {
 
                     let index = chunk.index();
 
-                    // Both backends send delta token_ids, so accumulate for both
-                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
-                    let current_completion_tokens = *completion_tokens;
+                    let current_completion_tokens = usage.record_chunk(&chunk);
 
                     // Decode tokens to text
                     let chunk_text = tokenizer
@@ -942,18 +969,13 @@ impl StreamingProcessor {
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
 
-                    // Use accumulated count (we tracked deltas from both backends)
-                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let completion_tokens = usage.record_complete(&complete);
 
                     let final_output_logprobs = accumulated_output_logprobs
                         .get(&index)
                         .and_then(|o| o.as_ref());
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
-                    prompt_tokens = complete.prompt_tokens();
-                    cached_tokens = cached_tokens.max(complete.cached_tokens());
-                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
-                    completed_indices.insert(index);
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -997,21 +1019,8 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
-        if let Some(handle) = reservation {
-            if completed_indices.len() as u32 >= ctx.expected_choices {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: prompt_tokens,
-                        completion_tokens: total_completion,
-                        cached_input_tokens: cached_tokens,
-                        reasoning_tokens: reasoning_tokens_map.values().sum(),
-                    })
-                    .await;
-            } else {
-                handle.close_reserved_only().await;
-            }
-        }
+        let total_completion = usage.completion_total();
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -2606,8 +2615,12 @@ impl<'a> ChatStream<'a> {
             })
             .map(|_| ChatStreamUsage::default());
 
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Where a Symphony table reads the response its reader takes the thought, and no
         // legacy parser is built to be asked whether one is available.
@@ -2638,6 +2651,7 @@ impl<'a> ChatStream<'a> {
             used_json_schema && matches!(spec.tool_choice, Some(ToolChoice::Function { .. }));
 
         let tool_parser_available = spec.tools.is_some()
+            && spec.symphony.is_none()
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -2651,7 +2665,7 @@ impl<'a> ChatStream<'a> {
             );
         }
 
-        if spec.tools.is_some() && !tool_parser_available {
+        if spec.tools.is_some() && spec.symphony.is_none() && !tool_parser_available {
             debug!(
                 "No tool parser found for model '{}', skipping tool call parsing",
                 model
@@ -4061,9 +4075,14 @@ impl<'a> MessagesStream<'a> {
             )
         };
 
-        // Per-request effective parser names (model-card override → configured).
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        // The request's parser names as its preparation resolved them (the spec carries
+        // them); resolved here only where the spec carries none.
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Check parser availability once upfront. Run parser when the user explicitly
         // enabled thinking, or when the selected parser needs structural special tokens.
@@ -4092,6 +4111,7 @@ impl<'a> MessagesStream<'a> {
 
         let tool_parser_available = has_tools
             && tool_choice_enabled
+            && legacy_reads
             && utils::check_tool_parser_availability(
                 &processor.tool_parser_factory,
                 tool_parser_name.as_deref(),

@@ -21,6 +21,10 @@ COMPONENTS = (
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
     ("scripts/ci_agentic_svc_deps.sh", "scripts/tests/test_ci_oracle_client_download.py"),
+    (
+        "e2e_test/benchmarks/nightly_summarize.py",
+        "scripts/tests/test_nightly_summary_errors.py",
+    ),
     ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
     ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),

@@ -509,24 +509,17 @@ async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponent
     components_with_multimodal(worker_registry, false).await
 }
 
-/// Components over the mock tokenizer; `with_multimodal` adds the
-/// multimodal bundle (default settings, no model directory) so media
-/// reaches the multimodal path instead of the "not available" refusal.
-async fn components_with_multimodal(
+/// Components over `tokenizer_registry` and `worker_registry` with the
+/// legacy parser choice; `with_multimodal` adds the multimodal bundle
+/// (default settings) so media reaches the multimodal path instead of the
+/// "not available" refusal. The bundle's model config is read from the
+/// tokenizer's source, so the caller's tokenizer decides whether there is
+/// a model directory.
+fn shared_components(
+    tokenizer_registry: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     with_multimodal: bool,
 ) -> Arc<SharedComponents> {
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .expect("load mock tokenizer");
     let multimodal = with_multimodal.then(|| {
         Arc::new(
             MultimodalComponents::new(
@@ -548,8 +541,27 @@ async fn components_with_multimodal(
         multimodal,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     })
+}
+
+/// [`shared_components`] over the mock tokenizer (no model directory).
+async fn components_with_multimodal(
+    worker_registry: Arc<WorkerRegistry>,
+    with_multimodal: bool,
+) -> Arc<SharedComponents> {
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    tokenizer_registry
+        .load(
+            "tokenizer-id",
+            MODEL,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("load mock tokenizer");
+    shared_components(tokenizer_registry, worker_registry, with_multimodal)
 }
 
 /// A worker whose servicer left `supports_vision` unset (the SGLang and
@@ -2877,29 +2889,7 @@ async fn v41_components(
         )
         .await
         .expect("register the DeepSeek-V4.1 tokenizer");
-    let multimodal = with_multimodal.then(|| {
-        Arc::new(
-            MultimodalComponents::new(
-                Arc::new(MultimodalConfigRegistry::new()),
-                None,
-                None,
-                &MultimodalSettings::default(),
-            )
-            .expect("multimodal components"),
-        )
-    });
-    Arc::new(SharedComponents {
-        templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-        tokenizer_registry,
-        worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
-        parser_resolver: utils::ParserResolver::disabled(),
-        multimodal,
-        tokenizer_autoload: true,
-        tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
-    })
+    shared_components(tokenizer_registry, worker_registry, with_multimodal)
 }
 
 /// Status, body, and the input ids and placeholders of every attempt a
@@ -3470,7 +3460,7 @@ async fn a_404_from_the_preparation_stage_is_reported_once_and_marked() {
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     });
 
     let response = pipeline

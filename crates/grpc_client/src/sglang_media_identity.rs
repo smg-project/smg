@@ -157,10 +157,10 @@ mod tests {
                 input_ids: vec![1, 7, 2],
                 original_text: "image".into(),
             }),
-            mm_inputs: Some(MultimodalInputs {
+            mm_inputs: Some(Box::new(MultimodalInputs {
                 image_urls: vec!["https://example.test/a.png".into()],
                 ..Default::default()
-            }),
+            })),
             disaggregated_params: Some(DisaggregatedParams {
                 bootstrap_host: "p".into(),
                 bootstrap_port: 8998,

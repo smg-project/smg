@@ -1162,7 +1162,7 @@ impl ZmqEngineClient {
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
                 .mm_inputs
-                .as_ref()
+                .as_deref()
                 .map(encode_media_refs)
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?

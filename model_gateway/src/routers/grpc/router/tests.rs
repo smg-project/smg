@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use http::header::RETRY_AFTER;
+use http::header::{HeaderValue, RETRY_AFTER};
 use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use portpicker::pick_unused_port;
@@ -1345,6 +1345,37 @@ async fn chat(
     (status, parser, body)
 }
 
+/// One Responses turn for `model` through `router` under `headers`, with
+/// one `lookup` tool declared, streamed or not: the status, the
+/// `x-smg-parser` response header, and the body (a stream's frames as one
+/// text).
+async fn responses(
+    router: &GrpcRouter,
+    model: &str,
+    headers: &HeaderMap,
+    stream: bool,
+) -> (StatusCode, Option<String>, String) {
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    let body: ResponsesRequest = serde_json::from_value(json!({
+        "model": model, "input": "hi", "stream": stream,
+        "tools": [{"type": "function", "name": "lookup",
+            "parameters": {"type": "object", "properties": {"q": {"type": "integer"}}}}]
+    }))
+    .expect("responses request");
+    let response = router
+        .route_responses(Some(headers), &tenant_meta, body, model)
+        .await;
+    let status = response.status();
+    let parser = response
+        .headers()
+        .get("x-smg-parser")
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, parser, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The served models of the mixed-fleet test: one the registry knows, whose
 /// workers label no parser, and one it does not know, of the family whose
 /// table the gateway's tool-call parser name selects.
@@ -1509,6 +1540,64 @@ async fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_throug
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
     drop(guard);
+}
+
+/// A Responses turn names the parser that read it as the chat route does,
+/// on its JSON answer and on its SSE answer, in both modes: Symphony under
+/// the default (the registry's table for the model), the legacy parsers
+/// under the request's `X-SMG-Parser: legacy`; the chat answer of the same
+/// request says the same.
+#[tokio::test]
+async fn a_responses_answer_names_the_parser_the_chat_route_names() {
+    for mode in [Mode::Regular, Mode::PrefillDecode] {
+        let ctx = grpc_ctx_with_parsers(routing_mode(mode), ParserChoice::Symphony, None).await;
+        register_tokenizer_for(
+            &ctx,
+            KNOWN_MODEL,
+            CHAT_TEMPLATE,
+            (TABLE_OUTPUT, TABLE_OUTPUT_ID),
+        )
+        .await;
+        for worker_type in roles(mode) {
+            let port = spawn_engine(vec![TABLE_OUTPUT_ID]).await;
+            register_worker(
+                &ctx,
+                &format!("grpc://127.0.0.1:{port}"),
+                *worker_type,
+                ModelCard::new(KNOWN_MODEL),
+            );
+        }
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        let mut legacy = HeaderMap::new();
+        legacy.insert("x-smg-parser", HeaderValue::from_static("legacy"));
+        for (headers, reader) in [(HeaderMap::new(), "symphony"), (legacy, "legacy")] {
+            let (status, parser, answer) = chat(&router, KNOWN_MODEL, &headers).await;
+            assert_eq!(status, StatusCode::OK, "{mode:?} {reader}: {answer}");
+            assert_eq!(
+                parser.as_deref(),
+                Some(reader),
+                "{mode:?} chat under {reader}: {answer}"
+            );
+            for stream in [false, true] {
+                let (status, parser, answer) =
+                    responses(&router, KNOWN_MODEL, &headers, stream).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{mode:?} {reader}, stream {stream}: {answer}"
+                );
+                assert_eq!(
+                    parser.as_deref(),
+                    Some(reader),
+                    "{mode:?} responses under {reader}, stream {stream}: {answer}"
+                );
+                assert!(
+                    answer.contains("lookup"),
+                    "{mode:?} {reader}, stream {stream}: {answer}"
+                );
+            }
+        }
+    }
 }
 
 /// The per-request media series count a `max_tokens: 0` request as the

@@ -41,7 +41,7 @@
   {"model": "deepseek-ai/DeepSeek-V3.1", "also": ["DeepSeek-V3.1-Base", "tencent/DeepSeek-V3.1-Terminus-W4AFP8"], "table": "deepseek_v3.1", "opener": null, "after": null},
   {"model": "deepseek-ai/DeepSeek-V3.2-Exp", "also": ["DeepSeek-V3.2-Exp-Base"], "table": "deepseek_v3.2", "opener": null, "after": null},
   {"model": "deepseek-ai/DeepSeek-V3.2", "also": ["DeepSeek-V3.2-Speciale"], "table": "deepseek_v3.2", "opener": null, "after": null},
-  {"model": "deepseek-ai/DeepSeek-V4-Flash", "also": [], "table": "deepseek_v4", "opener": null, "after": null},
+  {"model": "deepseek-ai/DeepSeek-V4-Flash", "also": ["DeepSeek-V4-Pro"], "table": "deepseek_v4", "opener": null, "after": null},
   {"model": "deepseek-ai/DeepSeek-V4.1-Flash", "also": ["DeepSeek-V4.1-Flash-1017"], "table": "deepseek_v4.1", "opener": null, "after": null},
   {"model": "mistralai/Devstral-2-123B-Instruct-2512", "also": [], "table": "mistral_v13", "opener": null, "after": null},
   {"model": "nvidia/DLER-Llama-Nemotron-8B-Merge-Research", "also": [], "table": "llama_nemotron", "opener": null, "after": null},

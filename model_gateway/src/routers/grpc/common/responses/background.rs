@@ -300,7 +300,7 @@ pub(crate) enum Transition {
 /// not revive the response), whichever gateway wrote it. The record is read
 /// to build the moved object and written with one conditional write, which
 /// the store refuses if the record was closed in between, on any gateway.
-pub(crate) async fn set_stored_status(
+async fn set_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
@@ -461,7 +461,7 @@ fn retire_unstored(
 /// inside the window, with a store that outlives the process. Returns how
 /// many records went. A store that keeps no query over the stored object
 /// answers 0 (see `ResponseStorage::delete_unstored_older_than`).
-pub(crate) async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
+async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
     let window =
         chrono::Duration::seconds(i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap_or(i64::MAX));
     match storage
@@ -511,7 +511,7 @@ pub(crate) fn spawn_unstored_sweeper(
 /// answers with an error: the write that ends a background run is not given up
 /// on a store blip. The first failure is logged once; the outcome is the
 /// caller's to log.
-pub(crate) async fn set_stored_status_retrying(
+async fn set_stored_status_retrying(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
@@ -760,7 +760,7 @@ pub(crate) async fn drive<F>(
 
 /// [`drive`] with the interval the stored record is read at while the work
 /// runs.
-pub(crate) async fn drive_watching<F>(
+async fn drive_watching<F>(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
     slot: BackgroundSlot,
@@ -1001,7 +1001,7 @@ pub(crate) async fn cancel(
 }
 
 /// [`cancel`] over the registry and the store it works on.
-pub(crate) async fn cancel_with(
+async fn cancel_with(
     registry: &BackgroundResponses,
     storage: &Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,

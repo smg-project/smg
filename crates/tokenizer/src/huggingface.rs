@@ -257,6 +257,15 @@ impl DirectEncoders {
             HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD
         }
     }
+
+    /// Reads the vocabulary into the direct encoder's seed, through the model
+    /// once its word cache is bounded: the words the seed merges then leave
+    /// nothing in the model's per-thread caches.
+    fn seed_native(&mut self, model: &ModelWrapper) {
+        if let Some(native) = &mut self.native {
+            native.seed_vocabulary(model);
+        }
+    }
 }
 
 /// What an encode runs on, shared between the wrapper and the deferred
@@ -450,11 +459,13 @@ impl HuggingFaceTokenizer {
     /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
     /// vocabulary and stages of `tokenizer.json`, with the post-processor
     /// the configuration prescribes when `tokenizer_config.json` sets
-    /// `add_bos_token` or `add_eos_token` (the rule is on
-    /// [`Self::from_file`]). A cross-check of the crate's ids against the
-    /// `tokenizers` crate compares with this pipeline, which adds the same
-    /// special tokens on request, or with `add_special_tokens` off, where it
-    /// and `tokenizer.json` read alone agree.
+    /// `add_bos_token` or `add_eos_token`, and with the file's `truncation`
+    /// and `padding` blocks cleared (both rules are on [`Self::from_file`]).
+    /// A cross-check of the crate's ids against the `tokenizers` crate
+    /// compares with this pipeline, which adds the same special tokens on
+    /// request, or with `add_special_tokens` off, where it and
+    /// `tokenizer.json` read alone agree once that file's blocks are cleared
+    /// too.
     pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
         &self.core.tokenizer
     }
@@ -479,6 +490,12 @@ impl HuggingFaceTokenizer {
     /// the file's post-processor already adds tokens). A cross-check against
     /// the `tokenizers` crate compares with [`Self::tokenizers_pipeline`],
     /// the same post-processor, or with the flag off.
+    ///
+    /// The file's `truncation` and `padding` blocks do not apply: they are
+    /// the defaults the serving engine's tokenizer keeps for a call that asks
+    /// to truncate or pad, and a plain encode runs with both off, so a prompt
+    /// longer than the block's `max_length` encodes to its whole id list here
+    /// as there.
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
         let path = Path::new(file_path);
@@ -635,6 +652,18 @@ impl HuggingFaceTokenizer {
         tokenizer_path: &Path,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
+        // The file's `truncation` and `padding` blocks are the defaults the
+        // engine's tokenizer keeps for a call that asks to truncate or pad; a
+        // plain encode runs with both off (the rule is on `from_file`).
+        // Cleared before the encode path is chosen, so the direct encoders
+        // decline nothing for a block that no longer applies. `None` passes
+        // the stride check `with_truncation` runs on a block.
+        tokenizer.with_truncation(None).map_err(|error| {
+            Error::msg(format!(
+                "Failed to load tokenizer: the truncation block did not clear: {error}"
+            ))
+        })?;
+        tokenizer.with_padding(None);
         // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -730,11 +759,12 @@ impl HuggingFaceTokenizer {
             .map(|dir| detect_renderer_from_config(dir, chat_template_str.is_some()))
             .unwrap_or(Renderer::Jinja);
 
-        let encoders = DirectEncoders::choose(&tokenizer);
+        let mut encoders = DirectEncoders::choose(&tokenizer);
         // The bound rides on the file's model into the built tokenizer: no
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
         let tokenizer = HfTokenizer::from(tokenizer);
+        encoders.seed_native(tokenizer.get_model());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
@@ -831,24 +861,32 @@ impl HuggingFaceTokenizer {
     ///
     /// `transformers` builds the tokenizer of a checkpoint whose
     /// `tokenizer_config.json` names `LlamaTokenizer` (or the `Fast`
-    /// spelling) and whose `config.json` says model type `llama` from the
-    /// file's vocabulary and merges with a pipeline of its own: no
-    /// normalizer, and a `Metaspace` pre-tokenizer whose prepend scheme the
-    /// configuration selects (`add_prefix_space: false`: the word marker is
-    /// prepended nowhere; `legacy: true`: before every split; otherwise at
-    /// the start of the text only). The serving engines load their
-    /// tokenizer through that class, so those are the ids a prompt gets. A
-    /// `tokenizer.json` converted the legacy way keeps instead a `Prepend`
-    /// normalizer, which puts the word marker before every split (after
-    /// every special token too) and into the pattern of every added token
-    /// matched after normalization, so that a marker such as `</think>` is
-    /// found only behind a space, and takes the space with it. For a file of
-    /// that legacy shape the loader installs the class's pipeline (no
-    /// normalizer, the `Metaspace` pre-tokenizer, and the class's decoder,
-    /// which strips the one leading space of the decoded text only where the
-    /// marker is prepended) over the file's vocabulary, added tokens and
-    /// post-processor; any other file, and any other model type (which
-    /// `transformers` reads as its file), stays as it is.
+    /// spelling) from the file's vocabulary and merges with a pipeline of
+    /// its own: no normalizer, and a `Metaspace` pre-tokenizer whose prepend
+    /// scheme the configuration selects (`add_prefix_space: false`: the word
+    /// marker is prepended nowhere; `legacy: true`: before every split;
+    /// otherwise at the start of the text only). The serving engines load
+    /// their tokenizer through that class, so those are the ids a prompt
+    /// gets. A `tokenizer.json` converted the legacy way keeps instead a
+    /// `Prepend` normalizer, which puts the word marker before every split
+    /// (after every special token too) and into the pattern of every added
+    /// token matched after normalization, so that a marker such as
+    /// `</think>` is found only behind a space, and takes the space with it.
+    /// For a file of that legacy shape the loader installs the class's
+    /// pipeline (no normalizer, the `Metaspace` pre-tokenizer, and the
+    /// class's decoder, which strips the one leading space of the decoded
+    /// text only where the marker is prepended) over the file's vocabulary,
+    /// added tokens and post-processor; any other file stays as it is.
+    ///
+    /// The class is read from `tokenizer_config.json`, as the reference reads
+    /// it, before any `config.json`: a checkpoint shipped as the tokenizer's
+    /// files alone, with no `config.json` or none that says a `model_type`,
+    /// is the class's, and so is one whose `config.json` names a model type
+    /// the reference leaves to the named class (`llama`, `minicpm`, `zamba2`,
+    /// and every type it has no tokenizer class of its own for). A
+    /// `config.json` that names a model type the reference reads as its file
+    /// ([`REFERENCE_READS_AS_FILE`]: `phi3`, `llava`, `mistral`, ...) keeps
+    /// the file.
     fn llama_class_pipeline(
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
@@ -860,7 +898,10 @@ impl HuggingFaceTokenizer {
         ) {
             return;
         }
-        if dir.and_then(model_type_from_config).as_deref() != Some("llama") {
+        if dir
+            .and_then(model_type_from_config)
+            .is_some_and(|model_type| reference_reads_as_file(&model_type))
+        {
             return;
         }
         if tokenizer.get_pre_tokenizer().is_some()
@@ -991,8 +1032,9 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        let encoders = DirectEncoders::choose(&tokenizer);
+        let mut encoders = DirectEncoders::choose(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
+        encoders.seed_native(tokenizer.get_model());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -1258,6 +1300,110 @@ fn model_type_from_config(dir: &Path) -> Option<String> {
     value.get("model_type")?.as_str().map(String::from)
 }
 
+/// The model types whose checkpoints `transformers` reads as their
+/// `tokenizer.json` although `tokenizer_config.json` names the Llama class:
+/// the types it lists as carrying a wrong class on the Hub, and the ones it
+/// registers to a plain or Mistral backend (its 5.22.1 tables, sorted). For
+/// every other type, registered to a class of its own or to none, the named
+/// class builds the pipeline, so a type missing here reads as the reference
+/// reads a type it does not know.
+const REFERENCE_READS_AS_FILE: &[&str] = &[
+    "EvollaModel",
+    "arctic",
+    "aria",
+    "beam",
+    "bigbird_pegasus",
+    "camembertv2-base",
+    "canary",
+    "chatlm",
+    "cohere_asr",
+    "ernie4_5",
+    "ernie4_5_moe",
+    "flex_olmo",
+    "fuyu",
+    "glm",
+    "glm4",
+    "glm4_moe",
+    "glm4_moe_lite",
+    "glm4v",
+    "glm4v_moe",
+    "glm_image",
+    "glmasr",
+    "got_ocr2",
+    "gpt_bigcode",
+    "gradium_phonon_tts",
+    "granite",
+    "granitemoe",
+    "granitemoehybrid",
+    "granitemoeshared",
+    "h2ovl_chat",
+    "hyperclovax",
+    "hyperclovax_vision_v2",
+    "hyperclovax_vlm",
+    "internlm2",
+    "jamba",
+    "kimi_k25",
+    "kimi_linear",
+    "kosmos-2",
+    "llava",
+    "llava_next",
+    "mimo_v2_flash",
+    "minicpm3",
+    "minicpm_ocr",
+    "minicpmv",
+    "minicpmv4_6",
+    "minicpmv4_7",
+    "minimax_m2",
+    "ministral",
+    "ministral3",
+    "mistral",
+    "mistral3",
+    "mistral_large4",
+    "mixtral",
+    "modernbert",
+    "modernbert-decoder",
+    "molmo",
+    "molmo2",
+    "nemo_speechlm",
+    "nemotron",
+    "nvfp4",
+    "nystromformer",
+    "olmo2",
+    "olmo3",
+    "olmo_hybrid",
+    "opencua",
+    "openvla",
+    "paddleocr_vl",
+    "pegasus_x",
+    "persimmon",
+    "phi3",
+    "phi3_v",
+    "phimoe",
+    "pix2struct",
+    "pixtral",
+    "pocket_tts",
+    "qwen2",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "siglip2",
+    "smolvlm",
+    "stablelm",
+    "step3_vl",
+    "umt5",
+    "vipllava",
+    "voxtral",
+    "voxtral_realtime",
+    "xlm-roberta-xl",
+];
+
+/// Whether the reference reads a Llama-class checkpoint of `model_type` as
+/// its file ([`REFERENCE_READS_AS_FILE`]).
+fn reference_reads_as_file(model_type: &str) -> bool {
+    REFERENCE_READS_AS_FILE.binary_search(&model_type).is_ok()
+}
+
 /// Whether `normalizer` is the one a legacy conversion of a sentencepiece
 /// vocabulary writes: a sequence that prepends the word marker U+2581 and
 /// then only replaces the space by that marker. A file that replaces
@@ -1291,11 +1437,11 @@ impl Encoder for HuggingFaceTokenizer {
         if let Some(v1) = &self.v1 {
             return v1.encode(input, add_special_tokens);
         }
-        // The direct path accepts no post-processor that adds tokens, so a
-        // request for special tokens gets the same ids and is served too. An
-        // input it gives up is counted and encoded by `tokenizers`.
+        // The direct path frames the ids itself on a request for special
+        // tokens (what the post-processor it read at load adds). An input it
+        // gives up is counted and encoded by `tokenizers`.
         if let Some(native) = &self.core.native {
-            match native.encode(self.core.tokenizer.get_model(), input) {
+            match native.encode(self.core.tokenizer.get_model(), input, add_special_tokens) {
                 Ok(ids) => return Ok(Encoding::Plain(ids)),
                 Err(fallback) => encode_path::note_fallback(fallback),
             }
@@ -2175,11 +2321,10 @@ fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
 }
 
 /// Per DeepSeek's encoding README, preserve all reasoning when a system
-/// message declares `tools`; otherwise drop earlier reasoning. (A developer
-/// message is a system message by the time the V4 shims read the list, see
-/// [`developer_messages_as_system_first`]; the V3.2 shim reads the list with
-/// the developer role as written, and a request's tools ride on the system
-/// message [`inject_tools_into_messages`] attaches them to.)
+/// message declares `tools`; otherwise drop earlier reasoning. (The shims read
+/// the list with the developer role as written, as the engine's renderers
+/// hand it to their tokenizer wrappers, and a request's tools ride on the
+/// system message [`inject_tools_into_messages`] attaches them to.)
 fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
     !messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("system")
@@ -2188,23 +2333,6 @@ fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
                 .is_some_and(|arr| !arr.is_empty())
     })
 }
-/// The messages as the engine's V4 and V4.1 renderers hand them to their
-/// tokenizer wrapper: the developer messages rewritten as system ones and
-/// merged ([`crate::chat_template::developer_messages_as_system`]) BEFORE the
-/// wrapper attaches the request's tools to a system message, so the attached
-/// tools survive the merge. Those encoders repeat the rewrite at their own
-/// entry for direct callers; after this it finds nothing to do. The V3.2
-/// renderer hands its encoder the developer role as written, so the V3.2
-/// shim never calls this.
-fn developer_messages_as_system_first(
-    messages: &[serde_json::Value],
-) -> std::borrow::Cow<'_, [serde_json::Value]> {
-    match crate::chat_template::developer_messages_as_system(messages) {
-        Some(rewritten) => std::borrow::Cow::Owned(rewritten),
-        None => std::borrow::Cow::Borrowed(messages),
-    }
-}
-
 /// Attach `tools` to a leading system message so the V3.2/V4
 /// encoder can render the tools block. Mirrors the wrapper step in
 /// one engine's `tokenizers/deepseek_v32.py` and another engine's V4 serving path.
@@ -2299,9 +2427,16 @@ fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
-    let messages = developer_messages_as_system_first(messages);
-    let owned = inject_tools_into_messages(&messages, params.tools);
-    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(&messages);
+    // A developer message reaches the encoder as written, as the engine's
+    // renderer hands it to its tokenizer wrapper (no developer-to-system
+    // rewrite on this path): the encoder drops one before the last user turn
+    // with the thinking and renders it as a user turn otherwise. The
+    // request's tools ride on the system message the wrapper step attaches
+    // them to. (The gateway's Responses path is unlike the chat path here: it
+    // folds a developer item into the system prompt before any renderer sees
+    // the conversation, so the drop is the chat path's alone.)
+    let owned = inject_tools_into_messages(messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
     let effort_kwarg = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
@@ -2485,9 +2620,12 @@ fn apply_deepseek_v41(
     // (structured output is enforced by the constraint), so the gateway's
     // projected kwarg is ignored here too. The encoder still renders a
     // per-message `response_format` for direct callers.
-    let messages = developer_messages_as_system_first(messages);
-    let owned = inject_tools_into_first_system_message(&messages, params.tools);
-    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.into_owned());
+    // A developer message reaches the encoder as written, as the engine's
+    // renderer hands it to its tokenizer wrapper (no developer-to-system
+    // rewrite on this path, see `apply_deepseek_v4`); the request's tools
+    // ride on the system message the wrapper step attaches them to.
+    let owned = inject_tools_into_first_system_message(messages, params.tools);
+    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
 
     let effort_kwarg = params
         .template_kwargs
@@ -2563,6 +2701,7 @@ mod tests {
     use super::{derive_thinking_mode, detect_renderer_from_config, Renderer};
     use crate::{
         chat_template::ChatTemplateParams,
+        encode_path::EncodePath,
         encoders::deepseek_v32::ThinkingMode,
         traits::{Decoder as _, Encoder as _, Tokenizer as _},
         HuggingFaceTokenizer,
@@ -2582,6 +2721,27 @@ mod tests {
             "vocab": { "hello": 0 },
             "merges": []
         }
+    }"#;
+
+    /// A byte-level BPE of the shape the direct encode path takes: two
+    /// letters, the space mark and the merges that join it to a letter.
+    const BYTE_LEVEL_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+        "post_processor": null,
+        "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+        "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": {"a": 0, "b": 1, "Ġ": 2, "Ġa": 3, "Ġb": 4},
+            "merges": [["Ġ", "a"], ["Ġ", "b"]]}
+    }"#;
+
+    /// A word-level vocabulary: no direct encode path takes it, so its
+    /// encodes run in `tokenizers`.
+    const WORD_LEVEL_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
     }"#;
 
     /// The added tokens a prefix cache may match are those of the raw pass
@@ -2923,9 +3083,9 @@ mod tests {
         assert_eq!(ids_of(&first, "<|im_start|>a"), [3, 7]);
     }
 
-    /// A checkpoint of another model type keeps its file's pipeline (the
-    /// reference reads those as their file), and so does one whose
-    /// configuration names another class or is missing.
+    /// A checkpoint of a model type the reference reads as its file (`phi3`)
+    /// keeps its file's pipeline, and so does one whose configuration names
+    /// another class or is missing.
     #[test]
     fn other_checkpoints_keep_their_file_pipeline() {
         let temp = TempDir::new().unwrap();
@@ -2955,6 +3115,57 @@ mod tests {
         fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
         let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    }
+
+    /// The table the gate reads is searched by `binary_search`, so it stays
+    /// strictly sorted in byte order and without repeats; a refresh that
+    /// misplaces an entry fails here instead of falling through to the class
+    /// pipeline.
+    #[test]
+    fn the_reference_s_file_table_is_strictly_sorted() {
+        assert!(super::REFERENCE_READS_AS_FILE.is_sorted_by(|a, b| a < b));
+    }
+
+    /// A model type the reference leaves to the named class (`minicpm`,
+    /// `zamba2`, or one it has no tokenizer class of its own for) is the
+    /// class's too, with the scheme the flags select; a type the reference
+    /// reads as its file (`mistral`, `granite`, `llava`) keeps the file.
+    #[test]
+    fn the_reference_s_model_type_table_decides_between_the_class_and_the_file() {
+        for model_type in ["minicpm", "zamba2", "a_type_the_reference_has_no_class_for"] {
+            let temp = TempDir::new().unwrap();
+            let path =
+                llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
+            let class = HuggingFaceTokenizer::from_file(&path).unwrap();
+            assert!(
+                class.tokenizers_pipeline().get_normalizer().is_none(),
+                "{model_type}"
+            );
+            // `legacy: true`: the marker before every split (file: [6, 7, 5, 6, 8]);
+            // a text starting with a space gets one marker, not two (file: [6, 6, 7]).
+            assert_eq!(
+                ids_of(&class, "a </think> b"),
+                [6, 7, 6, 5, 6, 8],
+                "{model_type}"
+            );
+            assert_eq!(ids_of(&class, " a"), [6, 7], "{model_type}");
+        }
+        for model_type in ["mistral", "granite", "llava"] {
+            let temp = TempDir::new().unwrap();
+            let path =
+                llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
+            let file = HuggingFaceTokenizer::from_file(&path).unwrap();
+            assert!(
+                file.tokenizers_pipeline().get_normalizer().is_some(),
+                "{model_type}"
+            );
+            assert_eq!(
+                ids_of(&file, "a </think> b"),
+                [6, 7, 5, 6, 8],
+                "{model_type}"
+            );
+            assert_eq!(ids_of(&file, " a"), [6, 6, 7], "{model_type}");
+        }
     }
 
     /// A Llama-class file whose normalizer replaces something other than the
@@ -3023,6 +3234,71 @@ mod tests {
         assert_eq!(ids_of(&tokenizer, " a<|im_end|> b"), [6, 7, 4, 6, 8]);
     }
 
+    /// A byte-fallback fixture vocabulary as a legacy conversion writes it:
+    /// the `Prepend` + `Replace` normalizer, no pre-tokenizer, the template
+    /// post-processor, and the pieces of the text `> <s> </s> <|` under the
+    /// ids a 32k byte-fallback vocabulary gives them, so that the ids below
+    /// are the reference's on that text.
+    const BYTE_FALLBACK_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "▁"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}]},
+        "pre_tokenizer": null,
+        "post_processor": {"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "<s>", "type_id": 1}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}}},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"}, {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]},
+        "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false,
+            "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "▁▁": 259, "▁<": 529, "▁>": 1405, "▁": 29871,
+                "<": 29966, ">": 29958, "|": 29989},
+            "merges": ["▁ <", "▁ ▁", "▁ >"]}
+    }"#;
+
+    /// The reference picks the class from `tokenizer_config.json` before it
+    /// reads any `config.json`, so a checkpoint shipped as the tokenizer's
+    /// files alone is the class's too: after a special token spelled in the
+    /// text, the class prepends no word marker where the file's normalizer
+    /// prepends one (the file: `[1405, 29871, 1, 259, 2, 29871, 529, 29989]`,
+    /// one id more). A `config.json` that says no model type reads the same.
+    #[test]
+    fn a_llama_class_checkpoint_shipped_without_config_json_encodes_as_its_class() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("tokenizer.json");
+        fs::write(&path, BYTE_FALLBACK_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({
+                "tokenizer_class": "LlamaTokenizer", "legacy": false, "bos_token": "<s>",
+                "eos_token": "</s>", "unk_token": "<unk>", "clean_up_tokenization_spaces": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let text = "> <s> </s> <|";
+        let class = [1405, 29871, 1, 29871, 2, 529, 29989];
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+        assert_eq!(ids_of(&tokenizer, text), class);
+
+        fs::write(
+            temp.path().join("config.json"),
+            json!({"architectures": ["LlamaForCausalLM"]}).to_string(),
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(ids_of(&tokenizer, text), class);
+    }
+
     #[test]
     fn response_template_is_retained_from_tokenizer_config() {
         let temp = TempDir::new().unwrap();
@@ -3056,6 +3332,52 @@ mod tests {
 
         let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
         assert_eq!(tokenizer.response_template(), None);
+    }
+
+    /// `tokenizer.json`'s `truncation` and `padding` blocks are the defaults
+    /// the engine's tokenizer keeps for a call that asks; a plain encode runs
+    /// with both off. The loader clears them: a prompt longer than
+    /// `max_length` encodes whole on the direct path and on the `tokenizers`
+    /// path alike, and the direct path takes a file whose only obstacle was
+    /// the block.
+    #[test]
+    fn the_files_truncation_and_padding_blocks_do_not_apply_to_an_encode() {
+        let twelve_words = "a b a b a b a b a b a b";
+        let byte_level_ids = [0, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3, 4];
+        let word_level_ids = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        let truncation = json!({
+            "direction": "Right", "max_length": 4, "strategy": "LongestFirst", "stride": 0
+        });
+        let padding = json!({
+            "strategy": {"Fixed": 16}, "direction": "Right", "pad_to_multiple_of": null,
+            "pad_id": 1, "pad_type_id": 0, "pad_token": "b"
+        });
+        for (block, params) in [("truncation", &truncation), ("padding", &padding)] {
+            for (file, expected, direct) in [
+                (BYTE_LEVEL_TOKENIZER_JSON, &byte_level_ids[..], true),
+                (WORD_LEVEL_TOKENIZER_JSON, &word_level_ids[..], false),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let tokenizer_path = temp.path().join("tokenizer.json");
+                let mut definition: serde_json::Value = serde_json::from_str(file).unwrap();
+                definition[block] = params.clone();
+                fs::write(&tokenizer_path, definition.to_string()).unwrap();
+
+                let tokenizer =
+                    HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+                assert_eq!(
+                    tokenizer.encode_path() == EncodePath::Tokenizers,
+                    !direct,
+                    "a {block} block: the encode path"
+                );
+                let ids = tokenizer.encode(twelve_words, false).unwrap();
+                assert_eq!(
+                    ids.token_ids(),
+                    expected,
+                    "a {block} block, direct path {direct}"
+                );
+            }
+        }
     }
 
     /// The DeepSeek V4 encoder port stands in for the encoder module those
@@ -3494,13 +3816,13 @@ mod segment_tests {
         wrapped
     }
 
-    /// The V4 and V4.1 engine renderers rewrite a developer message as the
-    /// system message BEFORE their tokenizer wrapper attaches the request's
-    /// tools, so a request with both keeps its tools block; the shims keep
-    /// that order and render the request as its system-message twin. The
-    /// V3.2 renderer hands the developer role to its encoder as written: the
-    /// tools ride on the system message the wrapper step inserts and the
-    /// developer message is the encoder's user turn under its heading.
+    /// The engines' tokenizer wrappers attach the request's tools to a system
+    /// message and hand the developer role to their encoders as written, so a
+    /// request with both keeps its tools block and, the declared tools keeping
+    /// the thinking-drop off, its developer message as the encoder's user turn
+    /// (V4 and V4.1: the user token and the content, never the system-message
+    /// twin; V3.2: a user turn under its heading, the tools on the system
+    /// message the wrapper step inserts).
     #[test]
     fn a_developer_message_with_request_tools_keeps_the_tools_block_on_the_gateway_path() {
         let tools = [
@@ -3525,16 +3847,18 @@ mod segment_tests {
             let rendered = tok
                 .apply_chat_template_with_encoding(&developer, params(), None)
                 .expect("the renderer renders the conversation");
-            let twin = tok
-                .apply_chat_template_with_encoding(&system, params(), None)
-                .expect("the renderer renders the conversation");
-            assert_eq!(rendered.text, twin.text);
             assert!(
                 rendered.text.contains("lookup_weather")
-                    && rendered.text.contains("Follow the policy."),
+                    && rendered.text.ends_with(
+                        "<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
+                    ),
                 "{}",
                 rendered.text
             );
+            let twin = tok
+                .apply_chat_template_with_encoding(&system, params(), None)
+                .expect("the renderer renders the conversation");
+            assert_ne!(rendered.text, twin.text);
         }
         let rendered = v32_like(&ADDED)
             .apply_chat_template_with_encoding(&developer, params(), None)
@@ -3674,9 +3998,11 @@ mod segment_tests {
     }
 
     /// The report follows the text where the encoders differ on a trailing
-    /// system message: V4 writes no header after one, V4.1 writes it after a
-    /// system message that is not the conversation's first and none after a
-    /// lone one or one left alone by its thinking-drop.
+    /// system message: V4 writes the header after one that ends the
+    /// conversation (a lone one included), as the serving engine's copy of
+    /// its encoder does; V4.1 writes it after a system message that is not
+    /// the conversation's first and none after a lone one or one left alone
+    /// by its thinking-drop.
     #[test]
     fn the_native_renderers_report_the_header_after_a_trailing_system_message_as_written() {
         let params = || ChatTemplateParams {
@@ -3692,11 +4018,13 @@ mod segment_tests {
             .apply_chat_template_with_encoding(&system_last, params(), None)
             .expect("the renderer renders the conversation");
         assert!(
-            rendered.text.ends_with("Answer in French."),
+            rendered
+                .text
+                .ends_with("Answer in French.<｜Assistant｜><think>"),
             "{}",
             rendered.text
         );
-        assert!(!rendered.generation_prompt);
+        assert!(rendered.generation_prompt);
         let rendered = v41_like(&ADDED)
             .apply_chat_template_with_encoding(&system_last, params(), None)
             .expect("the renderer renders the conversation");
@@ -3709,14 +4037,25 @@ mod segment_tests {
         );
         assert!(rendered.generation_prompt);
         let system_alone = [json!({"role": "system", "content": "Be brief."})];
+        let rendered = v4_like(&ADDED)
+            .apply_chat_template_with_encoding(&system_alone, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("Be brief.<｜Assistant｜><think>"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.generation_prompt);
         let rendered = v41_like(&ADDED)
             .apply_chat_template_with_encoding(&system_alone, params(), None)
             .expect("the renderer renders the conversation");
         assert!(rendered.text.ends_with("Be brief."), "{}", rendered.text);
         assert!(!rendered.generation_prompt);
-        // A developer message is rewritten as a system one and merged with
-        // the system message after it: one system turn, both texts, no
-        // header; the report reads the render, not the request's message list.
+        // A developer message before a system message that ends the
+        // conversation goes with the thinking-drop (that system message is the
+        // last user-like turn under this encoder's rule), and the one system
+        // message left is the conversation's first: bare text, no header; the
+        // report reads the render, not the request's message list.
         let developer_then_system = [
             json!({"role": "developer", "content": "Be terse."}),
             json!({"role": "system", "content": "Answer in French."}),
@@ -3725,7 +4064,8 @@ mod segment_tests {
             .apply_chat_template_with_encoding(&developer_then_system, params(), None)
             .expect("the renderer renders the conversation");
         assert!(
-            rendered.text.ends_with("Be terse.\n\nAnswer in French."),
+            rendered.text.ends_with("\n\nAnswer in French.")
+                && !rendered.text.contains("Be terse."),
             "{}",
             rendered.text
         );
@@ -4056,8 +4396,16 @@ mod segment_tests {
                 _ => &fixtures.effort_tiers,
             };
             tok.renderer = Renderer::DeepseekV41(effort_table_of(tiers));
+            // Three cases were recorded with the recording script's
+            // developer-to-system rewrite, which the engine's renderer does
+            // not make (it hands the role to its encoder as written; the
+            // encoder tests pin that); they are rendered as the system path
+            // they describe, through the crate's own fold as the encoder's
+            // replay of the same recordings does.
+            let messages = crate::chat_template::developer_messages_as_system(&case.messages)
+                .unwrap_or_else(|| case.messages.clone());
             let marked = tok
-                .render_marked(&case.messages, params)
+                .render_marked(&messages, params)
                 .unwrap_or_else(|e| panic!("case {}: {e}", case.name));
             let segments = marks::segments(&marked).expect("paired marks");
             let (text, controls) = marks::flatten(&marked).expect("paired marks");

@@ -67,14 +67,14 @@ use super::{
             ChatGenerateResponseProcessingStage, TranscriptionPreparationStage,
             TranscriptionRequestBuildingStage, TranscriptionResponseProcessingStage,
         },
-        streaming,
+        streaming, symphony,
     },
     spec::ResponseSpec,
     utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::types::RetryConfig,
+    config::{types::RetryConfig, ParserChoice},
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
@@ -864,7 +864,7 @@ impl RequestPipeline {
         // Which parser read a chat completion, so a client comparing the two can tell.
         if let Some(parser) = ctx.parser {
             response.headers_mut().insert(
-                "x-smg-parser",
+                symphony::HEADER,
                 http::HeaderValue::from_static(parser.name()),
             );
         }
@@ -1075,8 +1075,9 @@ impl RequestPipeline {
     }
 
     /// [`Self::run`], reporting to a Responses stream's startup barrier
-    /// whether the backend request started. A run that fails before then
-    /// hands its response to the barrier; the caller gets a placeholder the
+    /// whether the backend request started, with the parser header the
+    /// started stream's answer carries. A run that fails before then hands
+    /// its response to the barrier; the caller gets a placeholder the
     /// Responses stream never forwards.
     fn run_signalling<'a>(
         &'a self,
@@ -1095,7 +1096,18 @@ impl RequestPipeline {
             // either message.
             match outcome {
                 Ok(outcome) => {
-                    let _ = startup.send(Ok(()));
+                    // The parser that read the answer, as the Responses stream's
+                    // own answer names it: a stream answers early, its header
+                    // set by `routed_response`.
+                    let parser = match &outcome {
+                        RunOutcome::Early(response) => {
+                            response.headers().get(symphony::HEADER).cloned()
+                        }
+                        RunOutcome::Final(dctx, _) => dctx
+                            .parser
+                            .map(|parser| http::HeaderValue::from_static(parser.name())),
+                    };
+                    let _ = startup.send(Ok(parser));
                     Ok(outcome)
                 }
                 Err(failure) => {
@@ -1508,7 +1520,8 @@ impl RequestPipeline {
     /// each takes the reservation a chat request takes (reserved at ingress
     /// under a charge id of its own, settled with the engine's counts, closed
     /// unsettled when the iteration fails). Two differences:
-    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
+    /// 1. Returns the completion with the parser that read it (what the chat
+    ///    route answers in `x-smg-parser`), as a Result for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
         &self,
@@ -1517,7 +1530,7 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<(ChatCompletionResponse, Option<ParserChoice>), Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
@@ -1544,7 +1557,7 @@ impl RequestPipeline {
                     rate_limit_cell
                         .settle(Self::recorded_settlement(&dctx.response))
                         .await;
-                    Ok(response)
+                    Ok((response, dctx.parser))
                 }
                 Some(_) => {
                     error!(
@@ -2002,7 +2015,7 @@ mod alias_pipeline_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
+            parser: ParserChoice::Legacy,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -2095,7 +2108,7 @@ mod rate_limit_reserve_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
+            parser: ParserChoice::Legacy,
         })
     }
 

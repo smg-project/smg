@@ -22,6 +22,10 @@ class _SamplingParamsBase:
     echoing them back; whether they reached the worker is the engine rows' verdict.
     """
 
+    # The budget of the one-word answer. A reasoning model's class raises it: the analysis
+    # channel comes before the word, and a turn the budget cuts reads incomplete.
+    one_word_budget = 16
+
     def test_all_sampling_params_accepted(self, model, api_client, mock_answers):
         """Non-default sampling params produce a valid response with correct echo-back."""
         mock_answers.enqueue("2 + 2 = 4.")
@@ -62,7 +66,7 @@ class _SamplingParamsBase:
             "model": model,
             "input": "What is the capital of France? Answer in one word.",
             "temperature": 0,
-            "max_output_tokens": 16,
+            "max_output_tokens": self.one_word_budget,
         }
         resp1 = api_client.responses.create(**kwargs)
         resp2 = api_client.responses.create(**kwargs)
@@ -111,14 +115,66 @@ class _SamplingParamsBase:
 @pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSamplingParamsLocal(_SamplingParamsBase):
-    """Regular model (Qwen via SGLang)."""
+    """Regular model (Qwen via SGLang).
+
+    The two ``stop`` rows live on this class alone: the Harmony pipeline builds its
+    engine request from the Responses request itself and does not carry ``stop`` yet.
+    """
+
+    def test_stop_sequence_ends_the_answer(self, model, api_client, mock_answers):
+        """A ``stop`` sequence on a plain Responses request ends the answer and is
+        trimmed from the output, as it is on the chat path. On the mock the engine's
+        part is stated (the answer ends on the matched stop, as an engine reports it);
+        what the row reads is the gateway's own trim of the sequence, which is built
+        from the request the gateway forwards: a dropped ``stop`` leaves the sequence
+        in the text."""
+        mock_answers.enqueue("1,", finish_reason="stop", matched_stop=",")
+        resp = api_client.responses.create(
+            model=model,
+            input="Count from 1 to 10: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10",
+            temperature=0,
+            max_output_tokens=200,
+            extra_body={"stop": ","},
+        )
+        assert resp.status == "completed"
+        assert resp.output_text, "the text before the stop sequence is the answer"
+        assert "," not in resp.output_text, (
+            f"the stop sequence ',' should not appear in the output: {resp.output_text!r}"
+        )
+
+    def test_stop_sequence_ends_the_streamed_answer(self, model, api_client, mock_answers):
+        """The same ``stop`` sequence, in its list form, on a streamed request: neither
+        the text deltas nor the terminal event's object carry the sequence."""
+        mock_answers.enqueue("1,", finish_reason="stop", matched_stop=",")
+        stream = api_client.responses.create(
+            model=model,
+            input="Count from 1 to 10: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10",
+            temperature=0,
+            max_output_tokens=200,
+            stream=True,
+            extra_body={"stop": [","]},
+        )
+        events = list(stream)
+        completed = [e for e in events if e.type == "response.completed"]
+        assert len(completed) == 1
+
+        text = "".join(e.delta for e in events if e.type == "response.output_text.delta")
+        assert text, "the text before the stop sequence is the answer"
+        assert "," not in text, f"the stop sequence ',' should not appear in the deltas: {text!r}"
+        resp = completed[0].response
+        assert resp.status == "completed"
+        assert "," not in resp.output_text, (
+            f"the stop sequence ',' should not appear in the terminal object: {resp.output_text!r}"
+        )
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSamplingParamsHarmony(_SamplingParamsBase):
     """Harmony model (gpt-oss-20b via all gRPC backends)."""
+
+    one_word_budget = 256
