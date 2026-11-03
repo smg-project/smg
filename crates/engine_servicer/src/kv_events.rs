@@ -316,8 +316,9 @@ pub(crate) trait LoadSource: Send + Sync {
 /// differs by wire; [`LoadFromState`] adds the half every wire shares.
 pub(crate) trait RankLoads: Send + Sync {
     /// The record for `dp_rank` (`None`: a publisher that names no rank)
-    /// without the engine link's liveness fields, or `None` while the engine
-    /// has reported nothing.
+    /// without the engine link's liveness fields: a connected rank's last
+    /// figures, zero-filled until its first batch; `None` while the engine
+    /// is not connected or for a rank past the connected ones.
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
 
     /// The engine link whose liveness the record carries.
