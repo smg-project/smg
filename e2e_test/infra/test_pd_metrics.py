@@ -195,7 +195,10 @@ def test_only_mori_http_workers_have_an_idle_observer(backend, moriio, skipped):
         with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
             metrics.require_load_reports(backend, moriio=moriio)
     else:
-        metrics.require_load_reports(backend, moriio=moriio)
+        try:
+            metrics.require_load_reports(backend, moriio=moriio)
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"eligible idle observer was skipped: {exc}")
 
 
 @pytest.mark.parametrize(
