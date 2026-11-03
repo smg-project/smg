@@ -101,6 +101,45 @@ impl Frame {
     }
 }
 
+/// The top alternatives of one output position on a token wire: the sampled
+/// id first, then the others, with their logprobs in the same order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopAlternatives {
+    pub ids: Vec<u32>,
+    pub values: Vec<f32>,
+}
+
+/// Up to `k` alternatives for `sampled`: itself first at `logprob`, then the
+/// pool's other distinct entries in order from its first occurrence on
+/// (wrapping), each half a nat less likely than the one before. Keyed by
+/// value, not by position: a repeated entry reads the same alternatives
+/// wherever it stands, which keeps a streamed chunk's reading the whole
+/// answer's.
+fn top_k<T: Clone + PartialEq>(
+    pool: &[T],
+    sampled: &T,
+    logprob: f32,
+    k: usize,
+) -> (Vec<T>, Vec<f32>) {
+    let mut picked = vec![sampled.clone()];
+    let start = pool
+        .iter()
+        .position(|entry| entry == sampled)
+        .map_or(0, |at| at + 1);
+    for other in pool.iter().cycle().skip(start).take(pool.len()) {
+        if picked.len() == k {
+            break;
+        }
+        if !picked.contains(other) {
+            picked.push(other.clone());
+        }
+    }
+    let values = (0..picked.len())
+        .map(|rank| logprob - 0.5 * rank as f32)
+        .collect();
+    (picked, values)
+}
+
 /// An answer with the key it is filed under, when it has one.
 pub struct Scripted {
     pub key: Option<String>,
@@ -120,7 +159,10 @@ impl Answer {
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
     /// `key` and `input_ids` file the answer under a prompt (a `--script`
-    /// line needs one of them, an enqueued answer may carry one).
+    /// line needs one of them, an enqueued answer may carry one). An empty
+    /// `output_text` without `output_ids` is an answer of no tokens: the
+    /// completion alone, as an engine answers a request it may not generate
+    /// for. Beside ids, an empty string is one whole-text piece like any other.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -164,6 +206,12 @@ impl Answer {
         let output_ids = ids("output_ids")?.unwrap_or_default();
         let output_text = match object.get("output_text") {
             None | Some(Value::Null) => None,
+            // No tokens: nothing said and no ids to say it with. An empty
+            // string beside ids is the one whole-text piece it always was (a
+            // recorded answer of one special token decodes to "").
+            Some(Value::String(text)) if text.is_empty() && output_ids.is_empty() => {
+                Some(Vec::new())
+            }
             Some(Value::String(text)) => Some(vec![text.clone()]),
             Some(Value::Array(pieces)) => Some(
                 pieces
@@ -314,6 +362,41 @@ impl Answer {
         Ok(self)
     }
 
+    /// The answer under the request's token limit, as an engine would end
+    /// it: cut after `max_new_tokens` tokens with the `length` finish and no
+    /// matched stop when it is longer, whole when it fits or when the request
+    /// names no limit. A token is an output id, or a text piece on an answer
+    /// without ids (the text wire's units): a whole text written as one
+    /// piece beside ids is kept as the ids say.
+    pub fn cut_to(mut self, max_new_tokens: Option<u32>) -> Self {
+        let Some(limit) = max_new_tokens else {
+            return self;
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let units = if self.output_ids.is_empty() {
+            self.output_text.as_ref().map_or(0, Vec::len)
+        } else {
+            self.output_ids.len()
+        };
+        if units <= limit {
+            return self;
+        }
+        self.output_ids.truncate(limit);
+        if let Some(pieces) = &mut self.output_text {
+            if pieces.len() == units {
+                pieces.truncate(limit);
+            }
+        }
+        if let Some(logprobs) = &mut self.logprobs {
+            if logprobs.len() == units {
+                logprobs.truncate(limit);
+            }
+        }
+        self.finish_reason = "length".to_string();
+        self.matched_stop = None;
+        self
+    }
+
     /// The prompt tokens to report for a prompt of `prompt_len` ids.
     pub fn prompt_tokens(&self, prompt_len: usize) -> u32 {
         self.prompt_tokens
@@ -372,6 +455,52 @@ impl Answer {
             },
             |range| pieces[range].to_vec(),
         )
+    }
+
+    /// The top alternatives of some output tokens, as a request asking for
+    /// `top_logprobs` reads them: at most `k` entries per position, the
+    /// sampled token first with its own logprob, then the answer's other
+    /// distinct tokens in output order from the token's first occurrence in
+    /// the answer on (wrapping), each half a nat less likely than the one
+    /// before; a token the answer repeats reads the same alternatives at each
+    /// of its positions. The alternatives are the answer's own
+    /// tokens, so they decode under the request's tokenizer; an answer with
+    /// fewer distinct tokens than `k` reports fewer. Empty when `k` is 0 or
+    /// the logprobs do not align with the tokens.
+    pub fn top_logprobs(&self, ids: &[u32], logprobs: &[f32], k: usize) -> Vec<TopAlternatives> {
+        if k == 0 || ids.len() != logprobs.len() {
+            return Vec::new();
+        }
+        ids.iter()
+            .zip(logprobs)
+            .map(|(sampled, &logprob)| {
+                let (ids, values) = top_k(&self.output_ids, sampled, logprob, k);
+                TopAlternatives { ids, values }
+            })
+            .collect()
+    }
+
+    /// The top alternatives of some text pieces, the text wire's reading of
+    /// [`Self::top_logprobs`]: the piece first, then the answer's other
+    /// distinct pieces, up to `k` per position, each with its logprob.
+    pub fn top_pieces(
+        &self,
+        pieces: &[String],
+        logprobs: &[f32],
+        k: usize,
+    ) -> Vec<Vec<(String, f32)>> {
+        if k == 0 || pieces.len() != logprobs.len() {
+            return Vec::new();
+        }
+        let pool = self.output_text.as_deref().unwrap_or(&[]);
+        pieces
+            .iter()
+            .zip(logprobs)
+            .map(|(sampled, &logprob)| {
+                let (pieces, values) = top_k(pool, sampled, logprob, k);
+                pieces.into_iter().zip(values).collect()
+            })
+            .collect()
     }
 
     fn frames(
@@ -724,6 +853,21 @@ mod tests {
             parse(r#"{"key": "1:7", "output_ids": [3], "matched_stop": 3}"#).expect("keyed");
         assert_eq!(token.key.as_deref(), Some("1:7"));
         assert_eq!(token.answer.matched_stop, Some(MatchedStop::Token(3)));
+    }
+
+    #[test]
+    fn an_empty_text_is_no_tokens_alone_and_one_piece_beside_ids() {
+        let silent = parse(r#"{"output_text": ""}"#).expect("no tokens").answer;
+        assert_eq!(silent.completion_tokens(), 0);
+        assert_eq!(silent.text(), "");
+        // A recorded answer of one special token decodes to an empty string:
+        // the one whole-text piece for its ids, as any one string is.
+        let eos = parse(r#"{"output_ids": [2], "output_text": ""}"#)
+            .expect("ids beside an empty string")
+            .answer;
+        assert_eq!(eos.output_ids, vec![2]);
+        assert_eq!(eos.completion_tokens(), 1);
+        assert_eq!(eos.text(), "");
     }
 
     #[test]

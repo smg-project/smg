@@ -1,9 +1,9 @@
 //! A model family's marker tokens are spelled in up to four crates (the
-//! tokenizer's renderer, Symphony's format and grammar tables, the two
-//! legacy parsers), each copy right today. This test is the one place that
-//! spells them: a revision of one copy fails here, naming the file, instead
-//! of parting the renderer from the reader. The copies stay where they are
-//! until the families' markers have a single source.
+//! tokenizer's renderer, Symphony's format table and the tags its assembler
+//! reads, the two legacy parsers), each copy right today. This test is the
+//! one place that spells them: a revision of one copy fails here, naming the
+//! file, instead of parting the renderer from the reader. The copies stay
+//! where they are until the families' markers have a single source.
 
 use std::{fs, path::Path};
 
@@ -27,7 +27,7 @@ const FAMILIES: &[Family] = &[
         files: &[
             "crates/tokenizer/src/encoders/kimi_k3_xtml.rs",
             "crates/symphony/src/formats/kimi_k3.rs",
-            "crates/symphony/src/grammar/xtml.rs",
+            "crates/symphony/src/tagged/attributed.rs",
             "crates/reasoning_parser/src/parsers/kimi_k3.rs",
             "crates/tool_parser/src/parsers/kimi_k3.rs",
         ],

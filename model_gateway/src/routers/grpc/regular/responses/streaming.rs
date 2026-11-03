@@ -60,8 +60,9 @@ use crate::{
         grpc::{
             common::{
                 responses::{
-                    await_stream_startup, build_sse_response, persist_response_if_needed,
-                    signal_stream_startup, stored_foreground, stream_startup_channel,
+                    await_stream_startup, build_sse_response, naming_parser,
+                    persist_response_if_needed, signal_stream_startup, stored_foreground,
+                    stream_startup_channel,
                     streaming::{
                         attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                     },
@@ -72,6 +73,7 @@ use crate::{
                 },
                 stages::{iteration_charge, RateLimitCell},
             },
+            regular::symphony,
             utils,
         },
     },
@@ -127,8 +129,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         return chat_response;
     }
 
-    // Extract body from chat response
-    let (_parts, body) = chat_response.into_parts();
+    // The chat answer's body, and the parser that read it, which this
+    // answer names as the chat route does.
+    let (parts, body) = chat_response.into_parts();
+    let parser = parts.headers.get(symphony::HEADER).cloned();
 
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
@@ -186,7 +190,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     }
 
     // Build SSE response with transformed stream
-    build_sse_response(rx)
+    naming_parser(build_sse_response(rx), parser)
 }
 
 /// The SSE events of one frame of the chat stream's body.

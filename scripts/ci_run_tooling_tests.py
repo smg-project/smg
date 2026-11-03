@@ -20,6 +20,7 @@ COMPONENTS = (
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
+    ("scripts/ci_verify_sglang_rocm_e2e.py", "scripts/tests/test_ci_sglang_rocm_e2e.py"),
     ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
     ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),

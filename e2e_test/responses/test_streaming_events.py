@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
@@ -32,11 +32,12 @@ logger = logging.getLogger(__name__)
 class TestStreamingEventsLocal:
     """Streaming event tests against local gRPC backend."""
 
-    def test_output_item_event_emitted(self, model, api_client):
+    def test_output_item_event_emitted(self, model, api_client, mock_answers):
         """Test that output_index is zero-based in streaming responses.
 
         Verifies that the first output item has output_index: 0.
         """
+        mock_answers.enqueue("1, 2, 3.")
         resp = api_client.responses.create(
             model=model,
             input="Count from 1 to 3",

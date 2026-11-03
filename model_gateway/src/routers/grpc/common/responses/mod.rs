@@ -13,7 +13,8 @@ pub(crate) use context::ResponsesContext;
 pub(crate) use history::load_history;
 pub(crate) use streaming::{
     await_stream_startup, body_guards, build_sse_response, build_sse_response_from_stream,
-    build_sse_response_guarded, signal_stream_startup, stream_startup_channel, StreamStartupSender,
+    build_sse_response_guarded, naming_parser, signal_stream_startup, stream_startup_channel,
+    StreamStartupSender,
 };
 pub(crate) use utils::{
     ensure_mcp_connection, persist_response_if_needed, previous_response_chain, stored_foreground,

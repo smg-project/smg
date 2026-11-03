@@ -36,12 +36,17 @@ const PREPARED_TOOLS_KEPT: usize = 64;
 const PREPARED_TOOLS_MAX_KEY_BYTES: usize = 64 * 1024;
 
 /// The most a kept set may weigh ([`set_weight`]): a heavier one is prepared
-/// for its request alone.
+/// for its request alone. The weight charges the plain form; a checkpoint
+/// whose renderer reads the tools key-sorted keeps the sorted form beside it
+/// from its first render (`PreparedTools::key_sorted`), uncharged, so such a
+/// set weighs up to about twice this.
 const PREPARED_TOOLS_MAX_SET_WEIGHT: usize = 1024 * 1024;
 
 /// The weight the kept sets may sum to before the table starts over, so a
 /// run of distinct sets cannot keep more than about this alive after their
-/// requests have finished, whatever their shape.
+/// requests have finished, whatever their shape (about twice this where the
+/// sets are of checkpoints that read their tools key-sorted, which keep the
+/// sorted form beside the charged one).
 const PREPARED_TOOLS_KEPT_WEIGHT: usize = 16 * 1024 * 1024;
 
 /// The kept values by the tools' serialized bytes, and the weight they sum to.
