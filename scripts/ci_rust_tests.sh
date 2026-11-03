@@ -77,7 +77,7 @@ packages_of() {
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
-        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker ;;
+        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
         kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
@@ -175,7 +175,7 @@ commands_of() {
         protocols)
             echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker --features engine-zmq-client/mock-engine" ;;
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma"

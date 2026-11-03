@@ -1919,7 +1919,7 @@ mod worker_load_manager_tests {
 }
 
 #[cfg(test)]
-mod worker_monitor_tests;
+mod tests;
 
 #[cfg(test)]
 mod prom_scrape_tests {

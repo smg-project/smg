@@ -150,12 +150,13 @@ async fn responses_result_with_finishes(
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
-    let (status, content_type, bytes) = timeout(Duration::from_secs(30), async {
+    let (status, content_type, parser, bytes) = timeout(Duration::from_secs(30), async {
         let response = router.route_responses(None, &tenant, request, MODEL).await;
         let status = response.status();
         let content_type = response.headers().get("content-type").cloned();
+        let parser = response.headers().get("x-smg-parser").cloned();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        (status, content_type, bytes)
+        (status, content_type, parser, bytes)
     })
     .await
     .expect("Responses stream should terminate");
@@ -171,6 +172,19 @@ async fn responses_result_with_finishes(
         StatusCode::OK,
         "{}",
         String::from_utf8_lossy(&bytes)
+    );
+    // Every answer names the parser that read it, as the chat route does: the
+    // JSON answer and the SSE answer, with and without MCP tools (the MCP
+    // stream's header comes from the startup barrier, the non-stream tool
+    // loop's from its last completion). Which reader it is follows the
+    // parser rule the route test pins (here `legacy` for the plain cases,
+    // `symphony` for the scripted tool-call cases); the contract is that the
+    // header is there and names a reader.
+    let parser = parser.as_ref().and_then(|value| value.to_str().ok());
+    assert!(
+        matches!(parser, Some("symphony" | "legacy")),
+        "x-smg-parser on the {} answer: {parser:?}",
+        if stream { "SSE" } else { "JSON" }
     );
     if !stream {
         let response: Value = serde_json::from_slice(&bytes).unwrap();

@@ -10,7 +10,6 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/pr-test-rust.yml"
 AREAS = (
     "chat-completions",
-    "chat-symphony",
     "completions",
     "embeddings",
     "realtime",
@@ -46,23 +45,23 @@ def lane_decisions(path, tmp_path, monkeypatch):
     [
         (
             "scripts/ci_setup_sglang_rocm_image.sh",
-            "chat-completions chat-symphony completions embeddings agentic go-bindings",
+            "chat-completions completions embeddings agentic go-bindings",
         ),
         (
             "scripts/ci_setup_sglang_rocm_e2e.sh",
-            "chat-completions chat-symphony completions embeddings agentic go-bindings",
+            "chat-completions completions embeddings agentic go-bindings",
         ),
         (
-            "scripts/ci_repair_sglang_rocm_native.py",
-            "chat-completions chat-symphony completions embeddings agentic go-bindings",
+            "scripts/ci_verify_sglang_rocm_e2e.py",
+            "chat-completions completions embeddings agentic go-bindings",
         ),
         (
-            "scripts/sglang_rocm_native_patches.json",
-            "chat-completions chat-symphony completions embeddings agentic go-bindings",
+            "scripts/ci_run_sglang_rocm_units.sh",
+            "chat-completions completions embeddings agentic go-bindings",
         ),
         (
             "scripts/ci_setup_vllm_rocm_image.sh",
-            "chat-completions chat-symphony completions embeddings realtime",
+            "chat-completions completions embeddings realtime",
         ),
         ("scripts/ci_check_e2e_dependencies.py", " ".join(AREAS)),
         ("scripts/ci_check_vllm_engine_units.py", " ".join(AREAS)),
@@ -90,8 +89,8 @@ def test_a_symphony_only_change_reaches_every_engines_chat_messages_and_response
     tmp_path, monkeypatch
 ):
     """Symphony is the default parser, so a change confined to its crate reaches the lanes
-    of every engine's chat, messages and responses path (the tier table's row), not the
-    Symphony chat lane alone, which an earlier shortcut used to leave it."""
+    of every engine's chat, messages and responses path (the tier table's row); the chat
+    lanes read through it, and no lane pins it any more."""
     assert lane_decisions("crates/symphony/src/lib.rs", tmp_path, monkeypatch) == set(
-        "chat-completions chat-symphony agentic vendor".split()
+        "chat-completions agentic vendor".split()
     )
