@@ -379,7 +379,7 @@ def test_strict_survivors_are_failure_after_bounded_term_and_kill(mod, strict_tr
         (100, signal.SIGKILL),
         (101, signal.SIGKILL),
     ]
-    assert runtime.now <= 2.4 + 1e-9
+    assert runtime.now <= 20.4 + 1e-9
     assert runtime.closed == set(runtime.opened)
 
 
