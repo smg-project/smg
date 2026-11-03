@@ -552,10 +552,11 @@ mod tests {
         }
     }
 
-    /// The prompt the family's template renders for a conversation that ends with a system
-    /// message, as a coding agent's client sends one (its environment notes after the user turn):
-    /// the template writes the turn opener after a user message only, so the prompt opens no turn,
-    /// and the model starts inside its thought as it would after `<｜Assistant｜><think>`.
+    /// The prompt the checkpoint's own encoder file writes for a conversation that ends with a
+    /// system message, as a coding agent's client sends one (its environment notes after the user
+    /// turn): that file writes the turn opener after user and developer turns only, so the prompt
+    /// opens no turn, and the model starts inside its thought as it would after
+    /// `<｜Assistant｜><think>`.
     const TRAILING_SYSTEM_PROMPT: &str = concat!(
         "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
         "<｜User｜>The test suite has a failing test. Find the bug under src/ and fix it.",
@@ -563,10 +564,12 @@ mod tests {
         " - Platform: linux\n\nToday's date is 2026-10-16."
     );
 
-    /// The same client's later request: the environment notes after the first user turn, the
-    /// model's turn after them, the tool's result as the template merges it into a user turn, and
-    /// a note after that, with `</think>` quoted in the result. The template wrote no opener before
-    /// the model's earlier turn either (a system message came before it), so the prompt holds none.
+    /// The prompt the checkpoint's own encoder file writes, with the thoughts kept, for the same
+    /// client's later request: the environment notes after the first user turn, the model's turn
+    /// after them, the tool's result merged into a user turn, and a note after that, with
+    /// `</think>` quoted in the result. That file wrote no opener before the model's earlier turn
+    /// either (a system message came before it, and it opens the turn after user and developer
+    /// turns only), so the prompt holds none.
     const AGENT_LATER_TURN_PROMPT: &str = concat!(
         "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
         "<｜User｜>Fix the failing test.# Environment\n - Platform: linux\n",
@@ -630,8 +633,9 @@ mod tests {
         assert_eq!(reasoning(&events), thought);
         assert_eq!(content(&events), "");
         assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
-        // An earlier turn the template opened, then a user turn and a system note: the turn's end
-        // after the last opener says the prompt opens no turn for the model.
+        // The prompt the checkpoint's own encoder file writes, with the thoughts kept, for an
+        // earlier turn it opened, then a user turn and a system note: the turn's end after the
+        // last opener says the prompt opens no turn for the model.
         let prompt = concat!(
             "<｜User｜>u1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>",
             "<｜User｜>u2# Environment\n - Platform: linux"
