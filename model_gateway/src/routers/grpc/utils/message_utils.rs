@@ -3,15 +3,14 @@
 //!
 //! Parallel to `chat_utils.rs` but works with `CreateMessageRequest` / `InputMessage`
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
-#![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
+    traits::{MediaHandling, PromptEncoding, Tokenizer},
 };
 use openai_protocol::{
     common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -23,15 +22,18 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use tracing::error;
 
-use super::chat_utils;
-use crate::routers::{
-    error,
-    grpc::{
-        context::SharedComponents,
-        multimodal::{
-            self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+use super::{chat_utils, prepared_tools::prepare_tools};
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        error,
+        grpc::{
+            context::SharedComponents,
+            multimodal::{
+                self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+            },
+            ProcessedMessages,
         },
-        ProcessedMessages,
     },
 };
 
@@ -120,14 +122,14 @@ pub fn process_messages_with_encoding(
 }
 
 /// [`process_messages`] over the prompt parts alone.
-pub(crate) fn process_messages_prompt(
+fn process_messages_prompt(
     request: MessagesPrompt<'_>,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
-    let content_format = tokenizer.chat_template_content_format();
+    let content_format = tokenizer.chat_template_content_format_for_request(chat_tools.is_some());
 
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(
@@ -166,19 +168,13 @@ pub(crate) fn process_messages_prompt(
     // Step 3: Process tool call arguments in assistant messages (reuse from
     // chat_utils), unless the renderer parses them itself as written.
     if !capabilities.raw_tool_call_arguments {
-        chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+        chat_utils::process_tool_call_arguments(&mut transformed_messages);
     }
 
-    // Step 4: Serialize tools to JSON values for template processing
-    let tools_json: Option<Vec<Value>> = chat_tools
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+    // Step 4: the tools as the template reads them, prepared once per
+    // distinct tool set and shared by every request that carries the same
+    // tools.
+    let prepared_tools = chat_tools.map(prepare_tools).transpose()?;
 
     // Step 5: the thinking preference the request states, or its provider
     // profile reads from the effort, as for Chat.
@@ -227,7 +223,8 @@ pub(crate) fn process_messages_prompt(
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,
         continue_final_message: native_continuation,
-        tools: tools_json.as_deref(),
+        tools: prepared_tools.as_deref().map(PreparedTools::tools),
+        prepared_tools: prepared_tools.as_deref(),
         template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()
@@ -248,6 +245,7 @@ pub(crate) fn process_messages_prompt(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))
@@ -255,21 +253,15 @@ pub(crate) fn process_messages_prompt(
 
 /// The tools the template renders for a request: `chat_tools` (the custom
 /// tools as chat tools) narrowed by `tool_choice` the way the chat path
-/// narrows them (a forced tool renders alone, and `none` renders none unless
-/// the renderer declares the tools under `none` itself, see
-/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]); borrowed
-/// when the choice does not narrow. Shared by the preparation stage and
-/// count_tokens so both render the same prompt.
+/// narrows them (a forced tool renders alone; `none` renders them all, as
+/// the chat path and the engine's own server render them, the choice
+/// reaching the template as a kwarg); borrowed when the choice does not
+/// narrow. Shared by the preparation stage and count_tokens so both render
+/// the same prompt.
 pub fn template_tools<'a>(
     chat_tools: &'a [ChatTool],
     tool_choice: Option<&messages::ToolChoice>,
-    capabilities: RendererCapabilities,
 ) -> Cow<'a, [ChatTool]> {
-    if matches!(tool_choice, Some(messages::ToolChoice::None))
-        && !capabilities.declares_tools_under_tool_choice_none
-    {
-        return Cow::Borrowed(&[]);
-    }
     match tool_choice
         .map(ChatToolChoice::from)
         .and_then(|choice| choice.narrow_tools(chat_tools))
@@ -283,7 +275,9 @@ pub fn template_tools<'a>(
 /// from the registries before the template renders, as the preparation
 /// stages resolve it: nothing is fetched or preprocessed here.
 pub(crate) struct ResolvedMedia {
-    /// Where the model's template wants media parts relative to text.
+    /// Where the model's template wants media parts relative to text; the
+    /// default (`MediaFirst`) for a request without media, which no renderer
+    /// acts on: with no media part there is nothing to place.
     pub(crate) media_order: MediaPartOrder,
     /// The request's media and the placeholders the template writes for it,
     /// when the request carries media.
@@ -322,6 +316,7 @@ pub(crate) async fn resolve_messages_media(
     model_id: &str,
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
     resolve_media(
         components,
@@ -329,15 +324,18 @@ pub(crate) async fn resolve_messages_media(
         tokenizer,
         "resolve_messages_media",
         || multimodal::media_plan_messages(messages),
+        record_media,
     )
     .await
 }
 
 /// Resolve what a chat-like request's media needs before the template
-/// renders: the model's media-part order and, for a request with media, the
+/// renders: for a request with media, the model's media-part order and the
 /// plan `plan` builds from the request and the placeholder tokens (the
-/// engine's own limits applied). A renderer that writes media as template
-/// text has no plan and keeps the authored order. The chat and Messages
+/// engine's own limits applied); a request without media returns before the
+/// registries are read, with the default order and no plan. A renderer that writes media as template
+/// text has no plan and keeps the authored order, its request's media
+/// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
 /// refuse a request alike; `stage` names the caller in the log lines, as
 /// each caller's own lines named it before.
@@ -347,17 +345,59 @@ pub(crate) async fn resolve_media(
     tokenizer: &dyn Tokenizer,
     stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
+    // What a generation request carries, counted once and before any
+    // refusal or limit (a refused request's media included); a token count
+    // resolves the same plan and is not a request here.
+    let record = |plan: &MediaPlan| {
+        for &modality in plan.modalities() {
+            Metrics::record_mm_request_media(
+                model_id,
+                modality,
+                plan.count(modality),
+                &plan.source_counts(modality),
+            );
+        }
+    };
     if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
+        // A template that writes media as text takes no plan; a request
+        // that is recorded builds one for the count alone, a token count
+        // builds none.
+        if record_media {
+            record(&plan());
+        }
         return Ok(ResolvedMedia {
             media_order: MediaPartOrder::Authored,
             media: None,
         });
     }
-    let tokenizer_entry = components
-        .tokenizer_registry
-        .get_by_name(model_id)
-        .or_else(|| components.tokenizer_registry.get_by_id(model_id));
+    let plan = plan();
+    if record_media {
+        record(&plan);
+    }
+    // No images or video to a pool whose every worker is language model only (the engine admits
+    // such a request and never schedules it), and no modality to a pool whose engines take none of
+    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
+    // on the declared parts, before any byte of media is fetched, decoded or sent.
+    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    if plan.is_empty() {
+        // A request without media renders the same under either order (its text parts in
+        // their own order): the registries are not asked for a model with nothing to place.
+        return Ok(ResolvedMedia {
+            media_order: MediaPartOrder::MediaFirst,
+            media: None,
+        });
+    }
+    // The tokenizer's registry entry (its id and source) is read for the
+    // media paths alone, which need the multimodal components; a gateway
+    // without them looks nothing up.
+    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
+        components
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    });
     // The media-part order comes from the model registry so every path
     // renders a model consistently.
     let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
@@ -374,18 +414,6 @@ pub(crate) async fn resolve_media(
         _ => MediaPartOrder::MediaFirst,
     };
 
-    let plan = plan();
-    // No images or video to a pool whose every worker is language model only (the engine admits
-    // such a request and never schedules it), and no modality to a pool whose engines take none of
-    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
-    // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
-    if plan.is_empty() {
-        return Ok(ResolvedMedia {
-            media_order,
-            media: None,
-        });
-    }
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -497,7 +525,7 @@ pub(crate) async fn count_input_tokens(
 /// - User messages with Blocks → text/image blocks stay as user content,
 ///   ToolResult blocks become separate `{"role": "tool", ...}` messages
 /// - Assistant messages → `{"role": "assistant", "content": ..., "tool_calls": [...], "reasoning_content": ...}`
-pub(crate) fn process_message_content_format(
+fn process_message_content_format(
     messages: &[InputMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
@@ -519,7 +547,7 @@ pub(crate) fn process_message_content_format(
                     )?;
                 }
                 messages::Role::Assistant => {
-                    result.push(convert_assistant_message(&message.content));
+                    result.push(convert_assistant_message(&message.content, content_format));
                 }
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
@@ -555,16 +583,17 @@ fn convert_system_message(content: &InputContent) -> Value {
 }
 
 /// For a renderer whose reference writes no turn for a system message after
-/// the first ([`RendererCapabilities::leading_system_only`]): every `system`
+/// the first ([`llm_tokenizer::traits::RendererCapabilities::leading_system_only`]): every `system`
 /// message past the leading run becomes a user turn at its position. A
 /// coding agent sends its environment block and its notes as `system`-role
 /// messages inside `messages[]`, after tool results too; such a renderer
-/// would write the message as bare text with no role marker and, for one
-/// that ends the conversation, no assistant header, and the model answers
-/// an empty turn. As a user turn the text keeps its place and the header
-/// follows it, the way the family's newer encoder renders a mid-conversation
-/// system message. The leading run stays: it is the system prompt, which
-/// every renderer writes.
+/// writes the message as bare text with no role marker, glued to the text
+/// before it (the assistant header after it follows the reference's own
+/// rule, not the message's role). As a user turn the text keeps its place
+/// and is set off from the text before it as the user's words, the way the
+/// family's newer encoder gives a mid-conversation system message a turn of
+/// its own. The leading run stays: it is the system prompt, which every
+/// renderer writes.
 fn system_messages_after_the_first_as_user_turns(messages: &mut [Value]) {
     let mut leading_run = true;
     for message in messages.iter_mut() {
@@ -653,10 +682,7 @@ fn convert_user_message(
 /// text renders: a text source, or a content source made of text blocks. A
 /// PDF or URL source needs a document reader this gateway has no path for
 /// and is refused naming the block (`at`), not handed to the template.
-pub(crate) fn render_document(
-    document: &messages::DocumentBlock,
-    at: &str,
-) -> Result<String, String> {
+fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
     let text = match &document.source {
         messages::DocumentSource::Text { data } => data.as_str(),
         messages::DocumentSource::Content { content } => {
@@ -740,7 +766,10 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
 /// appropriate JSON fields that the chat template expects.
-fn convert_assistant_message(content: &InputContent) -> Value {
+fn convert_assistant_message(
+    content: &InputContent,
+    content_format: ChatTemplateContentFormat,
+) -> Value {
     match content {
         InputContent::String(text) => json!({"role": "assistant", "content": text}),
         InputContent::Blocks(blocks) => {
@@ -772,11 +801,12 @@ fn convert_assistant_message(content: &InputContent) -> Value {
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String("assistant".into()));
 
-            // With no text blocks (e.g. tool-calls-only), render content as
-            // `null` — the OpenAI-faithful representation the chat template
-            // expects — rather than an empty text frame.
+            // With no text blocks (a tool-use-only turn) the content is the
+            // empty content the engine's chat utils hand a template in its
+            // format (`""` or `[]`), never null, which a template that tests
+            // or concatenates every assistant message's content cannot take.
             let content = if text_parts.is_empty() {
-                Value::Null
+                chat_utils::empty_content(content_format)
             } else {
                 Value::String(text_parts.join(""))
             };
@@ -890,6 +920,7 @@ pub(crate) fn omit_thinking_text(content: &mut [messages::ContentBlock]) {
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::traits::RendererCapabilities;
     use messages::{InputMessage, Role, TextBlock};
 
     use super::*;
@@ -1027,8 +1058,13 @@ mod tests {
         assert_eq!(tool_calls[0]["function"]["name"], "calculator");
     }
 
+    /// An assistant turn without a text block (a tool-use-only turn) is
+    /// handed to the template as the empty content the engine's chat utils
+    /// hand it: `""` under the string format, `[]` under the OpenAI format,
+    /// never null, which a template that tests or concatenates the content
+    /// cannot take.
     #[test]
-    fn test_absent_assistant_content_renders_null() {
+    fn an_assistant_turn_without_text_is_the_engines_empty_content_in_the_templates_format() {
         let messages = vec![InputMessage {
             role: Role::Assistant,
             content: InputContent::Blocks(vec![InputContentBlock::ToolUse(
@@ -1041,14 +1077,72 @@ mod tests {
             )]),
         }];
 
-        let result = process_message_content_format(
-            &messages,
-            ChatTemplateContentFormat::String,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
+        for (format, empty) in [
+            (ChatTemplateContentFormat::String, json!("")),
+            (ChatTemplateContentFormat::OpenAI, json!([])),
+        ] {
+            let result =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            assert_eq!(result[0]["content"], empty, "{format:?}");
+            assert_eq!(
+                result[0]["tool_calls"][0]["function"]["name"],
+                json!("calc")
+            );
+        }
+    }
+
+    /// A tool-use-only assistant turn in the history renders through a
+    /// template that tests, splits and prints every assistant message's
+    /// content (a reasoning model's template strips the thought this way):
+    /// the check is false on the empty content and nothing is printed for
+    /// the turn, as the engine's own server renders it.
+    #[test]
+    fn a_tool_use_only_assistant_turn_renders_through_a_content_testing_template() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for message in messages -%}\
+                 {%- if message.role == 'assistant' and '</think>' in message.content -%}\
+                 {%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+                 {%- else -%}{%- set content = message.content -%}{%- endif -%}\
+                 <|{{ message.role }}|>{{ content }}\
+                 {%- if message.tool_calls -%}{%- for call in message.tool_calls -%}\
+                 <call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+                 <|end|>{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "18 celsius"}
+                ]}
+            ]
+        }))
         .unwrap();
-        assert!(result[0]["content"].is_null());
+        let rendered =
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text;
+        assert_eq!(
+            rendered,
+            "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
+             <|tool|>18 celsius<|end|><|assistant|>"
+        );
     }
 
     #[test]
@@ -1101,6 +1195,46 @@ mod tests {
         };
         assert_eq!(string(MediaPartOrder::MediaFirst), "<image>\nquestion");
         assert_eq!(string(MediaPartOrder::Authored), "question\n<image>");
+    }
+
+    /// The early return in `resolve_media` (an empty plan: no registry is read
+    /// for the order) serves this renderer too: a user turn of text and
+    /// document blocks carries no media part, so both orders render it the
+    /// same under both content formats, as the chat renderer's twin test pins
+    /// for a content array without media.
+    #[test]
+    fn blocks_without_media_render_the_same_under_either_order() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Text(TextBlock {
+                    text: "question".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+                InputContentBlock::Document(messages::DocumentBlock {
+                    source: messages::DocumentSource::Text {
+                        data: "the notes".to_string(),
+                    },
+                    cache_control: None,
+                    title: Some("notes".to_string()),
+                    context: None,
+                    citations: None,
+                }),
+            ]),
+        }];
+        for format in [
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ] {
+            let media_first =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            let authored =
+                process_message_content_format(&messages, format, None, MediaPartOrder::Authored)
+                    .unwrap();
+            assert_eq!(media_first, authored, "{format:?}");
+        }
     }
 
     /// The Messages path renders a user turn's blocks where the request put
@@ -1561,11 +1695,7 @@ mod tests {
         }))
         .unwrap();
         let chat_tools = request.chat_tools();
-        let tools = template_tools(
-            &chat_tools,
-            request.tool_choice.as_ref(),
-            RendererCapabilities::default(),
-        );
+        let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
         assert_eq!(tools.len(), 1, "a forced tool renders alone");
 
         let counted = count_input_tokens(
@@ -1580,11 +1710,11 @@ mod tests {
         assert_eq!(counted, 5);
     }
 
-    /// `tool_choice: {"type": "none"}` renders no tool, as on the chat path,
-    /// unless the renderer declares the tools under `none` itself; `auto`
-    /// renders them all.
+    /// `tool_choice: {"type": "none"}` renders every tool, as on the chat
+    /// path and as the engine's own server renders it (the choice reaches
+    /// the template as a kwarg); `auto` renders them all too.
     #[test]
-    fn tool_choice_none_renders_no_tool() {
+    fn tool_choice_none_renders_the_tools_as_auto_does() {
         let request = |tool_choice: Value| -> CountMessageTokensRequest {
             serde_json::from_value(json!({
                 "model": "m",
@@ -1597,21 +1727,18 @@ mod tests {
             }))
             .unwrap()
         };
-        let plain = RendererCapabilities::default();
-        let declaring = RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(&none.chat_tools(), none.tool_choice.as_ref(), plain).is_empty());
-        assert_eq!(
-            template_tools(&none.chat_tools(), none.tool_choice.as_ref(), declaring).len(),
-            1,
-            "the renderer that declares the tools under none gets them"
+        let none_tools = none.chat_tools();
+        let under_none = template_tools(&none_tools, none.tool_choice.as_ref());
+        assert!(
+            matches!(under_none, Cow::Borrowed(_)),
+            "none narrows nothing: the tools are the request's own"
         );
+        assert_eq!(under_none.len(), 1, "the tool stays declared under none");
         let auto = request(json!({"type": "auto"}));
+        let auto_tools = auto.chat_tools();
         assert_eq!(
-            template_tools(&auto.chat_tools(), auto.tool_choice.as_ref(), plain).len(),
+            template_tools(&auto_tools, auto.tool_choice.as_ref()).len(),
             1
         );
     }
@@ -1639,11 +1766,7 @@ mod tests {
             }
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
             let chat_tools = request.chat_tools();
-            let tools = template_tools(
-                &chat_tools,
-                request.tool_choice.as_ref(),
-                tok.renderer_capabilities(),
-            );
+            let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
             let tools_for_template = if tools.is_empty() {
                 None
             } else {
@@ -1663,9 +1786,10 @@ mod tests {
         );
         let none = rendered(Some(json!({"type": "none"})));
         assert_eq!(none["template_kwargs"]["tool_choice"], json!("none"));
-        assert!(
-            none.get("tools").is_none(),
-            "a plain renderer gets no tool under none: {none}"
+        assert_eq!(
+            none["tools"].as_array().map(Vec::len),
+            Some(1),
+            "the tool stays declared under none, the template told the choice: {none}"
         );
         let unset = rendered(None);
         assert!(
@@ -1674,7 +1798,7 @@ mod tests {
         );
     }
 
-    /// The K3 stand-in vocabulary of the kit test (`tests/kimi_k3_tool_choice_none.rs`):
+    /// The K3 stand-in vocabulary of the kit test (`tests/grpc/kimi_k3_tool_choice_none.rs`):
     /// byte-level ranks plus the K3 control tokens, under the config that
     /// selects the renderer, so the rendering reads back as text.
     fn k3_stand_in_dir() -> tempfile::TempDir {
@@ -1723,11 +1847,7 @@ mod tests {
         }))
         .expect("the request");
         let chat_tools = request.chat_tools();
-        let tools = template_tools(
-            &chat_tools,
-            request.tool_choice.as_ref(),
-            tok.renderer_capabilities(),
-        );
+        let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
         let (processed, _) = process_messages(
             &request,
             tok.as_ref(),
@@ -1959,8 +2079,7 @@ mod tests {
     /// A `system`-role message inside `messages[]` is forwarded in place
     /// unless the renderer writes no turn for a system message after the
     /// first: then every one past the leading run is a user turn at its
-    /// position, so the prompt keeps its assistant header after the note
-    /// that ends the conversation and before the historical assistant turn.
+    /// position, and the leading run stays.
     #[test]
     fn system_messages_after_the_first_are_user_turns_for_a_leading_system_only_renderer() {
         let request = coding_agent_request();
@@ -2070,12 +2189,13 @@ mod tests {
     }
 
     /// Through the DeepSeek V4 renderer the coding agent's notes are user
-    /// turns the encoder merges into the turn before them: the prompt ends
-    /// with the note, the assistant header and the open thought, where the
-    /// in-place system message left it ending with the bare note; and the
-    /// historical assistant turn has its header after the environment block.
-    /// The prompt is rendered before the parser is chosen, so every parser
-    /// reads this one.
+    /// turns the encoder merges into the turn before them behind a blank
+    /// line: the prompt ends with the tool result, the note, the assistant
+    /// header and the open thought, and the historical assistant turn has
+    /// its header after the environment block (in place, the encoder glues
+    /// a system message's text to the text before it with no separator and
+    /// opens the same headers). The prompt is rendered before the parser is
+    /// chosen, so every parser reads this one.
     #[test]
     fn the_deepseek_v4_renderer_gets_the_coding_agents_notes_as_user_turns() {
         let dir = deepseek_v4_stand_in_dir();

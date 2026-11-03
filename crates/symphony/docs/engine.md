@@ -15,9 +15,9 @@ What the engine decides for every format, and what it leaves open:
   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
   is bellwether #17; `Dropped { Whitespace }` exists for the other answer. A table whose family's
   reference parser reads a marker together with the separator before it spells the marker that
-  way (DeepSeek V4.1's block opener after its blank line, `docs/tables.md`): the separator then
-  leaves with the marker as `Dropped { Wrapper }`, and the scanner's hold-back keeps a stream's
-  reading the whole's. One exception, so
+  way (the DeepSeek DSML tables' block opener after its blank line, `docs/tables.md`): the
+  separator then leaves with the marker as `Dropped { Wrapper }`, and the scanner's hold-back
+  keeps a stream's reading the whole's. One exception, so
   that a stream shows the content the whole answer has: whitespace a content stay begins with
   is held while nothing else has arrived in the stay, and leaves as content before the stay's
   first other text, as `Dropped { Whitespace }` when the stay ends without any (a call's opener
@@ -108,12 +108,24 @@ is a later step).
 
 ## What a table read from a response template adds
 
-- A table can say that the stream's stop closes the call in a state (`Format::closes_at_stop`),
-  for a family whose last call ends with a stop token the stop decoder hides: a stream that stops
-  there ends the call as its closing terminal would, with no bytes. One cut for length, aborted,
-  or ended with any finish but `Stop` is cut as before; a driver hands a stop sequence of the
-  request's that matched inside the call over as such a finish, so that it never completes the
-  call (the stop row in `format`).
+- The stream's stop (`EngineFinish::Stop`, the model's own end of output) is a call's third
+  ending, beside its closing terminal and a cut. A table can say that the stop closes the call in
+  a state (`Format::closes_at_stop`), for a family whose last call ends with a stop token the stop
+  decoder hides: a stream that stops there ends the call as its closing terminal would, with no
+  bytes. Without the row a syntax whose JSON is the model's own (JSON, Python, Gemma's tokens, a
+  call given as data) ends a call the stop found open as a cut ends it, since the model closed
+  neither; the tagged syntaxes, whose JSON the assembler writes for values the model wrote as
+  text between tags, end it as the marker would and close a string still open, with one
+  `Malformed { OpenAtTheStop }` event of no bytes before the closing fragment (`assemblers.md`,
+  the third ending); a tag the end cut short before the stop (a partial structural terminal at
+  the end of the output) ends the call the same way. A call's closing terminal inside a streamed
+  string of a tagged syntax closes the string too, under `Malformed { OpenAtTheMarker }`: the
+  marker is the model's own end of the call (the recorded shape writes `</tool_call>` after the
+  open value, then its stop token), so the value's bytes are complete there as at the stop, and
+  the two words tell the two ends apart. One cut for length, aborted, or ended with
+  any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
+  matched inside the call over as such a finish, so that it never completes the call (the stop
+  row in `format`).
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is
@@ -186,8 +198,15 @@ loop {
   that starts a marker, the common content or reasoning delta) costs no copy. A run the engine
   held (a content stay's lead, a trimmed stay's tail, a shaped call's header), a run merged with
   an earlier one in the same buffer, and the events an assembler builds carry their text owned
-  (`Cow::Owned`): an arguments delta takes the whole-text path too, which saves it the scan and
-  the piece, but its bytes go to the assembler, whose events own their text and their JSON.
+  (`Cow::Owned`). An arguments delta takes the whole-text path too, which saves it the scan and
+  the piece, and its bytes go to the assembler: a JSON syntax (an object, a list of objects, a
+  forced call's value) passes the model's own bytes on as the call's fragments, so a fragment that
+  arrived in one delta borrows it, `json` and `source` alike (`Event::ToolCallArguments`), and
+  the engine fills one buffer of its own for the assembler's piece and keeps it between pieces;
+  a fragment that reaches back into an earlier delta (bytes the judge held, a word being spelled),
+  and the JSON a syntax writes for values given as text between tags, stay owned. The assembler's
+  own copy of the call's bytes still grows by doubling as the value lengthens: the one allocation
+  an arguments delta can still cost, now and then, with nothing per fragment.
 - The buffer's lifetime is the step's: `Events<'d>` cannot outlive the delta it borrows, so a
   delta's text lives with the caller, next to the buffer, and a caller that keeps events past the
   step takes them with `Event::into_owned` (or the whole buffer with `Events::into_owned`). A

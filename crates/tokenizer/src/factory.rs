@@ -236,8 +236,11 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
 /// field of `tokenizer_config.json`, which transformers' tokenizer reads next.
 /// `chat_template.json` is the processor's legacy template file, which that
 /// tokenizer never reads: a checkpoint may ship it beside a config template
-/// and the two can differ, so it serves only a config without one. Any other
-/// `.jinja` file comes last. `None` leaves the config's template, or none.
+/// and the two can differ, so it serves only a config without one here, and
+/// the renderer holds it for the tool-less requests the engine's server
+/// renders through the processor's template
+/// ([`discover_processor_chat_template_in_dir`]). Any other `.jinja` file
+/// comes last. `None` leaves the config's template, or none.
 pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     use std::fs;
 
@@ -269,18 +272,32 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     None
 }
 
+/// The processor's chat template file beside a tokenizer, `chat_template.json`,
+/// when the checkpoint ships one: the legacy file transformers' processor
+/// reads before any `chat_template.jinja`, and the template the engine's
+/// server renders a request without tools through when the checkpoint has a
+/// processor (its second choice, after the request's own template and before
+/// the tokenizer's). The tokenizer's own template stays the one for requests
+/// with tools, so the loaders hold both (see
+/// `ChatTemplateState::from_checkpoint`); `None` when the checkpoint ships no
+/// such file.
+pub fn discover_processor_chat_template_in_dir(dir: &Path) -> Option<String> {
+    let json_template_path = dir.join("chat_template.json");
+    json_template_path
+        .is_file()
+        .then(|| json_template_path.to_str().map(str::to_string))
+        .flatten()
+}
+
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
-/// loaders read: a string. A named-template list (the form some checkpoints
-/// ship) is not read by them, so it must not stand in the way of the file
-/// fallbacks.
+/// loaders read: a string, or a list of named templates (see
+/// `ConfigChatTemplates`). The file fallbacks serve a config without one.
 fn config_has_chat_template(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
         .is_some_and(|config| {
-            config
-                .get("chat_template")
-                .is_some_and(serde_json::Value::is_string)
+            crate::chat_template::ConfigChatTemplates::read(config.get("chat_template")).is_some()
         })
 }
 
@@ -806,16 +823,22 @@ mod tests {
             path.join("chat_template.json").to_str()
         );
 
-        // A named-template list in the config is not a template the loaders
-        // read, so the legacy file still serves such a checkpoint.
+        // A named-template list in the config is the tokenizer's own template
+        // too (default / tool_use), so the legacy file does not replace it.
         std::fs::write(
             path.join("tokenizer_config.json"),
             r#"{"chat_template": [{"name": "default", "template": "a"}, {"name": "tool_use", "template": "b"}]}"#,
         )
         .unwrap();
+        assert_eq!(discover(path), None);
+
+        // The processor's file is found beside the tokenizer's template for
+        // the tool-less requests, and only when the checkpoint ships it.
         assert_eq!(
-            discover(path).as_deref(),
+            super::discover_processor_chat_template_in_dir(path).as_deref(),
             path.join("chat_template.json").to_str()
         );
+        std::fs::remove_file(path.join("chat_template.json")).unwrap();
+        assert_eq!(super::discover_processor_chat_template_in_dir(path), None);
     }
 }

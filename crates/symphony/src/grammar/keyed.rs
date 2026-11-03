@@ -13,6 +13,8 @@
 //! string as it is, everything else as JSON, which [`shape`] pins); a property without a type, or
 //! a schema without properties, takes any text up to the value's close. When the calls sit in a
 //! block, the block's ways in frame one or more calls, as Kimi K3's do.
+//!
+//! [`shape`]: crate::shape
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -157,42 +159,12 @@ fn any_argument(tags: &Tags, ends: &Ends<'_>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::Function;
     use serde_json::json as value;
 
-    use super::*;
-    use crate::formats;
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
-
-    fn weather_tools() -> Vec<Tool> {
-        vec![
-            tool(
-                "get_weather",
-                value!({
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"},
-                        "days": {"type": "integer", "minimum": 1},
-                        "units": {"type": "string", "enum": ["c", "f"]},
-                    },
-                    "required": ["city", "days"],
-                }),
-            ),
-            tool("ping", value!({"type": "object"})),
-        ]
-    }
+    use crate::{
+        formats,
+        testing::{tool, weather_tools},
+    };
 
     #[test]
     fn ling_writes_each_call_with_the_templates_newlines() {

@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
+
+/// The image placeholder the chat template writes once per image, the one
+/// token the expansion repeats; `image_token_id` in the config names its id.
+/// Qwen3-Omni (`super::qwen3_omni`) answers the same spelling.
+pub(super) const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
 
 pub(super) struct QwenVLVisionSpec;
 
@@ -33,7 +41,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|image_pad|>".to_string())
+        Ok(IMAGE_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
@@ -48,6 +56,23 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 10)]))
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Qwen2VLProcessor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

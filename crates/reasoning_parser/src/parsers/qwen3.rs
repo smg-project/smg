@@ -9,7 +9,7 @@ use crate::{
 
 /// Qwen3 reasoning parser.
 ///
-/// This parser requires explicit <think> tokens to enter reasoning mode
+/// This parser requires explicit `<think>` tokens to enter reasoning mode
 /// (in_reasoning=false initially).
 pub struct Qwen3Parser {
     base: BaseReasoningParser,

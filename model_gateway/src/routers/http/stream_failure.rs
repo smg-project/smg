@@ -22,7 +22,7 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{error_reason_from_status, metrics_labels, Metrics},
     routers::grpc::utils::{
         error_type_from_status, route_to_endpoint,
         stream_failure::{MESSAGES_API_ERROR_TYPE, STREAM_ERROR_TYPE},
@@ -77,11 +77,22 @@ impl UpstreamCut {
     }
 }
 
-/// `error` and its sources, outermost first: a body error reads "error
-/// decoding response body" on its own, and keeps the transport's reason (the
-/// connection reset, the transfer closed before its end) in the chain.
-fn cause(error: &reqwest::Error) -> String {
+/// `error` and its sources, outermost first, without the request's URL: a
+/// body error reads "error decoding response body" on its own, and keeps the
+/// transport's reason (the connection reset, the transfer closed before its
+/// end) in the chain; the URL reqwest names in the outer error ("error sending
+/// request for url (...)") is the worker's address, which the gateway logs and
+/// a client's answer does not carry. The detail a side's failure below HTTP is
+/// answered with (see `pd_router`), and the HTTP router's for a call it made.
+pub(crate) fn cause(error: &reqwest::Error) -> String {
     let mut text = error.to_string();
+    if let Some(url) = error.url() {
+        // reqwest's Display ends with the URL, after the kind's words.
+        let suffix = format!(" for url ({url})");
+        if text.ends_with(&suffix) {
+            text.truncate(text.len() - suffix.len());
+        }
+    }
     let mut source = error.source();
     while let Some(inner) = source {
         text.push_str(": ");
@@ -168,13 +179,15 @@ impl RelaySource {
     /// after a failed head is charged for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
+        let reason = error_reason_from_status(cut.status);
         warn!(
-            worker = self.worker.url(),
+            worker = self.worker.redacted_url(),
             worker_type = self.worker_type,
             route = self.route,
             bytes_relayed,
             http_status = cut.status.as_u16(),
             error_type,
+            reason,
             "Stream ended by the worker before completion: {}",
             cut.cause
         );
@@ -191,6 +204,7 @@ impl RelaySource {
             &self.model,
             route_to_endpoint(self.route),
             error_type,
+            reason,
         );
     }
 
@@ -261,11 +275,13 @@ pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use openai_protocol::{messages::MessageStreamEvent, worker::HealthCheckConfig};
+    use openai_protocol::messages::MessageStreamEvent;
     use serde_json::Value;
 
     use super::*;
-    use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::worker::{
+        circuit_breaker::CircuitBreakerConfig, test_support::no_health_check, BasicWorkerBuilder,
+    };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
                          connection reset";
@@ -278,10 +294,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -310,6 +323,42 @@ mod tests {
         let (source, worker) = source("/v1/chat/completions");
         metrics::with_local_recorder(&recorder, || source.account(cut, 839));
         (worker, handle.render())
+    }
+
+    /// A call to a worker nobody listens at: the connect is refused, and the
+    /// error carries the worker's URL as reqwest attaches it.
+    async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
+        let refused = crate::test_support::RefusedAddress::reserve();
+        let addr = refused.addr();
+        let error = crate::clients::http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(error.url().map(|url| url.port()), Some(Some(addr.port())));
+        (addr, error)
+    }
+
+    /// The cause a client is told is the transport's reason and its chain, and
+    /// never the worker's address reqwest puts in the outer error: the same
+    /// words head a side's 502 and the error event that ends a cut stream.
+    #[tokio::test]
+    async fn the_cause_of_a_failed_call_names_the_reason_and_not_the_worker() {
+        let (addr, error) = refused_call().await;
+
+        let text = cause(&error);
+        assert!(text.starts_with("error sending request: "), "{text}");
+        assert!(!text.contains(&addr.to_string()), "{text}");
+        assert!(!text.contains("for url"), "{text}");
+        assert!(text.contains("onnect"), "the reason stays: {text}");
+
+        let (source, _worker) = source("/v1/chat/completions");
+        let event = source.error_event(&UpstreamCut::of(&error));
+        let event = std::str::from_utf8(&event).unwrap();
+        assert!(event.contains(&text), "{event}");
+        assert!(!event.contains(&addr.to_string()), "{event}");
     }
 
     /// The rendered sample line of `family` with all of `labels`, if any.
@@ -349,6 +398,7 @@ mod tests {
                 "model=\"relay-test\"",
                 "endpoint=\"chat\"",
                 "error_type=\"backend_error\"",
+                "reason=\"transport_disconnect\"",
             ],
         )
         .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
@@ -373,7 +423,11 @@ mod tests {
             sample(
                 &rendered,
                 "smg_router_request_errors_total",
-                &["router_type=\"http\"", "error_type=\"timeout\""]
+                &[
+                    "router_type=\"http\"",
+                    "error_type=\"timeout\"",
+                    "reason=\"deadline\""
+                ]
             )
             .is_some(),
             "{rendered}"

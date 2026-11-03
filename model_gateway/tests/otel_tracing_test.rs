@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     pin::Pin,
     sync::{
@@ -27,6 +25,7 @@ use smg::{
     workflow::Job,
 };
 use smg_grpc_client::{common_proto, tokenspeed_proto as ts};
+use smg_test_harness as common;
 use tokio::sync::oneshot;
 use tonic::{metadata::MetadataMap, transport::Server, Request as TonicRequest, Response, Status};
 use tower::ServiceExt;
@@ -162,14 +161,15 @@ async fn test_router_with_tracing() {
         enable_trace: true,
         otlp_traces_endpoint: collector_endpoint.clone(),
     };
+    // `--log-level warn` with the default targets: the spans export without a log directive for them.
     let _log_guard = logging::init_logging(
         logging::LoggingConfig {
-            level: tracing::Level::INFO,
+            level: tracing::Level::WARN,
             json_format: false,
             log_dir: None,
             colorize: false,
             log_file_name: "test-otel".to_string(),
-            log_targets: Some(vec!["smg".to_string()]),
+            log_targets: None,
         },
         Some(trace_config),
     );

@@ -395,9 +395,10 @@ def test_slim_wire_appends_prefill_score_columns_and_accepts_older_senders(wire)
     encoded = msgspec.msgpack.encode(slim)
     array = msgspec.msgpack.decode(encoded)
 
-    assert len(array) == 27
+    assert len(array) == 28
     assert array[24:26] == [[[[-0.5, -30.0]]], [[[42, 7]]]]
     assert array[26] == [None]  # finished_err_types: the request did not abort
+    assert array[27] == [None]  # output_hidden_states: the request asked for none
     decoded = msgspec.msgpack.decode(encoded, type=wire.BatchTokenIDSlimOutput)
     assert decoded.output_token_ids_logprobs_val == [[[-0.5, -30.0]]]
     assert decoded.output_token_ids_logprobs_idx == [[[42, 7]]]

@@ -27,7 +27,8 @@ use smg_auth as auth;
 
 mod servicer;
 use servicer::{
-    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyTrtllmGrpcServer,
+    PyVllmGrpcServer,
 };
 
 // Define the enums with PyO3 bindings
@@ -461,6 +462,9 @@ struct Router {
     client_key_path: Option<String>,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
+    decode_expected_workers: Option<usize>,
+    decode_min_ready_percent: Option<u8>,
+    decode_min_ready_workers: Option<usize>,
     decode_policy: Option<PolicyType>,
     decode_selector: HashMap<String, String>,
     decode_urls: Option<Vec<String>>,
@@ -489,6 +493,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
     health_check_endpoint: String,
     health_check_interval_secs: u64,
@@ -506,7 +511,6 @@ struct Router {
     job_queue_concurrency: usize,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
-    kv_index: Option<String>,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
     least_load_max_waiting_requests: u32,
@@ -536,11 +540,13 @@ struct Router {
     mesh_tls_key: Option<String>,
     mm_allow_private_media_hosts: bool,
     mm_allowed_media_domains: Option<Vec<String>>,
+    mm_fetch_timeout_ms: Option<u64>,
     mm_per_request_image_limit: Option<usize>,
     mm_pixel_cache_mb: Option<usize>,
     mm_pixel_rdma: bool,
     mm_processing: Option<String>,
     mm_turbojpeg: Option<String>,
+    mm_video_fetch_timeout_ms: Option<u64>,
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
@@ -551,14 +557,17 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
-    /// `legacy` or `symphony`: which parser reads a chat completion's output.
+    /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
+    prefill_expected_workers: Option<usize>,
     prefill_max_inflight_requests_per_worker: i32,
+    prefill_min_ready_percent: Option<u8>,
+    prefill_min_ready_workers: Option<usize>,
     prefill_policy: Option<PolicyType>,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -606,6 +615,7 @@ struct Router {
     service_discovery_namespace: Option<String>,
     service_discovery_port: u16,
     shutdown_grace_period_secs: u64,
+    shutdown_settle_secs: Option<u64>,
     sse_keepalive_secs: u64,
     storage_context_headers: HashMap<String, String>,
     storage_hook_wasm_path: Option<String>,
@@ -782,6 +792,29 @@ impl Router {
         }
     }
 
+    /// Build optional per-role readiness thresholds from Python arguments.
+    fn pd_readiness_config(&self) -> Option<config::PdReadinessConfig> {
+        let configured = self.prefill_expected_workers.is_some()
+            || self.prefill_min_ready_workers.is_some()
+            || self.prefill_min_ready_percent.is_some()
+            || self.decode_min_ready_workers.is_some()
+            || self.decode_expected_workers.is_some()
+            || self.decode_min_ready_percent.is_some();
+        configured.then(|| config::PdReadinessConfig {
+            prefill: config::ReadinessRoleConfig {
+                expected_workers: self.prefill_expected_workers,
+                min_healthy_workers: self.prefill_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.prefill_min_ready_percent,
+            },
+            decode: config::ReadinessRoleConfig {
+                expected_workers: self.decode_expected_workers,
+                min_healthy_workers: self.decode_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.decode_min_ready_percent,
+            },
+        })
+    }
+
+    /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
@@ -990,7 +1023,6 @@ impl Router {
         } else {
             self.discovery.clone()
         };
-        let has_discovery = discovery.is_some();
 
         // The metrics listener `start` creates: its port when unset is the
         // exporter's default, so the validator's port checks (the admin,
@@ -1071,7 +1103,7 @@ impl Router {
         // additionally pins the startup workers' runtime: the shared EngineCore
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed. HTTP/gRPC keep auto-detection (None). Mirrors
-        // `to_router_config` in model_gateway/src/main.rs.
+        // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
                 match self.backend {
@@ -1093,6 +1125,7 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .pd_readiness(self.pd_readiness_config())
             .admin_port(self.admin_port)
             .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
@@ -1101,6 +1134,7 @@ impl Router {
             .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .grpc_request_timeout_secs(self.grpc_request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -1120,8 +1154,6 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
-            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1158,12 +1190,9 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                // Explicit setting wins; otherwise recovery-by-removal follows
-                // service discovery, which is what re-adds a removed worker.
-                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
-                    has_discovery,
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
@@ -1241,6 +1270,8 @@ impl Router {
             .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .mm_turbojpeg(mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1314,6 +1345,9 @@ impl Router {
         client_key_path = None,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
+        decode_expected_workers = None,
+        decode_min_ready_percent = None,
+        decode_min_ready_workers = None,
         decode_policy = None,
         decode_selector = HashMap::new(),
         decode_urls = None,
@@ -1338,6 +1372,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
         health_check_interval_secs = 60,
@@ -1355,7 +1390,6 @@ impl Router {
         job_queue_concurrency = 200,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        kv_index = None,
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
         least_load_max_waiting_requests = 0,
@@ -1383,11 +1417,13 @@ impl Router {
         mesh_tls_key = None,
         mm_allow_private_media_hosts = false,
         mm_allowed_media_domains = None,
+        mm_fetch_timeout_ms = None,
         mm_per_request_image_limit = None,
         mm_pixel_cache_mb = None,
         mm_pixel_rdma = false,
         mm_processing = None,
         mm_turbojpeg = None,
+        mm_video_fetch_timeout_ms = None,
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
@@ -1398,13 +1434,16 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
-        parser = String::from("legacy"),
+        parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
+        prefill_expected_workers = None,
         prefill_max_inflight_requests_per_worker = -1,
+        prefill_min_ready_percent = None,
+        prefill_min_ready_workers = None,
         prefill_policy = None,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1452,6 +1491,7 @@ impl Router {
         service_discovery_namespace = None,
         service_discovery_port = 80,
         shutdown_grace_period_secs = 180,
+        shutdown_settle_secs = None,
         sse_keepalive_secs = 15,
         storage_context_headers = HashMap::new(),
         storage_hook_wasm_path = None,
@@ -1492,6 +1532,7 @@ impl Router {
         zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
+    /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1526,6 +1567,9 @@ impl Router {
         client_key_path: Option<String>,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
+        decode_expected_workers: Option<usize>,
+        decode_min_ready_percent: Option<u8>,
+        decode_min_ready_workers: Option<usize>,
         decode_policy: Option<PolicyType>,
         decode_selector: HashMap<String, String>,
         decode_urls: Option<Vec<String>>,
@@ -1550,6 +1594,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
         health_check_endpoint: String,
         health_check_interval_secs: u64,
@@ -1567,7 +1612,6 @@ impl Router {
         job_queue_concurrency: usize,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
-        kv_index: Option<String>,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
         least_load_max_waiting_requests: u32,
@@ -1595,11 +1639,13 @@ impl Router {
         mesh_tls_key: Option<String>,
         mm_allow_private_media_hosts: bool,
         mm_allowed_media_domains: Option<Vec<String>>,
+        mm_fetch_timeout_ms: Option<u64>,
         mm_per_request_image_limit: Option<usize>,
         mm_pixel_cache_mb: Option<usize>,
         mm_pixel_rdma: bool,
         mm_processing: Option<String>,
         mm_turbojpeg: Option<String>,
+        mm_video_fetch_timeout_ms: Option<u64>,
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
@@ -1616,7 +1662,10 @@ impl Router {
         pd_pairing_mode: String,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
+        prefill_expected_workers: Option<usize>,
         prefill_max_inflight_requests_per_worker: i32,
+        prefill_min_ready_percent: Option<u8>,
+        prefill_min_ready_workers: Option<usize>,
         prefill_policy: Option<PolicyType>,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -1664,6 +1713,7 @@ impl Router {
         service_discovery_namespace: Option<String>,
         service_discovery_port: u16,
         shutdown_grace_period_secs: u64,
+        shutdown_settle_secs: Option<u64>,
         sse_keepalive_secs: u64,
         storage_context_headers: HashMap<String, String>,
         storage_hook_wasm_path: Option<String>,
@@ -1775,6 +1825,9 @@ impl Router {
             client_key_path,
             control_plane_auth,
             cors_allowed_origins,
+            decode_expected_workers,
+            decode_min_ready_percent,
+            decode_min_ready_workers,
             decode_policy,
             decode_selector,
             decode_urls,
@@ -1799,6 +1852,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grpc_request_timeout_secs,
             header_read_timeout_secs,
             health_check_endpoint,
             health_check_interval_secs,
@@ -1816,7 +1870,6 @@ impl Router {
             job_queue_concurrency,
             kv_connector_annotation,
             kv_engine_id_annotation,
-            kv_index,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
             least_load_max_waiting_requests,
@@ -1844,11 +1897,13 @@ impl Router {
             mesh_tls_key,
             mm_allow_private_media_hosts,
             mm_allowed_media_domains,
+            mm_fetch_timeout_ms,
             mm_per_request_image_limit,
             mm_pixel_cache_mb,
             mm_pixel_rdma,
             mm_processing,
             mm_turbojpeg,
+            mm_video_fetch_timeout_ms,
             model_aliases,
             model_id_from,
             model_path,
@@ -1865,7 +1920,10 @@ impl Router {
             pd_pairing_mode,
             postgres_config,
             power_of_two_load_metric,
+            prefill_expected_workers,
             prefill_max_inflight_requests_per_worker,
+            prefill_min_ready_percent,
+            prefill_min_ready_workers,
             prefill_policy,
             prefill_queue_size,
             prefill_queue_timeout_secs,
@@ -1913,6 +1971,7 @@ impl Router {
             service_discovery_namespace,
             service_discovery_port,
             shutdown_grace_period_secs,
+            shutdown_settle_secs,
             sse_keepalive_secs,
             storage_context_headers,
             storage_hook_wasm_path,
@@ -1955,6 +2014,7 @@ impl Router {
         })
     }
 
+    /// Run the gateway with the configured propagation window and shared shutdown deadline.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
@@ -1982,7 +2042,7 @@ impl Router {
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .and_then(mesh_discovery::MeshDiscoveryConfig::from_discovery);
+            .and_then(mesh::discovery::MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
@@ -2033,6 +2093,7 @@ impl Router {
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()
@@ -2056,7 +2117,7 @@ impl Router {
                             })
                         })
                         .transpose()?;
-                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
                     // for Pods with no usable annotation.
@@ -2180,7 +2241,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The process-level TLS crypto provider, installed once when the module
     // is imported: every HTTP client a binding builds takes it, whether or
     // not a router is started in this process.
-    tls::install_crypto_provider();
+    clients::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
@@ -2196,6 +2257,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVllmGrpcServer>()?;
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<PyTrtllmGrpcServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;

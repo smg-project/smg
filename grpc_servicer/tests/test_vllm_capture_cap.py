@@ -163,6 +163,142 @@ def test_no_window_leaves_the_engines_default():
 
 
 @pytest.mark.parametrize(
+    ("max_num_seqs", "step", "setting", "cap", "mentions"),
+    [
+        # A window of 255: the engine's list ends 510 at 496, so a ceiling of
+        # 500 (496 on the grid) raises nothing and 512 does.
+        (255, 16384, "500", None, "default 496 (twice --max-num-seqs 255, on the capture grid)"),
+        (255, 16384, "512", 512, "default was 496 (twice --max-num-seqs 255, on the capture grid)"),
+        # The step under twice the window: the engine's own cap is the step.
+        (
+            255,
+            500,
+            None,
+            None,
+            "default 500 (twice --max-num-seqs 255, at most the admission step)",
+        ),
+        (
+            255,
+            500,
+            "1024",
+            None,
+            "default 500 (twice --max-num-seqs 255, at most the admission step)",
+        ),
+        # A window of 33: 66 ends at 64 on the grid, and at the step under it.
+        (33, 16384, None, 512, "default was 64 (twice --max-num-seqs 33, on the capture grid)"),
+        (33, 65, None, None, "default 65 (twice --max-num-seqs 33, at most the admission step)"),
+    ],
+)
+def test_the_engines_default_is_read_as_its_list_ends_it(
+    max_num_seqs, step, setting, cap, mentions
+):
+    """The engine truncates a default that is not its list's last entry (to
+    the grid), and appends the step size where that fits under the default
+    (the step is the cap then): the derivation compares against that value."""
+    decision = derive_capture_cap(
+        max_num_seqs=max_num_seqs, max_num_batched_tokens=step, setting=setting
+    )
+    assert decision.cap == cap
+    assert mentions in decision.detail
+
+
+PLATFORM_PAIR = "512 or 1024 by platform (--max-num-seqs unset"
+
+
+@pytest.mark.parametrize(
+    ("step", "setting", "cap", "mentions"),
+    [
+        (16384, "2048", 2048, f"default was {PLATFORM_PAIR}"),
+        (16384, "1024", 1024, f"default was {PLATFORM_PAIR}"),
+        (None, "2048", 2048, f"default was {PLATFORM_PAIR}"),
+        # A ceiling under 1024 could lower the engine's own 1024 on the platform
+        # whose default ceiling that is: kept out, and the line says so.
+        (16384, "1000", None, "could lower it on the platform whose default ceiling is 1024"),
+        (16384, "768", None, "could lower it on the platform whose default ceiling is 1024"),
+        # The step under the default ceiling: the engine's own cap is the step.
+        (300, "2048", None, "default 300 (--max-num-seqs unset"),
+        (300, "2048", None, "at most the admission step) covers the admission step"),
+        # The step between the two platform defaults: the 1024 one is the step.
+        (700, "2048", 700, "512 or 700 by platform (--max-num-seqs unset"),
+        (700, "2048", 700, "reach the default ceiling, at most the admission step)"),
+        # A ceiling at or under the engine's default ceiling raises nothing.
+        (16384, "512", None, f"default {PLATFORM_PAIR}"),
+        (16384, "auto", None, f"default {PLATFORM_PAIR}"),
+        (16384, None, None, f"default {PLATFORM_PAIR}"),
+    ],
+)
+def test_a_recipes_ceiling_applies_when_the_window_is_left_to_the_engine(
+    step, setting, cap, mentions
+):
+    """A recipe that leaves --max-num-seqs to the engine still gets the ceiling
+    it set where that raises the engine's default on every platform (512, or
+    1024 on one): a ceiling of 1024 or more applies; `auto` keeps the engine's
+    default as before."""
+    decision = derive_capture_cap(max_num_seqs=None, max_num_batched_tokens=step, setting=setting)
+    assert decision.cap == cap
+    assert mentions in decision.detail
+    if cap is None:
+        assert decision.source == "window"
+    else:
+        assert decision.source == "derived"
+        assert str(cap) in decision.detail
+
+
+def test_a_step_between_the_two_platform_defaults_is_named_as_the_step():
+    """A window of 300 with a step of 550: 512, or 550 on the 1024 platform
+    (the engine ends its list at the step there); a ceiling of 540 is kept and
+    the line names the step, not the grid."""
+    decision = derive_capture_cap(max_num_seqs=300, max_num_batched_tokens=550, setting="540")
+    assert decision.cap is None
+    assert "512 or 550 by platform (twice --max-num-seqs 300, at most the admission step" in (
+        decision.detail
+    )
+    assert "on the capture grid" not in decision.detail
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "setting", "cap", "mentions"),
+    [
+        # A window of 512: the engine's default is 512, or 1024 on one platform.
+        (512, "768", None, "512 or 1024 by platform (twice --max-num-seqs 512"),
+        (512, "768", None, "could lower it on the platform whose default ceiling is 1024"),
+        (512, "1024", 1024, "default was 512 or 1024 by platform"),
+        (512, "2048", 2048, "default was 512 or 1024 by platform"),
+        (512, None, None, "covers the admission step"),
+        # A window of 300: 512, or 600 on the 1024 platform, which the engine's
+        # list ends at 592; 768 raises both, and so does 600 (592 on the grid).
+        (300, "768", 768, "default was 512 or 592 by platform (twice --max-num-seqs 300"),
+        (300, "600", 592, "default was 512 or 592 by platform (twice --max-num-seqs 300, on the"),
+        (300, "576", None, "could lower it on the platform whose default ceiling is 1024"),
+        # A window of 511: 1022 ends at 1008 on the grid; 1008 raises 512 and equals it.
+        (
+            511,
+            "1008",
+            1008,
+            "default was 512 or 1008 by platform (twice --max-num-seqs 511, on the",
+        ),
+        (
+            511,
+            "1000",
+            None,
+            "a cap of 992 (--max-num-batched-tokens 16384, ceiling 992) could lower",
+        ),
+        # A window of 256 or less: one default on every platform, as before.
+        (256, "768", 768, "default was 512 (twice --max-num-seqs 256)"),
+        (32, "768", 768, "default was 64 (twice --max-num-seqs 32)"),
+    ],
+)
+def test_a_ceiling_never_lowers_the_engines_default_on_the_platform_with_the_higher_ceiling(
+    max_num_seqs, setting, cap, mentions
+):
+    decision = derive_capture_cap(
+        max_num_seqs=max_num_seqs, max_num_batched_tokens=16384, setting=setting
+    )
+    assert decision.cap == cap
+    assert mentions in decision.detail
+
+
+@pytest.mark.parametrize(
     ("kwargs", "source", "mentions"),
     [
         ({"explicit_cap": 128}, "operator", "max_cudagraph_capture_size=128"),
@@ -458,6 +594,28 @@ def test_a_ceiling_in_the_variable_bounds_the_derived_cap(parser_class, monkeypa
     monkeypatch.setenv(CAPTURE_CAP_ENV, "1000")
     parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
     assert parsed.max_cudagraph_capture_size == 992
+
+
+def test_a_recipe_without_the_window_flag_gets_the_ceiling_it_set(
+    parser_class, monkeypatch, caplog
+):
+    """The recipe's ceiling is applied with --max-num-seqs left to the engine,
+    and the line says what the engine's default was bounded by."""
+    monkeypatch.setenv(CAPTURE_CAP_ENV, "2048")
+    with caplog.at_level(logging.INFO, logger="smg_grpc_servicer"):
+        parsed = _serve_parser(parser_class).parse_args(
+            ["--grpc", "m", "--max-num-batched-tokens", "16384"]
+        )
+    assert parsed.max_cudagraph_capture_size == 2048
+    lines = [
+        record.getMessage() for record in caplog.records if "capture cap" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert (
+        "2048, derived from the admission step (--max-num-batched-tokens 16384, ceiling 2048)"
+        in lines[0]
+    )
+    assert "default was 512 or 1024 by platform (--max-num-seqs unset" in lines[0]
 
 
 def test_a_bad_variable_value_is_a_usage_error_that_names_it(parser_class, monkeypatch, capsys):

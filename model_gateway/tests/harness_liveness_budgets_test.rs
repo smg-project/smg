@@ -7,9 +7,7 @@
 use std::time::Duration;
 
 use smg::config::RouterConfig;
-
-#[path = "common/mod.rs"]
-mod common;
+use smg_test_harness as common;
 
 #[tokio::test]
 async fn a_built_context_applies_its_configurations_liveness_budgets() {

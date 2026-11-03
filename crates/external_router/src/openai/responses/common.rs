@@ -24,27 +24,102 @@ pub(crate) fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value)
 
 /// Processes incoming byte chunks into complete SSE blocks.
 /// Handles buffering of partial chunks and CRLF normalization.
+///
+/// Network chunk boundaries are arbitrary: a multi-byte UTF-8 character (or a
+/// `\r\n` pair) may be split across two chunks. Such a split must not be
+/// decoded on its own, otherwise a large event (e.g. `response.output_text.done`
+/// carrying the full text) gets U+FFFD in place of the split character, both
+/// in what is forwarded to the client and in what is stored. An incomplete
+/// UTF-8 sequence at the end of a chunk is therefore carried over to the next
+/// chunk, and a trailing `\r` is held back until we know whether `\n` follows.
 pub(super) struct ChunkProcessor {
     pending: String,
+    /// Bytes of an incomplete UTF-8 sequence at the end of the last chunk.
+    carry: Vec<u8>,
+    /// The last decoded text ended with `\r` that has not been emitted yet.
+    pending_cr: bool,
 }
 
 impl ChunkProcessor {
     pub fn new() -> Self {
         Self {
             pending: String::new(),
+            carry: Vec::new(),
+            pending_cr: false,
         }
     }
 
     /// Append a chunk to the buffer, normalizing line endings
     pub fn push_chunk(&mut self, chunk: &[u8]) {
-        let chunk_str = match std::str::from_utf8(chunk) {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(String::from_utf8_lossy(chunk).into_owned()),
-        };
-        if chunk_str.contains('\r') {
-            self.pending.push_str(&chunk_str.replace("\r\n", "\n"));
+        let joined;
+        let mut rest: &[u8] = if self.carry.is_empty() {
+            chunk
         } else {
-            self.pending.push_str(&chunk_str);
+            let mut buf = std::mem::take(&mut self.carry);
+            buf.extend_from_slice(chunk);
+            joined = buf;
+            &joined
+        };
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    self.push_text(s);
+                    break;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    // `valid_up_to` guarantees this prefix is valid UTF-8.
+                    self.push_text(std::str::from_utf8(valid).unwrap_or_default());
+                    match e.error_len() {
+                        // Incomplete sequence at the end: wait for the next chunk.
+                        None => {
+                            self.carry = after.to_vec();
+                            break;
+                        }
+                        // Genuinely invalid bytes: replace them, keep going.
+                        Some(n) => {
+                            self.push_text("\u{FFFD}");
+                            rest = &after[n..];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append decoded text, normalizing `\r\n` to `\n` across chunk boundaries.
+    fn push_text(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let mut s = Cow::Borrowed(s);
+        if std::mem::take(&mut self.pending_cr) {
+            if s.starts_with('\n') {
+                // `\r` + `\n` split across chunks: the `\r` is dropped.
+            } else {
+                self.pending.push('\r');
+            }
+        }
+        if s.ends_with('\r') {
+            self.pending_cr = true;
+            s = Cow::Owned(s[..s.len() - 1].to_string());
+        }
+        if s.contains('\r') {
+            self.pending.push_str(&s.replace("\r\n", "\n"));
+        } else {
+            self.pending.push_str(&s);
+        }
+    }
+
+    /// End of stream: whatever is still held back becomes plain text
+    /// (an incomplete UTF-8 tail is replaced, a lone `\r` is kept).
+    fn flush_held(&mut self) {
+        if !self.carry.is_empty() {
+            let tail = String::from_utf8_lossy(&std::mem::take(&mut self.carry)).into_owned();
+            self.push_text(&tail);
+        }
+        if std::mem::take(&mut self.pending_cr) {
+            self.pending.push('\r');
         }
     }
 
@@ -63,11 +138,12 @@ impl ChunkProcessor {
 
     /// Check if there's remaining content in the buffer
     pub fn has_remaining(&self) -> bool {
-        !self.pending.trim().is_empty()
+        !self.pending.trim().is_empty() || !self.carry.is_empty()
     }
 
     /// Take any remaining content from the buffer
     pub fn take_remaining(&mut self) -> String {
+        self.flush_held();
         std::mem::take(&mut self.pending)
     }
 }
@@ -131,6 +207,96 @@ mod tests {
 
         let (_event, data) = parse_sse_block("event: ping");
         assert!(data.is_empty());
+    }
+
+    /// Feed `bytes` split at every position in `cuts` and collect all blocks
+    /// plus whatever remains at end of stream.
+    fn run_chunks(bytes: &[u8], cuts: &[usize]) -> (Vec<String>, String) {
+        let mut cp = ChunkProcessor::new();
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        for &cut in cuts.iter().chain(std::iter::once(&bytes.len())) {
+            cp.push_chunk(&bytes[start..cut]);
+            while let Some(b) = cp.next_block() {
+                blocks.push(b);
+            }
+            start = cut;
+        }
+        let rest = if cp.has_remaining() {
+            cp.take_remaining()
+        } else {
+            String::new()
+        };
+        (blocks, rest)
+    }
+
+    #[test]
+    fn test_chunk_processor_multibyte_split_at_every_byte() {
+        // "化" is 3 bytes and "😀" is 4: split the stream at every possible
+        // position, the decoded block must never contain U+FFFD.
+        let text = "热迁移是虚拟化的标志😀能力";
+        let event = format!("event: response.output_text.done\ndata: {{\"text\":\"{text}\"}}\n\n");
+        let bytes = event.as_bytes();
+        for cut in 1..bytes.len() {
+            let (blocks, rest) = run_chunks(bytes, &[cut]);
+            assert_eq!(blocks.len(), 1, "cut at {cut}");
+            assert!(
+                !blocks[0].contains('\u{FFFD}'),
+                "cut at {cut}: {}",
+                blocks[0]
+            );
+            assert!(blocks[0].contains(text), "cut at {cut}");
+            assert!(rest.is_empty(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn test_chunk_processor_one_byte_chunks() {
+        let event = "data: {\"delta\":\"云计算架构\"}\n\ndata: {\"text\":\"、与私有子网（\"}\n\n";
+        let bytes = event.as_bytes();
+        let cuts: Vec<usize> = (1..bytes.len()).collect();
+        let (blocks, rest) = run_chunks(bytes, &cuts);
+        assert_eq!(
+            blocks,
+            vec![
+                "data: {\"delta\":\"云计算架构\"}".to_string(),
+                "data: {\"text\":\"、与私有子网（\"}".to_string()
+            ]
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_processor_crlf_split_across_chunks() {
+        let bytes = b"event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n";
+        for cut in 1..bytes.len() {
+            let (blocks, rest) = run_chunks(bytes, &[cut]);
+            assert_eq!(
+                blocks,
+                vec![
+                    "event: a\ndata: 1".to_string(),
+                    "event: b\ndata: 2".to_string()
+                ],
+                "cut at {cut}"
+            );
+            assert!(rest.is_empty(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn test_chunk_processor_invalid_bytes_still_replaced() {
+        // A byte that can never start a UTF-8 sequence is replaced, the rest kept.
+        let (blocks, _) = run_chunks(b"data: a\xffb\n\n", &[]);
+        assert_eq!(blocks, vec!["data: a\u{FFFD}b".to_string()]);
+    }
+
+    #[test]
+    fn test_chunk_processor_truncated_tail_at_end_of_stream() {
+        // Stream ends in the middle of a character: the remainder is still returned.
+        let bytes = "data: 化".as_bytes();
+        let (blocks, rest) = run_chunks(&bytes[..bytes.len() - 1], &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(rest, "data: \u{FFFD}");
     }
 
     #[test]

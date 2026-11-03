@@ -10,7 +10,7 @@
 //! that may be null held until its text says, any other value written whole at its close.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
         value::NULL_WORDS,
@@ -22,7 +22,7 @@ use crate::{
 pub(super) enum Mode {
     /// A declared string, pushed piece by piece once its opening fragment is out.
     Streaming { opened: bool },
-    /// Written at the close with [`json`](super::json).
+    /// Written at the close with [`json`](super::value::json).
     Whole,
     /// A string that may be null: held until its text rules the null words out.
     Undecided,
@@ -64,7 +64,7 @@ impl Object {
     pub(super) fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -73,17 +73,6 @@ impl Object {
     pub(super) fn close<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         let json = if self.written == 0 { "{}" } else { "}" }.to_string();
         self.push_fragment(json, source, out);
-    }
-
-    /// The carried bytes as `Malformed` with `why`, whitespace included; nothing when none.
-    pub(super) fn report(&mut self, why: MalformedReason, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Malformed {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why,
-        });
     }
 
     /// The carried bytes refused ([`refuse`](super::refuse)): a `Malformed` event of no bytes
@@ -96,13 +85,7 @@ impl Object {
     /// read, dropped so the report holds only the text (after text released already an assembler
     /// keeps it with the report instead); nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The next bytes of the value under `key`, whose text starts at `start` in the carried
@@ -190,7 +173,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ToolCallArguments { json, source, .. } => {
-                    (json.clone(), source.text.to_string())
+                    (json.to_string(), source.text.to_string())
                 }
                 Event::Dropped { text, .. } => ("dropped".to_string(), text.text.to_string()),
                 Event::Malformed { text, .. } => ("malformed".to_string(), text.text.to_string()),
@@ -253,21 +236,23 @@ mod tests {
     }
 
     #[test]
-    fn carried_bytes_are_reported_or_dropped_once_and_nothing_is_pushed_for_none() {
+    fn carried_bytes_are_refused_or_dropped_once_and_nothing_is_pushed_for_none() {
         let mut object = Object::new(0);
         let mut out = Events::new();
-        object.report(MalformedReason::TextBetweenTags, &mut out);
+        object.refuse(MalformedReason::TextBetweenTags, &mut out);
         object.drop_carried(&mut out);
         assert!(out.is_empty());
         object.carried.push_str("  ");
         object.drop_carried(&mut out);
         object.carried.push('x');
-        object.report(MalformedReason::TextBetweenTags, &mut out);
+        object.refuse(MalformedReason::TextBetweenTags, &mut out);
+        // Refused: the counted event of no bytes, then the bytes as the model's failed call.
         assert_eq!(
             fragments(&out),
             vec![
                 ("dropped".to_string(), "  ".to_string()),
-                ("malformed".to_string(), "x".to_string()),
+                ("malformed".to_string(), String::new()),
+                ("dropped".to_string(), "x".to_string()),
             ]
         );
         assert!(object.carried.is_empty());

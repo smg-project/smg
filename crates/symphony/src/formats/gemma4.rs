@@ -44,10 +44,12 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{Event, Events},
+        event::{Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, reasoning, the_same_at_every_cut,
+        },
         Declared,
     };
 
@@ -240,6 +242,97 @@ mod tests {
             &events[ended - 1],
             Event::Malformed { text, .. } if text.text.is_empty()
         ));
+    }
+
+    /// A call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+    /// call's length: inside a bare member, inside a nested object, inside a string and right
+    /// after a member's comma. The call's arguments are the prefix as the model wrote it, the cut
+    /// member's key and bytes included and no brace the model never wrote; nothing of the call
+    /// reaches a chat client as content; the one word before the call's end says that the
+    /// arguments are no whole value; and the finish is the engine's `length`, whole, a character
+    /// at a time and at every two-way cut.
+    #[test]
+    fn a_call_the_token_limit_cut_keeps_its_bytes_as_its_arguments_and_nothing_as_content() {
+        for (output, arguments) in [
+            (
+                "<|tool_call>call:play{artist:<|\"|>Taylor<|\"|>,n:1",
+                r#"{"artist": "Taylor", "n": 1"#,
+            ),
+            (
+                "<|tool_call>call:play{artist:<|\"|>Taylor<|\"|>,prefs:{size:<|\"|>lar",
+                r#"{"artist": "Taylor", "prefs": {"size": "lar"#,
+            ),
+            (
+                "<|tool_call>call:play{artist:<|\"|>Tay",
+                r#"{"artist": "Tay"#,
+            ),
+            (
+                "<|tool_call>call:play{artist:<|\"|>Taylor<|\"|>,",
+                r#"{"artist": "Taylor""#,
+            ),
+        ] {
+            let read = |pieces: &[&str]| {
+                drive_to(
+                    &mut Engine::new(gemma4(), declared()),
+                    PROMPT,
+                    pieces,
+                    EngineFinish::Length,
+                )
+            };
+            let said = the_same_at_every_cut(read, output);
+            assert_eq!(
+                said.calls,
+                vec![("play".to_string(), arguments.to_string())],
+                "{output:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{output:?}");
+            assert_eq!(said.content, "", "{output:?}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(arguments).is_err(),
+                "{output:?}: the arguments stay cut"
+            );
+            let events = read(&[output]);
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert!(
+                malformed(&events).iter().all(String::is_empty),
+                "nothing of the call is content: {events:?}"
+            );
+            assert!(
+                matches!(
+                    &events[events.len() - 3..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. },
+                        Event::Finish { .. },
+                    ] if text.text.is_empty() && source.text.is_empty()
+                ),
+                "{output:?}: {events:?}"
+            );
+        }
+    }
+
+    /// The model's own end of output inside a call, before its closing marker: the table has no
+    /// stop row, so the engine ends the call as a cut ends it (the braces and tokens are the
+    /// model's own), and the call stays open, where it used to be closed with a brace the model
+    /// never wrote; whole, a character at a time and at every two-way cut.
+    #[test]
+    fn a_call_the_model_leaves_open_at_its_own_end_stays_open_too() {
+        let output = "<|tool_call>call:play{artist:<|\"|>Taylor<|\"|>,n:1";
+        let said = the_same_at_every_cut(|pieces| run(PROMPT, pieces), output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "play".to_string(),
+                r#"{"artist": "Taylor", "n": 1"#.to_string()
+            )]
+        );
+        assert!(matches!(said.finish, Some((_, 1))), "{said:?}");
+        assert_eq!(said.content, "");
+        let events = run(PROMPT, &[output]);
+        assert!(
+            malformed(&events).iter().all(String::is_empty),
+            "nothing of the call is content: {events:?}"
+        );
     }
 
     #[test]

@@ -484,7 +484,7 @@ impl PolicyRegistry {
     }
 
     /// Policies that already honor the routing key keep their own handling
-    /// (they consult `rid_key` before the header, like the override does); all
+    /// (they consult the header before `rid_key`, like the override does); all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
@@ -1158,7 +1158,7 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
+    use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
@@ -1166,17 +1166,10 @@ mod tests {
     use crate::{
         policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
-            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
-            WorkerType,
+            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
         Arc::new(
@@ -1365,25 +1358,7 @@ mod tests {
     }
 
     fn cache_aware_config() -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
     }
 
     fn headers_with_tokens(value: &str) -> HeaderMap {
@@ -1772,6 +1747,25 @@ mod tests {
         }
     }
 
+    /// A round-robin registry whose routing-key override delegates the assignment, its
+    /// default policy and the two regular workers the sticky-selection tests route over.
+    fn delegating_registry_with_two_workers() -> (
+        PolicyRegistry,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<Arc<dyn Worker>>,
+    ) {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        (reg, policy, workers)
+    }
+
     #[test]
     fn derive_rid_key_strips_turn_and_retry_suffixes() {
         let reg = PolicyRegistry::with_override(
@@ -1803,15 +1797,7 @@ mod tests {
 
     #[test]
     fn header_key_wins_over_rid_and_rid_is_fallback() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
 
         let headers = headers_with_key("conversation-42");
         let first = reg
@@ -1895,15 +1881,7 @@ mod tests {
 
     #[test]
     fn header_priority_accounts_inflight_requests_under_the_selected_key() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let headers = headers_with_key("conversation_t1");
         let mut guards = Vec::new();
         for rid in ["request-1", "request-2", "request-3"] {
@@ -1934,25 +1912,7 @@ mod tests {
     #[test]
     fn delegate_assignment_routes_via_underlying_policy_then_pins() {
         let reg = PolicyRegistry::with_override(
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 10000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 10000),
             rid_override(ManualAssignmentMode::Delegate),
         );
         let policy = reg.get_default_policy();
@@ -2008,15 +1968,7 @@ mod tests {
     #[test]
     #[traced_test]
     fn sticky_selection_emits_decision_line_per_request() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let info = SelectWorkerInfo {
             rid_key: Some("conv1"),
             ..Default::default()
@@ -2038,15 +1990,7 @@ mod tests {
     #[test]
     #[traced_test]
     fn overloaded_sticky_pin_respills_through_the_stale_path() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let fleet = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, fleet) = delegating_registry_with_two_workers();
         let available = |fleet: &[Arc<dyn Worker>]| -> Vec<Arc<dyn Worker>> {
             fleet.iter().filter(|w| w.is_available()).cloned().collect()
         };
@@ -2096,15 +2040,7 @@ mod tests {
     #[test]
     #[traced_test]
     fn all_overloaded_leaves_sticky_selection_empty() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         for w in &workers {
             w.set_overloaded(true);
         }
@@ -2119,15 +2055,7 @@ mod tests {
 
     #[test]
     fn cap_respill_reassigns_and_pin_follows_strict_improvement() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let info = SelectWorkerInfo {
             rid_key: Some("convA"),
             ..Default::default()
@@ -2151,15 +2079,7 @@ mod tests {
 
     #[test]
     fn cap_respill_keeps_pin_when_no_strictly_better_pick() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let info = SelectWorkerInfo {
             rid_key: Some("convB"),
             ..Default::default()
@@ -2215,15 +2135,7 @@ mod tests {
     #[test]
     #[traced_test]
     fn busy_worker_does_not_respill_idle_key() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let info = SelectWorkerInfo {
             rid_key: Some("convD"),
             ..Default::default()
@@ -2246,15 +2158,7 @@ mod tests {
     #[test]
     #[traced_test]
     fn two_inflight_same_key_respill_the_third() {
-        let reg = PolicyRegistry::with_override(
-            PolicyConfig::RoundRobin,
-            rid_override(ManualAssignmentMode::Delegate),
-        );
-        let policy = reg.get_default_policy();
-        let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-        ];
+        let (reg, policy, workers) = delegating_registry_with_two_workers();
         let info = SelectWorkerInfo {
             rid_key: Some("convE"),
             ..Default::default()
@@ -2550,25 +2454,9 @@ mod tests {
 
         const ADDERS: usize = 4;
 
-        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 0,
-            max_tree_size: 128,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }));
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+            0.5, 32, 1.5, 0, 128,
+        )));
 
         for round in 0..64 {
             let monitor = Arc::new(KvEventMonitor::new());

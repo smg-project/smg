@@ -1,6 +1,6 @@
 //! L1 Cache: Special-token boundary prefix cache
 //!
-//! Caches tokenization results at ALL special token boundaries.
+//! Caches tokenization results at selected special token boundaries.
 //! Special tokens (like `<|im_start|>`, `<|im_end|>`) are atomic in BPE tokenizers (special: true, normalized: false),
 //! making them the ONLY safe split points that guarantee correctness. A tokenizer extracts its added tokens in two
 //! passes: the `normalized: false` ones from the raw text, then the `normalized: true` ones from the pieces that pass
@@ -8,10 +8,10 @@
 //! tokens it matches so that no boundary falls inside them are raw-pass added tokens; a token of the second pass can
 //! neither displace a raw-pass token nor be a boundary of a raw-text matcher.
 //!
-//! **Design**: Cache at every special token boundary (not at fixed granularity intervals)
-//! - Simple: No granularity parameter, no search windows
-//! - Efficient: Fewer cache entries (10 instead of 64 for typical 8KB prompt)
-//! - Natural: Aligns with actual chat template structure
+//! **Design**: Select checkpoints from special token boundaries.
+//! - Cold fills: Geometrically spaced token lengths plus the deepest boundary.
+//! - Hits: Learn the next boundary after a match and the deepest boundary.
+//! - Admission: Nonblocking and subject to the retained-memory budget.
 //!
 //! Example:
 //!
@@ -20,7 +20,7 @@
 //! Request 1: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>"
 //! Request 2: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nHello!<|im_end|>"
 //!
-//! Cache points: After each "<|im_end|>" (atomic tokens, guaranteed safe)
+//! Candidate split points: After atomic special tokens such as "<|im_end|>".
 //! Result: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
 
 use std::{
@@ -57,15 +57,43 @@ pub(super) struct Seed {
 /// The boundaries of an input, in order.
 pub(super) type PrefixSeeds = Vec<Seed>;
 
+/// The boundaries deeper than a match that the caller learns on its way to
+/// the tail: the next one, so a prefix many inputs share behind a shallow
+/// match is learned one boundary per request, and the input's deepest one,
+/// so its next turn matches there. `next` is `None` when it would be the
+/// deepest; both are `None` when the match is the deepest boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Deeper {
+    pub(super) next: Option<Seed>,
+    pub(super) deepest: Option<Seed>,
+}
+
+impl Deeper {
+    fn of(deeper: &[Seed]) -> Self {
+        match deeper {
+            [] => Self::default(),
+            [deepest] => Self {
+                next: None,
+                deepest: Some(*deepest),
+            },
+            [next, .., deepest] => Self {
+                next: Some(*next),
+                deepest: Some(*deepest),
+            },
+        }
+    }
+}
+
 /// Outcome of [`L1Cache::lookup_with_seeds`].
 pub(super) enum PrefixLookup {
     /// Longest cached prefix: the shared token allocation plus the boundary
     /// it ends at (its byte length and the special token there). The tokens
     /// are returned as `Arc<[TokenIdType]>` so a hit does not copy the (large)
     /// cached prefix; the caller splices the suffix into an exact-capacity
-    /// buffer. The last field is the input's deepest boundary when it lies
-    /// beyond the match, so the caller can cache it.
-    Hit(Arc<[TokenIdType]>, Seed, Option<Seed>),
+    /// buffer. The last field names the boundaries deeper than the match that
+    /// the caller caches on its way to the tail: the next one and the input's
+    /// deepest one (see [`Deeper`]).
+    Hit(Arc<[TokenIdType]>, Seed, Deeper),
     /// No cached prefix. Carries the seeds the failed search computed (empty
     /// when the input has no special-token boundaries) so the miss path can
     /// seed entries without recomputing them.
@@ -322,6 +350,20 @@ impl SpecialTokenBoundaries {
     }
 }
 
+/// The access timestamp of an entry nothing has matched yet: below every
+/// timestamp the counter issues, so the eviction sampler takes such an entry
+/// before any other it sees.
+const STALE: u64 = 0;
+
+/// How an inserted prefix enters the LRU order.
+#[derive(Clone, Copy)]
+enum Recency {
+    /// As the most recently used entry: the request that inserted it used it.
+    Fresh,
+    /// As the least recently used entry ([`STALE`]): a speculation.
+    Stale,
+}
+
 /// A cached prefix entry
 /// Uses Arc<[TokenIdType]> for zero-copy access to tokens
 #[derive(Debug, Clone)]
@@ -498,22 +540,24 @@ impl L1Cache {
         }
 
         // Search from the longest boundary to find the best match
-        for &seed in seeds.iter().rev() {
+        for (at, &seed) in seeds.iter().enumerate().rev() {
             let shard_idx = seed.digest[0] as usize % NUM_SHARDS;
 
             if let Some(entry) = self.shards[shard_idx].get(&seed.digest) {
                 // Update last accessed timestamp for LRU
-                let timestamp = self.access_counter.fetch_add(1, Ordering::Relaxed);
-                entry.last_accessed.store(timestamp, Ordering::Relaxed);
+                entry
+                    .last_accessed
+                    .store(self.next_timestamp(), Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 L1.hit(seed.end);
-                // Share the cached allocation instead of copying it on every hit.
-                let deeper = seeds
-                    .last()
-                    .copied()
-                    .filter(|deepest| deepest.end > seed.end);
-                return PrefixLookup::Hit(Arc::clone(&entry.tokens), seed, deeper);
+                // Share the cached allocation instead of copying it on every hit;
+                // the boundaries beyond the match go with it, for the caller to cache.
+                return PrefixLookup::Hit(
+                    Arc::clone(&entry.tokens),
+                    seed,
+                    Deeper::of(&seeds[at + 1..]),
+                );
             }
         }
 
@@ -522,10 +566,10 @@ impl L1Cache {
         PrefixLookup::Miss(seeds)
     }
 
-    /// Insert prefix entries at all special token boundaries (incremental hashing
-    /// and tokenization, O(N)). The miss path of [`super::CachedTokenizer`] instead
-    /// uses [`Self::populate_with_seeds`], which reuses this per-segment work to also
-    /// return the full encoding.
+    /// Insert geometrically spaced prefixes plus the deepest special-token
+    /// boundary, subject to admission. The miss path of [`super::CachedTokenizer`]
+    /// uses `Self::populate_with_seeds`, which reuses the incremental hashing
+    /// and per-segment encoding to also return the full encoding.
     pub fn insert_at_boundaries<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -545,12 +589,12 @@ impl L1Cache {
         Ok(())
     }
 
-    /// Miss-path encode: tokenize `input` exactly once, caching the cumulative prefix
-    /// at every special token boundary, and return the assembled encoding, equal
-    /// to an uncached `encode(input, add_special_tokens)`: the segments are
+    /// Miss-path encode: tokenize `input` once, admitting geometrically spaced
+    /// prefixes plus the deepest special-token boundary, and return the assembled
+    /// encoding, equal to an uncached `encode(input, add_special_tokens)`: the segments are
     /// encoded in context and the frame the flag adds goes around the whole.
     /// A request with the flag is served by the plain encode, uncached, when
-    /// the frame cannot be read off the tokenizer ([`SpecialTokenFrame::probe`]).
+    /// the frame cannot be read off the tokenizer (`SpecialTokenFrame::probe`).
     pub fn populate_and_encode<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -599,8 +643,8 @@ impl L1Cache {
             return tokenizer.encode(input, add_special_tokens);
         };
 
-        // Tokenize + cache every boundary prefix; `running` covers input[0..last
-        // boundary], behind the frame's leading ids.
+        // Tokenize every segment and cache selected prefixes; `running` covers
+        // input[0..last boundary], behind the frame's leading ids.
         let mut running =
             self.populate_boundaries(input, seeds, tokenizer, special_tokens, frame)?;
 
@@ -618,8 +662,9 @@ impl L1Cache {
     /// Shared core of the insert and fused-miss paths: walk the precomputed
     /// `seeds`, encoding each segment once without the flag (the first as the
     /// start of the input, each later one after the special token that ends
-    /// the boundary before it), cache the cumulative prefix at each boundary,
-    /// and return the running token vector (covering `input[0..last boundary]`)
+    /// the boundary before it), cache geometrically spaced cumulative prefixes
+    /// plus the deepest boundary, and return the running token vector
+    /// (covering `input[0..last boundary]`)
     /// behind `frame`'s leading ids when there is a frame; the entries never
     /// hold the frame. Nothing is stored before every segment came back exact.
     fn populate_boundaries<E: Encoder + ?Sized>(
@@ -658,10 +703,21 @@ impl L1Cache {
             last = Some(seed);
         }
 
-        // Keep only offsets until every segment is known to splice exactly.
-        // Copy each admitted prefix directly from the completed running buffer.
-        for (seed, end) in seeds.iter().zip(prefix_lengths) {
-            self.insert_prefix(seed.digest, seed.end, &running_tokens[head..end]);
+        // Wait for exact segment splicing before admitting any prefix. Copying
+        // every cumulative prefix is quadratic for many-turn conversations.
+        // Doubling the token length bounds geometric copies by twice the final
+        // prefix length; always retaining the deepest adds at most one more.
+        // Advance the selection even when admission fails (budget/contention).
+        let mut previous = None;
+        for (at, (seed, end)) in seeds.iter().zip(prefix_lengths).enumerate() {
+            let length = end - head;
+            if previous
+                .is_none_or(|before: usize| length > before && length >= before.saturating_mul(2))
+                || at + 1 == seeds.len()
+            {
+                previous = Some(length);
+                self.insert_prefix(seed.digest, seed.end, &running_tokens[head..end]);
+            }
         }
 
         Ok(running_tokens)
@@ -682,6 +738,37 @@ impl L1Cache {
         boundary_pos: usize,
         tokens: &[TokenIdType],
     ) {
+        self.insert_prefix_with(hash_bytes, boundary_pos, tokens, Recency::Fresh);
+    }
+
+    /// Like [`Self::insert_prefix`], for a prefix one request speculates
+    /// others share (the boundary right after its match). The entry enters as
+    /// the oldest the eviction sampler can find, so it is evicted ahead of the
+    /// matched entries the sampler sees and speculations take up little of the
+    /// budget (the room for one is still made before it exists, from whatever
+    /// the sampler finds then); the first lookup or insert that meets it again
+    /// makes it as fresh as any.
+    pub(super) fn insert_prefix_speculative(
+        &self,
+        hash_bytes: Blake3Hash,
+        boundary_pos: usize,
+        tokens: &[TokenIdType],
+    ) {
+        self.insert_prefix_with(hash_bytes, boundary_pos, tokens, Recency::Stale);
+    }
+
+    /// The next access timestamp: above [`STALE`] from the first one on.
+    fn next_timestamp(&self) -> u64 {
+        self.access_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn insert_prefix_with(
+        &self,
+        hash_bytes: Blake3Hash,
+        boundary_pos: usize,
+        tokens: &[TokenIdType],
+        recency: Recency,
+    ) {
         let Some(size_bytes) = tokens
             .len()
             .checked_mul(size_of::<TokenIdType>())
@@ -699,10 +786,9 @@ impl L1Cache {
         // An existing hash already represents the same prefix. Avoid copying
         // or evicting it merely because another miss encoded it concurrently.
         if let Some(cached) = self.shards[shard_idx].get(&hash_bytes) {
-            cached.last_accessed.store(
-                self.access_counter.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            cached
+                .last_accessed
+                .store(self.next_timestamp(), Ordering::Relaxed);
             return;
         }
         let current = self.current_memory.load(Ordering::Relaxed) as usize;
@@ -710,9 +796,13 @@ impl L1Cache {
         if size_bytes > available {
             self.evict_lru(size_bytes - available);
         }
+        let last_accessed = match recency {
+            Recency::Fresh => self.next_timestamp(),
+            Recency::Stale => STALE,
+        };
         let cached = CachedPrefix {
             tokens: tokens.into(),
-            last_accessed: Arc::new(AtomicU64::new(self.access_counter.load(Ordering::Relaxed))),
+            last_accessed: Arc::new(AtomicU64::new(last_accessed)),
             size_bytes,
         };
         self.shards[shard_idx].insert(hash_bytes, cached);
@@ -847,6 +937,46 @@ mod tests {
         SpecialTokenBoundaries, SpecialTokenFrame,
     };
     use crate::*;
+
+    #[test]
+    fn a_speculative_entry_goes_before_the_ones_requests_matched() {
+        // Three entries fill the cache (one per shard: the sampler reads one
+        // entry per shard); the middle one is a speculation. The fourth needs
+        // the room of one, and it is the speculation that goes.
+        let tokens = [7u32; 100];
+        let size = 10 + tokens.len() * size_of::<TokenIdType>();
+        let cache = L1Cache::new(3 * size);
+        let hash = |first: u8| {
+            let mut hash = [0u8; 32];
+            hash[0] = first;
+            hash
+        };
+        cache.insert_prefix(hash(0), 10, &tokens);
+        cache.insert_prefix_speculative(hash(1), 10, &tokens);
+        cache.insert_prefix(hash(2), 10, &tokens);
+        assert_eq!(cache.len(), 3);
+        cache.insert_prefix(hash(3), 10, &tokens);
+        assert_eq!(cache.len(), 3);
+        assert!(
+            cache.shards[1].get(&hash(1)).is_none(),
+            "the speculation went"
+        );
+        for first in [0, 2, 3] {
+            assert!(
+                cache.shards[first as usize].get(&hash(first)).is_some(),
+                "entry {first} stays"
+            );
+        }
+        // A speculation an insert meets again is as fresh as any: the next
+        // eviction takes an older matched entry instead.
+        cache.insert_prefix_speculative(hash(4), 10, &tokens);
+        cache.insert_prefix(hash(4), 10, &tokens);
+        cache.insert_prefix(hash(5), 10, &tokens);
+        assert!(
+            cache.shards[4].get(&hash(4)).is_some(),
+            "the met speculation stays"
+        );
+    }
 
     /// Oversized prefixes must be rejected without displacing useful entries.
     #[test]
@@ -1611,6 +1741,160 @@ mod tests {
                     .is_none(),
                 "opposite flag must not collide with populated entries"
             );
+        }
+    }
+
+    /// Cold admission copies a linear token payload without relying on eviction.
+    #[test]
+    fn cold_admission_bounds_copies_and_keeps_deepest() {
+        let tokenizer = bos_tokenizer();
+        for turns in [1, 8, 4096] {
+            for suffix in ["", "tail"] {
+                let input = format!("{}{suffix}", "<|im_start|>abcdefgh<|im_end|>".repeat(turns));
+                for flag in [false, true] {
+                    let cache = L1Cache::new(128 * 1024 * 1024);
+                    let got = cache
+                        .populate_and_encode(&input, &tokenizer, &SPECIALS, flag)
+                        .unwrap();
+                    assert_eq!(
+                        got.token_ids(),
+                        tokenizer.encode(&input, flag).unwrap().token_ids()
+                    );
+                    let seeds = L1Cache::boundary_seeds(
+                        &input,
+                        &SpecialTokenBoundaries::new(&SPECIALS),
+                        flag,
+                    );
+                    let deepest = seeds.last().unwrap().end;
+                    let expected = tokenizer.encode(&input[..deepest], false).unwrap();
+                    let copied: usize = cache
+                        .shards
+                        .iter()
+                        .map(|s| s.iter().map(|e| e.tokens.len()).sum::<usize>())
+                        .sum();
+                    assert!(
+                        copied <= 3 * expected.token_ids().len(),
+                        "copied {copied} tokens"
+                    );
+                    assert!(cache.len() <= usize::BITS as usize + 1);
+                    let (tokens, offset) =
+                        cache.longest_prefix_match(&input, &SPECIALS, flag).unwrap();
+                    assert_eq!(offset, deepest);
+                    assert_eq!(tokens.as_ref(), expected.token_ids());
+                    let next = format!("{input}<|im_start|>next<|im_end|>tail");
+                    assert_eq!(
+                        cache
+                            .longest_prefix_match(&next, &SPECIALS, flag)
+                            .unwrap()
+                            .1,
+                        deepest
+                    );
+                }
+            }
+        }
+    }
+
+    /// Geometric short checkpoints remain reusable by independently branched histories.
+    #[test]
+    fn cold_admission_keeps_geometric_shared_prefixes() {
+        let tokenizer = bos_tokenizer();
+        let turn = "<|im_start|>abcdefgh<|im_end|>";
+        let input = format!("{}tail", turn.repeat(4096));
+        let cache = L1Cache::new(128 * 1024 * 1024);
+        cache
+            .populate_and_encode(&input, &tokenizer, &SPECIALS, false)
+            .unwrap();
+        for turns in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+            let prefix = turn.repeat(turns);
+            let sibling = format!("{prefix}different");
+            let (tokens, offset) = cache
+                .longest_prefix_match(&sibling, &SPECIALS, false)
+                .unwrap();
+            assert_eq!(offset, prefix.len());
+            assert_eq!(
+                tokens.as_ref(),
+                tokenizer.encode(&prefix, false).unwrap().token_ids()
+            );
+        }
+    }
+
+    /// Tight budgets reject large checkpoints without replacing a useful small one.
+    #[test]
+    fn cold_admission_tight_budget_keeps_shared_prefix() {
+        let tokenizer = bos_tokenizer();
+        let input = format!("{}tail", "<|im_start|>abcdefgh<|im_end|>".repeat(4096));
+        for budget in [0, 1, 32, 4096, 8 * 1024 * 1024] {
+            let cache = L1Cache::new(budget);
+            for flag in [false, true] {
+                let got = cache
+                    .populate_and_encode(&input, &tokenizer, &SPECIALS, flag)
+                    .unwrap();
+                assert_eq!(
+                    got.token_ids(),
+                    tokenizer.encode(&input, flag).unwrap().token_ids()
+                );
+                assert!(cache.stats().memory_bytes <= budget);
+            }
+            let retained: usize = cache
+                .shards
+                .iter()
+                .map(|s| s.iter().map(|e| e.size_bytes).sum::<usize>())
+                .sum();
+            assert_eq!(cache.stats().memory_bytes, retained);
+            if budget == 32 {
+                assert_eq!(cache.len(), 2);
+                assert!(cache
+                    .longest_prefix_match("<|im_start|>different", &SPECIALS, false)
+                    .is_some());
+            }
+            cache.clear();
+            assert_eq!(cache.stats().memory_bytes, 0);
+        }
+    }
+
+    /// Cold fills racing with clear/churn keep charge bounded and reconcile at rest.
+    #[test]
+    fn cold_admission_concurrent_clear_reconciles() {
+        use std::sync::{Arc, Barrier};
+        for budget in [0, 1, 4096, 8 * 1024 * 1024] {
+            let cache = Arc::new(L1Cache::new(budget));
+            let gate = Barrier::new(17);
+            std::thread::scope(|scope| {
+                for worker in 0..16 {
+                    let (cache, gate) = (&cache, &gate);
+                    scope.spawn(move || {
+                        let tokenizer = bos_tokenizer();
+                        gate.wait();
+                        for round in 0..16 {
+                            let input =
+                                format!("{worker}/{round}{}tail", "abcdefgh<|im_end|>".repeat(128));
+                            let got = cache
+                                .populate_and_encode(&input, &tokenizer, &SPECIALS, false)
+                                .unwrap();
+                            assert_eq!(
+                                got.token_ids(),
+                                tokenizer.encode(&input, false).unwrap().token_ids()
+                            );
+                            assert!(cache.stats().memory_bytes <= budget);
+                        }
+                    });
+                }
+                gate.wait();
+                for _ in 0..128 {
+                    cache.clear();
+                    std::thread::yield_now();
+                }
+            });
+            let retained: usize = cache
+                .shards
+                .iter()
+                .map(|s| s.iter().map(|e| e.size_bytes).sum::<usize>())
+                .sum();
+            assert_eq!(cache.stats().memory_bytes, retained);
+            assert!(retained <= budget);
+            cache.clear();
+            assert!(cache.is_empty());
+            assert_eq!(cache.stats().memory_bytes, 0);
         }
     }
 }

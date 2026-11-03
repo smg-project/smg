@@ -118,6 +118,15 @@ kubectl patch crd ephemeralrunnersets.actions.github.com \
 Each values file explicitly references the shared controller service account in
 `org-actions-runner`. Install the required scale sets into `actions-runner-system`:
 
+The three accelerator scale sets share `runner-values-gpu-base.yaml` (the pod template:
+the init containers, the volumes, the node selector and tolerations); each
+`runner-values-<set>.yaml` is an overlay with the scale-set name, the runner bounds and the
+runner container, and Helm reads the base first, then the overlay. Helm replaces lists whole
+when it merges values files, which is why the whole runner container sits in the overlay.
+`check-runner-values.sh --against <rev>` renders each set from the base and its overlay and
+compares the render, byte for byte, with the files at `<rev>` (`CHART=<path>` renders from a
+local chart archive).
+
 ```bash
 helm upgrade --install k8s-runner-cpu \
   --namespace actions-runner-system \
@@ -130,6 +139,7 @@ helm upgrade --install 1-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-1-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
@@ -137,6 +147,7 @@ helm upgrade --install 2-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-2-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
@@ -144,6 +155,7 @@ helm upgrade --install 4-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 ```
@@ -202,7 +214,9 @@ docker push fra.ocir.io/idqj093njucb/action-runner:2.337.0
 ```
 
 For a future runner release, substitute its version in the commands above and
-update **both** image references in all four active `runner-values-*.yaml` files
+update the image references in the six files: the runner image in the three accelerator
+overlays, the runner and dind images in `runner-values-gpu-base.yaml`, both in
+`runner-values-cpu.yaml`, and the runner image in `runner-values-bellwether-record.yaml`
 after publishing the image. Redeploy the scale sets using step 4.
 
 If runners report `Runner version ... is deprecated and cannot receive messages`,
@@ -338,6 +352,56 @@ One issue per check, never per node; the issue body lists the affected nodes.
 | WARN | GPU memory held by no pod | over 2 GiB allocated with no pod attached for 30 min |
 | WARN | GPU over 85C | for 15 min |
 | WARN | Workflow runs queued over 24h | runs that will never be picked up |
+
+### A queued job left behind when a scale set drains to zero
+
+`GPU runner label starved` with one job queued, no registered runner for its
+label and every pool idle is a known shape, not a lost runner: a matrix's jobs
+for the label were all served, the scale set scaled to zero, and one job was
+still queued at that moment. It stays queued until the next job for the label
+arrives, because the scale-up is driven by job arrival and a job already in the
+queue does not bring a runner back by itself. In fourteen days of this
+repository's records (2026-10-20 to 2026-11-03) the single-GPU set did this
+thirteen times, always in a quiet period, with waits of 45 minutes to 22 hours
+46 minutes; twelve of the thirteen jobs were picked up 13 to 19 seconds after
+the next matrix's jobs were created, before any of those jobs. Every case ran
+with the set's floor at zero.
+
+- Confirm it: `kubectl get autoscalingrunnersets -n actions-runner-system`
+  (current and desired runners of the set), the repository's runner list for the
+  label (the scale set's ephemeral runners carry no labels in the API; group
+  them by name prefix), and the listener pod's log around the wave's last job
+  completion and around the queued job's request id.
+- Unstick it: raise the set's floor until the queued job is picked up (a runner
+  pod can take more than a minute to register), then restore the overlay's
+  value; the queued job is handed to the first runner that registers. Do not
+  cancel and re-run the workflow run: a queued job cannot be re-run on its own,
+  a whole-run re-run restarts every job, and the run's record is lost.
+
+  ```bash
+  kubectl patch autoscalingrunnerset <set> -n actions-runner-system \
+    --type=merge -p '{"spec":{"minRunners":1}}'
+  ```
+
+- Prevent it: keep a floor on every scale set (`minRunners` at least 1; the
+  overlays in this directory carry 4 for the 1- and 2-set overlays and the CPU
+  set, 2 for the 4-set overlay and the record set). The floor is what makes the
+  shape impossible, and it also removes the cold-start minute of a wave's first
+  jobs. Check the live floor and the stored release against the overlay the
+  install command in section 4 names: the live object first (a patch applied by
+  the unstick step is visible only here; Helm does not record it), then the
+  stored values; the floor was found at zero live while the file said 4. At a
+  quiet moment the runner list shows the floor's runners idle.
+
+  ```bash
+  kubectl get autoscalingrunnerset <set> -n actions-runner-system \
+    -o jsonpath='{.spec.minRunners}'
+  helm get values <release> -n actions-runner-system
+  ```
+
+- Upstream: the listener log at the wave's last completion and at the moment the
+  left-behind job is finally assigned is the evidence a report to the
+  controller's project needs.
 
 ### Noise rules
 

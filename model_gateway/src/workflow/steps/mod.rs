@@ -291,6 +291,7 @@ pub fn create_worker_workflow_data(
         detected_runtime_type: None,
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,
+        symphony_table: None,
         model_cards: Vec::new(),
         workers: None,
         final_labels: std::collections::HashMap::new(),

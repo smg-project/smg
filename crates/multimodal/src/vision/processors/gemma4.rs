@@ -27,10 +27,10 @@ use ndarray::Array3;
 
 use crate::{
     encoder_inputs::ModelSpecificValue,
-    types::RgbFrameRef,
+    types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::{
             pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes, TransformError,
         },
@@ -198,6 +198,25 @@ fn pixel_lut(config: &PreProcessorConfig) -> Result<[[f32; 256]; 3], TransformEr
         .ok_or_else(|| shape("Gemma 4 pixel transform overflow"))
 }
 
+/// The pixel pipeline a config sets: whether an image is resized, the
+/// filter it is resized with, and the per-channel table of [`pixel_lut`].
+#[derive(Debug, Clone)]
+struct Pixels {
+    do_resize: bool,
+    filter: FilterType,
+    lut: [[f32; 256]; 3],
+}
+
+impl Pixels {
+    fn from_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
+        Ok(Self {
+            do_resize: config.do_resize.unwrap_or(true),
+            filter: pil_to_filter(config.resampling.or(Some(3))),
+            lut: pixel_lut(config)?,
+        })
+    }
+}
+
 trait RgbSource {
     fn dimensions(&self) -> (u32, u32);
     fn rgb(&self) -> Result<Cow<'_, [u8]>, TransformError>;
@@ -247,13 +266,13 @@ struct Encoded {
 fn encode<F: RgbSource>(
     frame: &F,
     params: Params,
-    config: &PreProcessorConfig,
-    lut: &[[f32; 256]; 3],
+    pixels: &Pixels,
 ) -> Result<Encoded, TransformError> {
     let (source_w, source_h) = frame.dimensions();
     let (source_w, source_h) = (source_w as usize, source_h as usize);
     let raw = frame.rgb()?;
-    let (height, width) = if config.do_resize.unwrap_or(true) {
+    let lut = &pixels.lut;
+    let (height, width) = if pixels.do_resize {
         params.target_size(source_h, source_w)?
     } else {
         (source_h, source_w)
@@ -275,7 +294,7 @@ fn encode<F: RgbSource>(
     let pixels: Cow<'_, [u8]> = if (height, width) == (source_h, source_w) {
         raw
     } else {
-        let filter = pil_to_filter(config.resampling.or(Some(3)));
+        let filter = pixels.filter;
         let resized = if filter == FilterType::CatmullRom {
             resize_bicubic_torch_aa_rgb(
                 raw.as_ref(),
@@ -363,7 +382,8 @@ fn stack(
 
 fn preprocess_video_frames<F: RgbSource>(
     frames: &[F],
-    config: &PreProcessorConfig,
+    params: Params,
+    pixels: &Pixels,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
     let first = frames.first().ok_or(TransformError::EmptyBatch)?;
     let (width, height) = first.dimensions();
@@ -373,11 +393,9 @@ fn preprocess_video_frames<F: RgbSource>(
     {
         return Err(shape("Gemma 4 video frames must have identical dimensions"));
     }
-    let params = Params::from_config(config, true)?;
-    let lut = pixel_lut(config)?;
     let encoded = frames
         .iter()
-        .map(|frame| encode(frame, params, config, &lut))
+        .map(|frame| encode(frame, params, pixels))
         .collect::<Result<Vec<_>, _>>()?;
     let (tensor, positions, tokens) = stack(encoded, params)?;
     Ok(
@@ -411,12 +429,68 @@ fn shape(message: impl Into<String>) -> TransformError {
 }
 
 /// Gemma 4 image and video preprocessor.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Gemma4Processor;
+#[derive(Debug, Clone)]
+pub struct Gemma4Processor {
+    /// The modality the processor was built for, whose geometry `params` is.
+    modality: Modality,
+    params: Params,
+    pixels: Pixels,
+}
+
+impl Default for Gemma4Processor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Gemma4Processor {
+    /// The image processor of the default preprocessor config.
+    #[expect(
+        clippy::expect_used,
+        reason = "the default config pins a supported geometry and an identity normalization"
+    )]
     pub fn new() -> Self {
-        Self
+        Self::from_config_for(&PreProcessorConfig::default(), Modality::Image)
+            .expect("the default preprocessor config is valid")
+    }
+
+    /// Resolve the geometry of `modality` (image or video) and the pixel
+    /// transform of `config` once; a config the processor cannot serve for
+    /// that modality is refused here. Only that modality's settings are
+    /// read, so a setting only the other modality's path would refuse does
+    /// not stop it. Any other modality is refused.
+    pub fn from_config_for(
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> Result<Self, TransformError> {
+        let video = match modality {
+            Modality::Image => false,
+            Modality::Video => true,
+            other => {
+                return Err(shape(format!(
+                    "Gemma 4 preprocesses images and video, not {other}"
+                )))
+            }
+        };
+        let params = Params::from_config(config, video)?;
+        Ok(Self {
+            modality,
+            params,
+            pixels: Pixels::from_config(config)?,
+        })
+    }
+
+    /// The geometry for a call of `modality`: this processor's own, or the
+    /// error for a call of the modality it was not built for.
+    fn params_for(&self, modality: Modality) -> Result<Params, TransformError> {
+        if modality == self.modality {
+            Ok(self.params)
+        } else {
+            Err(shape(format!(
+                "this Gemma 4 processor was built for {} preprocessing, not {modality}",
+                self.modality
+            )))
+        }
     }
 }
 
@@ -437,16 +511,14 @@ impl VisionPreProcessor for Gemma4Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-        let params = Params::from_config(config, false)?;
-        let lut = pixel_lut(config)?;
+        let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
-            .map(|image| encode(image, params, config, &lut))
+            .map(|image| encode(image, params, &self.pixels))
             .collect::<Result<Vec<_>, _>>()?;
         let (tensor, positions, tokens) = stack(encoded, params)?;
         let sizes = images.iter().map(GenericImageView::dimensions).collect();
@@ -457,28 +529,23 @@ impl VisionPreProcessor for Gemma4Processor {
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        preprocess_video_frames(frames, config)
+        preprocess_video_frames(frames, self.params_for(Modality::Video)?, &self.pixels)
     }
 
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        preprocess_video_frames(frames, config)
+        preprocess_video_frames(frames, self.params_for(Modality::Video)?, &self.pixels)
     }
 
     /// Soft tokens for an image of this size; the preprocessing error for a
-    /// config or a size the reference rule cannot resize.
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        let params = Params::from_config(config, false)?;
+    /// size the reference rule cannot resize.
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        let params = self.params_for(Modality::Image)?;
         let target = params.target_size(height as usize, width as usize)?;
         Ok(params.soft_tokens(target))
     }
@@ -488,7 +555,7 @@ impl VisionPreProcessor for Gemma4Processor {
     }
 
     /// The size depends on the image's aspect ratio.
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -533,6 +600,18 @@ mod tests {
 
     /// Target sizes and token counts of the reference `get_aspect_ratio_preserving_size`
     /// (height, width in; height, width out), as transformers computes them.
+    /// A processor is built for images or video; any other modality is
+    /// refused when it is built rather than on every call.
+    #[test]
+    fn construction_refuses_a_modality_it_does_not_preprocess() {
+        for modality in [Modality::Audio, Modality::ImageEmbeds] {
+            assert!(
+                Gemma4Processor::from_config_for(&PreProcessorConfig::default(), modality).is_err(),
+                "{modality}"
+            );
+        }
+    }
+
     #[test]
     fn target_sizes_follow_the_reference_rule() {
         let params = params();
@@ -581,8 +660,9 @@ mod tests {
     #[test]
     fn preprocess_emits_the_engine_contract() {
         let image = solid(512, 512, [255, 0, 51]);
-        let out = Gemma4Processor::new()
-            .preprocess(std::slice::from_ref(&image), &image_config())
+        let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
+            .unwrap()
+            .preprocess(std::slice::from_ref(&image))
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[1, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256]);
@@ -612,8 +692,9 @@ mod tests {
     #[test]
     fn batches_stack_images_of_different_sizes() {
         let images = [solid(64, 64, [1, 2, 3]), solid(1920, 1080, [4, 5, 6])];
-        let out = Gemma4Processor::new()
-            .preprocess(&images, &image_config())
+        let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
+            .unwrap()
+            .preprocess(&images)
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[2, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256, 264]);
@@ -628,10 +709,9 @@ mod tests {
     #[test]
     fn video_stacks_frames_and_counts_them() {
         let frames = vec![solid(320, 240, [9, 9, 9]); 3];
-        let processor = Gemma4Processor::new();
-        let out = processor
-            .preprocess_video(&frames, &video_config())
-            .unwrap();
+        let processor = Gemma4Processor::from_config_for(&video_config(), Modality::Video).unwrap();
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let out = processor.preprocess_video(&frames, &clip).unwrap();
         assert_eq!(out.encoder_input.shape(), &[3, 630, 768]);
         assert_eq!(out.feature_token_counts, vec![3 * 63]);
         assert_eq!(out.item_sizes, vec![(320, 240)]);
@@ -661,9 +741,7 @@ mod tests {
                 data,
             })
             .collect();
-        let borrowed = processor
-            .preprocess_video_rgb(&refs, &video_config())
-            .unwrap();
+        let borrowed = processor.preprocess_video_rgb(&refs, &clip).unwrap();
         assert_eq!(
             borrowed.encoder_input.as_f32().as_slice(),
             out.encoder_input.as_f32().as_slice()
@@ -671,66 +749,48 @@ mod tests {
         assert_eq!(borrowed.feature_token_counts, out.feature_token_counts);
 
         let mixed = [solid(320, 240, [0; 3]), solid(321, 240, [0; 3])];
-        assert!(processor.preprocess_video(&mixed, &video_config()).is_err());
-        assert!(processor.preprocess_video(&[], &video_config()).is_err());
+        assert!(processor.preprocess_video(&mixed, &clip).is_err());
+        assert!(processor.preprocess_video(&[], &clip).is_err());
     }
 
     #[test]
-    fn token_count_reports_what_preprocessing_refuses() {
-        // A config the parameters cannot be read from is the same error for
-        // the count as for the preprocessing, not a count of zero.
+    fn construction_refuses_a_config_the_parameters_cannot_read() {
+        // A config the parameters cannot be read from is the parameters' error
+        // when the processor is built, not a count of zero later.
         let mut config = image_config();
         config.extra.insert(
             "pooling_kernel_size".to_string(),
             serde_json::json!("three"),
         );
-        let processor = Gemma4Processor::new();
-        let counted = processor
-            .calculate_num_tokens(512, 512, &config)
-            .unwrap_err()
-            .to_string();
-        let preprocessed = processor
-            .preprocess(&[solid(512, 512, [0; 3])], &config)
+        let constructed = Gemma4Processor::from_config_for(&config, Modality::Image)
             .err()
             .unwrap()
             .to_string();
-        assert_eq!(counted, preprocessed);
+        let read = Params::from_config(&config, false).unwrap_err().to_string();
+        assert_eq!(constructed, read);
     }
 
     #[test]
     fn token_counts_and_degenerate_inputs() {
-        let processor = Gemma4Processor::new();
-        let config = image_config();
-        assert_eq!(
-            processor.calculate_num_tokens(512, 512, &config).unwrap(),
-            256
-        );
-        assert_eq!(
-            processor.calculate_num_tokens(1920, 1080, &config).unwrap(),
-            264
-        );
-        assert_eq!(
-            processor.calculate_num_tokens(3000, 10, &config).unwrap(),
-            280
-        );
-        assert!(processor.calculate_num_tokens(0, 10, &config).is_err());
+        let processor = Gemma4Processor::from_config_for(&image_config(), Modality::Image).unwrap();
+        assert_eq!(processor.calculate_num_tokens(512, 512).unwrap(), 256);
+        assert_eq!(processor.calculate_num_tokens(1920, 1080).unwrap(), 264);
+        assert_eq!(processor.calculate_num_tokens(3000, 10).unwrap(), 280);
+        assert!(processor.calculate_num_tokens(0, 10).is_err());
         assert_eq!(processor.model_name(), "gemma4");
         assert!(processor.supports_per_image_preprocessing());
-        assert_eq!(processor.get_processed_size(&config), None);
-        assert!(processor.preprocess(&[], &config).is_err());
+        assert_eq!(processor.get_processed_size(), None);
+        assert!(processor.preprocess(&[]).is_err());
         // No resize: the input must already be block-aligned and within budget.
         let no_resize: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"do_resize": false})).unwrap();
-        assert!(processor
-            .preprocess(&[solid(100, 100, [0; 3])], &no_resize)
-            .is_err());
-        let aligned = processor
-            .preprocess(&[solid(96, 48, [0; 3])], &no_resize)
-            .unwrap();
+        let no_resize = Gemma4Processor::from_config_for(&no_resize, Modality::Image).unwrap();
+        assert!(no_resize.preprocess(&[solid(100, 100, [0; 3])]).is_err());
+        let aligned = no_resize.preprocess(&[solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
-        assert!(processor
-            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])], &no_resize)
+        assert!(no_resize
+            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])])
             .is_err());
     }
 

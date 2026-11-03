@@ -5,14 +5,20 @@ use serde_json::Value;
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        qwen_vl::IMAGE_PAD_TOKEN, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, Qwen3OmniVisionProcessor, VisionPreProcessor},
 };
 
-const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+/// The video placeholder: the spelling the spec answers when the tokenizer
+/// cannot name the thinker config's `video_token_id`.
 const VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
-const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
+/// The audio placeholder, answered the same way for `audio_token_id`;
+/// Qwen3-ASR (`super::qwen3_asr`) reads it.
+pub(super) const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
 
 pub(super) struct Qwen3OmniSpec;
 
@@ -127,6 +133,23 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             (Modality::Video, 1),
             (Modality::Audio, 10),
         ]))
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Qwen3OmniVisionProcessor::from_config_for(preprocessor_config, modality),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn audio_processor(

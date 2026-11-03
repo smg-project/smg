@@ -1,11 +1,9 @@
 name: Release SMG to PyPI
 
+# Published only on a maintainer's dispatch against a release tag or branch
+# (scripts/release/README.md): no push publishes, and a release candidate (a ref named -rc.) is
+# refused: candidates never reach PyPI.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - bindings/python/pyproject.toml
   workflow_dispatch:
 
 permissions:
@@ -14,6 +12,9 @@ permissions:
 jobs:
   build:
     name: build on ${{ matrix.platform || matrix.os }} (${{ matrix.target }} - ${{ matrix.manylinux || 'auto' }})
+    # A candidate never reaches PyPI: its dispatch is a no-op (the upload needs this job), and the first step says why
+    # when the job is reached anyway.
+    if: ${{ !contains(github.ref_name, '-rc.') }}
     runs-on: ${{ matrix.os }}-latest
     permissions:
       contents: read
@@ -60,6 +61,17 @@ jobs:
             target: aarch64
 
     steps:
+      - name: Refuse a release candidate
+        shell: bash
+        run: |
+          # A release candidate never reaches PyPI (scripts/release/README.md): the job's if makes an -rc. dispatch
+          # a no-op, and this step holds the rule, with the reason, when the job is reached anyway.
+          case "${GITHUB_REF_NAME:-}" in
+            *-rc.*)
+              echo "${GITHUB_REF_NAME} is a release candidate: candidates are never published to PyPI (the images, the chart and the GitHub pre-release carry a candidate); dispatch this workflow against a final's tag" >&2
+              exit 1 ;;
+          esac
+
       - uses: actions/checkout@v7
         with:
           path: smg-repo
@@ -146,10 +158,23 @@ jobs:
 
   build-sdist:
     name: Build SDist
+    # The same rule as the wheels' job: the upload needs both.
+    if: ${{ !contains(github.ref_name, '-rc.') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      - name: Refuse a release candidate
+        shell: bash
+        run: |
+          # A release candidate never reaches PyPI (scripts/release/README.md): the job's if makes an -rc. dispatch
+          # a no-op, and this step holds the rule, with the reason, when the job is reached anyway.
+          case "${GITHUB_REF_NAME:-}" in
+            *-rc.*)
+              echo "${GITHUB_REF_NAME} is a release candidate: candidates are never published to PyPI (the images, the chart and the GitHub pre-release carry a candidate); dispatch this workflow against a final's tag" >&2
+              exit 1 ;;
+          esac
+
       - uses: actions/checkout@v7
         with:
           path: smg-repo

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -9,7 +11,7 @@ use crate::{
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, Qwen3VLProcessor, VisionPreProcessor},
 };
 
 pub(super) struct Qwen3VLVisionSpec;
@@ -92,9 +94,9 @@ impl Qwen3VLVisionSpec {
     /// reported no timing: the preprocessor config's `fps`, else the family's 2.
     fn sample_fps(preprocessor_config: Option<&PreProcessorConfig>) -> f64 {
         preprocessor_config
-            .and_then(|config| config.get_extra::<f32>("fps"))
+            .and_then(|config| config.get_extra::<f64>("fps"))
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .map_or(2.0, f64::from)
+            .unwrap_or(2.0)
     }
 
     /// The seconds stamped on each of `grid_t` temporal groups, as the family's
@@ -303,6 +305,24 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
             limits.insert(Modality::Video, 1);
         }
         Ok(limits)
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(Qwen3VLProcessor::from_config_for(
+                preprocessor_config,
+                modality,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

@@ -5,10 +5,16 @@ Mirrors the ``_FakeItem`` harness in ``test_hooks_zmq_filter.py``.
 
 from __future__ import annotations
 
+import os
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fixtures import hooks
+from infra import constants
+
+pytest_plugins = ["pytester"]
 
 
 class _FakeItem:
@@ -65,6 +71,10 @@ def _clean_env(monkeypatch):
         "E2E_RUNTIME",
         "E2E_ZMQ_ENGINE_COUNT",
         "E2E_MIN_SELECTED",
+        "E2E_SGLANG_SERVICER_IMPL",
+        "E2E_TOKENSPEED_SERVICER_IMPL",
+        "E2E_VLLM_SERVICER_IMPL",
+        "E2E_AMD_REQUIRE_PASSING_CALL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -286,12 +296,67 @@ def test_floor_satisfied_from_collection_hook(monkeypatch):
     assert items == [match]
 
 
-def test_sglang_zmq_lane_keeps_multimodal_and_http_error_shapes_off_the_wire():
+def test_sglang_zmq_lane_runs_multimodal_and_keeps_http_error_shapes_off_the_wire():
+    """The wire carries the preprocessed media to the scheduler, so the
+    multimodal module runs on the lane; the error-shape cases exercise
+    SGLang's own HTTP server, which the wire has no counterpart of."""
     mm = _FakeItem("e2e_test/chat_completions/test_multimodal.py::test_image[grpc]")
     shape = _FakeItem("e2e_test/chat_completions/test_error_shapes.py::test_json[http]")
     text = _FakeItem("e2e_test/chat_completions/test_basic.py::test_chat[grpc]")
     kept, deselected = hooks._filter_sglang_zmq_items([mm, shape, text])
-    assert kept == [text] and deselected == [mm, shape]
+    assert kept == [mm, text] and deselected == [shape]
+
+
+def test_tokenspeed_rust_lane_drops_only_unserved_wires_and_plain_fleets():
+    """The TokenSpeed Rust servicer serves what the engine's handshake declares
+    (control messages, the encode role, the logprob columns): a Rust lane keeps
+    the PD and EPD cases and the admin operations, and drops a fleet of plain
+    workers and a wire it does not serve."""
+    workers = lambda **kwargs: SimpleNamespace(kwargs=kwargs)  # noqa: E731
+    pd = _FakeItem(
+        "router/test_pd_topologies.py::T::t[1p1d]", params={"setup_backend": ("pd_grpc", (1, 1))}
+    )
+    # A topology whose pools carry a dict (per-pool transports or environment):
+    # the whole param cannot be hashed, its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "router/test_pd_topologies.py::T::t[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
+    )
+    pd_env = _FakeItem(
+        "router/test_pd_topologies.py::T::t[1p1d-env]",
+        params={
+            "setup_backend": ("pd_grpc", (1, 1, {"prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"}}))
+        },
+    )
+    pd_workers = _FakeItem(
+        "router/test_pd_responses.py::t", markers={"workers": workers(prefill=1, decode=1)}
+    )
+    epd = _FakeItem(
+        "chat_completions/test_epd_multimodal.py::T::t[1e1p1d]",
+        params={"setup_backend": ("epd_grpc", (1, 1, 1))},
+    )
+    admin = _FakeItem("router/test_admin_ops.py::t", params={"setup_backend": "grpc"})
+    fleet = _FakeItem("router/test_loads.py::t", markers={"workers": workers(count=2)})
+    plain = _FakeItem("chat_completions/test_openai_server.py::t", params={"setup_backend": "grpc"})
+    other = _FakeItem("router/test_other_wire.py::t", params={"setup_backend": "mesh_grpc"})
+    kept, deselected = hooks._filter_tokenspeed_rust_items(
+        [pd, pd_mixed, pd_env, pd_workers, epd, admin, fleet, plain, other]
+    )
+    assert [item.nodeid for item in kept] == [
+        pd.nodeid,
+        pd_mixed.nodeid,
+        pd_env.nodeid,
+        pd_workers.nodeid,
+        epd.nodeid,
+        admin.nodeid,
+        plain.nodeid,
+    ]
+    assert [item.nodeid for item in deselected] == [fleet.nodeid, other.nodeid]
 
 
 def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
@@ -301,6 +366,21 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     pd = _FakeItem(
         "e2e_test/chat_completions/test_pd.py::test_pd[pd_mooncake]",
         params={"setup_backend": "pd_mooncake"},
+    )
+    # A topology whose pools carry a dict: the whole param cannot be hashed,
+    # its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "e2e_test/router/test_pd_topologies.py::test_pd[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
+    )
+    epd = _FakeItem(
+        "e2e_test/chat_completions/test_epd.py::test_epd[1e1p1d]",
+        params={"setup_backend": ("epd_grpc", (1, 1, 1))},
     )
     mm = _FakeItem(
         "e2e_test/chat_completions/test_multimodal.py::test_image[grpc]",
@@ -313,7 +393,209 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     embed = _FakeItem(
         "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
     )
-    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, mm, admin, embed])
-    # Admin ops and embeddings ride the wire (control calls, embedding
-    # requests); PD topologies and multimodal payloads do not.
-    assert kept == [chat, admin, embed] and deselected == [pd, mm]
+    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, pd_mixed, epd, mm, admin, embed])
+    # Prefill/decode topologies, multimodal payloads, admin ops and embeddings
+    # ride the wire (the bootstrap slots, the scheduler's processor output,
+    # control calls, embedding requests); the EPD encode dispatch does not.
+    assert kept == [chat, pd, pd_mixed, mm, admin, embed] and deselected == [epd]
+
+
+# ---------------------------------------------------------------------------
+# pytest_collection_modifyitems: the Rust-path filters key on the implementation
+# the lane's workers run (the lane's setting, else the servicer package's default)
+# ---------------------------------------------------------------------------
+
+
+def _lane(monkeypatch, runtime: str, package_default: str | None, setting: str | None):
+    """A lane of ``runtime`` whose servicer package defaults to
+    ``package_default`` (None: the package is absent) and whose own setting is
+    ``setting`` (None: unset)."""
+    monkeypatch.setenv("E2E_RUNTIME", runtime)
+    monkeypatch.setattr(constants, "_RUNTIME_CACHE", None)
+    switch = (
+        None
+        if package_default is None
+        else (lambda variable, environ=None, **_: (package_default, "default"))
+    )
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: switch)
+    if setting is not None:
+        monkeypatch.setenv(f"E2E_{runtime.upper()}_SERVICER_IMPL", setting)
+
+
+def _rust_lane_items(runtime: str):
+    """One case the Rust path serves and one it does not, for ``runtime``."""
+    plain = _FakeItem(f"{runtime}/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"})
+    if runtime == "tokenspeed":
+        # The engine declares control, encode and logprobs on its handshake;
+        # what the lane still drops is a fleet of plain workers.
+        refused = _FakeItem(
+            "router/test_loads.py::test_fleet",
+            markers={"workers": SimpleNamespace(kwargs={"count": 2})},
+        )
+    else:
+        refused = _FakeItem(
+            "chat_completions/test_epd.py::test_epd[1e1p1d]",
+            params={"setup_backend": ("epd_grpc", (1, 1, 1))},
+        )
+    return plain, refused
+
+
+@pytest.mark.parametrize("runtime", ["tokenspeed", "sglang"])
+@pytest.mark.parametrize(
+    ("package_default", "setting", "filtered"),
+    [
+        ("rust", None, True),  # unset lane on a package whose default is the Rust servicer
+        ("python", None, False),  # unset lane on a package whose default is the Python servicer
+        (None, None, False),  # unset lane, package absent: nothing known, nothing dropped
+        ("rust", "python", False),  # an explicit python lane keeps the Rust-refused cases
+        ("python", "rust", True),  # an explicit rust lane drops them whatever the default
+    ],
+)
+def test_rust_path_filters_follow_the_effective_servicer(
+    monkeypatch, runtime, package_default, setting, filtered
+):
+    _lane(monkeypatch, runtime, package_default, setting)
+    plain, refused = _rust_lane_items(runtime)
+    config = _FakeConfig()
+    items = _run(config, [plain, refused])
+    if filtered:
+        assert items == [plain] and config.deselected == [refused]
+        assert f"1 by {runtime}-rust-servicer" in _summary(config)
+    else:
+        # The hook also orders the kept items for the worker pool.
+        assert sorted(items, key=lambda i: i.nodeid) == sorted(
+            [plain, refused], key=lambda i: i.nodeid
+        )
+        assert config.deselected == []
+        assert "rust-servicer" not in _summary(config)
+
+
+@pytest.mark.parametrize(
+    "body, enabled, exit_code, gate_signal, xml_counts",
+    [
+        pytest.param(
+            "import pytest\ndef test_case(): pytest.skip('optional')",
+            False,
+            0,
+            False,
+            (1, 0, 0),
+            id="default-off",
+        ),
+        pytest.param(
+            "import pytest\ndef test_case(): pytest.skip('optional')",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="call-skip",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.fixture\ndef missing(): pytest.skip('unavailable')\n"
+            "def test_case(missing): pass",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="setup-skip",
+        ),
+        pytest.param("def test_case(): assert True", True, 0, False, (0, 0, 0), id="pass"),
+        pytest.param(
+            "import pytest\ndef test_a(): assert True\ndef test_b(): pytest.skip('optional')",
+            True,
+            0,
+            False,
+            (1, 0, 0),
+            id="pass-and-skip",
+        ),
+        pytest.param("def test_case(): assert False", True, 1, False, (0, 1, 0), id="failure"),
+        pytest.param(
+            "import pytest\n@pytest.fixture\ndef broken(): raise RuntimeError('setup')\n"
+            "def test_case(broken): pass",
+            True,
+            1,
+            False,
+            (0, 0, 1),
+            id="setup-error",
+        ),
+        pytest.param("value = 1", True, 5, False, (0, 0, 0), id="no-tests"),
+        pytest.param(
+            "def test_case(): raise KeyboardInterrupt()",
+            True,
+            2,
+            False,
+            (0, 0, 0),
+            id="interrupted",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known', strict=True)\n"
+            "def test_case(): assert True",
+            True,
+            1,
+            False,
+            (0, 1, 0),
+            id="strict-xpass",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known')\ndef test_case(): assert False",
+            True,
+            1,
+            True,
+            (1, 0, 0),
+            id="xfail",
+        ),
+        pytest.param(
+            "import pytest\n@pytest.mark.xfail(reason='known')\ndef test_case(): assert True",
+            True,
+            0,
+            False,
+            (0, 0, 0),
+            id="xpass",
+        ),
+    ],
+)
+def test_passing_call_real_sessions(
+    pytester, monkeypatch, body, enabled, exit_code, gate_signal, xml_counts
+):
+    """Exercise the actual complete plugin in isolated pytest processes."""
+    for key in list(os.environ):
+        if key.startswith(("PYTEST_", "E2E_")):
+            monkeypatch.delenv(key)
+    hook = Path(__file__).with_name("hooks.py").resolve()
+    monkeypatch.setenv("PYTHONPATH", str(hook.parent.parent))
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    if enabled:
+        monkeypatch.setenv("E2E_AMD_REQUIRE_PASSING_CALL", "1")
+    config = pytester.makeini("[pytest]\n")
+    pytester.makeconftest(
+        f"""
+        from pathlib import Path
+        pytest_plugins = ["fixtures.hooks"]
+        def pytest_configure(config):
+            from fixtures import hooks
+            actual = Path(hooks.__file__).resolve()
+            if actual != Path({str(hook)!r}):
+                raise RuntimeError("wrong hooks module: " + str(actual))
+            Path("loaded-hook.txt").write_text(str(actual))
+        """
+    )
+    case = pytester.makepyfile(test_case=body)
+    xml_path = pytester.path / "result.xml"
+    result = pytester.runpytest_subprocess(
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(pytester.path),
+        "--junitxml",
+        str(xml_path),
+        str(case),
+        timeout=10,
+    )
+    assert result.ret == exit_code
+    assert ("AMD_E2E_NO_PASSING_CALL" in result.stdout.str() + result.stderr.str()) is gate_signal
+    assert (pytester.path / "loaded-hook.txt").read_text() == str(hook)
+    xml = ET.parse(xml_path).getroot()
+    assert tuple(len(list(xml.iter(tag))) for tag in ("skipped", "failure", "error")) == xml_counts

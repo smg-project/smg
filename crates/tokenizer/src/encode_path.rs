@@ -4,9 +4,9 @@
 //! `tokenizers` v1 pipeline (feature `tokenizers-v1`), the crate's direct
 //! byte-level encoder (`native`), and `tokenizers` 0.23 itself. Each of the
 //! first two takes the tokenizers whose configuration it reproduces and
-//! declines the rest with a reason ([`Declined`]); the load logs the path it
+//! declines the rest with a reason (`Declined`); the load logs the path it
 //! ended on and those reasons, once. After the choice an input can still
-//! leave the direct encoder for `tokenizers` ([`Fallback`]), which costs the
+//! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
 //! work done up to that point.
 //!
 //! The process-lifetime totals here have the shape of `cache::activity`:
@@ -86,9 +86,6 @@ impl fmt::Display for Declined {
 /// choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fallback {
-    /// The text is not in NFC under an NFC normalizer; found before any
-    /// work, by the quick check or a normalizing pass.
-    NotNfc,
     /// The model declined a piece (a vocabulary whose `unk_token` is not in
     /// it, in `tokenizers` 0.23); found after the pieces before it were
     /// tokenized, so that the error surfaces from the `tokenizers` encode.
@@ -99,21 +96,19 @@ impl Fallback {
     /// The reason's name as the metrics write it.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::NotNfc => "not_nfc",
             Self::PieceDeclined => "piece_declined",
         }
     }
 
     fn index(self) -> usize {
         match self {
-            Self::NotNfc => 0,
-            Self::PieceDeclined => 1,
+            Self::PieceDeclined => 0,
         }
     }
 }
 
 static LOADS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static FALLBACKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static FALLBACKS: [AtomicU64; 1] = [AtomicU64::new(0)];
 
 /// Count one load that ended on `path`.
 pub(crate) fn note_load(path: EncodePath) {
@@ -138,7 +133,7 @@ pub struct EncodePathLoads {
 /// tokenizer instances.
 #[derive(Debug, Clone, Copy)]
 pub struct EncodeFallbacks {
-    /// `not_nfc` or `piece_declined`, see [`Fallback`].
+    /// `piece_declined`, see `Fallback`.
     pub reason: &'static str,
     /// Inputs encoded by `tokenizers` after the direct encoder gave them
     /// up; one per input, a batch counting each of its inputs.
@@ -154,8 +149,8 @@ pub fn encode_path_loads() -> [EncodePathLoads; 3] {
 }
 
 /// Read process-lifetime totals, including activity before a metrics recorder exists.
-pub fn encode_fallbacks() -> [EncodeFallbacks; 2] {
-    [Fallback::NotNfc, Fallback::PieceDeclined].map(|fallback| EncodeFallbacks {
+pub fn encode_fallbacks() -> [EncodeFallbacks; 1] {
+    [Fallback::PieceDeclined].map(|fallback| EncodeFallbacks {
         reason: fallback.as_str(),
         encodes: FALLBACKS[fallback.index()].load(Ordering::Relaxed),
     })

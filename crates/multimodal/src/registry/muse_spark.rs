@@ -17,7 +17,7 @@
 //! replacement declares its feature ranges. Images and frames travel as patch
 //! rows with per-item grids (see [`crate::vision::processors::muse_spark`]);
 //! audio as the clip's padded samples, `[samples, 1]` rows flat over the
-//! batch (see [`crate::audio::processors::muse_spark`]).
+//! batch (see [`crate::audio::processors::MuseSparkAudioProcessor`]).
 
 use std::collections::HashMap;
 
@@ -39,8 +39,11 @@ use crate::{
         VideoSamplingInfo,
     },
     vision::{
-        processors::muse_spark::{DEFAULT_MERGE_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE},
-        PreProcessorConfig,
+        processors::{
+            muse_spark::{DEFAULT_MERGE_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE},
+            MuseSparkVisionProcessor,
+        },
+        PreProcessorConfig, VisionPreProcessor,
     },
 };
 
@@ -57,7 +60,7 @@ const AUDIO_END: &str = "<|soft_audio_end|>";
 /// released checkpoints raise it in their processor config.
 const DEFAULT_VIDEO_FRAMES: usize = 96;
 /// The reference video processor class's sampling rate (`fps`).
-const DEFAULT_VIDEO_FPS: f32 = 2.0;
+const DEFAULT_VIDEO_FPS: f64 = 2.0;
 /// The reference video processor class's stamp (`frame_timestamp_format`);
 /// the released checkpoints write two decimals.
 const DEFAULT_FRAME_TIMESTAMP_FORMAT: &str = "Time: {timestamp:.1f}s";
@@ -295,7 +298,7 @@ impl MuseSparkSpec {
         let sample_fps = config
             .get_extra::<f64>("fps")
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .unwrap_or_else(|| f64::from(DEFAULT_VIDEO_FPS));
+            .unwrap_or(DEFAULT_VIDEO_FPS);
         let format = config
             .get_extra::<String>("frame_timestamp_format")
             .unwrap_or_else(|| DEFAULT_FRAME_TIMESTAMP_FORMAT.to_string());
@@ -472,6 +475,23 @@ impl ModelProcessorSpec for MuseSparkSpec {
 
     /// No audio tower is a model without audio; a tower whose geometry the
     /// processor cannot serve is an error naming the field.
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                MuseSparkVisionProcessor::from_preprocessor_config(preprocessor_config),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn audio_processor(
         &self,
         model_config: &Value,
@@ -508,14 +528,14 @@ impl ModelProcessorSpec for MuseSparkSpec {
     }
 
     /// The reference video processor's `fps`.
-    fn default_video_sample_fps(&self) -> Option<f32> {
+    fn default_video_sample_fps(&self) -> Option<f64> {
         Some(DEFAULT_VIDEO_FPS)
     }
 
-    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f32> {
+    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
         Some(
             config
-                .and_then(|config| config.get_extra::<f32>("fps"))
+                .and_then(|config| config.get_extra::<f64>("fps"))
                 .filter(|fps| fps.is_finite() && *fps > 0.0)
                 .unwrap_or(DEFAULT_VIDEO_FPS),
         )

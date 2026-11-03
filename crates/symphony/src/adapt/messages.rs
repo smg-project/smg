@@ -9,7 +9,7 @@
 //! block's `input` is the call's argument fragments parsed as one JSON value. Fragments that are no
 //! whole JSON text, which the parser said in a `Malformed` event (the output cut inside the
 //! arguments, or the model wrote something else after a prefix a strict reader accepts), give the
-//! value their complete members make ([`Prefix::closed`]): the prefix the readers sent, cut back to
+//! value their complete members make (`Prefix::closed`): the prefix the readers sent, cut back to
 //! the last member complete at every level and closed, which is the value a client's partial JSON
 //! reader ends with from the stream's deltas; `{}` where nothing of it is complete, and for a call
 //! the model closed without arguments. Fragments that are one whole JSON text no `input` value
@@ -411,7 +411,7 @@ mod tests {
     fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.into(),
+            json: json.to_owned().into(),
             source: Text::default(),
         }
     }

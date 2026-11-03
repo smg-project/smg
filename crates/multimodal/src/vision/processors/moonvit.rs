@@ -30,7 +30,7 @@ use crate::vision::{
     transforms::{self, TransformError, TransparentBg, TransparentBgFillStage},
 };
 
-/// MoonViT resize/patchify parameters for a single model.
+/// MoonViT resize/patchify/normalize parameters for a single model.
 #[derive(Debug, Clone, Copy)]
 pub struct MoonVitParams {
     pub patch_size: usize,
@@ -39,6 +39,10 @@ pub struct MoonVitParams {
     pub in_patch_limit: usize,
     /// Maximum patches along one spatial dimension.
     pub patch_limit_on_one_side: usize,
+    /// Normalization mean (the config's, else CLIP's).
+    pub mean: [f64; 3],
+    /// Normalization std (the config's, else CLIP's).
+    pub std: [f64; 3],
 }
 
 impl MoonVitParams {
@@ -49,9 +53,8 @@ impl MoonVitParams {
 
     /// Overlay whatever the model's `preprocessor_config.json` supplies.
     ///
-    /// The registry hands out one shared processor instance built from
-    /// compiled-in defaults, so this is the only point where a model's real
-    /// limits can be applied. K2.5 and K3 ship different `in_patch_limit`
+    /// A processor resolves this once, when it is built for the model, over
+    /// its compiled-in defaults. K2.5 and K3 ship different `in_patch_limit`
     /// values (16384 vs 65536), which is exactly the kind of divergence that
     /// silently caps resolution if the defaults win.
     pub fn resolved(self, config: &PreProcessorConfig) -> Self {
@@ -67,6 +70,8 @@ impl MoonVitParams {
                 .get_extra::<usize>("patch_limit_on_one_side")
                 .unwrap_or(self.patch_limit_on_one_side)
                 .max(1),
+            mean: config.get_image_mean(),
+            std: config.get_image_std(),
         }
     }
 
@@ -246,7 +251,6 @@ fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f
 pub fn preprocess(
     params: MoonVitParams,
     images: &[DynamicImage],
-    config: &PreProcessorConfig,
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
     if images.is_empty() {
@@ -254,8 +258,7 @@ pub fn preprocess(
     }
 
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
-    let mean = config.get_image_mean();
-    let std = config.get_image_std();
+    let (mean, std) = (params.mean, params.std);
 
     // Pre-size the pooled batch buffer exactly (patch_features per patch =
     // 3 * patch_size^2; this is the data plane's hottest allocation).

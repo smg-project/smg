@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::profile::ProviderProfile;
 
 use crate::routers::{
     error,
@@ -54,11 +55,18 @@ impl BuildStage for TranscriptionRequestBuildingStage {
 
         // The backend request is chat-shaped: reuse the chat build path on the
         // request synthesized in preparation. Regular-only, so a single-plan
-        // request with no PD metadata and no tool constraints.
+        // request with no PD metadata and no tool constraints. The profile is
+        // the one the shared chat preparation derived for that request.
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(&chat_request.model));
         let (plan, stamp, _) = build_chat_backed_plan(
             ctx,
             &chat_request,
+            provider,
             processed_messages.text,
+            processed_messages.generation_prompt,
             processed_messages.continued_final_message,
             token_ids,
             None,

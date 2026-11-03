@@ -33,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
 )
@@ -41,6 +42,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
+    METRICS_PORT_ENV,
     SERVICER_IMPL_ENV,
     default_kv_events_config,
     serve_rust,
@@ -142,6 +144,8 @@ async def serve_grpc(
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))
+        # A metrics port under the Python servicer is a port nobody serves.
+        check_metrics_port_needs_rust(impl, server_args, METRICS_PORT_ENV)
         # The Python servicer gets the Rust path's KV-events default too:
         # server args without --kv-events-config have SGLang's ZMQ publisher
         # on, at a port found free on this host, before the schedulers and the
@@ -637,12 +641,20 @@ def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> A
     except ValueError as error:
         logger.warning("%s; the planned warm-up is skipped", error)
         return None
+    if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
+        # This servicer's own warm-up request above carried the stand-in
+        # bootstrap already; the planned pass on a prefill or decode leg is
+        # the Rust launcher's (this servicer's start-up is kept as it is).
+        logger.info("Planned warm-up: none on a disaggregation role on this servicer")
+        return None
     facts = {
         "is_generation": bool(getattr(model_info, "is_generation", True)),
         "max_context_length": getattr(model_info, "max_context_length", 0),
         "vocab_size": getattr(model_info, "vocab_size", 0),
     }
-    plan = plan_for(setting, warmup_inputs(server_args, facts), knob=WARMUP_ENV)
+    # This servicer's generate path forwards no rank pin, so the plan is one
+    # rank's (the engine's own load balancing places its requests).
+    plan = plan_for(setting, warmup_inputs(server_args, facts, pins_ranks=False), knob=WARMUP_ENV)
     if plan is None:
         return None
     return run_warmup(plan, warmup_wire("", channel=channel), budget_secs=setting.budget_secs)

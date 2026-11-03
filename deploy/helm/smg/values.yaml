@@ -17,6 +17,16 @@ global:
 router:
   replicas: 1
 
+  # -- Rollout progress deadline of the router Deployment, in seconds.
+  #    /readiness follows the engine, so the deadline covers the gateway's own
+  #    worker start-up bound (--worker-startup-timeout-secs, 1800 s by default)
+  #    plus the chart's tail after it (one start-up poll of 30 s, the readiness
+  #    probe's period, the registration) and a margin for the image pull and
+  #    container start, which run on the rollout's clock before the gateway's.
+  #    Raise it with --worker-startup-timeout-secs (README, Readiness
+  #    Deadlines). The mesh StatefulSet has no such field.
+  progressDeadlineSeconds: 1920
+
   # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
   policy: cache_aware
 
@@ -30,13 +40,19 @@ router:
     enabled: false
     port: 39527               # mesh gossip port
     # peerUrls: []            # auto-generated from StatefulSet pod DNS
+    # Without peerUrls the routers find each other among the release's router
+    # pods through the Kubernetes API, which the gateway runs only inside
+    # Kubernetes discovery; with the file, slurm or consul discovery
+    # provider, set peerUrls.
 
   # -- Explicit worker URLs
   workerUrls: []
   #   - http://worker-1:8000
   #   - grpc://worker-2:8001
 
-  # -- Kubernetes service discovery (auto-discover worker pods by label)
+  # -- Kubernetes service discovery (auto-discover worker pods by label).
+  #    The legacy spelling of discovery.provider=kubernetes, rendering the
+  #    arguments it always has; set this or discovery.provider, not both.
   serviceDiscovery:
     enabled: false
     clusterWide: false     # set true to watch all namespaces (requires ClusterRole/ClusterRoleBinding)
@@ -45,6 +61,73 @@ router:
     port: 80
     # -- Extract model ID from pod metadata
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
+
+  # -- Worker discovery: where the router finds its workers at runtime
+  #    (README, Worker Discovery). Selecting a provider turns IGW mode on in
+  #    the gateway, and the chart's `workers` are then no longer passed as
+  #    --worker-urls: the provider is the source of workers.
+  discovery:
+    # -- "" (off), kubernetes, file, slurm or consul
+    provider: ""
+    # -- Seconds between the provider's periodic passes (the gateway's
+    #    default, 30, when unset). Kubernetes, file and Consul discovery apply
+    #    a change as it happens and use the pass to retry; Slurm polls on it.
+    checkIntervalSecs: null
+
+    # -- Worker pods found by label through the Kubernetes API; the chart
+    #    creates the Role (ClusterRole when clusterWide) that allows it
+    kubernetes:
+      clusterWide: false   # watch all namespaces (ClusterRole/ClusterRoleBinding)
+      namespace: ""        # defaults to release namespace
+      selector: ""         # e.g. "app=sglang-worker"; empty matches no pod
+      port: 80             # for pods without a smg.ai/worker-ports annotation
+      modelIdFrom: ""      # "namespace", "label:key", or "annotation:key"
+
+    # -- Workers listed in a JSON manifest the gateway rereads when it
+    #    changes. The manifest usually comes from an existing ConfigMap,
+    #    mounted whole at /etc/smg/discovery: the kubelet projects each update
+    #    of it into the pod, which a subPath mount would not.
+    file:
+      configMap:
+        name: ""           # existing ConfigMap holding the manifest
+        key: workers.json  # its key holding the manifest
+      path: ""             # the manifest's path in the pod (default: the ConfigMap key under /etc/smg/discovery)
+
+    # -- Workers on the nodes of running Slurm jobs, found with `squeue` and
+    #    `scontrol`. The published image has no Slurm client: this needs an
+    #    image with Slurm >= 23.11 clients and the cluster's configuration and
+    #    authentication (README, Worker Discovery).
+    slurm:
+      jobNames: []         # jobs whose nodes are regular workers
+      encodeJobNames: []
+      prefillJobNames: []
+      decodeJobNames: []
+      port: null           # the inference server's port on every node (required)
+      bootstrapPort: null  # bootstrap port of encode and prefill workers
+      user: ""             # whose jobs (default: the router's user, UID 65532 in the published image)
+      account: ""
+      partition: ""
+
+    # -- Instances of a Consul service with passing health checks. The ACL
+    #    token and the TLS files reach the gateway through Consul's own
+    #    environment variables, never as arguments.
+    consul:
+      service: ""          # required
+      address: ""          # e.g. https://consul-server.consul:8501 (default: CONSUL_HTTP_ADDR, else 127.0.0.1:8500)
+      datacenter: ""       # default: the agent's own
+      # -- An existing Secret holding the ACL token, set as CONSUL_HTTP_TOKEN
+      token:
+        existingSecret: ""
+        secretKey: token
+      # -- An existing Secret holding the TLS files, mounted at
+      #    /etc/smg/consul-tls and named by CONSUL_CACERT, CONSUL_CLIENT_CERT
+      #    and CONSUL_CLIENT_KEY. Give the address an https:// scheme.
+      tls:
+        existingSecret: ""
+        secretKeys:
+          caCert: ca.crt   # added to the default trust roots (empty: those alone)
+          clientCert: ""   # client certificate and key: both or neither
+          clientKey: ""
 
   # -- Model / tokenizer
   model: ""                # HuggingFace model ID or local path
@@ -62,6 +145,7 @@ router:
   # -- Request handling
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
+  grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
   maxConcurrentRequests: -1    # -1 = unlimited
   queueSize: 100
   queueTimeoutSecs: 60
@@ -195,9 +279,13 @@ router:
   #    no healthy worker, while a tokenizer is not yet registered and while it
   #    drains after SIGTERM, so traffic is steered away from such a pod. A
   #    router whose workers are registered at runtime through the admin API
-  #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
-  #    configured) stays unready until the first one is: set `path: /health`
-  #    there, or register through a port-forward to the pod.
+  #    (no `workers`, `router.workerUrls`, `router.serviceDiscovery` or
+  #    `router.discovery` configured) stays unready until the first one is:
+  #    set `path: /health` there, or register through a port-forward to the
+  #    pod. A worker's engine counts as healthy only once it reports so, which
+  #    for a large checkpoint is tens of minutes after its pod starts: every
+  #    deadline on the router's readiness has to cover that bring-up (README,
+  #    Readiness Deadlines).
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
@@ -208,6 +296,9 @@ router:
   #    terminationGracePeriodSeconds is this plus terminationGraceMarginSeconds,
   #    so the drain is not cut short by the kubelet's default 30 s.
   shutdownGracePeriodSeconds: 180
+  # -- Listener propagation window; null retains the default 5 seconds.
+  #    Explicit seconds are capped at half the grace period; 0 skips the window.
+  shutdownSettleSeconds: null
   terminationGraceMarginSeconds: 30
 
   # -- Optional features
@@ -219,6 +310,12 @@ router:
     configPath: ""
   reasoningParser: ""
   toolCallParser: ""
+  # -- Which parser reads a chat completion's reasoning and tool calls: "symphony"
+  #    (one table per model family) or "legacy" (the older per-model parsers). Empty
+  #    renders no --parser, so the image's own default applies (Symphony from the
+  #    release after 1.13.0 on, the older parsers on 1.13.0). A set value needs an
+  #    image of 1.13.0 or later and applies to gRPC and ZMQ workers only.
+  parser: ""
 
 # =============================================================================
 # HuggingFace Configuration
@@ -309,7 +406,12 @@ serviceAccount:
 
 rbac:
   # -- Create Role/RoleBinding for K8s service discovery (pods list/watch).
-  #    Automatically enabled when router.serviceDiscovery.enabled=true.
+  #    Created anyway when the router calls the Kubernetes API: Kubernetes
+  #    worker discovery (router.serviceDiscovery.enabled or
+  #    router.discovery.provider=kubernetes), or mesh without peerUrls, which
+  #    finds its peers among the router pods. The file, Slurm and Consul
+  #    providers need none. Created in the namespace Kubernetes discovery
+  #    watches, the release's unless its namespace setting names another.
   create: false
 
 # =============================================================================
@@ -320,6 +422,63 @@ grafana:
     enabled: false
     labels:
       grafana_dashboard: "1"
+
+# =============================================================================
+# Prometheus alerting rules (a PrometheusRule for the Prometheus Operator)
+# =============================================================================
+# Ten alerts over the families the router already exposes; the thresholds are
+# starting points for a serving fleet, not laws: set them to the deployment's
+# SLOs. The rationale of each default:
+#   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
+#     minutes is an outage to a retrying client; a shorter window pages on one
+#     worker's restart.
+#   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
+#     p99 above five seconds for ten minutes means queues are building in
+#     front of the engines (set it to the SLO once there is one).
+#   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
+#     overlap of a rolling restart.
+#   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
+#     preempts and recomputes; sustained, the fleet is undersized.
+#   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
+#     is gone or not ready, not a missed scrape; a target that left discovery
+#     (no up series at all) counts the same.
+#   circuitBreakerOpenFor 5m: the breaker reopens on each failed trial after
+#     its timeout, so a worker that fails requests while passing its health
+#     probes cycles open -> half-open -> open; five minutes in either state
+#     is that worker, not one failed call.
+#   admissionRejectionsFor 5m: rejections at the admission queue for five
+#     minutes are sustained overload, not a burst.
+#   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
+#     runtime's canary; a handful in ten minutes is a blocked thread or CPU
+#     starvation.
+#   degradedRanksFor 30m: a degraded rank is expected right after a gateway
+#     attaches to a running engine and clears at the next resync; half an
+#     hour means it did not.
+prometheusRule:
+  enabled: false
+  # -- Labels the Prometheus Operator selects rules by (e.g. release: prometheus).
+  labels: {}
+  # -- The label matcher that selects this release's series (every alert
+  #    carries it and keeps namespace and job through its aggregation, so
+  #    several releases on one Prometheus alert apart), e.g.
+  #    namespace="team-a", job="smg-router".
+  #    Empty: this release's namespace and the Service name the ServiceMonitor
+  #    scrapes (<fullname>-router, the Operator's default job label); the
+  #    namespace keeps a same-named release in another namespace out.
+  jobSelector: ""
+  alerts:
+    errorRatio: 0.05
+    errorRatioFor: 5m
+    ttftP99Seconds: 5
+    ttftP99For: 10m
+    noHealthyWorkerFor: 1m
+    kvUsage: 0.9
+    kvUsageFor: 10m
+    scrapeMissingFor: 2m
+    circuitBreakerOpenFor: 5m
+    admissionRejectionsFor: 5m
+    eventLoopStalls: 5
+    degradedRanksFor: 30m
 
 # =============================================================================
 # Workers Configuration
@@ -337,8 +496,16 @@ workers: []
 #       count: 1                        # GPUs per replica (tensor parallel size)
 #       type: nvidia.com/gpu            # resource name (default)
 #     image:
+#       registry: ghcr.io               # default
+#       repository: smg-project/smg     # default: the path the engine images are published under
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
+#     metrics:                          # the engine pod's Prometheus endpoint (gRPC mode only)
+#       enabled: false                  # true: the worker runs the Rust servicer, which serves
+#                                       # GET /metrics (smg_servicer_*); the Python servicer has no
+#                                       # endpoint, and the SGLang Rust servicer serves neither
+#                                       # PD/EPD disaggregation nor image/video input yet
+#       port: 29100                     # the metrics listener's port; must differ from `port`
 #     resources: {}
 #     extraArgs: []                     # extra engine CLI args
 #     extraEnv: []
@@ -349,6 +516,7 @@ workers: []
 #       initialDelaySeconds: 60
 #       periodSeconds: 10
 #       failureThreshold: 30
+#     progressDeadlineSeconds: 960      # rollout deadline; default: the startup probe's budget + 600 s
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:

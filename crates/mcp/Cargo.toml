@@ -1,6 +1,6 @@
 [package]
 name = "smg-mcp"
-version = "2.3.5"
+version = "2.3.6"
 edition = "2021"
 description = "Model Context Protocol (MCP) client implementation"
 license = "Apache-2.0"
@@ -17,8 +17,6 @@ categories = ["api-bindings"]
 name = "smg_mcp"
 
 [dependencies]
-async-trait.workspace = true
-axum.workspace = true
 futures.workspace = true
 dashmap.workspace = true
 lru.workspace = true

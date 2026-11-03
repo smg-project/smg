@@ -1,8 +1,8 @@
 # cargo-audit configuration. `cargo audit` runs on every pull request that changes the dependency
 # graph (the cargo-audit job of pr-test-rust.yml) and daily on main (cargo-audit-nightly.yml), both
 # through scripts/ci_cargo_audit.sh. A vulnerability that is not listed here fails the job; an
-# unmaintained or yanked crate is printed as an allowed warning. Every entry needs a reason and a
-# review date, and goes when the fixed release is in the lockfile.
+# unmaintained, yanked or unsound crate is printed as an allowed warning. Every entry needs a reason
+# and a review date, and goes when the fixed release is in the lockfile.
 [advisories]
 ignore = [
     # RUSTSEC-2023-0071: rsa 0.9, a timing side channel on RSA private-key operations (Marvin),
@@ -14,9 +14,23 @@ ignore = [
     # secret to leak. Review by 2027-01-15.
     "RUSTSEC-2023-0071",
 
-    # Unmaintained crates without a release that drops them. cargo-audit reports them as warnings
-    # (the job stays green); they are listed so that a new warning stands out in the job's output
-    # and each one carries its exit and a review date.
+    # RUSTSEC-2026-0387: crypto-bigint 0.5, operations meant to be constant-time (subtraction, zero
+    # counting, division, Montgomery multiplication, limb equality, inversion) that can branch on
+    # their operands; fixed in 0.7.6. The crate reaches the runtime graph only through the
+    # rust_crypto backend of jsonwebtoken (crates/auth; model_gateway's dev-dependency signs test
+    # tokens only): elliptic-curve 0.13 and ecdsa 0.16 / p256 0.13 / p384 0.13 / primeorder 0.13
+    # pin crypto-bigint 0.5, and every released jsonwebtoken (10.0 through 11.1) requires p256
+    # 0.13, so neither a lockfile bump nor a manifest bump reaches the fixed line. The gateway
+    # verifies ES256/ES384 JWT signatures with public keys (DecodingKey built from JWKS components)
+    # and never signs with an EC private key outside its test suite, so the variable-time
+    # operations run on public inputs only. Goes when jsonwebtoken's rust_crypto backend moves to
+    # the 0.14 curve crates (released: elliptic-curve 0.14.1, p256 0.14.0, crypto-bigint 0.7.6) or
+    # when the backend changes. Review by 2027-01-15.
+    "RUSTSEC-2026-0387",
+
+    # Warning-level advisories: unmaintained crates without a release that drops them. cargo-audit
+    # reports them as warnings (the job stays green); they are listed so that a new warning stands
+    # out in the job's output and each one carries its exit and a review date.
 
     # RUSTSEC-2025-0012: backoff 0.4, the retry policy of the workflow engine (crates/workflow;
     # crates/mcp declares it as well). RUSTSEC-2024-0384: instant 0.1, pulled by backoff alone.

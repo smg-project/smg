@@ -94,8 +94,9 @@
 //! in a state of its own has no start to choose.
 //!
 //! An **unopened row** names the state a turn starts in when the prompt opens no turn for the
-//! model. A template that writes the turn opener after a user message only (DeepSeek's) leaves
-//! the turn unopened when the conversation ends with a system message rendered in place, and the
+//! model. A template that writes the turn opener after some messages only (DeepSeek's: not after
+//! a system message a latest reminder follows; the checkpoint's own encoder file, after user and
+//! developer turns only) leaves the turn unopened when the conversation ends there, and the
 //! model starts its turn as its default has it: DeepSeek inside its thought. The prompt opens no
 //! turn when it holds no turn opener, or when the turn's end the row names (`<｜end▁of▁sentence｜>`)
 //! follows the last one: the turn it opened is over, and nothing opened the next. Nothing of such
@@ -295,6 +296,9 @@ pub enum CallId {
 pub struct Format {
     name: String,
     terminals: Vec<Terminal>,
+    /// The terminals' texts as the engine's scanner takes them ([`Self::terminal_texts`]), built
+    /// once here and shared by every scanner the format makes, so that a request copies nothing.
+    scanner_markers: Arc<[String]>,
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
@@ -411,6 +415,7 @@ impl Format {
         Self {
             name: name.into(),
             terminals: Vec::new(),
+            scanner_markers: Arc::from([]),
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
@@ -439,6 +444,7 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
     }
 
@@ -453,7 +459,20 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
+    }
+
+    /// The shared marker list follows the terminals: rebuilt when one is added (at build time,
+    /// a handful of times per format), never per request.
+    fn rebuild_scanner_markers(&mut self) {
+        self.scanner_markers = self.terminal_texts().map(str::to_owned).collect();
+    }
+
+    /// A scanner over the format's terminals, numbered as [`Self::terminal_texts`] lists them:
+    /// what [`Scanner::new`] over those texts would be, sharing the format's list.
+    pub(crate) fn scanner(&self) -> Scanner {
+        Scanner::sharing(Arc::clone(&self.scanner_markers))
     }
 
     /// A token of the model's vocabulary that the format's tags begin with (`<|open|>`,
@@ -648,9 +667,10 @@ impl Format {
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
     /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
     /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
-    /// DeepSeek's template writes the turn opener after a user message only, so a conversation
-    /// that ends with a system message rendered in place leaves the turn unopened, and the model,
-    /// which thinks unless told not to, starts inside its thought. Nothing of such a prompt is
+    /// DeepSeek's template writes no turn opener after a system message a latest reminder
+    /// follows (the checkpoint's own encoder file, after no system message at all), so such a
+    /// conversation leaves the turn unopened, and the model, which thinks unless told not to,
+    /// starts inside its thought. Nothing of such a prompt is
     /// replayed. The state must already be in the table; the table must name a turn opener.
     #[must_use]
     pub fn unopened_turn_starts_in(mut self, state: &str, turn_end: &str) -> Self {
@@ -776,14 +796,14 @@ impl Format {
     /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
     /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
     /// arguments state or a calls wrapper, and the message frame's are the terminals with a row
-    /// into or out of the frame ([`Self::message_framing`]): a table whose thought is framed by
+    /// into or out of the frame (`Self::message_framing`): a table whose thought is framed by
     /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
     /// neither does the variant [`Self::without_calls`] made of it. A state's own text rows
     /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
     /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
-    /// its text and counts no malformed run, as in the table ([`Self::is_remade`]), so an output
+    /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
     /// counts the same whether the request separates reasoning or not.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
@@ -815,7 +835,7 @@ impl Format {
     /// text where they move the engine, so a call's bytes stay in the content as the model wrote
     /// them. The markers that frame the thought and the answer are not shown: a marker that also
     /// opens the thought, and, where the turn starts in a message header
-    /// ([`Self::message_framing`]: Inkling's arguments state, which the message opener returns
+    /// (`Self::message_framing`: Inkling's arguments state, which the message opener returns
     /// to and the thought and the answer open from), every marker of the message frame, which
     /// stays dropped in a variant made of this one too; so the thought and the answer read as
     /// before, their markers dropped, and a call the model writes anyway is content between
@@ -827,7 +847,7 @@ impl Format {
     /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
     /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
     /// state made content here is its text and adds no malformed run of its own
-    /// ([`Self::is_remade`]): in the table the call's syntax reads it and says what it is.
+    /// (`Self::is_remade`): in the table the call's syntax reads it and says what it is.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
         let frame = self.message_frame();
@@ -946,8 +966,10 @@ impl Format {
             .collect()
     }
 
-    /// The turn opener, if the table names one.
-    pub(crate) fn turn_opener(&self) -> Option<&str> {
+    /// The turn opener, if the table names one: what the template writes before the model's turn.
+    /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
+    /// turn's start on it ([`Self::unopened_turn_starts_in`]).
+    pub fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
     }
 
@@ -1086,7 +1108,7 @@ impl Format {
             .turn_opener()
             .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
             .map_or(0, str::len);
-        let mut scanner = Scanner::new(self.terminal_texts());
+        let mut scanner = self.scanner();
         let (mut state, mut rest) = (start, start);
         // Whether the prompt wrote text other than whitespace in the stay the output continues;
         // a marker is the template's, whether or not a row reads it here.

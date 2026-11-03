@@ -7,9 +7,12 @@ the headless engine, construct the server, poll ``engine_ready`` /
 ``last_error``, close admission with ``set_serving(False)``, then wait for
 ``active_requests`` to reach zero (or the drain deadline) before ``stop``.
 The count includes aborted requests until their response streams are released.
-``set_ready(False)`` holds the health answer alone, admission open, for the
-launcher's own requests before SERVING (its planned warm-up); ``set_ready(True)``
-releases it.
+``set_ready(False)`` holds the health answer alone, admission open to the
+launcher's own requests before SERVING (its planned warm-up's, ``smg-warmup-<n>``)
+and to nothing else; ``set_ready(True)`` releases it. ``kv_relay_subscribed``
+says whether the KV-event relay's subscription reached the engine's publisher
+(or there is none to wait for), which the launcher reads before it starts the
+warm-up.
 Worker-side media processing is the one request-time crossing, when the
 Python processors are chosen: a ``media_processor`` object
 (``smg_grpc_servicer.vllm.rust_media``) runs them for a request's
@@ -25,13 +28,26 @@ over same-host headless TokenSpeed scheduler(s) on their msgpack ZMQ wire, with 
 same lifecycle shape; its launcher is ``serve_rust`` in
 ``smg_grpc_servicer.tokenspeed.rust``, reached by setting
 ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` on ``python -m smg_grpc_servicer.tokenspeed``.
+
+:class:`TrtllmGrpcServer` serves ``trtllm.TrtllmService`` over a same-host
+TensorRT-LLM engine behind the shim beside its LLM API (the shim dials the
+msgpack ZMQ wire), with the same lifecycle shape; its launcher is ``serve_rust``
+in ``smg_grpc_servicer.trtllm``, reached by setting ``SMG_TRTLLM_SERVICER_IMPL=rust``
+on the engine's gRPC entrypoint.
 """
 
 from smg.smg_rs import (
     SglangGrpcServer,
     TokenSpeedGrpcServer,
+    TrtllmGrpcServer,
     VllmGrpcServer,
     init_servicer_tracing,
 )
 
-__all__ = ["SglangGrpcServer", "TokenSpeedGrpcServer", "VllmGrpcServer", "init_servicer_tracing"]
+__all__ = [
+    "SglangGrpcServer",
+    "TokenSpeedGrpcServer",
+    "TrtllmGrpcServer",
+    "VllmGrpcServer",
+    "init_servicer_tracing",
+]

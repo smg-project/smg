@@ -70,10 +70,9 @@ What this table says beyond the Qwen ones:
   the tag wherever the block opens (after a text preamble, after the thought's close, at a chat
   turn's start, after a tool result), whole and streamed alike: the scanner takes the longer
   marker where the blank line stands and holds a newline that may begin it. The bare tag still
-  opens a block written without the blank line, as it did; what precedes it is content. V4 and
-  V3.2 keep their reading (the blank line is content where text precedes it) until their
-  reference parsers are read the same way; the legacy `deepseek_v41` parser strips exactly this
-  blank line too.
+  opens a block written without the blank line, as it did; what precedes it is content. The V4
+  and V3.2 tables spell their openers the same way (their sections); the legacy `deepseek_v41`
+  parser strips exactly this blank line too.
 
 ## DeepSeek V4 (`deepseek_v4`)
 
@@ -89,24 +88,34 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   first and its parser refuses a block inside the thought; the gateway's legacy reasoning parser for
   this checkpoint ends the thought on `</think>` alone, so a block inside it stays in the thought
   there; this table reads the call.
-- **The template writes two newlines before the block.** They are what the template renders and
-  what this table's forced-call tag writes (`Tags::DSML_V4.before_block`), not what its reading
-  needs: the table enters the block on its opener wherever it stands, after the thought's text or
-  the content's last byte as much as after the newlines, and the newlines the model writes are
-  content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
-  The family's reference parser is the one that looks for the block after the two newlines; the
-  V4.1 table spells its opener that way (its section). The prompt ends with `<think>` in thinking mode and with `</think>` right after
-  `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
-  bellwether has not recorded the group's set yet.
+- **The block's opener is the blank line and the tag.** The template writes two newlines before
+  the block (what this table's forced-call tag writes too, `Tags::DSML_V4.before_block`), and the
+  family's reference parser (the model repository's `encoding` module) looks for the block as
+  `\n\n<｜DSML｜tool_calls`, reading the content up to there and otherwise as written: a blank
+  line inside the content, a third newline or a space before the block's blank line, and
+  whitespace at the turn's end stay. The table spells the opener the same way, as a second
+  terminal beside the bare tag, so the blank line leaves with the tag wherever the block opens
+  (after a text preamble, after the thought's close, at a chat turn's start, after a tool result,
+  in a turn the prompt leaves unopened), whole and streamed alike: the scanner takes the longer
+  marker where the blank line stands and holds a newline that may begin it. The bare tag still
+  opens a block written without the blank line, as it did; what precedes it is content (the
+  legacy parser trims those newlines too). The prompt ends with `<think>` in thinking mode and
+  with `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside
+  the thought or in the content; bellwether has not recorded the group's set yet.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
-  `<｜Assistant｜>` and the thought's opener after a user message only: a conversation that ends with
-  a system message rendered in place (a coding agent's environment notes after the user turn, and
-  after every tool result) has no opener for the model's turn, and the model, which thinks unless
+  `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
+  ends the conversation or that an assistant turn follows (a coding agent's environment notes and
+  its notes after tool results take the opener); a system message a latest reminder follows stays
+  bare, and the checkpoint's own encoder file opens the turn after user and developer turns only,
+  so a prompt can still have no opener for the model's turn, and the model, which thinks unless
   told not to, writes its thought and `</think>` as it would after `<｜Assistant｜><think>`. The table
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
   output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
-  quoted in a tool result move nothing). The legacy reasoning parser for this checkpoint starts
+  quoted in a tool result move nothing). A prompt that is the thought's markers with no opener
+  before them is such a prompt too: the corpus replay feeds the turn opener before the template's
+  tail for this reason (the tail alone read a thinking-off turn's text as reasoning; the gateway
+  replays the whole prompt and never meets it). The legacy reasoning parser for this checkpoint starts
   inside the thought whenever the request leaves thinking on, whatever the prompt; the two agree
   on this shape. The V4.1 template opens the turn after a mid-conversation system message too, so
   its table meets no unopened turn. The table is pinned against the turns the
@@ -119,9 +128,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
 
 DSML as V4 spells it, with `function_calls` for the block's name: the table is V4's with the block's
 two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so what the
-V4 section says of the format holds here (a calls block ends the thought; the two newlines before
-the block are the content's where text precedes them and the template's spacing, dropped, where
-none does; the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`), with two
+V4 section says of the format holds here (a calls block ends the thought; the blank line before
+the block is the opener's, `\n\n<｜DSML｜function_calls>` beside the bare tag, as the encoder's
+parser reads it; the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`), with two
 exceptions at the turn's start. The table has no unopened row, and must not take V4's: the encoder
 writes `<think>` or `</think>` after every user message and after every tool result, so the turn
 is never left unopened, and after a tool result `<｜end▁of▁sentence｜>` follows the last
@@ -131,9 +140,9 @@ mode the answer would then read as reasoning; the `chat_after_result` assertion 
 the four tails the encoder writes before the model's turn, as turn anchors (`<｜Assistant｜>` and
 `</function_results>` with two newlines, each followed by `<think>` or `</think>`): the replay
 starts after the last of them, in the state it names, so the turn's earlier block and the tool
-result's text are not walked (a DSML marker quoted in a result moves nothing), and the two newlines
-the model writes before a block after a tool result in chat mode start a stay with nothing begun
-and are dropped, as at the turn's start and as the encoder's parser drops them.
+result's text are not walked (a DSML marker quoted in a result moves nothing), and the blank line
+the model writes before a block after a tool result leaves with the block's opener, as at the
+turn's start and after a preamble, as the encoder's parser reads it.
 Beyond that:
 
 - **The checkpoint ships an encoder, not a chat template.** The repository's `encoding` module
@@ -143,10 +152,11 @@ Beyond that:
   `</think>` in chat mode), the tails the table anchors the turn at, so the output starts inside
   the thought, or in the content, as the tail says.
 - **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
-  content under this table and this block is content under theirs; the registry reads V3.2 and
-  V3.2-Speciale here, V3.2-Exp (it writes the earlier V3.1 spelling) with `deepseek_v3.1`, and
-  the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the
-  older parser to this table.
+  content under this table and this block is content under theirs; the registry reads V3.2,
+  V3.2-Speciale and V3.2-Exp here (the Exp checkpoint's own template writes the earlier V3.1
+  spelling, but the engine renders its architecture through the V3.2 encoder, and bellwether
+  records it so), the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment
+  that names the older parser to this table.
 - **A string value that holds a closing tag is two parameters.** DSML writes a string raw, so a
   value holding `</｜DSML｜parameter>` and another parameter's opening tag reads as two parameters,
   to the encoder's own parser (it splits at the first closing tag) and to this table alike; the
@@ -186,9 +196,9 @@ What the table says beyond the DSML ones:
   `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
 - **The recorded set holds no call.** The template concatenates a call's arguments as a string,
   and bellwether's corpus holds them as an object, so the recorder refused every call case of
-  `deepseek-v3.1` (and of `deepseek-v3.2-exp`, the same spelling): the content sets replay; the
-  calls stand on the turns the template renders with string arguments, held in the module's tests
-  at every cut, as the V4 table stands on its encoder's turns.
+  `deepseek-v3.1`: the content sets replay; the calls stand on the turns the template renders
+  with string arguments, held in the module's tests at every cut, as the V4 table stands on its
+  encoder's turns.
 
 - **A forced call's tag is the block around the calls the table reads.** `Format::grammar` writes
   the block's ways in (`<｜tool▁calls▁begin｜>` from the turn's own state, or `</think>` first from
@@ -429,6 +439,16 @@ What the table says beyond the others:
   between the dropped framing (`search<|content_invoke_tool_json|>{...}`), as the legacy path
   leaves it. Before this, the variant showed `<|end_message|><|message_model|><|content_text|>`
   and the answer's `<|end_message|>` as content on every request without tools.
+- **A request with tools and `tool_choice: none` reads with the table itself.** The gateway
+  renders such a request's tools as it renders them under `auto`, as the engine's own server does
+  (its prompt keeps the definitions unless an operator excludes them; the choice reaches the
+  template as a kwarg), so the model may write a call anyway. The table reads it whole, and the
+  gateway's reader drops its events (`event::forbidden_calls`: every call's bytes become
+  `Dropped { ForbiddenCall }`, the finish counts none and a `tool_calls` finish is `stop` again),
+  counted per table as `smg_symphony_calls_forbidden_total`; the text around the call is content
+  as under `auto`, and nothing of the call reaches the client as a call or as content, which is
+  what the engine's own server delivers for it. A request with no tools anywhere still reads with
+  the variant without calls, whatever its `tool_choice`.
 
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,
@@ -493,6 +513,11 @@ render no tool call at all. What the table says beyond the others:
   at every cut; bellwether's hand-written sets record them for the family once its recorder has a
   rule for call ids (the template requires one of nine letters or digits, and a corpus case's
   calls carry none).
+- **A request with tools takes a template an operator supplies.** A checkpoint whose own chat
+  template renders no tool call (Mistral Small 3 and 3.1, Devstral Small 2505) never shows the
+  model the request's tools through it, so such a request is served through a template that
+  renders them, handed to the gateway as `--chat-template`; the engine's own HTTP server has the
+  same limit, and its example template for the family writes the list the table reads.
 - **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
   reads what its template writes around the content, and the module tests expect it. Whether
@@ -557,6 +582,10 @@ arguments, and never a list, content beside a call or a thought, since the templ
 the call token and the `;` between calls are what a served Llama 3.1 Instruct checkpoint writes,
 held verbatim in the table's unit tests, and the list and the wrapping after an object rest on the
 unit tests until a group writes them.
+Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct write it under their own ids too: their
+one template is, byte for byte, the one the Nemotron Ultra CPT, UltraLong 1M/2M/4M and Safety Guard
+8B v3 checkpoints carry, so those five recorded groups replay it already; bellwether has recorded
+none of the four, so their rows await fixtures.
 
 ## Llama 4 (`llama4`)
 
@@ -593,15 +622,29 @@ list and nothing after it; no thought. What the table says beyond the others:
   declares reads by its text, a number or a word as what it is and anything else as the string.
   The text between the quotes is the value's characters as they are: the template decodes no
   escape, so a backslash and an `r` in a value stay those two characters (the recorded patches
-  are full of them), and the table reads them so. A value the model writes bare (`days=3`,
-  `detailed=False`, `city='Paris'`), the spelling its model card and the family's parsers take,
-  reads as Python's, a single-quoted string with its escapes. The structural tags write Python's
-  values, the spelling the model is told to write.
-- **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
-  inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
-  reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
-  of Scout's), and the corpus replay counts them apart, by the reference that holds the quote,
-  rather than against the table. A string that holds a newline or a backslash reads as written.
+  are full of them), and the table reads them so; a backslash before the closing quote is the
+  value's last character, not an escape, so a value that ends in one (`command="dir C:\"`, as
+  the recorded benchmark sets write it) closes at its quote, whole and at every cut. One
+  reading is kept from the model's side: a `"` right after a backslash is the model's own
+  escaped quote (`size="5\" screen"`, which the family's own readers decode) unless `,` or `)`
+  follows it, whitespace aside, so such a value reads whole with its backslash kept, and only a
+  quote the value's end follows closes it. A value the
+  model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
+  the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
+  structural tags write Python's values, the spelling the model is told to write.
+- **A quote inside a quoted value is ambiguous.** The template does not escape a `"` inside a
+  string it quotes, so the bytes it writes for such a value do not say where the value ends; a
+  list or an object between the quotes is Python's repr, which quotes an element, or a key, that
+  holds an apostrophe with `"`, so a nested apostrophe raises the same question. The table reads
+  the value whole when the quotes inside it pair up and nothing between the two of a pair would
+  end or reopen the value in the reader's eyes: no `,` or `)`, no `'` and no opening bracket (the
+  recorded cases are written so: a word in quotes, a JSON object, a command line); it cannot
+  otherwise, since the bytes alone do not say which reading the model meant. The recorded sets
+  hold a few such cases (five in a hundred thousand of Scout's under the `"` form alone; the
+  apostrophe form was not counted), the recorder refuses the class at record time, and the corpus
+  replay counts the ones recorded before that apart, by the reference that holds the quote (a `"`
+  at any depth, a `'` below the top level, the keys of a nested object included), rather than
+  against the table. A string that holds a newline or a backslash reads as written.
 - **`<|python_start|>` and `<|python_end|>` are wrapping wherever they stand.** The family's
   earlier template wrote a tool turn's content between them, and the model may write them around
   its code or its list; the table ignores both terminals, so the text between them reads as what
@@ -838,16 +881,22 @@ wrapper state for the block, an arguments state per call):
   `<|tool_call_argument_begin|>`, `<|tool_call_end|>` and `<|tool_calls_section_end|>` are each
   a token of the vocabulary, so a `max_tokens` cut cannot split one; the table declares no
   structural token.
-- **What the table stands on.** bellwether holds a manifest for each of the six checkpoints and
-  no recorded set yet, so the table stands on the module's tests, which hold a hand-picked set of
-  the turns the templates render for the shapes a tool-calling conversation takes (an answer, a
-  call, two calls, content before a call, a thought and a call, the turn after a tool result, a
-  call with thinking off, arguments that nest and hold text outside ASCII, a brace inside a string
-  value), read whole and at every cut, and on the id contract. Those shapes are hand-written cases
-  of bellwether's sets, which its recorder renders with each template at its pinned revision; the
-  six slugs are listed in the corpus harness (`tests/bellwether_parse_fixtures.rs`), which replays
-  the recorded sets from the fixture pin once it holds them, and the README rows say awaiting
-  fixtures until then. Two things the templates taught: K2
+- **What the table stands on.** bellwether records each of the six groups' hand-written sets with
+  the vendor's tokenizer class in its sandbox (the class is the checkpoint's own code, which the
+  reference recorder runs nowhere else): the render set whole, 24 cases a group, and of the parse
+  sets the content and reasoning cases, three to seven of the sixteen common cases and two or
+  three of the twelve turns. The call cases are refused at record time: the templates write a
+  call's id and its arguments and never its name (a served model puts the name inside the id,
+  `functions.NAME:N`, and the hand-written cases carry no id), so renaming a call leaves the
+  rendered turn as it was and the recorder refuses the case as lossy. The corpus harness
+  (`tests/bellwether_parse_fixtures.rs`) replays what is recorded from the fixture pin, five to
+  ten cases a group, each as the reference says but the listed reasoning probe (bellwether #16,
+  K2.7-Code, whose template alone renders a thought for that request). So the call shapes stand
+  on the module's tests, which hold a hand-picked set of the turns the templates render for the
+  shapes a tool-calling conversation takes (an answer, a call, two calls, content before a call, a
+  thought and a call, the turn after a tool result, a call with thinking off, arguments that nest
+  and hold text outside ASCII, a brace inside a string value), read whole and at every cut, and on
+  the id contract. Two things the templates taught: K2
   Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
   and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
   the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct

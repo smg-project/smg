@@ -63,7 +63,7 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// workers unhealthy): its image requests go on to worker selection, which
 /// keeps them off the workers without the encoder ([`request_needs_vision`]
 /// is the demand) and refuses them the same way once no candidate has one.
-pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
+fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
     let workers = registry.get_by_model(model_id);
     !workers.is_empty()
         && workers
@@ -280,7 +280,7 @@ pub(crate) fn ensure_backend_supports_modalities(
 /// pre-computed image embeddings are not: an engine may take those with its
 /// visual inputs disabled, and whether a runtime takes them at all is
 /// [`runtime_supports_modality`]'s call.
-pub(crate) fn is_pixel_modality(modality: Modality) -> bool {
+fn is_pixel_modality(modality: Modality) -> bool {
     matches!(modality, Modality::Image | Modality::Video)
 }
 
@@ -468,28 +468,19 @@ mod tests {
         use std::sync::Arc;
 
         use llm_multimodal::MediaContentPart;
-        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+        use openai_protocol::model_card::ModelCard;
 
         use super::*;
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+        use crate::worker::{
+            test_support::{grpc_worker, registry_with},
+            BasicWorkerBuilder, ConnectionMode, WorkerType,
+        };
 
         const MODEL: &str = "pool-test-model";
 
         /// A gRPC-pipeline worker of `runtime` serving the model, with `labels`.
         fn worker_of(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-            let mut builder = BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(MODEL))
-                .worker_type(WorkerType::Regular)
-                .runtime_type(runtime)
-                .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                });
-            for (key, value) in labels {
-                builder = builder.label(*key, *value);
-            }
-            Arc::new(builder.build())
+            grpc_worker(url, MODEL, runtime, labels)
         }
 
         fn worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
@@ -498,14 +489,6 @@ mod tests {
 
         fn engine_worker(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
             worker_of(url, runtime, &[])
-        }
-
-        fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-            let registry = WorkerRegistry::new();
-            for worker in workers {
-                registry.register(worker).expect("register");
-            }
-            registry
         }
 
         fn image_part() -> MediaContentPart {
@@ -582,6 +565,26 @@ mod tests {
                 assert!(
                     ensure_model_accepts_media(&pool, MODEL, &video_plan()).is_ok(),
                     "{runtime}"
+                );
+            }
+        }
+
+        /// Default SGLang workers retain the early refusal; only native media
+        /// reference workers may fetch and preprocess video at the destination.
+        #[test]
+        fn sglang_video_requires_an_advertised_native_media_processor() {
+            use crate::routers::grpc::multimodal::refs::MM_PROCESSOR_LABEL;
+
+            for (processor, expected) in [("", false), ("python", false), ("smg", true)] {
+                let pool = registry_with(vec![worker_of(
+                    "grpc://10.0.0.1:1",
+                    RuntimeType::Sglang,
+                    &[(MM_PROCESSOR_LABEL, processor)],
+                )]);
+                assert_eq!(
+                    ensure_model_accepts_media(&pool, MODEL, &video_plan()).is_ok(),
+                    expected,
+                    "processor={processor:?}"
                 );
             }
         }

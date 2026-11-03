@@ -1451,7 +1451,7 @@ enum Gather {
     All { cap: Option<usize> },
 }
 
-/// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates`]: the two
+/// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates_for_hashes`]: the two
 /// config knobs plus the immutable load snapshot captured from the load
 /// receiver at selection time, from which each worker's waiting-prefill
 /// backlog (queued uncached tokens, clamped non-negative) is derived at
@@ -1992,7 +1992,10 @@ impl CacheAwarePolicy {
     /// hot prefixes replicate instead of queueing behind one engine. Both
     /// margins must clear so the gate neither fires on steady-state variance
     /// (relative alone would, at low means) nor stays blind to a deep queue
-    /// (absolute alone would, at high means).
+    /// (absolute alone would, at high means). Outside the fleet-wide
+    /// KV-pressure fallback, a request with no holder is routed among the
+    /// workers under the same gate ([`Self::ungated_candidates`]), so a
+    /// burst of misses is bounded by the margins a hit spills at.
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2262,12 +2265,17 @@ impl CacheAwarePolicy {
             );
         }
 
-        // A miss has no affinity candidates and is not a spill: every
-        // eligible worker the decision read participates. A true spill
-        // excludes other workers that trip the same gate, preventing a
+        // A miss has no affinity candidates and is not a spill, but it goes
+        // to the expected-wait worker among the eligible workers under the
+        // same count-pressure gate, so a burst of misses is bounded by the
+        // margins a hit spills at. Expected wait alone keeps no count bound:
+        // its queue and rate signals are a poll old, and a burst routed on
+        // them piles onto one worker while another has free slots. A true
+        // spill excludes other workers that trip the same gate, preventing a
         // fallback from reselecting a hot holder.
         if affinity_candidates.is_empty() {
-            return self.select_expected_wait(workers, healthy_indices, info);
+            let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
+            return self.select_expected_wait(workers, &candidates, info);
         }
         // A spill target gives no prefix up: its gate is the swing's.
         let spill_candidates: Vec<usize> = healthy_indices
@@ -2283,6 +2291,33 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, candidates, info)
     }
 
+    /// The eligible workers under the count-pressure gate at the swing's
+    /// margin (a request with no holder gives no prefix up), compared
+    /// without a trace record like the warm-up slice's check, so a miss
+    /// writes no gate entries for workers it did not pick. The lightest
+    /// worker never clears the snapshot mean, but `avg_load` and the
+    /// per-worker load re-read can disagree under concurrent dispatch, so
+    /// the guard keeps a selection from returning no worker.
+    fn ungated_candidates(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        avg_load: f64,
+    ) -> Vec<usize> {
+        let ungated: Vec<usize> = healthy_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                !self.over_count_pressure_gate(workers[idx].load() as f64, avg_load, 0.0)
+            })
+            .collect();
+        if ungated.is_empty() {
+            healthy_indices.to_vec()
+        } else {
+            ungated
+        }
+    }
+
     /// Run the selection policy over this request's inputs and resolve its
     /// pick with the host's gate, expected-wait selector and credit.
     ///
@@ -2294,7 +2329,8 @@ impl CacheAwarePolicy {
     ///
     /// - `Pick::Group`: the affinity group, resolved as before (pressure
     ///   gate, then expected wait, which credits the result).
-    /// - `Pick::None`: the miss path (expected wait over the healthy fleet).
+    /// - `Pick::None`: the miss path (expected wait over the eligible workers
+    ///   under the count-pressure gate).
     /// - `Pick::Final`: that worker, credited through the expected-wait
     ///   selector; the policy owns the load trade-off, so the count-pressure
     ///   gate does not apply. If the waiting-queue veto drops it, the fleet
@@ -2623,11 +2659,25 @@ impl CacheAwarePolicy {
             .map(|candidate| candidate.raw_score)
             .fold(0.0_f64, f64::max);
         let request_blocks = request.request_blocks as f64;
+        // The chosen worker's undecayed overlap in blocks is the predicted
+        // overlap of a decision, observed at every exit (the warm-up
+        // placements included, where it is thin or nothing) so the
+        // histogram's count is the count of event-driven decisions.
+        let overlap_of = |idx: usize| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.idx == idx)
+                .map_or(0.0, |candidate| candidate.raw_score)
+        };
+        let observe = |overlap: f64| {
+            Metrics::record_cache_aware_match_ratio(overlap / request_blocks);
+        };
         let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
             || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
             if let Some(idx) = self.warmup_slice(workers, &table, indexer, info, avg_load) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
+                observe(overlap_of(idx));
                 debug!(
                     worker = workers[idx].url(),
                     branch = "warmup_slice",
@@ -2645,6 +2695,7 @@ impl CacheAwarePolicy {
             best_overlap / request_blocks,
         ) {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
+            observe(overlap_of(idx));
             debug!(
                 worker = workers[idx].url(),
                 branch = "warmup_divert",
@@ -2667,10 +2718,8 @@ impl CacheAwarePolicy {
         // `overlap_blocks` is the chosen worker's undecayed overlap, so a
         // per-decision join against the engine's `cached_tokens` compares
         // blocks and not only the branch.
-        let overlap_blocks = candidates
-            .iter()
-            .find(|candidate| candidate.idx == idx)
-            .map_or(0, |candidate| candidate.raw_score as u64);
+        let overlap = overlap_of(idx);
+        let overlap_blocks = overlap as u64;
         let branch = if !had_overlap {
             "event_miss"
         } else if overlap_blocks > 0 {
@@ -2679,6 +2728,7 @@ impl CacheAwarePolicy {
             "event_spill"
         };
         Metrics::record_worker_cache_aware_policy_branch(branch);
+        observe(overlap);
         debug!(
             worker = workers[idx].url(),
             branch,
@@ -3086,40 +3136,15 @@ impl CacheAwarePolicy {
         let now = Instant::now();
 
         // Hash mode keys on token ids; untokenized requests stay load-balanced.
-        let tokens = Self::placement_tokens(info);
-        let Some(tokens) = tokens.filter(|t| !t.is_empty()) else {
-            return self.hash_expected_wait(
-                workers,
-                info,
-                healthy_indices,
-                model_id,
-                "expected_wait_fallback",
-                &[],
-                &[],
-                now,
-            );
-        };
-
+        let tokens: &[u32] = Self::placement_tokens(info).unwrap_or(&[]);
         let applicable_end = self
             .config
             .cache_boundaries
             .partition_point(|&p| p <= tokens.len());
         let applicable = &self.config.cache_boundaries[..applicable_end];
 
-        // Head-only traffic must stay load-balanced.
-        if applicable.is_empty() {
-            return self.hash_expected_wait(
-                workers,
-                info,
-                healthy_indices,
-                model_id,
-                "short_request",
-                tokens,
-                applicable,
-                now,
-            );
-        }
-
+        // Backend KV pressure sheds fleet-wide ahead of any count gate, as the
+        // tree path does for every request it routes.
         if self.is_kv_imbalanced(workers, healthy_indices) {
             return self.hash_expected_wait(
                 workers,
@@ -3127,6 +3152,27 @@ impl CacheAwarePolicy {
                 healthy_indices,
                 model_id,
                 "kv_pressure_expected_wait",
+                tokens,
+                applicable,
+                now,
+            );
+        }
+
+        // Untokenized or head-only traffic has no holder to find: it stays
+        // load-balanced, bounded by the count-pressure gate like a tree miss.
+        if applicable.is_empty() {
+            let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
+            let branch = if tokens.is_empty() {
+                "expected_wait_fallback"
+            } else {
+                "short_request"
+            };
+            return self.hash_expected_wait(
+                workers,
+                info,
+                &candidates,
+                model_id,
+                branch,
                 tokens,
                 applicable,
                 now,
@@ -3172,10 +3218,13 @@ impl CacheAwarePolicy {
             return Some(selected);
         }
 
+        // No live holder at any boundary: bounded by the count-pressure gate
+        // like a tree miss.
+        let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
         self.hash_expected_wait(
             workers,
             info,
-            healthy_indices,
+            &candidates,
             model_id,
             "expected_wait_fallback",
             tokens,
@@ -3184,21 +3233,21 @@ impl CacheAwarePolicy {
         )
     }
 
-    /// Expected-wait dispatch for hash-path fallback branches; records only
-    /// the final worker when boundaries apply.
+    /// Expected-wait dispatch over `candidates` for hash-path fallback
+    /// branches; records only the final worker when boundaries apply.
     #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn hash_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
-        healthy_indices: &[usize],
+        candidates: &[usize],
         model_id: &str,
         branch: &'static str,
         tokens: &[u32],
         applicable: &[usize],
         now: Instant,
     ) -> Option<usize> {
-        let idx = self.select_expected_wait(workers, healthy_indices, info)?;
+        let idx = self.select_expected_wait(workers, candidates, info)?;
         if !applicable.is_empty() {
             self.record_placement(
                 model_id,

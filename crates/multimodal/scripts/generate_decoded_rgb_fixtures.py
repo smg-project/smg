@@ -18,7 +18,7 @@ The images land under ``tests/fixtures/images/decoded_rgb/``; the expected
 bytes (raw interleaved RGB, row-major, base64 in the JSON: ``expected_rgb``
 for the composite, ``expected_dropped_rgb`` for the drop) and the case list
 in ``tests/fixtures/golden/decoded_rgb/manifest.json``.
-``tests/decoded_rgb_reference.rs`` reads them. Regenerate with the Pillow
+``tests/preprocess/decoded_rgb_reference.rs`` reads them. Regenerate with the Pillow
 version the manifest records.
 """
 

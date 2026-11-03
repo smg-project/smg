@@ -34,7 +34,9 @@ use crate::{
     vision::{
         execution::{scope as parallel_scope, task_count},
         preprocessor_config::PreProcessorConfig,
-        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        processor::{
+            ModelSpecificValue, PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+        },
         rgb_runs,
         transforms::{
             par_threads, pil_to_filter, resize, resize_bicubic_torch_aa,
@@ -69,6 +71,15 @@ pub struct QwenVLConfig {
     pub std: [f64; 3],
     /// Model name for identification
     pub model_name: &'static str,
+}
+
+impl QwenVLConfig {
+    /// Consecutive elements of one channel within a patch row
+    /// (`[C, temporal, patch_h, patch_w]`): temporal × patch_h × patch_w.
+    #[inline]
+    fn channel_block(&self) -> usize {
+        self.temporal_patch_size * self.patch_size * self.patch_size
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,16 +340,88 @@ pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
     allow_video_dimensions_below_factor: bool,
     raise_rounded_sides_to_factor: bool,
+    transforms: QwenTransforms,
+}
+
+/// The transforms a preprocessor config sets for the Qwen pipeline, resolved
+/// once at construction: the resize filter, whether frames are resized, and
+/// the normalization the patch bytes carry.
+#[derive(Debug, Clone, Copy)]
+struct QwenTransforms {
+    filter: FilterType,
+    do_resize: bool,
+    norm: PixelNorm,
+}
+
+impl QwenTransforms {
+    fn resolve(geometry: &QwenVLConfig, config: &PreProcessorConfig) -> Self {
+        Self {
+            // Qwen2VL/Qwen3VL image processors default to BICUBIC (PIL resample=3)
+            // when the preprocessor config omits `resample`. The global pil_to_filter
+            // fallback is bilinear, which yields smoother features and measurably
+            // degrades VLM accuracy, so pin the HF-correct default here.
+            filter: pil_to_filter(config.resampling.or(Some(3))),
+            do_resize: config.do_resize.unwrap_or(true),
+            norm: pixel_norm(
+                config,
+                geometry.mean,
+                geometry.std,
+                geometry.channel_block(),
+            ),
+        }
+    }
 }
 
 impl QwenVLProcessorBase {
-    /// Create a new processor with the given configuration.
+    /// Create a new processor with the given configuration and the default
+    /// preprocessor config's transforms.
     pub fn new(config: QwenVLConfig) -> Self {
+        Self::from_configs(config, &PreProcessorConfig::default())
+    }
+
+    /// Create a processor with the given configuration and the transforms
+    /// `preprocessor_config` sets (resize filter, resize switch,
+    /// normalization).
+    pub fn from_configs(config: QwenVLConfig, preprocessor_config: &PreProcessorConfig) -> Self {
         Self {
+            transforms: QwenTransforms::resolve(&config, preprocessor_config),
             config,
             allow_video_dimensions_below_factor: false,
             raise_rounded_sides_to_factor: false,
         }
+    }
+
+    /// Resolve the transforms from `config`, keeping this processor's
+    /// geometry.
+    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.transforms = QwenTransforms::resolve(&self.config, config);
+        self
+    }
+
+    /// This processor with a per-frame video budget of `video_max_pixels`.
+    pub(super) fn with_video_max_pixels(mut self, video_max_pixels: usize) -> Self {
+        self.config.video_max_pixels = video_max_pixels;
+        self
+    }
+
+    /// Whether frames are resized to the planned grid (`do_resize`).
+    pub(super) fn resizes(&self) -> bool {
+        self.transforms.do_resize
+    }
+
+    /// The resize filter the preprocessor config selected.
+    pub(super) fn filter(&self) -> FilterType {
+        self.transforms.filter
+    }
+
+    /// Preserve an already aligned native-loader video grid and its pixel bytes.
+    /// Only the caller's clone is changed; ordinary Qwen/vLLM planning is unchanged.
+    pub(super) fn with_aligned_video_frames(mut self, pixels: usize) -> Self {
+        self.config.video_min_pixels = pixels;
+        self.config.video_max_pixels = pixels;
+        self.config.video_resize_mode = QwenVideoResizeMode::PerFrame;
+        self.transforms.do_resize = false;
+        self
     }
 
     /// Allow non-zero video dimensions below the patch-alignment factor.
@@ -407,7 +490,7 @@ impl QwenVLProcessorBase {
         frame_count: usize,
         width: u32,
         height: u32,
-        config: &PreProcessorConfig,
+        clip: &VideoClipOptions,
     ) -> Result<QwenVideoPlan, TransformError> {
         let temporal_patch_size = self.config.temporal_patch_size;
         let padded_frames = frame_count.div_ceil(temporal_patch_size) * temporal_patch_size;
@@ -430,9 +513,8 @@ impl QwenVLProcessorBase {
                 "Qwen video patch buffer size overflow: patches={num_patches}, features={patch_features}"
             ))
         })?;
-        // MediaConnector samples video at 2 fps by default. A checkpoint may
-        // override that value in video_preprocessor_config.json.
-        let sample_fps = config.get_extra::<f32>("fps").unwrap_or(2.0);
+        // The rate the clip was sampled at sets the time each temporal patch spans.
+        let sample_fps = clip.sample_fps;
         if !sample_fps.is_finite() || sample_fps <= 0.0 {
             return Err(TransformError::ShapeError(format!(
                 "Qwen video fps must be finite and positive, got {sample_fps}"
@@ -450,15 +532,10 @@ impl QwenVLProcessorBase {
             num_patches,
             output_values,
             tokens: self.calculate_tokens_from_grid(grid_t, grid_h, grid_w),
-            second_per_grid: temporal_patch_size as f32 / sample_fps,
-            filter: pil_to_filter(config.resampling.or(Some(3))),
-            do_resize: config.do_resize.unwrap_or(true),
-            norm: pixel_norm(
-                config,
-                self.config.mean,
-                self.config.std,
-                self.channel_block(),
-            ),
+            second_per_grid: (temporal_patch_size as f64 / sample_fps) as f32,
+            filter: self.transforms.filter,
+            do_resize: self.transforms.do_resize,
+            norm: self.transforms.norm,
         })
     }
 
@@ -508,13 +585,6 @@ impl QwenVLProcessorBase {
     #[inline]
     pub fn get_factor(&self) -> usize {
         self.config.patch_size * self.config.merge_size
-    }
-
-    /// Consecutive elements of one channel within a patch row
-    /// (`[C, temporal, patch_h, patch_w]`): temporal × patch_h × patch_w.
-    #[inline]
-    fn channel_block(&self) -> usize {
-        self.config.temporal_patch_size * self.config.patch_size * self.config.patch_size
     }
 
     /// Smart resize algorithm for Qwen VL models.
@@ -1208,31 +1278,20 @@ impl QwenVLProcessorBase {
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
-    fn plan_image_batch(
-        &self,
-        images: &[DynamicImage],
-        config: &PreProcessorConfig,
-    ) -> Result<ImageBatchPlan, TransformError> {
+    fn plan_image_batch(&self, images: &[DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        // Qwen2VL/Qwen3VL image processors default to BICUBIC (PIL resample=3)
-        // when the preprocessor config omits `resample`. The global pil_to_filter
-        // fallback is bilinear, which yields smoother features and measurably
-        // degrades VLM accuracy, so pin the HF-correct default here.
-        let filter = pil_to_filter(config.resampling.or(Some(3)));
+        let QwenTransforms {
+            filter,
+            do_resize,
+            norm,
+        } = self.transforms;
 
         let patch_size = self.config.patch_size;
         let temporal_patch_size = self.config.temporal_patch_size;
         let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
-        let do_resize = config.do_resize.unwrap_or(true);
-        let norm = pixel_norm(
-            config,
-            self.config.mean,
-            self.config.std,
-            self.channel_block(),
-        );
 
         let mut plans = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
@@ -1297,10 +1356,9 @@ impl QwenVLProcessorBase {
     fn preprocess_into_wire(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        let batch = match self.plan_image_batch(images, config) {
+        let batch = match self.plan_image_batch(images) {
             Ok(batch) => batch,
             Err(error) => return Some(Err(error)),
         };
@@ -1535,9 +1593,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let batch = self.plan_image_batch(images, config)?;
+        let batch = self.plan_image_batch(images)?;
         let ImageBatchPlan {
             filter,
             patch_features,
@@ -1639,23 +1696,22 @@ impl VisionPreProcessor for QwenVLProcessorBase {
     fn preprocess_wire(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        self.preprocess_into_wire(images, config, dtype)
+        self.preprocess_into_wire(images, dtype)
     }
 
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        config: &PreProcessorConfig,
+        clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if frames.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
         let (width, height) = frames[0].dimensions();
-        let plan = self.plan_video(frames.len(), width, height, config)?;
+        let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         let mut all_patches = vec![0u8; plan.output_values];
         let mut out_idx = 0;
@@ -1709,13 +1765,13 @@ impl VisionPreProcessor for QwenVLProcessorBase {
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        config: &PreProcessorConfig,
+        clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if frames.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, config)?;
+        let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         let mut all_patches = vec![0u8; plan.output_values];
         for frame in frames {
@@ -1797,12 +1853,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         Self::finish_video(plan, all_patches)
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        _config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         // The size the image is resized to; a size the reference refuses
         // (an aspect ratio past its limit) is refused here as it is at
         // preprocessing, not counted at the minimum size.
@@ -1815,7 +1866,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         self.config.model_name
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // Qwen VL models have dynamic sizing, no fixed output size
         None
     }
@@ -1877,7 +1928,7 @@ mod tests {
     /// The tensor path's oracle for the byte path: the raw 0..255 planes
     /// mapped through the per-byte table the bytes carry, the reference's
     /// fused arithmetic (the table itself is checked against the reference
-    /// processors in `tests/qwen_pixel_norm_golden.rs`).
+    /// processors in `tests/preprocess/qwen_pixel_norm_golden.rs`).
     fn tensor_through_table(image: &DynamicImage, mean: &[f64; 3], std: &[f64; 3]) -> Array3<f32> {
         let table = pixel_norm(&PreProcessorConfig::default(), *mean, *std, 1).table_f32();
         let mut tensor = to_tensor_no_norm(image);
@@ -1892,28 +1943,33 @@ mod tests {
     #[test]
     fn test_preprocess_per_image_concat_matches_batch() {
         use crate::{
-            types::FieldLayout,
+            types::{FieldLayout, Modality},
             vision::processors::{Qwen2VLProcessor, Qwen3VLProcessor},
         };
 
-        let processors: [&dyn VisionPreProcessor; 2] =
-            [&Qwen2VLProcessor::new(), &Qwen3VLProcessor::new()];
-        for processor in processors {
-            assert!(processor.supports_per_image_preprocessing());
+        type Build = fn(&PreProcessorConfig) -> Box<dyn VisionPreProcessor>;
+        let builders: [Build; 2] = [
+            |config| Box::new(Qwen2VLProcessor::from_preprocessor_config(config)),
+            |config| Box::new(Qwen3VLProcessor::from_config_for(config, Modality::Image)),
+        ];
+        for build in builders {
+            let defaults = build(&PreProcessorConfig::default());
             let config = PreProcessorConfig {
-                image_mean: Some(processor.default_mean().to_vec()),
-                image_std: Some(processor.default_std().to_vec()),
+                image_mean: Some(defaults.default_mean().to_vec()),
+                image_std: Some(defaults.default_std().to_vec()),
                 min_pixels: Some(56 * 56),
                 max_pixels: Some(112 * 112),
                 ..Default::default()
             };
+            let processor = build(&config);
+            assert!(processor.supports_per_image_preprocessing());
             let images = vec![
                 create_sized_pattern_frame(7, 9, 3),
                 create_sized_pattern_frame(12, 6, 42),
                 create_sized_pattern_frame(8, 8, 250),
             ];
 
-            let batched = processor.preprocess(&images, &config).unwrap();
+            let batched = processor.preprocess(&images).unwrap();
 
             let layouts = std::collections::HashMap::from([
                 ("image_grid_thw".to_string(), FieldLayout::Batched),
@@ -1921,11 +1977,7 @@ mod tests {
             ]);
             let parts = images
                 .iter()
-                .map(|image| {
-                    processor
-                        .preprocess(std::slice::from_ref(image), &config)
-                        .unwrap()
-                })
+                .map(|image| processor.preprocess(std::slice::from_ref(image)).unwrap())
                 .collect::<Vec<_>>();
             let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
 
@@ -2052,6 +2104,24 @@ mod tests {
         DynamicImage::ImageRgb8(image)
     }
 
+    /// The borrowed RGB views of `frames`, as a decoded video hands them to
+    /// the processor; every test frame is RGB8.
+    fn rgb_views(frames: &[DynamicImage]) -> Vec<RgbFrameRef<'_>> {
+        frames
+            .iter()
+            .map(|frame| {
+                let DynamicImage::ImageRgb8(rgb) = frame else {
+                    panic!("test frame is not RGB8");
+                };
+                RgbFrameRef {
+                    width: rgb.width(),
+                    height: rgb.height(),
+                    data: rgb.as_raw(),
+                }
+            })
+            .collect()
+    }
+
     fn create_sized_pattern_frame(w: u32, h: u32, seed: u8) -> DynamicImage {
         let mut image = RgbImage::new(w, h);
         for y in 0..h {
@@ -2099,6 +2169,7 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         let image = create_sized_pattern_frame(7, 9, 3);
         let (target_h, target_w) = processor.smart_resize(9, 7).unwrap();
         assert!(
@@ -2106,9 +2177,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let result = processor
-            .preprocess(std::slice::from_ref(&image), &config)
-            .unwrap();
+        let result = processor.preprocess(std::slice::from_ref(&image)).unwrap();
         let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
@@ -2234,6 +2303,7 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         // Odd dimensions force smart_resize_video to a different factor-aligned
         // target, guaranteeing the resize branch runs.
         let frames = vec![
@@ -2246,23 +2316,13 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
-        let dynamic = processor.preprocess_video(&frames, &config).unwrap();
+        let dynamic = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
         let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &config)
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap();
 
         let a = dynamic.encoder_input.flat_f32().into_owned();
@@ -2289,6 +2349,7 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         let frames = vec![
             create_sized_pattern_frame(7, 9, 3),
             create_sized_pattern_frame(7, 9, 101),
@@ -2305,23 +2366,13 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
-        let dynamic = processor.preprocess_video(&frames, &config).unwrap();
+        let dynamic = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
         let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &config)
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap();
 
         let a = dynamic.encoder_input.flat_f32().into_owned();
@@ -2458,9 +2509,12 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         let frames = vec![create_pattern_frame(3), create_pattern_frame(101)];
 
-        let result = processor.preprocess_video(&frames, &config).unwrap();
+        let result = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
         let actual = result.encoder_input.flat_f32().into_owned();
 
         let tensors = frames
@@ -2493,29 +2547,20 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         let frames = vec![
             create_pattern_frame(3),
             create_pattern_frame(101),
             create_pattern_frame(177),
         ];
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
-        let dynamic_result = processor.preprocess_video(&frames, &config).unwrap();
+        let dynamic_result = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
         let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &config)
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap();
 
         assert_eq!(
@@ -2547,28 +2592,19 @@ mod tests {
             image_std: Some(processor.default_std().to_vec()),
             ..Default::default()
         };
+        let processor = processor.with_preprocessor_config(&config);
         let frames = vec![
             create_sized_pattern_frame(280, 280, 3),
             create_sized_pattern_frame(280, 280, 101),
         ];
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
-        let dynamic_result = processor.preprocess_video(&frames, &config).unwrap();
+        let dynamic_result = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
         let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &config)
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap();
 
         assert_eq!(
@@ -2633,16 +2669,16 @@ mod wire_tests {
                 gradient(1296, 972, 5),
             ],
         ];
-        for (processor, config) in processors.iter().zip(&configs) {
+        for processor in &processors {
             for images in &batches {
-                let two_pass = processor.preprocess(images, config).unwrap();
+                let two_pass = processor.preprocess(images).unwrap();
                 for dtype in [
                     EncoderDtype::BFloat16,
                     EncoderDtype::Float16,
                     EncoderDtype::Float32,
                 ] {
                     let wire = processor
-                        .preprocess_wire(images, config, dtype)
+                        .preprocess_wire(images, dtype)
                         .expect("the Qwen base writes wires")
                         .unwrap();
                     assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
@@ -2664,7 +2700,7 @@ mod wire_tests {
                     );
                 }
                 assert!(processor
-                    .preprocess_wire(images, config, EncoderDtype::Uint8)
+                    .preprocess_wire(images, EncoderDtype::Uint8)
                     .is_none());
             }
         }

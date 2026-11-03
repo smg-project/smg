@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
-        MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        kimi_k25::MEDIA_PAD_TOKEN, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 /// Structural tokens wrapping one Kimi-K3 image, from the checkpoint's
@@ -62,7 +66,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|media_pad|>".to_string())
+        Ok(MEDIA_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
@@ -74,6 +78,23 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 10)]))
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(KimiK3Processor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

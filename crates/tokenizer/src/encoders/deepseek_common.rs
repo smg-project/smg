@@ -1,16 +1,18 @@
 //! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
 //! tested once: the JSON spelling and the OpenAI-shape readers every one of
-//! them uses, the last-user index predicates, the quick-instruction task
-//! tokens, and the V4 family's message preprocessing (tool-message merging,
-//! tool-result sorting, drop-thinking, DSML argument rendering, the tools
-//! template), which V4 and V4.1 run with their own DSML tag strings (V4 bare
-//! `invoke`/`parameter`; V4.1 ` invoke`/` parameter` with a leading space).
+//! them uses, the message read (`Turn`), the last-user index predicates, the
+//! quick-instruction task tokens, the tools-and-response-format section of a
+//! system or developer turn, and the V4 family's message preprocessing
+//! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
+//! rendering, the tools template), which V4 and V4.1 run with their own DSML
+//! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
+//! with a leading space).
 //!
 //! V3.2's tool-message handling, drop-thinking role set, DSML argument
 //! rendering and tools template are different algorithms and texts under
 //! some of the same names; they stay in `deepseek_v32.rs`.
 
-use std::{borrow::Cow, sync::OnceLock};
+use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde_json::{json, Value};
@@ -451,6 +453,70 @@ pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> 
         .collect()
 }
 
+/// One message as the family's renderers read it: the fields of the
+/// OpenAI-shape value every renderer reads, read once, with the tools and
+/// tool calls in the encoders' shape and empty lists dropped the way Python's
+/// truthiness drops them (`if tools:`); `response_format` is the field as
+/// written, read by each renderer under its reference's rule. A field only
+/// some arms read is read on demand ([`Turn::wo_eos`]), so a renderer that
+/// never asks pays no lookup.
+pub(super) struct Turn<'m> {
+    pub(super) index: usize,
+    pub(super) msg: &'m Value,
+    pub(super) role: &'m str,
+    pub(super) content: &'m str,
+    pub(super) tools: Option<Vec<Value>>,
+    pub(super) response_format: Option<&'m Value>,
+    pub(super) tool_calls: Option<Vec<Value>>,
+    /// The gateway's protocol takes the `reasoning` spelling as an alias of
+    /// `reasoning_content`, so a history assistant's reasoning renders under
+    /// either spelling for every renderer: a superset of the engines' copies
+    /// of these encoders, each of which reads one spelling alone.
+    pub(super) reasoning_content: &'m str,
+}
+
+impl<'m> Turn<'m> {
+    /// The message `msg` at `index` of its conversation (the renderer refuses
+    /// an index past the end in its own error type).
+    pub(super) fn read(index: usize, msg: &'m Value) -> Self {
+        let tools = msg
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|tools| tools_from_openai_format(tools))
+            .filter(|tools| !tools.is_empty());
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
+            .filter(|tool_calls| !tool_calls.is_empty());
+        Self {
+            index,
+            msg,
+            role: text(msg, "role"),
+            content: text(msg, "content"),
+            tools,
+            response_format: msg.get("response_format"),
+            tool_calls,
+            reasoning_content: text(msg, "reasoning_content"),
+        }
+    }
+
+    /// `wo_eos`: the message ends without the EOS token (read on demand by
+    /// the assistant arms of V4 and V4.1; V3.2 never asks).
+    pub(super) fn wo_eos(&self) -> bool {
+        self.msg
+            .get("wo_eos")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// A string field of a message, empty when absent or not a string, as the
+/// references' `msg.get(key, "")` reads it.
+pub(super) fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
+    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
 /// The tool schemas as the tools templates take them: each tool's JSON, one
 /// per line.
 pub(super) fn tool_schemas(tools: &[Value]) -> String {
@@ -502,6 +568,29 @@ Otherwise, output directly after {tend} with tool calls or final response.
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 "
     )
+}
+
+/// The tools template and the response format a system or developer turn
+/// carries, each after a blank line, when the turn has them; `render_tools`
+/// is the dialect's tools template.
+pub(super) fn push_tools_and_response_format(
+    prompt: &mut String,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    if let Some(tools) = tools {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(schema) = response_format {
+        prompt.push_str("\n\n");
+        let _ = write!(
+            prompt,
+            "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
+            to_json(schema)
+        );
+    }
 }
 
 #[cfg(test)]

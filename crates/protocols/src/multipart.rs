@@ -1,8 +1,8 @@
 //! Axum extractors for multipart/form-data inference endpoints.
 //!
-//! JSON endpoints get [`crate::validated::ValidatedJson`]; the
+//! JSON endpoints get `validated::ValidatedJson`; the
 //! `/v1/audio/transcriptions` endpoint uses multipart/form-data and gets
-//! [`AudioTranscriptionMultipart`], which parses the form into a typed
+//! `AudioTranscriptionMultipart`, which parses the form into a typed
 //! `(TranscriptionRequest, AudioFile)` pair before the handler runs.
 
 #[cfg(feature = "axum")]

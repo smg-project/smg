@@ -37,7 +37,7 @@ use crate::{
             sse::{SseEncodeError, SseEncoder, SseReceiver, SseSender},
         },
         error,
-        grpc::{context::LoadGuards, harmony::responses::ToolResult},
+        grpc::{context::LoadGuards, harmony::responses::ToolResult, regular::symphony},
     },
     worker::GuardedStream,
 };
@@ -157,6 +157,12 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// Chat `finish_reason` of the final chunk, e.g. `"length"` for a
     /// `max_output_tokens` truncation. Drives the terminal event's status.
     finish_reason: Option<String>,
+    /// Whether a closed call was cut: its function-shaped arguments read
+    /// `incomplete` under the finish reason, before a custom tool's call became
+    /// its `custom_tool_call` item, which carries no status. Recorded by the
+    /// one read of a call's status (`function_call_status`), whichever stream
+    /// closes the call; the terminal event and the stored object read it.
+    cut_call: bool,
     /// The response runs in the background: `response.created` reports it
     /// `queued`, `response.queued` follows, and the objects echo the flag.
     background: bool,
@@ -174,7 +180,33 @@ struct ReasoningStreamItem {
     text: String,
 }
 
+/// The kind of a serde error the stored object's typed read met, for its log
+/// line: serde's invalid-type and unknown-variant texts quote the offending
+/// value, which may be model output, so the text itself is never logged.
+fn serde_error_kind(error: &serde_json::Error) -> &'static str {
+    let text = error.to_string();
+    if text.starts_with("missing field") {
+        "missing field"
+    } else if text.starts_with("invalid type")
+        || text.starts_with("invalid value")
+        || text.starts_with("invalid length")
+    {
+        "type mismatch"
+    } else if text.starts_with("unknown variant") || text.starts_with("unknown field") {
+        "unknown name"
+    } else if text.starts_with("duplicate field") {
+        "duplicate field"
+    } else {
+        "other"
+    }
+}
+
 impl ResponseStreamEventEmitter {
+    /// The model label the response's events carry.
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn new(response_id: String, model: String, created_at: u64) -> Self {
         let message_id = format!("msg_{}", Uuid::now_v7());
 
@@ -195,6 +227,7 @@ impl ResponseStreamEventEmitter {
             tool_call_items: Vec::new(),
             reasoning_item: None,
             finish_reason: None,
+            cut_call: false,
             background: false,
             last_error: None,
             encoder: SseEncoder::new(),
@@ -205,6 +238,16 @@ impl ResponseStreamEventEmitter {
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
         self.background = request.background.unwrap_or(false);
         self.original_request = Some(request);
+    }
+
+    /// The finish reason of the iteration a stream that drives the emitter
+    /// through its own events (never through chat chunks) has read: the
+    /// terminal event, the stored object and the items the stream closes read
+    /// their status from it, as they read the final chunk's. Cleared when each
+    /// iteration starts and set when its terminal frame comes, so the finish
+    /// of an earlier turn never reads for a later one.
+    pub(crate) fn set_finish_reason(&mut self, finish_reason: Option<&str>) {
+        self.finish_reason = finish_reason.map(str::to_string);
     }
 
     /// Update tool call output items with tool execution results.
@@ -243,12 +286,6 @@ impl ResponseStreamEventEmitter {
                 }
             }
         }
-    }
-
-    /// Whether a streamed output item is a call cut short: a `function_call` whose status says
-    /// its arguments are not complete JSON.
-    fn is_cut_call(item: &serde_json::Value) -> bool {
-        item["type"] == "function_call" && item["status"] == "incomplete"
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -404,20 +441,20 @@ impl ResponseStreamEventEmitter {
             output
         };
 
-        // A `length` finish means max_output_tokens truncated the response;
-        // the Responses contract reports that as status=incomplete with
-        // incomplete_details and terminates the stream with
-        // response.incomplete, mirroring the non-streaming conversion.
-        let length = self.finish_reason.as_deref() == Some("length");
-        let truncated = length || output.iter().any(Self::is_cut_call);
-        let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
+        // The event's status is read where the stored object and the
+        // non-streaming conversion read theirs: a `length` finish is incomplete
+        // with `max_output_tokens`, a cut call is incomplete without details, a
+        // failed generation is failed; the stream ends with the event of that
+        // status.
+        let (status, incomplete_details) =
+            super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
 
         // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
+            "status": status,
             "background": self.background,
             "model": self.model,
             "output": output
@@ -425,8 +462,8 @@ impl ResponseStreamEventEmitter {
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
-        if length {
-            response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        if let Some(details) = incomplete_details {
+            response_obj["incomplete_details"] = json!(details);
         }
 
         // Add usage if provided
@@ -474,12 +511,10 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": if failed {
-                ResponseEvent::FAILED
-            } else if truncated {
-                ResponseEvent::INCOMPLETE
-            } else {
-                ResponseEvent::COMPLETED
+            "type": match status {
+                ResponseStatus::Failed => ResponseEvent::FAILED,
+                ResponseStatus::Incomplete => ResponseEvent::INCOMPLETE,
+                _ => ResponseEvent::COMPLETED,
             },
             "sequence_number": self.next_sequence(),
             "response": response_obj
@@ -876,9 +911,23 @@ impl ResponseStreamEventEmitter {
             .output_items
             .iter()
             .filter_map(|item| {
-                item.item_data
-                    .as_ref()
-                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+                let data = item.item_data.as_ref()?;
+                match serde_json::from_value::<ResponseOutputItem>(data.clone()) {
+                    Ok(typed) => Some(typed),
+                    Err(error) => {
+                        // The terminal event carries the raw item; the stored object carries
+                        // what reads as a typed item, so a drop is said rather than silent.
+                        warn!(
+                            response_id = %self.response_id,
+                            output_index = item.output_index,
+                            item_type = data["type"].as_str().unwrap_or(""),
+                            error_kind = serde_error_kind(&error),
+                            "a streamed output item does not read as a typed output item; \
+                             the stored object drops it"
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -887,11 +936,8 @@ impl ResponseStreamEventEmitter {
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason, a cut call without one.
-        let cut_call = output.iter().any(|item| {
-            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
-        });
         let (status, incomplete_details) =
-            super::utils::response_status(self.finish_reason.as_deref(), cut_call);
+            super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
 
         // Build response using builder
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
@@ -1051,6 +1097,33 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// The status of the message item a stream closes, under the turn's finish
+    /// reason: `in_progress` when the generation failed (closing the event
+    /// sequence does not imply it succeeded; the partial message belongs in
+    /// the terminal output all the same), else `completed`. A stream that
+    /// drives the emitter through its own events and closes its message item
+    /// itself reads it here, so its item carries the status the typed read of
+    /// the stored object requires.
+    pub(crate) fn message_status(&self) -> &'static str {
+        if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+            "in_progress"
+        } else {
+            "completed"
+        }
+    }
+
+    /// The status of a function call the stream closes, read under the
+    /// finish reason the emitter holds, as `message_status` reads the message
+    /// item's: a call whose arguments the finish cut reads `incomplete`, and
+    /// the response reads it as cut on its terminal event and stored object.
+    /// The chat-chunk path and a stream that closes its own call items read
+    /// every call's status here, so the cut is recorded wherever it is read.
+    pub(crate) fn function_call_status(&mut self, arguments: &str) -> &'static str {
+        let status = super::utils::function_call_status(self.finish_reason.as_deref(), arguments);
+        self.cut_call |= status == "incomplete";
+        status
+    }
+
     /// Closing the event sequence does not imply generation succeeded: partial
     /// messages remain in_progress on the wire, but belong in terminal output.
     async fn close_message_item(&mut self, tx: &SseSender) -> Result<(), String> {
@@ -1072,11 +1145,7 @@ impl ResponseStreamEventEmitter {
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
-                "status": if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                },
+                "status": self.message_status(),
             });
             let event = self.emit_output_item_done(output_index, &item);
             self.send_event(&event, tx).await?;
@@ -1093,6 +1162,9 @@ impl ResponseStreamEventEmitter {
     /// output, so they must be closed and collected here.
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
         for item in std::mem::take(&mut self.tool_call_items) {
+            // The call's status as a function call, read before a custom
+            // tool's call becomes its item.
+            let status = self.function_call_status(&item.arguments);
             let full = if item.custom {
                 let input = super::utils::custom_tool_input(&item.arguments);
                 for (event_type, field) in [
@@ -1128,10 +1200,7 @@ impl ResponseStreamEventEmitter {
                     "call_id": item.call_id,
                     "name": item.name,
                     "arguments": item.arguments,
-                    "status": super::utils::function_call_status(
-                        self.finish_reason.as_deref(),
-                        &item.arguments,
-                    ),
+                    "status": status,
                 })
             };
             let event = self.emit_output_item_done(item.output_index, &full);
@@ -1491,10 +1560,17 @@ impl ResponseStreamEventEmitter {
     }
 }
 
+/// The `x-smg-parser` value of the chat answer a Responses stream relays,
+/// which the stream's own answer carries; `None` where no parser read it
+/// (the Harmony path).
+pub(crate) type StreamParser = Option<HeaderValue>;
+
 /// One-shot signal used by streaming `/v1/responses` handlers to avoid
 /// returning HTTP 200 until the first backend request has actually started.
-pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
-pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<(), Response>>;
+/// A start brings the [`StreamParser`] of the chat answer that opened the
+/// stream, so the Responses answer built at the barrier names its reader.
+pub(crate) type StreamStartupSender = oneshot::Sender<Result<StreamParser, Response>>;
+pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<StreamParser, Response>>;
 
 pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupReceiver) {
     oneshot::channel()
@@ -1503,7 +1579,7 @@ pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupRec
 #[must_use]
 pub(crate) fn signal_stream_startup(
     startup: &mut Option<StreamStartupSender>,
-    result: Result<(), Response>,
+    result: Result<StreamParser, Response>,
 ) -> bool {
     let Some(startup) = startup.take() else {
         return true;
@@ -1517,13 +1593,23 @@ pub(crate) async fn await_stream_startup(
     rx: SseReceiver,
 ) -> Response {
     match startup.await {
-        Ok(Ok(())) => build_sse_response(rx),
+        Ok(Ok(parser)) => naming_parser(build_sse_response(rx), parser),
         Ok(Err(response)) => response,
         Err(_) => error::internal_error(
             "responses_stream_startup_failed",
             "Streaming response failed before backend request startup",
         ),
     }
+}
+
+/// `response` naming the parser that read the chat answer it relays, as the
+/// chat route names it in `x-smg-parser`: a client reading a Responses turn
+/// tells the two readers apart as it does on chat. Unchanged where none did.
+pub(crate) fn naming_parser(mut response: Response, parser: StreamParser) -> Response {
+    if let Some(parser) = parser {
+        response.headers_mut().insert(symphony::HEADER, parser);
+    }
+    response
 }
 
 /// Build a Server-Sent Events (SSE) response
@@ -1602,6 +1688,9 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, responses_api_test_usage,
+    };
 
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
@@ -1719,26 +1808,10 @@ mod tests {
         let emitter =
             ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
 
-        let usage = Usage::from_counts(12, 7)
-            .with_cached_tokens(3)
-            .with_reasoning_tokens(2);
+        let usage = responses_api_test_usage();
         let wire = serde_json::to_value(emitter.finalize(Some(usage)))
             .expect("finalized response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
-
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+        assert_responses_api_usage(&wire);
     }
 
     #[tokio::test]
@@ -1762,7 +1835,7 @@ mod tests {
         let (_sse_tx, sse_rx) = sse_channel();
         let mut startup = Some(startup_tx);
 
-        assert!(signal_stream_startup(&mut startup, Ok(())));
+        assert!(signal_stream_startup(&mut startup, Ok(None)));
         assert!(startup.is_none());
 
         let response = await_stream_startup(startup_rx, sse_rx).await;
@@ -1773,6 +1846,23 @@ mod tests {
                 "text/event-stream; charset=utf-8"
             ))
         );
+    }
+
+    /// A started stream's answer names the parser the barrier brought, as the
+    /// chat answer it relays does; a start without one names none.
+    #[tokio::test]
+    async fn a_started_stream_names_the_parser_the_barrier_brought() {
+        for parser in [Some(HeaderValue::from_static("symphony")), None] {
+            let (startup_tx, startup_rx) = stream_startup_channel();
+            let (_sse_tx, sse_rx) = sse_channel();
+            let mut startup = Some(startup_tx);
+
+            assert!(signal_stream_startup(&mut startup, Ok(parser.clone())));
+
+            let response = await_stream_startup(startup_rx, sse_rx).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get(symphony::HEADER), parser.as_ref());
+        }
     }
 }
 
@@ -2251,5 +2341,90 @@ mod process_chunk_tests {
             wire["incomplete_details"],
             json!({"reason": "max_output_tokens"})
         );
+    }
+
+    #[tokio::test]
+    async fn a_cut_custom_tool_call_reads_incomplete_on_the_terminal_event_and_the_stored_object() {
+        for finish in [Some("abort"), Some("stop")] {
+            let mut emitter =
+                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+            emitter.set_original_request(
+                serde_json::from_value(json!({"model": "test-model", "input": "hi",
+                    "tools": [{"type": "custom", "name": "emit_command"}]}))
+                .unwrap(),
+            );
+            let (tx, mut rx) = mpsc::channel(256);
+            emitter
+                .process_chunk(
+                    &chunk(
+                        json!({"tool_calls": [{"index": 0, "id": "call_c", "type": "function",
+                            "function": {"name": "emit_command", "arguments": "{\"input\": \"pw"}}]}),
+                        None,
+                    ),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            emitter
+                .process_chunk(&chunk(json!({}), finish), &tx)
+                .await
+                .unwrap();
+            drop(tx);
+            while rx.recv().await.is_some() {}
+
+            let stored = serde_json::to_value(emitter.finalize(None)).unwrap();
+            assert_eq!(stored["status"], "incomplete", "{finish:?}");
+            assert!(stored["incomplete_details"].is_null(), "{finish:?}");
+            assert_eq!(
+                stored["output"][0]["type"], "custom_tool_call",
+                "{finish:?}"
+            );
+            let terminal = emitter.emit_completed(None);
+            assert_eq!(terminal["type"], "response.incomplete", "{finish:?}");
+            assert_eq!(terminal["response"]["status"], "incomplete", "{finish:?}");
+            assert!(
+                terminal["response"]["incomplete_details"].is_null(),
+                "{finish:?}"
+            );
+            assert_eq!(
+                terminal["response"]["output"][0]["type"], "custom_tool_call",
+                "{finish:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod serde_error_kind_tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::serde_error_kind;
+
+    #[derive(Debug, Deserialize)]
+    struct Item {
+        count: u32,
+    }
+
+    /// The drop warning names the error's kind and never its text: a type
+    /// mismatch's text quotes the value, a missing field's names the field.
+    #[test]
+    fn a_serde_error_is_named_by_its_kind_only() {
+        let read: Item = serde_json::from_value(json!({"count": 3})).expect("a count");
+        assert_eq!(read.count, 3);
+
+        let mismatch =
+            serde_json::from_value::<Item>(json!({"count": "the model's words"})).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("the model's words"),
+            "{mismatch}"
+        );
+        assert_eq!(serde_error_kind(&mismatch), "type mismatch");
+
+        let missing = serde_json::from_value::<Item>(json!({})).unwrap_err();
+        assert_eq!(serde_error_kind(&missing), "missing field");
+
+        let truncated = serde_json::from_str::<Item>("{\"count\": ").unwrap_err();
+        assert_eq!(serde_error_kind(&truncated), "other");
     }
 }

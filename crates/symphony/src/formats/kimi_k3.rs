@@ -15,7 +15,7 @@ use crate::{
 
 /// The Kimi K3 table.
 pub fn kimi_k3() -> Format {
-    Format::new("kimi_k3")
+    let format = Format::new("kimi_k3")
         .terminal("think_open", "<|open|>think<|sep|>")
         .terminal("think_close", "<|close|>think<|sep|>")
         .terminal("response_open", "<|open|>response<|sep|>")
@@ -24,9 +24,14 @@ pub fn kimi_k3() -> Format {
         .terminal("tools_close", "<|close|>tools<|sep|>")
         .terminal("call_open", "<|open|>call tool=\"")
         .terminal("call_close", Tags::XTML.invoke_close)
-        .terminal("message_close", "<|close|>message<|sep|>")
-        .structural_token("<|open|>")
-        .structural_token("<|close|>")
+        .terminal("message_close", "<|close|>message<|sep|>");
+    // The special tokens the tags are built of, declared once beside the assembler that reads
+    // them (`Tags::XTML.structural_tokens`): the engine and the assembler drop the same cut tails.
+    let format = Tags::XTML
+        .structural_tokens
+        .iter()
+        .fold(format, |format, token| format.structural_token(token));
+    format
         .state("message", Emits::Wrapper)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
@@ -61,7 +66,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, dropped, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -70,6 +75,7 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
+        input::EngineFinish,
         Declared,
     };
 
@@ -102,13 +108,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
@@ -190,7 +189,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();
@@ -245,16 +244,20 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: nothing is closed for a value the model
-        // never closed, and the one word of no bytes before the end says so.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
-        let ended = events
+        // The block's close ended `h` inside a string: the model ended the call, so the string
+        // is closed with the value's bytes whole, and the one word of no bytes before the
+        // closing quote says the marker closed it.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
-            .expect("the third call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(matches!(
-            &events[ended - 1],
-            Event::Malformed { text, .. } if text.text.is_empty()
+            &events[at..at + 2],
+            [
+                Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                Event::ToolCallArguments { index: 2, json, .. }
+            ] if text.text.is_empty() && json == "\""
         ));
         assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
@@ -378,14 +381,104 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
-        let events = run(
+    fn a_partial_argument_close_at_the_stop_is_a_cut_tag_not_the_values_text() {
+        // `<|close|>argument` begins no engine terminal, so it reaches the assembler, whose scanner
+        // holds it as the start of the argument's close. At the model's own stop it is a tag the
+        // end cut short, never the value's text: the string closes on its own bytes, the call
+        // ends, and the tail is dropped after it, every byte in its place.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"string\"<|sep|>Paris<|close|>argument"
+        );
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(
+            arguments_of(&stopped, 0),
+            r#"{"x": "Paris"}"#,
+            "{stopped:?}"
+        );
+        assert_eq!(bytes(&stopped), output);
+        let end = stopped
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .unwrap_or_else(|| panic!("the call ends: {stopped:?}"));
+        let tail = stopped
+            .iter()
+            .position(|event| *event == dropped("<|close|>argument"))
+            .unwrap_or_else(|| panic!("the tail is dropped: {stopped:?}"));
+        assert!(
+            end < tail,
+            "the call's bytes leave before the tail: {stopped:?}"
+        );
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // Cut by the token limit, nothing closes: the prefix as written, every byte kept.
+        let cut = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
             PROMPT,
-            &[concat!(
-                "<|close|>think<|sep|><|open|>tools<|sep|>",
-                "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
-                "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
-            )],
+            &[output],
+            EngineFinish::Length,
+        );
+        assert_eq!(bytes(&cut), output);
+        assert!(
+            arguments_of(&cut, 0).starts_with(r#"{"x": "Paris"#),
+            "{cut:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
+        );
+        // The model's own end of output there ends the call as its closing tag would: the value
+        // held for its close is refused, the object closes without it, and one word says the
+        // stop closed the call.
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // A partial structural terminal at the end of the output (`<|close|>` begins the
+        // argument's, the call's and the tools' close) is a tag the end cut short: it is dropped,
+        // and the call ends as the stream's end ends it, the stop closing the string the model
+        // left open and saying so, a cut leaving it open.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"string\"<|sep|>Paris<|close|>"
+        );
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"x": "Paris"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        assert_eq!(bytes(&stopped), output);
+        let cut = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 0), r#"{"x": "Paris"#);
+        assert_eq!(bytes(&cut), output);
+        // Cut by the token limit, nothing closes.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
+        );
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -433,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_named_nothing_is_reported_however_it_ended() {
+    fn a_call_that_named_nothing_is_refused_whole_however_it_ended() {
         for (output, ending) in [
             (
                 concat!(
@@ -457,10 +550,19 @@ mod tests {
         ] {
             let events = run(PROMPT, &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the bytes dropped as the model's failed call, never content, behind
+            // the counted event of no bytes.
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
+                )),
+                "{ending}: {events:?}"
+            );
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
                 )),
                 "{ending}: {events:?}"
             );
@@ -543,36 +645,83 @@ mod tests {
         // The output cut right after the `<|close|>` of a number argument, inside a call: the
         // assembler still holds the argument's bytes, which came before the cut tag, so the call
         // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
-        // every byte in exactly one event, in the output's order, and none of it content.
+        // every byte in exactly one event, in the output's order, and none of it content. Cut
+        // by the token limit the argument is the call's own fragment, as written; at the model's own
+        // stop the call ends as its closing tag would end it, the held number reported, the
+        // object closed without it, and the one word says the stop closed the call.
         let tokens = [
             "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
             "<|open|>argument key=\"n\" type=\"number\"<|sep|>",
             "1.5",
             "<|close|>",
         ];
-        let events = run(PROMPT_THINKING_OFF, &tokens);
-        assert_eq!(bytes(&events), tokens.concat(), "{events:?}");
-        assert_eq!(content(&events), "", "{events:?}");
-        let end = events
-            .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .unwrap_or_else(|| panic!("the call ends: {events:?}"));
-        let cut = events
-            .iter()
-            .position(|event| *event == dropped("<|close|>"))
-            .unwrap_or_else(|| panic!("the cut tag is dropped: {events:?}"));
+        let in_order = |events: &[Event<'static>]| {
+            assert_eq!(bytes(events), tokens.concat(), "{events:?}");
+            assert_eq!(content(events), "", "{events:?}");
+            let end = events
+                .iter()
+                .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                .unwrap_or_else(|| panic!("the call ends: {events:?}"));
+            let cut = events
+                .iter()
+                .position(|event| *event == dropped("<|close|>"))
+                .unwrap_or_else(|| panic!("the cut tag is dropped: {events:?}"));
+            assert!(
+                end < cut,
+                "the call's bytes leave before the cut tag: {events:?}"
+            );
+        };
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT_THINKING_OFF,
+            &tokens,
+            EngineFinish::Length,
+        );
+        in_order(&events);
+        assert_eq!(
+            arguments_of(&events, 0),
+            r#"{"n": 1.5"#,
+            "the unfinished argument is the call's own bytes, as written: {events:?}"
+        );
         assert!(
-            end < cut,
-            "the call's bytes leave before the cut tag: {events:?}"
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallArguments { json, source, .. }
+                    if json == r#"{"n": 1.5"#
+                        && source.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "{events:?}"
         );
         assert!(
             events.iter().any(|event| matches!(
                 event,
                 Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text.is_empty()
+            )),
+            "the one word says the arguments are no whole value: {events:?}"
+        );
+        let stopped = run(PROMPT_THINKING_OFF, &tokens);
+        in_order(&stopped);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(
+            stopped.iter().any(|event| matches!(
+                event,
+                Event::Malformed { text, why: MalformedReason::TagCutShort } if text.text.is_empty()
+            )),
+            "the cut tag is counted: {stopped:?}"
+        );
+        assert!(
+            stopped.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::MalformedCall }
                     if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
             )),
-            "the unfinished argument is the call's malformed bytes: {events:?}"
+            "the held number is refused, never content: {stopped:?}"
         );
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
     }
 
     #[test]
@@ -589,5 +738,55 @@ mod tests {
         let cut = run(PROMPT_THINKING_OFF, &["Pong.", "<|close|>", "think"]);
         assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
         assert_eq!(bytes(&cut), "Pong.<|close|>think");
+    }
+
+    /// A call whose arguments the model wrote as JSON and closed with a `json` region of its own
+    /// (seen live): the call is read with no arguments, and the JSON with the region's tags is
+    /// refused as the model's failed call, counted and never content, where `{…}<|close|>json
+    /// <|sep|>` reached the client as content before.
+    #[test]
+    fn arguments_written_as_json_in_a_region_of_the_models_own_are_refused_never_content() {
+        const OUTPUT: &str = concat!(
+            "Noise.<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"get_law_categories\" index=\"0\"<|sep|>",
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>",
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        );
+        const SLIP: &str =
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>";
+        for pieces in [vec![OUTPUT], OUTPUT.split_inclusive(',').collect()] {
+            let events = run(PROMPT, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(arguments_of(&events, 0), "{}", "{pieces:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "{pieces:?}: {events:?}");
+            let refused: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused, SLIP, "{pieces:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::TagOutOfPlace,
+                        ..
+                    }
+                )),
+                "{pieces:?}"
+            );
+        }
     }
 }

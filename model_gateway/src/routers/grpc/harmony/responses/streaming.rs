@@ -267,9 +267,10 @@ async fn execute_mcp_tool_loop_streaming(
             "Harmony Responses streaming iteration"
         );
 
-        // Execute pipeline and get stream + load guards
+        // Execute pipeline and get stream + load guards, under the
+        // iteration's tenant rate-limit reservation
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards) = match ctx
+        let (execution_result, _load_guards, reservation, router_stops) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -295,18 +296,32 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
-        // Process stream with token-level streaming
+        // Process stream with token-level streaming; the reservation is
+        // settled with the engine's counts the stream brought, or closed
+        // unsettled (its debit kept) when the stream broke or ended before
+        // its terminal frame.
         let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
             execution_result,
             emitter,
             tx,
             Some(&session),
             Some(&ctx.mcp_format_registry),
+            &router_stops,
         )
         .await
         {
-            Ok(result) => result,
+            Ok((result, counts)) => {
+                // The counts come with the terminal frame; a stream that
+                // ended before it brought none, and the reservation keeps
+                // its debit as the chat streams' does.
+                match counts {
+                    Some(counts) => reservation.settle(counts.settlement()).await,
+                    None => reservation.close_unsettled().await,
+                }
+                result
+            }
             Err(err_msg) => {
+                reservation.close_unsettled().await;
                 emitter
                     .emit_error(&err_msg, Some("processing_error"), tx)
                     .await;
@@ -322,6 +337,9 @@ async fn execute_mcp_tool_loop_streaming(
                 partial_text,
                 usage,
                 request_id: _,
+                // The stored object and the terminal read the finish the
+                // emitter was told.
+                finish_reason: _,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
@@ -542,9 +560,10 @@ async fn execute_without_mcp_streaming(
     debug!("No MCP tools - executing single iteration");
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
 
-    // Execute pipeline and get stream + load guards
+    // Execute pipeline and get stream + load guards, under the request's
+    // tenant rate-limit reservation
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards) = match ctx
+    let (execution_result, _load_guards, reservation, router_stops) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             current_request,
@@ -570,18 +589,32 @@ async fn execute_without_mcp_streaming(
         }
     };
 
-    // Process stream (no MCP context, all tools treated as function tools)
+    // Process stream (no MCP context, all tools treated as function tools);
+    // the reservation is settled with the engine's counts the stream
+    // brought, or closed unsettled (its debit kept) when the stream broke
+    // or ended before its terminal frame.
     let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
         execution_result,
         emitter,
         tx,
         None,
         None,
+        &router_stops,
     )
     .await
     {
-        Ok(result) => result,
+        Ok((result, counts)) => {
+            // The counts come with the terminal frame; a stream that ended
+            // before it brought none, and the reservation keeps its debit
+            // as the chat streams' does.
+            match counts {
+                Some(counts) => reservation.settle(counts.settlement()).await,
+                None => reservation.close_unsettled().await,
+            }
+            result
+        }
         Err(err_msg) => {
+            reservation.close_unsettled().await;
             emitter
                 .emit_error(&err_msg, Some("processing_error"), tx)
                 .await;

@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 
+from .constants import SERVICER_WARMUP_BUDGET_SECS
+
 # Environment variable for local model paths (CI uses local copies for speed)
 ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
 # Nightly benchmarks skip --enforce-eager for performance measurement
@@ -41,6 +43,25 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("meta-llama/Llama-3.2-1B-Instruct"),
         "tp": 1,
         "features": ["chat", "streaming", "tool_choice"],
+    },
+    # The same checkpoint's tokenizer and chat template from an ungated
+    # repository: what the classes on the mock engine read, so the CPU lane
+    # fetches the files without a hub token (the mock needs no weights, only
+    # the tokenizer files). Not a model any engine lane runs: no features, and
+    # no tier downloads it.
+    "RedHatAI/Llama-3.2-1B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Llama-3.2-1B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
+    },
+    # The primary chat model's tokenizer and chat template from an ungated
+    # repository, for the classes on the mock engine (as above).
+    "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
     },
     # Function calling specialist
     "Qwen/Qwen2.5-7B-Instruct": {
@@ -142,7 +163,8 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("openai/gpt-oss-120b"),
         "tp": 4,
         "features": ["chat", "streaming", "reasoning", "harmony"],
-        "startup_timeout": 600,
+        # The engine's own start, then the servicer's planned warm-up (its budget).
+        "startup_timeout": 600 + SERVICER_WARMUP_BUDGET_SECS,
         "vllm_args": [
             "--structured-outputs-config",
             '{"enable_in_reasoning": true}',
@@ -173,7 +195,8 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("Qwen/Qwen3.5-9B"),
         "tp": 1,
         "features": ["chat", "streaming", "multimodal", "moe"],
-        "startup_timeout": 600,
+        # The engine's own start, then the servicer's planned warm-up (its budget).
+        "startup_timeout": 600 + SERVICER_WARMUP_BUDGET_SECS,
         "tokenspeed_args": [
             "--attention-backend",
             "fa3",
@@ -210,7 +233,9 @@ MODEL_SPECS: dict[str, dict] = {
         "vllm_args": [
             "--max-model-len=196608",
         ],
-        "startup_timeout": 1200,  # Large MoE model may need extra download/load time
+        # A large MoE model may need extra download/load time, then the servicer's
+        # planned warm-up (its budget).
+        "startup_timeout": 1200 + SERVICER_WARMUP_BUDGET_SECS,
     },
     # MLX (Apple Silicon). Smallest Qwen3 with tool calling + thinking (~400 MB).
     "mlx-community/Qwen3-0.6B-4bit": {

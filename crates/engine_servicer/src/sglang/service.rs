@@ -11,7 +11,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{admin, embed, generate, info, State};
+use super::{embed, generate, info, State};
 use crate::{kv_events, tokenizer_bundle, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
@@ -42,6 +42,7 @@ impl SglangScheduler for SglangService {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
         generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
+            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
             .map(Response::new)
     }
 
@@ -71,6 +72,7 @@ impl SglangScheduler for SglangService {
         // id is reported as the Python servicer reports it.
         let found = self
             .state
+            .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
         Ok(Response::new(if found > 0 {
@@ -111,7 +113,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        admin::flush_cache(&self.state, request)
+        crate::admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
     }
@@ -120,7 +122,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        admin::start_profile(&self.state, request.into_inner())
+        crate::admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -129,14 +131,16 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        admin::stop_profile(&self.state).await.map(Response::new)
+        crate::admin::stop_profile(&self.state.shared)
+            .await
+            .map(Response::new)
     }
 
     async fn get_tokenizer(
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
+        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -145,7 +149,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.kv_relay else {
+        let Some(relay) = &self.state.shared.kv_relay else {
             return Err(Status::unimplemented(kv_events::SGLANG_DISABLED_MESSAGE));
         };
         relay.subscribe(request.into_inner()).map(Response::new)

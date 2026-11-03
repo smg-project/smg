@@ -9,7 +9,7 @@ and normalization off, which gives the patch bytes, and once as configured,
 which gives the normalized floats. From the two the per-byte table each
 channel maps through is read off, and the normalized tensor is fingerprinted
 as `f32` and as `bfloat16` (round to nearest even, what the engine casts it
-to). The Rust integration test ``tests/qwen_pixel_norm_golden.rs`` checks its
+to). The Rust integration test ``tests/preprocess/qwen_pixel_norm_golden.rs`` checks its
 own table and tensors against this JSON bit for bit.
 
 448 is a multiple of both families' patch grids (28 and 32) and within both

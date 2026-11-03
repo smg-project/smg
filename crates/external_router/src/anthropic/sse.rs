@@ -3,7 +3,7 @@
 //! Provides SSE frame parsing, event formatting, stream wrappers,
 //! and the core stream consumption logic used by the streaming processor.
 
-use std::{borrow::Cow, io};
+use std::{borrow::Cow, fmt, io};
 
 use axum::{
     body::Body,
@@ -32,6 +32,31 @@ use crate::{
 
 /// Sentinel error string returned when the downstream SSE client disconnects.
 pub(crate) const CLIENT_DISCONNECTED_ERROR: &str = "Client disconnected";
+
+/// Why `consume_and_forward` stopped before the upstream stream's end. The
+/// text is the one the loop reported before the variants existed.
+#[derive(Debug)]
+pub(crate) enum StreamFailure {
+    /// The client went away: nothing to count against the worker.
+    ClientGone,
+    /// The upstream read ran past the request's time bound.
+    Timeout(String),
+    /// The upstream connection failed under the read.
+    Read(String),
+    /// The upstream answered bytes the forwarder could not read: a frame
+    /// that is not UTF-8, data that is not JSON, a buffer past its bound, a
+    /// block index past the maximum.
+    BadFrame(String),
+}
+
+impl fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientGone => f.write_str(CLIENT_DISCONNECTED_ERROR),
+            Self::Timeout(text) | Self::Read(text) | Self::BadFrame(text) => f.write_str(text),
+        }
+    }
+}
 
 /// Maximum SSE buffer size (1 MB) to prevent DoS from upstream workers
 /// that send data without frame delimiters.
@@ -230,7 +255,7 @@ pub(crate) async fn consume_and_forward<F>(
     global_index: &mut u32,
     is_first_iteration: bool,
     resolve_server_name: F,
-) -> Result<StreamConsumeResult, String>
+) -> Result<StreamConsumeResult, StreamFailure>
 where
     F: Fn(&str) -> String,
 {
@@ -245,17 +270,27 @@ where
     );
 
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
+        let chunk = chunk_result.map_err(|e| {
+            let text = format!("Stream read error: {e}");
+            if e.is_timeout() {
+                StreamFailure::Timeout(text)
+            } else {
+                StreamFailure::Read(text)
+            }
+        })?;
 
-        decoder.push(&chunk).map_err(|e| match e {
-            SseDecodeError::BufferOverflow => format!(
-                "SSE buffer exceeded maximum size ({MAX_SSE_BUFFER_SIZE} bytes) — possible malformed upstream stream"
-            ),
-            other => format!("SSE decode error: {other}"),
+        decoder.push(&chunk).map_err(|e| {
+            StreamFailure::BadFrame(match e {
+                SseDecodeError::BufferOverflow => format!(
+                    "SSE buffer exceeded maximum size ({MAX_SSE_BUFFER_SIZE} bytes) — possible malformed upstream stream"
+                ),
+                other => format!("SSE decode error: {other}"),
+            })
         })?;
 
         while let Some(frame) = decoder.next_frame() {
-            let frame = frame.map_err(|e| format!("Invalid UTF-8 in SSE frame: {e}"))?;
+            let frame = frame
+                .map_err(|e| StreamFailure::BadFrame(format!("Invalid UTF-8 in SSE frame: {e}")))?;
             if let Some((event_type, data)) = resolve_event(frame) {
                 processor.process(&event_type, &data).await?;
             }
@@ -265,9 +300,11 @@ where
 
     // Process any trailing data not terminated by a blank line.
     if let Some(frame) = decoder.flush() {
-        let frame = frame.map_err(|e| match e {
-            SseDecodeError::InvalidUtf8(u) => format!("Invalid UTF-8 in final SSE data: {u}"),
-            other => format!("SSE decode error on flush: {other}"),
+        let frame = frame.map_err(|e| {
+            StreamFailure::BadFrame(match e {
+                SseDecodeError::InvalidUtf8(u) => format!("Invalid UTF-8 in final SSE data: {u}"),
+                other => format!("SSE decode error on flush: {other}"),
+            })
         })?;
         if let Some((event_type, data)) = resolve_event(frame) {
             processor.process(&event_type, &data).await?;
@@ -494,17 +531,17 @@ where
     }
 
     /// Send an SSE event to the client, returning `Err` on disconnect.
-    async fn send(&mut self, event_type: &str, data: &Value) -> Result<(), String> {
+    async fn send(&mut self, event_type: &str, data: &Value) -> Result<(), StreamFailure> {
         if !send_event(self.tx, self.enc, event_type, data).await {
-            return Err(CLIENT_DISCONNECTED_ERROR.into());
+            return Err(StreamFailure::ClientGone);
         }
         Ok(())
     }
 
     /// Process a single SSE event from the upstream worker.
-    async fn process(&mut self, event_type: &str, data: &str) -> Result<(), String> {
-        let mut parsed: Value =
-            serde_json::from_str(data).map_err(|e| format!("Failed to parse SSE data: {e}"))?;
+    async fn process(&mut self, event_type: &str, data: &str) -> Result<(), StreamFailure> {
+        let mut parsed: Value = serde_json::from_str(data)
+            .map_err(|e| StreamFailure::BadFrame(format!("Failed to parse SSE data: {e}")))?;
 
         match event_type {
             "message_start" => {
@@ -535,13 +572,13 @@ where
 
     /// Handle a `content_block_start` event: transform tool_use → mcp_tool_use,
     /// remap index, and initialize the block accumulator.
-    async fn handle_block_start(&mut self, parsed: &mut Value) -> Result<(), String> {
+    async fn handle_block_start(&mut self, parsed: &mut Value) -> Result<(), StreamFailure> {
         let upstream_index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
         if upstream_index > MAX_UPSTREAM_BLOCK_INDEX {
-            return Err(format!(
+            return Err(StreamFailure::BadFrame(format!(
                 "Upstream content block index {upstream_index} exceeds maximum ({MAX_UPSTREAM_BLOCK_INDEX})"
-            ));
+            )));
         }
 
         let block_type = parsed
@@ -579,7 +616,7 @@ where
         content_block: &Value,
         upstream_index: u32,
         client_index: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), StreamFailure> {
         let id = content_block
             .get("id")
             .and_then(|v| v.as_str())
@@ -616,7 +653,7 @@ where
 
     /// Handle a `content_block_delta` event: accumulate content and forward
     /// with remapped index.
-    async fn handle_block_delta(&mut self, parsed: &mut Value) -> Result<(), String> {
+    async fn handle_block_delta(&mut self, parsed: &mut Value) -> Result<(), StreamFailure> {
         let upstream_index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let client_index = self.index_base + upstream_index;
 
@@ -633,7 +670,7 @@ where
 
     /// Handle a `content_block_stop` event: finalize the accumulated block
     /// and update the global index.
-    async fn handle_block_stop(&mut self, parsed: &Value) -> Result<(), String> {
+    async fn handle_block_stop(&mut self, parsed: &Value) -> Result<(), StreamFailure> {
         let upstream_index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let client_index = self.index_base + upstream_index;
 

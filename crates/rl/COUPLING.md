@@ -5,16 +5,17 @@ that adds a surface must update this file.
 
 | # | Surface | model_gateway file | Notes |
 |---|---|---|---|
-| (a) | `RlWorkerView` read-only registry view | `src/rl_adapter.rs`, `src/lib.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}`; hands the RL crate each HTTP worker's negotiated client through `Worker::{http_client_handle_if_initialized,http_client}`, the same client the gateway's admin ops use, so control calls inherit the worker's HTTP version, TLS identity and roots, and pool tuning; `lib.rs` gains `pub mod rl_adapter;`; for gRPC/ZMQ workers it borrows a control client from `WorkerHttpClientCache::get(&spec.http_pool, false)` (`AppContext.worker_client_cache`) and reads the `rl.control_url` label (`CONTROL_URL_LABEL`), resolving wildcard hosts with `smg_rl::resolve_control_url` |
+| (a) | `RlWorkerView` read-only registry view | `src/worker/rl_adapter.rs`, `src/worker/mod.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}`; hands the RL crate each HTTP worker's negotiated client through `Worker::{http_client_handle_if_initialized,http_client}`, the same client the gateway's admin ops use, so control calls inherit the worker's HTTP version, TLS identity and roots, and pool tuning; `worker/mod.rs` declares `pub mod rl_adapter;`; for gRPC/ZMQ workers it borrows a control client from `WorkerHttpClientCache::get(&spec.http_pool, false)` (`AppContext.worker_client_cache`) and reads the `rl.control_url` label (`CONTROL_URL_LABEL`), resolving wildcard hosts with `smg_rl::resolve_control_url` |
+| (a) | `RlControlCalls` on `RlWorkerInfo.control_calls` | `src/worker/rl_adapter.rs` | `EngineConnectionControl` for a TokenSpeed ZMQ worker: reaches the worker's client through `Worker::get_backend_client` at call time and runs `ZmqEngineClient::rl_control_call` (`BackendClient::Zmq`); used by the proxy and the fan-out for a worker without a `control_url` |
 | (d) | `AppContext.rl: Option<Arc<RlState>>` | `src/app_context.rs` | built in `AppContextBuilder::build()` when `router_config.rl.enabled` |
 | (d) | route mount | `src/server.rs` `build_app` | `nest("/v1/rl", smg_rl::router(..))` under `apply_control_plane_auth` |
 | (d) | metrics HELP registration | `src/observability/metrics.rs` | `smg_rl::init_rl_metrics()` |
-| (d) | config + flags | `src/config/{types,builder,validation}.rs`, `src/main.rs`, `bindings/python/src/smg/router_args.py`, `bindings/python/src/lib.rs` | `RouterConfig.rl`, three CLI flags |
+| (d) | config + flags | `src/config/{types,builder,validation}.rs`, `src/main.rs`, `src/cli/configure.rs`, `bindings/python/src/smg/router_args.py`, `bindings/python/src/lib.rs` | `RouterConfig.rl`, three CLI flags |
 | (d) | manifests | `model_gateway/Cargo.toml`, `bindings/python/Cargo.toml` | `smg-rl` pulled in via `workspace = true` (router crate and the pyo3 bindings crate) |
 
 Test-only files that the mount also touches, none of them a new surface:
-`model_gateway/tests/rl_control_plane_test.rs` (gateway-level `/v1/rl` tests),
-`model_gateway/tests/common/mock_worker.rs` (engine-native RL routes on the
+`model_gateway/tests/http/rl_control_plane_test.rs` (gateway-level `/v1/rl` tests),
+`model_gateway/test_harness/src/mock_worker.rs` (engine-native RL routes on the
 mock), and the three `#[cfg(test)]` `AppContext { .. }` literals in
 `src/service_discovery/testing.rs`, `src/workflow/steps/local/drain_workers.rs`, and
 `src/workflow/steps/local/update_worker_properties.rs`, which gain `rl: None`
@@ -34,7 +35,7 @@ labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
 `src/routers/grpc/pipeline.rs` give slime's model-less single-prompt
 `/generate` SGLang's shape; `src/routers/http/router.rs` (with
 `crates/protocols/src/generate.rs`) stops forwarding the wildcard `model`
-placeholder. `model_gateway/tests/rl_tokenspeed_control_endpoint_test.rs`
+placeholder. `model_gateway/tests/http/rl_tokenspeed_control_endpoint_test.rs`
 registers a TokenSpeed gRPC mock through `POST /workers`, drives it through
 `/v1/rl` via the control endpoint its server info advertised, and checks the
 version and the shape the gRPC `/generate` path reports.

@@ -77,12 +77,19 @@ class KindGateway:
         self.stop()
         self.start(extra_args)
 
-    def workers(self) -> list[dict]:
+    def fetch_workers(self) -> list[dict] | None:
+        """The registered workers, or None when the gateway could not be
+        asked; an unanswered request must never read as an empty fleet."""
         try:
-            payload = requests.get(f"{self.base_url}/workers", timeout=5).json()
-        except requests.RequestException:
-            return []
+            response = requests.get(f"{self.base_url}/workers", timeout=5)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return None
         return payload.get("workers", payload if isinstance(payload, list) else [])
+
+    def workers(self) -> list[dict]:
+        return self.fetch_workers() or []
 
     def worker_count(self) -> int:
         return len(self.workers())
@@ -100,7 +107,10 @@ class KindGateway:
             assert self.proc is not None and self.proc.poll() is None, (
                 f"smg process died while waiting for {what}"
             )
-            if self.worker_count() == expect:
+            # Counted from an answered request only: a failed one is no fleet
+            # at all, not an empty one that satisfies an expected zero.
+            workers = self.fetch_workers()
+            if workers is not None and len(workers) == expect:
                 return
             time.sleep(1)
         raise AssertionError(f"timed out waiting for {what}; workers: {self.workers()}")

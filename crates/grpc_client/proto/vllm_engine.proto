@@ -20,6 +20,12 @@ service VllmEngine {
   // Invalidate the local KV prefix cache without preempting requests.
   rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
 
+  // Start the engine's profiler (configured at its launch) on every rank
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export its traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
@@ -177,8 +183,8 @@ message MultimodalInputs {
 }
 
 // One media item the worker fetches and processes itself. `url` is forwarded
-// verbatim from the API request: http(s)://, data:<mime>;base64,..., or
-// file://. The worker's MediaConnector applies --allowed-media-domains /
+// verbatim from the API request: `http(s)://`, `data:<mime>;base64,...`, or
+// `file://`. The worker's MediaConnector applies --allowed-media-domains /
 // --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
 message MediaRef {
   smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
@@ -503,6 +509,17 @@ message GetServerInfoResponse {
   // holds each item to; the worker-side pipeline takes the same number from
   // its launcher.
   int32 mm_encoder_budget = 25;
+
+  // The vocabulary of structural-tag nodes the engine's grammar compiler
+  // takes: "older" when the xgrammar installed beside the engine predates the
+  // `optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release
+  // with them) and refuses a tag that carries one at compile time; "" for a
+  // current one, another backend, or nothing known. Flattened into the
+  // `structural_tag_vocabulary` worker label, by which the router spells such
+  // a worker's structural tags without `optional`, `plus` and `star`, the same
+  // language; a `token` node stays as derived, so a table that writes
+  // single-token markers still meets the older compiler's refusal.
+  string structural_tag_vocabulary = 26;
 }
 
 // =====================

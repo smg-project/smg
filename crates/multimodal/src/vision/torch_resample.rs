@@ -425,7 +425,8 @@ mod tests {
                     for c in 0..3 {
                         let mut s = half;
                         for x in 0..n {
-                            s += i64::from(data[(y * in_w + x0 + x) * 3 + c]) * k.taps[xx][x];
+                            s += i64::from(data[(y * in_w + x0 + x) * 3 + c])
+                                * i64::from(k.taps[xx][x]);
                         }
                         out[(y * out_w + xx) * 3 + c] = clip(&k, s);
                     }
@@ -450,7 +451,7 @@ mod tests {
             for x in 0..width * 3 {
                 let mut s = half;
                 for y in 0..n {
-                    s += i64::from(mid[(y0 + y) * width * 3 + x]) * k.taps[yy][y];
+                    s += i64::from(mid[(y0 + y) * width * 3 + x]) * i64::from(k.taps[yy][y]);
                 }
                 out[yy * width * 3 + x] = clip(&k, s);
             }

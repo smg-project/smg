@@ -20,7 +20,10 @@ use openai_protocol::decisions::{
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 
-use crate::routers::error;
+use crate::{
+    observability::metrics::error_reason_from_status,
+    routers::{common::attempt_ledger::UpstreamAnswer, error, grpc::utils::mark_error_reason},
+};
 
 pub(crate) const UPSTREAM_ROUTE: &str = "/v1/systemone";
 
@@ -239,6 +242,12 @@ impl SglangDecisionAdapter {
                         .and_then(Value::as_str)
                         .unwrap_or("upstream_decisions_error");
                     let mut response = error::create_error(parts.status, code, message);
+                    // A worker's own answer (not the gateway's failed send or
+                    // body read), re-minted under its code or the relay's: the
+                    // error counter's reason is the worker's status.
+                    if parts.extensions.get::<UpstreamAnswer>().is_some() {
+                        mark_error_reason(&mut response, error_reason_from_status(parts.status));
+                    }
                     if let Some(value) = value.filter(|value| {
                         value
                             .pointer("/error/message")
@@ -740,6 +749,77 @@ mod tests {
             );
             assert!(value.get("answers").is_none());
         }
+    }
+
+    /// A worker's own error answer, re-minted under its code (or the
+    /// relay's), carries the worker's status as the error counter's reason:
+    /// its 500 reads as the engine's internal fault, its 404 as the model
+    /// not found, its 400 as the request's own fault, never as the gateway's
+    /// own processing.
+    #[tokio::test]
+    async fn a_relayed_worker_error_names_the_workers_status_reason() {
+        use crate::{
+            observability::metrics::metrics_labels::{
+                REASON_ENGINE_INTERNAL, REASON_INVALID_REQUEST, REASON_MODEL_NOT_FOUND,
+            },
+            routers::{
+                common::attempt_ledger::mark_upstream_answer,
+                grpc::utils::error_reason_for_response,
+            },
+        };
+        for (status, fixture, reason) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":{"message":"boom","type":"server_error","code":"engine_exploded"}}),
+                REASON_ENGINE_INTERNAL,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"detail":"no code at all"}),
+                REASON_ENGINE_INTERNAL,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"error":{"message":"no such model","type":"invalid_request_error","code":"model_not_found"}}),
+                REASON_MODEL_NOT_FOUND,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"detail":"question q0 label is not a single token"}),
+                REASON_INVALID_REQUEST,
+            ),
+        ] {
+            let adapter =
+                SglangDecisionAdapter::new(&request(json!("x"), all_questions())).unwrap();
+            let mut answer = (status, Json(fixture)).into_response();
+            mark_upstream_answer(&mut answer);
+            let response = adapter.convert_response(answer, 100_000).await;
+            assert_eq!(response.status(), status);
+            assert_eq!(error_reason_for_response(&response), reason, "{status}");
+        }
+    }
+
+    /// The gateway's own failed send or body read reaches the adapter as an
+    /// error without the worker's answer marker: its code keeps naming the
+    /// reason (a transport fault stays one), the status does not take over.
+    #[tokio::test]
+    async fn a_gateway_own_error_keeps_the_reason_of_its_code() {
+        use crate::{
+            observability::metrics::metrics_labels::REASON_TRANSPORT_DISCONNECT,
+            routers::grpc::utils::error_reason_for_response,
+        };
+        let adapter = SglangDecisionAdapter::new(&request(json!("x"), all_questions())).unwrap();
+        let response = adapter
+            .convert_response(
+                error::internal_error("call_upstream_connection_failed", "refused"),
+                100_000,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_reason_for_response(&response),
+            REASON_TRANSPORT_DISCONNECT
+        );
     }
 
     #[tokio::test]

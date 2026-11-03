@@ -7,16 +7,28 @@
 //! the response body (the edge's one body wrapper, see `edge_body`), so it
 //! is only released after the entire stream has been delivered.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{ready, Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::{header::RETRY_AFTER, HeaderValue, StatusCode},
-    middleware::Next,
     response::Response,
 };
-use tokio::{sync::Semaphore, time::error::Elapsed};
+use futures_util::future::BoxFuture;
+use pin_project_lite::pin_project;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::error::Elapsed,
+};
+use tower::{Layer, Service};
 use tracing::{debug, warn};
 
 use super::{
@@ -41,7 +53,7 @@ fn shed_response(status: StatusCode, code: &'static str, message: &'static str) 
 }
 
 /// Returns an acquired token when the request is cancelled or the response body is dropped.
-struct TokenPermit {
+pub struct TokenPermit {
     token_bucket: Arc<TokenBucket>,
     /// Number of tokens to return.
     tokens: f64,
@@ -103,88 +115,146 @@ impl Drop for QueueDepthGuard {
     }
 }
 
-async fn run_with_permit(next: Next, mut request: Request<Body>, permit: TokenPermit) -> Response {
-    // The wait for the permit was the admission queue's, bounded by its own
-    // timeout; the bound ahead of worker selection counts from here.
-    restamp_accepted_at(request.extensions_mut());
-    let mut response = next.run(request).await;
-    // Held until the response body is fully consumed or dropped, by the
-    // edge's one body wrapper.
-    BodyDuties::hand(&mut response, |duties| {
-        duties.permit = Some(Box::new(permit));
-    });
-    response
-}
-
 /// Bounded admission queue: at most `queue_size` requests wait for a token;
 /// the next arrival sheds immediately. FIFO order comes from the token
 /// bucket's waiter queue.
 pub struct AdmissionQueue {
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
     queue_timeout: Duration,
 }
 
 impl AdmissionQueue {
     pub fn new(queue_size: usize, queue_timeout: Duration) -> Self {
         Self {
-            slots: Semaphore::new(queue_size),
+            slots: Arc::new(Semaphore::new(queue_size)),
             queue_timeout,
         }
     }
 }
 
-/// Middleware function for concurrency limiting with optional queuing
-pub async fn concurrency_limit_middleware(
-    State(app_state): State<Arc<AppState>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    // Cluster-wide rate limiting was previously enforced via the
-    // v1 `MeshSyncManager::check_global_rate_limit` path. That hook
-    // is removed in this PR. Local per-node token-bucket rate
-    // limiting below still applies; cluster aggregation will return
-    // through the v2 `RateLimitSyncAdapter` in a follow-up PR.
+/// The legacy admission as a route layer: the token bucket bounds the
+/// requests in flight, the optional queue parks the overflow. A request that
+/// finds a token takes the route's own future, the permit handed to its
+/// response on the way out: no clone of the route service, no boxed future.
+/// The wait for a token is the one path that runs before the route, and the
+/// one that is boxed; a shed for queuing disabled or a full queue is answered
+/// at once, a wait that times out is answered from the boxed path.
+#[derive(Clone)]
+pub struct ConcurrencyLimitLayer {
+    app_state: Arc<AppState>,
+}
 
-    let token_bucket = match &app_state.context.rate_limiter {
-        Some(bucket) => bucket.clone(),
-        None => {
-            // Rate limiting disabled, pass through immediately
-            return next.run(request).await;
+impl ConcurrencyLimitLayer {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+impl<S> Layer<S> for ConcurrencyLimitLayer {
+    type Service = ConcurrencyLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConcurrencyLimitService {
+            inner,
+            app_state: self.app_state.clone(),
         }
-    };
+    }
+}
 
-    // Try to acquire token immediately
-    if let Ok(permit) = TokenPermit::try_acquire(token_bucket.clone(), 1.0) {
-        debug!("Acquired token immediately");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-        return run_with_permit(next, request, permit).await;
+/// The service [`ConcurrencyLimitLayer`] wraps a route in. The token rides
+/// on the response body (the edge's one body wrapper, see `edge_body`), so it
+/// is released only after the entire stream has been delivered; a request
+/// parked at admission keeps its body unread.
+#[derive(Clone)]
+pub struct ConcurrencyLimitService<S> {
+    inner: S,
+    app_state: Arc<AppState>,
+}
+
+impl<S> Service<Request<Body>> for ConcurrencyLimitService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = ConcurrencyLimitFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
     }
 
-    let Some(queue) = &app_state.admission_queue else {
-        warn!("No tokens available and queuing is disabled, returning 429");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-        return shed_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "admission_queue_full",
-            "concurrency limit reached and queuing is disabled",
-        );
-    };
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        // Rate limiting disabled: the route's own future, untouched.
+        let Some(token_bucket) = &self.app_state.context.rate_limiter else {
+            return ConcurrencyLimitFuture::Through {
+                inner: self.inner.call(request),
+            };
+        };
+        if let Ok(permit) = TokenPermit::try_acquire(Arc::clone(token_bucket), 1.0) {
+            debug!("Acquired token immediately");
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+            // The bound ahead of worker selection counts from here.
+            restamp_accepted_at(request.extensions_mut());
+            return ConcurrencyLimitFuture::Admitted {
+                inner: self.inner.call(request),
+                permit: Some(permit),
+            };
+        }
+        let Some(queue) = &self.app_state.admission_queue else {
+            warn!("No tokens available and queuing is disabled, returning 429");
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            return ConcurrencyLimitFuture::Shed {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "admission_queue_full",
+                message: "concurrency limit reached and queuing is disabled",
+            };
+        };
+        // The queue's slot is taken here, before the route is cloned and the
+        // wait boxed: a request a full queue turns away costs neither.
+        let Ok(slot) = Arc::clone(&queue.slots).try_acquire_owned() else {
+            warn!("Request queue is full, returning 429");
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
+            return ConcurrencyLimitFuture::Shed {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "admission_queue_full",
+                message: "admission queue is at capacity",
+            };
+        };
+        // The route service a queued request is handed to is the one that
+        // reported ready, as tower's contract has it; the clone stays here.
+        let clone = self.inner.clone();
+        let route = std::mem::replace(&mut self.inner, clone);
+        ConcurrencyLimitFuture::Queued {
+            inner: Box::pin(admit_from_queue(
+                route,
+                request,
+                slot,
+                Arc::clone(token_bucket),
+                queue.queue_timeout,
+            )),
+        }
+    }
+}
 
-    let Ok(slot) = queue.slots.try_acquire() else {
-        warn!("Request queue is full, returning 429");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-        Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
-        return shed_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "admission_queue_full",
-            "admission queue is at capacity",
-        );
-    };
-
+/// The wait in the admission queue (its slot taken by the caller), then the
+/// route: a wait longer than the queue's timeout sheds. Waiters park on the
+/// token bucket, which serves them in FIFO order.
+async fn admit_from_queue<S>(
+    mut route: S,
+    mut request: Request<Body>,
+    slot: OwnedSemaphorePermit,
+    token_bucket: Arc<TokenBucket>,
+    queue_timeout: Duration,
+) -> Result<Response, Infallible>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible>,
+{
     debug!("No tokens available, waiting in admission queue");
     let permit_result = {
         let _queued = QueueDepthGuard::enter();
-        TokenPermit::acquire_timeout(token_bucket, 1.0, queue.queue_timeout).await
+        TokenPermit::acquire_timeout(token_bucket, 1.0, queue_timeout).await
     };
     match permit_result {
         Ok(permit) => {
@@ -193,17 +263,75 @@ pub async fn concurrency_limit_middleware(
             drop(slot);
             debug!("Acquired token from queue");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-            run_with_permit(next, request, permit).await
+            // The wait for the permit was the admission queue's, bounded by
+            // its own timeout; the bound ahead of worker selection counts
+            // from here.
+            restamp_accepted_at(request.extensions_mut());
+            let Ok(mut response) = route.call(request).await;
+            hand_permit(&mut response, permit);
+            Ok(response)
         }
         Err(_) => {
             warn!("Request timed out in admission queue");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_TIMEOUT);
-            shed_response(
+            Ok(shed_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "admission_queue_timeout",
                 "timed out waiting for an admission slot",
-            )
+            ))
+        }
+    }
+}
+
+/// The permit on the response: held until the response body is fully
+/// consumed or dropped, by the edge's one body wrapper.
+fn hand_permit(response: &mut Response, permit: TokenPermit) {
+    BodyDuties::hand(response, |duties| {
+        duties.permit = Some(Box::new(permit));
+    });
+}
+
+pin_project! {
+    /// The admission layer's future: the route's own future where a token was
+    /// there (the permit handed to the response when it is ready), the boxed
+    /// wait where it was not, the shed built when it is polled.
+    #[project = ConcurrencyLimitProj]
+    pub enum ConcurrencyLimitFuture<F> {
+        /// Rate limiting disabled: the route's future as it is.
+        Through { #[pin] inner: F },
+        /// A token at once: the route's future, the permit for its response.
+        Admitted { #[pin] inner: F, permit: Option<TokenPermit> },
+        /// No token: the wait in the admission queue, then the route.
+        Queued { #[pin] inner: BoxFuture<'static, Result<Response, Infallible>> },
+        /// Shed at once (queuing disabled, or the queue full): the answer is
+        /// built when polled.
+        Shed { status: StatusCode, code: &'static str, message: &'static str },
+    }
+}
+
+impl<F> Future for ConcurrencyLimitFuture<F>
+where
+    F: Future<Output = Result<Response, Infallible>>,
+{
+    type Output = Result<Response, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            ConcurrencyLimitProj::Through { inner } => inner.poll(cx),
+            ConcurrencyLimitProj::Admitted { inner, permit } => {
+                let Ok(mut response) = ready!(inner.poll(cx));
+                if let Some(permit) = permit.take() {
+                    hand_permit(&mut response, permit);
+                }
+                Poll::Ready(Ok(response))
+            }
+            ConcurrencyLimitProj::Queued { inner } => inner.poll(cx),
+            ConcurrencyLimitProj::Shed {
+                status,
+                code,
+                message,
+            } => Poll::Ready(Ok(shed_response(*status, code, message))),
         }
     }
 }
@@ -285,10 +413,7 @@ mod tests {
     fn echo_app(app_state: Arc<AppState>) -> Router {
         Router::new()
             .route("/echo", post(|body: Bytes| async move { body }))
-            .layer(axum::middleware::from_fn_with_state(
-                app_state,
-                concurrency_limit_middleware,
-            ))
+            .layer(ConcurrencyLimitLayer::new(app_state))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
@@ -302,12 +427,7 @@ mod tests {
 
     /// App with a one-shot channel-fed streaming route plus `/echo`,
     /// queueing disabled.
-    fn stream_app(
-        bucket: Arc<TokenBucket>,
-    ) -> (
-        Router,
-        mpsc::Sender<Result<Bytes, std::convert::Infallible>>,
-    ) {
+    fn stream_app(bucket: Arc<TokenBucket>) -> (Router, mpsc::Sender<Result<Bytes, Infallible>>) {
         let (frame_tx, frame_rx) = mpsc::channel(4);
         let frame_rx = Arc::new(std::sync::Mutex::new(Some(frame_rx)));
         let stream = move || {
@@ -321,10 +441,7 @@ mod tests {
         let app = Router::new()
             .route("/stream", post(stream))
             .route("/echo", post(|body: Bytes| async move { body }))
-            .layer(axum::middleware::from_fn_with_state(
-                test_app_state(bucket, None),
-                concurrency_limit_middleware,
-            ))
+            .layer(ConcurrencyLimitLayer::new(test_app_state(bucket, None)))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         (app, frame_tx)
     }
@@ -366,7 +483,7 @@ mod tests {
 
     impl http_body::Body for PollRecordingBody {
         type Data = Bytes;
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
 
         fn poll_frame(
             self: Pin<&mut Self>,
@@ -646,10 +763,10 @@ mod tests {
         let app = Router::new()
             .route("/hold", post(hold))
             .route("/echo", post(|body: Bytes| async move { body }))
-            .layer(axum::middleware::from_fn_with_state(
-                test_app_state(bucket, Some(queue)),
-                concurrency_limit_middleware,
-            ))
+            .layer(ConcurrencyLimitLayer::new(test_app_state(
+                bucket,
+                Some(queue),
+            )))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
 
         let first = tokio::spawn(

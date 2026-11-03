@@ -474,7 +474,7 @@ impl fmt::Debug for McpTransport {
 /// MCP-specific proxy configuration (does NOT affect LLM API traffic)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpProxyConfig {
-    /// HTTP proxy URL (e.g., "http://proxy.internal:8080")
+    /// HTTP proxy URL (e.g., `http://proxy.internal:8080`)
     pub http: Option<String>,
 
     /// HTTPS proxy URL

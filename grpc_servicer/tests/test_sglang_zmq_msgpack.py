@@ -3,6 +3,7 @@ shapes SMG relies on, and a loopback through a fake SMG that binds the three
 sockets. Needs an SGLang install (its io_struct and sampling params)."""
 
 import array
+import ctypes
 import logging
 import os
 import struct
@@ -83,6 +84,154 @@ def test_request_decodes_from_the_sampling_prefix_the_frontend_sends():
     assert params.is_normalized is False and params.stop_strs is None
 
 
+def test_request_decodes_the_bootstrap_triple_from_its_slots():
+    """A prefill/decode request's rendezvous rides the scheduler's own slots
+    (the extended prefix through ``require_reasoning``, the defaulted slots
+    between at their defaults): the plugin decodes it as SGLang's tokenizer
+    manager would have set it."""
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="pd") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        "10.0.0.7",  # bootstrap_host
+        8998,  # bootstrap_port
+        41,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        None,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+    ]
+    assert len(request) == fields.index("require_reasoning") + 2  # the tag at element 0
+    assert request[fields.index("bootstrap_host") + 1] == "10.0.0.7"
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert (req.bootstrap_host, req.bootstrap_port, req.bootstrap_room) == ("10.0.0.7", 8998, 41)
+    assert req.require_reasoning is False and req.lora_id is None
+
+
+def test_request_decodes_the_encode_dispatch_slots_as_the_frontend_sets_them():
+    """A language-only worker's request whose media went to the encoders
+    carries the three slots the scheduler's receiver reads, past the
+    defaulted ones through ``return_entropy``: the wait flag, the assignment
+    keyed by the modality (its enum value on the wire) and the encoder
+    snapshot; the prompt text rides ``input_text`` for the rebuild."""
+    from sglang.srt.managers.schedule_batch import Modality
+
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="epd") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        None,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+        None,  # priority
+        None,  # extra_key
+        False,  # no_logs
+        False,  # return_bytes
+        False,  # return_entropy
+        True,  # need_wait_for_mm_inputs
+        {1: [1, 0]},  # num_items_assigned: Modality.IMAGE -> per-encoder counts
+        ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"],  # encoder_urls
+    ]
+    request[3] = "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert len(request) == fields.index("encoder_urls") + 2  # the tag at element 0
+    assert fields.index("need_wait_for_mm_inputs") == 38
+    assert fields.index("num_items_assigned") == 39
+    assert fields.index("encoder_urls") == 40
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.need_wait_for_mm_inputs is True
+    assert req.num_items_assigned == {Modality.IMAGE: [1, 0]}
+    assert req.encoder_urls == ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"]
+    assert req.input_text == "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert req.mm_inputs is None and req.require_reasoning is False
+
+
+def test_the_encode_dispatch_failure_notice_decodes_as_the_schedulers_own_request():
+    """The notice the Rust servicer sends after a request whose dispatch
+    failed (the bytes its wire test pins) is the scheduler's own
+    ``EncoderDispatchErrorReq``, passed through the ADD decode untouched for
+    the scheduler's receiver to consume; its layout is declared for the
+    handshake check like the requests'."""
+    rust_pinned = bytes.fromhex(
+        "95b7456e636f64657244697370617463684572726f72526571a56570642d31c0d925456e636f6465206661"
+        "696c656420666f722072657175657374206570642d313a20626f6f6dcd01f6"
+    )
+    (notice,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, rust_pinned])
+    assert isinstance(notice, sglang_io.EncoderDispatchErrorReq)
+    assert (notice.rid, notice.error_msg, notice.error_code) == (
+        "epd-1",
+        "Encode failed for request epd-1: boom",
+        502,
+    )
+    assert wire.request_layouts()["EncoderDispatchErrorReq"] == [
+        "rid",
+        "http_worker_ipc",
+        "error_msg",
+        "error_code",
+    ]
+
+
+def test_request_decodes_the_routed_dp_rank_from_its_slot():
+    """A request the Router pins to a data-parallel rank carries the rank in
+    the scheduler's own ``routed_dp_rank`` slot (the extended prefix, the
+    defaulted slots around it at their defaults): the plugin decodes it as
+    SGLang's tokenizer manager would have set it from the API's pin."""
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="dp") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        1,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+    ]
+    assert len(request) == fields.index("require_reasoning") + 2  # the tag at element 0
+    assert request[fields.index("routed_dp_rank") + 1] == 1
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.routed_dp_rank == 1
+    assert (req.bootstrap_host, req.bootstrap_port, req.bootstrap_room) == (None, None, None)
+    assert req.disagg_prefill_dp_rank is None and req.require_reasoning is False
+
+
 def test_the_ready_response_declares_the_request_structs_field_order():
     """The field order SMG checks the prefixes it encodes against: the
     installed release's own declaration, which pins where the prefixes end."""
@@ -98,6 +247,164 @@ def test_the_ready_response_declares_the_request_structs_field_order():
     assert layouts["TokenizedGenerateReqInput"].index("lora_id") == 21
     assert layouts["TokenizedGenerateReqInput"].index("require_reasoning") == 32
     assert layouts["TokenizedEmbeddingReqInput"].index("dimensions") == 11
+    # The multimodal payload's structs, every slot of which SMG writes.
+    assert layouts["MultimodalProcessorOutput"][:4] == [
+        "mm_items",
+        "input_ids",
+        "padded_input_ids",
+        "im_token_id",
+    ]
+    assert layouts["MultimodalDataItem"] == [
+        "modality",
+        "hash",
+        "pad_value",
+        "offsets",
+        "format",
+        "feature",
+        "precomputed_embeddings",
+        "keep_device_embedding",
+        "model_specific_data",
+    ]
+
+
+# The `ADD` payload the Rust servicer sends for a request carrying one image:
+# rid `mm`, ids `[1, 7, 7, 7, 2]`, default sampling params, and in the
+# `mm_inputs` slot the scheduler's processor output of one item whose feature
+# is `torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5`, with
+# `image_grid_thw = [[1, 2, 2]]` (int64), offsets `[(1, 3)]` and
+# `im_token_id = 7`; the same constant is pinned in `protocol/sglang/request.rs`
+# (`the_payload_the_plugins_test_decodes_is_pinned`), so a change there is a
+# change here.
+RUST_MM_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c091"
+    "92010301c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000"
+    "0020400000404000006040c0c281ae696d6167655f677269645f746877c72a020000000e93920103a5696e743634a363"
+    "7075010000000000000002000000000000000200000000000000c0c007c0dc001acc"
+    "80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb000000000000"
+    "0000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_the_rust_servicers_media_decodes_as_the_schedulers_processor_output():
+    """The slot decodes through the scheduler's own hooks into the object the
+    Python servicer builds for the same request: the tensors bitwise, the
+    offsets, the token id, the modality, and the slots neither side fills at
+    the scheduler's defaults (its hash and pad value are its own to derive)."""
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalInputFormat,
+        MultimodalProcessorOutput,
+    )
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST)])
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    media = req.mm_inputs
+    assert isinstance(media, MultimodalProcessorOutput)
+    assert media.im_token_id == 7 and media.padded_input_ids is None
+    (item,) = media.mm_items
+    assert item.modality is Modality.IMAGE and item.format is MultimodalInputFormat.NORMAL
+    assert item.hash is None and item.pad_value is None
+    assert item.offsets == [(1, 3)]
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5
+    assert item.feature.dtype is torch.float32 and item.feature.device.type == "cpu"
+    assert torch.equal(item.feature, expected)
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+
+
+# The `ADD` message the Rust servicer sends for the same request on a
+# scheduler whose plugin resolves auxiliary frames, with the feature
+# `torch.arange(8192, dtype=torch.float32) * 0.5` (32 KiB, the frame bar): the
+# payload carries SMG's frame-reference extension (type 100) over
+# `[[8192], "float32", 1]` in the feature's slot (the frame's one-based index in
+# the data's place), the grid inline; behind it ride the pixels, then the empty metadata map. The
+# same constant is pinned in `protocol/sglang/request.rs`
+# (`the_framed_payload_the_plugins_test_decodes_is_pinned`).
+RUST_MM_FRAMED_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c0919201"
+    "0301c70e649391cd2000a7666c6f6174333201c0c281ae696d6167655f677269645f746877c72a020000000e93920103"
+    "a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0dc001acc80c0c0c0cb3f"
+    "f0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff000"
+    "00000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def _framed_pixels():
+    torch = pytest.importorskip("torch")
+    return torch.arange(8192, dtype=torch.float32) * 0.5
+
+
+def _framed_message(meta: bytes = b"\x80") -> list:
+    """``[type, payload, pixels, metadata]`` as the receiver sees them: the
+    frames are writable buffers (a zmq frame's buffer is)."""
+    pixels = bytearray(_framed_pixels().numpy().tobytes())
+    return [wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_FRAMED_REQUEST), pixels, meta]
+
+
+def test_a_tensor_sent_as_a_frame_is_built_over_the_frame_without_a_copy():
+    """The feature's slot names its frame; the tensor the scheduler gets is
+    the frame's memory itself (no copy: its storage address is the frame's),
+    equal to the sender's values, and it outlives the receiver's frame list;
+    the small grid rides inline as before."""
+    torch = pytest.importorskip("torch")
+    frames = _framed_message()
+    frame_address = ctypes.addressof(ctypes.c_char.from_buffer(frames[2]))
+    (req,) = wire.decode_request_frames(frames)
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    (item,) = req.mm_inputs.mm_items
+    assert item.feature.dtype is torch.float32 and tuple(item.feature.shape) == (8192,)
+    assert torch.equal(item.feature, _framed_pixels())
+    assert item.feature.data_ptr() == frame_address, "the tensor is the frame, not a copy"
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+    assert item.offsets == [(1, 3)] and req.mm_inputs.im_token_id == 7
+    del frames
+    assert float(item.feature.sum()) == float(_framed_pixels().sum())
+
+
+def test_a_frame_reference_outside_the_message_or_of_the_wrong_length_is_refused():
+    """A frame index the message has no frame for, or a frame whose length is
+    not the tensor's, is a decode error by name (the request is answered, not
+    served from a plausible tensor of wrong numbers)."""
+    pytest.importorskip("torch")
+    missing = _framed_message()
+    del missing[2]  # [type, payload, metadata]: no tensor frame at all
+    with pytest.raises(Exception, match="frame index 1 is outside the 0 tensor frame"):
+        wire.decode_request_frames(missing)
+    short = _framed_message()
+    short[2] = short[2][:-4]
+    with pytest.raises(Exception, match="holds 32764 bytes, float32 \\[8192\\] needs 32768"):
+        wire.decode_request_frames(short)
+
+
+def test_the_metadata_frame_is_the_last_frame_behind_the_tensors():
+    """The request's metadata rides as the message's last frame, behind the
+    tensor frames when there are any, where a message without tensor frames
+    has always carried it."""
+    pytest.importorskip("torch")
+    meta = msgspec.msgpack.encode({"trace_headers": {"traceparent": "00-aa-bb-01"}})
+
+    class Traces:
+        seen: list = []
+
+        def attach(self, request, headers):
+            self.seen.append((request.rid, headers))
+            return True
+
+    traces = Traces()
+    wire.decode_request_frames(_framed_message(meta=meta), traces)
+    wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST), meta], traces)
+    assert traces.seen == [("mm", {"traceparent": "00-aa-bb-01"})] * 2
+
+
+def test_the_ready_response_declares_that_frames_are_resolved():
+    """What SMG reads at the handshake before it frames a tensor: the key goes
+    out on every registration (an older plugin sent none, and SMG reads an
+    absent key as "every tensor inline")."""
+    ready = wire.WireEngineCoreReadyResponse()
+    assert ready.tensor_aux_frames is True
+    assert msgspec.msgpack.decode(wire.encode(ready))["tensor_aux_frames"] is True
 
 
 def test_abort_frame_fans_out_one_abort_per_rid():
@@ -191,6 +498,7 @@ def test_slim_output_pins_its_positional_layout():
         [[], []],  # output_token_ids_logprobs_val
         [[], []],  # output_token_ids_logprobs_idx
         [None, None],  # finished_err_types: no abort
+        [None, None],  # output_hidden_states: neither request asked
     ]
 
 
@@ -214,9 +522,16 @@ def test_slim_output_carries_the_schedulers_abort_err_type():
     assert slim.finished_status == [None, None]
     assert slim.finished_err_types == [None, "GrammarRejectedToken"]
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 27 and encoded[26] == [None, "GrammarRejectedToken"]
-    # Pin for the Rust decoder (`protocol/sglang/output.rs`, PYTHON_SLIM27).
-    print("PIN_SLIM27", msgspec.msgpack.encode(slim).hex())
+    # 28 fields: the 27th (index 26) is finished_err_types, the 28th (index 27)
+    # output_hidden_states, None per request that asked for none.
+    assert len(encoded) == 28 and encoded[26] == [None, "GrammarRejectedToken"]
+    assert encoded[27] == [None, None]
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): PYTHON_SLIM27 is
+    # this batch as an earlier plugin encoded it (27 fields, decoded with no
+    # rows). The hex below is its 28-field form today, which no Rust constant
+    # pins; PYTHON_SLIM28 pins a different batch (hidden-state rows, not these
+    # aborts).
+    print("PIN_SLIM27_AS_28", msgspec.msgpack.encode(slim).hex())
     # A PD decode side's grammar failure carries the name next to its 500.
     full.finished_reasons[1] = {
         "type": "abort",
@@ -526,9 +841,13 @@ def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
     full.input_top_logprobs_idx = [None, [None, [2], [3]]]
     slim = wire.BatchTokenIDSlimOutput.from_full(full)
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 27
+    assert len(encoded) == 28
     assert encoded[24:26] == [[[], []], [[], []]]
     assert encoded[26] == [None, None]  # finished_err_types: no abort
+    assert encoded[27] == [
+        None,
+        None,
+    ]  # output_hidden_states: None per request without the relay's rows
     assert encoded[19] == [0, 4]
     assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
     assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]
@@ -651,3 +970,117 @@ def test_relay_failures_abort_in_the_scheduler_too(caplog, monkeypatch):
     sender.send_output(_full_output())
     (batch,) = sink.sent
     assert batch[1] == ["a", "b"] and batch[11:15] == [0, 0, 0, 0] and not sender.pending_aborts
+
+
+def test_slim_output_carries_hidden_states_as_rows_per_position():
+    """A request that asked for hidden states gets the rows its output ADDED,
+    one per position a forward ran on: the engine keeps the list cumulative
+    (the prefill's block as one element, a row per prompt position computed,
+    then a decode step's rows), the relay remembers the elements it consumed
+    per request
+    and the slim wire carries the rest, flattened into rows, so the Rust
+    decoder reads the step's rows. A request that asked for none rides as
+    None; a finished request is forgotten; an older sender without the column
+    decodes as None."""
+    full = _full_output()
+    prefill_block = [[0.5, 1.5], [2.5, 3.5]]  # two prompt positions
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    # The fixture's second request has finished; here it is still running, so
+    # its rows accumulate across outputs until the step that finishes it.
+    finished_at_the_end = list(full.finished_reasons)
+    full.finished_reasons = [None, None]
+    rows = wire.HiddenStateRows()
+    slim = wire.BatchTokenIDSlimOutput.from_full(
+        full, engine_index=1, hidden_rows=rows.column(full)
+    )
+    assert slim.output_hidden_states == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    # The next output of the same request carries only the row the step added.
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert rows.column(full) == [None, [[6.5, 7.5]]]
+    # The output that finishes it carries what that step added (nothing here)
+    # and the relay forgets the request: a later output under the same rid
+    # starts over from the whole list. Without the column, nothing rides.
+    full.finished_reasons = finished_at_the_end
+    assert rows.column(full) == [None, []]
+    full.finished_reasons = [None, None]
+    assert rows.column(full) == [None, [*prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert wire.BatchTokenIDSlimOutput.from_full(full).output_hidden_states == [None, None]
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    encoded = msgspec.msgpack.encode(slim)
+    arr = msgspec.msgpack.decode(encoded)
+    assert arr[-1] == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    decoded = msgspec.msgpack.decode(encoded, type=wire.BatchTokenIDSlimOutput)
+    assert decoded.output_hidden_states == slim.output_hidden_states
+    older = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(arr[:-1]), type=wire.BatchTokenIDSlimOutput
+    )
+    assert older.output_hidden_states is None
+
+
+# Pinned by the Rust request encoder test, including the video_token_id slot.
+RUST_VIDEO_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c099919902c0c09192010301"
+    "c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000002040000040"
+    "4000006040c0c281ae766964656f5f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000"
+    "000002000000000000000200000000000000c0c007c0c0c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000"
+    "000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3"
+    "c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_rust_video_tokens_are_padded_before_embedding():
+    """Use the native SGLang decoder to verify video placeholder padding."""
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+    )
+    from sglang.srt.managers.schedule_batch import Modality
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_VIDEO_REQUEST)])
+    media = req.mm_inputs
+    assert media.video_token_id == 7
+    (item,) = media.mm_items
+    assert item.modality is Modality.VIDEO
+    item.pad_value = 1000
+    padded = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+        req.input_ids, media
+    )
+    assert list(padded) == [1, 1000, 1000, 1000, 2]
+    assert list(req.input_ids) == [1, 7, 7, 7, 2]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("modality", [1, 2])
+def test_sender_cpu_hash_preserves_engine_identity_padding_and_features(
+    monkeypatch, dtype, modality
+):
+    """Rust's SHA256 wire identity replaces hashing, never feature computation."""
+    import hashlib
+
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers import mm_utils
+
+    monkeypatch.setenv("SGLANG_MM_SKIP_COMPUTE_HASH", "0")
+    feature = torch.arange(32768, dtype=torch.float32).to(getattr(torch, dtype))
+    raw = feature.view(torch.uint8).numpy().tobytes()
+    payload = msgspec.msgpack.decode(bytes.fromhex(RUST_MM_FRAMED_REQUEST))
+    item = payload[6][0][0]
+    item[0] = modality
+    item[5] = msgspec.msgpack.Ext(100, msgspec.msgpack.encode([[32768], dtype, 1]))
+    (baseline,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    expected = baseline.mm_inputs.mm_items[0]
+    expected.set_pad_value()
+    item[1] = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+    (candidate,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    actual = candidate.mm_inputs.mm_items[0]
+    monkeypatch.setattr(
+        mm_utils, "hash_feature", lambda _: pytest.fail("sender hash must be reused")
+    )
+    actual.set_pad_value()
+    assert (actual.hash, actual.pad_value) == (expected.hash, expected.pad_value)
+    assert actual.feature.dtype == expected.feature.dtype
+    assert torch.equal(actual.feature, expected.feature)
+    assert actual.offsets == expected.offsets

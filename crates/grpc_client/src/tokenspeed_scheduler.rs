@@ -272,7 +272,7 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty),
             max_new_tokens: request.max_output_tokens,
-            stop: vec![],               // Does not pass through request.stop yet
+            stop: stop_strings(request.stop.as_ref()),
             stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
@@ -579,6 +579,28 @@ mod connect_tests {
         let refused = refused_endpoint();
         let result = TokenSpeedSchedulerClient::connect(&refused.url).await;
         assert!(result.is_err(), "a refused dial fails the connect");
+    }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        // The list form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::Array(vec![
+                "STOP".to_string(),
+                "\n\n".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let params =
+            TokenSpeedSchedulerClient::build_sampling_params_from_responses(&request, None)
+                .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP", "\n\n"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
     }
 }
 

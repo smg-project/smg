@@ -16,9 +16,9 @@ use tracing::{debug, error, info, warn};
 use super::utils::should_propagate_header;
 use crate::{
     error,
-    metrics::{bool_to_static_str, metrics_labels, Metrics},
+    metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
     upstream_body::{read_response_body_limited, ReadBodyResult, MAX_ERROR_RESPONSE_SIZE},
-    worker::ExternalWorker,
+    worker::{redacted_url, ExternalWorker},
 };
 
 /// Build the target URL and propagated headers for a worker request.
@@ -28,7 +28,7 @@ pub(crate) fn build_request(
 ) -> (String, HeaderMap) {
     let url = format!("{}/v1/messages", worker.url());
     let propagated = propagated_headers(headers, worker.api_key());
-    debug!(url = %url, header_count = %propagated.len(), "Request built");
+    debug!(url = %redacted_url(&url), header_count = %propagated.len(), "Request built");
     (url, propagated)
 }
 
@@ -57,15 +57,20 @@ fn propagated_headers(headers: Option<&HeaderMap>, configured_key: Option<&Strin
     propagated
 }
 
-/// Send the HTTP request to the worker.
+/// Sends the HTTP request to the worker. A send that fails below HTTP is
+/// counted against the model before it becomes the caller's answer: a timeout
+/// under `timeout`/`deadline` with the 504, any other transport failure under
+/// `backend_error`/`transport_disconnect` with the 502.
 pub(crate) async fn send_request(
     http_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     request: &CreateMessageRequest,
     timeout: Duration,
+    model_id: &str,
+    start_time: Instant,
 ) -> Result<reqwest::Response, Response> {
-    debug!(url = %url, "Sending request to worker");
+    debug!(url = %redacted_url(url), "Sending request to worker");
 
     let mut builder = http_client.post(url).json(request).timeout(timeout);
     for (key, value) in headers {
@@ -74,11 +79,24 @@ pub(crate) async fn send_request(
 
     match builder.send().await {
         Ok(response) => {
-            debug!(url = %url, status = %response.status(), "Received response from worker");
+            debug!(url = %redacted_url(url), status = %response.status(), "Received response from worker");
             Ok(response)
         }
         Err(e) => {
-            warn!(url = %url, error = %e, "Request to worker failed");
+            warn!(url = %redacted_url(url), error = %e, "Request to worker failed");
+
+            let (kind, reason) = if e.is_timeout() {
+                (
+                    metrics_labels::ERROR_TIMEOUT,
+                    metrics_labels::REASON_DEADLINE,
+                )
+            } else {
+                (
+                    metrics_labels::ERROR_BACKEND,
+                    metrics_labels::REASON_TRANSPORT_DISCONNECT,
+                )
+            };
+            record_failure_metrics(model_id, start_time, kind, reason);
 
             if e.is_timeout() {
                 Err(error::gateway_timeout(
@@ -125,21 +143,11 @@ pub(crate) async fn parse_response(
         }
         Err(e) => {
             error!(model = %model_id, error = %e, "Failed to parse response");
-            Metrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
+            record_failure_metrics(
                 model_id,
-                "messages",
-                start_time.elapsed(),
-            );
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
-                model_id,
-                "messages",
+                start_time,
                 "parse_error",
+                metrics_labels::REASON_BAD_RESPONSE,
             );
             Err(error::bad_gateway(
                 "parse_error",
@@ -184,21 +192,11 @@ pub(crate) async fn handle_error_response(
     );
     let body = error::sanitize_error_body(&body);
 
-    Metrics::record_router_duration(
-        metrics_labels::ROUTER_HTTP,
-        metrics_labels::BACKEND_EXTERNAL,
-        metrics_labels::CONNECTION_HTTP,
+    record_failure_metrics(
         model_id,
-        "messages",
-        start_time.elapsed(),
-    );
-    Metrics::record_router_error(
-        metrics_labels::ROUTER_HTTP,
-        metrics_labels::BACKEND_EXTERNAL,
-        metrics_labels::CONNECTION_HTTP,
-        model_id,
-        "messages",
+        start_time,
         metrics_labels::ERROR_BACKEND,
+        error_reason_from_status(status),
     );
 
     (status, body).into_response()
@@ -246,11 +244,94 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
     );
 }
 
+/// Records a failed Messages request: its duration, then the error under
+/// `kind` and `reason`, with the route's fixed labels.
+pub(crate) fn record_failure_metrics(
+    model_id: &str,
+    start_time: Instant,
+    kind: &'static str,
+    reason: &'static str,
+) {
+    Metrics::record_router_duration(
+        metrics_labels::ROUTER_HTTP,
+        metrics_labels::BACKEND_EXTERNAL,
+        metrics_labels::CONNECTION_HTTP,
+        model_id,
+        "messages",
+        start_time.elapsed(),
+    );
+    Metrics::record_router_error(
+        metrics_labels::ROUTER_HTTP,
+        metrics_labels::BACKEND_EXTERNAL,
+        metrics_labels::CONNECTION_HTTP,
+        model_id,
+        "messages",
+        kind,
+        reason,
+    );
+}
+
+/// What a test reads back from a local recorder: the series a failed request
+/// was counted under.
+#[cfg(test)]
+pub(crate) mod probe {
+    use metrics_exporter_prometheus::PrometheusHandle;
+
+    /// The recorder's rendered line of `metric` carrying `model`, if any.
+    pub(crate) fn series_line(
+        handle: &PrometheusHandle,
+        metric: &str,
+        model: &str,
+    ) -> Option<String> {
+        let rendered = handle.render();
+        let model = format!("model=\"{model}\"");
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{metric}{{")) && line.contains(&model))
+            .map(str::to_string)
+    }
+
+    /// The error series the failed request is counted under for `model`, as
+    /// `(error_type, reason, count)`, with the number of duration samples.
+    pub(crate) fn counted_failure(
+        handle: &PrometheusHandle,
+        model: &str,
+    ) -> (String, String, u64, u64) {
+        let errors = series_line(handle, "smg_router_request_errors_total", model)
+            .expect("the failed request is counted");
+        let label = |name: &str| {
+            let key = format!("{name}=\"");
+            let start = errors.find(&key).expect(name) + key.len();
+            let end = errors[start..].find('"').expect(name) + start;
+            errors[start..end].to_string()
+        };
+        let count = |line: &str| -> u64 {
+            line.rsplit(' ')
+                .next()
+                .expect("a value")
+                .parse()
+                .expect("a count")
+        };
+        let durations = series_line(handle, "smg_router_request_duration_seconds_count", model)
+            .expect("the failed request has a duration");
+        (
+            label("error_type"),
+            label("reason"),
+            count(&errors),
+            count(&durations),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{body::to_bytes, http::StatusCode};
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
-    use super::*;
+    use super::{probe::counted_failure, *};
+    use crate::test_support::{
+        RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+    };
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
 
@@ -273,6 +354,133 @@ mod tests {
         assert!(!text.contains("org-abc123"), "{text}");
         assert!(!text.contains("proj_xyz789"), "{text}");
         assert!(text.contains("Rate limit reached for model"), "{text}");
+    }
+
+    /// A client whose budget for a call is `timeout`, the process TLS crypto
+    /// provider installed first.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client_with_timeout(timeout: Duration) -> reqwest::Client {
+        use rustls::crypto::ring::default_provider;
+        let _ = default_provider().install_default();
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("a client")
+    }
+
+    fn request() -> CreateMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "q"}],
+        }))
+        .expect("a request")
+    }
+
+    /// Every line the transport writes about a worker names its address
+    /// masked: a worker registered with credentials at a port nobody listens
+    /// on fails its send, and neither the request-built line nor the send
+    /// lines carry the credentials. The capture is the tracing subscriber
+    /// itself, so the rendering is read as a log reader would.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn the_transports_lines_name_the_worker_masked() {
+        let worker = StubWorker::at(CREDENTIALED_WORKER_URL);
+        let (url, headers) = build_request(worker.as_ref(), None);
+        assert_eq!(url, format!("{CREDENTIALED_WORKER_URL}/v1/messages"));
+
+        let answer = send_request(
+            worker.http_client(),
+            &url,
+            &headers,
+            &request(),
+            Duration::from_secs(5),
+            "m",
+            Instant::now(),
+        )
+        .await;
+
+        let response = answer.expect_err("a failed send");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("user:"));
+        assert!(logs_contain("Request built"));
+        assert!(logs_contain("Request to worker failed"));
+        assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/messages")));
+    }
+
+    /// A send the request timeout cuts is the caller's 504 and one error
+    /// counted against the model under `timeout`/`deadline`, with a duration
+    /// sample; the upstream completes the handshake and never answers.
+    #[tokio::test]
+    async fn a_send_that_times_out_is_counted_as_a_deadline_against_the_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let url = format!(
+            "http://{}/v1/messages",
+            silent.local_addr().expect("an address")
+        );
+        let budget = Duration::from_millis(50);
+
+        let answer = send_request(
+            &client_with_timeout(budget),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            budget,
+            "silent-upstream",
+            Instant::now(),
+        )
+        .await;
+
+        let response = answer.expect_err("a failed send");
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            counted_failure(&handle, "silent-upstream"),
+            ("timeout".to_string(), "deadline".to_string(), 1, 1)
+        );
+    }
+
+    /// A send nothing answers (the port refuses the connection) is the
+    /// caller's 502 and one error counted against the model under
+    /// `backend_error`/`transport_disconnect`, with a duration sample.
+    #[tokio::test]
+    async fn a_refused_connection_is_counted_as_a_transport_disconnect_against_the_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/messages", refused.addr());
+
+        let answer = send_request(
+            &client_with_timeout(Duration::from_secs(5)),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            Duration::from_secs(5),
+            "closed-port",
+            Instant::now(),
+        )
+        .await;
+
+        let response = answer.expect_err("a failed send");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            counted_failure(&handle, "closed-port"),
+            (
+                "backend_error".to_string(),
+                "transport_disconnect".to_string(),
+                1,
+                1
+            )
+        );
     }
 
     fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

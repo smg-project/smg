@@ -21,6 +21,8 @@ struct Processor {
     calls: Arc<Calls>,
     independent: bool,
     reorder: bool,
+    /// The config's `rescale_factor`, as a processor built from it retains it.
+    scale: f32,
 }
 
 impl VisionPreProcessor for Processor {
@@ -33,12 +35,7 @@ impl VisionPreProcessor for Processor {
     fn default_std(&self) -> [f64; 3] {
         [1.0; 3]
     }
-    fn calculate_num_tokens(
-        &self,
-        _: u32,
-        _: u32,
-        _: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, _: u32, _: u32) -> Result<usize, TransformError> {
         Ok(1)
     }
     fn model_name(&self) -> &'static str {
@@ -47,7 +44,6 @@ impl VisionPreProcessor for Processor {
     fn preprocess(
         &self,
         images: &[image::DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let ids: Vec<_> = images.iter().map(image::DynamicImage::width).collect();
         if self.reorder && ids == [1] {
@@ -73,9 +69,7 @@ impl VisionPreProcessor for Processor {
         Ok(PreprocessedEncoderInputs::new(
             Array2::from_shape_vec(
                 (ids.len(), 1),
-                ids.iter()
-                    .map(|&id| id as f32 * config.rescale_factor.unwrap_or(1.0) as f32)
-                    .collect(),
+                ids.iter().map(|&id| id as f32 * self.scale).collect(),
             )
             .unwrap(),
             ids.iter().map(|&id| id as usize).collect(),
@@ -97,20 +91,33 @@ impl Tokenizer for NoTokenizer {
     }
 }
 
+/// A Qwen2-VL model config with `preprocessor_config` and the processor its
+/// spec would build from it.
+fn model_config(
+    calls: &Arc<Calls>,
+    independent: bool,
+    reorder: bool,
+    preprocessor_config: PreProcessorConfig,
+) -> MultimodalModelConfig {
+    let processor = Arc::new(Processor {
+        calls: calls.clone(),
+        independent,
+        reorder,
+        scale: preprocessor_config.rescale_factor.unwrap_or(1.0) as f32,
+    });
+    MultimodalModelConfig::new(
+        serde_json::json!({"model_type": "qwen2_vl"}),
+        preprocessor_config,
+        None,
+    )
+    .with_vision_processors("qwen_vl", VisionProcessors::of("qwen_vl", processor))
+}
+
 fn setup(
     independent: bool,
     reorder: bool,
 ) -> (MultimodalComponents, Arc<Calls>, MultimodalModelConfig) {
     let calls = Arc::new(Calls::default());
-    let mut registry = VisionProcessorRegistry::new();
-    registry.register(
-        "qwen2-vl",
-        Box::new(Processor {
-            calls: calls.clone(),
-            independent,
-            reorder,
-        }),
-    );
     let mut components = MultimodalComponents::new(
         Arc::new(MultimodalConfigRegistry::new()),
         None,
@@ -118,17 +125,9 @@ fn setup(
         &MultimodalSettings::default(),
     )
     .unwrap();
-    components.vision_processor_registry = Arc::new(registry);
     components.pixel_cache = Some(Arc::new(PixelCache::new(1024 * 1024)));
-    (
-        components,
-        calls,
-        MultimodalModelConfig {
-            config: serde_json::json!({"model_type": "qwen2_vl"}),
-            preprocessor_config: PreProcessorConfig::default(),
-            video_preprocessor_config: None,
-        },
-    )
+    let config = model_config(&calls, independent, reorder, PreProcessorConfig::default());
+    (components, calls, config)
 }
 
 async fn run(
@@ -175,6 +174,7 @@ async fn run_for(
             spec,
             tokenizer_id,
             model_config: config,
+            vision_processors: config.vision_processors(spec),
             image_wire_dtype,
             transparency: TransparencyPolicy::KeepAlpha,
             encoder_budget: None,
@@ -263,9 +263,17 @@ async fn repeated_cold_images_keep_every_occurrence() {
 
 #[tokio::test]
 async fn cache_separates_preprocessing_model_and_tokenizer_parameters() {
-    let (components, calls, mut config) = setup(true, false);
+    let (components, calls, config) = setup(true, false);
     run(&components, &config, &[3, 4], "tok").await;
-    config.preprocessor_config.rescale_factor = Some(2.0);
+    let mut config = model_config(
+        &calls,
+        true,
+        false,
+        PreProcessorConfig {
+            rescale_factor: Some(2.0),
+            ..PreProcessorConfig::default()
+        },
+    );
     calls.batches.lock().unwrap().clear();
     let result = run(&components, &config, &[3, 4], "tok").await;
     assert_eq!(result.encoder_input.flat_f32().into_owned(), [6.0, 8.0]);
@@ -363,12 +371,7 @@ impl VisionPreProcessor for PixelProbe {
     fn default_std(&self) -> [f64; 3] {
         [1.0; 3]
     }
-    fn calculate_num_tokens(
-        &self,
-        _: u32,
-        _: u32,
-        _: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, _: u32, _: u32) -> Result<usize, TransformError> {
         Ok(1)
     }
     fn model_name(&self) -> &'static str {
@@ -377,7 +380,6 @@ impl VisionPreProcessor for PixelProbe {
     fn preprocess(
         &self,
         images: &[image::DynamicImage],
-        _: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let mut seen = self.seen.lock().unwrap();
         for image in images {
@@ -403,8 +405,7 @@ fn transparent_png() -> bytes::Bytes {
 
 fn probe_setup() -> (MultimodalComponents, MultimodalModelConfig, Seen) {
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = VisionProcessorRegistry::new();
-    registry.register("qwen2-vl", Box::new(PixelProbe { seen: seen.clone() }));
+    let processor = Arc::new(PixelProbe { seen: seen.clone() });
     let mut components = MultimodalComponents::new(
         Arc::new(MultimodalConfigRegistry::new()),
         None,
@@ -412,15 +413,15 @@ fn probe_setup() -> (MultimodalComponents, MultimodalModelConfig, Seen) {
         &MultimodalSettings::default(),
     )
     .unwrap();
-    components.vision_processor_registry = Arc::new(registry);
     components.pixel_cache = Some(Arc::new(PixelCache::new(1024 * 1024)));
     (
         components,
-        MultimodalModelConfig {
-            config: serde_json::json!({"model_type": "qwen2_vl"}),
-            preprocessor_config: PreProcessorConfig::default(),
-            video_preprocessor_config: None,
-        },
+        MultimodalModelConfig::new(
+            serde_json::json!({"model_type": "qwen2_vl"}),
+            PreProcessorConfig::default(),
+            None,
+        )
+        .with_vision_processors("qwen_vl", VisionProcessors::of("qwen_vl", processor)),
         seen,
     )
 }
@@ -465,6 +466,7 @@ async fn run_probe(
             spec,
             tokenizer_id: "tok",
             model_config: config,
+            vision_processors: config.vision_processors(spec),
             image_wire_dtype: None,
             transparency: policy,
             encoder_budget: None,

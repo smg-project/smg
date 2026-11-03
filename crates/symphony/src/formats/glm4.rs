@@ -49,12 +49,12 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, FinishReason, Text},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            reasoning, the_same_at_every_cut, Said,
+            drive_to, dropped, malformed, reasoning, said, the_same_at_every_cut, Said,
         },
-        Declared,
+        Declared, EngineFinish,
     };
 
     /// The recorded tool and one without parameters, as a request lists them.
@@ -104,13 +104,6 @@ mod tests {
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(glm4(), declared()), prompt, pieces)
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
@@ -219,6 +212,290 @@ mod tests {
     #[test]
     fn the_table_validates() {
         glm4().validate().expect("a sound table");
+    }
+
+    /// The tool of a recorded case: a question answered through one string parameter.
+    fn answer_tool() -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "answer_string".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "required": ["answer"], "properties": {
+                    "answer": {"type": "string"},
+                }}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }]
+    }
+
+    /// A recorded shape: the model answers through the string parameter and ends its output
+    /// with its own end-of-box marker, a newline and the end of the stream, writing neither
+    /// `</arg_value>` nor `</tool_call>`.
+    const OPEN_AT_THE_STOP: &str = concat!(
+        "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n",
+        "<arg_value>Logistic regression is a statistical method for a binary outcome.",
+        "<|end_of_box|>\n"
+    );
+
+    /// The value of that shape, whole: every byte the model wrote between the tag and its end.
+    const ANSWER: &str =
+        "Logistic regression is a statistical method for a binary outcome.<|end_of_box|>\n";
+
+    #[test]
+    fn a_string_value_the_model_leaves_open_at_its_own_end_is_closed_there_and_said() {
+        // Whole, one character at a time and at every two-way cut: the call carries the value
+        // with every byte of the model's text, its arguments one JSON object under `stop` with
+        // one call, which a client reading `tool_calls` parses; the one `Malformed` event of no
+        // bytes says the stop closed the string, right before the closing quote.
+        let run = |pieces: &[&str]| {
+            drive(
+                &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+                PROMPT,
+                pieces,
+            )
+        };
+        let arguments = format!(
+            "{{\"answer\": {}}}",
+            serde_json::to_string(ANSWER).expect("json")
+        );
+        assert_eq!(
+            the_same_at_every_cut(run, OPEN_AT_THE_STOP),
+            Said {
+                calls: vec![("answer_string".to_string(), arguments.clone())],
+                finish: Some((FinishReason::Stop, 1)),
+                content: String::new(),
+                reasoning: String::new(),
+            }
+        );
+        let events = run(&[OPEN_AT_THE_STOP]);
+        let read: serde_json::Value =
+            serde_json::from_str(&arguments_of(&events, 0)).expect("whole JSON");
+        assert_eq!(read["answer"], ANSWER);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "\""),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), OPEN_AT_THE_STOP);
+    }
+
+    /// The same shape as the live stream carries it: the model ends the value with its end-of-box
+    /// marker and a newline, skips `</arg_value>` alone, writes `</tool_call>`, and then its
+    /// turn's stop token, which the engine hides and reports as a stop. The closing marker, not
+    /// the stop, ends the call with the string open.
+    const OPEN_AT_THE_MARKER: &str = concat!(
+        "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n",
+        "<arg_value>Logistic regression is a statistical method for a binary outcome.",
+        "<|end_of_box|>\n</tool_call>"
+    );
+
+    #[test]
+    fn a_string_value_the_model_leaves_open_at_the_calls_closing_marker_is_closed_there_and_said() {
+        // Whole, one character at a time, at every two-way cut, and one piece per token at the
+        // end as the stream carries it (the text, the box marker, the newline, the marker): the
+        // call carries the value with every byte of the model's text, its arguments one JSON
+        // object under `stop` with one call, which a client reading `tool_calls` parses; the one
+        // `Malformed` event of no bytes says the marker closed the string, right before the
+        // closing quote; the marker's bytes are the call's end.
+        let run = |pieces: &[&str]| {
+            drive(
+                &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+                PROMPT,
+                pieces,
+            )
+        };
+        let arguments = format!(
+            "{{\"answer\": {}}}",
+            serde_json::to_string(ANSWER).expect("json")
+        );
+        let expected = Said {
+            calls: vec![("answer_string".to_string(), arguments.clone())],
+            finish: Some((FinishReason::Stop, 1)),
+            content: String::new(),
+            reasoning: String::new(),
+        };
+        assert_eq!(the_same_at_every_cut(run, OPEN_AT_THE_MARKER), expected);
+        let as_streamed = [
+            "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
+            "Logistic regression is a statistical method for a binary outcome",
+            ".",
+            "<|end_of_box|>",
+            "\n",
+            "</tool_call>",
+        ];
+        let events = run(&as_streamed);
+        assert_eq!(said(&events), expected);
+        let read: serde_json::Value =
+            serde_json::from_str(&arguments_of(&events, 0)).expect("whole JSON");
+        assert_eq!(read["answer"], ANSWER);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "\""),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallEnd { source, .. } if source.text == "</tool_call>"
+            )),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), as_streamed.concat());
+        // Cut by the token limit after the marker: the marker closed the call before the cut, so
+        // the arguments are the same whole object, and the engine's finish is kept.
+        let cut = drive_to(
+            &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+            PROMPT,
+            &[OPEN_AT_THE_MARKER],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 0), arguments);
+        assert_eq!(
+            malformed(&cut),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        assert_eq!(said(&cut).finish, Some((FinishReason::Length, 1)));
+    }
+
+    #[test]
+    fn the_same_value_cut_by_the_token_limit_stays_open_and_says_so() {
+        // The twin under `length`: the prefix as written, no closing quote and no brace, the
+        // one `Malformed { UnterminatedRegion }` event; whole, one character at a time and at
+        // every two-way cut.
+        let run = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(run, OPEN_AT_THE_STOP);
+        let mut prefix = format!(
+            "{{\"answer\": {}}}",
+            serde_json::to_string(ANSWER).expect("json")
+        );
+        prefix.truncate(prefix.len() - 2);
+        assert_eq!(said.calls, vec![("answer_string".to_string(), prefix)]);
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert!(serde_json::from_str::<serde_json::Value>(&said.calls[0].1).is_err());
+        assert_eq!(
+            malformed(&run(&[OPEN_AT_THE_STOP])),
+            [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
+    }
+
+    #[test]
+    fn a_call_the_token_limit_cut_inside_an_object_keeps_it_in_its_arguments() {
+        // The report's shape under `length`: the string whole, the object cut inside a nested
+        // string. The arguments are the prefix as written, the cut member's key and bytes
+        // included (before this the member left the call as a failed call's bytes and the
+        // arguments stopped at the string), no closing quote and no brace, the one `Malformed {
+        // UnterminatedRegion }` event of no bytes, nothing dropped as a failed call; whole, one
+        // character at a time and at every two-way cut.
+        let output = concat!(
+            "\n<think></think>\n<tool_call>ChaDri_change_drink\n",
+            "<arg_key>drink_id</arg_key>\n<arg_value>latte</arg_value>\n",
+            "<arg_key>new_preferences</arg_key>\n<arg_value>{\"size\": \"large\", \"temp"
+        );
+        let run = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm4(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(run, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        assert!(serde_json::from_str::<serde_json::Value>(&said.calls[0].1).is_err());
+        let events = run(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_the_model_leaves_open_between_its_pairs_at_its_own_end_is_closed_there_and_said() {
+        // The sibling shape: the second call's last value closed, then the end of the output
+        // with no `</tool_call>`. Both calls read whole, the second's object closed at the stop,
+        // and the one word says so.
+        let output = concat!(
+            "\n<think></think>\n<tool_call>ChaDri_change_drink\n",
+            "<arg_key>drink_id</arg_key>\n<arg_value>latte</arg_value>\n</tool_call>\n",
+            "<tool_call>ChaDri_change_drink\n",
+            "<arg_key>drink_id</arg_key>\n<arg_value>tea</arg_value>\n"
+        );
+        assert_eq!(
+            the_same_at_every_cut(|pieces| run(PROMPT, pieces), output),
+            Said {
+                calls: vec![
+                    (
+                        "ChaDri_change_drink".to_string(),
+                        r#"{"drink_id": "latte"}"#.to_string()
+                    ),
+                    (
+                        "ChaDri_change_drink".to_string(),
+                        r#"{"drink_id": "tea"}"#.to_string()
+                    ),
+                ],
+                finish: Some((FinishReason::Stop, 2)),
+                content: String::new(),
+                reasoning: String::new(),
+            }
+        );
+        assert_eq!(
+            malformed(&run(PROMPT, &[output])),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        // Cut by the token limit, the second call stays open, as before.
+        let cut = drive_to(
+            &mut Engine::new(glm4(), declared()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 1), r#"{"drink_id": "tea""#);
+        assert_eq!(
+            malformed(&cut),
+            [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
     }
 
     /// One call as the tag writes it after the thought's close, and as the template renders one.

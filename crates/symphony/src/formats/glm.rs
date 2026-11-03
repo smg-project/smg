@@ -2,7 +2,7 @@
 //! `</tool_call>` as its name and keyed arguments (`<arg_key>`, `<arg_value>`), typed by the
 //! request's tools, with nothing between the tags. Everything else is content; what a call block
 //! holds that the syntax cannot read (a tag out of its place, prose or Python where the name goes)
-//! is never content: refused and counted ([`keyed`]). The prompt opens
+//! is never content: refused and counted (`keyed`). The prompt opens
 //! the thought (`<|assistant|><think>`, whatever the request says: the template has no thinking
 //! switch, only `clear_thinking` for the history), so an empty thought writes `</think>` at once;
 //! a turn opens with `<|assistant|>`, so the prompt's replay starts there. The template strips the
@@ -42,8 +42,12 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        input::EngineFinish,
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, dropped, reasoning,
+            the_same_at_every_cut,
+        },
         Declared,
     };
 
@@ -152,13 +156,6 @@ mod tests {
             .collect()
     }
 
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
-    }
-
     #[test]
     fn a_recorded_output_gives_its_call_typed_by_the_tools_and_every_byte() {
         let events = run(PROMPT, &[OUTPUT]);
@@ -265,7 +262,12 @@ mod tests {
     fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
         let output =
             "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat";
-        let events = run(PROMPT, &[output]);
+        let events = drive_to(
+            &mut Engine::new(glm(), declared()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
         assert_eq!(bytes(&events), output);
         // The declared string streamed as it arrived and stays open: the client sees the cut.
         assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "lat"#);
@@ -277,6 +279,53 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there is no cut: the string and the object close, and
+        // one `Malformed { OpenAtTheStop }` event says the stop closed them.
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(bytes(&stopped), output);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"drink_id": "lat"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // The same call cut inside its object value, which the assembler holds for its close:
+        // the member leaves as written, the cut member's key and bytes included, nothing of the
+        // call is a failed call's bytes, and the finish is `length`; whole, one character at a
+        // time and at every two-way cut.
+        let output = concat!(
+            "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>latte",
+            "</arg_value><arg_key>new_preferences</arg_key><arg_value>{\"size\": \"large\", \"temp"
+        );
+        let cut = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(cut, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        let events = cut(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
+        );
     }
 
     #[test]

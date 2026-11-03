@@ -1777,10 +1777,12 @@ async fn a_sweep_the_store_refuses_answers_with_the_server_s_message() {
     assert!(!err.is_unavailable(), "{message}");
 }
 
-/// A failure the store answers (here a unique key refusing a second item under
-/// a client-supplied id) is the store's own error, not the store being
-/// unavailable: the gateway keeps the endpoint's answer for it rather than a
-/// 503 that asks the client to retry a request that will fail again.
+/// A failure the store answers (here the id column's width refusing an item
+/// under an id past its 64 characters) is the store's own error, not the
+/// store being unavailable: the gateway keeps the endpoint's answer for it
+/// rather than a 503 that asks the client to retry a request that will fail
+/// again. (A second item under a stored id is no longer a failure: the store
+/// answers the stored item, as the conformance suite pins.)
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
 async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
@@ -1792,29 +1794,28 @@ async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
         .expect("failed to initialize Postgres storage");
     let items = bundle.conversation_item_storage;
     let id = ConversationItemId::from(format!(
-        "item_dup_{}",
+        "item_long_{:0>60}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
-    let item = || NewConversationItem {
-        id: Some(id.clone()),
-        response_id: None,
-        item_type: "message".to_string(),
-        role: Some("user".to_string()),
-        content: json!([{"type": "input_text", "text": "once"}]),
-        status: Some("completed".to_string()),
-        tenant: None,
-    };
-    items.create_item(item()).await.expect("the first item");
+    assert!(id.0.len() > 64, "{} characters", id.0.len());
     let err = items
-        .create_item(item())
+        .create_item(NewConversationItem {
+            id: Some(id),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": "once"}]),
+            status: Some("completed".to_string()),
+            tenant: None,
+        })
         .await
-        .expect_err("a second item under the same id");
+        .expect_err("an id past the column's width");
     assert!(
         matches!(err, ConversationItemStorageError::StorageError(_)),
         "{err:?}"
     );
     assert!(!err.is_unavailable(), "{err}");
-    assert!(err.to_string().contains("duplicate key"), "{err}");
+    assert!(err.to_string().contains("too long"), "{err}");
 }
 
 /// The sweep index, the sweep and the lookup by output item mean the same
