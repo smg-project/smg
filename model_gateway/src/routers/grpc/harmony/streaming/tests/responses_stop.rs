@@ -6,7 +6,10 @@
 //! stream the engine request ends with the match: the stream is not read
 //! past the chunk the stop matched in and is released un-marked, the abort
 //! path a client disconnect takes (proven on scripted frames whose Complete
-//! waits behind a gate that never opens). Text a scanner held back as a
+//! waits behind a gate that never opens); an engine that ends the turn on
+//! the very step of the match sends its Complete next, which adds only the
+//! counts the stop could not know. A stop inside the analysis channel ends
+//! the streamed turn before any message. Text a scanner held back as a
 //! possible stop is released when the turn ends without one, and the whole
 //! chat turn keeps its cut through the helper both arms share.
 
@@ -50,12 +53,24 @@ fn chunk(token_ids: Vec<u32>) -> proto::GenerateResponse {
 }
 
 fn complete(output_ids: Vec<u32>, finish_reason: &str) -> proto::GenerateResponse {
+    complete_with_spec(output_ids, finish_reason, 0, 0)
+}
+
+/// The terminal frame with the speculative counters only it knows.
+fn complete_with_spec(
+    output_ids: Vec<u32>,
+    finish_reason: &str,
+    spec_accepted: u32,
+    spec_drafted: u32,
+) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index: 0,
             finish_reason: finish_reason.to_string(),
             prompt_tokens: 3,
             completion_tokens: output_ids.len() as u32,
+            spec_accepted_tokens: spec_accepted,
+            spec_draft_tokens: spec_drafted,
             output_ids,
             ..Default::default()
         })),
@@ -264,6 +279,104 @@ async fn a_router_stop_ends_the_streamed_turn_and_the_engine_request() {
         "{} of {} tokens",
         counts.completion,
         ids.len()
+    );
+}
+
+#[tokio::test]
+async fn a_router_stop_inside_the_analysis_channel_streams_no_message() {
+    // One chunk carries the whole turn: the final channel's text arrives in the
+    // same delta as the analysis the stop is in, and the engine's Complete comes
+    // right after the chunk the stop matched in.
+    let ids = harmony_tokens(Some("Think STOP more"), "Answer");
+    let frames = vec![chunk(ids.clone()), complete_with_spec(ids, "stop", 2, 3)];
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let streamed = timeout(
+        Duration::from_secs(5),
+        streamed(context::ExecutionResult::Single { stream }, &stops()),
+    )
+    .await
+    .expect("the stream ends with the engine's Complete");
+    server.abort();
+
+    assert!(
+        streamed
+            .events
+            .iter()
+            .all(|event| event["type"] != "response.output_text.delta"),
+        "nothing of the final channel streams past a stop in the analysis: {:?}",
+        streamed.events
+    );
+    let output = streamed.stored["output"]
+        .as_array()
+        .expect("the output items");
+    assert!(
+        output.iter().any(|item| item["type"] == "reasoning"),
+        "the analysis channel opened its item: {}",
+        streamed.stored
+    );
+    assert!(
+        output.iter().all(|item| item["type"] != "message"),
+        "no message item: the turn ended in the analysis: {}",
+        streamed.stored
+    );
+    assert_eq!(
+        streamed.stored["status"], "completed",
+        "{}",
+        streamed.stored
+    );
+    // The Complete after the stop chunk adds the counts the stop could not know.
+    let counts = streamed.counts.expect("the turn's counts");
+    assert_eq!(
+        (counts.prompt, counts.spec_accepted, counts.spec_drafted),
+        (3, 2, 3)
+    );
+}
+
+#[tokio::test]
+async fn the_engine_s_complete_right_after_the_stop_chunk_adds_only_the_counts_the_stop_could_not_know(
+) {
+    // The stop matches in the last chunk before the Complete: the engine ended
+    // the turn on that step (its own finish is `length`), nothing is aborted,
+    // and the turn stays the router's `stop`.
+    let ids = harmony_tokens(None, "Hello STOP");
+    let frames = vec![
+        chunk(ids.clone()),
+        complete_with_spec(ids.clone(), "length", 2, 3),
+    ];
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let streamed = timeout(
+        Duration::from_secs(5),
+        streamed(context::ExecutionResult::Single { stream }, &stops()),
+    )
+    .await
+    .expect("the stream ends with the engine's Complete");
+    server.abort();
+
+    assert_eq!(streamed.text(), "Hello STOP", "{:?}", streamed.events);
+    assert_eq!(
+        streamed.stored["status"], "completed",
+        "{}",
+        streamed.stored
+    );
+    assert!(
+        streamed.stored["incomplete_details"].is_null(),
+        "the engine's length finish does not overrule the router's stop: {}",
+        streamed.stored
+    );
+    assert_eq!(
+        streamed.terminal["type"], "response.completed",
+        "{}",
+        streamed.terminal
+    );
+    let counts = streamed.counts.expect("the turn's counts");
+    assert_eq!(
+        (
+            counts.prompt,
+            counts.completion as usize,
+            counts.spec_accepted,
+            counts.spec_drafted
+        ),
+        (3, ids.len(), 2, 3)
     );
 }
 
