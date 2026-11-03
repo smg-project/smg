@@ -10,15 +10,16 @@ use std::fmt::Write as _;
 use serde_json::Value;
 use thiserror::Error;
 
-// The index predicates, the JSON spelling and the OpenAI-shape readers are
-// the V4 family's too and come from `deepseek_common`. V3.2's tool-message
-// handling, drop-thinking role set, DSML argument rendering and tools
-// template are different algorithms and texts and stay here.
+// The message read, the index predicates, the JSON spelling, the OpenAI-shape
+// readers and the tools-and-response-format section are the V4 family's too
+// and come from `deepseek_common`. V3.2's tool-message handling, drop-thinking
+// role set, DSML argument rendering and tools template are different
+// algorithms and texts and stay here.
 use super::{
     deepseek_common::{
-        after_last_user, at_or_after_last_user, find_last_user_index, to_json,
-        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT, BOS,
-        DSML, EOS, THINKING_END, THINKING_START, USER,
+        after_last_user, at_or_after_last_user, find_last_user_index,
+        push_tools_and_response_format, to_json, tool_schemas, Turn, ASSISTANT, BOS, DSML, EOS,
+        THINKING_END, THINKING_START, USER,
     },
     marks, RendererProfile,
 };
@@ -165,12 +166,6 @@ Here are the functions available in JSONSchema format:
     )
 }
 
-fn response_format_block(schema: &str) -> String {
-    format!(
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}",
-    )
-}
-
 fn user_msg(content: &str) -> String {
     format!("{USER}{content}{ASSISTANT}")
 }
@@ -224,8 +219,8 @@ fn equals_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
 
 // ---------------------------------------------------------------------------
 // render_message — direct port of the Python function with the same name:
-// the message read into its parts, one function per role for the arms of its
-// `match role`.
+// the message read into its parts (the family's `Turn`), one function per
+// role for the arms of its `match role`.
 // ---------------------------------------------------------------------------
 
 fn render_message(
@@ -233,71 +228,46 @@ fn render_message(
     messages: &[Value],
     thinking_mode: ThinkingMode,
 ) -> Result<String, DsEncodingError> {
-    if index >= messages.len() {
+    let Some(msg) = messages.get(index) else {
         return Err(DsEncodingError::IndexOutOfRange {
             index,
             len: messages.len(),
         });
-    }
-
-    let mut prompt = String::new();
-    let msg = &messages[index];
+    };
+    let turn = Turn::read(index, msg);
     let last_user_idx = find_last_user_index(messages);
-
-    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let tools_raw = msg.get("tools").and_then(|v| v.as_array());
-    let response_format = msg.get("response_format");
-    let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
-    // The gateway's protocol takes the `reasoning` spelling as an alias of
-    // `reasoning_content`, so a history assistant's reasoning renders under
-    // either spelling for every renderer: a superset of the serving engines'
-    // copies of this encoder, each of which reads one spelling alone.
-    let reasoning_content = msg
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let tools_owned = tools_raw.map(|t| tools_from_openai_format(t));
-    let tools = tools_owned.as_deref();
-
-    let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
-    let tool_calls = tool_calls_owned.as_deref();
+    let mut prompt = String::new();
 
     // The thinking token after a user or developer message opens the thinking
     // at the last user turn in thinking mode and closes it everywhere else.
     let opens_thinking = equals_last_user(index, last_user_idx) && thinking_mode.is_thinking();
 
-    match role {
-        "system" => render_system(&mut prompt, content, tools, response_format),
+    match turn.role {
+        "system" => render_system(&mut prompt, &turn),
         "developer" => {
-            if content.is_empty() {
+            if turn.content.is_empty() {
                 return Err(DsEncodingError::InvalidMessage {
-                    role: role.to_string(),
-                    msg: msg.to_string(),
+                    role: turn.role.to_string(),
+                    msg: turn.msg.to_string(),
                 });
             }
-            render_developer(&mut prompt, content, tools, response_format, opens_thinking);
+            render_developer(&mut prompt, &turn, opens_thinking);
         }
-        "user" => render_user(&mut prompt, content, opens_thinking),
+        "user" => render_user(&mut prompt, turn.content, opens_thinking),
         "tool" => {
             let position = tool_result_position(index, messages)?;
             // The last result of a block opens the thinking from the last user
             // turn on in thinking mode (not the user message's rule above).
             let block_opens_thinking =
                 at_or_after_last_user(index, last_user_idx) && thinking_mode.is_thinking();
-            render_tool(&mut prompt, position, content, block_opens_thinking);
+            render_tool(&mut prompt, position, turn.content, block_opens_thinking);
         }
         "assistant" => {
-            let assistant = AssistantParts {
-                message: msg,
-                content,
-                tool_calls,
-                reasoning_content,
-                emits_thinking: thinking_mode.is_thinking()
-                    && after_last_user(index, last_user_idx),
-            };
-            render_assistant(&mut prompt, &assistant)?;
+            // The turn's thinking goes out in thinking mode after the last
+            // user message.
+            let emits_thinking =
+                thinking_mode.is_thinking() && after_last_user(index, last_user_idx);
+            render_assistant(&mut prompt, &turn, emits_thinking)?;
         }
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
@@ -315,47 +285,30 @@ fn thinking_token(opens_thinking: bool) -> &'static str {
     }
 }
 
-/// The tools and the response format a system or developer message carries,
-/// each after a blank line.
-fn render_tools_and_response_format(
-    prompt: &mut String,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(rf) = response_format {
-        prompt.push_str("\n\n");
-        prompt.push_str(&response_format_block(&to_json(rf)));
-    }
-}
-
 /// A system message: its content (`system_msg_template` is "{content}"),
 /// then the tools and the response format it carries.
-fn render_system(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
-    prompt.push_str(content);
-    render_tools_and_response_format(prompt, tools, response_format);
+fn render_system(prompt: &mut String, turn: &Turn<'_>) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
 /// A developer message: a user message made of the tools and the response
 /// format it carries and its content under a heading, then the thinking
 /// token (the content is never empty: the caller refused an empty one).
-fn render_developer(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-    opens_thinking: bool,
-) {
+fn render_developer(prompt: &mut String, turn: &Turn<'_>, opens_thinking: bool) {
     let mut content_developer = String::new();
-    render_tools_and_response_format(&mut content_developer, tools, response_format);
+    push_tools_and_response_format(
+        &mut content_developer,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
+    let content = turn.content;
     let _ = write!(content_developer, "\n\n# The user's message is: {content}");
 
     prompt.push_str(&user_msg(&content_developer));
@@ -457,17 +410,6 @@ fn render_tool(
     }
 }
 
-/// What an assistant message renders from: its content, its tool calls, its
-/// reasoning, and whether the turn's thinking goes out (thinking mode, after
-/// the last user message); the message itself names a refused one.
-struct AssistantParts<'a> {
-    message: &'a Value,
-    content: &'a str,
-    tool_calls: Option<&'a [Value]>,
-    reasoning_content: &'a str,
-    emits_thinking: bool,
-}
-
 /// An assistant message (`assistant_msg_template` is
 /// "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"): its reasoning and
 /// the thinking end token when the turn's thinking goes out (a turn with
@@ -475,12 +417,13 @@ struct AssistantParts<'a> {
 /// calls as a DSML block, and the EOS token.
 fn render_assistant(
     prompt: &mut String,
-    parts: &AssistantParts<'_>,
+    turn: &Turn<'_>,
+    emits_thinking: bool,
 ) -> Result<(), DsEncodingError> {
     let mut thinking_part = String::new();
 
     let mut tool_calls_content = String::new();
-    if let Some(tcs) = parts.tool_calls.filter(|t| !t.is_empty()) {
+    if let Some(tcs) = turn.tool_calls.as_deref() {
         let mut rendered = Vec::with_capacity(tcs.len());
         for tc in tcs {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -496,17 +439,17 @@ fn render_assistant(
         );
     }
 
-    let summary_content = parts.content;
+    let summary_content = turn.content;
 
-    if parts.emits_thinking {
-        let has_reasoning = !parts.reasoning_content.is_empty();
-        let has_tool_calls = parts.tool_calls.is_some_and(|t| !t.is_empty());
+    if emits_thinking {
+        let has_reasoning = !turn.reasoning_content.is_empty();
+        let has_tool_calls = turn.tool_calls.is_some();
         if !has_reasoning && !has_tool_calls {
             return Err(DsEncodingError::MissingReasoningOrToolCalls(
-                parts.message.to_string(),
+                turn.msg.to_string(),
             ));
         }
-        thinking_part.push_str(parts.reasoning_content);
+        thinking_part.push_str(turn.reasoning_content);
         thinking_part.push_str(THINKING_END);
     }
 

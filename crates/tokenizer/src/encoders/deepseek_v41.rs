@@ -21,16 +21,17 @@ pub use super::deepseek_common::{
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
-// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
-// tools template are V4's too, apart from the tag strings and the last-turn
+// The message read (`Turn`), message-shape preprocessing, drop-thinking, DSML
+// argument rendering, the tools template and the tools-and-response-format
+// section are V4's too, apart from the tag strings and the last-turn
 // definition; see `deepseek_common` for the shared implementation and its
 // own doc comments.
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        has_tools, merge_tool_messages, render_v4_tools_template, sort_tool_results_by_call_order,
-        task_sp_token, to_json, tool_calls_from_openai_format, tool_schemas,
-        tools_from_openai_format, DsmlTags,
+        has_tools, merge_tool_messages, push_tools_and_response_format, render_v4_tools_template,
+        sort_tool_results_by_call_order, task_sp_token, text, to_json, tool_schemas, DsmlTags,
+        Turn,
     },
     RendererProfile,
 };
@@ -254,13 +255,6 @@ fn render_tools(tools: &[Value]) -> String {
     render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
 }
 
-fn render_response_format(schema: &Value) -> String {
-    format!(
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-        to_json(schema)
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Image/content-part normalisation
 // ---------------------------------------------------------------------------
@@ -349,62 +343,6 @@ fn find_last_turn_index(messages: &[Value]) -> Option<usize> {
     None
 }
 
-/// One message as the renderer reads it: the fields of the OpenAI-shape
-/// value, read once, with the tools and tool calls in the encoder's shape
-/// and empty lists dropped the way Python's truthiness drops them.
-struct Turn<'m> {
-    index: usize,
-    msg: &'m Value,
-    role: &'m str,
-    content: &'m str,
-    tools: Option<Vec<Value>>,
-    /// Python `if response_format:` — absent, null and `{}` are all falsy.
-    response_format: Option<&'m Value>,
-    tool_calls: Option<Vec<Value>>,
-    reasoning_content: &'m str,
-    wo_eos: bool,
-}
-
-impl<'m> Turn<'m> {
-    fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
-        let Some(msg) = messages.get(index) else {
-            return Err(DsEncodingError::IndexOutOfRange {
-                index,
-                len: messages.len(),
-            });
-        };
-        let tools = msg
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .map(|tools| tools_from_openai_format(tools))
-            .filter(|tools| !tools.is_empty());
-        let tool_calls = msg
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
-            .filter(|tool_calls| !tool_calls.is_empty());
-        Ok(Self {
-            index,
-            msg,
-            role: text(msg, "role"),
-            content: text(msg, "content"),
-            tools,
-            response_format: msg
-                .get("response_format")
-                .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty())),
-            tool_calls,
-            reasoning_content: text(msg, "reasoning_content"),
-            wo_eos: msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false),
-        })
-    }
-}
-
-/// A string field of a message, empty when absent or not a string, as the
-/// reference's `msg.get(key, "")` reads it.
-fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
-    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
-}
-
 /// Mirrors the reference's `render_message`: one turn's text, by role in the
 /// reference's order, then the transition to the next turn.
 fn render_message(
@@ -415,7 +353,13 @@ fn render_message(
     reasoning_effort: Option<ReasoningEffort>,
     effort_table: EffortTable,
 ) -> Result<String, DsEncodingError> {
-    let turn = Turn::read(index, messages)?;
+    let Some(msg) = messages.get(index) else {
+        return Err(DsEncodingError::IndexOutOfRange {
+            index,
+            len: messages.len(),
+        });
+    };
+    let turn = Turn::read(index, msg);
     let last_user_idx = find_last_turn_index(messages);
     let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort, effort_table);
     match turn.role {
@@ -474,7 +418,12 @@ fn render_system(turn: &Turn<'_>, prompt: &mut String) {
         prompt.push_str(SYSTEM);
     }
     prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        response_format(turn),
+        render_tools,
+    );
 }
 
 /// A developer turn renders as a user turn; an empty one is an error.
@@ -487,21 +436,20 @@ fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodi
     }
     prompt.push_str(USER);
     prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        response_format(turn),
+        render_tools,
+    );
     Ok(())
 }
 
-/// The tools template and the response format of a system or developer
-/// turn, each after a blank line, when the turn has them.
-fn push_tools_and_response_format(turn: &Turn<'_>, prompt: &mut String) {
-    if let Some(tools) = &turn.tools {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(schema) = turn.response_format {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_response_format(schema));
-    }
+/// The response format a system or developer turn carries, under Python's
+/// `if response_format:`: absent, null and `{}` are all falsy.
+fn response_format<'m>(turn: &Turn<'m>) -> Option<&'m Value> {
+    turn.response_format
+        .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty()))
 }
 
 /// A user turn: its content blocks (text and the tool results
@@ -584,7 +532,7 @@ fn render_assistant(
     if let Some(tool_calls) = &turn.tool_calls {
         prompt.push_str(&tool_calls_block(tool_calls));
     }
-    if !turn.wo_eos {
+    if !turn.wo_eos() {
         prompt.push_str(EOS);
     }
 }
