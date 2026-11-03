@@ -645,7 +645,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::{json::PartialJson, testing::bytes};
 
     const CLOSE: &str = "</tool_call>";
 
@@ -771,6 +771,31 @@ mod tests {
                 "<arg_key>n</arg_key><arg_value>3</arg_value></tool_call>"
             )
         );
+    }
+
+    /// A value nested past the bound the crate's JSON reader puts on a call's arguments, the
+    /// arguments object counted, is a string holding its text, at its closing tag and at a cut
+    /// alike, as any text that reader does not take is, so that the fragments stay a prefix it
+    /// takes (the fuzz campaign's `json-prefix` class on this syntax); one level shallower reads
+    /// as the JSON it is.
+    #[test]
+    fn a_value_nested_past_the_json_readers_bound_is_a_string_whole_and_cut() {
+        let past = PartialJson::DEFAULT_MAX_DEPTH;
+        let deep = format!("{}1{}", "[".repeat(past), "]".repeat(past));
+        let within = format!("{}1{}", "[".repeat(past - 1), "]".repeat(past - 1));
+        let call = |value: &str| format!("f<arg_key>x</arg_key><arg_value>{value}</arg_value>");
+        assert_eq!(
+            arguments(&run(&[&call(&deep)], false)),
+            format!("{{\"x\": \"{deep}\"}}")
+        );
+        assert_eq!(
+            arguments(&run(&[&call(&within)], false)),
+            format!("{{\"x\": {within}}}")
+        );
+        let open = "[".repeat(past);
+        let cut = run(&[&format!("f<arg_key>x</arg_key><arg_value>{open}")], true);
+        assert_eq!(fragments(&cut), [format!("{{\"x\": \"{open}")]);
+        assert_eq!(malformed(&cut), [("", MalformedReason::UnterminatedRegion)]);
     }
 
     #[test]

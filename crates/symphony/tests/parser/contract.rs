@@ -38,6 +38,7 @@ use serde_json::json as value;
 use symphony::{
     format::CallId,
     formats::{self, Table},
+    json::PartialJson,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
         ValueParser,
@@ -1387,6 +1388,22 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
     "<|open|>think<|sep|>Only a thought.",
     "Plain prose with no marker at all.",
     "",
+    // An object-typed value nested past the JSON reader's bound (32 containers, the arguments
+    // object counted), whole and cut, and one cut right after a `\u` escape short of its
+    // digits: the fuzz campaign's `json-prefix` class on this syntax.
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"\\u1\"=",
 ];
 
 /// The plain table: prose of every shape, the other families' markers as prose, and nothing.
@@ -1440,6 +1457,10 @@ const OLMO3_OUTPUTS: &[&str] = &[
 const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[get_weather(city='Paris', note='it\\'s fine'), get_stock_price()]\
      <|tool_call_end|>",
+    // A list nested past the JSON reader's bound (32 containers, the arguments object counted),
+    // whole at the call's `)` and cut inside it: the fuzz campaign's `json-prefix` class.
+    "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]])]<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
     "<|tool_call_start|>[get_weather(city='Par",
     "<|tool_call_start|>[get_weather(",
     "<|tool_call_start|>[get_weather(ci",
@@ -1660,6 +1681,11 @@ const GLM_OUTPUTS: &[&str] = &[
      </tool_call>",
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par</tool_call>",
+    // A list nested past the JSON reader's bound (32 containers, the arguments object counted),
+    // whole at its closing tag and cut inside it: the fuzz campaign's `json-prefix` class.
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]</arg_value>\
+     </tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
     "<think></think><tool_call>get_weather<arg_key>q</arg_key><arg_value>計画 🌍 \"q\" \\ \
      </arg_value></tool_call>",
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>three</arg_value>\
@@ -2262,14 +2288,19 @@ fn replay(
 }
 
 /// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader asks
-/// for more bytes rather than refusing one it saw. The crate's partial parser is no oracle here: its
-/// prefix mode tolerates what JSON lacks (a trailing comma, a value left out, an escape JSON lacks),
-/// which is what a client's reader refuses once the call ends.
+/// for more bytes rather than refusing one it saw. The crate's partial parser is no oracle for
+/// that: its prefix mode tolerates what JSON lacks (a trailing comma, a value left out, an escape
+/// JSON lacks), which is what a client's reader refuses once the call ends. It is the oracle for
+/// what it refuses and the strict reader does not, nesting past its bound and the bytes it stops
+/// before (a `\u` escape short of its digits, which the strict reader reads past the text's end),
+/// so the prefix is one both take whole: the judge the fuzz harness applies to every fragment.
 fn strict_json_prefix(text: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(text) {
+    let strict = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(_) => true,
         Err(error) => error.is_eof(),
-    }
+    };
+    strict
+        && matches!(PartialJson::default().parse(text, true), Ok((_, read)) if read == text.len())
 }
 
 /// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
