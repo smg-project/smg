@@ -326,36 +326,37 @@ fn cache_tree_retention_setter_emits_per_model_and_tree_gauge() {
     );
 }
 
-/// A window's maximum is exact, the next window starts empty, and a tree
+/// The peak is the window's maximum, slides as seconds pass, and a tree
 /// that never observed one reports nothing.
 #[test]
-fn reuse_age_max_takes_the_window_maximum_and_restarts() {
-    let max = ReuseAgeMax::new();
-    assert_eq!(max.take(), None, "never observed");
+fn reuse_age_peak_is_the_windows_maximum() {
+    let peak = ReuseAgePeak::new();
+    assert_eq!(peak.peak(100), None);
 
-    for secs in [3, 4000, 0, 45] {
-        max.observe(secs);
-    }
-    assert_eq!(max.take(), Some(4000));
-    assert_eq!(max.take(), Some(0), "nothing since the last take");
+    peak.observe(100, 4000);
+    peak.observe(100, 30);
+    peak.observe(130, 5);
+    assert_eq!(peak.peak(159), Some(4000));
+    assert_eq!(peak.peak(160), Some(5), "second 100 left the window");
+    assert_eq!(peak.peak(400), Some(0));
 
-    max.observe(0);
-    assert_eq!(max.take(), Some(0), "an observed 0 is a 0, not nothing");
+    // Second 164 takes second 100's slot.
+    peak.observe(164, 7);
+    assert_eq!(peak.peak(164), Some(7));
 }
 
-/// A scrape publishes the largest reuse age recorded since the previous one,
-/// by tree.
+/// A scrape publishes the largest reuse age of the last window, by tree.
 #[test]
-fn scrape_publishes_cache_tree_reuse_age_max() {
+fn scrape_publishes_cache_tree_reuse_age_peak() {
     let rendered = render_with_recorder(|| {
         Metrics::record_cache_tree_reuse_age("string", "decode", 12);
         Metrics::record_cache_tree_reuse_age("string", "decode", 7777);
-        record_cache_tree_reuse_age_max();
+        record_cache_tree_reuse_age_peak();
     });
 
     // Other tests record token-tree ages in parallel: match the string line.
     let series =
-        "smg_cache_tree_reuse_age_max_seconds{tree=\"string\",worker_type=\"decode\"} 7777";
+        "smg_cache_tree_reuse_age_peak_seconds{tree=\"string\",worker_type=\"decode\"} 7777";
     assert!(
         rendered.lines().any(|l| l == series),
         "{series} missing; rendered:\n{rendered}"

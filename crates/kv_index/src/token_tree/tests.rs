@@ -2389,33 +2389,6 @@ fn age_tenant(node: &NodeRef, tenant: &str, secs_ago: u64) {
     }
 }
 
-/// Tree-wide eviction reports the age of the newest entry it evicted (not
-/// the first), and nothing when it evicts nothing.
-#[test]
-fn test_evict_by_size_reports_newest_evicted_age() {
-    let tree = TokenTree::new();
-    let leaves = [
-        make_tokens(1, 2),
-        make_tokens(100_000, 2),
-        make_tokens(200_000, 2),
-    ];
-    for (tokens, tenant) in leaves.iter().zip(["w1", "w2", "w3"]) {
-        tree.insert_tokens(tokens, tenant);
-    }
-    age_tenant(&tree.root, "w1", 100);
-    age_tenant(&tree.root, "w2", 50);
-
-    assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
-    // The budget holds one leaf: w1, then w2, go.
-    assert_age(tree.evict_tenant_by_size(2 * PAGE_SIZE), 50);
-    for (tokens, matched) in leaves.iter().zip([0, 0, 2 * PAGE_SIZE]) {
-        assert_eq!(
-            tree.match_prefix_with_counts(tokens).matched_token_count,
-            matched
-        );
-    }
-}
-
 /// With two holders of a prefix, the fused walk reports the age of the
 /// holder the request is routed to, not of the one the match resolved, and
 /// stamps only the routed holder: the other keeps its own last access.
@@ -2442,4 +2415,22 @@ fn test_fused_walk_reports_and_stamps_the_routed_holder() {
         age_of(&resolved),
     );
     assert_age(tree.match_and_insert(&tokens, routed).reuse_age_secs, 0);
+}
+
+/// The oldest stamp still held gives the tree's retention: an empty tree has
+/// none, and evicting the oldest entry moves it to the next oldest.
+#[test]
+fn test_oldest_stamp_age_reports_the_oldest_entry_held() {
+    let tree = TokenTree::new();
+    assert_eq!(tree.oldest_stamp_age_secs(), None);
+    let leaves = [make_tokens(1, 2), make_tokens(100_000, 2)];
+    for (tokens, tenant) in leaves.iter().zip(["w1", "w2"]) {
+        tree.insert_tokens(tokens, tenant);
+    }
+    age_tenant(&tree.root, "w1", 300);
+    age_tenant(&tree.root, "w2", 40);
+    assert_age(tree.oldest_stamp_age_secs(), 300);
+
+    tree.evict_tenant_by_size(2 * PAGE_SIZE);
+    assert_age(tree.oldest_stamp_age_secs(), 40);
 }

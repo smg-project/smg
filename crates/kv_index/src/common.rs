@@ -108,10 +108,12 @@ static STAMP_CLOCK: Once = Once::new();
 const STAMP_TICK: Duration = Duration::from_millis(250);
 
 /// Seconds since [`STAMP_ORIGIN_UNIX_SECS`], counted from 1, to within a
-/// [`STAMP_TICK`]. Inline, as both trees call it on every stamp from other
-/// modules: the hot path is the one load.
+/// [`STAMP_TICK`]: the clock the access stamps carry. Inline, as both trees
+/// call it on every stamp from other modules: the hot path is the one load.
+/// Public for a caller that needs whole seconds on the request path on the
+/// stamps' own boundaries (the gateway's reuse-age peak).
 #[inline]
-pub(super) fn stamp_seconds() -> u64 {
+pub fn stamp_seconds() -> u64 {
     match STAMP_SECONDS.load(Ordering::Relaxed) {
         0 => start_stamp_clock(),
         secs => secs,

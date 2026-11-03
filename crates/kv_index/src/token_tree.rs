@@ -1392,7 +1392,7 @@ impl TokenTree {
             };
 
             let node = &leaf_data[idx];
-            let (node_tokens, _, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
+            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
             if node_tokens > 0 {
                 evicted += node_tokens;
 
@@ -1473,22 +1473,24 @@ impl TokenTree {
     }
 
     /// Remove tenant from node and clean up empty ancestors.
-    /// Returns (tokens_removed, the removed access stamp, Option<(parent_node, ts)>
-    /// if parent became a leaf); (0, 0, None) when the tenant was not on the node.
+    /// Returns (tokens_removed, Option<(parent_node, ts)> if parent became a leaf).
     fn remove_tenant_and_cleanup(
         &self,
         node: &NodeRef,
         tenant_id: &TenantId,
-    ) -> (usize, u64, Option<(NodeRef, u64)>) {
-        let Some((_, removed_stamp)) = node.tenant_last_access_time.remove(tenant_id.as_ref())
-        else {
-            return (0, 0, None);
-        };
+    ) -> (usize, Option<(NodeRef, u64)>) {
+        if node
+            .tenant_last_access_time
+            .remove(tenant_id.as_ref())
+            .is_none()
+        {
+            return (0, None);
+        }
 
         let node_tokens = node.tokens.read().len();
         let parent_leaf_info = self.cleanup_empty_ancestors_with_parent(node, tenant_id);
 
-        (node_tokens, removed_stamp, parent_leaf_info)
+        (node_tokens, parent_leaf_info)
     }
 
     /// Remove empty nodes walking up via parent pointers.
@@ -1672,6 +1674,32 @@ impl TokenTree {
         }
     }
 
+    /// Seconds since the oldest access stamp still in the tree was taken:
+    /// how far back the index remembers. The same reading as the hash-mode
+    /// placement index's retention (its oldest live placement), so the two
+    /// modes report one quantity. Untimed stamps (an intermediate attach no
+    /// access has stamped since) are skipped. `None` when the tree holds no
+    /// timed stamp. One read-only walk of the tree.
+    pub fn oldest_stamp_age_secs(&self) -> Option<u64> {
+        let mut oldest: Option<u64> = None;
+        let mut stack: Vec<NodeRef> = self
+            .root
+            .children
+            .iter()
+            .map(|child| Arc::clone(child.value()))
+            .collect();
+        while let Some(node) = stack.pop() {
+            stack.extend(node.children.iter().map(|child| Arc::clone(child.value())));
+            for stamp in &node.tenant_last_access_time {
+                let stamp = *stamp.value();
+                if stamp >> 32 != 0 && oldest.is_none_or(|o| stamp < o) {
+                    oldest = Some(stamp);
+                }
+            }
+        }
+        oldest.and_then(stamp_age_secs)
+    }
+
     /// Evict cache entries until the tree-wide token total is at or under
     /// `max_size`. Matches the StringTree API.
     ///
@@ -1680,16 +1708,12 @@ impl TokenTree {
     /// removes leaves in policy order across tenants — least recently used
     /// first under LRU — using the same leaf-first machinery as
     /// [`Self::evict_tenant`].
-    ///
-    /// Returns the age in seconds of the most recently accessed entry it
-    /// evicted: under LRU, how far back the tree still remembers. `None`
-    /// when nothing was evicted.
-    pub fn evict_tenant_by_size(&self, max_size: usize) -> Option<u64> {
+    pub fn evict_tenant_by_size(&self, max_size: usize) {
         use std::{cmp::Reverse, collections::BinaryHeap};
 
         let initial_total = self.total_token_size();
         if initial_total <= max_size {
-            return None;
+            return;
         }
 
         let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
@@ -1698,8 +1722,6 @@ impl TokenTree {
         // Min-heap by eviction priority (policy-dependent), across all tenants
         let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
         let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::with_capacity(leaves.len());
-        // The newest stamp among the evicted entries.
-        let mut newest_evicted: Option<u64> = None;
 
         for (node, tenant, ts) in leaves.drain(..) {
             let priority = self.compute_eviction_priority(&node, ts);
@@ -1722,13 +1744,9 @@ impl TokenTree {
             if !self.is_tenant_leaf(&node, &tenant) {
                 continue;
             }
-            let (node_tokens, removed_stamp, parent_became_leaf) =
-                self.remove_tenant_and_cleanup(&node, &tenant);
+            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(&node, &tenant);
             if node_tokens > 0 {
                 self.sub_tenant_tokens(&tenant, node_tokens);
-                // The stamp removed, not the one read at collection: a match
-                // may have re-stamped the entry since.
-                newest_evicted = newest_evicted.max(Some(removed_stamp));
 
                 // Incremental leaf promotion (matching SGLang's approach)
                 if let Some((parent_node, parent_ts)) = parent_became_leaf {
@@ -1747,7 +1765,6 @@ impl TokenTree {
             policy = ?self.eviction_policy,
             "Evicted tokens to tree-wide budget (leaf-first)"
         );
-        newest_evicted.and_then(stamp_age_secs)
     }
 
     /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant.

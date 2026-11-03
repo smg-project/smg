@@ -411,14 +411,16 @@ impl CacheAwarePolicy {
                     for tree_ref in string_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
-                        if let Some(age) = tree.evict_tenant_by_size(max_tree_size) {
-                            Metrics::set_cache_tree_retention_seconds(
-                                model_id,
-                                "string",
-                                metrics_role_of(&role),
-                                age,
-                            );
-                        }
+                        tree.evict_tenant_by_size(max_tree_size);
+                        // The oldest stamp still held, as the hash mode's sweep
+                        // reports its oldest live placement: one meaning of
+                        // retention across the three indexes.
+                        Metrics::set_cache_tree_retention_seconds(
+                            model_id,
+                            "string",
+                            metrics_role_of(&role),
+                            tree.oldest_stamp_age_secs().unwrap_or(0),
+                        );
 
                         let (chars, tenants) = string_tree_totals(tree);
                         total_chars += chars;
@@ -435,14 +437,16 @@ impl CacheAwarePolicy {
                     for tree_ref in token_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
-                        if let Some(age) = tree.evict_tenant_by_size(max_tree_size) {
-                            Metrics::set_cache_tree_retention_seconds(
-                                model_id,
-                                "token",
-                                metrics_role_of(&role),
-                                age,
-                            );
-                        }
+                        tree.evict_tenant_by_size(max_tree_size);
+                        // The oldest stamp still held, as the hash mode's sweep
+                        // reports its oldest live placement: one meaning of
+                        // retention across the three indexes.
+                        Metrics::set_cache_tree_retention_seconds(
+                            model_id,
+                            "token",
+                            metrics_role_of(&role),
+                            tree.oldest_stamp_age_secs().unwrap_or(0),
+                        );
 
                         let (tokens, tenants) = token_tree_totals(tree);
                         total_tokens += tokens;

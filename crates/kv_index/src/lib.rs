@@ -33,7 +33,7 @@ pub use block::{
     ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
 pub use chain_index::{BlockRef, ChainIndex, ChainIndexStats};
-pub use common::{MatchResult, TenantId};
+pub use common::{stamp_seconds, MatchResult, TenantId};
 pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,

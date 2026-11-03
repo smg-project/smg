@@ -1154,22 +1154,42 @@ impl Tree {
             .collect()
     }
 
+    /// Seconds since the oldest access stamp still in the tree was taken:
+    /// how far back the index remembers. The same reading as the hash-mode
+    /// placement index's retention (its oldest live placement), so the two
+    /// modes report one quantity. Untimed stamps (an intermediate attach no
+    /// access has stamped since) are skipped. `None` when the tree holds no
+    /// timed stamp. One read-only walk of the tree.
+    pub fn oldest_stamp_age_secs(&self) -> Option<u64> {
+        let mut oldest: Option<u64> = None;
+        let mut stack: Vec<NodeRef> = self
+            .root
+            .children
+            .iter()
+            .map(|child| Arc::clone(child.value()))
+            .collect();
+        while let Some(node) = stack.pop() {
+            stack.extend(node.children.iter().map(|child| Arc::clone(child.value())));
+            for stamp in &node.tenant_last_access_time {
+                let stamp = *stamp.value();
+                if stamp >> 32 != 0 && oldest.is_none_or(|o| stamp < o) {
+                    oldest = Some(stamp);
+                }
+            }
+        }
+        oldest.and_then(stamp_age_secs)
+    }
+
     /// Evict cache entries until the tree-wide char total is at or under
     /// `max_size`.
     ///
     /// The budget is shared across all tenants of this tree: eviction triggers
     /// on the tree-wide total (no single tenant has to exceed anything) and
     /// removes leaves in LRU order across tenants, least recently used first.
-    ///
-    /// Returns the age in seconds of the most recently accessed entry it
-    /// evicted: how far back the tree still remembers. `None` when nothing
-    /// was evicted, or when no evicted entry's stamp carries time.
-    pub fn evict_tenant_by_size(&self, max_size: usize) -> Option<u64> {
+    pub fn evict_tenant_by_size(&self, max_size: usize) {
         if self.total_char_size() <= max_size {
-            return None;
+            return;
         }
-        // The newest stamp among the evicted entries.
-        let mut newest_evicted: Option<u64> = None;
 
         // Collect leaves across all tenants
         let mut stack = vec![Arc::clone(&self.root)];
@@ -1231,11 +1251,8 @@ impl Tree {
             let node_len = node.text.read().char_count();
             self.sub_tenant_chars(&tenant, node_len);
 
-            // Remove tenant from node; the age is the stamp removed, not the
-            // one queued: a match may have re-stamped the entry since.
-            if let Some((_, removed_stamp)) = node.tenant_last_access_time.remove(tenant.as_ref()) {
-                newest_evicted = newest_evicted.max(Some(removed_stamp));
-            }
+            // Remove tenant from node
+            node.tenant_last_access_time.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
             // Use Weak::upgrade() to get a strong reference if the parent still exists
@@ -1279,7 +1296,6 @@ impl Tree {
         for entry in &self.tenant_char_count {
             debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
-        newest_evicted.and_then(stamp_age_secs)
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {

@@ -3664,23 +3664,6 @@ fn spill_to_a_non_holder_records_no_reuse_age() {
     );
 }
 
-/// A declined selection reuses nothing, though its match result still
-/// carries the resolved holder's age.
-#[test]
-fn declined_selection_records_no_reuse_age() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        policy.record_tree_reuse_age("token", 32, 32, Some(30), false);
-    });
-    let rendered = handle.render();
-    assert!(
-        !rendered.contains("smg_cache_tree_reuse_age_seconds"),
-        "a declined selection recorded a reuse age; rendered:\n{rendered}"
-    );
-}
-
 #[test]
 fn hash_spill_uses_expected_wait_and_records_only_final_holder() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
@@ -3758,73 +3741,6 @@ fn hash_multiple_holders_use_expected_wait_only_within_affinity_set() {
     let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1, "non-holder w3 must not break cache affinity");
     assert_only_final_worker_credited(&policy, &workers, 1, 16);
-}
-
-/// Each live holder of a head comes with how long ago it last dispatched
-/// the head; a holder of another head does not count.
-#[test]
-fn hash_mode_live_holders_report_each_holders_age() {
-    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1]);
-    let head: Vec<u32> = (0..16).collect();
-    let t0 = Instant::now();
-    policy.record_placement("m", None, &head, &[16], "http://w1:8000", t0);
-    policy.record_placement(
-        "m",
-        None,
-        &head,
-        &[16],
-        "http://w2:8000",
-        t0 + Duration::from_secs(40),
-    );
-    let key = (16usize, hash_token_head(None, &head));
-
-    let mut holders = policy.live_holders(&url_to_idx, "m", key, t0 + Duration::from_secs(100));
-    holders.sort_unstable();
-    assert_eq!(
-        holders,
-        vec![(0, Duration::from_secs(100)), (1, Duration::from_secs(60))]
-    );
-    assert!(
-        policy
-            .live_holders(&url_to_idx, "m", (16, 7), t0)
-            .is_empty(),
-        "no holder"
-    );
-}
-
-/// A hash-mode decision that finds a holder records its reuse age under
-/// tree="hash"; a miss records none.
-#[test]
-fn hash_mode_selection_records_reuse_age_on_a_hit() {
-    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    let tokens: Vec<u32> = (0..32).collect();
-
-    let recorder = PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
-            CACHE_TREE_REUSE_AGE_BUCKETS,
-        )
-        .unwrap()
-        .build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        route_tokens(&policy, &workers, &tokens);
-        route_tokens(&policy, &workers, &tokens);
-    });
-    let rendered = handle.render();
-
-    for series in [
-        "smg_cache_tree_reuse_age_seconds_bucket{tree=\"hash\",worker_type=\"regular\",le=\"0\"} 1",
-        "smg_cache_tree_reuse_age_seconds_count{tree=\"hash\",worker_type=\"regular\"} 1",
-    ] {
-        assert!(
-            rendered.lines().any(|l| l == series),
-            "{series} missing; rendered:\n{rendered}"
-        );
-    }
 }
 
 /// With two holders of a head, a hit records the age of the holder it lands

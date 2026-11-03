@@ -1039,10 +1039,10 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_cache_tree_retention_seconds",
-        "Cache-aware tree retention by model and tree: the age of the most recently used entry \
-         the last size eviction dropped, so how far back the tree still remembers (under LRU); \
-         unchanged while the tree stays within its budget. tree=\"hash\": the age of the oldest \
-         live placement at the last sweep, at most --cache-ttl-secs"
+        "Cache-aware index retention by model and tree: the age of the oldest entry it still \
+         holds, so how far back it remembers, as of its last eviction cycle (tree modes: the \
+         oldest timed access stamp; tree=\"hash\": the oldest live placement, at most \
+         --cache-ttl-secs); 0 when it holds none"
     );
     describe_histogram!(
         "smg_cache_tree_reuse_age_seconds",
@@ -1053,10 +1053,11 @@ pub(crate) fn init_metrics() {
          the tenant only passed through, never stamped, are not observed)"
     );
     describe_gauge!(
-        "smg_cache_tree_reuse_age_max_seconds",
-        "Cache-aware tree's largest reuse age by tree since the previous scrape of this endpoint, \
-         exact where the reuse-age histogram only bounds it by bucket; 0 when no match since that \
-         scrape. With more than one scraper, each sees the maximum since any of them scraped"
+        "smg_cache_tree_reuse_age_peak_seconds",
+        "Cache-aware tree's largest reuse age in the last 60 seconds, by tree, exact where the \
+         reuse-age histogram only bounds it by bucket; 0 when no reuse in that window. Reading \
+         it changes nothing, so every scraper sees the same value; scraped at most 60 s apart, \
+         max_over_time over it misses no peak"
     );
     describe_gauge!(
         "smg_cache_placement_entries",
@@ -1374,72 +1375,104 @@ pub(super) fn record_tokenizer_cache_activity() {
     }
 }
 
-/// The largest reuse age a tree's matches observed since the last take: the
-/// exact maximum the reuse-age histogram can only bound by its buckets.
-#[derive(Default)]
-pub(crate) struct ReuseAgeMax {
-    /// The maximum plus one; 0 while nothing was observed since the take.
-    max_plus_one: AtomicU64,
+/// How far back [`ReuseAgePeak`] reaches: a scrape at most this far apart
+/// from the previous one misses no peak.
+pub(crate) const REUSE_AGE_PEAK_WINDOW_SECS: u64 = 60;
+const REUSE_AGE_PEAK_SLOTS: usize = 64;
+
+/// The largest reuse age a tree's matches observed in the last
+/// [`REUSE_AGE_PEAK_WINDOW_SECS`] seconds: the exact maximum the reuse-age
+/// histogram can only bound by its buckets. Each slot holds one second's
+/// maximum, `(second + 1) << 32 | age`, at index `second % 64`, and a read
+/// takes the maximum over the slots in the window. A read changes nothing,
+/// so any number of scrapers see the same peak.
+pub(crate) struct ReuseAgePeak {
+    slots: [AtomicU64; REUSE_AGE_PEAK_SLOTS],
     /// Whether this tree ever observed one, so a tree a deployment never
     /// routes through publishes no series.
     seen: AtomicBool,
 }
 
-impl ReuseAgeMax {
+impl ReuseAgePeak {
     pub(crate) const fn new() -> Self {
         Self {
-            max_plus_one: AtomicU64::new(0),
+            slots: [const { AtomicU64::new(0) }; REUSE_AGE_PEAK_SLOTS],
             seen: AtomicBool::new(false),
         }
     }
 
-    /// Fold one observation in. A load before the read-modify-write: most
-    /// observations are below the window's maximum and take no write.
-    pub(crate) fn observe(&self, secs: u64) {
-        let candidate = secs.saturating_add(1);
-        if self.max_plus_one.load(Ordering::Relaxed) < candidate {
-            self.max_plus_one.fetch_max(candidate, Ordering::Relaxed);
+    /// Fold an age observed at second `now` into that second's slot. A load
+    /// first: most observations are below the second's maximum and write
+    /// nothing. A slot a later second already took is left to it.
+    pub(crate) fn observe(&self, now: u64, secs: u64) {
+        let tag = now + 1;
+        let age = secs.min(u64::from(u32::MAX));
+        let slot = &self.slots[(now % REUSE_AGE_PEAK_SLOTS as u64) as usize];
+        let mut current = slot.load(Ordering::Relaxed);
+        loop {
+            let held = current >> 32;
+            if held > tag || (held == tag && current & 0xFFFF_FFFF >= age) {
+                break;
+            }
+            match slot.compare_exchange_weak(
+                current,
+                (tag << 32) | age,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
         if !self.seen.load(Ordering::Relaxed) {
             self.seen.store(true, Ordering::Relaxed);
         }
     }
 
-    /// The window's maximum, starting the next window: `None` when this tree
-    /// never observed a reuse age, `Some(0)` when nothing since the last take.
-    pub(crate) fn take(&self) -> Option<u64> {
-        // Check publication first: the initial observe may have updated the
-        // maximum but not yet set seen. Leave that value for the next scrape.
-        self.seen.load(Ordering::Relaxed).then(|| {
-            self.max_plus_one
-                .swap(0, Ordering::Relaxed)
-                .saturating_sub(1)
-        })
+    /// The largest age observed in the window ending at second `now`:
+    /// `None` when this tree never observed one, `Some(0)` when the window
+    /// holds none.
+    pub(crate) fn peak(&self, now: u64) -> Option<u64> {
+        if !self.seen.load(Ordering::Relaxed) {
+            return None;
+        }
+        let tag = now + 1;
+        let peak = self
+            .slots
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .filter(|&slot| {
+                let held = slot >> 32;
+                held != 0 && held <= tag && tag - held < REUSE_AGE_PEAK_WINDOW_SECS
+            })
+            .map(|slot| slot & 0xFFFF_FFFF)
+            .max();
+        Some(peak.unwrap_or(0))
     }
 }
 
-/// The trees and worker types the reuse-age maximum is kept for.
+/// The trees and worker types the reuse-age peak is kept for.
 const REUSE_AGE_TREES: [&str; 3] = ["string", "token", "hash"];
 const REUSE_AGE_ROLES: [&str; 4] = ["regular", "prefill", "decode", "encode"];
 
-/// [`ReuseAgeMax`] per tree kind ("hash": the hash-mode placement index) and
+/// [`ReuseAgePeak`] per tree kind ("hash": the hash-mode placement index) and
 /// worker type, indexed `tree * REUSE_AGE_ROLES.len() + role`.
-static CACHE_TREE_REUSE_AGE_MAX: [ReuseAgeMax; 12] = [const { ReuseAgeMax::new() }; 12];
+static CACHE_TREE_REUSE_AGE_PEAK: [ReuseAgePeak; 12] = [const { ReuseAgePeak::new() }; 12];
 
-fn reuse_age_max(tree: &str, role: &str) -> Option<&'static ReuseAgeMax> {
+fn reuse_age_peak(tree: &str, role: &str) -> Option<&'static ReuseAgePeak> {
     let t = REUSE_AGE_TREES.iter().position(|&x| x == tree)?;
     let r = REUSE_AGE_ROLES.iter().position(|&x| x == role)?;
-    CACHE_TREE_REUSE_AGE_MAX.get(t * REUSE_AGE_ROLES.len() + r)
+    CACHE_TREE_REUSE_AGE_PEAK.get(t * REUSE_AGE_ROLES.len() + r)
 }
 
-/// Publish each tree's largest reuse age since the previous scrape, by
-/// worker type, and start the next window.
-pub(super) fn record_cache_tree_reuse_age_max() {
+/// Publish each tree's reuse-age peak over the last window, by worker type.
+pub(super) fn record_cache_tree_reuse_age_peak() {
+    let now = kv_index::stamp_seconds();
     for (t, tree) in REUSE_AGE_TREES.iter().enumerate() {
         for (r, role) in REUSE_AGE_ROLES.iter().enumerate() {
-            if let Some(secs) = CACHE_TREE_REUSE_AGE_MAX[t * REUSE_AGE_ROLES.len() + r].take() {
+            if let Some(secs) = CACHE_TREE_REUSE_AGE_PEAK[t * REUSE_AGE_ROLES.len() + r].peak(now) {
                 gauge!(
-                    "smg_cache_tree_reuse_age_max_seconds",
+                    "smg_cache_tree_reuse_age_peak_seconds",
                     "tree" => *tree,
                     "worker_type" => *role
                 )
@@ -2756,9 +2789,8 @@ impl Metrics {
         gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
     }
 
-    /// Set cache-aware tree retention for a model and tree kind
-    /// ("string"/"token"): the age of the most recently used entry the last
-    /// size eviction dropped
+    /// Set cache-aware index retention for a model and tree kind
+    /// ("string"/"token"/"hash"): the age of the oldest entry it still holds
     pub fn set_cache_tree_retention_seconds(
         model_id: &str,
         tree: &'static str,
@@ -2778,8 +2810,8 @@ impl Metrics {
     /// Record the reuse age of a cache-aware tree match: seconds since the
     /// matched tenant last used the deepest matched node
     pub fn record_cache_tree_reuse_age(tree: &'static str, worker_type: &'static str, secs: u64) {
-        if let Some(max) = reuse_age_max(tree, worker_type) {
-            max.observe(secs);
+        if let Some(peak) = reuse_age_peak(tree, worker_type) {
+            peak.observe(kv_index::stamp_seconds(), secs);
         }
         handles::with_static(
             &handles::CACHE_TREE_REUSE_AGE,

@@ -2184,29 +2184,6 @@ fn age_tenant(node: &NodeRef, tenant: &str, secs_ago: u64) {
     }
 }
 
-/// Tree-wide eviction reports the age of the newest entry it evicted (not
-/// the first), and nothing when it evicts nothing.
-#[test]
-fn test_evict_by_size_reports_newest_evicted_age() {
-    let tree = Tree::new();
-    tree.insert_text("aaaaaaaaaa", "w1");
-    tree.insert_text("bbbbbbbbbb", "w2");
-    tree.insert_text("cccccccccc", "w3");
-    age_tenant(&tree.root, "w1", 100);
-    age_tenant(&tree.root, "w2", 50);
-
-    assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
-    // The budget holds one leaf: w1, then w2, go.
-    assert_age(tree.evict_tenant_by_size(10), 50);
-    for (text, matched) in [("aaaaaaaaaa", 0), ("bbbbbbbbbb", 0), ("cccccccccc", 10)] {
-        assert_eq!(
-            tree.match_prefix_with_counts(text).matched_char_count,
-            matched,
-            "{text}"
-        );
-    }
-}
-
 /// With two holders of a prompt, the fused walk reports the age of the
 /// holder the request is routed to, not of the one the match resolved, and
 /// stamps only the routed holder: the other keeps its own last access.
@@ -2233,4 +2210,20 @@ fn test_fused_walk_reports_and_stamps_the_routed_holder() {
         age_of(&resolved),
     );
     assert_age(tree.match_and_insert(text, routed).reuse_age_secs, 0);
+}
+
+/// The oldest stamp still held gives the tree's retention: an empty tree has
+/// none, and evicting the oldest entry moves it to the next oldest.
+#[test]
+fn test_oldest_stamp_age_reports_the_oldest_entry_held() {
+    let tree = Tree::new();
+    assert_eq!(tree.oldest_stamp_age_secs(), None);
+    tree.insert_text("alpha prompt", "w1");
+    tree.insert_text("beta prompt", "w2");
+    age_tenant(&tree.root, "w1", 300);
+    age_tenant(&tree.root, "w2", 40);
+    assert_age(tree.oldest_stamp_age_secs(), 300);
+
+    tree.evict_tenant_by_size("beta prompt".chars().count());
+    assert_age(tree.oldest_stamp_age_secs(), 40);
 }

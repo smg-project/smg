@@ -5,7 +5,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use super::metrics::UPKEEP_INTERVAL_SECS;
@@ -15,24 +15,13 @@ struct MetricsState {
     handle: PrometheusHandle,
 }
 
-/// Held across a scrape's publish-then-render: the reuse-age maximum is
-/// taken (and its window restarted) when published, so two overlapping
-/// scrapes must not interleave, or one renders the other's zero after
-/// taking its own maximum. An async lock, so a scrape waiting on another
-/// yields its runtime worker thread.
-static SCRAPE: Mutex<()> = Mutex::const_new(());
-
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
-    let body = {
-        let _scrape = SCRAPE.lock().await;
-        super::metrics::record_tokenizer_cache_activity();
-        super::metrics::record_detokenize_activity();
-        super::metrics::record_tokenizer_encode_activity();
-        super::metrics::record_cache_tree_reuse_age_max();
-        let mut body = state.handle.render();
-        super::worker_metrics::render_into(&mut body);
-        body
-    };
+    super::metrics::record_tokenizer_cache_activity();
+    super::metrics::record_detokenize_activity();
+    super::metrics::record_tokenizer_encode_activity();
+    super::metrics::record_cache_tree_reuse_age_peak();
+    let mut body = state.handle.render();
+    super::worker_metrics::render_into(&mut body);
     (
         [(
             http::header::CONTENT_TYPE,
