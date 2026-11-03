@@ -3451,7 +3451,10 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
 /// Two connected schedulers whose handshakes each say a data-parallel size
 /// of one: the zero-filled `GetLoads` before the first snapshot names the
 /// ranks the servicer serves (one per connected scheduler), as the pinned
-/// request path counts them.
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
 #[tokio::test]
 async fn the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();
@@ -3474,6 +3477,92 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 struct NativeVideoProcessor;
