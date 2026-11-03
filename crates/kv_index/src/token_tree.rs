@@ -1334,7 +1334,7 @@ impl TokenTree {
             };
 
             let node = &leaf_data[idx];
-            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
+            let (node_tokens, _, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
             if node_tokens > 0 {
                 evicted += node_tokens;
 
@@ -1415,24 +1415,22 @@ impl TokenTree {
     }
 
     /// Remove tenant from node and clean up empty ancestors.
-    /// Returns (tokens_removed, Option<(parent_node, ts)> if parent became a leaf).
+    /// Returns (tokens_removed, the removed access stamp, Option<(parent_node, ts)>
+    /// if parent became a leaf); (0, 0, None) when the tenant was not on the node.
     fn remove_tenant_and_cleanup(
         &self,
         node: &NodeRef,
         tenant_id: &TenantId,
-    ) -> (usize, Option<(NodeRef, u64)>) {
-        if node
-            .tenant_last_access_time
-            .remove(tenant_id.as_ref())
-            .is_none()
-        {
-            return (0, None);
-        }
+    ) -> (usize, u64, Option<(NodeRef, u64)>) {
+        let Some((_, removed_stamp)) = node.tenant_last_access_time.remove(tenant_id.as_ref())
+        else {
+            return (0, 0, None);
+        };
 
         let node_tokens = node.tokens.read().len();
         let parent_leaf_info = self.cleanup_empty_ancestors_with_parent(node, tenant_id);
 
-        (node_tokens, parent_leaf_info)
+        (node_tokens, removed_stamp, parent_leaf_info)
     }
 
     /// Remove empty nodes walking up via parent pointers.
@@ -1641,14 +1639,14 @@ impl TokenTree {
 
         // Min-heap by eviction priority (policy-dependent), across all tenants
         let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
-        let mut leaf_data: Vec<(NodeRef, TenantId, u64)> = Vec::with_capacity(leaves.len());
+        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::with_capacity(leaves.len());
         // The newest stamp among the evicted entries.
         let mut newest_evicted: Option<u64> = None;
 
         for (node, tenant, ts) in leaves.drain(..) {
             let priority = self.compute_eviction_priority(&node, ts);
             let idx = leaf_data.len();
-            leaf_data.push((node, tenant, ts));
+            leaf_data.push((node, tenant));
             heap.push(Reverse((priority, idx)));
         }
 
@@ -1657,25 +1655,28 @@ impl TokenTree {
                 break;
             };
 
-            let (node, tenant, ts) = {
-                let (node, tenant, ts) = &leaf_data[idx];
-                (Arc::clone(node), Arc::clone(tenant), *ts)
+            let (node, tenant) = {
+                let (node, tenant) = &leaf_data[idx];
+                (Arc::clone(node), Arc::clone(tenant))
             };
             // Verify this node is still a leaf for this tenant: a concurrent
             // insert may have attached the tenant to a descendant.
             if !self.is_tenant_leaf(&node, &tenant) {
                 continue;
             }
-            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(&node, &tenant);
+            let (node_tokens, removed_stamp, parent_became_leaf) =
+                self.remove_tenant_and_cleanup(&node, &tenant);
             if node_tokens > 0 {
                 self.sub_tenant_tokens(&tenant, node_tokens);
-                newest_evicted = newest_evicted.max(Some(ts));
+                // The stamp removed, not the one read at collection: a match
+                // may have re-stamped the entry since.
+                newest_evicted = newest_evicted.max(Some(removed_stamp));
 
                 // Incremental leaf promotion (matching SGLang's approach)
                 if let Some((parent_node, parent_ts)) = parent_became_leaf {
                     let priority = self.compute_eviction_priority(&parent_node, parent_ts);
                     let new_idx = leaf_data.len();
-                    leaf_data.push((parent_node, tenant, parent_ts));
+                    leaf_data.push((parent_node, tenant));
                     heap.push(Reverse((priority, new_idx)));
                 }
             }

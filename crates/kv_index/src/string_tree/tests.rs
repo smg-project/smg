@@ -2174,25 +2174,35 @@ fn test_untimed_intermediate_stamp_reports_no_age() {
     assert_eq!(result.reuse_age_secs, None);
 }
 
-/// Tree-wide eviction reports the age of the newest entry it evicted, and
-/// nothing when it evicts nothing.
+/// Re-stamp `tenant`'s stamps below `node` as taken `secs_ago` seconds back.
+fn age_tenant(node: &NodeRef, tenant: &str, secs_ago: u64) {
+    for child in &node.children {
+        if let Some(mut stamp) = child.value().tenant_last_access_time.get_mut(tenant) {
+            *stamp = ((stamp_seconds() - secs_ago) << 32) | (*stamp & 0xFFFF_FFFF);
+        }
+        age_tenant(child.value(), tenant, secs_ago);
+    }
+}
+
+/// Tree-wide eviction reports the age of the newest entry it evicted (not
+/// the first), and nothing when it evicts nothing.
 #[test]
 fn test_evict_by_size_reports_newest_evicted_age() {
     let tree = Tree::new();
     tree.insert_text("aaaaaaaaaa", "w1");
-    age_stamps(&tree.root, 100);
     tree.insert_text("bbbbbbbbbb", "w2");
+    tree.insert_text("cccccccccc", "w3");
+    age_tenant(&tree.root, "w1", 100);
+    age_tenant(&tree.root, "w2", 50);
 
     assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
-    assert_age(tree.evict_tenant_by_size(10), 100);
-    assert_eq!(
-        tree.match_prefix_with_counts("aaaaaaaaaa")
-            .matched_char_count,
-        0
-    );
-    assert_eq!(
-        tree.match_prefix_with_counts("bbbbbbbbbb")
-            .matched_char_count,
-        10
-    );
+    // The budget holds one leaf: w1, then w2, go.
+    assert_age(tree.evict_tenant_by_size(10), 50);
+    for (text, matched) in [("aaaaaaaaaa", 0), ("bbbbbbbbbb", 0), ("cccccccccc", 10)] {
+        assert_eq!(
+            tree.match_prefix_with_counts(text).matched_char_count,
+            matched,
+            "{text}"
+        );
+    }
 }

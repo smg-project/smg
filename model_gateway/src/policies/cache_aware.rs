@@ -3229,13 +3229,6 @@ impl CacheAwarePolicy {
             if holder_candidates.is_empty() {
                 continue;
             }
-            if let Some(age) = reuse_age {
-                Metrics::record_cache_tree_reuse_age(
-                    "hash",
-                    metrics_role_of(&self.metrics_role),
-                    age.as_secs(),
-                );
-            }
             // A holder of this boundary holds `boundary` tokens of the prompt.
             let holders: Vec<(usize, f64)> = holder_candidates
                 .iter()
@@ -3248,11 +3241,17 @@ impl CacheAwarePolicy {
                 avg_load,
                 info,
             )?;
-            let branch = if holder_candidates.contains(&selected) {
-                "hash_hit"
-            } else {
-                "hash_spill"
-            };
+            let hit = holder_candidates.contains(&selected);
+            let branch = if hit { "hash_hit" } else { "hash_spill" };
+            // Only a request that lands on a holder reuses the head; a spill
+            // (or a declined selection, returned above) reuses nothing.
+            if let (true, Some(age)) = (hit, reuse_age) {
+                Metrics::record_cache_tree_reuse_age(
+                    "hash",
+                    metrics_role_of(&self.metrics_role),
+                    age.as_secs(),
+                );
+            }
             self.record_placement(
                 model_id,
                 info.cache_namespace,
@@ -3521,6 +3520,8 @@ impl CacheAwarePolicy {
             result.matched_token_count.saturating_sub(marker_len),
             result.input_token_count.saturating_sub(marker_len),
             result.reuse_age_secs,
+            selected_idx.map(|idx| workers[idx].url()),
+            &result.matched_tenants,
         );
 
         let idx = selected_idx?;
@@ -3545,22 +3546,29 @@ impl CacheAwarePolicy {
         Some(idx)
     }
 
-    /// Record a tree decision's reuse age when the decision counts as reusing
-    /// the prefix: its match rate (namespace marker excluded) is over
+    /// Record a tree decision's reuse age when the decision reuses the
+    /// prefix: its match rate (namespace marker excluded) is over
     /// `cache_threshold`, the rate at which the selection holds a request to
-    /// the prefix's holders. A shorter match, a few chars of a common opening
-    /// in the string tree, says nothing about how far back the cache reaches.
+    /// the prefix's holders, and the selected worker is one of those holders.
+    /// A shorter match (a few chars of a common opening in the string tree)
+    /// or a spill to a worker without the prefix says nothing about how far
+    /// back the cache reaches.
     fn record_tree_reuse_age(
         &self,
         tree: &'static str,
         matched: usize,
         input: usize,
         reuse_age_secs: Option<u64>,
+        selected: Option<&str>,
+        matched_tenants: &[TenantId],
     ) {
-        let Some(age) = reuse_age_secs else {
+        let (Some(age), Some(selected)) = (reuse_age_secs, selected) else {
             return;
         };
-        if input > 0 && matched as f32 / input as f32 > self.config.cache_threshold {
+        let reused = input > 0
+            && matched as f32 / input as f32 > self.config.cache_threshold
+            && matched_tenants.iter().any(|t| t.as_ref() == selected);
+        if reused {
             Metrics::record_cache_tree_reuse_age(tree, metrics_role_of(&self.metrics_role), age);
         }
     }
@@ -3628,6 +3636,8 @@ impl CacheAwarePolicy {
             result.matched_char_count.saturating_sub(marker_len),
             result.input_char_count.saturating_sub(marker_len),
             result.reuse_age_secs,
+            selected_idx.map(|idx| workers[idx].url()),
+            &result.matched_tenants,
         );
 
         let idx = selected_idx?;

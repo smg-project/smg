@@ -2379,21 +2379,39 @@ fn test_partial_match_reports_reuse_age() {
     assert_age(result.reuse_age_secs, 45);
 }
 
-/// Tree-wide eviction reports the age of the newest entry it evicted, and
-/// nothing when it evicts nothing.
+/// Re-stamp `tenant`'s stamps below `node` as taken `secs_ago` seconds back.
+fn age_tenant(node: &NodeRef, tenant: &str, secs_ago: u64) {
+    for child in &node.children {
+        if let Some(mut stamp) = child.value().tenant_last_access_time.get_mut(tenant) {
+            *stamp = ((stamp_seconds() - secs_ago) << 32) | (*stamp & 0xFFFF_FFFF);
+        }
+        age_tenant(child.value(), tenant, secs_ago);
+    }
+}
+
+/// Tree-wide eviction reports the age of the newest entry it evicted (not
+/// the first), and nothing when it evicts nothing.
 #[test]
 fn test_evict_by_size_reports_newest_evicted_age() {
     let tree = TokenTree::new();
-    let (old, recent) = (make_tokens(1, 2), make_tokens(100_000, 2));
-    tree.insert_tokens(&old, "w1");
-    age_stamps(&tree.root, 100);
-    tree.insert_tokens(&recent, "w2");
+    let leaves = [
+        make_tokens(1, 2),
+        make_tokens(100_000, 2),
+        make_tokens(200_000, 2),
+    ];
+    for (tokens, tenant) in leaves.iter().zip(["w1", "w2", "w3"]) {
+        tree.insert_tokens(tokens, tenant);
+    }
+    age_tenant(&tree.root, "w1", 100);
+    age_tenant(&tree.root, "w2", 50);
 
     assert_eq!(tree.evict_tenant_by_size(usize::MAX), None);
-    assert_age(tree.evict_tenant_by_size(2 * PAGE_SIZE), 100);
-    assert_eq!(tree.match_prefix_with_counts(&old).matched_token_count, 0);
-    assert_eq!(
-        tree.match_prefix_with_counts(&recent).matched_token_count,
-        2 * PAGE_SIZE
-    );
+    // The budget holds one leaf: w1, then w2, go.
+    assert_age(tree.evict_tenant_by_size(2 * PAGE_SIZE), 50);
+    for (tokens, matched) in leaves.iter().zip([0, 0, 2 * PAGE_SIZE]) {
+        assert_eq!(
+            tree.match_prefix_with_counts(tokens).matched_token_count,
+            matched
+        );
+    }
 }

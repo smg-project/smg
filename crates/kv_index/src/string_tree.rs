@@ -1185,11 +1185,7 @@ impl Tree {
             let Some(Reverse(entry)) = pq.pop() else {
                 break;
             };
-            let EvictionEntry {
-                timestamp,
-                tenant,
-                node,
-            } = entry;
+            let EvictionEntry { tenant, node, .. } = entry;
 
             // Root is never eligible for eviction (re-enters via promotion)
             if Arc::ptr_eq(&node, &self.root) {
@@ -1213,9 +1209,11 @@ impl Tree {
             let node_len = node.text.read().char_count();
             self.sub_tenant_chars(&tenant, node_len);
 
-            // Remove tenant from node
-            node.tenant_last_access_time.remove(tenant.as_ref());
-            newest_evicted = newest_evicted.max(Some(timestamp));
+            // Remove tenant from node; the age is the stamp removed, not the
+            // one queued: a match may have re-stamped the entry since.
+            if let Some((_, removed_stamp)) = node.tenant_last_access_time.remove(tenant.as_ref()) {
+                newest_evicted = newest_evicted.max(Some(removed_stamp));
+            }
 
             // Get parent reference outside of the borrow scope
             // Use Weak::upgrade() to get a strong reference if the parent still exists

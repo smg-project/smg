@@ -3614,6 +3614,56 @@ fn hash_miss_uses_expected_wait_and_records_final_holder() {
     assert_eq!(holders[0].worker_url, workers[1].url());
 }
 
+/// A spill reuses nothing: no reuse age is recorded when the request lands
+/// on a worker that does not hold the head (hash mode) or the matched prefix
+/// (tree mode, its holder unhealthy).
+#[test]
+fn spill_to_a_non_holder_records_no_reuse_age() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        // Hash mode: the holder is loaded past the gate, the request spills.
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..16).collect();
+        policy.record_placement(
+            model,
+            None,
+            &tokens,
+            &[16],
+            workers[0].url(),
+            Instant::now(),
+        );
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
+        assert_ne!(
+            route_tokens(&policy, &workers, &tokens),
+            0,
+            "the request spills"
+        );
+
+        // Tree mode: the only holder of the prefix is unhealthy.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        workers[0].set_status(WorkerStatus::NotReady);
+        assert_eq!(
+            route_tokens(&policy, &workers, &tokens),
+            1,
+            "the request spills"
+        );
+    });
+    let rendered = handle.render();
+    assert!(
+        !rendered.contains("smg_cache_tree_reuse_age_seconds"),
+        "a spill recorded a reuse age; rendered:\n{rendered}"
+    );
+}
+
 #[test]
 fn hash_spill_uses_expected_wait_and_records_only_final_holder() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));

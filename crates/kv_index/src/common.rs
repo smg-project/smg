@@ -97,9 +97,10 @@ fn clock_seconds() -> u64 {
     offset + started.elapsed().as_secs() + 1
 }
 
-/// [`clock_seconds`] as of the stamp clock's last tick; 0 until the clock
-/// starts. A stamp reads this one atomic instead of the clock, which on the
-/// request path cost about 8% of a match.
+/// [`clock_seconds`] as of the stamp clock's last tick; 0 until the ticker
+/// thread first publishes (and for good if it cannot start). A stamp reads
+/// this one atomic instead of the clock, which on the request path cost
+/// about 8% of a match.
 static STAMP_SECONDS: AtomicU64 = AtomicU64::new(0);
 static STAMP_CLOCK: Once = Once::new();
 
@@ -117,23 +118,27 @@ pub(super) fn stamp_seconds() -> u64 {
     }
 }
 
-/// The first stamp's path: start the ticker thread.
+/// The path while [`STAMP_SECONDS`] is 0: start the ticker thread once, and
+/// read the clock itself until the ticker has published (or for good, if the
+/// thread could not start, so ages keep advancing either way).
 #[cold]
 #[inline(never)]
 fn start_stamp_clock() -> u64 {
     STAMP_CLOCK.call_once(|| {
-        STAMP_SECONDS.store(clock_seconds(), Ordering::Relaxed);
         let ticker = thread::Builder::new()
             .name("kv-index-stamp-clock".into())
             .spawn(|| loop {
-                thread::sleep(STAMP_TICK);
                 STAMP_SECONDS.store(clock_seconds(), Ordering::Relaxed);
+                thread::sleep(STAMP_TICK);
             });
         if let Err(err) = ticker {
-            warn!(%err, "stamp clock thread failed to start; access stamps keep their first second");
+            warn!(%err, "stamp clock thread failed to start; access stamps read the clock instead");
         }
     });
-    STAMP_SECONDS.load(Ordering::Relaxed)
+    match STAMP_SECONDS.load(Ordering::Relaxed) {
+        0 => clock_seconds(),
+        secs => secs,
+    }
 }
 
 /// An access stamp: the seconds in the high 32 bits, `sequence`'s low 32
