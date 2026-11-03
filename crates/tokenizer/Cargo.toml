@@ -70,6 +70,9 @@ unicode-normalization-alignments = "0.1"
 criterion = "0.8"
 openai-protocol.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+# The hub tests build the Hub's answers to a file request: http for the response, the reqwest hf-hub binds for the error.
+http.workspace = true
+reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).
