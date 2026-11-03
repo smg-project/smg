@@ -66,7 +66,7 @@ elif args[0] == "-c":
             sys.modules[name] = types.ModuleType(name)
         sys.modules["sglang"].__version__ = "fixture"
         extension = types.ModuleType("torch_c_dlpack_ext")
-        extension.core = types.SimpleNamespace(_lib=None)
+        extension.core = types.SimpleNamespace(_lib=os.environ.get("IMAGE_DLPACK_LIB"))
         sys.modules["torch_c_dlpack_ext"] = extension
     exec(args[1])
 elif args[:2] == ["-m", "pip"]:
@@ -115,6 +115,7 @@ def run_installer(
         "IMAGE_TORCH_VERSION",
         "IMAGE_TORCH_HIP",
         "IMAGE_TORCH_C_API",
+        "IMAGE_DLPACK_LIB",
         "FAIL_PIP_STAGE",
         "FAIL_NATIVE_CHECK",
     ):
@@ -301,4 +302,21 @@ def test_generic_cuda_install_does_not_repair_the_rocm_cohort(tmp_path):
         and EXTENSION_SOURCE not in call
         for call in calls
     )
+    assert not (tmp_path / "github.env").exists()
+
+
+def test_dlpack_own_library_is_rejected_before_check_and_handoff(tmp_path):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "IMAGE_DLPACK_LIB": "fixture-dlpack-library",
+        },
+    )
+    assert result.returncode != 0
+    assert "DLPack extension loaded its own library" in result.stderr
+    assert "fixture-dlpack-library" in result.stderr
+    assert len(calls) == 2
     assert not (tmp_path / "github.env").exists()
