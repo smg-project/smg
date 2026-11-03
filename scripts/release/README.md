@@ -20,10 +20,11 @@ release branch behind you, `bump` and `pick` leave you on the topic branch they 
 | publish | `make release-publish-plan VERSION=1.14.0-rc.1` | prints the workflow dispatches to run against the tag and the artifact names they produce; runs nothing | the release owner dispatches them |
 | notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes skeleton: the merged pull requests since the previous final, by type, and the Docker image list; prints the `gh release create` line | the release owner |
 | main follows | `make release-bump-main VERSION=1.14.0` | after a final: a pull request that moves `main`'s crates and packages to at least the release's; the gateway keeps its development version (it moves to the next one only when `main` still reads below the release) | the release owner |
+| ship | `make release-ship VERSION=1.14.1 [DRY_RUN=1] [FROM=<step>]` | the candidate, final or patch in one run on an existing release branch: the gate's CI rows for the commit the bump builds on, the bump (pushed to the branch when the rules allow the caller a push, else its pull request, waited for), the tag, the notes, the GitHub release and the publish dispatches; a rerun skips what is there ([Ship](#ship-the-release-in-one-run)) | the release owner, with push or bypass rights for the direct bump |
 
 `PUSH=1` is needed to push a release branch (`cut`, with the pull request that moves `main`) or a
 tag (`tag`); `PUSH=0` keeps a topic branch local (`bump`, `pick`, `bump-main` otherwise push it and
-open the pull request with `gh`).
+open the pull request with `gh`); the ship pushes and opens on its own.
 Every commit, pick and tag carries the caller's git identity and sign-off. Before the cut is
 pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read the local
 `release/<x.y>` and say so, which rehearses a release end to end on a clone; `bump`, `pick`,
@@ -117,6 +118,9 @@ A candidate or a final is tagged when, on the branch head:
 
 ## The steps of a release
 
+Steps 2, 3, 5, 6 and 8 below are one command each with `make release-ship VERSION=<version>`
+([Ship](#ship-the-release-in-one-run)); the steps spell out what it does.
+
 1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, and the
    topic branch `chore/main-versions-1.15.0-dev` that moves `main` above it, both locally; you
    stay on the branch you ran it from. Read the commits (`git show --stat refs/heads/release/1.14`,
@@ -140,6 +144,52 @@ A candidate or a final is tagged when, on the branch head:
    packages to at least the release's (the gateway keeps `1.15.0-dev`).
 8. A patch release later: `make release-bump VERSION=1.14.1` on the same branch, picks, step 2
    onwards; a candidate first (`1.14.1-rc.1`) when it needs one.
+
+## Ship: the release in one run
+
+`make release-ship VERSION=1.14.1` (a candidate: `VERSION=1.14.1-rc.1`) takes an existing release
+branch from the bump to the dispatches in one run. Every step reads the repository first and
+skips what is there, so the same command is run again after an interruption, and `FROM=<step>`
+(`release.sh ship <version> --from <step>`) starts at a step by name:
+
+1. `preflight`: the gate's CI rows for the commit the bump builds on (the branch head, or the
+   bump's parent when the branch reads the version already). A red row (a failed or cancelled
+   run, a read that failed, a matrix that ended without a success) stops the ship; pending rows
+   are printed and do not hold it: the bump changes version files only and ships on its
+   parent's run. The four verifier lines are printed for the release owner.
+2. `bump`: the bump commit (as `release-bump` makes it) on `chore/release-<version>`, the
+   versions and the registries checked at it before anything leaves the clone; then the branch
+   moves to it. By a push when the repository's rules allow the caller one: no branch protection
+   of the classic kind, and no pull-request or status-check rule on the branch, or the caller on
+   the always-bypass list of every ruleset that carries one. Otherwise by the bump pull request,
+   which the ship opens and waits for (`MERGE_WAIT` minutes, 120 by default, a read every
+   `MERGE_POLL` seconds, 30). A push the remote refuses all the same falls back to the pull
+   request. `BUMP_PUSH=1` pushes without reading the rules (a bypass by team or role, which the
+   ship does not read); `BUMP_PUSH=0` always opens the pull request. A rerun finds an open bump
+   pull request and waits for it.
+3. `tag`: `v<version>` at the branch head, as `release-tag` makes it, pushed. A tag on the
+   repository at the head is kept; one anywhere else stops the ship (tags never move).
+4. `notes`: `release-notes` rendered once into `.git/release/notes-v<version>.md` (kept across
+   reruns, so it can be edited), or the file `NOTES=<path>` names. Notes that are not ready (an
+   empty file, a heading that is not the release's) stop the ship before anything is published.
+   The engine-image list fills in once those images exist: `scripts/release_docker_notes.sh
+   v<version>` and `gh release edit` after the dispatches.
+5. `release`: `gh release create --verify-tag` with the notes, `--prerelease` for a candidate and
+   `--latest` for a final; an existing release is kept.
+6. `publish`: the dispatches of `release-publish-plan` against the tag, each one once: a
+   dispatch whose run exists on the tag and did not fail is skipped, a failed or cancelled run
+   is dispatched again, and the runs on the tag are listed at the end.
+
+`DRY_RUN=1` (`--dry-run`) prints each step with the values it reads (the CI rows, the rules, the
+tag, the release, the plan's dispatch lines and their runs) and writes nothing, in the clone or
+on the repository; `REGISTRY=0` skips the registry reads as for `check`.
+
+The bump reaches the branch without a review round only when the rules let the caller push to
+it: a release manager on the bypass list of the ruleset that protects the release branches, or a
+branch that carries no such rule. Without that, the bump costs the review round `release-bump`
+costs today, and the ship waits for it. The first candidate of a line is cut by `release-cut`
+(it also moves `main`); from then on the ship is the one command for every candidate, the final
+and the patches.
 
 ## Branch protection a maintainer sets
 
