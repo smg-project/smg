@@ -36,7 +36,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     config::Config,
-    drain::InFlight,
+    drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
     script::{self, Answer},
 };
@@ -48,6 +48,9 @@ struct AppState {
     /// and the script store address it by.
     name: String,
     engine: Option<Engine>,
+    /// The requests this worker is serving: what its load report counts as
+    /// running when no engine simulation runs.
+    in_flight: WorkerInFlight,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -110,7 +113,12 @@ pub async fn serve_with_listener_until(
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
-    let state = Arc::new(AppState { cfg, name, engine });
+    let state = Arc::new(AppState {
+        cfg,
+        name,
+        engine,
+        in_flight: WorkerInFlight::default(),
+    });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
     // response on a pooled keep-alive connection and distorts ITL/CPU numbers.
@@ -166,20 +174,27 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
             "utilization": s.token_usage,
             "max_running_requests": s.max_running_requests,
         }),
-        None => json!({
-            "dp_rank": 0,
-            "num_running_reqs": 0,
-            "num_waiting_reqs": 0,
-            "num_waiting_uncached_tokens": 0,
-            "num_total_reqs": 0,
-            "num_used_tokens": 0,
-            "max_total_num_tokens": 1_000_000,
-            "token_usage": 0.0,
-            "gen_throughput": 0.0,
-            "cache_hit_rate": 0.0,
-            "utilization": 0.0,
-            "max_running_requests": 0,
-        }),
+        None => {
+            // Without an engine simulation the work in flight is the canned
+            // and scripted answers whose responses are still open on this
+            // worker (not the process's other workers): the running count a
+            // load poll asks about, and nothing waits.
+            let running = state.in_flight.get();
+            json!({
+                "dp_rank": 0,
+                "num_running_reqs": running,
+                "num_waiting_reqs": 0,
+                "num_waiting_uncached_tokens": 0,
+                "num_total_reqs": running,
+                "num_used_tokens": 0,
+                "max_total_num_tokens": 1_000_000,
+                "token_usage": 0.0,
+                "gen_throughput": 0.0,
+                "cache_hit_rate": 0.0,
+                "utilization": 0.0,
+                "max_running_requests": 0,
+            })
+        }
     };
     Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] })).into_response()
 }
@@ -204,8 +219,9 @@ async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
     // In flight from here until the response is complete or its stream is
-    // done, so a shutdown knows what it waits for.
-    let in_flight = InFlight::enter();
+    // done, so a shutdown knows what it waits for and this worker's load
+    // report counts it.
+    let in_flight = InFlight::enter_on(&state.in_flight);
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let stream_requested = parsed
         .get("stream")
@@ -223,11 +239,12 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
     // A scripted answer, ahead of either engine mode: the worker's queue or
     // the prompt's key decides ([`crate::script`]).
     if let Some(answer) = script::take(&state.name, &prompt_ids) {
+        // The request's limit ends the answer as it would an engine's.
         return scripted_response(
             endpoint,
             &state.cfg,
             &parsed,
-            answer,
+            answer.cut_to(extract_max_tokens(&parsed)),
             prompt_ids.len(),
             stream_requested,
             in_flight,
@@ -348,6 +365,20 @@ fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
     }
 }
 
+/// How many top alternatives the request asked for per token: chat's
+/// `top_logprobs`, a completion's `logprobs: <n>` (the sampled token counts
+/// as one of them).
+fn wants_top(endpoint: Endpoint, request: &Value) -> usize {
+    let key = match endpoint {
+        Endpoint::Chat => "top_logprobs",
+        Endpoint::Completions => "logprobs",
+    };
+    request
+        .get(key)
+        .and_then(Value::as_u64)
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 /// The usage block of a scripted answer.
 fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
     let prompt_tokens = answer.prompt_tokens(prompt_len);
@@ -361,21 +392,41 @@ fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
 }
 
 /// The logprobs of some text pieces in the endpoint's shape: chat's
-/// `content` entries, a completion's parallel `tokens` and `token_logprobs`.
-fn scripted_logprobs(endpoint: Endpoint, pieces: &[String], logprobs: &[f32]) -> Value {
+/// `content` entries, a completion's parallel `tokens` and `token_logprobs`,
+/// with the answer's `top` alternatives per piece where the request asked for
+/// them (chat's entry list, a completion's piece-to-logprob map).
+fn scripted_logprobs(
+    endpoint: Endpoint,
+    answer: &Answer,
+    pieces: &[String],
+    logprobs: &[f32],
+    top: usize,
+) -> Value {
+    let mut alternatives = answer.top_pieces(pieces, logprobs, top).into_iter();
     match endpoint {
         Endpoint::Chat => json!({
             "content": pieces.iter().zip(logprobs).map(|(piece, logprob)| json!({
                 "token": piece,
                 "logprob": logprob,
                 "bytes": Value::Null,
-                "top_logprobs": [],
+                "top_logprobs": alternatives.next().unwrap_or_default().into_iter().map(|(token, logprob)| json!({
+                    "token": token,
+                    "logprob": logprob,
+                    "bytes": Value::Null,
+                })).collect::<Vec<Value>>(),
             })).collect::<Vec<Value>>(),
         }),
         Endpoint::Completions => json!({
             "tokens": pieces,
             "token_logprobs": logprobs,
-            "top_logprobs": pieces.iter().map(|_| json!({})).collect::<Vec<Value>>(),
+            "top_logprobs": pieces.iter().map(|_| {
+                alternatives
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(token, logprob)| (token, json!(logprob)))
+                    .collect::<serde_json::Map<String, Value>>()
+            }).collect::<Vec<serde_json::Map<String, Value>>>(),
             "text_offset": [],
         }),
     }
@@ -397,6 +448,11 @@ async fn scripted_response(
     in_flight: InFlight,
 ) -> Response {
     let want_logprobs = wants_logprobs(endpoint, request);
+    let top = if want_logprobs {
+        wants_top(endpoint, request)
+    } else {
+        0
+    };
     let usage = scripted_usage(&answer, prompt_len);
     let model = cfg.model_id.clone();
     let frames = answer.text_frames();
@@ -412,6 +468,7 @@ async fn scripted_response(
             answer,
             frames,
             want_logprobs,
+            top,
             usage,
         )))
         .into_response();
@@ -440,7 +497,7 @@ async fn scripted_response(
         (want_logprobs, &answer.output_text, &answer.logprobs)
     {
         if pieces.len() == logprobs.len() {
-            choice["logprobs"] = scripted_logprobs(endpoint, pieces, logprobs);
+            choice["logprobs"] = scripted_logprobs(endpoint, &answer, pieces, logprobs, top);
         }
     }
     let body = match endpoint {
@@ -472,6 +529,7 @@ fn scripted_frames(
     answer: Answer,
     frames: Vec<script::Frame>,
     want_logprobs: bool,
+    top: usize,
     usage: Option<Value>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     struct Scripted {
@@ -480,6 +538,7 @@ fn scripted_frames(
         answer: Answer,
         frames: std::collections::VecDeque<script::Frame>,
         want_logprobs: bool,
+        top: usize,
         usage: Option<Value>,
         started: bool,
         finished: bool,
@@ -491,6 +550,7 @@ fn scripted_frames(
         answer,
         frames: frames.into(),
         want_logprobs,
+        top,
         usage,
         started: false,
         finished: false,
@@ -548,7 +608,13 @@ fn scripted_frames(
             && !frame.logprobs.is_empty()
             && frame.logprobs.len() == frame.pieces.len()
         {
-            choice["logprobs"] = scripted_logprobs(st.endpoint, &frame.pieces, &frame.logprobs);
+            choice["logprobs"] = scripted_logprobs(
+                st.endpoint,
+                &st.answer,
+                &frame.pieces,
+                &frame.logprobs,
+                st.top,
+            );
         }
         st.started = true;
         let frame = scripted_chunk(st.endpoint, &st.model, choice);
@@ -819,7 +885,9 @@ fn hash_word(w: &str) -> u32 {
 }
 
 fn extract_max_tokens(v: &Value) -> Option<u32> {
-    for key in ["max_tokens", "max_new_tokens"] {
+    // The chat API's current name first, then the one it deprecates and the
+    // engines' native one.
+    for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
         if let Some(n) = v.get(key).and_then(Value::as_u64) {
             return Some(n as u32);
         }
@@ -853,6 +921,19 @@ mod tests {
             completion_tokens: tokens,
             cached_tokens: 0,
         }
+    }
+
+    #[test]
+    fn the_request_limit_is_read_under_each_of_its_names() {
+        for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
+            assert_eq!(extract_max_tokens(&json!({ key: 7 })), Some(7), "{key}");
+        }
+        assert_eq!(extract_max_tokens(&json!({ "stream": true })), None);
+        assert_eq!(
+            extract_max_tokens(&json!({ "max_completion_tokens": 3, "max_tokens": 9 })),
+            Some(3),
+            "the current name wins over the deprecated one"
+        );
     }
 
     #[tokio::test]

@@ -188,21 +188,19 @@ mod tests {
         TokenizerRegistry,
     };
     use openai_protocol::{chat::ChatCompletionRequest, worker::MmProcessingMode};
-    use reasoning_parser::ParserFactory as ReasoningParserFactory;
-    use tool_parser::ParserFactory as ToolParserFactory;
 
     use super::prepare_rendered_prompt;
     use crate::{
         routers::{
             common::placement::PipelinePin,
             grpc::{
-                context::{RequestContext, SharedComponents},
+                context::RequestContext,
                 multimodal::{
                     media_refs_pipeline_pin, MediaPlan, MultimodalComponents,
                     MultimodalConfigRegistry, MultimodalSettings, PlaceholderTokens,
                 },
-                regular::symphony::template::Templates,
-                utils::{MediaContext, ParserResolver},
+                regular::stages::testing::components_over,
+                utils::MediaContext,
             },
         },
         worker::WorkerRegistry,
@@ -218,18 +216,11 @@ mod tests {
             .load("tokenizer-id", "m", "test", || async move { Ok(loaded) })
             .await
             .unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+        let components = components_over(
             tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
-        });
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "Hello world"}]
         }))

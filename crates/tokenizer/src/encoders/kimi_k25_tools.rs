@@ -198,7 +198,10 @@ struct SchemaRegistry {
     definitions: HashMap<String, Value>,
     /// Insertion order of `$defs` keys. Upstream iterates a Python `dict`,
     /// which is insertion-ordered, so we must preserve that order (not sort)
-    /// to stay byte-equal for schemas whose keys aren't alphabetical.
+    /// to stay byte-equal for schemas whose keys aren't alphabetical. (The
+    /// checkpoint's own tokenizer class hands the encoder the tools with the
+    /// keys of every map sorted, and the tokenizer here does the same before
+    /// calling it; the encoder itself keeps the order it is given.)
     order: Vec<String>,
     has_self_ref: bool,
     depth: usize,
@@ -525,10 +528,13 @@ impl ParameterTypeArray {
     fn to_typescript(&self, indent: &str, registry: &SchemaRegistry) -> String {
         let inner_indent = format!("{indent}{TS_INDENT}");
         let item_doc = self.item.format_docstring(&inner_indent);
-        let item_ts = self.item.to_typescript(&inner_indent, registry);
         if item_doc.is_empty() {
-            format!("Array<{item_ts}>")
+            // The item is written at the array's own depth, as upstream
+            // writes it: an object item's fields sit one level under the
+            // array's line and its closing brace at that line's indent.
+            format!("Array<{}>", self.item.to_typescript(indent, registry))
         } else {
+            let item_ts = self.item.to_typescript(&inner_indent, registry);
             format!("Array<\n{item_doc}{inner_indent}{item_ts}\n{indent}>")
         }
     }

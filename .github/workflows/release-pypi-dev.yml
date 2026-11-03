@@ -61,9 +61,23 @@ jobs:
             echo "${parts[0]}.${parts[1]}.${parts[2]}"
           }
 
-          SMG_VERSION="$(bump_patch "$(read_version bindings/python/pyproject.toml)").${SUFFIX}"
-          PROTO_VERSION="$(bump_patch "$(read_version crates/grpc_client/python/pyproject.toml)").${SUFFIX}"
-          SERVICER_VERSION="$(bump_patch "$(read_version grpc_servicer/pyproject.toml)").${SUFFIX}"
+          # main reads the next development version with a -dev suffix (1.15.0-dev once
+          # release/1.14 is cut: scripts/release/README.md): that number is the one to
+          # build, as 1.15.0.devN, below the release it leads to and above every release
+          # before it. A plain X.Y.Z (a release branch, an older tree) keeps the patch
+          # step above it.
+          dev_version() {
+            local version
+            version=$(read_version "$1")
+            case "${version}" in
+              *-dev) echo "${version%-dev}.${SUFFIX}" ;;
+              *) echo "$(bump_patch "${version}").${SUFFIX}" ;;
+            esac
+          }
+
+          SMG_VERSION="$(dev_version bindings/python/pyproject.toml)"
+          PROTO_VERSION="$(dev_version crates/grpc_client/python/pyproject.toml)"
+          SERVICER_VERSION="$(dev_version grpc_servicer/pyproject.toml)"
 
           echo "smg_version=${SMG_VERSION}" >> "$GITHUB_OUTPUT"
           echo "proto_version=${PROTO_VERSION}" >> "$GITHUB_OUTPUT"

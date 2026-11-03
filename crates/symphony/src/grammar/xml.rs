@@ -452,7 +452,8 @@ mod tests {
         testing::{tool, weather_tools},
     };
 
-    const SEP: &str = "]<]minimax[>[";
+    /// MiniMax M3's separator before every tag, as its table spells it.
+    const SEP: &str = formats::minimax_m3::SEPARATOR;
 
     /// The markers that end a call wherever they stand, in the order of the table's rows.
     fn exits() -> Vec<&'static str> {

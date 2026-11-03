@@ -513,6 +513,17 @@ mod tests {
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
+        // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+        // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
+        for v3_2 in [
+            "deepseek-ai/DeepSeek-V3.2",
+            "deepseek-ai/DeepSeek-V3.2-Speciale",
+            "deepseek-ai/DeepSeek-V3.2-Exp",
+            "deepseek-ai/DeepSeek-V3.2-Exp-Base",
+            "deepseek-v3.2-exp",
+        ] {
+            assert_eq!(table_for(v3_2), Some(Table::DeepSeekV3_2), "{v3_2}");
+        }
         for mimo in [
             "XiaomiMiMo/MiMo-V2.6-Flash-RL",
             "XiaomiMiMo/MiMo-V2.6-Pro-RL",
