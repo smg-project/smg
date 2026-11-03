@@ -20,6 +20,7 @@ COMPONENTS = (
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
+    ("scripts/ci_agentic_svc_deps.sh", "scripts/tests/test_ci_oracle_client_download.py"),
     (
         "e2e_test/benchmarks/nightly_summarize.py",
         "scripts/tests/test_nightly_summary_errors.py",
