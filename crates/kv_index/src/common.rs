@@ -146,8 +146,7 @@ pub(super) fn compose_stamp(sequence: u64) -> u64 {
 }
 
 /// Seconds since `stamp` was taken; `None` for a stamp that carries no time
-/// (0, an attach no access has stamped, or a stamp from before stamps carried
-/// seconds).
+/// (0, or an intermediate tenant attachment no access has stamped).
 #[inline]
 pub(super) fn stamp_age_secs(stamp: u64) -> Option<u64> {
     let secs = stamp >> 32;

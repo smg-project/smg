@@ -1,11 +1,8 @@
 //! Compact serializable snapshot of a radix tree.
 //!
-//! Used by the mesh sync protocol as an alternative to the flat `TreeState`
-//! operation list. The structure-preserving format shares common prefixes,
-//! reducing wire size from ~40 MB to ~2-4 MB for a tree with 2048 entries
-//! sharing 80% prefixes. Receivers in `controller.rs` and `ping_server.rs`
-//! accept both `TreeState` and `TreeSnapshot` payloads under the
-//! `tree_state_lz4` policy type.
+//! The structure-preserving format shares common prefixes. Current mesh
+//! repair uses paginated entries instead; this format supports saving and
+//! restoring whole string trees.
 //!
 //! Wire format: flattened pre-order node list.  Each node stores its
 //! edge label and tenant list.  Children are implicitly ordered by
@@ -28,7 +25,8 @@ pub struct SnapshotNode {
     /// For token trees: will use a separate type.
     pub edge: String,
     /// Tenants (workers) that have this prefix cached,
-    /// with their last-access epoch.
+    /// with their access stamp: seconds in the high 32 bits, sequence in
+    /// the low 32 bits. A zero high half carries no access time.
     pub tenants: Vec<(String, u64)>,
     /// Number of children (for tree reconstruction from flat list).
     pub child_count: u32,
