@@ -20,8 +20,11 @@ pub(crate) struct MissingRouter {
 }
 
 /// The provider a worker spec targets: an explicit `provider`, else a known
-/// provider URL. `None` for a self-hosted engine.
-fn provider_of(spec: &WorkerSpec) -> Option<ProviderType> {
+/// provider URL. `None` for a self-hosted engine, and for an external
+/// endpoint that names no provider, which the OpenAI-compatible router takes
+/// as its fallback. The models listing reads a worker's provider here too, so
+/// admission and the listing judge a worker alike.
+pub(crate) fn provider_of(spec: &WorkerSpec) -> Option<ProviderType> {
     spec.provider
         .clone()
         .or_else(|| ProviderType::from_url(&spec.url))
