@@ -11,6 +11,13 @@
 //! output-token cap. The rule that `thinking.budget_tokens` stays under
 //! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
 //! beta lifts it), so the gateway's handler applies it.
+//!
+//! Tighter than the public API in one place, on purpose: `top_p` is refused
+//! at 0.0 and `top_k` outside 1 to `i32::MAX`, the bounds this gateway's Chat
+//! and Responses APIs apply to the same fields and the engines behind it
+//! enforce, because their wires cannot carry either zero as the request
+//! meant it and carry `top_k` as a signed 32-bit integer, which a larger
+//! value would wrap (`validate_sampling`).
 
 use std::collections::HashSet;
 
@@ -43,15 +50,45 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_thinking(req)
 }
 
-/// `temperature` and `top_p` take the public API's range, 0 to 1.
+/// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
+/// without its zero, and `top_k` from 1 to `i32::MAX`: the bounds the Chat
+/// and Responses requests apply to the same fields
+/// ([`crate::sampling_params::validate_top_p_value`],
+/// [`crate::sampling_params::validate_top_k_value`]). Every engine refuses a
+/// nucleus of nothing, and a `top_k` of 0 is "disabled" on some engines and
+/// an error on the others (never a top of nothing); the wire the engines read
+/// cannot tell either zero from a field the client left out, so such a request
+/// is refused here, with the engine's answer, instead of being sampled over
+/// the whole distribution or failing at the engine. The lower bound of
+/// `top_p` and the ceiling of `top_k` are judged on the values the wires
+/// carry, a 32-bit float and a signed 32-bit integer: a positive `top_p`
+/// below the smallest 32-bit float would arrive as the zero, and a `top_k`
+/// above `i32::MAX` would wrap to "disabled" (-1) or to a negative number the
+/// engine refuses. The upper bound of `top_p` stays on the value given, as
+/// the public API states it; the Chat and Responses requests read the field
+/// as a 32-bit float, so a value within one rounding step above 1 passes
+/// there as 1.0 and is refused here.
 fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    for (name, value) in [("temperature", req.temperature), ("top_p", req.top_p)] {
-        if value.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(invalid(
-                "value_out_of_range",
-                format!("{name}: range: 0..1"),
-            ));
-        }
+    if req.temperature.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "temperature: range: 0..1".to_owned(),
+        ));
+    }
+    if req.top_p.is_some_and(|v| !(v <= 1.0 && (v as f32) > 0.0)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_p: range: (0, 1]".to_owned(),
+        ));
+    }
+    if req
+        .top_k
+        .is_some_and(|k| !(1..=i32::MAX as u32).contains(&k))
+    {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_k: range: 1..2147483647".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -375,13 +412,92 @@ mod tests {
     }
 
     use super::*;
+    use crate::sampling_params::{validate_top_k_value, validate_top_p_value};
 
     #[test]
     fn sampling_parameters_take_the_public_range() {
         assert!(rejection(json!({"temperature": 2.0})).contains("temperature: range: 0..1"));
         assert!(rejection(json!({"temperature": -1.0})).contains("temperature: range: 0..1"));
-        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: 0..1"));
-        accepted(json!({"temperature": 1.0, "top_p": 0.0}));
+        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_p": -0.5})).contains("top_p: range: (0, 1]"));
+        accepted(json!({"temperature": 1.0, "top_p": 1.0, "top_k": 1}));
+        accepted(json!({"temperature": 0.0, "top_p": 0.5, "top_k": 40}));
+    }
+
+    #[test]
+    fn a_nucleus_of_nothing_and_a_top_k_of_zero_are_refused() {
+        // Every engine rejects a top_p of 0.0; a top_k of 0 is "disabled" on
+        // some engines and an error on the others; and the wire cannot tell
+        // either zero from a field the client left out, so the request gets
+        // the engine's answer here instead of a whole-distribution sample.
+        assert!(rejection(json!({"top_p": 0.0})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_k": 0})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn a_top_p_the_wires_would_carry_as_zero_is_refused() {
+        // The engines' wires carry top_p as a 32-bit float: a positive value
+        // below its smallest magnitude arrives as the zero the engines read
+        // as a field left out, so it is refused like the zero itself.
+        assert_eq!((1e-46_f64 as f32).to_bits(), 0);
+        assert!((1e-45_f64 as f32) > 0.0);
+        accepted(json!({"top_p": 1e-45}));
+        assert!(rejection(json!({"top_p": 1e-46})).contains("top_p: range: (0, 1]"));
+    }
+
+    #[test]
+    fn a_top_k_above_the_wires_signed_range_is_refused() {
+        // The engines' wires carry top_k as a signed 32-bit integer: u32::MAX
+        // would wrap to -1 ("disabled": the whole distribution) and i32::MAX + 1
+        // to i32::MIN (an engine error), neither what the client asked for.
+        accepted(json!({"top_k": i32::MAX}));
+        assert!(rejection(json!({"top_k": i32::MAX as u32 + 1}))
+            .contains("top_k: range: 1..2147483647"));
+        assert!(rejection(json!({"top_k": u32::MAX})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn the_bounds_are_the_chat_and_responses_bounds() {
+        // The same JSON value is accepted or refused alike on the three
+        // request paths (the Chat and Responses requests read these fields
+        // as f32 and i32 and apply the shared validators), with one
+        // difference: a value within one rounding step above 1 is 1.0 as an
+        // f32 and passes there, while the Messages request keeps the public
+        // API's bound on the value given.
+        for (value, chat_accepts, messages_accepts) in [
+            (json!(0.0), false, false),
+            (json!(1e-46), false, false),
+            (json!(1e-45), true, true),
+            (json!(0.5), true, true),
+            (json!(1.0), true, true),
+            (json!(1.000_000_01), true, false),
+            (json!(1.5), false, false),
+            (json!(-0.5), false, false),
+        ] {
+            let as_chat: f32 = serde_json::from_value(value.clone()).expect("a number");
+            assert_eq!(
+                validate_top_p_value(as_chat).is_ok(),
+                chat_accepts,
+                "chat top_p {value}"
+            );
+            assert_eq!(
+                request(json!({"top_p": value})).validate().is_ok(),
+                messages_accepts,
+                "messages top_p {value}"
+            );
+        }
+        for (value, accepted_everywhere) in [(0, false), (1, true), (40, true), (i32::MAX, true)] {
+            assert_eq!(
+                validate_top_k_value(value).is_ok(),
+                accepted_everywhere,
+                "chat top_k {value}"
+            );
+            assert_eq!(
+                request(json!({"top_k": value})).validate().is_ok(),
+                accepted_everywhere,
+                "messages top_k {value}"
+            );
+        }
     }
 
     #[test]
