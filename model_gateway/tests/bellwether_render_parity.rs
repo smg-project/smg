@@ -231,6 +231,15 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          closed",
     ),
     (
+        "deepseek-v4.1-flash/render/text-developer-role",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the serving engine does for this architecture, which drops a developer \
+         message before the last user turn with the thinking (and writes a trailing one as a \
+         user turn); the reference is the run of the Jinja template the checkpoint ships, \
+         handed the developer message as a system one; the entry goes when the group is \
+         re-recorded under the engine's rule",
+    ),
+    (
         "falcon-h1-3b-instruct/render/glaive-v2-24087-0",
         "a declared tool without parameters: the gateway renders its parameters as an empty \
          object where the template reference writes null (2 cases of glaive-v2-15)",
