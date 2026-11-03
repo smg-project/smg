@@ -83,6 +83,12 @@ def download(tmp_path):
     start = setup.index('    if [ ! -d "$INSTANT_CLIENT_DIR/instantclient_23_26" ]; then')
     end = setup.index('\n    if [ -n "$LIBAIO_PATH" ]; then', start)
     actual_block = setup[start:end]
+    zip_assignments = [
+        line.strip()
+        for line in setup[:start].splitlines()
+        if line.strip().startswith("INSTANT_CLIENT_ZIP=")
+    ]
+    assert len(zip_assignments) == 1, "Expected one production INSTANT_CLIENT_ZIP assignment"
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     shutil.copyfile(ROOT / "scripts/ci_retry.sh", scripts / "ci_retry.sh")
@@ -90,7 +96,7 @@ def download(tmp_path):
     driver.write_text(
         '#!/bin/bash\nset -euo pipefail\nINSTANT_CLIENT_DIR="$1"\n'
         f"CI_AGENTIC_SVC_DEPS_LIB_ONLY=1 source {shlex.quote(str(SCRIPT))}\n"
-        f'INSTANT_CLIENT_ZIP="{ARCHIVE}"\n'
+        f"{zip_assignments[0]}\n"
         "download_fixture() {\n" + actual_block + "\n}\ndownload_fixture\n"
     )
     tools = tmp_path / "tools"
