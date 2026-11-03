@@ -6,12 +6,12 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::{model_card::ModelCard, worker::ProviderType};
 
 /// A single model entry in the `/v1/models` response.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelObject {
     /// Model identifier (e.g., "meta-llama/Llama-3.1-8B-Instruct").
     pub id: String,
@@ -21,6 +21,9 @@ pub struct ModelObject {
     pub created: i64,
     /// Who owns/hosts the model.
     pub owned_by: String,
+    /// Engine-provided extension fields, preserved at the top level.
+    #[serde(default, flatten)]
+    pub extensions: Map<String, Value>,
 }
 
 /// Response body for `GET /v1/models`.
@@ -66,5 +69,81 @@ impl ListModelsResponse {
                 card
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn engine_model() -> Value {
+        json!({
+            "id": "served-model", "object": "model", "created": 123,
+            "owned_by": "vllm", "root": "org/checkpoint", "parent": null,
+            "max_model_len": 32768,
+            "permission": [{"id": "permission-1", "allow_sampling": true}],
+            "future_field": {"nested": [false, null, 5]}
+        })
+    }
+
+    #[test]
+    fn discovered_model_preserves_engine_fields_and_unknown_extensions() {
+        let expected = engine_model();
+        let mut card = ModelCard::new("served-model");
+        card.upstream_model = Some(serde_json::from_value(expected.clone()).unwrap());
+        let response = ListModelsResponse::from_model_cards([card.clone()]);
+        assert_eq!(serde_json::to_value(&response.data[0]).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(card.into_model_object()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn undiscovered_card_keeps_existing_shape_and_private_metadata_private() {
+        let card = ModelCard::new("local").with_metadata(json!({"internal": "operator-only"}));
+        assert_eq!(
+            serde_json::to_value(card.into_model_object()).unwrap(),
+            json!({
+                "id": "local", "object": "model", "created": 0, "owned_by": "self_hosted"
+            })
+        );
+    }
+
+    #[test]
+    fn registry_identity_wins_for_aliases_and_reserved_extension_keys() {
+        let mut card = ModelCard::new("friendly-alias");
+        let mut model: ModelObject = serde_json::from_value(engine_model()).unwrap();
+        model.extensions.insert("id".to_string(), json!("wrong-id"));
+        model
+            .extensions
+            .insert("owned_by".to_string(), json!("wrong-owner"));
+        card.upstream_model = Some(model);
+        let raw = serde_json::to_string(&card.into_model_object()).unwrap();
+        let body: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["id"], "friendly-alias");
+        assert_eq!(body["owned_by"], "vllm");
+        assert_eq!(raw.matches("\"id\":").count(), 2); // model plus permission id
+    }
+
+    #[test]
+    fn replica_deduplication_keeps_one_complete_object_not_a_fieldwise_merge() {
+        let mut first = ModelCard::new("served-model");
+        first.upstream_model = Some(serde_json::from_value(engine_model()).unwrap());
+        let mut second = first.clone();
+        second
+            .upstream_model
+            .as_mut()
+            .unwrap()
+            .extensions
+            .insert("max_model_len".into(), json!(8192));
+        let response = ListModelsResponse::from_model_cards([first, second]);
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&response.data[0]).unwrap(),
+            engine_model()
+        );
     }
 }

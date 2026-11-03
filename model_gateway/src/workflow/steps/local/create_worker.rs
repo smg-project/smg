@@ -690,6 +690,7 @@ pub(super) fn model_card_for_labels(
         tokenizer_path,
         tool_parser,
         reasoning_parser,
+        upstream_model,
     );
     (next, changed)
 }
@@ -704,6 +705,16 @@ fn card_from_labels(
     let mut card = operator_card
         .cloned()
         .unwrap_or_else(|| ModelCard::new(model_id));
+
+    if card.upstream_model.is_none() {
+        card.upstream_model = labels
+            .get(super::discover_metadata::MODEL_OBJECTS_LABEL)
+            .and_then(|raw| {
+                serde_json::from_str::<HashMap<String, openai_protocol::models::ModelObject>>(raw)
+                    .ok()
+            })
+            .and_then(|mut models| models.remove(model_id));
+    }
 
     if let Some(mt) = labels.get("model_type") {
         card = card.with_hf_model_type(mt.clone());

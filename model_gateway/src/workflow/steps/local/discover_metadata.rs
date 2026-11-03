@@ -3,6 +3,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use openai_protocol::models::ModelObject;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tool_parser::GrammarStart;
@@ -75,19 +76,71 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
+/// Public model objects carried through the existing discovery/refresh pipeline.
+pub(super) const MODEL_OBJECTS_LABEL: &str = "upstream_model_objects";
+
 /// Single entry from `/v1/models` (shared by sglang and vllm).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "serde_json::Value")]
 pub(super) struct ModelsResponseEntry {
     pub owned_by: Option<String>,
     pub id: Option<String>,
     pub root: Option<String>,
     pub max_model_len: Option<usize>,
+    pub model_object: Option<ModelObject>,
+}
+
+impl TryFrom<serde_json::Value> for ModelsResponseEntry {
+    type Error = serde_json::Error;
+
+    fn try_from(mut raw: serde_json::Value) -> Result<Self, Self::Error> {
+        #[derive(Deserialize)]
+        struct Identity {
+            owned_by: Option<String>,
+            id: Option<String>,
+            root: Option<String>,
+            max_model_len: Option<usize>,
+        }
+        let identity: Identity = serde_json::from_value(raw.clone())?;
+        if let Some(fields) = raw.as_object_mut() {
+            fields.entry("object").or_insert(serde_json::json!("model"));
+            fields.entry("created").or_insert(serde_json::json!(0));
+            fields
+                .entry("owned_by")
+                .or_insert(serde_json::json!("self_hosted"));
+        }
+        Ok(Self {
+            owned_by: identity.owned_by,
+            id: identity.id,
+            root: identity.root,
+            max_model_len: identity.max_model_len,
+            model_object: serde_json::from_value(raw).ok(),
+        })
+    }
 }
 
 /// `/v1/models` response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ModelsResponse {
     pub data: Vec<ModelsResponseEntry>,
+}
+
+impl ModelsResponse {
+    fn record_model_objects(&self, labels: &mut HashMap<String, String>) {
+        let models: HashMap<_, _> = self
+            .data
+            .iter()
+            .filter_map(|entry| {
+                let model = entry.model_object.as_ref()?;
+                Some((model.id.clone(), model))
+            })
+            .collect();
+        if !models.is_empty() {
+            if let Ok(json) = serde_json::to_string(&models) {
+                labels.insert(MODEL_OBJECTS_LABEL.to_string(), json);
+            }
+        }
+    }
 }
 
 /// vLLM `/version` response.
@@ -315,6 +368,7 @@ async fn fetch_sglang_http_metadata_checked(
         .await
     {
         Ok(models) => {
+            models.record_model_objects(&mut labels);
             if let Some(m) = models.data.first() {
                 if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
                     labels
@@ -367,6 +421,7 @@ async fn fetch_vllm_http_metadata_checked(
         .await
     {
         Ok(models) => {
+            models.record_model_objects(&mut labels);
             if let Some(m) = models.data.first() {
                 if let Some(ref root) = m.root {
                     labels.insert("model_path".to_string(), root.clone());
@@ -971,6 +1026,79 @@ mod tests {
 
         let labels = flat_labels(&info);
         assert!(!labels.contains_key("max_running_requests"));
+    }
+
+    #[tokio::test]
+    async fn http_model_metadata_survives_discovery_and_card_refresh() {
+        use axum::{routing::get, Json, Router};
+        use openai_protocol::worker::WorkerSpec;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        use super::super::create_worker::{build_model_card, model_card_for_labels};
+
+        let expected = json!({
+            "id": "served-model", "object": "model", "created": 123,
+            "owned_by": "vllm", "root": "org/checkpoint", "parent": null,
+            "max_model_len": 32768,
+            "permission": [{"id": "permission-1", "allow_sampling": true}],
+            "future_field": {"nested": [false, null, 5]}
+        });
+        let body = json!({"object": "list", "data": [expected.clone()]});
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only server, aborted below")]
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::clients::http_client();
+        let url = format!("http://{addr}");
+        let vllm = fetch_vllm_http_metadata(&client, &url, None).await;
+        let sglang = fetch_sglang_http_metadata(&client, &url, None).await;
+        server.abort();
+
+        for labels in [vllm, sglang] {
+            let card = build_model_card(
+                "served-model",
+                &WorkerSpec::new(&url),
+                &labels,
+                &HashMap::new(),
+            );
+            assert_eq!(
+                serde_json::to_value(card.clone().into_model_object()).unwrap(),
+                expected
+            );
+            let other = build_model_card(
+                "other-model",
+                &WorkerSpec::new(&url),
+                &labels,
+                &HashMap::new(),
+            );
+            assert!(
+                other.upstream_model.is_none(),
+                "metadata must not cross model IDs"
+            );
+
+            let mut after = labels.clone();
+            let mut updated = expected.clone();
+            updated["max_model_len"] = json!(65536);
+            after.insert(
+                MODEL_OBJECTS_LABEL.into(),
+                json!({"served-model": updated}).to_string(),
+            );
+            after.insert("max_model_len".into(), "65536".into());
+            let (refreshed, changed) = model_card_for_labels(&card, &labels, &after);
+            assert!(changed.contains(&"upstream_model"));
+            assert_eq!(
+                serde_json::to_value(refreshed.into_model_object()).unwrap(),
+                updated
+            );
+        }
     }
 
     #[tokio::test]
