@@ -40,9 +40,9 @@ use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
-        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
-        WaveEvent,
+        kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
+        trtllm::TrtllmProtocol, vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput,
+        EngineProtocol, UtilityReply, WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -474,6 +474,11 @@ struct RoutingState {
     /// `select_engine` never mutates this map; its reservations live in
     /// `inflight`.
     load: HashMap<u32, EngineLoad>,
+    /// The KV-transfer samples each rank's connector reported since the last
+    /// [`Client::take_kv_transfer`], folded per engine index once a taker
+    /// asked for them ([`Client::keep_kv_transfer`]): the engine reports
+    /// them with its steps, the servicer logs them per interval.
+    kv_transfer: HashMap<u32, KvTransferStats>,
     /// This client's own unfinished request ids, per rank: a floor under the
     /// (possibly stale) reported load, so routing never trusts a snapshot that
     /// says an engine we just loaded is idle. Keyed by id rather than counted,
@@ -616,6 +621,11 @@ struct ClientInner<P: EngineProtocol> {
     /// step report): its silence is then the scheduler's own, not a prefill
     /// in progress. Read by [`Client::reports_steps`].
     steps_reported: AtomicBool,
+    /// A taker wants the KV-transfer samples the engines report
+    /// ([`Client::keep_kv_transfer`]). Until one does, the dispatcher folds
+    /// none, so a client nobody drains (the gateway's direct lane) keeps no
+    /// growing series. Read by the dispatcher on every batch.
+    kv_transfer_wanted: AtomicBool,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -669,7 +679,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                     });
                 }
                 let mut routing = self.routing.lock();
-                let RoutingState { load, inflight } = &mut *routing;
+                let RoutingState { load, inflight, .. } = &mut *routing;
                 let count = self.engines.len();
                 let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
                 let mut best: Option<(f64, usize)> = None;
@@ -1220,6 +1230,7 @@ impl<P: EngineProtocol> Client<P> {
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
+            kv_transfer_wanted: AtomicBool::new(false),
         });
 
         // The input monitor was opened when the frontend bound the input
@@ -1419,6 +1430,20 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call, by engine index in order, nothing for a rank that reported none:
+    /// the servicer takes them on its stats tick and logs them in the
+    /// engine's own words ([`KvTransferStats::summary`]).
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        let taken = std::mem::take(&mut self.inner.routing.lock().kv_transfer);
+        let mut reports: Vec<(u32, KvTransferStats)> = taken
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .collect();
+        reports.sort_unstable_by_key(|(engine_index, _)| *engine_index);
+        reports
+    }
+
     /// How long the engine has produced nothing while this client holds
     /// requests in flight on it that the engine reports on every step
     /// ([`EngineProtocol::reported_every_step`]): the time since its last
@@ -1462,6 +1487,15 @@ impl<P: EngineProtocol> Client<P> {
     /// client told nothing is classified by what its wire shows.
     pub fn note_reports_steps(&self) {
         self.inner.steps_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`]: the taker announces itself and drains on
+    /// its own interval (the servicer's stats tick). A client without a
+    /// taker folds nothing, whatever its engines report, so nothing grows
+    /// behind the routing lock of a client nobody drains.
+    pub fn keep_kv_transfer(&self) {
+        self.inner.kv_transfer_wanted.store(true, Ordering::Relaxed);
     }
 
     /// Prompt tokens of the requests the engine has accepted (their add
@@ -1833,8 +1867,21 @@ impl<P: EngineProtocol> Dispatcher<P> {
         {
             inner.steps_reported.store(true, Ordering::Relaxed);
         }
-        if let Some(load) = batch.load {
-            inner.routing.lock().load.insert(batch.engine_index, load);
+        let kv_transfer = batch
+            .kv_transfer
+            .filter(|_| inner.kv_transfer_wanted.load(Ordering::Relaxed));
+        if batch.load.is_some() || kv_transfer.is_some() {
+            let mut routing = inner.routing.lock();
+            if let Some(load) = batch.load {
+                routing.load.insert(batch.engine_index, load);
+            }
+            if let Some(transfers) = kv_transfer {
+                routing
+                    .kv_transfer
+                    .entry(batch.engine_index)
+                    .or_default()
+                    .merge(*transfers);
+            }
         }
         if let Some(event) = batch.wave {
             inner.observe_wave(event, batch.engine_index);
