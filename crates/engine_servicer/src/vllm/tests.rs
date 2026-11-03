@@ -1635,7 +1635,8 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 }
 
 /// Deferred requests survive the wire, adapter, gRPC poll and KV load record,
-/// remain rank-local, and disappear when the engine drains its queues.
+/// remain rank-local (the other rank's zero-filled entry stays zero), and
+/// disappear when the engine drains its queues.
 #[tokio::test]
 async fn remote_kv_waiting_load_is_reported_per_rank() {
     let mut model = model_info();
@@ -1673,13 +1674,24 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(loads.loads.len(), 1);
-        let load = &loads.loads[0];
-        assert_eq!(load.dp_rank, 1);
-        assert_eq!(load.num_waiting_reqs, expected_total);
+        assert_eq!(loads.loads.len(), 2, "one entry per rank: {loads:?}");
+        let by_rank = |rank: i32| {
+            loads
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == rank)
+                .unwrap_or_else(|| panic!("rank {rank}'s entry: {loads:?}"))
+        };
+        assert_eq!(by_rank(1).num_waiting_reqs, expected_total);
         let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
         assert_eq!(record.waiting_requests, expected_record_total);
-        assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+        // Rank 0 has not reported: its entry and record stay zero-filled,
+        // never rank 1's queue.
+        assert_eq!(by_rank(0).num_waiting_reqs, 0);
+        assert_eq!(
+            kv_events::LoadSource::load(&source, Some(0)).map(|record| record.waiting_requests),
+            Some(0)
+        );
     }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -1687,7 +1699,8 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the
-/// second's figures (or the second reading zero while it serves).
+/// second's figures (or the second reading zero while it serves), from the
+/// second's first step on: a zero-filled entry, not a missing one.
 #[tokio::test]
 async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     let mut model = model_info();
@@ -1728,10 +1741,43 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10, 11, 12, 13]
     );
-    // Rank 0 has not reported a scheduler step: a batch of its gets no
-    // record rather than rank 1's figures.
+    // Rank 0 has not reported a scheduler step: its entry, and the record a
+    // batch of its would carry, are zero-filled (an idle rank, not a gone
+    // one), never rank 1's figures.
+    wait_until(|| {
+        h.server
+            .state
+            .shared
+            .engine()
+            .is_ok_and(|client| client.get_loads().loads.len() == 1)
+    })
+    .await;
     let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    let idle = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's zero record");
+    assert_eq!(
+        (
+            idle.running_requests,
+            idle.cache_hit_rate,
+            idle.gen_throughput
+        ),
+        (0, Some(0.0), 0.0),
+        "{idle:?}"
+    );
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2, "{loads:?}");
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 1)]
+    );
     // Then rank 0 reports an idle step.
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {

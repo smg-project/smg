@@ -2046,6 +2046,98 @@ async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_comp
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Two connected schedulers, one of which has reported a load tail: the
+/// report lists both ranks, the silent one zero-filled (an idle scheduler,
+/// not a gone one), on the poll, on the rank a request names and on the
+/// record the records-only stream reads for it; a rank past the connected
+/// ones has none.
+#[tokio::test]
+async fn an_idle_rank_keeps_its_zero_entry_once_a_sibling_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_count = 2;
+    config.model.data_parallel_size = 2;
+    let server = TokenSpeedServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..default_ready_response()
+    };
+    let (rank0, rank1) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(0)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(1)),
+    );
+    let (mut rank0_in, mut rank0_out) = rank0.expect("rank 0 handshake").split();
+    let _rank1 = rank1.expect("rank 1 handshake");
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut rank0_in).await;
+    send(
+        &mut rank0_out,
+        &batch("r0", vec![10], 1, None, Some((2, 1, 10, 100))),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    wait_until(|| {
+        server
+            .state
+            .shared
+            .engine
+            .client
+            .get()
+            .is_some_and(|client| !client.get_loads().loads.is_empty())
+    })
+    .await;
+
+    let loads = client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 2, 1), (1, 0, 0)]
+    );
+    let idle = client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = kv_events::LoadFromState(Arc::downgrade(&server.state));
+    let record = kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    drop(stream);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Under attention data parallelism a disaggregated request goes to the
 /// rank of its room's residue, the engine's own dispatch rule on both sides
 /// (the decode receiver looks for the KV on the prefill rank of that

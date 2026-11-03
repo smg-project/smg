@@ -207,9 +207,10 @@ impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let response = info::loads(self).ok()?;
         let load = match dp_rank {
-            // A rank the report has no entry for (it has not reported a
-            // scheduler step while another rank has) gets no record rather
-            // than another rank's figures, as under the Python servicer.
+            // A connected rank reads its own entry (zero-filled until its
+            // first scheduler step, whichever rank reported first), never
+            // another rank's figures; a rank past the connected ones gets
+            // no record.
             Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
             None => response
                 .loads
