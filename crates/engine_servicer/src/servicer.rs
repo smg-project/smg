@@ -592,6 +592,10 @@ mod tests {
         fn engine_link(&self) -> &EngineLink {
             &self.0.engine
         }
+
+        fn rank_count(&self) -> usize {
+            1
+        }
     }
 
     /// Once the listener is bound, the start hands the wire's connect the

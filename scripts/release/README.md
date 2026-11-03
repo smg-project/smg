@@ -90,8 +90,13 @@ against the tag once the gate is green; `make release-publish-plan VERSION=<x.y.
 exact commands and the artifact names (the gateway image's `latest` moves only for a final; a
 crate publishes when its exact version is not on crates.io yet; a PyPI version that is complete,
 wheel and sdist, is skipped, and `-f packages=proto|servicer|both` on `release-grpc` names a
-package outright for a retry). The nightly prerelease and the CI images are unchanged by this
-process.
+package outright for a retry). A release candidate is never published to PyPI or crates.io:
+`release-pypi`, `release-crates` and `release-grpc` refuse a ref whose name carries `-rc.` (the
+job is skipped, and its first step says why when it is reached anyway),
+`make release-publish-plan VERSION=1.14.0-rc.1` leaves the three out and says so,
+`make release-check` reports the rule, and the candidate ships as its images, its chart, its Go
+module tag and its GitHub pre-release. The nightly prerelease and the CI images are unchanged by
+this process.
 
 ## The gate
 

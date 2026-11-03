@@ -571,7 +571,13 @@ it over its in-process engine with its health service holding NOT_SERVING
 meanwhile. Under data parallelism every
 rank is a scheduler of its own: the plan runs the staircase once per rank and
 every prefill shape on every rank at once, each request pinned to its rank
-(`data_parallel_rank`), so the log's step count is per rank.
+(`data_parallel_rank`), so the log's step count is per rank. The prefill side
+of a prefill/decode pair plans one request per rank (and the media step when
+the model has one) and nothing more (its decode steps run on its peer, and
+an engine release that gave no stand-in's slots back ran the side's pool dry
+under a ladder of them): the
+first forward and the transfer path are paid before SERVING, the length
+classes by the first request of each.
 
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:

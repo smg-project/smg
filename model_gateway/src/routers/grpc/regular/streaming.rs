@@ -1462,18 +1462,65 @@ impl StreamingProcessor {
     ///
     /// Writes `event: {type}\ndata: {json}\n\n` into `buffer`, avoiding per-event
     /// allocations by reusing the same buffer across multiple events.
+    ///
+    /// The `content_block_delta` frames of the four string deltas, the frames a
+    /// stream sends per token, are written in one pass: their constant text
+    /// (the event's tag, the `index` and `delta` keys, the delta's tag and its
+    /// one key) goes in as literals and serde writes only the index and the
+    /// delta's string, so a frame costs the escape of its text, not the walk of
+    /// two tagged enums. The bytes are those of the serialized event, which
+    /// `tests::messages_delta_frames_write_the_bytes_of_the_serialized_event`
+    /// pins; every other event, `citations_delta` included, is serialized whole.
     #[inline]
     pub(crate) fn format_messages_sse_into(
         buffer: &mut Vec<u8>,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
+        fn failed(e: serde_json::Error) -> String {
+            format!("Failed to serialize messages event: {e}")
+        }
         buffer.clear();
+        let string_delta: Option<(&u32, &'static [u8], &str)> = match event {
+            MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                ContentBlockDelta::TextDelta { text } => Some((
+                    index,
+                    b",\"delta\":{\"type\":\"text_delta\",\"text\":".as_slice(),
+                    text.as_str(),
+                )),
+                ContentBlockDelta::InputJsonDelta { partial_json } => Some((
+                    index,
+                    b",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":".as_slice(),
+                    partial_json.as_str(),
+                )),
+                ContentBlockDelta::ThinkingDelta { thinking } => Some((
+                    index,
+                    b",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":".as_slice(),
+                    thinking.as_str(),
+                )),
+                ContentBlockDelta::SignatureDelta { signature } => Some((
+                    index,
+                    b",\"delta\":{\"type\":\"signature_delta\",\"signature\":".as_slice(),
+                    signature.as_str(),
+                )),
+                ContentBlockDelta::CitationsDelta { .. } => None,
+            },
+            _ => None,
+        };
+        if let Some((index, delta_head, text)) = string_delta {
+            buffer.extend_from_slice(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+            );
+            serde_json::to_writer(&mut *buffer, index).map_err(failed)?;
+            buffer.extend_from_slice(delta_head);
+            serde_json::to_writer(&mut *buffer, text).map_err(failed)?;
+            buffer.extend_from_slice(b"}}\n\n");
+            return Ok(());
+        }
         let event_type = Self::message_event_type_name(event);
         buffer.extend_from_slice(b"event: ");
         buffer.extend_from_slice(event_type.as_bytes());
         buffer.extend_from_slice(b"\ndata: ");
-        serde_json::to_writer(&mut *buffer, event)
-            .map_err(|e| format!("Failed to serialize messages event: {e}"))?;
+        serde_json::to_writer(&mut *buffer, event).map_err(failed)?;
         buffer.extend_from_slice(b"\n\n");
         Ok(())
     }

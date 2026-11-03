@@ -207,11 +207,12 @@ async fn a_snapshot_chunk_over_the_default_decode_limit_is_decoded() {
     assert_eq!(stream.message().await.unwrap(), None);
 }
 
-/// The two subscribe methods differ in one thing: whether they ask the
-/// servicer for its load records before the publisher's first batch. The
-/// plain one leaves the field unset, for a caller that dedupes by sequence
-/// number alone; the other sets it, for a caller that skips `load_only`
-/// batches before any sequence check.
+/// The three subscribe methods differ in what they ask the servicer for.
+/// The plain one leaves the record field unset, for a caller that dedupes by
+/// sequence number alone; the second asks for the load records before the
+/// publisher's first batch, for a caller that skips `load_only` batches
+/// before any sequence check; the third asks for the records alone, from
+/// sequence 0, for a caller that keeps no KV index.
 #[tokio::test]
 async fn the_subscribe_methods_differ_in_the_records_they_ask_for() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -237,6 +238,7 @@ async fn the_subscribe_methods_differ_in_the_records_they_ask_for() {
         .subscribe_kv_events_with_load_records(5)
         .await
         .unwrap();
+    client.subscribe_load_records().await.unwrap();
     let requests = seen.lock().unwrap().clone();
     assert_eq!(
         requests,
@@ -244,10 +246,17 @@ async fn the_subscribe_methods_differ_in_the_records_they_ask_for() {
             common::SubscribeKvEventsRequest {
                 start_sequence_number: 3,
                 load_records_before_first_batch: false,
+                loads_only: false,
             },
             common::SubscribeKvEventsRequest {
                 start_sequence_number: 5,
                 load_records_before_first_batch: true,
+                loads_only: false,
+            },
+            common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: true,
+                loads_only: true,
             },
         ]
     );

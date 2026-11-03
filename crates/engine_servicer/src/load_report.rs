@@ -33,10 +33,19 @@ impl RankFigures {
     }
 }
 
-/// The ranks of a zero-filled report (no snapshot carried yet): `0..count`
-/// as the proto's rank numbers.
+/// The proto's rank numbers of the `count` ranks a servicer serves: `0..count`.
 pub(crate) fn rank_ids(count: usize) -> impl Iterator<Item = i32> {
     (0..count).map(|rank| i32::try_from(rank).unwrap_or(i32::MAX))
+}
+
+/// The ranks of `0..count` with no entry in `reported`: a connected scheduler
+/// before its first output batch (an idle one, whether or not a sibling rank
+/// has reported). A report gives each a zero-filled entry, as the Python
+/// servicer reports an idle scheduler, so it lists every connected rank from
+/// boot on and a records-only stream reads an idle rank as idle, never as
+/// gone, through its siblings' first batches.
+pub(crate) fn unreported_ranks(count: usize, reported: &[i32]) -> impl Iterator<Item = i32> + '_ {
+    rank_ids(count).filter(move |rank| !reported.contains(rank))
 }
 
 /// One rank's share of the aggregate: the fields of a reported rank the
@@ -129,6 +138,15 @@ mod tests {
     fn rank_ids_count_from_zero() {
         assert_eq!(rank_ids(3).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(rank_ids(0).count(), 0);
+    }
+
+    /// The ranks a report zero-fills are the connected ones without an
+    /// entry, whichever reported first; none past the count.
+    #[test]
+    fn the_unreported_ranks_are_the_connected_ones_without_an_entry() {
+        assert_eq!(unreported_ranks(3, &[]).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(unreported_ranks(3, &[1]).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(unreported_ranks(1, &[0, 7]).count(), 0);
     }
 
     /// The aggregate sums the ranks (saturating) and averages their usage;
