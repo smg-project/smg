@@ -302,3 +302,84 @@ fn finish_preserves_pending_decode_errors() {
         .expect_err("EOF decode error must propagate");
     assert!(error.to_string().contains("pending token decode failed"));
 }
+
+/// The one-pass `content_block_delta` frames write exactly the bytes of the
+/// serialized event, so the literal head can never drift from serde's walk of
+/// the two tagged enums: every string delta variant, several block indices and
+/// texts that need escaping go through both and compare; the citations delta
+/// and the other events keep the serialized whole.
+#[test]
+fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
+    fn serialized(event: &MessageStreamEvent) -> Vec<u8> {
+        let mut bytes = format!(
+            "event: {}\ndata: ",
+            StreamingProcessor::message_event_type_name(event)
+        )
+        .into_bytes();
+        serde_json::to_writer(&mut bytes, event).expect("the event serializes");
+        bytes.extend_from_slice(b"\n\n");
+        bytes
+    }
+    fn formatted(event: &MessageStreamEvent) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(64);
+        StreamingProcessor::format_messages_sse_into(&mut buffer, event)
+            .expect("the event formats");
+        buffer
+    }
+    let texts = [
+        "",
+        "Hello",
+        "say \"hi\"",
+        "back\\slash",
+        "tab\tnewline\ncarriage\r",
+        "\u{1f}control\u{7f}",
+        "caf\u{e9} \u{1f600} \u{2028}",
+        "{\"partial\": [1, 2",
+    ];
+    for index in [0u32, 1, 7, 1234, u32::MAX] {
+        for text in texts {
+            let deltas = [
+                ContentBlockDelta::TextDelta {
+                    text: text.to_string(),
+                },
+                ContentBlockDelta::InputJsonDelta {
+                    partial_json: text.to_string(),
+                },
+                ContentBlockDelta::ThinkingDelta {
+                    thinking: text.to_string(),
+                },
+                ContentBlockDelta::SignatureDelta {
+                    signature: text.to_string(),
+                },
+            ];
+            for delta in deltas {
+                let event = MessageStreamEvent::ContentBlockDelta { index, delta };
+                assert_eq!(
+                    formatted(&event),
+                    serialized(&event),
+                    "index {index}, text {text:?}"
+                );
+            }
+        }
+    }
+    let citation = MessageStreamEvent::ContentBlockDelta {
+        index: 2,
+        delta: ContentBlockDelta::CitationsDelta {
+            citation: messages::Citation::CharLocation(messages::CharLocationCitation {
+                cited_text: "cited".to_string(),
+                document_index: 0,
+                document_title: Some("title".to_string()),
+                start_char_index: 3,
+                end_char_index: 8,
+                file_id: None,
+            }),
+        },
+    };
+    assert_eq!(formatted(&citation), serialized(&citation));
+    let stop = MessageStreamEvent::ContentBlockStop { index: 3 };
+    assert_eq!(formatted(&stop), serialized(&stop));
+    assert_eq!(
+        formatted(&stop),
+        b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
+    );
+}
