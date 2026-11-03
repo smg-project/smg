@@ -54,7 +54,7 @@ mod glm;
 enum Renderer {
     Jinja,
     DeepseekV32,
-    DeepseekV4(deepseek_v4::EffortEncoding),
+    DeepseekV4,
     DeepseekV41(deepseek_v41::EffortTable),
     Glm53(glm53::Template),
 }
@@ -67,7 +67,7 @@ impl Renderer {
             // GLM keeps the active template's switchless thinking contract.
             Self::Jinja | Self::Glm53(_) => None,
             Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
-            Self::DeepseekV4(encoding) => Some(encoding.profile()),
+            Self::DeepseekV4 => Some(deepseek_v4::PROFILE),
             Self::DeepseekV41(_) => Some(deepseek_v41::PROFILE),
         }
     }
@@ -831,24 +831,29 @@ impl HuggingFaceTokenizer {
     ///
     /// `transformers` builds the tokenizer of a checkpoint whose
     /// `tokenizer_config.json` names `LlamaTokenizer` (or the `Fast`
-    /// spelling) and whose `config.json` says model type `llama` from the
-    /// file's vocabulary and merges with a pipeline of its own: no
-    /// normalizer, and a `Metaspace` pre-tokenizer whose prepend scheme the
-    /// configuration selects (`add_prefix_space: false`: the word marker is
-    /// prepended nowhere; `legacy: true`: before every split; otherwise at
-    /// the start of the text only). The serving engines load their
-    /// tokenizer through that class, so those are the ids a prompt gets. A
-    /// `tokenizer.json` converted the legacy way keeps instead a `Prepend`
-    /// normalizer, which puts the word marker before every split (after
-    /// every special token too) and into the pattern of every added token
-    /// matched after normalization, so that a marker such as `</think>` is
-    /// found only behind a space, and takes the space with it. For a file of
-    /// that legacy shape the loader installs the class's pipeline (no
-    /// normalizer, the `Metaspace` pre-tokenizer, and the class's decoder,
-    /// which strips the one leading space of the decoded text only where the
-    /// marker is prepended) over the file's vocabulary, added tokens and
-    /// post-processor; any other file, and any other model type (which
-    /// `transformers` reads as its file), stays as it is.
+    /// spelling) from the file's vocabulary and merges with a pipeline of
+    /// its own: no normalizer, and a `Metaspace` pre-tokenizer whose prepend
+    /// scheme the configuration selects (`add_prefix_space: false`: the word
+    /// marker is prepended nowhere; `legacy: true`: before every split;
+    /// otherwise at the start of the text only). The serving engines load
+    /// their tokenizer through that class, so those are the ids a prompt
+    /// gets. A `tokenizer.json` converted the legacy way keeps instead a
+    /// `Prepend` normalizer, which puts the word marker before every split
+    /// (after every special token too) and into the pattern of every added
+    /// token matched after normalization, so that a marker such as
+    /// `</think>` is found only behind a space, and takes the space with it.
+    /// For a file of that legacy shape the loader installs the class's
+    /// pipeline (no normalizer, the `Metaspace` pre-tokenizer, and the
+    /// class's decoder, which strips the one leading space of the decoded
+    /// text only where the marker is prepended) over the file's vocabulary,
+    /// added tokens and post-processor; any other file stays as it is.
+    ///
+    /// The class is read from `tokenizer_config.json`, as the reference reads
+    /// it, before any `config.json`: a checkpoint shipped as the tokenizer's
+    /// files alone, with no `config.json` or none that says a `model_type`,
+    /// is the class's. A `config.json` that names a model type other than
+    /// `llama` keeps the file (the reference reads several of those, `phi3`
+    /// and `llava` among them, as their file).
     fn llama_class_pipeline(
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
@@ -860,7 +865,10 @@ impl HuggingFaceTokenizer {
         ) {
             return;
         }
-        if dir.and_then(model_type_from_config).as_deref() != Some("llama") {
+        if dir
+            .and_then(model_type_from_config)
+            .is_some_and(|model_type| model_type != "llama")
+        {
             return;
         }
         if tokenizer.get_pre_tokenizer().is_some()
@@ -1809,7 +1817,7 @@ impl HuggingFaceTokenizer {
                 "the Jinja and GLM renderers render no marked prompt",
             )),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
-            Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
+            Renderer::DeepseekV4 => apply_deepseek_v4(messages, &params),
             Renderer::DeepseekV41(table) => apply_deepseek_v41(messages, &params, table),
         }
     }
@@ -1835,9 +1843,7 @@ impl HuggingFaceTokenizer {
         let mut marked = self.render_marked(messages, params)?;
         let generation_prompt = match self.renderer {
             Renderer::DeepseekV32 => !final_message_is_assistant(messages),
-            Renderer::DeepseekV4(_) | Renderer::DeepseekV41(_) => {
-                ends_with_generation_header(&marked)
-            }
+            Renderer::DeepseekV4 | Renderer::DeepseekV41(_) => ends_with_generation_header(&marked),
             // No marked prompt: `render_marked` refused above.
             Renderer::Jinja | Renderer::Glm53(_) => false,
         };
@@ -2129,30 +2135,10 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
             );
             return Renderer::Jinja;
         }
-        let encoding = detect_dsv4_effort_encoding(dir);
-        debug!(
-            ?path,
-            ?encoding,
-            "selected DeepseekV4 chat-template renderer"
-        );
-        return Renderer::DeepseekV4(encoding);
+        debug!(?path, "selected DeepseekV4 chat-template renderer");
+        return Renderer::DeepseekV4;
     }
     Renderer::Jinja
-}
-
-/// Pick the effort-prompt revision for a V4 checkpoint. `config.json`,
-/// `tokenizer_config.json` and `generation_config.json` do not tell the
-/// revisions apart (the DSpark checkpoints share the 0731 config with the
-/// original effort table), so the only discriminator is the shipped
-/// `encoding/encoding_dsv4.py`. Without it (a tokenizer directory streamed
-/// from a worker carries no `encoding/`), render the table the engine's own
-/// server renders: its port of the encoder carries the refreshed table for
-/// every V4 checkpoint.
-fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
-    match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
-        Ok(source) => deepseek_v4::EffortEncoding::detect_from_encoder_source(&source),
-        Err(_) => deepseek_v4::EffortEncoding::V0731,
-    }
 }
 
 /// Pick the effort table of a V4.1 checkpoint from its shipped
@@ -2172,10 +2158,15 @@ fn detect_dsv41_effort_table(dir: &Path) -> deepseek_v41::EffortTable {
 // ---------------------------------------------------------------------------
 /// Derive the V3.2 thinking mode. The native encoder bypasses
 /// `ChatTemplateState::apply`, so this is where the resolved thinking preference
-/// is consumed. An explicit `template_kwargs["thinking"]` wins; otherwise fall
-/// back to `params.thinking` (resolved from `reasoning_effort` / Anthropic
-/// `ThinkingConfig`) — same precedence as the Jinja path. Default off, matching
-/// the `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
+/// is consumed. An explicit `template_kwargs["thinking"]` wins, then the
+/// engine's `enable_thinking` alias; otherwise fall back to `params.thinking`
+/// (resolved from `reasoning_effort` / Anthropic `ThinkingConfig`) — same
+/// precedence as the Jinja path and as the gateway's parser arming. The
+/// engine's tokenizer wrapper ORs the two keys; `thinking` wins here when both
+/// are present, as it does in the parser arming and in the V4 shim, so the
+/// prompt and the parser agree (a contradictory pair renders chat mode here
+/// where the engine would think). Default off, matching the
+/// `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
 fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMode {
     if explicit_thinking(params).unwrap_or(false) {
         deepseek_v32::ThinkingMode::Thinking
@@ -2184,20 +2175,19 @@ fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMo
     }
 }
 
-/// Explicit thinking preference: `template_kwargs["thinking"]` wins, else
+/// Explicit thinking preference: the `thinking` kwarg, else its
+/// `enable_thinking` alias ([`explicit_thinking_kwarg`]), else
 /// `params.thinking`.
 fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
-    params
-        .template_kwargs
-        .and_then(|k| k.get("thinking"))
-        .and_then(serde_json::Value::as_bool)
-        .or(params.thinking)
+    explicit_thinking_kwarg(params).or(params.thinking)
 }
 
 /// Per DeepSeek's encoding README, preserve all reasoning when a system
 /// message declares `tools`; otherwise drop earlier reasoning. (A developer
-/// message is a system message by the time the shims read the list, see
-/// [`developer_messages_as_system_first`].)
+/// message is a system message by the time the V4 shims read the list, see
+/// [`developer_messages_as_system_first`]; the V3.2 shim reads the list with
+/// the developer role as written, and a request's tools ride on the system
+/// message [`inject_tools_into_messages`] attaches them to.)
 fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
     !messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("system")
@@ -2206,12 +2196,14 @@ fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
                 .is_some_and(|arr| !arr.is_empty())
     })
 }
-/// The messages as the engine's renderer hands them to its tokenizer wrapper:
-/// the developer messages rewritten as system ones and merged
-/// ([`crate::chat_template::developer_messages_as_system`]) BEFORE the wrapper
-/// attaches the request's tools to a system message, so the attached tools
-/// survive the merge. The native encoders repeat the rewrite at their own
-/// entry for direct callers; after this it finds nothing to do.
+/// The messages as the engine's V4 and V4.1 renderers hand them to their
+/// tokenizer wrapper: the developer messages rewritten as system ones and
+/// merged ([`crate::chat_template::developer_messages_as_system`]) BEFORE the
+/// wrapper attaches the request's tools to a system message, so the attached
+/// tools survive the merge. Those encoders repeat the rewrite at their own
+/// entry for direct callers; after this it finds nothing to do. The V3.2
+/// renderer hands its encoder the developer role as written, so the V3.2
+/// shim never calls this.
 fn developer_messages_as_system_first(
     messages: &[serde_json::Value],
 ) -> std::borrow::Cow<'_, [serde_json::Value]> {
@@ -2252,9 +2244,13 @@ fn apply_deepseek_v32(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
-    let messages = developer_messages_as_system_first(messages);
-    let owned = inject_tools_into_messages(&messages, params.tools);
-    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(&messages);
+    // A developer message reaches the encoder as written, as the engine's
+    // renderer hands it to its tokenizer wrapper (no developer-to-system
+    // rewrite on this path): the encoder renders it as a user turn under a
+    // heading. The request's tools ride on the system message the wrapper
+    // step attaches them to.
+    let owned = inject_tools_into_messages(messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
     let thinking_mode = derive_thinking_mode(params);
     let encode_params = deepseek_v32::EncodeParams {
         add_default_bos_token: true,
@@ -2263,10 +2259,11 @@ fn apply_deepseek_v32(
     deepseek_v32::render_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V3.2 encode failed: {e}")))
 }
-/// V4's explicit thinking toggle: `template_kwargs["thinking"]`, else the engine's
-/// `enable_thinking` alias (the gateway reads the two keys in the same order
-/// when it arms the reasoning parser, see `renderer_capabilities`).
-fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
+/// The V3.2 and V4 shims' explicit thinking toggle: `template_kwargs["thinking"]`,
+/// else the engine's `enable_thinking` alias (the gateway reads the two keys
+/// in the same order when it arms the reasoning parser, see
+/// `renderer_capabilities`).
+fn explicit_thinking_kwarg(params: &ChatTemplateParams) -> Option<bool> {
     let kwargs = params.template_kwargs?;
     kwargs
         .get("thinking")
@@ -2297,7 +2294,9 @@ fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
 /// `reasoning_effort` maps as the engine maps it: `max` is the top level, `low`,
 /// `minimal` and `medium` the bottom one (which renders no prefix), every
 /// other string and an absent value `high`. Which text a level renders is
-/// the detected revision's table (see `detect_dsv4_effort_encoding`).
+/// the table the engine's copy of the encoder carries for every V4
+/// checkpoint, whatever the checkpoint's own `encoding/encoding_dsv4.py`
+/// says: the engine never reads it, so neither does this renderer.
 ///
 /// Deliberate divergence from the engine's Python renderer: there `reasoning_effort: "none"`
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
@@ -2307,7 +2306,6 @@ fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
 fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
-    effort_encoding: deepseek_v4::EffortEncoding,
 ) -> Result<String> {
     let messages = developer_messages_as_system_first(messages);
     let owned = inject_tools_into_messages(&messages, params.tools);
@@ -2323,7 +2321,7 @@ fn apply_deepseek_v4(
         Some("low" | "minimal" | "medium") => (Some(true), Some(deepseek_v4::ReasoningEffort::Low)),
         Some(_) => (Some(true), Some(deepseek_v4::ReasoningEffort::High)),
     };
-    let thinking_on = explicit_thinking_v4(params)
+    let thinking_on = explicit_thinking_kwarg(params)
         .or(effort_mode)
         .or(params.thinking)
         .unwrap_or(true);
@@ -2339,7 +2337,6 @@ fn apply_deepseek_v4(
         add_default_bos_token: true,
         drop_thinking: resolve_drop_thinking(msgs),
         reasoning_effort,
-        effort_encoding,
     };
     deepseek_v4::render_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V4 encode failed: {e}")))
@@ -3034,6 +3031,71 @@ mod tests {
         assert_eq!(ids_of(&tokenizer, " a<|im_end|> b"), [6, 7, 4, 6, 8]);
     }
 
+    /// A byte-fallback fixture vocabulary as a legacy conversion writes it:
+    /// the `Prepend` + `Replace` normalizer, no pre-tokenizer, the template
+    /// post-processor, and the pieces of the text `> <s> </s> <|` under the
+    /// ids a 32k byte-fallback vocabulary gives them, so that the ids below
+    /// are the reference's on that text.
+    const BYTE_FALLBACK_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "▁"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}]},
+        "pre_tokenizer": null,
+        "post_processor": {"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "<s>", "type_id": 1}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}}},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"}, {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]},
+        "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false,
+            "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "▁▁": 259, "▁<": 529, "▁>": 1405, "▁": 29871,
+                "<": 29966, ">": 29958, "|": 29989},
+            "merges": ["▁ <", "▁ ▁", "▁ >"]}
+    }"#;
+
+    /// The reference picks the class from `tokenizer_config.json` before it
+    /// reads any `config.json`, so a checkpoint shipped as the tokenizer's
+    /// files alone is the class's too: after a special token spelled in the
+    /// text, the class prepends no word marker where the file's normalizer
+    /// prepends one (the file: `[1405, 29871, 1, 259, 2, 29871, 529, 29989]`,
+    /// one id more). A `config.json` that says no model type reads the same.
+    #[test]
+    fn a_llama_class_checkpoint_shipped_without_config_json_encodes_as_its_class() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("tokenizer.json");
+        fs::write(&path, BYTE_FALLBACK_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({
+                "tokenizer_class": "LlamaTokenizer", "legacy": false, "bos_token": "<s>",
+                "eos_token": "</s>", "unk_token": "<unk>", "clean_up_tokenization_spaces": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let text = "> <s> </s> <|";
+        let class = [1405, 29871, 1, 29871, 2, 529, 29989];
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+        assert_eq!(ids_of(&tokenizer, text), class);
+
+        fs::write(
+            temp.path().join("config.json"),
+            json!({"architectures": ["LlamaForCausalLM"]}).to_string(),
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(ids_of(&tokenizer, text), class);
+    }
+
     #[test]
     fn response_template_is_retained_from_tokenizer_config() {
         let temp = TempDir::new().unwrap();
@@ -3086,7 +3148,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             detect_renderer_from_config(temp.path(), false),
-            Renderer::DeepseekV4(_)
+            Renderer::DeepseekV4
         ));
         assert!(matches!(
             detect_renderer_from_config(temp.path(), true),
@@ -3370,6 +3432,54 @@ mod tests {
             ThinkingMode::Chat
         ));
     }
+
+    /// The engine's tokenizer wrapper switches V3.2 thinking on from the
+    /// `thinking` kwarg or its `enable_thinking` alias; the shim reads the
+    /// alias too, and the alias, like the key, outranks the projected
+    /// `params.thinking`. Deliberate divergence from the engine's wrapper,
+    /// which ORs the two keys: `thinking` wins here when both are present,
+    /// the order the gateway arms the reasoning parser in (as in the V4
+    /// shim), so a contradictory pair renders chat mode here where the
+    /// engine would think, and the prompt and the parser agree. (That the
+    /// profile declares the alias is checked through the detected renderer
+    /// in the render tests.)
+    #[test]
+    fn derive_thinking_mode_reads_the_enable_thinking_alias() {
+        let alias = |value: bool| {
+            HashMap::from([(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(value),
+            )])
+        };
+        let on = alias(true);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                template_kwargs: Some(&on),
+                ..Default::default()
+            }),
+            ThinkingMode::Thinking
+        ));
+        let off = alias(false);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(true),
+                template_kwargs: Some(&off),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
+        let both = HashMap::from([
+            ("thinking".to_string(), serde_json::Value::Bool(false)),
+            ("enable_thinking".to_string(), serde_json::Value::Bool(true)),
+        ]);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                template_kwargs: Some(&both),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
+    }
 }
 
 /// Prompts rendered by segments: the renderer's control tokens are the
@@ -3444,7 +3554,7 @@ mod segment_tests {
     /// The same vocabulary served by the V4 renderer.
     fn v4_like(added: &[&str]) -> HuggingFaceTokenizer {
         let mut wrapped = v41_like(added);
-        wrapped.renderer = Renderer::DeepseekV4(deepseek_v4::EffortEncoding::Original);
+        wrapped.renderer = Renderer::DeepseekV4;
         wrapped.profile = wrapped.renderer.profile();
         wrapped
     }
@@ -3457,10 +3567,13 @@ mod segment_tests {
         wrapped
     }
 
-    /// The engine rewrites a developer message as the system message BEFORE
-    /// its tokenizer wrapper attaches the request's tools, so a request with
-    /// both keeps its tools block; the shims keep that order and render the
-    /// request as its system-message twin.
+    /// The V4 and V4.1 engine renderers rewrite a developer message as the
+    /// system message BEFORE their tokenizer wrapper attaches the request's
+    /// tools, so a request with both keeps its tools block; the shims keep
+    /// that order and render the request as its system-message twin. The
+    /// V3.2 renderer hands the developer role to its encoder as written: the
+    /// tools ride on the system message the wrapper step inserts and the
+    /// developer message is the encoder's user turn under its heading.
     #[test]
     fn a_developer_message_with_request_tools_keeps_the_tools_block_on_the_gateway_path() {
         let tools = [
@@ -3476,12 +3589,12 @@ mod segment_tests {
             json!({"role": "system", "content": "Follow the policy."}),
             json!({"role": "user", "content": "Question?"}),
         ];
-        for tok in [v32_like(&ADDED), v4_like(&ADDED), v41_like(&ADDED)] {
-            let params = || ChatTemplateParams {
-                add_generation_prompt: true,
-                tools: Some(&tools),
-                ..Default::default()
-            };
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        for tok in [v4_like(&ADDED), v41_like(&ADDED)] {
             let rendered = tok
                 .apply_chat_template_with_encoding(&developer, params(), None)
                 .expect("the renderer renders the conversation");
@@ -3496,6 +3609,25 @@ mod segment_tests {
                 rendered.text
             );
         }
+        let rendered = v32_like(&ADDED)
+            .apply_chat_template_with_encoding(&developer, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered
+                .text
+                .starts_with("<｜begin▁of▁sentence｜>\n\n## Tools")
+                && rendered.text.contains("lookup_weather"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.ends_with(
+                "<｜User｜>\n\n# The user's message is: Follow the policy.<｜Assistant｜></think>\
+                 <｜User｜>Question?<｜Assistant｜></think>"
+            ),
+            "{}",
+            rendered.text
+        );
     }
 
     fn chat_params() -> ChatTemplateParams<'static> {

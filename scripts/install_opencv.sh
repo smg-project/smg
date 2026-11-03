@@ -50,9 +50,14 @@ install_apt() {
   local sudo=""
   has_cmd sudo && sudo="sudo"
   export DEBIAN_FRONTEND=noninteractive
-  # Keep this list in sync with .github/workflows/pr-test-rust.yml.
-  run $sudo apt-get update
-  run $sudo apt-get install -y --no-install-recommends \
+  local retry=()
+  if [[ "${CI:-}" == "true" ]]; then
+    run bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_update.sh" $sudo
+    retry=(bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10)
+  else
+    run $sudo apt-get update
+  fi
+  run "${retry[@]}" $sudo apt-get install -y --no-install-recommends \
     clang \
     libclang-dev \
     cmake \

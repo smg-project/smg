@@ -12,20 +12,29 @@ OPENAPI_GENERATOR_CLI_VERSION := 2.30.0
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 JOBS ?= $(shell echo $$(($(NPROC) > 16 ? 16 : $(NPROC))))
 
-# Check if sccache is available and set RUSTC_WRAPPER accordingly
+# Check if sccache is available and set RUSTC_WRAPPER accordingly. The note is printed for the goals that compile (the
+# ones that build with cargo or maturin): the help, version and release targets print output that is read as such, and
+# the note would come first in it; a goal that cleans, formats or sets up a tool has no compilation for it to precede.
 SCCACHE := $(shell which sccache 2>/dev/null)
 ifdef SCCACHE
     export RUSTC_WRAPPER := $(SCCACHE)
-    $(info Using sccache for compilation caching)
-else
-    $(info sccache not found. Install it for faster builds: cargo install sccache)
+endif
+COMPILING_GOALS := $(filter build test docs check dev-setup pre-commit python-dev python-build python-build-release \
+    python-install python-check dev install generate-%,$(MAKECMDGOALS))
+ifneq ($(strip $(COMPILING_GOALS)),)
+    ifdef SCCACHE
+        $(info Using sccache for compilation caching)
+    else
+        $(info sccache not found. Install it for faster builds: cargo install sccache)
+    endif
 endif
 
 .PHONY: help build test clean docs check fmt opencv-deps dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
+        perf-build perf-base perf-bed perf-cpu perf-alloc perf-mem perf-live perf-report \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
         generate-openapi generate-python-types generate-java-types generate-clients \
         show-version bump-version check-versions \
-        release-cut release-bump release-pick release-pick-pr release-status release-tag release-notes release-bump-main release-publish-plan release-check
+        release-plan release-cut release-bump release-pick release-pick-pr release-status release-tag release-notes release-bump-main release-publish-plan release-check
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -232,7 +241,10 @@ check-versions: ## Check workspace crate versions against latest tag (usage: mak
 # Release process (scripts/release/README.md): release branches cut from main, moved by pull requests
 RELEASE_TOOL := scripts/release/release.sh
 
-release-cut: ## Cut release/<x.y> from FROM (default origin/main) and bump it to VERSION (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
+release-plan: ## Before a cut: the bump the next cut writes against TAG (default: the highest final release tag), quietly; nothing is changed (usage: make release-plan [TAG=v1.13.0] [VERSION=1.14.0-rc.1]; VERSION defaults to the first candidate of main's development version)
+	@VERSION_OVERRIDE="$(VERSION)" python3 scripts/check_release_versions.py --plan $(TAG)
+
+release-cut: ## Cut release/<x.y> from FROM (default origin/main), bump it to VERSION, and open the pull request that moves main to the next development version (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) cut "$(VERSION)" $(FROM)
 
 release-bump: ## Bump an existing release branch to VERSION through a pull request (usage: make release-bump VERSION=1.14.0-rc.2 [PUSH=0])
@@ -241,8 +253,8 @@ release-bump: ## Bump an existing release branch to VERSION through a pull reque
 release-pick: ## Cherry-pick SHA (comma-separated) from main onto release/RELEASE through a pull request (usage: make release-pick RELEASE=1.14 SHA=<sha>[,<sha>] [PUSH=0])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick "$(RELEASE)" "$(SHA)"
 
-release-pick-pr: ## After a resolved pick conflict: push the pick branch and open its pull request (usage: make release-pick-pr RELEASE=1.14)
-	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick-pr "$(RELEASE)"
+release-pick-pr: ## After a resolved pick conflict: push the pick branch (the current one, or PICK=<branch> checked out first) and open its pull request (usage: make release-pick-pr RELEASE=1.14 [PICK=pick/1.14-<sha>])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick-pr "$(RELEASE)" $(PICK)
 
 release-status: ## What is on main and not on release/RELEASE, its own commits, tags and open pull requests (usage: make release-status RELEASE=1.14)
 	@$(RELEASE_TOOL) status "$(RELEASE)"
@@ -253,7 +265,7 @@ release-tag: ## Check the versions at release/<x.y>'s head and tag it vVERSION (
 release-notes: ## The release notes skeleton for VERSION on stdout (usage: make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md)
 	@$(RELEASE_TOOL) notes "$(VERSION)" $(SINCE)
 
-release-bump-main: ## After a final: a pull request that moves main's version files to vVERSION's (usage: make release-bump-main VERSION=1.14.0 [PUSH=0])
+release-bump-main: ## After a final: a pull request that moves main's crates and packages to at least vVERSION's; the gateway keeps its development version (usage: make release-bump-main VERSION=1.14.0 [PUSH=0])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) bump-main "$(VERSION)"
 
 release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatches to run against the tag and the artifacts they produce; prints, runs nothing (usage: make release-publish-plan VERSION=1.14.0)
@@ -261,3 +273,58 @@ release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatc
 
 release-check: ## The release gate for vVERSION: what the repository can read (versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) (usage: make release-check VERSION=1.14.0-rc.1)
 	@$(RELEASE_TOOL) check "$(VERSION)"
+
+# Gateway perf bed (crates/gateway_perf, the `gateway-perf` binary): the gateway's cost per
+# request on a CPU mock bed, base against head. PERF_OUT is the run root (one stamp per make
+# invocation; each target writes under it: PERF_OUT/perf-cpu, PERF_OUT/perf-alloc, ...); the
+# cell targets (perf-cpu, perf-alloc, perf-mem) take PERF_PATHS, PERF_REQUESTS, PERF_REPEATS and
+# PERF_GATES; PERF_ARGS holds extra driver flags valid for the target's mode (the cell targets
+# take the cell flags such as "--rate-scale 0.5", perf-bed and perf-live the bed flags only,
+# such as "--gw-cores 0-7"); TOKENIZER selects a tokenizer directory (default: a synthetic one).
+PERF := target/release/gateway-perf
+ifeq ($(origin PERF_OUT),undefined)
+PERF_OUT := target/gateway-perf/$(shell date -u +%Y%m%dT%H%M%SZ)
+endif
+PERF_HEAD ?= target/gateway-perf/head/smg
+PERF_BASE ?= target/gateway-perf/base/smg
+PERF_BASE_REV ?= origin/main
+PERF_BASE_TARGET ?= target/gateway-perf/base-target
+PERF_PATHS ?= chat,stream,tools,json,messages
+PERF_REQUESTS ?= 10000
+PERF_REPEATS ?= 3
+PERF_MEM_PATHS ?= stream
+PERF_MEM_REQUESTS ?= 5000
+PERF_ARGS ?=
+PERF_GATES ?=
+PERF_COMMON = --head $(PERF_HEAD) --out $(PERF_OUT)/$@ $(PERF_ARGS)
+PERF_GATE_FLAG = $(if $(PERF_GATES),--gates $(PERF_GATES),)
+PERF_CELLS = --base $(PERF_BASE) --paths $(PERF_PATHS) --requests $(PERF_REQUESTS) --repeats $(PERF_REPEATS) $(PERF_GATE_FLAG)
+
+perf-build: ## Release binaries of the perf bed: the gateway alone (one cargo line, the same as perf-base), then the mock engine, the load client and the driver; the gateway copied under target/gateway-perf/head
+	@cargo build --release -p smg --bin smg
+	@mkdir -p target/gateway-perf/head && cp target/release/smg target/gateway-perf/head/smg
+	@cargo build --release -p mock-worker --bin mock-worker --bin stress_load
+	@cargo build --release -p gateway-perf
+	@git rev-parse HEAD > target/gateway-perf/head/commit 2>/dev/null || true
+
+perf-base: perf-build ## The base revision's gateway for an A/B (usage: make perf-base [PERF_BASE_REV=origin/main]); its own target directory, so a full release build
+	@$(PERF) base $(PERF_BASE_REV) $(PERF_BASE) --target $(PERF_BASE_TARGET)
+
+perf-bed: perf-build ## Bring the bed up (the gateway + mock engines), one request per path with the answer shown and the script counts, bed down
+	@$(PERF) bed smoke $(PERF_COMMON) --paths $(PERF_PATHS)
+
+perf-cpu: perf-build ## Instructions, cycles and CPU time per request, base vs head, interleaved repeats (needs perf-base)
+	@$(PERF) cpu $(PERF_COMMON) $(PERF_CELLS)
+
+perf-alloc: perf-build ## Allocation calls and KiB requested per request (jemalloc exit statistics), base vs head (needs perf-base)
+	@$(PERF) alloc $(PERF_COMMON) $(PERF_CELLS)
+
+perf-mem: perf-build ## RSS over windows on one gateway, growth per 10k requests, the peak after a burst, base vs head (needs perf-base; PERF_MEM_PATHS, default stream)
+	@$(PERF) mem $(PERF_COMMON) --base $(PERF_BASE) --paths $(PERF_MEM_PATHS) --requests $(PERF_MEM_REQUESTS) $(PERF_GATE_FLAG)
+
+perf-live: perf-build ## An open-loop ramp with the capacity rule (the head; the base too when its binary exists)
+	@$(PERF) live $(PERF_COMMON) $(if $(wildcard $(PERF_BASE)),--base $(PERF_BASE),)
+
+perf-report: ## The Numbers table and the gate verdicts of a run (usage: make perf-report PERF_OUT=target/gateway-perf/<stamp>/perf-cpu [PERF_GATES=<toml>])
+	@case "$(origin PERF_OUT)" in command\ line|environment) ;; *) echo "perf-report: name the run: make perf-report PERF_OUT=target/gateway-perf/<stamp>/perf-cpu" >&2; exit 2 ;; esac
+	@$(PERF) report --out $(PERF_OUT) $(PERF_GATE_FLAG)

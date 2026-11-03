@@ -1,6 +1,6 @@
 //! Test support of the regular stages: the shared components of a gateway
-//! with `--parser symphony` and no parser names, and a builder client on a
-//! mock engine.
+//! with no parser names (with `--parser symphony` and no worker, or over given
+//! registries and parser), and a builder client on a mock engine.
 
 use std::sync::Arc;
 
@@ -25,21 +25,35 @@ use crate::{
     worker::WorkerRegistry,
 };
 
-/// The gateway with `--parser symphony`, no parser names and no worker.
-pub(crate) fn components() -> Arc<SharedComponents> {
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+/// The gateway's shared components over `tokenizer_registry` and `worker_registry`,
+/// reading with `parser`: no parser names, no multimodal components, the tokenizer
+/// autoload on.
+pub(crate) fn components_over(
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    worker_registry: Arc<WorkerRegistry>,
+    parser: ParserChoice,
+) -> Arc<SharedComponents> {
     Arc::new(SharedComponents {
         templates: Arc::new(Templates::new(Arc::clone(&tokenizer_registry))),
         tokenizer_registry,
-        worker_registry: Arc::new(WorkerRegistry::new()),
+        worker_registry,
         tool_parser_factory: ToolParserFactory::default(),
         reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: ParserResolver::disabled(),
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Symphony,
+        parser,
     })
+}
+
+/// The gateway with `--parser symphony`, no parser names and no worker.
+pub(crate) fn components() -> Arc<SharedComponents> {
+    components_over(
+        Arc::new(TokenizerRegistry::new()),
+        Arc::new(WorkerRegistry::new()),
+        ParserChoice::Symphony,
+    )
 }
 
 /// A builder client connected to a mock engine serving `model_id`, with the
