@@ -1251,8 +1251,10 @@ async fn a_ranks_start_wave_request_wakes_the_whole_group() {
 }
 
 /// A drain notification is bookkeeping, not a wake: `wave_complete` folds
-/// into the clock but must NOT restart the group, or the ranks would never
-/// stay parked and an idle group would spin.
+/// into the clock but must NOT restart the group while no prompt the group
+/// was handed is unanswered, or the ranks would never stay parked and an
+/// idle group would spin. (With such a prompt pending it is the drain
+/// racing a submit, and the group is woken once more: the next test.)
 #[tokio::test]
 async fn wave_complete_updates_the_clock_without_waking() {
     let (client, mut engines, _ns) = connect_ranks(2, true).await;
@@ -1358,6 +1360,90 @@ async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_agai
             .is_err(),
         "a drained wave with nothing pending woke the group"
     );
+
+    // A later prompt is owed its own re-wake: the bound is per prompt, not
+    // per group.
+    let _second = client.submit(request_for("req-2", 1)).await.unwrap();
+    match engines[1].recv().await.unwrap() {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, "req-2"),
+        other => panic!("rank 1 expected the Add, got {other:?}"),
+    }
+    let second = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, second);
+    for rank in 0..2u32 {
+        engines[rank as usize]
+            .send_output(wave_control(rank, DpControlMessage::WaveComplete(second)))
+            .await
+            .unwrap();
+    }
+    let rewoken = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
+        .await
+        .expect("the group was not woken again for the second prompt");
+    assert!(rewoken > second);
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
+            .await
+            .expect("rank 1 was not woken again for the second prompt"),
+        rewoken
+    );
+}
+
+/// The re-wake is bounded, once per handed prompt, so the silence watchdog
+/// stays the last resort: a prompt the holder never schedules (an add the
+/// engine dropped while every rank stays healthy and answers each wake with
+/// a drain) buys one extra round, after which the group stays parked and the
+/// client declares the engine dead at the window, as it did before the
+/// re-wake existed. Unbounded, every drain would wake the group again and
+/// every report of the round would reset the watchdog, for good.
+#[tokio::test]
+async fn a_prompt_the_holder_never_schedules_is_rewoken_once_and_then_given_up_on() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let window = Duration::from_millis(600);
+    client.set_silence_death_timeout(window);
+
+    // Each rank answers every wake with a drain report at that wave and
+    // never schedules the add: the engine that dropped it.
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let mut responders = Vec::new();
+    for rank in (0..2u32).rev() {
+        let mut engine = engines.remove(rank as usize);
+        let wakes = wakes.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a responder ends with its engine's socket and is aborted at the end of the test"
+        )]
+        let responder = tokio::spawn(async move {
+            while let Ok(inbound) = engine.recv().await {
+                if let EngineInbound::StartDpWave { wave, .. } = inbound {
+                    wakes.fetch_add(1, Ordering::SeqCst);
+                    engine
+                        .send_output(wave_control(rank, DpControlMessage::WaveComplete(wave)))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        responders.push(responder);
+    }
+
+    let started = std::time::Instant::now();
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    let error = tokio::time::timeout(window * 3, stream.next())
+        .await
+        .expect("the group cycled waves past three windows: the re-wake is unbounded")
+        .expect("the stream ends with an error, not cleanly")
+        .expect_err("a prompt the holder never schedules cannot be answered");
+    assert!(
+        matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead)),
+        "{error:?}"
+    );
+    assert!(started.elapsed() >= window, "given up on before the window");
+    assert!(!client.is_alive());
+    // The submit's wake and one re-wake, on each of the two ranks.
+    assert_eq!(wakes.load(Ordering::SeqCst), 4);
+    for responder in responders {
+        responder.abort();
+    }
 }
 
 /// Independent ranks keep no wave clock, so a stray wave notification (a

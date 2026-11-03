@@ -138,6 +138,11 @@ struct InFlight<O> {
     prompt_tokens: u64,
     handed: bool,
     started: bool,
+    /// A lockstep group that drained while this prompt was still unanswered
+    /// was woken again on its behalf ([`RequestRegistry::rewake_due`]): once
+    /// per prompt, so a prompt the holder never schedules ends by the
+    /// silence watchdog instead of cycling waves.
+    rewoken: bool,
     every_step: bool,
 }
 
@@ -205,6 +210,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 prompt_tokens,
                 handed: false,
                 started: false,
+                rewoken: false,
                 every_step,
             },
         );
@@ -365,13 +371,21 @@ impl<O: EngineOutput> RequestRegistry<O> {
         self.prefill_pending
     }
 
-    /// Whether a prompt the engine was handed is still unanswered: a request
-    /// whose add frame the engine accepted and whose first output has not
-    /// come.
-    fn awaits_first_output(&self) -> bool {
-        self.requests
-            .values()
-            .any(|entry| entry.handed && !entry.started)
+    /// Whether a prompt the engine was handed is still unanswered and has not
+    /// had the drain re-wake yet: a request whose add frame the engine
+    /// accepted, whose first output has not come, and on whose behalf no
+    /// wake went out after a drain. Every such prompt is marked as woken
+    /// here, so one wake covers them all and a prompt never answered buys
+    /// one re-wake and no more.
+    fn rewake_due(&mut self) -> bool {
+        let mut due = false;
+        for entry in self.requests.values_mut() {
+            if entry.handed && !entry.started && !entry.rewoken {
+                entry.rewoken = true;
+                due = true;
+            }
+        }
+        due
     }
 
     /// How long the engine may take to prefill `tokens` at the allowed rate
@@ -1056,9 +1070,15 @@ impl<P: EngineProtocol> ClientInner<P> {
                 // wakes its peers again, and the silence watchdog ends the
                 // group. So the group is woken once more, at a fresh wave.
                 // Every rank reports the drain: the report that moves the
-                // clock wakes, the rest find it moved. Nothing pending,
-                // nothing sent: an idle group stays parked.
-                if advanced && self.registry.lock().awaits_first_output() {
+                // clock wakes, the rest find it moved. Once per prompt: a
+                // prompt the holder never schedules (an add the engine
+                // dropped while staying alive) buys one extra round, then
+                // the group stays parked and the silence watchdog ends it as
+                // it did before; every frame of the round would otherwise
+                // reset the watchdog and the group would cycle waves for
+                // good. Nothing pending, nothing sent: an idle group stays
+                // parked.
+                if advanced && self.registry.lock().rewake_due() {
                     self.queue_wake(wave, "a prompt pending through a drained wave");
                 }
             }
