@@ -422,3 +422,84 @@ def test_collection_finish_checks_actual_paths_and_declared_minimum(monkeypatch)
     with pytest.raises(ValueError, match="outside"):
         reporter.pytest_collection_finish(session)
     assert hooks._SelectionReporter is type(reporter)
+
+
+@pytest.mark.parametrize(
+    "entry,profile,mode,base",
+    [
+        ("local", "vllm-zmq-dp2-chat", "zmq", 301),
+        ("class", "vllm-zmq-dp2-chat", "zmq", 301),
+        ("pooled", "vllm-zmq-dp2-chat", "zmq", 301),
+        ("local", "vllm-4gpu-chat", "http", 61),
+        ("class", "vllm-4gpu-chat", "http", 61),
+    ],
+)
+def test_gateway_contract_rejection_precedes_model_ports_and_worker_acquisition(
+    monkeypatch, entry, profile, mode, base
+):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, profile)
+    model = _ZMQ_DP2_MODELS[0] if mode == "zmq" else "openai/gpt-oss-120b"
+    events = []
+
+    def forbidden(*args, **kwargs):
+        events.append("preparation")
+        pytest.fail("invalid gateway contract reached model/port/worker preparation")
+
+    monkeypatch.delenv(setup.ENV_SKIP_BACKEND_SETUP, raising=False)
+    monkeypatch.setattr(setup, "get_model_spec", forbidden)
+    monkeypatch.setattr(worker_module, "get_model_spec", forbidden)
+    monkeypatch.setattr(worker_module, "get_engine_port", forbidden)
+    monkeypatch.setattr(setup, "_start_workers_tracked", forbidden)
+    monkeypatch.setattr(setup, "get_pool", lambda: SimpleNamespace(acquire_zmq=forbidden))
+    monkeypatch.setattr(setup, "get_runtime", lambda: "vllm")
+    config = {**setup._GW_DEFAULTS, "timeout": base}
+    node = SimpleNamespace(stash={})
+    if entry == "local":
+        generator = setup._setup_local(
+            model,
+            "model-path",
+            "vllm",
+            setup.ConnectionMode(mode),
+            {},
+            config,
+            SimpleNamespace(shutdown=forbidden),
+            "vllm",
+            None,
+        )
+    elif entry == "pooled":
+        generator = setup._setup_pooled_zmq(
+            node, model, "model-path", "vllm", {}, config, "vllm", None
+        )
+    else:
+        monkeypatch.setattr(setup, "resolve_class_marker", lambda *args: None)
+        monkeypatch.setattr(setup, "model_id_for_engine", lambda *args: model)
+        monkeypatch.setattr(setup, "get_marker_kwargs", lambda *args, **kwargs: config)
+        request = SimpleNamespace(param="http", node=node)
+        generator = setup.setup_backend.__wrapped__(request)
+    with pytest.raises(ValueError, match="exceeds frozen wait"):
+        next(generator)
+    assert events == []
+
+
+@pytest.mark.parametrize("changed", [None, "", " ", "vllm-4gpu-chat", "unsupported-profile"])
+def test_real_gateway_rejects_cleared_or_changed_pinned_profile_before_model(monkeypatch, changed):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    if changed is None:
+        monkeypatch.delenv("E2E_STARTUP_PROFILE")
+    else:
+        monkeypatch.setenv("E2E_STARTUP_PROFILE", changed)
+    events = []
+
+    def forbidden(*args, **kwargs):
+        events.append("model lookup")
+        pytest.fail("changed profile reached the ordinary model timeout")
+
+    monkeypatch.setattr(setup, "get_model_spec", forbidden)
+    monkeypatch.setattr(worker_module, "get_model_spec", forbidden)
+    with pytest.raises(
+        ValueError, match="context changed|validated pytest|declared startup profile"
+    ):
+        setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, _ZMQ_DP2_MODELS[0], 60)
+    assert events == []

@@ -162,22 +162,24 @@ def _gateway_readiness_timeout(
     bound and rejects a larger gateway timeout; non-ZMQ profiles retain their
     separate short gateway wait.
     """
-    profile = get_startup_profile() if os.environ.get(ENV_STARTUP_PROFILE, "").strip() else None
+    profile = get_startup_profile()
     if profile is not None:
         definition = startup_profile_definition()
         if connection_mode not in definition.modes:
             raise ValueError(f"{profile} does not permit gateway wire {connection_mode!r}")
-        bound = (
-            worker_startup_timeout(model_id)
-            if connection_mode == ConnectionMode.ZMQ
-            else definition.max_floor
-        )
+        if connection_mode == ConnectionMode.ZMQ:
+            model_contract = definition.models.get(model_id)
+            if model_contract is None:
+                raise ValueError(f"{profile} has no frozen startup contract for {model_id!r}")
+            bound = model_contract[0]
+        else:
+            bound = definition.max_floor
         if base_timeout > bound:
             raise ValueError(
                 f"{profile} gateway timeout {base_timeout!r} exceeds frozen wait {bound}"
             )
         if connection_mode == ConnectionMode.ZMQ:
-            return bound
+            return worker_startup_timeout(model_id)
         return effective_startup_timeout(base_timeout)
     if connection_mode != ConnectionMode.ZMQ:
         return effective_startup_timeout(base_timeout)
@@ -332,6 +334,8 @@ def setup_backend(request: pytest.FixtureRequest):
         connection_mode = mode_override
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
+    if get_startup_profile() is not None:
+        _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
     if is_pd and pool_counts is not None:
@@ -511,6 +515,12 @@ def _setup_local(
     num_workers = workers_config.get("count") or 1
     logger.info("Starting %s backend: model=%s, workers=%d", backend_name, model_id, num_workers)
 
+    # ZMQ loads inside gateway readiness. Check the bound before acquiring
+    # uncached workers so a rejection cannot strand them outside teardown.
+    gateway_config = {
+        **gateway_config,
+        "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
+    }
     workers = _start_workers_tracked(
         model_id=model_id,
         engine=engine,
@@ -525,12 +535,6 @@ def _setup_local(
     # caller owns their teardown (like the PD path). gRPC/HTTP workers stay
     # in the pool and outlive the gateway.
     is_zmq = connection_mode == ConnectionMode.ZMQ
-    # ZMQ engines load the model inside the gateway's readiness gate (the worker
-    # spawn returned immediately), so that gate must cover model load.
-    gateway_config = {
-        **gateway_config,
-        "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
-    }
     # The class's workers, cached or not, for the answers a test states on
     # the mock engine.
     set_class_workers(workers)
@@ -944,6 +948,7 @@ def backend_router(request: pytest.FixtureRequest):
         connection_mode = mode_override
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
+    gateway_timeout = _gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT)
     model_path = get_model_spec(model_id)["model"]
     is_zmq = connection_mode == ConnectionMode.ZMQ
 
@@ -964,7 +969,7 @@ def backend_router(request: pytest.FixtureRequest):
             model_path=model_path,
             backend=engine if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
-            timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
+            timeout=gateway_timeout,
         )
         yield gateway
     finally:
