@@ -22,6 +22,7 @@ The render checks need the ``helm`` binary and are skipped without it.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ from smg.router_args import RouterArgs
 REPO = Path(__file__).resolve().parents[3]
 CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
+SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
 # The gateway's Consul provider, which reads Consul's own variables.
 CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
@@ -834,6 +836,27 @@ def test_chart_workers_without_discovery_are_passed_as_worker_urls():
 def test_every_example_renders_arguments_the_launcher_parses(example):
     _, documents = render(files=(example,))
     launcher_args(router_container(documents)["args"])
+
+
+@needs_helm
+@pytest.mark.parametrize("value", [-1, 0, 4096])
+def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
+    """``router.maxConcurrentRequests`` is passed through as the launcher's
+    ``--max-concurrent-requests``, sentinels included: the gateway reads -1 as
+    the host-derived bound and 0 as no bound."""
+    _, documents = render(f"router.maxConcurrentRequests={value}")
+    assert launcher_args(router_container(documents)["args"]).max_concurrent_requests == value
+
+
+@needs_chart
+def test_the_schema_says_what_the_concurrency_sentinels_do():
+    """The schema describes the key with the gateway's rule for -1 and 0,
+    where the values comment used to say -1 meant unlimited."""
+    schema = json.loads(SCHEMA.read_text())
+    router = schema["properties"]["router"]["properties"]
+    description = router["maxConcurrentRequests"]["description"]
+    assert "-1 derives the bound from the host" in description, description
+    assert "0 lifts the bound" in description, description
 
 
 @needs_helm

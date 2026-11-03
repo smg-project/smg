@@ -70,6 +70,10 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 `cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
 
+### Admission Bound
+
+`router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
+
 ### Workers
 
 Each entry in `workers[]` creates a Deployment + Service:
