@@ -4,9 +4,9 @@
 //! in-memory backend. The gRPC router's typed routes reserve once per
 //! logical request in the ingress stage (`RateLimitReserveStage`), and each
 //! iteration of a gRPC Responses request reserves on its own; the regular
-//! HTTP router's typed routes reserve once per logical request before
-//! dispatch (`routers/http/tenant_rate_limit.rs`). The HTTP PD router is
-//! not wired to the manager.
+//! and the disaggregated HTTP routers' typed routes and the external
+//! routers' gateway side reserve once per logical request before dispatch
+//! (`routers/http/tenant_rate_limit.rs`).
 
 mod backend;
 mod bucket;

@@ -71,14 +71,13 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
-            rate_limit_cell::RateLimitCell,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
+                is_request_timeout, is_retryable_response, is_retryable_status,
                 request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, SseRechunker},
@@ -98,7 +97,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge},
+            tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
@@ -571,31 +570,24 @@ impl Router {
 
     /// Reserve the tenant's estimate once per logical request, before any
     /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation
-    /// (with the request's samples per prompt, for the resolve) or the
-    /// denial, which is the request's answer, never retried; `(None, None)`
-    /// for a request outside the limiter.
+    /// the rate limiter on and a tenant to charge, either the reservation or
+    /// the denial, which is the request's answer, never retried; `(None,
+    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`).
     async fn reserve_tenant_estimate<T: TenantCharge>(
         &self,
         tenant_meta: Option<&TenantRequestMeta>,
         typed_req: &T,
         model_id: &str,
         routing_text: Option<&str>,
-    ) -> (Option<(RateLimitCell, u32)>, Option<Response>) {
-        match (&self.rate_limit_manager, tenant_meta) {
-            (Some(manager), Some(tenant_meta)) => {
-                let cell = RateLimitCell::new();
-                let estimate = typed_req.estimated_input_tokens(routing_text);
-                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
-                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
-                    Err(mut denied) => {
-                        mark_non_retryable(&mut denied);
-                        (None, Some(denied))
-                    }
-                }
-            }
-            _ => (None, None),
-        }
+    ) -> (Option<TenantReservation>, Option<Response>) {
+        tenant_rate_limit::reserve(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            typed_req,
+            model_id,
+            routing_text,
+        )
+        .await
     }
 
     /// The one dispatch of a request with retries disabled: the lease frees
@@ -669,25 +661,19 @@ impl Router {
     /// estimate. An answer outside the limiter passes through.
     async fn resolve_tenant_reservation(
         &self,
-        reservation: Option<&(RateLimitCell, u32)>,
+        reservation: Option<&TenantReservation>,
         route: &'static str,
         is_stream: bool,
         response: Response,
     ) -> Response {
-        match reservation {
-            Some((cell, samples_per_prompt)) => {
-                tenant_rate_limit::resolve(
-                    cell,
-                    route,
-                    *samples_per_prompt,
-                    is_stream,
-                    response,
-                    self.max_payload_size,
-                )
-                .await
-            }
-            None => response,
-        }
+        tenant_rate_limit::resolve(
+            reservation,
+            route,
+            is_stream,
+            response,
+            self.max_payload_size,
+        )
+        .await
     }
 
     /// One attempt of a typed request as a sequence of named stages: the

@@ -59,7 +59,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
-    config::{RetryConfig, RouterConfig},
+    config::{PolicyConfig, RetryConfig, RouterConfig},
     middleware::TenantRequestMeta,
     rate_limit::{
         RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
@@ -75,10 +75,10 @@ use uuid::Uuid;
 use crate::common;
 
 /// Two words: the reserve-time estimate is `ceil(2 * 1.3)` tokens.
-const PROMPT_TEXT: &str = "Hello world";
-const ESTIMATED_INPUT_TOKENS: u32 = 3;
+pub(super) const PROMPT_TEXT: &str = "Hello world";
+pub(super) const ESTIMATED_INPUT_TOKENS: u32 = 3;
 const TEN_WORDS: &str = "one two three four five six seven eight nine ten";
-const MODEL: &str = "tenant-rl-http-test-model";
+pub(super) const MODEL: &str = "tenant-rl-http-test-model";
 
 // ---------------------------------------------------------------------------
 // The mock worker.
@@ -97,22 +97,22 @@ struct WorkerState {
 }
 
 /// A mock HTTP worker serving every route the tests call; stopped on drop.
-struct MockWorker {
-    url: String,
+pub(super) struct MockWorker {
+    pub(super) url: String,
     state: WorkerState,
     task: JoinHandle<()>,
 }
 
 impl MockWorker {
-    fn answer(&self, body: Value) {
+    pub(super) fn answer(&self, body: Value) {
         *self.state.body.lock() = body;
     }
 
-    fn fail_next(&self, requests: usize) {
+    pub(super) fn fail_next(&self, requests: usize) {
         self.state.failures.store(requests, Ordering::SeqCst);
     }
 
-    fn requests(&self) -> usize {
+    pub(super) fn requests(&self) -> usize {
         self.state.requests.load(Ordering::SeqCst)
     }
 }
@@ -152,7 +152,7 @@ async fn answer(State(state): State<WorkerState>, body: Bytes) -> Response {
     clippy::disallowed_methods,
     reason = "the mock worker's task is aborted by the owning MockWorker on drop"
 )]
-async fn mock_worker() -> MockWorker {
+pub(super) async fn mock_worker() -> MockWorker {
     let state = WorkerState::default();
     let app = [
         "/generate",
@@ -183,7 +183,7 @@ async fn mock_worker() -> MockWorker {
 /// A backend that admits every reservation and records every call made to
 /// it: what was reserved, settled, closed unsettled and abandoned.
 #[derive(Default)]
-struct RecordingBackend {
+pub(super) struct RecordingBackend {
     reserves: Mutex<Vec<ReserveRequest>>,
     settlements: Mutex<Vec<UsageSettlement>>,
     closes: AtomicUsize,
@@ -191,7 +191,7 @@ struct RecordingBackend {
 }
 
 impl RecordingBackend {
-    fn estimates(&self) -> Vec<u32> {
+    pub(super) fn estimates(&self) -> Vec<u32> {
         self.reserves
             .lock()
             .iter()
@@ -199,21 +199,30 @@ impl RecordingBackend {
             .collect()
     }
 
-    fn settlements(&self) -> Vec<UsageSettlement> {
+    /// The model each reservation was keyed by.
+    pub(super) fn models(&self) -> Vec<Option<String>> {
+        self.reserves
+            .lock()
+            .iter()
+            .map(|request| request.model_id.clone())
+            .collect()
+    }
+
+    pub(super) fn settlements(&self) -> Vec<UsageSettlement> {
         self.settlements.lock().clone()
     }
 
-    fn closes(&self) -> usize {
+    pub(super) fn closes(&self) -> usize {
         self.closes.load(Ordering::SeqCst)
     }
 
-    fn abandons(&self) -> usize {
+    pub(super) fn abandons(&self) -> usize {
         self.abandons.load(Ordering::SeqCst)
     }
 
     /// Wait for `n` abandons: a dropped body's abandon runs on a task of
     /// its own.
-    async fn await_abandons(&self, n: usize) {
+    pub(super) async fn await_abandons(&self, n: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while self.abandons() < n {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -245,25 +254,36 @@ impl RateLimitBackend for RecordingBackend {
 }
 
 /// How the router under test limits its tenants.
-enum Limiter {
+pub(super) enum Limiter {
     Off,
     /// The in-memory backend under a policy of this many tokens per minute,
     /// and more requests per minute than any test makes.
     Tokens(u32),
+    /// The in-memory backend under a default policy of 1,000 tokens per
+    /// minute and a rule of this many for the one model named exactly.
+    ModelRule(&'static str, u32),
     Recording(Arc<RecordingBackend>),
 }
 
-/// The context of a router over `worker`, its retries on or off (on, they
-/// back off for a millisecond), and the tempdir of its policy YAML (kept
-/// for the test's duration).
-async fn context(
+/// The context of a router under `limiter`, its retries on or off (on, they
+/// back off for a millisecond), routing at random, with no worker yet, and
+/// the tempdir of its policy YAML (kept for the test's duration).
+pub(super) async fn limited_context(
     limiter: Limiter,
-    worker: &MockWorker,
     retries: bool,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    limited_context_with_policy(limiter, retries, PolicyConfig::Random).await
+}
+
+/// [`limited_context`] routing by `policy`.
+pub(super) async fn limited_context_with_policy(
+    limiter: Limiter,
+    retries: bool,
+    policy: PolicyConfig,
 ) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
     let mut builder = RouterConfig::builder()
         .regular_mode(vec![])
-        .random_policy()
+        .policy(policy)
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(1024 * 1024)
@@ -276,17 +296,23 @@ async fn context(
             backoff_multiplier: 1.0,
             jitter_factor: 0.0,
         });
-    let dir = if let Limiter::Tokens(tokens_per_minute) = limiter {
+    let yaml = match &limiter {
+        Limiter::Tokens(tokens_per_minute) => Some(format!(
+            "default_policy:\n  tokens_per_minute: {tokens_per_minute}\n  \
+             requests_per_minute: 1000\n"
+        )),
+        Limiter::ModelRule(model, tokens_per_minute) => Some(format!(
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 1000\n  \
+             model_rules:\n    - rule_id: the-model\n      \
+             matcher: {{type: exact, value: {model}}}\n      \
+             tokens_per_minute: {tokens_per_minute}\n      requests_per_minute: 1000\n"
+        )),
+        Limiter::Off | Limiter::Recording(_) => None,
+    };
+    let dir = if let Some(yaml) = yaml {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            format!(
-                "default_policy:\n  tokens_per_minute: {tokens_per_minute}\n  \
-                 requests_per_minute: 1000\n"
-            ),
-        )
-        .unwrap();
+        std::fs::write(&path, yaml).unwrap();
         builder = builder
             .tenant_rate_limit_enabled(true)
             .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()));
@@ -306,8 +332,20 @@ async fn context(
             )
             .await
         }
-        Limiter::Off | Limiter::Tokens(_) => common::create_test_context(config).await,
+        Limiter::Off | Limiter::Tokens(_) | Limiter::ModelRule(..) => {
+            common::create_test_context(config).await
+        }
     };
+    (ctx, dir)
+}
+
+/// [`limited_context`] with `worker` registered as its one regular worker.
+pub(super) async fn context(
+    limiter: Limiter,
+    worker: &MockWorker,
+    retries: bool,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    let (ctx, dir) = limited_context(limiter, retries).await;
     ctx.worker_registry
         .register(Arc::new(
             BasicWorkerBuilder::new(&worker.url)
@@ -323,7 +361,7 @@ async fn context(
 }
 
 /// The regular HTTP router over `worker` (see [`context`]).
-async fn router(
+pub(super) async fn router(
     limiter: Limiter,
     worker: &MockWorker,
     retries: bool,
@@ -332,11 +370,11 @@ async fn router(
     (HttpRouter::new(&ctx).await.unwrap(), dir)
 }
 
-fn tenant() -> TenantRequestMeta {
+pub(super) fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("integration-test-tenant"))
 }
 
-async fn body_of(response: Response) -> String {
+pub(super) async fn body_of(response: Response) -> String {
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
@@ -347,7 +385,7 @@ async fn body_of(response: Response) -> String {
 
 /// An endpoint the HTTP router reserves on.
 #[derive(Clone, Copy, Debug)]
-enum Endpoint {
+pub(super) enum Endpoint {
     Generate,
     Chat,
     Completion,
@@ -359,7 +397,7 @@ enum Endpoint {
 
 impl Endpoint {
     /// The endpoints that stream when asked.
-    const STREAMING: [Self; 5] = [
+    pub(super) const STREAMING: [Self; 5] = [
         Self::Generate,
         Self::Chat,
         Self::Completion,
@@ -368,7 +406,7 @@ impl Endpoint {
     ];
 
     /// One request of [`PROMPT_TEXT`] through `router`, streamed or not.
-    async fn call(self, router: &HttpRouter, stream: bool) -> Response {
+    pub(super) async fn call(self, router: &dyn RouterTrait, stream: bool) -> Response {
         let tenant = tenant();
         match self {
             Self::Generate => {
@@ -425,7 +463,7 @@ impl Endpoint {
     /// `input` and `output` tokens in the endpoint's own shape. Embeddings
     /// and classify generate nothing and report no `output`, as OpenAI's
     /// embeddings usage has no `completion_tokens`.
-    fn usage_body(self, input: u32, output: u32) -> Value {
+    pub(super) fn usage_body(self, input: u32, output: u32) -> Value {
         match self {
             Self::Generate => json!({
                 "text": "hi",
@@ -448,7 +486,7 @@ impl Endpoint {
     }
 
     /// What [`Self::usage_body`] settles.
-    fn settlement(self, input: u32, output: u32) -> UsageSettlement {
+    pub(super) fn settlement(self, input: u32, output: u32) -> UsageSettlement {
         match self {
             Self::Embeddings | Self::Classify => usage(input, 0),
             _ => usage(input, output),
@@ -456,11 +494,11 @@ impl Endpoint {
     }
 }
 
-fn request<T: serde::de::DeserializeOwned>(body: Value) -> T {
+pub(super) fn request<T: serde::de::DeserializeOwned>(body: Value) -> T {
     serde_json::from_value(body).unwrap()
 }
 
-fn usage(input: u32, output: u32) -> UsageSettlement {
+pub(super) fn usage(input: u32, output: u32) -> UsageSettlement {
     UsageSettlement {
         actual_input_tokens: input,
         completion_tokens: output,
