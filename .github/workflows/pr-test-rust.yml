@@ -1490,8 +1490,10 @@ jobs:
       gpu_tier: "1"
       # Reference-lane limits; AMD timings remain unqualified.
       # Keep this lane off until the full suite passes within these limits.
-      timeout: 46
-      test_timeout: 40
+      # One startup pass (40 min) plus the prior test-step allowance (40 min).
+      # Planning budget only; measure AMD duration before enabling this lane.
+      timeout: 86
+      test_timeout: 80
       test_dirs: "e2e_test/chat_completions"
       min_selected: 202
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
@@ -1640,13 +1642,10 @@ jobs:
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
-  # Initial local Responses API coverage on AMD, intentionally partial.
-  # The positive pytest paths below target local Responses behavior.
-  # Parametrized collection and current runtime qualification are separate.
-  # This is not the full SGLang Responses row or original38 index22 acceptance.
-  # Keep the full NVIDIA/CPU/vendor/Oracle/MCP lanes above and below unchanged.
-  # Default OFF. Review the exact caller/callee combination and shared-host
-  # admission before setting this flag; ordinary PRs need their own opt-in too.
+  # Partial local Responses tests for vLLM on AMD, selected by the paths below.
+  # The full SGLang e2e-1gpu-responses job remains separate and unchanged.
+  # Off unless SMG_RUN_AMD_RESPONSES_CORE is true; PRs also need SMG_RUN_AMD_ON_PRS.
+  # Validate collected cases and shared-runner admission before enabling it.
   e2e-1gpu-responses-memory-core-amd:
     name: e2e-1gpu-responses-memory-core-amd (vllm; partial local core)
     needs: [build-wheel, detect-changes]
@@ -1666,9 +1665,8 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
       timeout: 32
       test_timeout: 24
-      # Literal node IDs reject unknown class/method paths rather than silently
-      # accepting a substring match. Keep the full original row's92 floor intact;
-      # this separate partial lane rejects empty selection but claims no collected count.
+      # Missing classes/methods fail collection; this floor rejects empty selection.
+      # The full e2e-1gpu-responses job retains its min_selected: 92 floor.
       test_dirs: >-
         e2e_test/responses/test_background.py::TestBackgroundResponsesGptOss
         e2e_test/responses/test_sampling_params.py::TestSamplingParamsHarmony
@@ -1832,8 +1830,10 @@ jobs:
       gpu_tier: "4"
       # Reference-lane limits; AMD timings remain unqualified.
       # Keep this lane off until the full suite passes within these limits.
-      timeout: 30
-      test_timeout: 25
+      # One startup pass (30 min) plus the prior test-step allowance (25 min).
+      # Planning budget only; measure AMD duration before enabling this lane.
+      timeout: 60
+      test_timeout: 55
       startup_profile: "vllm-4gpu-chat"
       test_dirs: "e2e_test/chat_completions"
       min_selected: 32

@@ -284,7 +284,8 @@ def reap_strict(
     owner_uid = os.getuid() if uid is None else uid
     entry = f"{MARKER_ENV}={marker}".encode()
     term_deadline = clock() + grace
-    deadline = term_deadline + 2.0
+    deadline = term_deadline + 20.0
+    max_scans = max(2, math.ceil((grace + 20.0) / POLL_SECS) + 2)
     handles: dict[int, tuple[OwnedProcess, int]] = {}
     seen: dict[int, int] = {}
     sent: set[tuple[int, int, int]] = set()
@@ -308,7 +309,7 @@ def reap_strict(
     try:
         protected = _strict_ancestors(proc_root, me)
         quiet = 0
-        for _ in range(64):
+        for _ in range(max_scans):
             if _strict_ancestors(proc_root, me) != protected:
                 raise ValueError("cleanup process ancestor chain changed")
             observed: list[OwnedProcess] = []

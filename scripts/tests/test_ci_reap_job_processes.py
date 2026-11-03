@@ -517,3 +517,44 @@ def test_strict_same_uid_unmarked_unreadable_process_holds_without_signal(
     assert denied == [str(unreadable)]
     assert runtime.sent == [] and runtime.opened == {} and runtime.closed == set()
     assert any("PermissionError" in line and str(unreadable) in line for line in lines)
+
+
+def test_strict_allows_owned_exit_fifteen_seconds_after_kill(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    killed_at = {}
+
+    def on_signal(pid, sig):
+        if sig == signal.SIGKILL:
+            killed_at[pid] = runtime.now
+
+    def on_sleep():
+        for pid, killed in list(killed_at.items()):
+            if runtime.now - killed >= 15.0:
+                runtime.remove(pid)
+
+    runtime.on_signal = on_signal
+    runtime.on_sleep = on_sleep
+    assert runtime.run(mod, grace=10.0)
+    assert 25.0 <= runtime.now < 30.0
+    assert runtime.closed == set(runtime.opened)
+    assert all(runtime.sent.count((pid, signal.SIGKILL)) == 1 for pid in (100, 101))
+
+
+def test_strict_survivor_after_twenty_second_kill_wait_still_fails(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    runtime.on_signal = lambda pid, sig: None
+    assert not runtime.run(mod, grace=10.0)
+    assert 30.0 <= runtime.now <= 30.001
+    assert runtime.closed == set(runtime.opened)
+    assert all(runtime.sent.count((pid, signal.SIGKILL)) == 1 for pid in (100, 101))
+
+
+def test_strict_stalled_clock_still_stops_without_unverified_success(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    runtime.on_signal = lambda pid, sig: None
+    sleeps = []
+    assert not runtime.run(mod, grace=10.0, sleep=sleeps.append)
+    assert 0 < len(sleeps) <= 200
+    assert runtime.now == 0.0
+    assert not any(sig == signal.SIGKILL for _pid, sig in runtime.sent)
+    assert runtime.closed == set(runtime.opened)

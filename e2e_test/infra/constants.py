@@ -560,7 +560,7 @@ def get_startup_profile() -> str | None:
     global _STARTUP_PROFILE_CONTEXT
     declaration = _startup_profile_declaration()
     if declaration is None:
-        context = ("",)
+        context: tuple[str, ...] = ("",)
         profile = None
     else:
         profile, spec = declaration

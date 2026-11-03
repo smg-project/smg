@@ -1281,6 +1281,8 @@ def validate_startup_profile_worker(
     if type(count) is not int or count != 1:
         raise ValueError(f"{profile} requires exactly one worker group")
     definition = startup_profile_definition()
+    if definition is None:
+        raise ValueError(f"{profile} has no startup profile definition")
     expected_mode = mode in definition.modes
     if (
         (engine or get_runtime()) != "vllm"

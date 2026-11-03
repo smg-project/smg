@@ -4,6 +4,7 @@ floor on startup waits."""
 import ast
 import importlib
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -503,3 +504,46 @@ def test_real_gateway_rejects_cleared_or_changed_pinned_profile_before_model(mon
     ):
         setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, _ZMQ_DP2_MODELS[0], 60)
     assert events == []
+
+
+def test_profile_ci_budgets_include_startups_and_prior_test_allowance():
+    from infra.constants import _STARTUP_PROFILES
+
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/pr-test-rust.yml"
+    jobs = dict(
+        re.findall(
+            r"^  ([a-z0-9_-]+):\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
+            workflow.read_text(),
+            re.M | re.S,
+        )
+    )
+    for profile, job, test_allowance, job_gap in [
+        ("vllm-zmq-dp2-chat", "e2e-2gpu-chat-zmq-dp-vllm-amd", 40, 6),
+        ("vllm-4gpu-chat", "e2e-4gpu-chat-vllm-amd", 25, 5),
+    ]:
+        startup_seconds = sum(
+            bound for bound, _tp in _STARTUP_PROFILES[profile].models.values()
+        )
+        step_match = re.search(r"^      test_timeout: (\d+)$", jobs[job], re.M)
+        job_match = re.search(r"^      timeout: (\d+)$", jobs[job], re.M)
+        assert step_match is not None and job_match is not None
+        step_minutes = int(step_match.group(1))
+        job_minutes = int(job_match.group(1))
+        assert step_minutes >= (startup_seconds + 59) // 60 + test_allowance
+        assert job_minutes >= step_minutes + job_gap
+
+
+def test_absent_profile_definition_rejects_before_model_lookup(monkeypatch):
+    from infra.constants import ConnectionMode
+
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    monkeypatch.setattr(worker_module, "startup_profile_definition", lambda: None)
+
+    def forbidden_lookup(model_id):
+        pytest.fail("model lookup must follow profile-definition validation")
+
+    monkeypatch.setattr(worker_module, "get_model_spec", forbidden_lookup)
+    with pytest.raises(ValueError, match="no startup profile definition"):
+        worker_module.validate_startup_profile_worker(
+            _ZMQ_DP2_MODELS[0], engine="vllm", mode=ConnectionMode.ZMQ
+        )
