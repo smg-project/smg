@@ -3528,6 +3528,7 @@ impl CacheAwarePolicy {
             result.matched_token_count.saturating_sub(marker_len),
             result.input_token_count.saturating_sub(marker_len),
             result.reuse_age_secs,
+            selected_idx.is_some(),
         );
 
         let idx = selected_idx?;
@@ -3558,16 +3559,19 @@ impl CacheAwarePolicy {
     /// the prefix's holders, and the selected worker is one of those holders.
     /// The tree reads the age from the selected worker's own stamp, and has
     /// none for a worker without the prefix. A shorter match (a few chars of a
-    /// common opening in the string tree) or a spill to a worker without the
-    /// prefix says nothing about how far back the cache reaches.
+    /// common opening in the string tree), a spill to a worker without the
+    /// prefix, or a declined selection (whose result still carries the
+    /// resolved holder's age) says nothing about how far back the cache
+    /// reaches.
     fn record_tree_reuse_age(
         &self,
         tree: &'static str,
         matched: usize,
         input: usize,
         reuse_age_secs: Option<u64>,
+        selected: bool,
     ) {
-        let Some(age) = reuse_age_secs else {
+        let (Some(age), true) = (reuse_age_secs, selected) else {
             return;
         };
         if input > 0 && matched as f32 / input as f32 > self.config.cache_threshold {
@@ -3638,6 +3642,7 @@ impl CacheAwarePolicy {
             result.matched_char_count.saturating_sub(marker_len),
             result.input_char_count.saturating_sub(marker_len),
             result.reuse_age_secs,
+            selected_idx.is_some(),
         );
 
         let idx = selected_idx?;

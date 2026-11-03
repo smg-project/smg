@@ -3664,6 +3664,23 @@ fn spill_to_a_non_holder_records_no_reuse_age() {
     );
 }
 
+/// A declined selection reuses nothing, though its match result still
+/// carries the resolved holder's age.
+#[test]
+fn declined_selection_records_no_reuse_age() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        policy.record_tree_reuse_age("token", 32, 32, Some(30), false);
+    });
+    let rendered = handle.render();
+    assert!(
+        !rendered.contains("smg_cache_tree_reuse_age_seconds"),
+        "a declined selection recorded a reuse age; rendered:\n{rendered}"
+    );
+}
+
 #[test]
 fn hash_spill_uses_expected_wait_and_records_only_final_holder() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
@@ -3847,7 +3864,11 @@ fn hash_mode_hit_records_the_selected_holders_age() {
         .unwrap_or_else(|| panic!("no hash reuse age; rendered:\n{rendered}"))
         .parse()
         .unwrap();
-    assert_eq!(sum, 30.0, "w1's age, not w2's 5 s");
+    // Whole seconds since the placement; the test may cross one.
+    assert!(
+        (30.0..=31.0).contains(&sum),
+        "{sum}: w1's age, not w2's 5 s"
+    );
 }
 
 #[test]
