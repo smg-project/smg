@@ -613,7 +613,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_connections_active",
-        "Currently active HTTP connections"
+        "HTTP requests in flight at the edge layer, not open connections: an idle keep-alive connection carries no request and one HTTP/2 connection carries many"
     );
     describe_counter!(
         "smg_http_connection_timeouts_total",
