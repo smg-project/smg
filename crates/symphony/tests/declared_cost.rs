@@ -6,8 +6,10 @@
 //! copy, the held bytes joined to it; inside a streamed call, a delta of the call's arguments the
 //! JSON syntax passes on whole allocates nothing of its own either, its fragment borrows the delta
 //! (the assembler's own copy of the call's bytes still grows by doubling as the value lengthens,
-//! the one cost that remains, outside the pin). A separate executable, so it can declare the
-//! counting allocator the pins need.
+//! the one cost that remains, outside the pin). What a tagged syntax still pays is pinned too: a
+//! delta of a string argument costs two strings today, the escaped text and its source, a count
+//! held so that the change which removes them flips the pin in the same commit. A separate
+//! executable, so it can declare the counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -274,6 +276,106 @@ fn a_delta_of_a_calls_arguments_read_whole_allocates_nothing() {
         );
     }
     for text in ["\", \"filter\": {\"status\": \"open\"}}\n", "</tool_call>"] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    assert!(
+        matches!(
+            out.as_slice().last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ),
+        "the output ends with its one call counted: {:?}",
+        out.as_slice()
+    );
+}
+
+/// A tagged syntax writes the call's JSON itself, so every streamed piece of a string argument
+/// is written as its escaped text and carried as its own source: two strings per delta today,
+/// where the JSON syntax's fragments borrow the delta. The pin holds that count, so the change
+/// that lets the tagged assembler's pieces borrow the delta flips it to zero in the same commit,
+/// and a third copy cannot arrive unnoticed. The attributed, keyed and XML assemblers write their
+/// strings through the same object.
+#[test]
+fn a_delta_of_a_tagged_calls_string_argument_costs_two_strings_today() {
+    let mut engine = Engine::new(Table::Qwen3Tagged.format(), Declared::shared(tools()));
+    let mut out = Events::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: "<|im_start|>assistant\n",
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    black_box(out.drain());
+    // The call's opener, the function and the parameter tags, and the value's first bytes: the
+    // start's events, the member's opening fragment and the buffers take their capacity here.
+    for text in [
+        "Let me look that up.\n",
+        "<tool_call>\n",
+        "<function=lookup_0>\n",
+        "<parameter=key>\n",
+        "k7-1",
+    ] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    // The string argument streams in deltas of four bytes, 2,000 bytes in all; the first few are
+    // warm-up, the rest are the pin. No delta ends in a byte that could begin a tag or in the
+    // newline the template puts before the closing tag, so each streams whole.
+    let piece = "abcd";
+    let mut costs = Vec::with_capacity(500);
+    for _ in 0..500 {
+        costs.push(allocations_for_delta(&mut engine, &mut out, piece));
+    }
+    let steady = &costs[4..];
+    assert!(
+        steady.iter().all(|&cost| cost == 2),
+        "the deltas of a tagged call's string argument allocated {:?} times (the first four \
+         {:?}): today each piece is written as one escaped JSON string and carried as one source \
+         string, two allocations per delta where the JSON syntax's fragment borrows the delta; \
+         pieces that borrow the delta take this to 0",
+        steady
+            .iter()
+            .copied()
+            .fold(std::collections::BTreeSet::new(), |mut set, cost| {
+                set.insert(cost);
+                set
+            }),
+        &costs[..4]
+    );
+    // One more piece, read for its shape: one fragment, the escaped text and its source both
+    // owned, which is where the two strings go.
+    let mut events = std::mem::take(&mut out);
+    engine
+        .feed(
+            Input::Delta {
+                token_ids: &[],
+                text: piece,
+                spans: &[],
+            },
+            &mut events,
+        )
+        .expect("the delta is taken");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Event::ToolCallArguments { json: Cow::Owned(json), source, .. }]
+                if json == piece && matches!(&source.text, Cow::Owned(bytes) if bytes == piece)
+        ),
+        "the arguments delta {piece:?} gave {:?}: one fragment, its text and its source each a \
+         string of its own",
+        events.as_slice()
+    );
+    out = events.recycle();
+    for text in ["\n</parameter>\n", "</function>\n", "</tool_call>"] {
         allocations_for_delta(&mut engine, &mut out, text);
     }
     engine
