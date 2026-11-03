@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,7 @@ DETAILS = re.compile(r"^\s*</?(details|summary)\b", re.IGNORECASE)
 CHECKBOX = re.compile(r"^\[[ xX]\]\s*")
 BREAKING = re.compile(r"\bBREAKING[ -]CHANGES?\b")
 COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+CODE_SPAN = re.compile(r"`[^`\n]+`")
 TOKEN = re.compile(r"\{\{([a-z_]+)\}\}")
 BATCH = 100  # pull requests per GraphQL query
 
@@ -150,6 +152,24 @@ def warn(text: str) -> None:
     print(f"notes: {text}", file=sys.stderr)
 
 
+def outside_code(text: str, change: Callable[[str], str]) -> str:
+    """The text with `change` applied to what sits outside backtick spans, which stay as written: a span that
+    quotes a comment keeps it, a comment that holds a span goes with it."""
+    spans: list[str] = []
+
+    def mask(match: re.Match[str]) -> str:
+        spans.append(match.group(0))
+        return f"\0{len(spans) - 1}\0"
+
+    return re.sub(
+        r"\0(\d+)\0", lambda found: spans[int(found.group(1))], change(CODE_SPAN.sub(mask, text))
+    )
+
+
+def without_comments(text: str) -> str:
+    return outside_code(text, lambda part: COMMENT.sub("", part))
+
+
 @dataclass
 class Pull:
     """A merged pull request as its squash subject names it, and what its body says."""
@@ -200,7 +220,7 @@ class Pull:
         """The text read for Upgrade notes: the subject, the sentence, the declaring sections, the footers."""
         parts = [self.subject, self.note or ""]
         declaring = False
-        for line in COMMENT.sub("", self.body).split("\n"):
+        for line in without_comments(self.body).split("\n"):
             heading = HEADING.match(line)
             if heading:
                 declaring = DECLARING_HEADING.search(heading.group("text")) is not None
@@ -264,12 +284,13 @@ def note_section(body: str) -> tuple[bool, str | None]:
     empty (nothing, or a template's placeholder comment alone), "" when it declares none.
 
     The section is a heading (any level) that starts with "Release note", read until the next heading, or a
-    "Release note:" line, read until the blank line after it; list markers go, the lines join into one. A comment
-    opener or closer inside the sentence is written out as text, so it cannot open a comment in the draft.
+    "Release note:" line, read until the blank line after it; list markers go, the lines join into one. Comments
+    are stripped, and a comment opener or closer left in the sentence is written out as text so it cannot open a
+    comment in the draft; what sits in backtick spans stays as written either way.
     """
     mode = None
     collected: list[str] = []
-    for line in COMMENT.sub("", body.replace("\r\n", "\n")).split("\n"):
+    for line in without_comments(body.replace("\r\n", "\n")).split("\n"):
         heading = HEADING.match(line)
         if heading:
             if mode:
@@ -299,7 +320,9 @@ def note_section(body: str) -> tuple[bool, str | None]:
         return True, None
     if NONE_NOTE.match(text):
         return True, ""
-    return True, text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    return True, outside_code(
+        text, lambda part: part.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    )
 
 
 def release_note(body: str) -> str | None:
@@ -309,7 +332,8 @@ def release_note(body: str) -> str | None:
 
 def read_bodies(pulls: list[Pull], gh: str, repo: str, cache: Path, refresh: bool = False) -> None:
     """Each numbered pull request's body from the cache, the rest fetched in batches and cached; every one fetched
-    again under refresh (a note added to a pull request after the first draft)."""
+    again under refresh (a note added to a pull request after the first draft). A fetch that fails leaves the
+    earlier read standing where there is one, and says so."""
     numbered: dict[
         int, list[Pull]
     ] = {}  # a number can be listed twice (a revert, a pick's original)
@@ -328,9 +352,20 @@ def read_bodies(pulls: list[Pull], gh: str, repo: str, cache: Path, refresh: boo
     records = {} if refresh else {number: cached(store, number) for number in numbered}
     missing = sorted(number for number in numbered if records.get(number) is None)
     if missing:
-        fetch(missing, gh, repo, store)
+        fetched = fetch(missing, gh, repo, store)
         for number in missing:
+            if number in fetched:
+                records[number] = cached(store, number)
+        unreached = [number for number in missing if number not in fetched]
+        earlier = [number for number in unreached if cached(store, number) is not None]
+        for number in earlier:  # a refresh that failed: the earlier read stands, and stderr says so
             records[number] = cached(store, number)
+        if earlier:
+            warn(
+                f"{len(earlier)} of them render from the earlier read; the refresh did not reach them"
+            )
+        if len(unreached) > len(earlier):
+            warn(f"{len(unreached) - len(earlier)} of them fall back to their subjects")
     for number, listed_pulls in numbered.items():
         record = records.get(number)
         if record is None or record.get("missing"):
@@ -349,11 +384,13 @@ def cached(store: Path, number: int) -> dict | None:
         return None
 
 
-def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
-    """The bodies of these pull requests through gh, BATCH per GraphQL query, one file each under store."""
+def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> set[int]:
+    """The bodies of these pull requests through gh, BATCH per GraphQL query, one file each under store; returns
+    the numbers written (every number of a batch that answered; a missing record for one that is no pull request)."""
+    written: set[int] = set()
     if shutil.which(gh) is None:
         warn(f"'{gh}' is not installed: the bodies of {len(numbers)} pull requests are not read")
-        return
+        return written
     owner, name = repo.split("/", 1)
     for start in range(0, len(numbers), BATCH):
         batch = numbers[start : start + BATCH]
@@ -374,11 +411,8 @@ def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
         except (ValueError, KeyError, TypeError) as error:
             first = done.stderr.strip().split("\n")[0] if done.stderr.strip() else ""
             cause = first or str(error) or f"gh exited {done.returncode}"
-            warn(
-                f"the read of {len(numbers) - start} pull request bodies failed ({cause});"
-                " they fall back to their subjects"
-            )
-            return
+            warn(f"the read of {len(numbers) - start} pull request bodies failed ({cause})")
+            return written
         for number in batch:
             record = data.get(f"p{number}") or {"number": number, "missing": True}
             if "author" in record:
@@ -387,6 +421,8 @@ def fetch(numbers: list[int], gh: str, repo: str, store: Path) -> None:
             partial = store / f"{number}.json.tmp"
             partial.write_text(json.dumps(record), encoding="utf-8")
             os.replace(partial, store / f"{number}.json")
+        written.update(batch)
+    return written
 
 
 # --- the sections --------------------------------------------------------------------------------------
@@ -623,15 +659,19 @@ def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, st
     A sentence may quote a template expression of its own (`{{ bos_token }}`): only the names the notes template
     defines are placeholders, every token-shaped text when the names are unknown. An author comment counts wherever
     "AUTHOR:" sits in it (a stray opener before it would swallow it), and an opener without a closer is reported
-    too: published, it hides everything after it.
+    too: published, it hides everything after it. Backtick spans are skipped: a comment quoted in code hides nothing.
     """
     found = []
+    scanned = CODE_SPAN.sub(
+        lambda span: " " * len(span.group(0)), text
+    )  # the same offsets, the spans blanked
     closed_to = 0
-    for match in COMMENT.finditer(text):
+    for match in COMMENT.finditer(scanned):
         closed_to = match.end()
         if "AUTHOR:" in match.group(0).upper():
-            found.append((text.count("\n", 0, match.start()) + 1, match.group(0).split("\n")[0]))
-    stray = text.find("<!--", closed_to)
+            excerpt = text[match.start() : match.end()].split("\n")[0]
+            found.append((text.count("\n", 0, match.start()) + 1, excerpt))
+    stray = scanned.find("<!--", closed_to)
     if stray != -1:
         found.append(
             (

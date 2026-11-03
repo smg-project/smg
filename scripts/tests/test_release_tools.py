@@ -1785,11 +1785,9 @@ def test_notes_render_without_the_bodies_when_gh_cannot_read_them(
         GH_STUB_GRAPHQL_ERROR="boom",
         NOTES_CACHE=str(tmp_path / "c1"),
     )
-    assert (
-        "the read of 16 pull request bodies failed (gh: boom); they fall back to their subjects"
-        in offline.stderr
-    )
+    assert "the read of 16 pull request bodies failed (gh: boom)" in offline.stderr
     assert "0 carry a release note" in offline.stderr
+    assert "16 of them fall back to their subjects" in offline.stderr
     assert (
         "- feat(health): the readiness body names each served model (#201) <!-- AUTHOR: no release note in the pull"
         " request: write the sentence or drop the line -->" in offline.stdout
@@ -1914,6 +1912,14 @@ def test_the_release_note_of_a_pull_request_body() -> None:
         (2, "<!-- AUTHOR: x -->"),
         (3, "{{t}}"),
     ]
+    quoted = "## Release note\n\nThe template writes `<!-- x -->` as text, and `-->` alone.\n"
+    assert (
+        notes.release_note(quoted) == "The template writes `<!-- x -->` as text, and `-->` alone."
+    )
+    mixed = "## Release note\n\n<!-- hidden --> kept, with `<!-- shown -->` and <!-- see `x` --> gone.\n"
+    assert notes.release_note(mixed) == "kept, with `<!-- shown -->` and gone."
+    assert notes.placeholders("an opener in code: `<!--` hides nothing\n") == []
+    assert notes.placeholders("`<!-- AUTHOR: quoted -->` is not a placeholder") == []
 
 
 def test_notes_render_without_the_bodies_when_the_repository_is_not_visible(
@@ -1953,6 +1959,23 @@ def test_notes_refresh_reads_every_body_again_and_a_cut_cache_file_is_read_again
     reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
     assert len(reads) == 3 and "p201:" in reads[2] and "p202:" not in reads[2], (
         "only the cut file is read again"
+    )
+    (cache / "example-repo" / "205.json").unlink()  # one body with no earlier read left
+    failed = repo.tool("notes", "1.14.0", NOTES_REFRESH="1", GH_STUB_GRAPHQL_ERROR="boom", **env)
+    assert "the read of 16 pull request bodies failed (gh: boom)" in failed.stderr
+    assert (
+        "15 of them render from the earlier read; the refresh did not reach them" in failed.stderr
+    )
+    assert (
+        "1 of them fall back to their subjects" in failed.stderr
+        and "2 could not be read" in failed.stderr
+    )
+    assert "- The retry charge is one per request. (#212)" in failed.stdout, (
+        "the earlier read stands, and says so"
+    )
+    assert "(#205) <!-- AUTHOR: no release note in the pull request" in failed.stdout
+    assert "- chore(ci): pin the runner image (#213)" in failed.stdout, (
+        "#213 is no pull request: unread as always"
     )
 
 
