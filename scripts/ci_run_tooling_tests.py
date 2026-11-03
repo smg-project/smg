@@ -21,6 +21,7 @@ COMPONENTS = (
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
+    ("scripts/bfcl/launch_arm.sh", "scripts/tests/test_bfcl_launch_readiness.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
     (
         "e2e_test/benchmarks/nightly_summarize.py",
