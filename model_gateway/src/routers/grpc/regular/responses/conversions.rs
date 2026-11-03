@@ -47,6 +47,9 @@ use crate::routers::grpc::common::responses::{
 ///   matched sequence both read it from the chat request)
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
+/// - the sampling knobs (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
+///   request keeps as plain values cross only when set
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     responses_to_chat_with_tools(req, None)
@@ -383,6 +386,15 @@ fn chat_request(
         messages,
         model,
         temperature: req.temperature,
+        // The chat twins of these five knobs are `Option`s whose `None` lets
+        // the model's own defaults fill the knob; three of them are plain
+        // values with serde defaults on the Responses request and cross only
+        // when set, or every request would carry the sentinels.
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        top_k: req.top_k_if_set(),
+        min_p: req.min_p_if_set(),
+        repetition_penalty: req.repetition_penalty_if_set(),
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
         // Preserve caller-provided stream_options (e.g. `include_obfuscation: false`
@@ -1216,6 +1228,62 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.reasoning_effort, None);
+    }
+
+    /// The five sampling knobs a Responses request sets are the chat
+    /// request's. Three of them are plain values with serde defaults on the
+    /// Responses request (`top_k` -1, `min_p` 0, `repetition_penalty` 1) and
+    /// cross only when set: an unset knob stays `None`, so the model's own
+    /// defaults still fill it.
+    #[test]
+    fn a_responses_request_s_sampling_knobs_reach_the_chat_request_only_when_set() {
+        let unset = ResponsesRequest {
+            input: ResponseInput::Text("What is 2+2?".to_string()),
+            model: "local-model".to_string(),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&unset).unwrap();
+        assert_eq!(chat.frequency_penalty, None, "no frequency_penalty was set");
+        assert_eq!(chat.presence_penalty, None, "no presence_penalty was set");
+        assert_eq!(
+            chat.top_k, None,
+            "the serde default -1 is not a top_k the client set"
+        );
+        assert_eq!(
+            chat.min_p, None,
+            "the serde default 0 is not a min_p the client set"
+        );
+        assert_eq!(
+            chat.repetition_penalty, None,
+            "the serde default 1 is not a repetition_penalty the client set"
+        );
+
+        let set = ResponsesRequest {
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            top_k: 40,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
+            ..unset
+        };
+        let chat = responses_to_chat(&set).unwrap();
+        assert_eq!(
+            chat.frequency_penalty,
+            Some(0.5),
+            "frequency_penalty crosses as set"
+        );
+        assert_eq!(
+            chat.presence_penalty,
+            Some(0.3),
+            "presence_penalty crosses as set"
+        );
+        assert_eq!(chat.top_k, Some(40), "top_k crosses as set");
+        assert_eq!(chat.min_p, Some(0.05), "min_p crosses as set");
+        assert_eq!(
+            chat.repetition_penalty,
+            Some(1.1),
+            "repetition_penalty crosses as set"
+        );
     }
 
     #[test]
