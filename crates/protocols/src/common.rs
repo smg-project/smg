@@ -4,7 +4,11 @@ use std::{
 };
 
 use serde::{
-    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    de::{
+        self,
+        value::{MapDeserializer, SeqAccessDeserializer},
+        SeqAccess, Visitor,
+    },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
@@ -382,7 +386,7 @@ pub struct VideoUrl {
 // Response Format (for structured outputs)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
     #[serde(rename = "text")]
@@ -393,12 +397,319 @@ pub enum ResponseFormat {
     JsonSchema { json_schema: JsonSchemaFormat },
 }
 
+/// The kind a `response_format` object names under `type`, read with the
+/// words serde uses for a tag: an unknown name lists the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseFormatKind {
+    Text,
+    JsonObject,
+    JsonSchema,
+}
+
+impl ResponseFormatKind {
+    const ALL: [ResponseFormatKind; 3] = [
+        ResponseFormatKind::Text,
+        ResponseFormatKind::JsonObject,
+        ResponseFormatKind::JsonSchema,
+    ];
+
+    /// The name under `type`: the variant's rename on [`ResponseFormat`].
+    const fn name(self) -> &'static str {
+        match self {
+            ResponseFormatKind::Text => "text",
+            ResponseFormatKind::JsonObject => "json_object",
+            ResponseFormatKind::JsonSchema => "json_schema",
+        }
+    }
+}
+
+/// The names an unknown kind's error lists, in the variants' order.
+const RESPONSE_FORMAT_KINDS: &[&str] = &[
+    ResponseFormatKind::Text.name(),
+    ResponseFormatKind::JsonObject.name(),
+    ResponseFormatKind::JsonSchema.name(),
+];
+
+impl<'de> Deserialize<'de> for ResponseFormatKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KindVisitor;
+
+        impl Visitor<'_> for KindVisitor {
+            type Value = ResponseFormatKind;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("variant identifier")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                ResponseFormatKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.name() == name)
+                    .ok_or_else(|| E::unknown_variant(name, RESPONSE_FORMAT_KINDS))
+            }
+        }
+
+        deserializer.deserialize_identifier(KindVisitor)
+    }
+}
+
+/// The object is read field by field. serde's derive for an internally
+/// tagged enum buffers the whole object before it picks the variant, so a
+/// JSON schema would be built twice (the buffer, then the `Value`); this
+/// reads `type` and `json_schema` in whatever order they arrive and builds
+/// the schema once: straight into its struct once the kind is known to want
+/// it, skipped once the kind is known not to, and kept as it arrived only
+/// when it arrives before the kind (a `KeptSchema`: an object as its entries
+/// in order, any other shape as a `Value`, for the schema's own derive to
+/// read at the end, so a repeated or malformed field is the derive's error
+/// in either order and ignored by the two kinds that carry no schema). The
+/// accepted shapes and the errors are the derive's: a missing `type`, an
+/// unknown kind, a missing or malformed `json_schema` for the kind that
+/// wants it, a duplicate key; a kind that carries no schema ignores a
+/// `json_schema` field of any shape, and every other key is ignored. One
+/// corner differs in text alone: with `type` first, a malformed schema
+/// followed by a repeated `type` reads the schema's error here, because the
+/// schema is read the moment the kind is known (the point of this reader),
+/// where the derive, still buffering, reads a duplicate `type`; both refuse
+/// the body.
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Kind,
+            JsonSchema,
+            Other,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str("field identifier")
+                    }
+
+                    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                        Ok(match name {
+                            "type" => Field::Kind,
+                            "json_schema" => Field::JsonSchema,
+                            _ => Field::Other,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        /// What was read under `json_schema` before the end of the object.
+        enum Schema {
+            /// Read straight into its struct: the kind was known to want it.
+            Read(JsonSchemaFormat),
+            /// Kept as read: the kind was not known yet.
+            Kept(KeptSchema),
+            /// Skipped: the kind was known not to want it.
+            Skipped,
+        }
+
+        struct FormatVisitor;
+
+        impl<'de> Visitor<'de> for FormatVisitor {
+            type Value = ResponseFormat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("internally tagged enum ResponseFormat")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // serde's derive also reads the kind and then the content
+                // from a sequence; the shape and its errors are kept
+                let kind: ResponseFormatKind = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("type"))?;
+                let (format, read) = match kind {
+                    ResponseFormatKind::Text => (ResponseFormat::Text, 0),
+                    ResponseFormatKind::JsonObject => (ResponseFormat::JsonObject, 0),
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::JsonSchema with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::JsonSchema { json_schema }, 1)
+                    }
+                };
+                let mut extra = 0;
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    extra += 1;
+                }
+                if extra > 0 {
+                    let expected: &dyn de::Expected = if read == 1 {
+                        &"1 element in sequence"
+                    } else {
+                        &"0 elements in sequence"
+                    };
+                    return Err(de::Error::invalid_length(read + extra, expected));
+                }
+                Ok(format)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind: Option<ResponseFormatKind> = None;
+                let mut schema: Option<Schema> = None;
+                let mut schema_twice = false;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Kind => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            kind = Some(map.next_value()?);
+                        }
+                        Field::JsonSchema => {
+                            if schema.is_some() {
+                                // the derive reports the duplicate once the
+                                // object is read, whatever the second value
+                                schema_twice = true;
+                                map.next_value::<de::IgnoredAny>()?;
+                                continue;
+                            }
+                            schema = Some(match kind {
+                                Some(ResponseFormatKind::JsonSchema) => {
+                                    Schema::Read(map.next_value()?)
+                                }
+                                Some(_) => {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                    Schema::Skipped
+                                }
+                                None => Schema::Kept(map.next_value()?),
+                            });
+                        }
+                        Field::Other => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+                Ok(match kind {
+                    ResponseFormatKind::Text => ResponseFormat::Text,
+                    ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = match schema {
+                            Some(Schema::Read(json_schema)) => json_schema,
+                            Some(Schema::Kept(KeptSchema::Object(entries))) => {
+                                // the derive's own visitor reads the entries as they
+                                // arrived, duplicates included, and raises its error first
+                                JsonSchemaFormat::deserialize(
+                                    MapDeserializer::<_, serde_json::Error>::new(
+                                        entries.into_iter(),
+                                    ),
+                                )
+                                .map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Kept(KeptSchema::Other(value))) => {
+                                serde_json::from_value(value).map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Skipped) | None => {
+                                return Err(de::Error::missing_field("json_schema"))
+                            }
+                        };
+                        if schema_twice {
+                            // the derive reads the first value before it meets the
+                            // second key: the value's own error comes first
+                            return Err(de::Error::duplicate_field("json_schema"));
+                        }
+                        ResponseFormat::JsonSchema { json_schema }
+                    }
+                })
+            }
+        }
+
+        deserializer.deserialize_any(FormatVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsonSchemaFormat {
     pub name: String,
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+/// A `json_schema` object that arrived before the kind, kept for the end of
+/// the enclosing object: an object's entries as they arrived (duplicates
+/// included), so that the schema's own derive reads them at the end and raises
+/// its own error first, whatever it is, exactly as it does when `type` comes
+/// first; any other shape is kept as a `Value`, for the kind to accept or
+/// refuse. The two kinds that carry no schema drop it unread.
+enum KeptSchema {
+    Object(Vec<(String, Value)>),
+    Other(Value),
+}
+
+impl<'de> Deserialize<'de> for KeptSchema {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeptVisitor;
+
+        impl<'de> Visitor<'de> for KeptVisitor {
+            type Value = KeptSchema;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Null))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<KeptSchema, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(KeptSchema::Other(Value::Array(items)))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<KeptSchema, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    entries.push((key, value));
+                }
+                Ok(KeptSchema::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(KeptVisitor)
+    }
 }
 
 /// Strict structured outputs (`strict: true`) require every object node of the
@@ -1745,5 +2056,345 @@ mod tests {
         ] {
             assert!(!choice(free.clone()).forces_call(), "{free}");
         }
+    }
+
+    /// `response_format` on the wire: `{"type": ...}` with the schema object
+    /// under `json_schema`. The three kinds read in either key order, an
+    /// unknown key is ignored, and a kind that carries no schema ignores a
+    /// `json_schema` field of any shape.
+    #[test]
+    fn a_response_format_reads_its_three_kinds_in_either_key_order() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text);
+        assert!(matches!(
+            read(r#"{"type":"text"}"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_object"}"#).expect("json_object"),
+            ResponseFormat::JsonObject
+        ));
+        let schema = json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"],
+            "additionalProperties": false
+        });
+        let type_first = format!(
+            r#"{{"type":"json_schema","json_schema":{{"name":"answer","schema":{schema},"strict":true}}}}"#
+        );
+        let type_last = format!(
+            r#"{{"json_schema":{{"strict":true,"schema":{schema},"name":"answer"}},"type":"json_schema"}}"#
+        );
+        for text in [&type_first, &type_last] {
+            match read(text).expect("json_schema") {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.name, "answer");
+                    assert_eq!(json_schema.schema, schema);
+                    assert_eq!(json_schema.strict, Some(true));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let format = read(&type_first).expect("json_schema");
+        assert_eq!(
+            serde_json::to_value(&format).expect("serializes"),
+            json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema, "strict": true}})
+        );
+        assert!(matches!(
+            read(r#"{"type":"text","verbosity":"low"}"#).expect("an unknown key is ignored"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"text","json_schema":"not an object"}"#).expect("ignored for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":1},"type":"json_object"}"#)
+                .expect("ignored for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":"a","name":"b"},"type":"text"}"#)
+                .expect("a repeated field is ignored with the object, for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"strict":true,"strict":false},"type":"json_object"}"#)
+                .expect("a repeated field is ignored with the object, for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"strict":true}"#)
+                .expect("a stray key beside the schema is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
+        assert!(serde_json::from_str::<Option<ResponseFormat>>("null")
+            .expect("null")
+            .is_none());
+    }
+
+    /// The errors are the derive's, word for word: the missing tag, an
+    /// unknown kind, the missing or malformed schema object, a duplicate key,
+    /// the sequence form's lengths. Read on their own they carry a position
+    /// where the derive gave none (it read the variant from its buffer after
+    /// the object); inside a request both point at the field's end, except a
+    /// malformed schema object under `json_schema`, whose column is the
+    /// failing token's instead of the closing brace's (pinned last).
+    #[test]
+    fn a_response_format_error_names_what_is_wrong() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"json_schema":{"name":"a","schema":{}}}"#,
+                "missing field `type` at line 1 column 40",
+            ),
+            ("{}", "missing field `type` at line 1 column 2"),
+            (
+                r#"{"type":"xml"}"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 13",
+            ),
+            (
+                r#"{"type":1}"#,
+                "invalid type: integer `1`, expected variant identifier at line 1 column 9",
+            ),
+            (
+                r#"{"type":"json_schema"}"#,
+                "missing field `json_schema` at line 1 column 22",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":null}"#,
+                "invalid type: null, expected struct JsonSchemaFormat at line 1 column 40",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":"text"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 42",
+            ),
+            (
+                r#"{"json_schema":"text","type":"json_schema"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 43",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"schema":{}}}"#,
+                "missing field `name` at line 1 column 49",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a"}}"#,
+                "missing field `schema` at line 1 column 48",
+            ),
+            (
+                r#"{"type":"text","type":"text"}"#,
+                "duplicate field `type` at line 1 column 21",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"json_schema":{"name":"b","schema":{}}}"#,
+                "duplicate field `json_schema` at line 1 column 100",
+            ),
+            (
+                r#""text""#,
+                "invalid type: string \"text\", expected internally tagged enum ResponseFormat at line 1 column 6",
+            ),
+            ("[]", "missing field `type` at line 1 column 2"),
+            (
+                r#"["xml"]"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 6",
+            ),
+            (
+                "[1]",
+                "invalid type: integer `1`, expected variant identifier at line 1 column 2",
+            ),
+            (
+                r#"["json_schema"]"#,
+                "invalid length 0, expected struct variant ResponseFormat::JsonSchema with 1 element at line 1 column 15",
+            ),
+            (
+                r#"["json_schema","text"]"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 21",
+            ),
+            (
+                r#"["json_schema",{"name":"a","schema":{}},"extra"]"#,
+                "invalid length 2, expected 1 element in sequence at line 1 column 48",
+            ),
+            (
+                r#"["text",{"json_schema":"x"}]"#,
+                "invalid length 1, expected 0 elements in sequence at line 1 column 28",
+            ),
+            (
+                r#"["json_object","x","y"]"#,
+                "invalid length 2, expected 0 elements in sequence at line 1 column 23",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        // the sequence form the derive read is still read
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(r#"["text"]"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        match serde_json::from_str::<ResponseFormat>(
+            r#"["json_schema",["a",{"type":"object"},true]]"#,
+        )
+        .expect("json_schema")
+        {
+            ResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.name, "a");
+                assert_eq!(json_schema.strict, Some(true));
+            }
+            other => panic!("{other:?}"),
+        }
+        // inside a request: the field's end, and the one moved column
+        let request_err = |format: &str| {
+            let text = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{format},"max_tokens":8}}"#
+            );
+            serde_json::from_str::<crate::chat::ChatCompletionRequest>(&text)
+                .expect_err(format)
+                .to_string()
+        };
+        assert_eq!(
+            request_err(r#"{"json_schema":{"name":"a","schema":{}},"type":"xml"}"#),
+            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 127"
+        );
+        assert_eq!(
+            request_err(r#"{"type":"json_schema","json_schema":"text"}"#),
+            "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 117"
+        );
+    }
+
+    /// One value of each kind writes its name under `type` and reads back as
+    /// the same kind, from a `Value` and from text; `kind_of` matches every
+    /// variant of `ResponseFormat`, so a new variant fails this build until
+    /// the reader learns it, and the unknown-kind list is the names in order.
+    #[test]
+    fn a_response_format_round_trips_each_kind_under_its_name() {
+        fn kind_of(format: &ResponseFormat) -> ResponseFormatKind {
+            match format {
+                ResponseFormat::Text => ResponseFormatKind::Text,
+                ResponseFormat::JsonObject => ResponseFormatKind::JsonObject,
+                ResponseFormat::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+            }
+        }
+        let formats = [
+            ResponseFormat::Text,
+            ResponseFormat::JsonObject,
+            ResponseFormat::JsonSchema {
+                json_schema: JsonSchemaFormat {
+                    name: "answer".to_owned(),
+                    schema: json!({"type": "object"}),
+                    strict: None,
+                },
+            },
+        ];
+        assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
+        for (format, kind) in formats.iter().zip(ResponseFormatKind::ALL) {
+            assert_eq!(kind_of(format), kind);
+            let written = serde_json::to_value(format).expect("writes");
+            assert_eq!(written["type"], kind.name(), "{written}");
+            let read: ResponseFormat = serde_json::from_value(written.clone()).expect("reads back");
+            assert_eq!(kind_of(&read), kind, "{written}");
+            let read: ResponseFormat =
+                serde_json::from_str(&written.to_string()).expect("reads back from text");
+            assert_eq!(kind_of(&read), kind, "{written}");
+        }
+        assert_eq!(
+            RESPONSE_FORMAT_KINDS,
+            ResponseFormatKind::ALL.map(ResponseFormatKind::name)
+        );
+    }
+
+    /// A schema object that arrives before `type` is kept as it arrived and
+    /// read by the schema's own derive once the kind wants it: a repeated
+    /// field is the duplicate-field error, a field malformed before it repeats
+    /// the invalid-type error, in that order as in the other (the position
+    /// then being the enclosing object's end, the derive's); a duplicate
+    /// deeper in the schema keeps the last value in both orders, as a `Value`
+    /// does.
+    #[test]
+    fn a_kept_schema_object_refuses_a_repeated_field_in_either_order() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","name":"b","schema":{}}}"#,
+                "duplicate field `name` at line 1 column 54",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","name":"b","schema":{}},"type":"json_schema"}"#,
+                "duplicate field `name` at line 1 column 72",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"schema":{}}}"#,
+                "duplicate field `schema` at line 1 column 68",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"schema":{}},"type":"json_schema"}"#,
+                "duplicate field `schema` at line 1 column 73",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"strict":true,"strict":false}}"#,
+                "duplicate field `strict` at line 1 column 82",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"strict":true,"strict":false},"type":"json_schema"}"#,
+                "duplicate field `strict` at line 1 column 90",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1,"name":"b","schema":{}}}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+            (
+                r#"{"json_schema":{"name":1,"name":"b","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 70",
+            ),
+            // the field repeated at the top level: the first value is read
+            // before the repeat is raised, as the derive's visitor does
+            (
+                r#"{"json_schema":{"name":1},"json_schema":{"name":"a","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 86",
+            ),
+            (
+                r#"{"json_schema":5,"json_schema":{},"type":"json_schema"}"#,
+                "invalid type: integer `5`, expected struct JsonSchemaFormat at line 1 column 55",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{}},"json_schema":{},"type":"json_schema"}"#,
+                "duplicate field `json_schema` at line 1 column 78",
+            ),
+            // the eager read's one difference in text: a repeated `type` after
+            // a malformed schema reads the schema's error here and
+            // `duplicate field `type`` under the derive; both refuse the body
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1},"type":"text"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        for text in [
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"x":1,"x":2}}}"#,
+            r#"{"json_schema":{"name":"a","schema":{"x":1,"x":2}},"type":"json_schema"}"#,
+        ] {
+            match serde_json::from_str::<ResponseFormat>(text).expect(text) {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.schema, json!({"x": 2}), "{text}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // a kept object with a repeated unknown key is as the derive read it:
+        // the key ignored, no error
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(
+                r#"{"json_schema":{"name":"a","schema":{},"note":1,"note":2},"type":"json_schema"}"#
+            )
+            .expect("an unknown key twice is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
     }
 }

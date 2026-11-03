@@ -1,9 +1,10 @@
-//! A model family's marker tokens are spelled in up to four crates (the
-//! tokenizer's renderer, Symphony's format and grammar tables, the two
-//! legacy parsers), each copy right today. This test is the one place that
-//! spells them: a revision of one copy fails here, naming the file, instead
-//! of parting the renderer from the reader. The copies stay where they are
-//! until the families' markers have a single source.
+//! A model family's marker tokens are spelled in up to five crates (the
+//! tokenizer's renderer, Symphony's format table and the tags its assembler
+//! reads, the multimodal registry's placeholder, the two legacy parsers),
+//! each copy right today. This test is the one place that spells them: a
+//! revision of one copy fails here, naming the file, instead of parting the
+//! renderer from the reader. The copies stay where they are until the
+//! families' markers have a single source.
 
 use std::{fs, path::Path};
 
@@ -14,6 +15,13 @@ use std::{fs, path::Path};
 /// copy the code runs, and a file that spells a marker only there is not
 /// listed. A family with one such file pins nothing between crates and is
 /// not listed either.
+///
+/// The pin asks whether a file spells a marker at all, not how many times:
+/// it parts a file that stops spelling the marker from the rest, which is
+/// the drift between crates it exists for. A file that spells one marker in
+/// several places (a renderer's instruction text and the history it writes)
+/// keeps those equal by its own tests, the renderer's parity fixtures among
+/// them; this test does not read them apart.
 struct Family {
     name: &'static str,
     markers: &'static [&'static str],
@@ -27,7 +35,7 @@ const FAMILIES: &[Family] = &[
         files: &[
             "crates/tokenizer/src/encoders/kimi_k3_xtml.rs",
             "crates/symphony/src/formats/kimi_k3.rs",
-            "crates/symphony/src/grammar/xtml.rs",
+            "crates/symphony/src/tagged/attributed.rs",
             "crates/reasoning_parser/src/parsers/kimi_k3.rs",
             "crates/tool_parser/src/parsers/kimi_k3.rs",
         ],
@@ -71,6 +79,98 @@ const FAMILIES: &[Family] = &[
         files: &[
             "crates/symphony/src/formats/minimax_m3.rs",
             "crates/tool_parser/src/parsers/minimax_m3.rs",
+        ],
+    },
+    Family {
+        name: "kimi media placeholder",
+        markers: &["<|media_pad|>"],
+        files: &[
+            "crates/tokenizer/src/encoders/kimi_k3_xtml.rs",
+            "crates/multimodal/src/registry/kimi_k25.rs",
+        ],
+    },
+    Family {
+        name: "deepseek image placeholder",
+        markers: &["<｜deepseek_image｜>"],
+        files: &[
+            "crates/tokenizer/src/encoders/deepseek_v41.rs",
+            "crates/multimodal/src/registry/deepseek_v41.rs",
+        ],
+    },
+    Family {
+        name: "deepseek thinking markers",
+        markers: &["<think>", "</think>"],
+        files: &[
+            "crates/tokenizer/src/encoders/deepseek_common.rs",
+            "crates/symphony/src/formats/deepseek_v3.rs",
+            "crates/symphony/src/formats/deepseek_v3_1.rs",
+            "crates/symphony/src/formats/deepseek_v3_2.rs",
+            "crates/symphony/src/formats/deepseek_v4.rs",
+            "crates/symphony/src/formats/deepseek_v4_1.rs",
+            "crates/reasoning_parser/src/parsers/deepseek_v41.rs",
+            "crates/reasoning_parser/src/parsers/deepseek_r1.rs",
+        ],
+    },
+    Family {
+        name: "deepseek end of sentence",
+        markers: &["<｜end▁of▁sentence｜>"],
+        files: &[
+            "crates/tokenizer/src/encoders/deepseek_common.rs",
+            "crates/symphony/src/formats/deepseek_v4.rs",
+            "crates/tool_parser/src/parsers/deepseek31.rs",
+            "crates/tool_parser/src/parsers/deepseek_dsml.rs",
+        ],
+    },
+    Family {
+        name: "deepseek markup namespace",
+        markers: &["｜DSML｜"],
+        files: &[
+            "crates/tokenizer/src/encoders/deepseek_common.rs",
+            "crates/symphony/src/formats/deepseek_v3_2.rs",
+            "crates/symphony/src/formats/deepseek_v4.rs",
+            "crates/symphony/src/formats/deepseek_v4_1.rs",
+            "crates/symphony/src/tagged/attributed.rs",
+            "crates/reasoning_parser/src/parsers/deepseek_v41.rs",
+            "crates/tool_parser/src/parsers/deepseek_dsml.rs",
+        ],
+    },
+    Family {
+        name: "glm thinking markers",
+        markers: &["<think>", "</think>"],
+        files: &[
+            "crates/tokenizer/src/encoders/glm53.rs",
+            "crates/symphony/src/formats/glm.rs",
+            "crates/symphony/src/formats/glm4.rs",
+            "crates/reasoning_parser/src/parsers/glm45.rs",
+            "crates/tool_parser/src/parsers/glm4_moe.rs",
+        ],
+    },
+    Family {
+        name: "glm tool call tags",
+        markers: &["<tool_call>", "</tool_call>"],
+        files: &[
+            "crates/tokenizer/src/encoders/glm53.rs",
+            "crates/symphony/src/formats/glm.rs",
+            "crates/symphony/src/formats/glm4.rs",
+            "crates/tool_parser/src/parsers/glm4_moe.rs",
+        ],
+    },
+    Family {
+        name: "glm argument tags",
+        markers: &["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"],
+        files: &[
+            "crates/tokenizer/src/encoders/glm53.rs",
+            "crates/symphony/src/tagged/keyed.rs",
+            "crates/tool_parser/src/parsers/glm4_moe.rs",
+        ],
+    },
+    Family {
+        name: "glm assistant turn",
+        markers: &["<|assistant|>"],
+        files: &[
+            "crates/tokenizer/src/encoders/glm53.rs",
+            "crates/symphony/src/formats/glm.rs",
+            "crates/symphony/src/formats/glm4.rs",
         ],
     },
 ];

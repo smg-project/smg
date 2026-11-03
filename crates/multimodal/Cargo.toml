@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.14.0"
+version = "1.15.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -57,6 +57,8 @@ blake3.workspace = true
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 http.workspace = true
+# The reqwest hf-hub binds: the hub tests build the Hub's answers to a file request with it.
+reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 # The golden tests read `.npz` fixtures: a zip archive whose members are the arrays as `.npy` files.
 npyz = "0.9"
 zip = "9.0"
@@ -89,4 +91,12 @@ workspace = true
 
 [[bench]]
 name = "minimax_m3_concurrency"
+harness = false
+
+[[bench]]
+name = "pixel_cache_hit"
+harness = false
+
+[[bench]]
+name = "audio_clip"
 harness = false

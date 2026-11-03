@@ -143,7 +143,7 @@ async fn assemble_multimodal_data_impl(
                     spawn_tokenspeed_assembly(intermediate, options).await?,
                 ))
             }
-            // The same single batch the gRPC arm sends the servicer: the
+            // The same modality batches the gRPC arm sends the servicer: the
             // adapter frames it as the scheduler's processor output.
             RuntimeType::Sglang => assemble_sglang_data(intermediate),
             runtime => anyhow::bail!(
@@ -153,10 +153,28 @@ async fn assemble_multimodal_data_impl(
     }
 }
 
-/// The SGLang payload, one batch, as both the gRPC and the ZMQ arm send it.
+/// Both transports share the same per-modality assembly.
 fn assemble_sglang_data(intermediate: MultimodalIntermediate) -> Result<MultimodalData> {
-    let batch = into_single_batch(intermediate, "SGLang")?;
-    Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
+    Ok(MultimodalData::Sglang(assemble_sglang_batches(
+        intermediate,
+        "float32",
+    )?))
+}
+
+/// Assemble each modality independently, retaining its tensors and prompt bindings.
+pub(super) fn assemble_sglang_batches(
+    intermediate: MultimodalIntermediate,
+    dtype: &str,
+) -> Result<SglangMultimodalData> {
+    let mut batches = intermediate.into_batches().into_iter();
+    let first = batches
+        .next()
+        .context("SGLang multimodal input has no batches")?;
+    let mut data = assemble_sglang_with_dtype(first, dtype)?;
+    data.extra_batches = batches
+        .map(|batch| assemble_sglang_with_dtype(batch, dtype))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data)
 }
 
 /// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
@@ -269,7 +287,7 @@ pub(super) fn assemble_vllm_batches_with(
     Ok(data)
 }
 
-/// SGLang and TRT-LLM take a single preprocessed batch (one modality). The
+/// TRT-LLM takes a single preprocessed batch (one modality). The
 /// per-modality capability is enforced by
 /// [`ensure_client_supports_intermediate`]; this only enforces the structural
 /// single-batch constraint.
@@ -298,15 +316,6 @@ fn ensure_client_supports_intermediate(
     ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
-/// Assemble router-side tensors with the backward-compatible float32 dtype.
-fn assemble_sglang(
-    intermediate: PrecomputedMultimodalIntermediate,
-) -> Result<SglangMultimodalData> {
-    // Router-side processing retains its established dtype. A native worker
-    // may select the vision encoder's dtype explicitly.
-    assemble_sglang_with_dtype(intermediate, "float32")
-}
-
 /// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
 pub(super) fn assemble_sglang_with_dtype(
     intermediate: PrecomputedMultimodalIntermediate,
@@ -331,6 +340,7 @@ pub(super) fn assemble_sglang_with_dtype(
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 
     Ok(SglangMultimodalData {
+        extra_batches: Vec::new(),
         modality: modality.to_string(),
         image_data: Vec::new(),
         pixel_values,

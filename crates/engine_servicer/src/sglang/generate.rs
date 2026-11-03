@@ -60,6 +60,9 @@ pub(super) async fn generate(
     if let Some(mm) = &mut req.mm_inputs {
         if !reused {
             mm.feature_hash = None;
+            for batch in &mut req.extra_mm_inputs {
+                batch.feature_hash = None;
+            }
         }
     }
     if req.mm_inputs.as_ref().is_some_and(|mm| {
