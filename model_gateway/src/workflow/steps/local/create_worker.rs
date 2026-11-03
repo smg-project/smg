@@ -692,8 +692,10 @@ pub(super) fn model_card_for_labels(
         tokenizer_path,
         tool_parser,
         reasoning_parser,
-        upstream_model,
     );
+    if !card.upstream_model_is_override {
+        follow!(upstream_model);
+    }
     (next, changed)
 }
 
@@ -738,6 +740,8 @@ fn card_from_labels(
         .cloned()
         .unwrap_or_else(|| ModelCard::new(model_id));
 
+    card.upstream_model_is_override =
+        operator_card.is_some_and(|card| card.upstream_model.is_some());
     if card.upstream_model.is_none() {
         card.upstream_model = model_object_from_labels(model_id, labels, card.owned_by());
     }
@@ -1236,6 +1240,44 @@ mod tests {
         assert!(card_from_labels(None, "served", &oversized)
             .upstream_model
             .is_none());
+    }
+
+    /// Explicit objects remain operator-owned even when initially equal to
+    /// discovery; automatically discovered objects continue following refreshes.
+    #[test]
+    fn an_explicit_model_object_equal_to_discovery_survives_refresh() {
+        use serde_json::json;
+
+        use super::super::discover_metadata::MODEL_OBJECTS_LABEL;
+
+        let original = json!({"id": "m", "object": "model", "created": 1,
+            "owned_by": "engine", "max_model_len": 4096});
+        let before = HashMap::from([(
+            MODEL_OBJECTS_LABEL.into(),
+            json!({"m": original}).to_string(),
+        )]);
+        let after = HashMap::from([(MODEL_OBJECTS_LABEL.into(), json!({"m": {
+            "id": "m", "object": "model", "created": 2, "owned_by": "engine", "max_model_len": 8192
+        }}).to_string())]);
+        let discovered = card_from_labels(None, "m", &before);
+        let operator = discovered.clone();
+        let explicit = card_from_labels(Some(&operator), "m", &before);
+        assert!(explicit.upstream_model_is_override);
+        // The provenance survives transport/storage of the worker's model card.
+        let explicit =
+            serde_json::from_value::<ModelCard>(serde_json::to_value(explicit).unwrap()).unwrap();
+        let (kept, changed) = model_card_for_labels(&explicit, &before, &after);
+        assert!(!changed.contains(&"upstream_model"));
+        assert_eq!(
+            serde_json::to_value(kept.into_model_object()).unwrap(),
+            original
+        );
+        let (updated, changed) = model_card_for_labels(&discovered, &before, &after);
+        assert!(changed.contains(&"upstream_model"));
+        assert_eq!(
+            updated.into_model_object().extensions["max_model_len"],
+            8192
+        );
     }
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
