@@ -29,16 +29,18 @@ def _vllm_skip(node):
     )
 
 
-def _scope_skips_vllm(nodes):
+def _scope_skips_vllm(nodes, seen):
     pending = list(nodes)
+    found = False
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             continue
         if _vllm_skip(node):
-            return True
+            seen.add(id(node))
+            found = True
         pending.extend(ast.iter_child_nodes(node))
-    return False
+    return found
 
 
 def _parameter_marks(node):
@@ -110,8 +112,11 @@ def gated_cases(root):
                 f"Cannot enumerate required vLLM cases in {source}: dynamic collection"
             )
 
+        seen = set()
+
         def collect(nodes, classes=(), inherited=False):
-            inherited = inherited or _scope_skips_vllm(nodes)
+            scoped = _scope_skips_vllm(nodes, seen)
+            inherited = inherited or scoped
             for node in nodes:
                 if isinstance(node, ast.ClassDef):
                     if node.name.startswith("Test"):
@@ -127,7 +132,7 @@ def gated_cases(root):
                             f"{source}:{node.name}"
                         )
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    gated = _scope_skips_vllm(node.body)
+                    gated = _scope_skips_vllm(node.body, seen)
                     if node.name.startswith("test_") and (inherited or gated):
                         classname = ".".join((module, *classes))
                         for name in _case_names(node, f"{source}:{node.name}"):
@@ -139,8 +144,18 @@ def gated_cases(root):
                         raise SystemExit(
                             f"Cannot enumerate vLLM gate outside a test: {source}:{node.name}"
                         )
+                elif (inherited or any(_vllm_skip(child) for child in ast.walk(node))) and any(
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and child.name.startswith(("test_", "Test"))
+                    for child in ast.walk(node)
+                ):
+                    raise SystemExit(
+                        f"Cannot enumerate conditional vLLM test definitions in {source}"
+                    )
 
         collect(tree.body)
+        if any(_vllm_skip(node) and id(node) not in seen for node in ast.walk(tree)):
+            raise SystemExit(f"Cannot enumerate a nested or conditional vLLM gate in {source}")
     return cases
 
 

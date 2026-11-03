@@ -179,8 +179,10 @@ def test_a_module_skip_cannot_hide_the_required_rejection_notice_cases(junit):
         if case.get("classname") == module:
             removed.append(case)
             suite.remove(case)
-    assert len(removed) == 12
-    assert sum("[" in case.get("name", "") for case in removed) == 4
+    assert sorted(f"{module}::{case.get('name')}" for case in removed) == sorted(
+        case for case in REQUIRED if case.startswith(f"{module}::")
+    )
+    assert any("[" in case.get("name", "") for case in removed)
     skipped = ET.SubElement(suite, "testcase", classname=module, name="module import")
     ET.SubElement(skipped, "skipped", message="torch import failed")
     ET.ElementTree(root).write(path)
@@ -257,3 +259,39 @@ def test_duplicate_required_manifest_ids_fail_closed(tmp_path):
     )
     with pytest.raises(SystemExit, match="distinct nonempty case IDs"):
         CHECK.load_required(tmp_path, manifest)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import sys\nif sys.version_info >= (3, 11):\n def test_hidden():\n'
+        '  pytest.importorskip("vllm")\n',
+        'def test_hidden():\n def setup():\n  pytest.importorskip("vllm")\n setup()\n',
+        'if True:\n pytest.importorskip("vllm")\n def test_hidden(): pass\n',
+        'pytest.importorskip("vllm")\nif True:\n def test_hidden(): pass\n',
+    ],
+)
+def test_nested_or_conditional_gated_shapes_cannot_silently_disappear(tmp_path, source):
+    required = ["grpc_servicer.tests.test_sample::test_visible"]
+    _, manifest = _gated_tree(
+        tmp_path,
+        "import pytest\n" + source + '\ndef test_visible():\n pytest.importorskip("vllm")\n',
+        required,
+    )
+    with pytest.raises(SystemExit, match="Cannot enumerate.*vLLM"):
+        CHECK.gated_cases(tmp_path)
+    with pytest.raises(SystemExit, match="Cannot enumerate.*vLLM"):
+        CHECK.load_required(tmp_path, manifest)
+
+
+def test_every_direct_gate_is_recorded_before_completeness_check(tmp_path):
+    required = ["grpc_servicer.tests.test_sample.TestCases::test_case"]
+    _, manifest = _gated_tree(
+        tmp_path,
+        'import pytest\npytest.importorskip("vllm")\npytest.importorskip("vllm")\n'
+        'class TestCases:\n def test_case(self):\n  pytest.importorskip("vllm")\n'
+        '  pytest.importorskip("vllm")\n',
+        required,
+    )
+    assert CHECK.gated_cases(tmp_path) == set(required)
+    assert CHECK.load_required(tmp_path, manifest) == required
