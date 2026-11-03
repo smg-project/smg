@@ -237,15 +237,40 @@ macro_rules! impl_subscribe_kv_events {
                 .await
         }
 
+        /// The servicer's load records alone (`SubscribeKvEventsRequest.
+        /// loads_only`): `load_only` batches numbered 0 from the
+        /// subscription on, one per data-parallel rank at the record's
+        /// cadence, no events. A servicer that predates the field streams
+        /// its events too; the caller drops them.
+        pub async fn subscribe_load_records(
+            &self,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe($crate::common_proto::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: true,
+                loads_only: true,
+            })
+            .await
+        }
+
         async fn subscribe_kv_events_asking(
             &self,
             start_sequence_number: u64,
             load_records_before_first_batch: bool,
         ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
-            let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
+            self.subscribe($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
                 load_records_before_first_batch,
-            });
+                loads_only: false,
+            })
+            .await
+        }
+
+        async fn subscribe(
+            &self,
+            request: $crate::common_proto::SubscribeKvEventsRequest,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            let request = tonic::Request::new(request);
             let mut client = self
                 .client
                 .clone()
