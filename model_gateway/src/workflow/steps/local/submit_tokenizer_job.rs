@@ -4,6 +4,8 @@
 //! tokenizer_registration workflow. The workflow handles validation, deduplication,
 //! and caching - this step just submits the job.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use llm_tokenizer::TokenizerRegistry;
 use tracing::{debug, info, warn};
@@ -81,30 +83,12 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         for worker in workers {
             let model_id = worker.model_id().to_string();
 
-            // Get tokenizer path with fallback chain (an empty value is no path):
-            // 1. Worker labels: tokenizer_path
-            // 2. Worker labels: model_path
-            // 3. Router config (CLI args): --tokenizer-path
-            // 4. Router config (CLI args): --model-path
-            let usable = |path: &&String| !path.is_empty();
-            let tokenizer_path: String = if let Some(path) = labels
-                .get("tokenizer_path")
-                .filter(usable)
-                .or_else(|| labels.get("model_path").filter(usable))
-            {
-                path.clone()
-            } else if let Some(path) = app_context
-                .router_config
-                .tokenizer_path
-                .as_ref()
-                .filter(usable)
-                .or_else(|| app_context.router_config.model_path.as_ref().filter(usable))
-            {
-                debug!(
-                    "Using router config tokenizer path '{}' for model {}",
-                    path, model_id
-                );
-                path.clone()
+            let tokenizer_path: String = if let Some(source) = tokenizer_source(
+                labels,
+                app_context.router_config.tokenizer_path.as_deref(),
+                app_context.router_config.model_path.as_deref(),
+            ) {
+                source.to_string()
             } else {
                 // Nothing of this worker's loads the model's tokenizer. Unless
                 // the model has one already (another worker's or the
@@ -116,7 +100,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                         .tokenizer_load_failures
                         .record(&model_id, TokenizerLoadFailure::NoSource);
                 warn!(
-                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config){}",
+                    "No tokenizer source for model {} (checked the worker's tokenizer_path, model_path and model_id labels and the router config){}",
                     model_id,
                     if recorded {
                         "; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
@@ -172,5 +156,102 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false // Job submission failures are not retryable at this level
+    }
+}
+
+/// The source a model's tokenizer is loaded from, in order (an empty value is
+/// no source): the worker's `tokenizer_path` label, its `model_path` label,
+/// the router's `--tokenizer-path`, its `--model-path`, and last the worker's
+/// `model_id` label. A dialect whose model info names the model by its id
+/// only (a path or hub id on the worker's side) still gets a job that way:
+/// for a gRPC worker a local load that fails on the id falls back to the
+/// worker's own bundle (`fetch_tokenizer_from_worker`); a ZMQ worker's id has
+/// to be a path or hub id the gateway itself can load. Coming last, the id
+/// never displaces an operator's flag.
+fn tokenizer_source<'a>(
+    labels: &'a HashMap<String, String>,
+    router_tokenizer_path: Option<&'a str>,
+    router_model_path: Option<&'a str>,
+) -> Option<&'a str> {
+    let usable = |path: &&str| !path.is_empty();
+    let label = |key: &str| labels.get(key).map(String::as_str).filter(usable);
+    label("tokenizer_path")
+        .or_else(|| label("model_path"))
+        .or_else(|| router_tokenizer_path.filter(usable))
+        .or_else(|| router_model_path.filter(usable))
+        .or_else(|| label("model_id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::tokenizer_source;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A worker that names its model by id only, with neither a path label
+    /// nor a router flag: the id is the source (a local load that fails on
+    /// it falls back to the worker's bundle); an empty id is no source.
+    #[test]
+    fn tokenizer_source_is_the_model_id_when_nothing_else_names_a_path() {
+        let id_only = labels(&[("model_id", "/engines/served")]);
+        assert_eq!(
+            tokenizer_source(&id_only, None, None),
+            Some("/engines/served")
+        );
+        assert_eq!(
+            tokenizer_source(&id_only, Some(""), Some("")),
+            Some("/engines/served")
+        );
+        assert_eq!(
+            tokenizer_source(&labels(&[("model_id", "")]), None, None),
+            None
+        );
+        assert_eq!(tokenizer_source(&labels(&[]), None, None), None);
+    }
+
+    /// The operator's flags and the worker's path labels keep their
+    /// precedence over the id: `--tokenizer-path`, then `--model-path`, win
+    /// over an id-only worker, and a `tokenizer_path` or `model_path` label
+    /// wins over the flags as before.
+    #[test]
+    fn tokenizer_source_reads_the_model_id_only_after_the_flags_and_path_labels() {
+        let id_only = labels(&[("model_id", "/engines/served")]);
+        assert_eq!(
+            tokenizer_source(&id_only, Some("/opt/tok"), None),
+            Some("/opt/tok")
+        );
+        assert_eq!(
+            tokenizer_source(&id_only, None, Some("/opt/model")),
+            Some("/opt/model")
+        );
+        assert_eq!(
+            tokenizer_source(&id_only, Some("/opt/tok"), Some("/opt/model")),
+            Some("/opt/tok")
+        );
+
+        let with_paths = labels(&[
+            ("model_id", "/engines/served"),
+            ("model_path", "/engines/weights"),
+            ("tokenizer_path", "/engines/tok"),
+        ]);
+        assert_eq!(
+            tokenizer_source(&with_paths, Some("/opt/tok"), None),
+            Some("/engines/tok")
+        );
+        let with_model_path = labels(&[
+            ("model_id", "/engines/served"),
+            ("model_path", "/engines/weights"),
+        ]);
+        assert_eq!(
+            tokenizer_source(&with_model_path, Some("/opt/tok"), None),
+            Some("/engines/weights")
+        );
     }
 }

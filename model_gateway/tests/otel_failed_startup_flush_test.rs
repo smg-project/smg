@@ -128,6 +128,7 @@ fn a_refused_startup_flushes_the_spans_the_exporter_holds() {
         request_timeout_secs: 60,
         request_id_headers: None,
         shutdown_grace_period_secs: 1,
+        shutdown_settle_secs: None,
         control_plane_auth: None,
         mesh_server_config: None,
         webrtc_bind_addr: None,

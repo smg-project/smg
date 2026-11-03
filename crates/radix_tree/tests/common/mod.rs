@@ -10,6 +10,8 @@
 //! - [`workload`]: a seeded deterministic generator producing
 //!   §7-scoped operation streams with shared prefixes, divergent
 //!   tails, duplicates, gaps, and content coincidence.
+//! - [`subject`]: the two implementations under test behind one
+//!   handle, driven by the same operation stream.
 
 // Each integration-test binary compiles this module independently and
 // uses a different slice of it; unused-in-this-binary is expected.
@@ -17,6 +19,7 @@
 
 pub mod model;
 pub mod oracle;
+pub mod subject;
 pub mod workload;
 
 /// One operation in a workload stream. Holder identity is a dense

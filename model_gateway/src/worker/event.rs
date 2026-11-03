@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use openai_protocol::worker::WorkerStatus;
 
-use super::{registry::WorkerId, worker::Worker};
+use super::{basic::Worker, registry::WorkerId};
 
 /// Events broadcast when worker state changes.
 ///

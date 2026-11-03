@@ -36,7 +36,7 @@ pub fn delta_without_role(choice: u32, event: &Event<'_>) -> Option<ChatStreamCh
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, *index, id.clone(), name.clone())),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.clone()),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.to_string()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, reason, *tool_calls)),
@@ -64,7 +64,7 @@ pub fn into_delta_without_role(choice: u32, event: Event<'_>) -> Option<ChatStre
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, index, id, name)),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json.into_owned()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, &reason, tool_calls)),
@@ -294,42 +294,13 @@ fn with_role(mut choice: ChatStreamChoice) -> ChatStreamChoice {
     choice
 }
 
-/// The byte ranges of the output that are the message's content, from the events' sources in
-/// order (every byte of the output lands in one event), adjacent runs joined. Malformed text is
-/// content, as [`message`] writes it; a logprobs filter keeps the tokens in these ranges. The
-/// events must be the parser's own, whole; the one-call-only rule keeps the bytes of the calls it
-/// drops as dropped text, so the ranges hold under it
-/// ([`first_call_only`](crate::event::first_call_only)).
-pub fn content_spans(events: &[Event]) -> Vec<(usize, usize)> {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    for event in events {
-        let (bytes, content) = match event {
-            Event::Content(text) | Event::Malformed { text, .. } => (text.text.len(), true),
-            Event::Reasoning(text) | Event::Dropped { text, .. } => (text.text.len(), false),
-            Event::ToolCallStart { source, .. }
-            | Event::ToolCallArguments { source, .. }
-            | Event::ToolCallEnd { source, .. } => (source.text.len(), false),
-            Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => (0, false),
-        };
-        if content && bytes > 0 {
-            match spans.last_mut() {
-                Some((_, end)) if *end == at => *end = at + bytes,
-                _ => spans.push((at, at + bytes)),
-            }
-        }
-        at += bytes;
-    }
-    spans
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
 
     use super::*;
     use crate::{
-        event::{first_call_only, DropReason, MalformedReason, Text},
+        event::{DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
@@ -337,32 +308,6 @@ mod tests {
 
     fn wire(choice: Option<ChatStreamChoice>) -> Value {
         serde_json::to_value(choice.expect("a choice")).expect("serializable")
-    }
-
-    #[test]
-    fn content_spans_join_content_and_malformed_runs_and_skip_the_rest() {
-        let events = [
-            Event::Content(Text::uncounted("Sure. ")),
-            Event::Malformed {
-                text: Text::uncounted("{bad"),
-                why: MalformedReason::InvalidArguments,
-            },
-            Event::Reasoning(Text::uncounted("think")),
-            Event::ToolCallStart {
-                index: 0,
-                id: "call_0".to_string(),
-                name: "f".to_string(),
-                source: Text::uncounted("<call>"),
-            },
-            Event::Content(Text::uncounted("done")),
-            Event::Finish {
-                reason: FinishReason::Stop,
-                tool_calls: 1,
-                reasoning_tokens: 0,
-            },
-        ];
-        assert_eq!(content_spans(&events), [(0, 10), (21, 25)]);
-        assert!(content_spans(&[]).is_empty());
     }
 
     /// One event of every kind, with text where the kind carries it.
@@ -381,12 +326,12 @@ mod tests {
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: "{\"q\":".to_string(),
+                json: "{\"q\":".into(),
                 source: Text::uncounted("{\"q\":"),
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: String::new(),
+                json: "".into(),
                 source: Text::uncounted(""),
             },
             Event::ToolCallEnd {
@@ -594,7 +539,7 @@ mod tests {
             Event::Reasoning(Text::uncounted("")),
             Event::ToolCallArguments {
                 index: 0,
-                json: String::new(),
+                json: "".into(),
                 source: Text::default(),
             },
         ];
@@ -615,7 +560,7 @@ mod tests {
     fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.into(),
+            json: json.to_owned().into(),
             source: Text::default(),
         }
     }
@@ -643,7 +588,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "{\"q\":1}".to_string(),
+                    json: "{\"q\":1}".into(),
                     source: Text::uncounted(""),
                 },
                 Event::ToolCallEnd {
@@ -882,37 +827,6 @@ mod tests {
         "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
         "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
     );
-
-    /// The content ranges under one call only, against the whole output's: the rule turns the
-    /// calls it drops into dropped text, so the ranges after a dropped call are where the
-    /// content is. Content after a dropped second call.
-    #[test]
-    fn content_spans_hold_after_a_call_the_one_call_only_rule_dropped() {
-        let output = format!("Checking.\n{TWO_CALLS}\nDone.");
-        let whole = parsed(&output);
-        let mut one = whole.clone();
-        first_call_only(&mut one);
-        let spans = content_spans(&one);
-        assert_eq!(spans, content_spans(&whole), "{one:?}");
-        let kept: Vec<&str> = spans.iter().map(|&(from, to)| &output[from..to]).collect();
-        assert_eq!(kept, ["Checking.\n", "\nDone."]);
-        assert_eq!(one.len(), whole.len(), "one event per event: {one:?}");
-    }
-
-    /// Malformed text after a dropped second call (a third call the output cuts before its
-    /// header: its opener is wrapper text the table drops, its body malformed text): the text is
-    /// content, at its own offsets.
-    #[test]
-    fn content_spans_hold_for_malformed_text_after_a_call_the_one_call_only_rule_dropped() {
-        let output = format!("{TWO_CALLS}\n<tool_call>\n{{\"name\": \"get_time\"");
-        let whole = parsed(&output);
-        let mut one = whole.clone();
-        first_call_only(&mut one);
-        let spans = content_spans(&one);
-        assert_eq!(spans, content_spans(&whole), "{one:?}");
-        let kept: Vec<&str> = spans.iter().map(|&(from, to)| &output[from..to]).collect();
-        assert_eq!(kept, ["\n{\"name\": \"get_time\""]);
-    }
 
     #[test]
     fn two_turns_of_two_calls_carry_four_distinct_ids_the_deltas_and_the_message_agree_on() {

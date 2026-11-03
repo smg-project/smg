@@ -21,6 +21,7 @@ import pytest
 import yaml
 from infra import BRAVE_MCP_HOST, BRAVE_MCP_PORT, BRAVE_MCP_URL
 from infra.streams import collect_streamed_response
+from infra.web_search import skip_if_web_search_found_nothing
 
 logger = logging.getLogger(__name__)
 
@@ -485,6 +486,7 @@ class TestMcpWebSearchStreamingEvents:
         )
 
         # Verify mcp_call item structure
+        skip_if_web_search_found_nothing(final_response.output)
         mcp_calls = [item for item in final_response.output if item.type == "mcp_call"]
         for mcp_call in mcp_calls:
             assert mcp_call.status == "completed"

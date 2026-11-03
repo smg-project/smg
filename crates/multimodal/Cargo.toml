@@ -86,3 +86,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "minimax_m3_concurrency"
+harness = false

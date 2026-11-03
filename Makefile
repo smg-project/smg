@@ -24,7 +24,8 @@ endif
 .PHONY: help build test clean docs check fmt opencv-deps dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
         generate-openapi generate-python-types generate-java-types generate-clients \
-        show-version bump-version check-versions
+        show-version bump-version check-versions \
+        release-cut release-bump release-pick release-pick-pr release-status release-tag release-notes release-bump-main release-publish-plan release-check
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -227,3 +228,36 @@ bump-version: ## Bump version across all files (usage: make bump-version VERSION
 
 check-versions: ## Check workspace crate versions against latest tag (usage: make check-versions [TAG=v1.0.0] [VERSION_OVERRIDE=1.3.1])
 	@VERSION_OVERRIDE="$(VERSION_OVERRIDE)" python3 scripts/check_release_versions.py $(TAG)
+
+# Release process (scripts/release/README.md): release branches cut from main, moved by pull requests
+RELEASE_TOOL := scripts/release/release.sh
+
+release-cut: ## Cut release/<x.y> from FROM (default origin/main) and bump it to VERSION (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) cut "$(VERSION)" $(FROM)
+
+release-bump: ## Bump an existing release branch to VERSION through a pull request (usage: make release-bump VERSION=1.14.0-rc.2 [PUSH=0])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) bump "$(VERSION)"
+
+release-pick: ## Cherry-pick SHA (comma-separated) from main onto release/RELEASE through a pull request (usage: make release-pick RELEASE=1.14 SHA=<sha>[,<sha>] [PUSH=0])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick "$(RELEASE)" "$(SHA)"
+
+release-pick-pr: ## After a resolved pick conflict: push the pick branch and open its pull request (usage: make release-pick-pr RELEASE=1.14)
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick-pr "$(RELEASE)"
+
+release-status: ## What is on main and not on release/RELEASE, its own commits, tags and open pull requests (usage: make release-status RELEASE=1.14)
+	@$(RELEASE_TOOL) status "$(RELEASE)"
+
+release-tag: ## Check the versions at release/<x.y>'s head and tag it vVERSION (usage: make release-tag VERSION=1.14.0-rc.1 [PUSH=1])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) tag "$(VERSION)"
+
+release-notes: ## The release notes skeleton for VERSION on stdout (usage: make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md)
+	@$(RELEASE_TOOL) notes "$(VERSION)" $(SINCE)
+
+release-bump-main: ## After a final: a pull request that moves main's version files to vVERSION's (usage: make release-bump-main VERSION=1.14.0 [PUSH=0])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) bump-main "$(VERSION)"
+
+release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatches to run against the tag and the artifacts they produce; prints, runs nothing (usage: make release-publish-plan VERSION=1.14.0)
+	@$(RELEASE_TOOL) publish-plan "$(VERSION)"
+
+release-check: ## The release gate for vVERSION: what the repository can read (versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) (usage: make release-check VERSION=1.14.0-rc.1)
+	@$(RELEASE_TOOL) check "$(VERSION)"
