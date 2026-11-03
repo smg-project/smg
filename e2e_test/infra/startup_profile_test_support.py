@@ -21,6 +21,6 @@ def set_profile_lane(monkeypatch, profile, args=None, floor=None):
         monkeypatch.setenv(key, value)
     chat = Path(__file__).resolve().parents[2] / definition.test_dir
     selected = [str(chat)] if args is None else args
-    config = pytest.Config.fromdictargs({}, ["--noconftest", *selected])
+    config = pytest.Config.fromdictargs({}, ["--noconftest", "--assert=plain", "-s", *selected])
     hooks_module.pytest_configure(config)
     return config

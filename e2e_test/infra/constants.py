@@ -407,6 +407,13 @@ _STARTUP_PROFILE_SELECTION: tuple[str, object, str] | None = None
 
 @dataclass(frozen=True)
 class StartupProfile:
+    """Declared startup bounds and lane identity.
+
+    ``max_floor`` caps ``E2E_STARTUP_TIMEOUT`` and is also the frozen
+    gateway readiness wait for non-ZMQ wires. Four-GPU workers retain
+    their 1200/600s waits beside the separate 60s gateway bound.
+    """
+
     models: Mapping[str, tuple[int, int]]
     lane: tuple[tuple[str, str], ...]
     max_floor: int
