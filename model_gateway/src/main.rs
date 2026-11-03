@@ -5147,4 +5147,77 @@ mod tests {
         );
         assert_eq!(listener.runtime_worker_threads, Some(2));
     }
+
+    /// `configure` validates the configuration once, through the builder's
+    /// `build()`: a second pass over the same value repeats every file read
+    /// of the validators (the scheduler YAML, the log-directory probe) for no
+    /// second opinion. A FIFO as the scheduler file counts the reads: each
+    /// open of it is served by one write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        use std::{
+            io::Write,
+            os::unix::fs::OpenOptionsExt,
+            sync::{
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        };
+
+        // Linux's `O_NONBLOCK` and `ENXIO`: a non-blocking open of a FIFO for
+        // writing fails with `ENXIO` while no reader holds it.
+        const O_NONBLOCK: i32 = 0o4000;
+        const ENXIO: i32 = 6;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("scheduler.yaml");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let served = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (fifo, served, stop) = (fifo.clone(), Arc::clone(&served), Arc::clone(&stop));
+            // Blocks in `open` until a reader opens the FIFO, serves that one
+            // read, waits for the reader to leave (a reader still draining
+            // would take the next document too), and goes back to waiting
+            // until told to stop.
+            std::thread::spawn(move || {
+                while let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(&fifo) {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    writer.write_all(b"{}\n").unwrap();
+                    drop(writer);
+                    while std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(O_NONBLOCK)
+                        .open(&fifo)
+                        .map_or_else(|e| e.raw_os_error() != Some(ENXIO), |_| true)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let cli = cli_args_from(&[
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            fifo.to_str().unwrap(),
+        ]);
+        cli.configure(vec![], vec![]).expect("configures");
+        let reads = served.load(Ordering::SeqCst);
+
+        // Pair with the writer's pending open so the thread can see the stop flag and end.
+        stop.store(true, Ordering::SeqCst);
+        std::fs::read_to_string(&fifo).unwrap();
+        writer.join().unwrap();
+        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
+    }
 }
