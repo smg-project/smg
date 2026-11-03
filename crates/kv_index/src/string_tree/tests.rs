@@ -2206,3 +2206,31 @@ fn test_evict_by_size_reports_newest_evicted_age() {
         );
     }
 }
+
+/// With two holders of a prompt, the fused walk reports the age of the
+/// holder the request is routed to, not of the one the match resolved, and
+/// stamps only the routed holder: the other keeps its own last access.
+#[test]
+fn test_fused_walk_reports_and_stamps_the_routed_holder() {
+    let tree = Tree::new();
+    let text = "system prompt, turn one";
+    tree.insert_text(text, "w1");
+    tree.insert_text(text, "w2");
+    age_tenant(&tree.root, "w1", 100);
+    age_tenant(&tree.root, "w2", 10);
+    let age_of = |tenant: &str| if tenant == "w1" { 100 } else { 10 };
+
+    let mut resolved = String::new();
+    let result = tree.match_and_insert_with(text, |result| {
+        resolved = result.tenant.to_string();
+        Some(if resolved == "w1" { "w2" } else { "w1" })
+    });
+    let routed = if resolved == "w1" { "w2" } else { "w1" };
+    assert_age(result.reuse_age_secs, age_of(routed));
+
+    assert_age(
+        tree.match_and_insert(text, &resolved).reuse_age_secs,
+        age_of(&resolved),
+    );
+    assert_age(tree.match_and_insert(text, routed).reuse_age_secs, 0);
+}

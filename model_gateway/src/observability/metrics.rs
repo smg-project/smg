@@ -289,6 +289,7 @@ mod handles {
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_MATCH_RATIO.set(None);
+        CACHE_TREE_REUSE_AGE.with_borrow_mut(HashMap::clear);
         ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
         ADMISSION_QUEUE_DEPTH.set(None);
         ADMISSION_INFLIGHT.set(None);

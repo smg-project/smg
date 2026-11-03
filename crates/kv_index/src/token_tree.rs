@@ -158,9 +158,11 @@ pub struct PrefixMatchResult {
     /// so a router can pressure-select among them instead of being bound to
     /// the single cached `tenant`. Empty when nothing matched.
     pub matched_tenants: Vec<TenantId>,
-    /// Seconds since `tenant` last accessed the deepest matched node, before
-    /// this match stamped it: how far back the reused prefix reaches. `None`
-    /// when nothing matched.
+    /// Seconds since the routed tenant last accessed the deepest matched
+    /// node, before this request stamped it: how far back the reused prefix
+    /// reaches. The routed tenant is the one `select` returned from
+    /// [`TokenTree::match_and_insert_with`], else `tenant`. `None` when
+    /// nothing matched, or the routed tenant does not hold that node.
     pub reuse_age_secs: Option<u64>,
 }
 
@@ -365,6 +367,51 @@ impl Node {
             }
         }
         Some((tenant, prev))
+    }
+
+    /// [`Self::touch_any_tenant`]'s pick without the stamp: the cached tenant
+    /// if it still owns this node, else the first in map order, with its
+    /// current stamp. The fused walk resolves through it, so a holder the
+    /// request is not routed to keeps the stamp of its own last access; the
+    /// replay stamps the tenant the request is routed to. Counts the LFU hit
+    /// the touch would have.
+    fn peek_any_tenant(&self, track_lfu: bool) -> Option<(TenantId, u64)> {
+        let cached = self.last_tenant.read().clone();
+        let picked = cached
+            .and_then(|tenant| {
+                let stamp = *self.tenant_last_access_time.get(tenant.as_ref())?;
+                Some((tenant, stamp))
+            })
+            .or_else(|| {
+                self.tenant_last_access_time
+                    .iter()
+                    .next()
+                    .map(|entry| (Arc::clone(entry.key()), *entry.value()))
+            })?;
+        if track_lfu {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(picked)
+    }
+
+    /// Stamp `tenant` if it is attached here, without attaching it: no edge
+    /// check is needed, since a node with a tenant attached is not detached.
+    /// Returns false when the tenant is not attached.
+    fn restamp_tenant(&self, tenant: &TenantId, ts: u64, track_lfu: bool) -> bool {
+        let Some(mut stamp) = self.tenant_last_access_time.get_mut(tenant.as_ref()) else {
+            return false;
+        };
+        *stamp = ts;
+        drop(stamp);
+        if track_lfu {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if ts & 0xF == 0 {
+            if let Some(mut guard) = self.last_tenant.try_write() {
+                *guard = Some(Arc::clone(tenant));
+            }
+        }
+        true
     }
 }
 
@@ -901,11 +948,13 @@ impl TokenTree {
     /// match completes. `select` is invoked once with the [`PrefixMatchResult`];
     /// `Some(tenant)` inserts `tokens` for it, `None` skips the insert.
     ///
-    /// Equivalent to match-then-[`Self::insert_tokens`] single-threaded. Under
-    /// concurrent node splits, `tenant_token_count` and routing stay exact (per-node
-    /// advances are frozen at match time); only per-node access timestamps are
-    /// approximate — a concurrently-split intermediate may miss a bump and evict
-    /// slightly early.
+    /// Equivalent to match-then-[`Self::insert_tokens`] single-threaded, except
+    /// that the match stamps nothing: only the inserting tenant is stamped, so a
+    /// holder the request was not routed to keeps its own last access (for its
+    /// LRU order and its reuse age). Under concurrent node splits,
+    /// `tenant_token_count` and routing stay exact (per-node advances are frozen
+    /// at match time); only per-node access timestamps are approximate — a
+    /// concurrently-split intermediate may miss a bump and evict slightly early.
     #[inline]
     pub fn match_and_insert_with<'t, F>(&self, tokens: &[TokenId], select: F) -> PrefixMatchResult
     where
@@ -967,10 +1016,10 @@ impl TokenTree {
         let mut matched_tokens = 0usize;
         let mut remaining = tokens;
         // Every full-match node we descended through, in order, and the tenant
-        // the match stamped on it (`None` once the match is frozen). Each node
+        // the match resolved on it (`None` once the match is frozen). Each node
         // is cloned once, into `path`; `current` indexes it (`None` = root).
         let mut path: Vec<NodeRef> = Vec::with_capacity(16);
-        let mut stamped: Vec<Option<TenantId>> = Vec::with_capacity(16);
+        let mut resolved: Vec<Option<TenantId>> = Vec::with_capacity(16);
         // The page key each edge of `path` was descended by, so the replay can
         // confirm an edge still exists before it attaches a tenant under it.
         let mut keys: Vec<TokenPageKey> = Vec::with_capacity(16);
@@ -979,8 +1028,8 @@ impl TokenTree {
         // tenant (an index into `path`), or the partial-match node.
         let mut last_full: Option<usize> = None;
         let mut partial: Option<(NodeRef, TenantId)> = None;
-        // The stamp the deepest matched node held before this match.
-        let mut last_prev_stamp: Option<u64> = None;
+        // The resolved tenant's stamp on the deepest matched node.
+        let mut resolved_stamp: Option<u64> = None;
         // Once match would stop (all-evicted node / partial), freeze the match
         // result but keep descending for insert (insert's reach is a superset).
         let mut match_frozen = false;
@@ -1029,10 +1078,10 @@ impl TokenTree {
                         // Partial match within the node: match stops here.
                         drop(child_tokens);
                         if !match_frozen {
-                            if let Some((t, prev)) = child.touch_any_tenant(ts, track_lfu) {
+                            if let Some((t, stamp)) = child.peek_any_tenant(track_lfu) {
                                 matched_tokens += match_len;
                                 partial = Some((child, t));
-                                last_prev_stamp = Some(prev);
+                                resolved_stamp = Some(stamp);
                             }
                             // (If the node is all-evicted, match records nothing
                             // and simply stops — same as match_prefix_with_counts.)
@@ -1047,15 +1096,15 @@ impl TokenTree {
                         drop(child_tokens);
                         let mut tenant = None;
                         if !match_frozen {
-                            match child.touch_any_tenant(ts, track_lfu) {
+                            match child.peek_any_tenant(track_lfu) {
                                 None => {
                                     // All-evicted: match stops, insert continues.
                                     match_frozen = true;
                                 }
-                                Some((t, prev)) => {
+                                Some((t, stamp)) => {
                                     matched_tokens += match_len;
                                     tenant = Some(t);
-                                    last_prev_stamp = Some(prev);
+                                    resolved_stamp = Some(stamp);
                                 }
                             }
                         }
@@ -1080,7 +1129,7 @@ impl TokenTree {
                         last_full = Some(path.len());
                     }
                     path.push(next);
-                    stamped.push(tenant);
+                    resolved.push(tenant);
                     keys.push(page_key);
                     remaining = &remaining[advance..];
                     current = Some(path.len() - 1);
@@ -1092,19 +1141,19 @@ impl TokenTree {
         let (tenant, matched_tenants) = match (&partial, last_full) {
             (Some((node, t)), _) => (Arc::clone(t), node.matched_tenants()),
             (None, Some(i)) => (
-                stamped[i]
+                resolved[i]
                     .as_ref()
                     .map_or_else(|| intern_tenant("empty"), Arc::clone),
                 path[i].matched_tenants(),
             ),
             (None, None) => (intern_tenant("empty"), Vec::new()),
         };
-        let result = PrefixMatchResult {
+        let mut result = PrefixMatchResult {
             tenant,
             matched_token_count: matched_tokens,
             input_token_count,
             matched_tenants,
-            reuse_age_secs: last_prev_stamp.and_then(stamp_age_secs),
+            reuse_age_secs: resolved_stamp.and_then(stamp_age_secs),
         };
         let Some(tenant) = select(&result) else {
             // No insert (router selected no worker).
@@ -1113,6 +1162,24 @@ impl TokenTree {
         // Intern through the shared pool so the stored Arc dedups with every
         // other call (matches insert_tokens' interning).
         let tenant_id = intern_tenant(tenant);
+
+        // The reuse age is the routed tenant's: its stamp on the node the match
+        // resolved on, before the replay below stamps it. `None` when it does
+        // not hold that node.
+        if !Arc::ptr_eq(&tenant_id, &result.tenant) {
+            let resolved_on = match (&partial, last_full) {
+                (Some((node, _)), _) => Some(node),
+                (None, Some(i)) => Some(&path[i]),
+                (None, None) => None,
+            };
+            result.reuse_age_secs = resolved_on
+                .and_then(|node| {
+                    node.tenant_last_access_time
+                        .get(tenant_id.as_ref())
+                        .map(|stamp| *stamp)
+                })
+                .and_then(stamp_age_secs);
+        }
 
         // ---- Phase 2: INSERT replay for `tenant_id` (no second walk) ----
         // Mirrors insert_tokens' root bookkeeping: ensure-present, so read
@@ -1150,26 +1217,17 @@ impl TokenTree {
         // detach that came first shows here as a lost edge; an attach that
         // came first leaves a node the detach keeps.
         let mut lost_edge = false;
-        for (i, (node, matched)) in path.iter().zip(&stamped).enumerate() {
-            // The match stamped this very tenant on this node a moment ago (the
-            // common hit: the request routes to the worker it matched). While
-            // it is still attached there is nothing to re-stamp or credit: the
-            // stamp already is this request's `ts` and `touch_any_tenant` did
-            // the `last_tenant` refresh, so only the LFU hit that the replay's
-            // `touch_tenant` would have counted is still owed. A read-locked
-            // lookup confirms the attachment; if an eviction took the tenant
-            // off this node in between, fall through so the replay re-attaches
-            // and credits it exactly as the two-pass version did. An eviction
-            // that lands after this check is indistinguishable from one that
-            // lands right after the request returns.
-            if matched.as_ref().is_some_and(|t| Arc::ptr_eq(t, &tenant_id))
-                && node
-                    .tenant_last_access_time
-                    .contains_key(tenant_id.as_ref())
-            {
-                if track_lfu {
-                    node.hit_count.fetch_add(1, Ordering::Relaxed);
-                }
+        for (i, node) in path.iter().enumerate() {
+            // Already attached (the common hit: the request routes to a worker
+            // that holds the prefix): stamp it, nothing to credit, and no edge
+            // check, since a node with a tenant attached is not detached. The
+            // match only read the stamps, so a holder the request does not
+            // route to keeps its own. If an eviction took the tenant off this
+            // node meanwhile, fall through so the replay re-attaches and
+            // credits it exactly as the two-pass version did. An eviction that
+            // lands after this is indistinguishable from one that lands right
+            // after the request returns.
+            if node.restamp_tenant(&tenant_id, ts, track_lfu) {
                 continue;
             }
             let parent = if i == 0 { &self.root } else { &path[i - 1] };

@@ -64,12 +64,14 @@ pub struct PrefixMatchResult {
     /// so a router can pressure-select among them instead of being bound to
     /// the single cached `tenant`. Empty when nothing matched.
     pub matched_tenants: Vec<TenantId>,
-    /// Seconds since `tenant` last accessed the node the match resolved on,
-    /// read before this match touched it: how far back the reused prefix
-    /// reaches. A node gets a stamp when a request ends on it (its leaf
-    /// insert) and on one match in eight, so on a node only passed through
-    /// the age can run up to that sampling gap long. `None` when nothing
-    /// matched, or when the tenant's stamp on that node carries no time (an
+    /// Seconds since the routed tenant last accessed the node the match
+    /// resolved on, read before this request touched it: how far back the
+    /// reused prefix reaches. The routed tenant is the one `select` returned
+    /// from [`Tree::match_and_insert_with`], else `tenant`. A node gets a
+    /// stamp when a request ends on it (its leaf insert) and on one match in
+    /// eight, so on a node only passed through the age can run up to that
+    /// sampling gap long. `None` when nothing matched, when the routed tenant
+    /// does not hold that node, or when its stamp there carries no time (an
     /// intermediate attach no access has stamped since).
     pub reuse_age_secs: Option<u64>,
 }
@@ -709,14 +711,16 @@ impl Tree {
         // timestamp touch and the result are the tail the fused walk shares
         // with this match.
         let (tenant, took_slow_path, stamp) = self.resolve_tenant_readonly(&curr);
-        self.finish_match(
+        let result = self.finish_match(
             &curr,
             tenant,
             took_slow_path,
             stamp,
             matched_chars,
             input_char_count,
-        )
+        );
+        Self::sample_touch(&curr, &result.tenant);
+        result
     }
 
     /// Read-only resolution of a node's "owning" tenant: the `last_tenant`
@@ -766,7 +770,9 @@ impl Tree {
     /// [`PrefixMatchResult`] (`None` skips the insert). The matched prefix is
     /// compared once. The match runs fully before any insert mutation, so the
     /// tenant pick observes the un-polluted tree; only insert's timestamps shift
-    /// by a few ticks, immaterial to LRU.
+    /// by a few ticks, immaterial to LRU. The match's sampled touch goes to the
+    /// tenant `select` returns, so a holder the request is not routed to keeps
+    /// its own last access.
     #[inline]
     pub fn match_and_insert_with<'t, F>(&self, text: &str, select: F) -> PrefixMatchResult
     where
@@ -864,7 +870,7 @@ impl Tree {
             (None, None) => &self.root,
         };
         let (match_tenant, match_slow, match_stamp) = self.resolve_tenant_readonly(match_curr);
-        let result = self.finish_match(
+        let mut result = self.finish_match(
             match_curr,
             match_tenant,
             match_slow,
@@ -880,6 +886,18 @@ impl Tree {
         // Intern through the shared pool so the stored Arc dedups (matches
         // insert_text's interning).
         let tenant_id = intern_tenant(tenant);
+
+        // The reuse age and the match's sampled touch are the routed tenant's,
+        // so a holder the request is not routed to keeps its own last access.
+        // The age is read before the touch and the insert stamp it; `None`
+        // when the routed tenant does not hold the node.
+        if !Arc::ptr_eq(&tenant_id, &result.tenant) && matched_chars > 0 {
+            result.reuse_age_secs = match_curr
+                .tenant_last_access_time
+                .get(tenant_id.as_ref())
+                .and_then(|stamp| stamp_age_secs(*stamp));
+        }
+        Self::sample_touch(match_curr, &tenant_id);
 
         // ---- Phase 2: INSERT for `tenant_id` without re-walking the prefix ----
         // Root bookkeeping (mirrors insert_text): ensure-present, so read first
@@ -978,14 +996,29 @@ impl Tree {
         result
     }
 
+    /// The match's probabilistic (1 in 8) timestamp touch on the node it
+    /// resolved on, for `tenant` if it holds that node, to keep the contention
+    /// on the tenant map low (LRU eviction needs no exact timestamps). A
+    /// tenant that does not hold the node (the synthetic "empty" one, or one
+    /// an eviction removed meanwhile) is not attached: that is the insert's
+    /// work.
+    fn sample_touch(match_node: &NodeRef, tenant: &TenantId) {
+        let epoch = get_epoch();
+        if epoch & 0x7 == 0 {
+            if let Some(mut stamp) = match_node.tenant_last_access_time.get_mut(tenant.as_ref()) {
+                *stamp = epoch;
+            }
+        }
+    }
+
     /// The match's tail, shared by [`Self::match_prefix_with_counts`] and the
     /// fused walk behind [`Self::match_and_insert_with`]: replay the single
     /// deferred side effect of the tenant resolution (populate the
-    /// `last_tenant` cache on the slow path), then the probabilistic 1-in-8
-    /// timestamp touch on the resolved final node, and build the match result
-    /// (its reuse age from `stamp`, the tenant's stamp before that touch),
-    /// which takes `tenant` as it is (the callers hand over the id they
-    /// resolved, so the tail costs what the inline one did).
+    /// `last_tenant` cache on the slow path), and build the match result (its
+    /// reuse age from `stamp`, the tenant's stamp before any touch), which
+    /// takes `tenant` as it is (the callers hand over the id they resolved, so
+    /// the tail costs what the inline one did). The callers then make the
+    /// match's sampled touch ([`Self::sample_touch`]).
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the tree; the match's tail"
@@ -1002,17 +1035,6 @@ impl Tree {
         // On the slow path the original resolution populates the cache.
         if took_slow_path {
             *match_node.last_tenant.write() = Some(Arc::clone(&tenant));
-        }
-
-        // Probabilistic (1 in 8) timestamp touch on the resolved tenant, to keep
-        // the contention on the tenant map low (LRU eviction needs no exact
-        // timestamps), skipping the synthetic "empty" tenant so a tenant no
-        // insert ever named does not enter the tree.
-        let epoch = get_epoch();
-        if epoch & 0x7 == 0 && tenant.as_ref() != "empty" {
-            match_node
-                .tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
         }
 
         PrefixMatchResult {

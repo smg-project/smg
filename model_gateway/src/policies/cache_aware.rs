@@ -3225,14 +3225,14 @@ impl CacheAwarePolicy {
                 boundary,
                 hash_token_head(info.cache_namespace, &tokens[..boundary]),
             );
-            let (holder_candidates, reuse_age) = self.live_holders(&url_to_idx, model_id, key, now);
+            let holder_candidates = self.live_holders(&url_to_idx, model_id, key, now);
             if holder_candidates.is_empty() {
                 continue;
             }
             // A holder of this boundary holds `boundary` tokens of the prompt.
             let holders: Vec<(usize, f64)> = holder_candidates
                 .iter()
-                .map(|&idx| (idx, boundary as f64))
+                .map(|&(idx, _)| (idx, boundary as f64))
                 .collect();
             let selected = self.select_final_from_affinity(
                 workers,
@@ -3241,11 +3241,19 @@ impl CacheAwarePolicy {
                 avg_load,
                 info,
             )?;
-            let hit = holder_candidates.contains(&selected);
-            let branch = if hit { "hash_hit" } else { "hash_spill" };
-            // Only a request that lands on a holder reuses the head; a spill
-            // (or a declined selection, returned above) reuses nothing.
-            if let (true, Some(age)) = (hit, reuse_age) {
+            // Only a request that lands on a holder reuses the head, as old as
+            // that holder's last dispatch of it; a spill (or a declined
+            // selection, returned above) reuses nothing.
+            let reuse_age = holder_candidates
+                .iter()
+                .find(|&&(idx, _)| idx == selected)
+                .map(|&(_, age)| age);
+            let branch = if reuse_age.is_some() {
+                "hash_hit"
+            } else {
+                "hash_spill"
+            };
+            if let Some(age) = reuse_age {
                 Metrics::record_cache_tree_reuse_age(
                     "hash",
                     metrics_role_of(&self.metrics_role),
@@ -3333,41 +3341,41 @@ impl CacheAwarePolicy {
         key: (usize, u64),
         now: Instant,
     ) -> Vec<usize> {
-        self.live_holders(url_to_idx, model_id, key, now).0
+        self.live_holders(url_to_idx, model_id, key, now)
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
-    /// [`Self::live_holder_candidates`], with how long ago the most recent of
-    /// those holders last dispatched the head: the reuse age of a hit on
-    /// `key`. `None` when no healthy worker holds it.
+    /// [`Self::live_holder_candidates`], each with how long ago its holder
+    /// last dispatched the head: the reuse age of a hit on that worker.
     fn live_holders(
         &self,
         url_to_idx: &HashMap<&str, Vec<usize>>,
         model_id: &str,
         key: (usize, u64),
         now: Instant,
-    ) -> (Vec<usize>, Option<Duration>) {
+    ) -> Vec<(usize, Duration)> {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
         let Some(model) = self
             .placement_index
             .get(model_id)
             .map(|entry| Arc::clone(entry.value()))
         else {
-            return (Vec::new(), None);
+            return Vec::new();
         };
         let Some(mut holders) = model.get_mut(&key) else {
-            return (Vec::new(), None);
+            return Vec::new();
         };
         holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
         let mut candidates = Vec::new();
-        let mut reuse_age: Option<Duration> = None;
         for holder in holders.iter() {
             if let Some(indices) = url_to_idx.get(holder.worker_url.as_str()) {
-                candidates.extend_from_slice(indices);
                 let age = now.duration_since(holder.last_touch);
-                reuse_age = Some(reuse_age.map_or(age, |newest| newest.min(age)));
+                candidates.extend(indices.iter().map(|&idx| (idx, age)));
             }
         }
-        (candidates, reuse_age)
+        candidates
     }
 
     /// Record/touch `worker_url` at every applicable boundary of this
@@ -3520,8 +3528,6 @@ impl CacheAwarePolicy {
             result.matched_token_count.saturating_sub(marker_len),
             result.input_token_count.saturating_sub(marker_len),
             result.reuse_age_secs,
-            selected_idx.map(|idx| workers[idx].url()),
-            &result.matched_tenants,
         );
 
         let idx = selected_idx?;
@@ -3550,25 +3556,21 @@ impl CacheAwarePolicy {
     /// prefix: its match rate (namespace marker excluded) is over
     /// `cache_threshold`, the rate at which the selection holds a request to
     /// the prefix's holders, and the selected worker is one of those holders.
-    /// A shorter match (a few chars of a common opening in the string tree)
-    /// or a spill to a worker without the prefix says nothing about how far
-    /// back the cache reaches.
+    /// The tree reads the age from the selected worker's own stamp, and has
+    /// none for a worker without the prefix. A shorter match (a few chars of a
+    /// common opening in the string tree) or a spill to a worker without the
+    /// prefix says nothing about how far back the cache reaches.
     fn record_tree_reuse_age(
         &self,
         tree: &'static str,
         matched: usize,
         input: usize,
         reuse_age_secs: Option<u64>,
-        selected: Option<&str>,
-        matched_tenants: &[TenantId],
     ) {
-        let (Some(age), Some(selected)) = (reuse_age_secs, selected) else {
+        let Some(age) = reuse_age_secs else {
             return;
         };
-        let reused = input > 0
-            && matched as f32 / input as f32 > self.config.cache_threshold
-            && matched_tenants.iter().any(|t| t.as_ref() == selected);
-        if reused {
+        if input > 0 && matched as f32 / input as f32 > self.config.cache_threshold {
             Metrics::record_cache_tree_reuse_age(tree, metrics_role_of(&self.metrics_role), age);
         }
     }
@@ -3636,8 +3638,6 @@ impl CacheAwarePolicy {
             result.matched_char_count.saturating_sub(marker_len),
             result.input_char_count.saturating_sub(marker_len),
             result.reuse_age_secs,
-            selected_idx.map(|idx| workers[idx].url()),
-            &result.matched_tenants,
         );
 
         let idx = selected_idx?;

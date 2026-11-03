@@ -592,9 +592,6 @@ impl PolicyRegistry {
         }
     }
 
-    /// Inject the mesh adapter into a policy if it's cache-aware.
-    /// The setter also flips `populate_hash_index` to match adapter
-    /// presence, so callers do not need to touch that flag directly.
     /// Label a cache-aware role policy's cache metrics with its pool, so the
     /// prefill and decode policies of a PD router (each with its own index)
     /// report apart rather than as one series.
@@ -604,6 +601,9 @@ impl PolicyRegistry {
         }
     }
 
+    /// Inject the mesh adapter into a policy if it's cache-aware.
+    /// The setter also flips `populate_hash_index` to match adapter
+    /// presence, so callers do not need to touch that flag directly.
     fn maybe_inject_mesh_tree_sync(
         policy: &Arc<dyn LoadBalancingPolicy>,
         adapter: Option<&Arc<TreeSyncAdapter>>,

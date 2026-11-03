@@ -3743,10 +3743,10 @@ fn hash_multiple_holders_use_expected_wait_only_within_affinity_set() {
     assert_only_final_worker_credited(&policy, &workers, 1, 16);
 }
 
-/// A hit on a head reports how long ago its most recent holder last
-/// dispatched it; a holder of another head does not count.
+/// Each live holder of a head comes with how long ago it last dispatched
+/// the head; a holder of another head does not count.
 #[test]
-fn hash_mode_live_holders_report_the_newest_holders_age() {
+fn hash_mode_live_holders_report_each_holders_age() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1]);
@@ -3763,17 +3763,17 @@ fn hash_mode_live_holders_report_the_newest_holders_age() {
     );
     let key = (16usize, hash_token_head(None, &head));
 
-    let (holders, age) = policy.live_holders(&url_to_idx, "m", key, t0 + Duration::from_secs(100));
-    assert_eq!(holders.len(), 2);
+    let mut holders = policy.live_holders(&url_to_idx, "m", key, t0 + Duration::from_secs(100));
+    holders.sort_unstable();
     assert_eq!(
-        age,
-        Some(Duration::from_secs(60)),
-        "w2's touch is the newest"
+        holders,
+        vec![(0, Duration::from_secs(100)), (1, Duration::from_secs(60))]
     );
-    assert_eq!(
-        policy.live_holders(&url_to_idx, "m", (16, 7), t0).1,
-        None,
-        "no holder, no age"
+    assert!(
+        policy
+            .live_holders(&url_to_idx, "m", (16, 7), t0)
+            .is_empty(),
+        "no holder"
     );
 }
 
@@ -3808,6 +3808,46 @@ fn hash_mode_selection_records_reuse_age_on_a_hit() {
             "{series} missing; rendered:\n{rendered}"
         );
     }
+}
+
+/// With two holders of a head, a hit records the age of the holder it lands
+/// on, not the newest holder's.
+#[test]
+fn hash_mode_hit_records_the_selected_holders_age() {
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let model = normalize_model_key(workers[0].model_id());
+    let tokens: Vec<u32> = (0..32).collect();
+    let now = Instant::now();
+    let ago = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+    policy.record_placement(model, None, &tokens, &[16], workers[0].url(), ago(30));
+    policy.record_placement(model, None, &tokens, &[16], workers[1].url(), ago(5));
+    // The newer holder is busier, so the hit lands on the older one.
+    workers[1].increment_load();
+
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
+            CACHE_TREE_REUSE_AGE_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    let selected =
+        metrics::with_local_recorder(&recorder, || route_tokens(&policy, &workers, &tokens));
+    assert_eq!(selected, 0);
+    let rendered = handle.render();
+    let sum: f64 = rendered
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(
+                "smg_cache_tree_reuse_age_seconds_sum{tree=\"hash\",worker_type=\"regular\"} ",
+            )
+        })
+        .unwrap_or_else(|| panic!("no hash reuse age; rendered:\n{rendered}"))
+        .parse()
+        .unwrap();
+    assert_eq!(sum, 30.0, "w1's age, not w2's 5 s");
 }
 
 #[test]
