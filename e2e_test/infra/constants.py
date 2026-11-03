@@ -87,6 +87,11 @@ ENV_STARTUP_TIMEOUT = (
 )
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
+# A tracing filter for the Rust servicer in every worker a lane starts (the worker
+# process's RUST_LOG; the gateway's own logging is untouched). Empty or unset leaves
+# the servicer's default. A lane whose tests read the servicer's per-request line
+# raises that line's target: "info,engine_servicer::request=debug".
+ENV_WORKER_RUST_LOG = "E2E_WORKER_RUST_LOG"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 

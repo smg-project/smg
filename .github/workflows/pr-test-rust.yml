@@ -1657,6 +1657,8 @@ jobs:
       test_timeout: ${{ matrix.test_timeout || 34 }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The rank-pin cases read the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
       min_selected: ${{ matrix.min_selected }}
       servicer_impl: ${{ matrix.servicer_impl || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
@@ -1682,6 +1684,8 @@ jobs:
       test_timeout: 34
       test_dirs: e2e_test/router/test_pd_multimodal.py
       mm_processing: worker
+      # The placement assertion reads the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
       min_selected: 4 # the 4 PD multimodal cases
     secrets: inherit
 
