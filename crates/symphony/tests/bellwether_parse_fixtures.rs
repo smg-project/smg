@@ -24,7 +24,9 @@
 //! case's request tools, and the Qwen2.5 table, each after the turn opener the registry names
 //! for it and the prompt tail its template leaves, on as many threads as the run has CPUs, each
 //! model's report written in the table's order as soon as it and the models before it are done;
-//! it skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! it skips the slugs bellwether has not recorded yet, and says so, and a slug whose manifest
+//! names its checkpoint group replays the group's sets, recorded once under its primary's slug,
+//! under its own id ([`sets_of`]). When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -609,9 +611,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
     // Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct: one template, byte for byte the
     // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry. bellwether records
-    // the 3.3 group's hand-written sets; the 3.1 manifest is a member of its group (the same
-    // inputs) with no sets of its own, so that slug keeps its notice until the member is followed
-    // to its primary.
+    // the 3.3 group's hand-written sets; the 3.1 manifest is a member of a group recorded under
+    // another slug (the same inputs, no sets of its own), so its row replays that group's sets
+    // ([`sets_of`]).
     ("llama-3.1-8b-instruct", GenerationPrompt::Plain),
     ("llama-3.3-70b-instruct", GenerationPrompt::Plain),
     // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
@@ -1045,8 +1047,10 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         if format.name() == "dots3" {
             continue;
         }
-        let Ok(text) = fs::read_to_string(root.join(slug).join("render").join("common.jsonl"))
-        else {
+        let Some(sets) = sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(sets.dir.join("common.jsonl")) else {
             continue;
         };
         let Some(rendered) = text
@@ -1096,6 +1100,184 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         root.display()
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A slug's recorded sets of one kind under the tree: their directory, and the primary whose sets
+/// they are when the slug is a member of a checkpoint group.
+#[derive(Debug)]
+struct Sets {
+    dir: PathBuf,
+    /// The slug of the group's primary, for a member; a slug's own sets carry none.
+    primary: Option<String>,
+}
+
+/// Where `slug`'s sets of `kind` (`parse`, `render`) are under `root`: its own `<slug>/<kind>`
+/// when bellwether recorded the slug, else its group's primary's, read from the `group` key of the
+/// slug's `manifest.toml`. bellwether records a checkpoint group (one tokenizer, template and
+/// generation config) once, under its primary's slug; the other members' manifests name the group
+/// and hold no sets, and `bellwether unpack` writes every member's manifest. None when neither
+/// directory exists: the slug is not recorded yet. A manifest whose `group` cannot be read is an
+/// error ([`group_of`]).
+fn sets_of(root: &std::path::Path, slug: &str, kind: &str) -> Result<Option<Sets>, String> {
+    let own = root.join(slug).join(kind);
+    if own.is_dir() {
+        return Ok(Some(Sets {
+            dir: own,
+            primary: None,
+        }));
+    }
+    let Some(primary) = group_of(&root.join(slug).join("manifest.toml"))? else {
+        return Ok(None);
+    };
+    let dir = root.join(&primary).join(kind);
+    Ok(dir.is_dir().then_some(Sets {
+        dir,
+        primary: Some(primary),
+    }))
+}
+
+/// The `group` a bellwether manifest names, the slug of its group's primary: `bellwether
+/// manifests` writes the key as one `group = "<slug>"` line on a member's manifest and none on a
+/// primary's. None when there is no such file or it names no group; an error naming the file when
+/// it cannot be read or its `group` value is not a double-quoted slug (a literal string, a
+/// trailing comment, an escape, a path separator): a none there would read as a slug bellwether
+/// has not recorded, and the member would be skipped with the notice instead of failing the run.
+fn group_of(manifest: &std::path::Path) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(manifest) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", manifest.display())),
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "group" {
+            continue;
+        }
+        let value = value.trim();
+        let slug = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .filter(|slug| !slug.is_empty() && !slug.contains(['/', '\\', '"']));
+        return match slug {
+            Some(slug) => Ok(Some(slug.to_string())),
+            None => Err(format!(
+                "{}: `group = {value}` is not a double-quoted slug; a member's manifest names \
+                 its group's primary as `group = \"<slug>\"`",
+                manifest.display()
+            )),
+        };
+    }
+    Ok(None)
+}
+
+/// A tree in bellwether's layout under the build's `target/tmp`, removed when dropped.
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new(name: &str) -> std::io::Result<Self> {
+        let pid = std::process::id();
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("symphony-bellwether-{name}-{pid}"));
+        fs::create_dir_all(&root)?;
+        Ok(Self(root))
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_recorded_slugs_sets_are_its_own() {
+    let tree = TempTree::new("own").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    let sets = sets_of(&tree.0, "primary", "parse")
+        .expect("a readable tree")
+        .expect("recorded");
+    assert_eq!(sets.dir, tree.0.join("primary/parse"));
+    assert!(sets.primary.is_none());
+}
+
+#[test]
+fn a_members_sets_are_its_groups_primarys() {
+    let tree = TempTree::new("member").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    fs::create_dir_all(tree.0.join("member")).expect("the member's directory");
+    // The manifest as `bellwether manifests` writes it: the key padded, a comment, the quoted
+    // keys of `[inputs]`; none of the others is the group.
+    fs::write(
+        tree.0.join("member/manifest.toml"),
+        "model    = \"org/Member\"\nrevision = \"0123abcd\"\ntier     = 3\n\
+         # group = \"not-this-one\"\ngroup    = \"primary\"\n\n\
+         [inputs]  # sha256 of each oracle input\n\"tokenizer.json\" = \"group\"\n",
+    )
+    .expect("the member's manifest");
+    let sets = sets_of(&tree.0, "member", "parse")
+        .expect("a readable tree")
+        .expect("the group is recorded");
+    assert_eq!(sets.dir, tree.0.join("primary/parse"));
+    assert_eq!(sets.primary.as_deref(), Some("primary"));
+    assert!(
+        sets_of(&tree.0, "member", "render")
+            .expect("a readable tree")
+            .is_none(),
+        "the group has no render sets"
+    );
+}
+
+#[test]
+fn a_slug_without_sets_or_a_recorded_group_is_not_recorded() {
+    let tree = TempTree::new("unrecorded").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("lonely")).expect("a member's directory");
+    fs::write(
+        tree.0.join("lonely/manifest.toml"),
+        "model = \"org/Lonely\"\ngroup = \"absent\"\n",
+    )
+    .expect("a manifest naming a group the tree lacks");
+    fs::create_dir_all(tree.0.join("primary")).expect("a primary's directory");
+    fs::write(
+        tree.0.join("primary/manifest.toml"),
+        "model = \"org/Primary\"\n",
+    )
+    .expect("a primary's manifest before its sets");
+    for slug in ["lonely", "primary", "missing"] {
+        assert!(
+            sets_of(&tree.0, slug, "parse")
+                .expect("a readable tree")
+                .is_none(),
+            "{slug}"
+        );
+    }
+}
+
+#[test]
+fn a_group_value_this_reader_cannot_read_ends_the_run() {
+    let tree = TempTree::new("malformed").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    for (slug, line) in [
+        ("literal", "group = 'primary'"),
+        ("comment", "group = \"primary\"  # the group"),
+        ("escape", "group = \"pri\\\"mary\""),
+        ("separator", "group = \"../primary\""),
+        ("empty", "group = \"\""),
+    ] {
+        fs::create_dir_all(tree.0.join(slug)).expect("the member's directory");
+        fs::write(
+            tree.0.join(slug).join("manifest.toml"),
+            format!("model = \"org/{slug}\"\n{line}\n"),
+        )
+        .expect("the member's manifest");
+        let error = sets_of(&tree.0, slug, "parse")
+            .expect_err("a group value this reader cannot read is an error, not a skip");
+        assert!(
+            error.contains(slug) && error.contains("double-quoted slug"),
+            "{slug}: {error}"
+        );
+    }
 }
 
 /// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case
@@ -1674,21 +1856,28 @@ enum Replayed {
     reason = "a set that cannot be read ends the test with its path"
 )]
 fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) -> Replayed {
-    let dir = root.join(slug).join("parse");
-    if !dir.is_dir() {
+    let Some(Sets { dir, primary }) =
+        sets_of(root, slug, "parse").unwrap_or_else(|e| panic!("{e}"))
+    else {
         return Replayed::Skipped(format!(
             "skipping {slug}: bellwether has not recorded its parse sets yet"
         ));
-    }
-    if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+    };
+    // The sets read are the primary's for a member, and the lists keyed by slug describe the
+    // sets; the table and the format are the slug's own.
+    let recorded = primary.as_deref().unwrap_or(slug);
+    if let Some((_, reason)) = SKIPPED
+        .iter()
+        .find(|(skipped, _)| *skipped == slug || *skipped == recorded)
+    {
         return Replayed::Skipped(format!("skipping {slug}: {reason}"));
     }
     let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
     let model = model_of(slug);
     let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
     let format = for_model(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
-    let known_differences = table.known_differences(slug, prompt);
-    let allowed = table.allowances(slug, prompt);
+    let known_differences = table.known_differences(recorded, prompt);
+    let allowed = table.allowances(recorded, prompt);
     let Parity {
         report,
         summary,
@@ -1707,9 +1896,16 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
             holds_a_list_after_content: table.holds_a_list_after_content(),
         },
     );
+    let heading = match &primary {
+        Some(primary) => format!(
+            "{slug} ({}, {prompt:?}), the sets of {primary}:",
+            table.name()
+        ),
+        None => format!("{slug} ({}, {prompt:?}):", table.name()),
+    };
     Replayed::Compared {
-        report: format!("{slug} ({}, {prompt:?}):\n{report}", table.name()),
-        summary: format!("{slug} ({}, {prompt:?}):\n{summary}", table.name()),
+        report: format!("{heading}\n{report}"),
+        summary: format!("{heading}\n{summary}"),
         failures,
     }
 }
@@ -2938,12 +3134,12 @@ fn corrupt_model(
     slug: &'static str,
     prompt: GenerationPrompt,
 ) -> Corrupted {
-    let dir = root.join(slug).join("parse");
-    if !dir.is_dir() {
+    let Some(Sets { dir, .. }) = sets_of(root, slug, "parse").unwrap_or_else(|e| panic!("{e}"))
+    else {
         return Corrupted::Skipped(format!(
             "skipping {slug}: bellwether has not recorded its parse sets yet"
         ));
-    }
+    };
     let Cases { fixtures, .. } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
     let model = model_of(slug);
     let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
