@@ -11,9 +11,7 @@ import pytest
 from infra import worker, worker_pool
 from infra.constants import ConnectionMode, WorkerType
 
-_INVALID_PAIRS = [
-    (engine, mode) for engine in ("sglang", "vllm") for mode in ConnectionMode
-] + [
+_INVALID_PAIRS = [(engine, mode) for engine in ("sglang", "vllm") for mode in ConnectionMode] + [
     ("trtllm", ConnectionMode.GRPC),
     ("mlx", ConnectionMode.GRPC),
     ("mock", ConnectionMode.GRPC),
