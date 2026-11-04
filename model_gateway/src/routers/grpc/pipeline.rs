@@ -650,8 +650,9 @@ impl RequestPipeline {
     /// Full two-phase run. `metrics_endpoint` enables the request's
     /// router-request, error and duration records, one each per request as
     /// the HTTP routers record a route (the responses-internal entry points
-    /// pass `None`: the Responses route records its own); `retry_config`
-    /// enables the dispatch-phase retry loop.
+    /// pass `None`: a Responses turn runs the pipeline once per tool-loop
+    /// iteration, so the pipeline is not where that turn is counted);
+    /// `retry_config` enables the dispatch-phase retry loop.
     ///
     /// The run is boxed once, here, and the context moves straight into that
     /// box: it holds ingress + per-attempt state across awaits, and an
