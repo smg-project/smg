@@ -269,6 +269,14 @@ jobs:
       # test that needs a tool this runner lacks skips itself and says so under -rs),
       # the shell tests one by one. A new test file runs from its first commit instead
       # of waiting for a name here; scripts/tests/test_ci_tooling_tests.py pins this step.
+      # The release tests drive scripts/release/release.sh, which runs `make`; this
+      # runner's image ships no build tools (go-unit-tests installs its own too).
+      - name: Install the tools the tooling tests drive
+        run: |
+          bash scripts/ci_apt_mirror.sh
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+
       # `python -m pytest`, not the console script: it puts the repository root on
       # sys.path, which the tests that import `scripts.<module>` need to collect.
       - name: Run CI tooling unit tests
