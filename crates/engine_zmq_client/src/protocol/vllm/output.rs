@@ -87,6 +87,8 @@ pub struct EngineCoreEvent {
 /// every token batch pays.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineCoreOutput {
+    /// Local metadata copied from the enclosing batch; never serialized.
+    pub batch_timestamp: Option<f64>,
     pub request_id: String,
     pub new_token_ids: Vec<u32>,
     /// Decoded sample logprobs for the newly generated positions.
@@ -252,6 +254,7 @@ impl WireEngineCoreOutput {
     /// Resolve the wire-format logprobs using the aux frames.
     fn resolve(self, frames: &[Bytes]) -> Result<EngineCoreOutput> {
         Ok(EngineCoreOutput {
+            batch_timestamp: None,
             request_id: self.request_id,
             new_token_ids: self.new_token_ids,
             new_logprobs: self

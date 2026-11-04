@@ -44,8 +44,10 @@ fn core(
 /// vLLM's report: the core, the cache hit rate and the token counts; no
 /// sections on its wire.
 impl From<&vllm_proto::SchedulerLoad> for common::EngineLoad {
+    /// Preserve optional input capacity when converting a poll to a pushed record.
     fn from(load: &vllm_proto::SchedulerLoad) -> Self {
         Self {
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -156,6 +158,7 @@ impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
 /// unset stays at the type's default, which the gateway merges with what it
 /// knew from the last record that carried it.
 impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
+    /// Read input capacity directly, including absence after the samples expire.
     fn from(record: &common::EngineLoad) -> Self {
         let signed = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
         let disagg = record.disaggregation.as_ref();
@@ -173,6 +176,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
             max_total_num_tokens: record.max_total_num_tokens.unwrap_or(0),
             token_usage: record.token_usage,
             gen_throughput: record.gen_throughput,
+            prefill_throughput: record.prefill_throughput,
             cache_hit_rate: record.cache_hit_rate.unwrap_or(0.0),
             utilization: record.token_usage,
             max_running_requests: signed(record.max_running_requests),
@@ -227,6 +231,25 @@ pub fn core_only(record: &mut common::EngineLoad) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polling and core-only push records preserve optional input capacity.
+    #[test]
+    fn prefill_capacity_survives_poll_push_and_core_only_and_clears_when_absent() {
+        for rate in [Some(1234.0), None] {
+            let load = vllm_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                gen_throughput: 0.5,
+                ..Default::default()
+            };
+            let polled = SchedulerLoadSnapshot::from(load);
+            let mut pushed = common::EngineLoad::from(&load);
+            core_only(&mut pushed);
+            let pushed = SchedulerLoadSnapshot::from(&pushed);
+            assert_eq!(polled.prefill_throughput, rate);
+            assert_eq!(pushed.prefill_throughput, rate);
+            assert_eq!(pushed.gen_throughput, 0.5);
+        }
+    }
 
     /// A SGLang rank with every section set, as the Python servicer reports
     /// one. `utilization`, `num_total_reqs` and the queued token-work are
@@ -340,6 +363,7 @@ mod tests {
         );
     }
 
+    /// Legacy vLLM loads without measured capacity remain identical on both wires.
     #[test]
     fn a_vllm_rank_reads_the_same_from_the_record_as_from_the_poll() {
         let rank = vllm_proto::SchedulerLoad {
@@ -351,6 +375,7 @@ mod tests {
             max_total_num_tokens: 676_144,
             token_usage: 0.1479,
             gen_throughput: 2_000.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.33,
             utilization: 0.1479,
             max_running_requests: 256,

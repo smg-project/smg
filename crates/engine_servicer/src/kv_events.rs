@@ -352,7 +352,8 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
 /// batch: any queue, running or window change, KV usage by half a percent,
 /// the rate by 5 % or 50 tokens per second.
 pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.running_requests != current.running_requests
+    last.prefill_throughput != current.prefill_throughput
+        || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests

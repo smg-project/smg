@@ -172,7 +172,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape, with the handshake's capacity figures and, from this
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
-/// token-work, generation throughput and hit rate that vLLM's stats do not
+/// token-work, prefill/generation throughput and hit rate that vLLM's stats do not
 /// carry, each rank's own: the servicer picks the rank a request goes to
 /// and sees what that rank cached and streamed for it.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
@@ -206,6 +206,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 max_total_num_tokens,
                 num_waiting_uncached_tokens: estimate.queued_token_work,
                 gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
                 cache_hit_rate: estimate.cache_hit_rate,
             }
         },
@@ -217,6 +218,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 max_total_num_tokens,
                 num_waiting_uncached_tokens: estimate.queued_token_work,
                 gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
                 cache_hit_rate: estimate.cache_hit_rate,
                 ..Default::default()
             }
