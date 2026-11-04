@@ -1116,8 +1116,9 @@ impl PrefillTicket {
     }
 
     /// The first response came back, reporting `cached` prompt tokens served
-    /// from the engine's prefix cache.
-    fn first_response(&mut self, cached: u64) {
+    /// from the engine's prefix cache (zero when the transport reports no
+    /// count).
+    pub(crate) fn first_response(&mut self, cached: u64) {
         if !self.released {
             self.released = true;
             self.worker

@@ -53,7 +53,9 @@ use crate::{
     rate_limit::RateLimitManager,
     routers::{
         common::{
-            attach_sized_body, header_utils,
+            attach_sized_body,
+            attempt_ledger::failed_side,
+            header_utils,
             kv_transfer::{
                 carries_moriio_peer_markers, connector_mode_for_worker, is_moriio_worker,
                 mooncake_decode_params, mooncake_prefill_params, moriio_decode_params,
@@ -64,6 +66,7 @@ use crate::{
             },
             overload,
             pd_failure::{PdSide, SidePhase},
+            pd_silence::{await_prefill_within, PrefillBound, SilenceVerdict},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
@@ -74,9 +77,13 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{
-            error_reason_for_response, error_type_for_response, error_type_from_status,
-            route_to_endpoint,
+        grpc::{
+            common::stages::helpers::middleware_request_id,
+            proto_wrapper::PrefillTicket,
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
         },
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
@@ -85,7 +92,8 @@ use crate::{
     worker::{
         acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
         PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -214,6 +222,13 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+    /// The prompt's length the prefill side's silence bound is sized by: the
+    /// request's token ids when it carries them, else the rate limiter's
+    /// estimate of its input tokens (the gRPC pipeline reads its tokenized
+    /// prompt).
+    prompt_tokens: u64,
+    /// The middleware's request id, for the lines a side's verdict writes.
+    request_id: Option<&'a str>,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -607,6 +622,10 @@ impl PDRouter {
         } else {
             (None, None)
         };
+        let prompt_tokens = match &tokens {
+            Some(ids) => ids.len() as u64,
+            None => u64::from(body.estimated_input_tokens(text.as_deref())),
+        };
         let routing = RoutingDerivatives {
             tokens,
             text,
@@ -623,6 +642,8 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
+            prompt_tokens,
+            request_id: middleware_request_id(tenant_meta),
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
@@ -1119,6 +1140,7 @@ impl PDRouter {
             response.status(),
             prefill_outcome,
             head_success_recorded(&response),
+            failed_side(&response),
         );
         response
     }
@@ -1135,7 +1157,20 @@ impl PDRouter {
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
         decode_head_recorded: bool,
+        failed_side: Option<WorkerType>,
     ) {
+        // A side given up on alone (a prefill silent past its bound, see
+        // `pd_silence`) had its worker error counted where the verdict fell;
+        // its breaker sample is taken here on that side's worker, and its
+        // partner, which was waiting on it, is not charged.
+        if let Some(side) = failed_side {
+            if side == WorkerType::Prefill {
+                prefill.record_outcome(status.as_u16());
+            } else {
+                decode.record_outcome(status.as_u16());
+            }
+            return;
+        }
         let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
         if attempt_records_prefill {
             prefill.record_outcome(status.as_u16());
@@ -1375,10 +1410,38 @@ impl PDRouter {
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
         let dispatch_start = Instant::now();
+        // The prefill side's silence is bounded from its dispatch, as the gRPC
+        // pipeline's `execute_parallel_pd` bounds it: the bound read before
+        // the side is booked on its worker, so its own prompt is not counted
+        // twice, and the booking taken before the call is polled.
+        let bound = PrefillBound::at(&prefill, context.prompt_tokens, dispatch_start);
+        let mut prefill_ticket = PrefillTicket::book_as(&prefill, context.prompt_tokens, false);
         let prefill_fut = async {
-            let resp = send_with_stale_conn_retry(prefill_request)
-                .await
-                .map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?;
+            let send = send_with_stale_conn_retry(prefill_request);
+            tokio::pin!(send);
+            let resp = match await_prefill_within(
+                bound.as_ref(),
+                send,
+                &prefill,
+                None,
+                metrics_labels::CONNECTION_HTTP,
+                context.request_id.unwrap_or_default(),
+                context.prompt_tokens,
+            )
+            .await
+            {
+                Ok(sent) => sent.map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?,
+                // The pending call is dropped with this future, which closes
+                // its connection; the decode side is cancelled with it.
+                Err(verdict) => {
+                    return Err(DispatchError::Prefill(verdict.answer(prefill.as_ref())))
+                }
+            };
+            // The head is the side's answer on this wire; the booking is
+            // released as answered (the wire reports no cached count).
+            if let Some(ticket) = prefill_ticket.as_mut() {
+                ticket.first_response(0);
+            }
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
                 let prefill = Arc::clone(&prefill);
                 let model_id = context.model_id.to_string();
@@ -1440,6 +1503,13 @@ impl PDRouter {
                 .map_err(|e| DispatchError::Transport(PdSide::Decode, e))?;
             if !resp.status().is_success() {
                 return Err(DispatchError::Decode(resp));
+            }
+            // On this shape the decode's head follows the handoff the prefill
+            // worker made: the sign of life the prefill side's silence rule
+            // reads while the side's own answer waits (as the gRPC pipeline's
+            // `dispatch_pd_sides` reads the decode's first output).
+            if bound.is_some() {
+                prefill.note_prefill_handoff();
             }
             Ok((dispatch_start.elapsed(), resp))
         };
@@ -1710,10 +1780,31 @@ impl PDRouter {
                 ),
                 dp_rank,
             );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
+            // The prefill side's silence is bounded from its dispatch, as the
+            // gRPC pipeline's `execute_sequential_pd` bounds it: the bound
+            // read before the booking, the booking before the call is polled.
+            let bound = PrefillBound::at(&prefill, context.prompt_tokens, dispatch_start);
+            let mut prefill_ticket = PrefillTicket::book_as(&prefill, context.prompt_tokens, false);
+            let send = send_with_stale_conn_retry(prefill_request);
+            tokio::pin!(send);
+            let prefill_response = match await_prefill_within(
+                bound.as_ref(),
+                send,
+                &prefill,
+                None,
+                metrics_labels::CONNECTION_HTTP,
+                context.request_id.unwrap_or_default(),
+                context.prompt_tokens,
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
+                Err(verdict) => return Self::prefill_silent(verdict, prefill.as_ref()),
             };
+            if let Some(ticket) = prefill_ticket.as_mut() {
+                ticket.first_response(0);
+            }
             let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if !prefill_status.is_success() {
@@ -1914,11 +2005,31 @@ impl PDRouter {
             ),
             dp_rank,
         );
+        // The prefill side's silence bounded from its dispatch, as on the
+        // other two shapes; the decode side is cancelled with a verdict.
+        let bound = PrefillBound::at(&prefill, context.prompt_tokens, dispatch_start);
+        let mut prefill_ticket = PrefillTicket::book_as(&prefill, context.prompt_tokens, false);
         let prefill_side = async {
-            let response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
+            let send = send_with_stale_conn_retry(prefill_request);
+            tokio::pin!(send);
+            let response = match await_prefill_within(
+                bound.as_ref(),
+                send,
+                &prefill,
+                None,
+                metrics_labels::CONNECTION_HTTP,
+                context.request_id.unwrap_or_default(),
+                context.prompt_tokens,
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
+                Err(verdict) => return Err(Self::prefill_silent(verdict, prefill.as_ref())),
             };
+            if let Some(ticket) = prefill_ticket.as_mut() {
+                ticket.first_response(0);
+            }
             let status = StatusCode::from_u16(response.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if !status.is_success() {
@@ -2022,6 +2133,16 @@ impl PDRouter {
             dispatch_start,
         )
         .await
+    }
+
+    /// The answer of a shape that accounts per side (the sequential and the
+    /// MoRI-IO concurrent shapes) for a prefill side given up on for its
+    /// silence: the verdict counted the worker error where the bound passed;
+    /// the breaker sample is taken here, on the prefill alone, since the
+    /// decode side was never served.
+    fn prefill_silent(verdict: SilenceVerdict, prefill: &dyn Worker) -> Response {
+        prefill.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+        verdict.answer(prefill)
     }
 
     /// Per-side outcome accounting for the sequential path: a side that was
@@ -4227,6 +4348,7 @@ mod tests {
                     StatusCode::OK,
                     outcome,
                     false,
+                    None,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -5934,6 +6056,8 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
+            prompt_tokens: 0,
+            request_id: None,
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -6026,6 +6150,8 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    prompt_tokens: 0,
+                    request_id: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -6122,6 +6248,8 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
+                            prompt_tokens: 0,
+                            request_id: None,
                         },
                         prefill,
                         decode,
@@ -6203,6 +6331,8 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    prompt_tokens: 0,
+                    request_id: None,
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -6395,6 +6525,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             true,
+            None,
         );
         assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
 
@@ -6405,6 +6536,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             false,
+            None,
         );
         assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
     }
@@ -7320,6 +7452,268 @@ mod tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A prefill-decode pair for the silence-bound cases: both breakers open
+    /// at the first failure, the client waits a minute for a side (so a side
+    /// is cut by the bound, never by the request timeout), the sides on
+    /// `runtime`'s dispatch shape. The pair's workers, prefill first.
+    fn silence_pair(
+        router: &PDRouter,
+        prefill_url: String,
+        decode_url: String,
+        runtime: RuntimeType,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let client = Arc::new(
+            crate::clients::http_client_builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        );
+        let mut pair = Vec::new();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(runtime)
+                .http_client(Arc::clone(&client))
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                    timeout_duration: std::time::Duration::from_secs(60),
+                    window_duration: std::time::Duration::from_secs(60),
+                })
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            let worker: Arc<dyn Worker> = Arc::new(worker);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&worker));
+            pair.push(worker);
+        }
+        let decode = pair.pop().unwrap();
+        (pair.pop().unwrap(), decode)
+    }
+
+    /// A short generate request: the gated stubs of these cases answer the
+    /// `/generate` route alone.
+    fn short_generate() -> GenerateRequest {
+        serde_json::from_value(json!({"text": "hi", "stream": false}))
+            .expect("valid generate request")
+    }
+
+    /// The `smg_worker_errors_total` lines of `rendered` for `worker_type`
+    /// under the `timeout` class, as counted.
+    fn timeout_errors(rendered: &str, worker_type: &str) -> Vec<String> {
+        rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(&format!("worker_type=\"{worker_type}\""))
+                    && line.contains("error_type=\"timeout\"")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The silence bound of a short prompt is the default wedge threshold,
+    /// three seconds; a side given up on at it answers well inside this.
+    const SILENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// On the concurrent dispatch shape a prefill side that produces nothing
+    /// is given up on at its silence bound, as the gRPC pipeline gives it
+    /// up: the shared 504 `prefill_worker_silent` long before the request's
+    /// own timeout, the decode side cancelled with its load released, the
+    /// prefill worker charged once (the `timeout` worker error and one
+    /// breaker failure), the decode worker not at all.
+    #[test]
+    fn a_silent_prefill_side_is_given_up_on_at_its_bound_on_the_concurrent_shape() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (router, prefill, decode) = runtime.block_on(async {
+            // Neither side answers within the test: the prefill is silent,
+            // the decode waits on it.
+            let (prefill_url, _) =
+                spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER).await;
+            let (decode_url, _) =
+                spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER).await;
+            let router = single_attempt_router();
+            let (prefill, decode) =
+                silence_pair(&router, prefill_url, decode_url, RuntimeType::Sglang);
+            (router, prefill, decode)
+        });
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let started = Instant::now();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    HANG_GUARD,
+                    router.route_generate(None, &tenant, short_generate(), UNKNOWN_MODEL_ID),
+                )
+                .await
+                .expect("given up on at the bound, not held to the request timeout")
+            })
+        });
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            PdSide::Prefill.code(SidePhase::Silent)
+        );
+        assert!(
+            elapsed >= SILENCE_BOUND - std::time::Duration::from_millis(100),
+            "cut at the bound, not before: {elapsed:?}"
+        );
+        assert_eq!(
+            (prefill.load(), decode.load()),
+            (0, 0),
+            "both sides' load released with the verdict"
+        );
+        assert_eq!(
+            prefill.circuit_breaker_state(),
+            CircuitState::Open,
+            "the verdict is the prefill worker's one failure"
+        );
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Closed,
+            "the decode worker, which waited on the prefill, is not charged"
+        );
+        let rendered = handle.render();
+        let prefill_timeouts = timeout_errors(&rendered, "prefill");
+        assert!(
+            prefill_timeouts.len() == 1 && prefill_timeouts[0].ends_with(" 1"),
+            "one prefill timeout error, counted once:\n{rendered}"
+        );
+        assert!(
+            timeout_errors(&rendered, "decode").is_empty(),
+            "no decode error:\n{rendered}"
+        );
+    }
+
+    /// On the sequential shape a silent prefill side is given up on the
+    /// same way, and the decode side is never contacted.
+    #[tokio::test]
+    async fn a_silent_prefill_side_is_given_up_on_at_its_bound_on_the_sequential_shape() {
+        let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER).await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = single_attempt_router();
+        let (prefill, decode) = silence_pair(&router, prefill_url, decode_url, RuntimeType::Vllm);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            HANG_GUARD,
+            router.route_generate(None, &tenant, short_generate(), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("given up on at the bound, not held to the request timeout");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            PdSide::Prefill.code(SidePhase::Silent)
+        );
+        assert!(
+            elapsed >= SILENCE_BOUND - std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(
+            taken(&decode_seen).is_empty(),
+            "the decode side is never contacted"
+        );
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+        assert_eq!(prefill.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A prefill side past its bound waits on while its worker is alive: a
+    /// worker that answered another side inside the bound is backed up, not
+    /// frozen, and so is one whose decode partner showed the handoff (the
+    /// decode's head on the concurrent shape). A prefill that answers within
+    /// the reprieve is served, and nothing is charged. The lesson of a cold
+    /// engine: slow is not silent.
+    #[tokio::test]
+    async fn a_prefill_side_past_its_bound_waits_on_while_its_worker_answers_or_hands_off() {
+        // The prefill answers past the bound, inside the reprieve.
+        let answer_at = SILENCE_BOUND + std::time::Duration::from_millis(500);
+        // (the decode head's delay, whether the worker answers another side):
+        // with the head after the prefill's answer the reprieve is the
+        // other answer's; with the head inside the bound it is the handoff's.
+        for (decode_delay, another_answer) in [
+            (std::time::Duration::from_millis(4_000), true),
+            (std::time::Duration::from_millis(2_000), false),
+        ] {
+            let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), answer_at).await;
+            let (decode_url, _decode_seen) =
+                spawn_delayed_stub(StatusCode::OK, json!({}), decode_delay).await;
+            let router = single_attempt_router();
+            let (prefill, decode) =
+                silence_pair(&router, prefill_url, decode_url, RuntimeType::Sglang);
+            // A handoff counts on a worker that has answered before.
+            prefill.note_prefill_started(8, false);
+            prefill.note_prefill_ended(8, false, Some(0));
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let case =
+                format!("decode head after {decode_delay:?}, another answer {another_answer}");
+
+            let started = Instant::now();
+            let request = router.route_generate(None, &tenant, short_generate(), UNKNOWN_MODEL_ID);
+            tokio::pin!(request);
+            let not_yet = |response: Response| {
+                panic!(
+                    "{case}: given up on before the prefill answered: {} {}",
+                    response.status(),
+                    error::extract_error_code_from_response(&response)
+                )
+            };
+            // Halfway to the bound the worker answers another side.
+            tokio::select! {
+                biased;
+                response = &mut request => not_yet(response),
+                () = tokio::time::sleep(std::time::Duration::from_millis(1_500)) => {}
+            }
+            if another_answer {
+                prefill.note_prefill_started(8, false);
+                prefill.note_prefill_ended(8, false, Some(0));
+            }
+            let response = tokio::time::timeout(HANG_GUARD, &mut request)
+                .await
+                .expect("served once the prefill answered");
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{case}: {}",
+                error::extract_error_code_from_response(&response)
+            );
+            assert!(
+                elapsed >= answer_at,
+                "{case}: served after the bound: {elapsed:?}"
+            );
+            assert_eq!(
+                prefill.circuit_breaker_state(),
+                CircuitState::Closed,
+                "{case}: a reprieved side charges nothing"
+            );
+            assert_eq!(
+                decode.circuit_breaker_state(),
+                CircuitState::Closed,
+                "{case}"
+            );
+        }
     }
 
     /// What every dispatch body takes from the setup: the sides and the

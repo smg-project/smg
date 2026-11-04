@@ -23,6 +23,8 @@
 //! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
 //!   named by (the side, the phase, the failure's own status), the HTTP and
 //!   gRPC prefill-decode paths' answers built from it
+//! - `pd_silence` — the silence bound of a disaggregated prefill side and
+//!   its one judge, the gRPC pipeline's and the HTTP prefill-decode router's
 //! - `placement` — policy-driven worker placement over the routing
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
@@ -55,6 +57,7 @@ pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
+pub(crate) mod pd_silence;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
 pub(crate) mod rate_limit_cell;
