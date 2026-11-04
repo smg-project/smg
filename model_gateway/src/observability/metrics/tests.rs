@@ -31,7 +31,7 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
         init_metrics();
         record_tokenizer_encode_activity();
     });
-    for path in ["v1", "native", "tokenizers"] {
+    for path in ["vllm", "v1", "native", "tokenizers"] {
         assert!(
             rendered.lines().any(|line| {
                 line.starts_with("smg_tokenizer_encode_path_loads_total{")
