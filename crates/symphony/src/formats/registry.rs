@@ -195,14 +195,15 @@ impl Table {
         None
     }
 
-    /// The table, built once and shared: the engines that run it, and whoever asks the table
-    /// for its tags, read the one copy. [`Self::format`] builds a copy of one's own to change.
-    /// The copies stand at the tables' positions in [`Self::ALL`], which is the enum's order;
-    /// every table a name or a group can select is in `ALL` (the tests say so).
+    /// The table, built once, checked once (`Format::validated`) and shared: the engines that
+    /// run it, and whoever asks the table for its tags, read the one copy. [`Self::format`]
+    /// builds a copy of one's own to change. The copies stand at the tables' positions in
+    /// [`Self::ALL`], which is the enum's order; every table a name or a group can select is in
+    /// `ALL` (the tests say so).
     pub fn shared(self) -> Arc<Format> {
         static SHARED: [OnceLock<Arc<Format>>; Table::ALL.len()] =
             [const { OnceLock::new() }; Table::ALL.len()];
-        Arc::clone(SHARED[self as usize].get_or_init(|| Arc::new(self.format())))
+        Arc::clone(SHARED[self as usize].get_or_init(|| self.format().validated()))
     }
 
     /// The table, built.
@@ -359,12 +360,12 @@ pub fn for_model(model: &str) -> Option<Format> {
     for_model_shared(model).map(|format| (*format).clone())
 }
 
-/// [`for_model`]'s table, built once and shared, as [`Table::shared`] shares a table: the engines
-/// that read a model's output hold the one copy.
+/// [`for_model`]'s table, built once, checked once and shared, as [`Table::shared`] shares a
+/// table: the engines that read a model's output hold the one copy.
 pub fn for_model_shared(model: &str) -> Option<Arc<Format>> {
     let (index, group) = group_for(model)?;
     Some(Arc::clone(
-        GROUP_FORMATS[index].get_or_init(|| Arc::new(group.format())),
+        GROUP_FORMATS[index].get_or_init(|| group.format().validated()),
     ))
 }
 

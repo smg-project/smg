@@ -21,7 +21,11 @@
 //! README's evidence section says how a change produces its throughput row from these.
 #![allow(clippy::expect_used)]
 
-use std::{hint::black_box, sync::OnceLock, time::Duration};
+use std::{
+    hint::black_box,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use openai_protocol::common::{Function, Tool};
@@ -465,6 +469,16 @@ fn setup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
             b.iter(|| black_box(engine(subject.table, subject.prompt, &tools)));
         });
+        // An engine over the shared table, as a request's reader makes one: the construction
+        // alone, the table built and checked before the measurement.
+        group.bench_with_input(
+            BenchmarkId::new("engine_shared", name),
+            subject,
+            |b, subject| {
+                let format = subject.table.shared();
+                b.iter(|| black_box(Engine::shared(Arc::clone(&format), tools.clone())));
+            },
+        );
     }
     group.bench_function("declared", |b| b.iter(|| black_box(declared())));
     group.finish();

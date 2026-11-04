@@ -139,7 +139,7 @@ call cut from the one call's; `tests/common/slices.rs` reads them from the tree
 `BELLWETHER_FIXTURES` names, and the rows are skipped with a notice without it) it measures the
 output fed whole, one character at a time and in pieces of about a token
 (`slice/<family>/{whole,chars,tokens}`, in bytes or tokens per second), the parts of the setup
-(`setup/{table,validate,scanner,declared,engine}`) and the adapters over the events a slice
+(`setup/{table,validate,scanner,declared,engine,engine_shared}`) and the adapters over the events a slice
 produces (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A change to the decode
 path carries its rows.
 

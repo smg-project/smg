@@ -110,7 +110,7 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::{
     engine::is_strip_space,
@@ -322,10 +322,38 @@ impl PartialEq for TurnOpener {
 
 impl Eq for TurnOpener {}
 
+/// The mark a table carries once it has passed [`Format::validate`]. Two tables that differ only
+/// in whether anyone has checked them yet are the same table, so the mark takes no part in a
+/// table's equality: the registry's shared copy equals a fresh build of the same table. A copy
+/// of a table is a table of its own, whatever is built on it next: a clone comes out unmarked,
+/// and every engine over it walks it.
+#[derive(Debug, Default)]
+struct Checked(OnceLock<()>);
+
+impl Clone for Checked {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for Checked {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Checked {}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Format {
+    /// Set once the table has passed [`Self::validate`] at [`Self::validated`], the one place
+    /// that sets it (a table built to be shared, whose `Arc` never hands the table back by
+    /// value). An engine over a table without the mark checks it and sets nothing, so a table a
+    /// caller holds is never marked in place; a variant ([`Self::without_calls`],
+    /// [`Self::without_reasoning`]) starts unset, as a table of its own.
+    checked: Checked,
     name: String,
     terminals: Vec<Terminal>,
     /// The terminals' texts as the engine's scanner takes them ([`Self::terminal_texts`]), built
@@ -445,6 +473,7 @@ impl Format {
     /// An empty table with a name; add terminals, states and transitions to it.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            checked: Checked::default(),
             name: name.into(),
             terminals: Vec::new(),
             scanner_markers: Arc::from([]),
@@ -837,8 +866,12 @@ impl Format {
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
     /// counts the same whether the request separates reasoning or not.
+    /// The variant is a table of its own: every engine that runs it checks it (`check`),
+    /// inside that engine's isolation, and sets no mark; the mark is the shared build's
+    /// alone.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
+        self.checked = Checked::default();
         let calls = self.terminals_of_calls();
         let framing = self.message_framing();
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
@@ -880,8 +913,12 @@ impl Format {
     /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
     /// state made content here is its text and adds no malformed run of its own
     /// (`Self::is_remade`): in the table the call's syntax reads it and says what it is.
+    /// The variant is a table of its own: every engine that runs it checks it (`check`),
+    /// inside that engine's isolation, and sets no mark; the mark is the shared build's
+    /// alone.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
+        self.checked = Checked::default();
         let frame = self.message_frame();
         let framing = self.message_framing();
         let demoted: Vec<bool> = self
@@ -1567,6 +1604,44 @@ impl Format {
             self.validate_shaped(shape)?;
         }
         Ok(())
+    }
+
+    /// The table, checked ([`Self::validate`]) once and shared: a table the crate wrote wrong is
+    /// found at its first use, not by every engine that runs it. The `Arc` is the crate's: the
+    /// registry keeps one reference and an engine moves its own in, so a checked table never
+    /// comes back out as an owned value; a copy of it comes out unmarked, so no builder carries
+    /// the mark past a change.
+    ///
+    /// # Panics
+    ///
+    /// A table [`Self::validate`] refuses. Definitions are written in the crate, so that is a
+    /// programming error; a shape built at run time is checked before its table is.
+    pub(crate) fn validated(self) -> Arc<Self> {
+        self.check();
+        self.checked.0.get_or_init(|| ());
+        Arc::new(self)
+    }
+
+    /// The check an engine runs over its table: nothing for a table that carries the mark (the
+    /// registry's, [`Self::validated`]); [`Self::validate`] for any other, inside whatever
+    /// isolation that engine runs in, and no mark is set: a table a caller keeps, or a variant a
+    /// request asks for, is checked by every engine over it, so that no table a caller can get
+    /// back by value ever carries the mark.
+    ///
+    /// # Panics
+    ///
+    /// A table [`Self::validate`] refuses, as [`Self::validated`].
+    #[expect(
+        clippy::panic,
+        reason = "a table that fails its own check is a programming error, found where an engine is made"
+    )]
+    pub(crate) fn check(&self) {
+        if self.checked.0.get().is_some() {
+            return;
+        }
+        if let Err(why) = self.validate() {
+            panic!("{why}");
+        }
     }
 
     /// What a table with a shaped call must hold besides: a shape a stream can run, every call
@@ -2375,6 +2450,35 @@ mod tests {
             .turn_anchor("")
             .turn_anchor("x");
         assert_eq!(unchecked.turn("axb"), ("b", 0));
+    }
+
+    #[test]
+    fn a_copy_of_a_checked_table_is_a_table_of_its_own() {
+        use crate::formats::Table;
+        let shared = Table::Plain.shared();
+        assert!(
+            shared.checked.0.get().is_some(),
+            "the shared table is checked where it is shared"
+        );
+        let copy = (*shared).clone();
+        assert!(
+            copy.checked.0.get().is_none(),
+            "a copy carries no mark: every engine over it walks it"
+        );
+        assert_eq!(copy, *shared, "a copy is the same table");
+        let checked = two_states().validated();
+        assert!(checked.checked.0.get().is_some());
+        let kept = Arc::new(two_states());
+        let _ = crate::Engine::shared(Arc::clone(&kept), crate::Declared::default());
+        assert!(
+            kept.checked.0.get().is_none(),
+            "an engine over a table the caller holds sets no mark on it"
+        );
+        assert_eq!(
+            (*checked).clone().turn_anchor("").validate(),
+            Err("format t: an empty turn anchor".to_string()),
+            "what is built on a copy is checked again"
+        );
     }
 
     #[test]
