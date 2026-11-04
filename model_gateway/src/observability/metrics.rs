@@ -3426,10 +3426,11 @@ impl Metrics {
     }
 
     /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
-    /// ended while its registration stands: its status left `Ready` (see
-    /// `WorkerMonitor::evict_worker_loads`), so the worker series store keeps
-    /// its series and the last load would read as live. Each gauge is set to
-    /// -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// ended while its URL stays registered: its status left `Ready`, or a
+    /// same-URL replacement has not yet published its own load (see
+    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
+    /// those series, so the last load would read as live. Each gauge is set
+    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
     /// worker needs no sentinel: the store drops every `worker`-labelled
     /// series with the registration ([`Self::remove_worker_metrics`]) and
     /// no-ops the writes that follow, this one included.
