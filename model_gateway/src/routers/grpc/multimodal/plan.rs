@@ -477,6 +477,79 @@ mod tests {
         assert!(!error.contains("limit of"), "{error}");
     }
 
+    /// A spec that declares a modality without a count of its own leaves the
+    /// bound to the engine's advertised limit and the router's knobs: with
+    /// neither, a request carrying more images than another family's copied
+    /// default goes through; the flag and the engine's limit still refuse it,
+    /// each naming itself.
+    #[tokio::test]
+    async fn a_spec_without_a_count_of_its_own_leaves_the_bound_to_the_engine_and_the_knobs() {
+        let registry = Arc::new(MultimodalConfigRegistry::new());
+        registry.insert(
+            "tok".to_string(),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({"model_type": "kimi_k3", "media_placeholder_token_id": 163605}),
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        let tokenizer = MockTokenizer::new().with_tokens(&[("<|media_pad|>", 163605)]);
+        let plan = image_urls(11);
+        let prepare = |image_limit, engine: HashMap<Modality, EngineItemLimit>| {
+            let components = MultimodalComponents::new(
+                registry.clone(),
+                image_limit,
+                None,
+                &MultimodalSettings::default(),
+            )
+            .unwrap();
+            let plan = &plan;
+            let tokenizer = &tokenizer;
+            async move {
+                prepare_placeholder_tokens(
+                    plan,
+                    "org/kimi-k3",
+                    tokenizer,
+                    &components,
+                    "tok",
+                    "unused",
+                    &engine,
+                    |_| true,
+                )
+                .await
+            }
+        };
+
+        let placeholders = prepare(None, HashMap::new())
+            .await
+            .expect("no engine limit and no knob: the spec sets no count of its own");
+        assert_eq!(placeholders.get(Modality::Image), Some("<|media_pad|>"));
+
+        let error = prepare(Some(10), HashMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("11 image items")
+                && error.contains("limit of 10")
+                && error.contains("(--mm-per-request-image-limit)"),
+            "{error}"
+        );
+
+        let engine = HashMap::from([(
+            Modality::Image,
+            EngineItemLimit {
+                limit: 8,
+                runtime: RuntimeType::Vllm,
+            },
+        )]);
+        let error = prepare(None, engine).await.unwrap_err().to_string();
+        assert!(
+            error.contains("limit of 8") && error.contains("the engine's"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn media_plan_preserves_media_order_and_counts() {
         let plan = MediaPlan::new([
