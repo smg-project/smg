@@ -800,7 +800,7 @@ impl MediaConnector {
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
         let hash = crate::hasher::hash_audio(&bytes);
-        let decoded = decode_audio_mono_f32(&bytes).await?;
+        let decoded = decode_audio_mono_f32(bytes.clone()).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
