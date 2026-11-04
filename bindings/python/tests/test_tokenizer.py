@@ -18,18 +18,21 @@ so the suite needs no network. What it pins:
 - a request renders under the tokenizer's model id, which selects the
   provider profile (a Hub cache snapshot names its own), and a local path
   without one renders no chat;
-- the tokenizer encodes from several threads at once, and works in a child
-  forked after the parent used it (rayon's global pool would leave such a
-  child hanging); its pool takes its size from ``SMG_TOKENIZER_THREADS`` and
-  ``TOKENIZERS_PARALLELISM``.
+- the tokenizer pickles with its smg build, encodes from several threads at
+  once, and works in a child forked after the parent used it, or while
+  another thread is in a call (rayon's global pool, or a lock held at the
+  fork, would leave such a child hanging); its pool takes its size from
+  ``SMG_TOKENIZER_THREADS`` and ``TOKENIZERS_PARALLELISM``.
 """
 
 from __future__ import annotations
 
+import copy
 import http.server
 import json
 import multiprocessing
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -431,6 +434,10 @@ def test_an_openai_model_name_loads_with_tiktoken(
     assert tokenizer.decode(ids) == "hello world"
     assert tokenizer.model == name
     assert tokenizer.provider_profile == "openai"
+    restored = pickle.loads(pickle.dumps(tokenizer))
+    assert restored.source == name
+    assert restored.fingerprint == tokenizer.fingerprint
+    assert restored.encode("hello world") == ids
 
 
 def test_load_errors(checkpoint: Path, tmp_path: Path) -> None:
@@ -869,6 +876,106 @@ def test_a_segment_aware_renderer_returns_its_own_encode(tmp_path: Path) -> None
 # --- processes and threads -----------------------------------------------------
 
 
+def test_a_tokenizer_pickles_and_reloads(tokenizer: Tokenizer) -> None:
+    restored = pickle.loads(pickle.dumps(tokenizer))
+    assert restored is not tokenizer
+    assert (restored.source, restored.model) == (tokenizer.source, tokenizer.model)
+    assert restored.encode("hello world") == tokenizer.encode("hello world")
+    assert copy.copy(tokenizer) is tokenizer
+    assert copy.deepcopy(tokenizer) is tokenizer
+
+
+def test_a_pickle_of_another_smg_build_is_refused(tokenizer: Tokenizer) -> None:
+    restore, arguments = tokenizer.__reduce__()
+    assert arguments[-2:] == (Tokenizer.smg_build, tokenizer.fingerprint)
+    with pytest.raises(RuntimeError, match=r"pickled by smg 0\.0\.0 \(old\) and is unpickled by"):
+        restore(*arguments[:-2], "0.0.0 (old)", arguments[-1])
+
+
+def test_the_fingerprint_follows_the_files_and_a_pickle_refuses_changed_ones(
+    tmp_path: Path,
+) -> None:
+    path = write_checkpoint(tmp_path / "ckpt")
+    template = tmp_path / "template.jinja"
+    template.write_text("{% for message in messages %}[{{ message.content }}]{% endfor %}")
+    tokenizer = Tokenizer(path, chat_template=template, model=MODEL)
+    same = Tokenizer(path, chat_template=template, model=MODEL)
+    assert same.fingerprint == tokenizer.fingerprint
+    other = Tokenizer(path, chat_template=template, model="other")
+    assert other.fingerprint != tokenizer.fingerprint
+    pickled = pickle.dumps(tokenizer)
+    # A template edited in place: another fingerprint, so another pickle (the
+    # cache key datasets.map derives from it), and the old pickle refused.
+    template.write_text("{% for message in messages %}<{{ message.content }}>{% endfor %}")
+    edited = Tokenizer(path, chat_template=template, model=MODEL)
+    assert edited.fingerprint != tokenizer.fingerprint
+    assert pickle.dumps(edited) != pickled
+    with pytest.raises(RuntimeError, match="changed since this tokenizer was pickled"):
+        pickle.loads(pickled)
+    # A pickled path that is not there is refused, not read as a model name.
+    moved = pickle.dumps(Tokenizer(write_checkpoint(tmp_path / "gpt-4o"), model=MODEL))
+    (tmp_path / "gpt-4o").rename(tmp_path / "elsewhere")
+    with pytest.raises(FileNotFoundError, match="no such file or directory"):
+        pickle.loads(moved)
+
+
+def test_a_hub_snapshot_pickles_with_its_model_id(tmp_path: Path) -> None:
+    snapshot = tmp_path / "models--org--name" / "snapshots" / "0a1b"
+    tokenizer = Tokenizer(write_checkpoint(snapshot))
+    restore, arguments = tokenizer.__reduce__()
+    assert arguments[1:5] == (str(snapshot), None, "org/name", ("org/name", ""))
+    restored = restore(*arguments)
+    assert (restored.source, restored.model) == (str(snapshot), "org/name")
+    file_arguments = Tokenizer(snapshot / "tokenizer.json").__reduce__()[1]
+    assert file_arguments[4] == ("org/name", "tokenizer.json")
+    (snapshot / "tok_v2.json").write_text((snapshot / "tokenizer.json").read_text())
+    other_file_arguments = Tokenizer(snapshot / "tok_v2.json").__reduce__()[1]
+    # The snapshot here, with files that differ from the pickled ones (edited,
+    # or only partly downloaded into this cache), is refused.
+    (snapshot / "generation_config.json").write_text("{}")
+    with pytest.raises(RuntimeError, match=r"Tokenizer\('org/name'\) downloads the missing"):
+        restore(*arguments)
+    (snapshot / "generation_config.json").unlink()
+    # Where the snapshot is missing, its Hub id downloads it, and a file
+    # source loads its file in the download: here a stand-in for the
+    # download, which loads a copy of the files from elsewhere.
+    snapshot.rename(tmp_path / "gone")
+    loaded: list[str] = []
+
+    def downloading(copy: Path) -> type[Tokenizer]:
+        class Downloaded(Tokenizer):
+            def __init__(self, source: str, **kwargs: Any) -> None:
+                loaded.append(source)
+                super().__init__(copy if source == "org/name" else source, **kwargs)
+
+        return Downloaded
+
+    hub = write_checkpoint(tmp_path / "hub")
+    restored = restore(downloading(hub), *arguments[1:])
+    assert (restored.source, restored.model) == (str(hub), "org/name")
+    restored = restore(downloading(hub), *file_arguments[1:])
+    assert restored.source == str(hub / "tokenizer.json")
+    assert loaded == ["org/name", "org/name", str(hub / "tokenizer.json")]
+    # A file the download has not, or downloaded files that differ (the Hub's
+    # main moved on), are refused.
+    with pytest.raises(RuntimeError, match="without tok_v2.json"):
+        restore(downloading(hub), *other_file_arguments[1:])
+    # Downloaded files that differ (the Hub's main moved on) are refused.
+    moved = write_checkpoint(tmp_path / "moved", chat_template=PROBE)
+    with pytest.raises(RuntimeError, match="which is not here; org/name downloaded from the Hub"):
+        restore(downloading(moved), *arguments[1:])
+
+
+def _encode_in_worker(tokenizer: Tokenizer) -> list[int]:
+    return tokenizer.encode("hello world")
+
+
+def test_a_spawned_worker_unpickles_the_tokenizer(tokenizer: Tokenizer) -> None:
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(1) as pool:
+        assert pool.apply(_encode_in_worker, (tokenizer,)) == [HELLO, WORLD]
+
+
 def test_threads_encode_concurrently(tokenizer: Tokenizer) -> None:
     texts = [f"hello world {index}" * 50 for index in range(64)]
     expected = [tokenizer.encode(text) for text in texts]
@@ -921,6 +1028,162 @@ def test_a_child_forked_after_use_does_not_hang(
         pytest.fail("the forked child hung")
     assert child.exitcode == 0
     assert results.get(timeout=10) == expected
+
+
+def _tool(name: str) -> dict[str, Any]:
+    return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="os.fork")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_child_forked_during_a_call_renders_with_the_inherited_tokenizer(
+    tokenizer: Tokenizer,
+) -> None:
+    # Another thread keeps rendering tool sets never sent before, each a
+    # write to the gateway's prepared-tools table. With a long switch
+    # interval this thread runs only while that one is in a call, so every
+    # fork lands in one; os.fork() waits for it to end, and the child, which
+    # renders tools with the tokenizer it inherited, finds no lock held.
+    # Forked mid-call instead, about half such children wait forever.
+    stop = threading.Event()
+    names = iter(range(10**9))
+
+    def request() -> dict[str, Any]:
+        return {"messages": CONVERSATION[:1], "tools": [_tool(f"tool_{next(names)}")]}
+
+    def keep_calling() -> None:
+        while not stop.is_set():
+            tokenizer.render_chat_batch([request() for _ in range(64)])
+
+    caller = threading.Thread(target=keep_calling)
+    interval = sys.getswitchinterval()
+    caller.start()
+    sys.setswitchinterval(100.0)
+    try:
+        for _ in range(10):
+            time.sleep(0.002)
+            pid = os.fork()
+            if pid == 0:
+                code = 2
+                try:
+                    tokenizer.render_chat_batch([request() for _ in range(8)])
+                    code = 0
+                finally:
+                    os._exit(code)
+            deadline = time.monotonic() + 60
+            while True:
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    assert os.waitstatus_to_exitcode(status) == 0
+                    break
+                if time.monotonic() > deadline:
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                    pytest.fail("a child forked during a call hung")
+                time.sleep(0.01)
+    finally:
+        sys.setswitchinterval(interval)
+        stop.set()
+        caller.join()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="os.fork")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_os_fork_waits_until_the_call_in_flight_ends(tokenizer: Tokenizer) -> None:
+    # A thread decodes with the GIL released while this one forks: the fork
+    # starts only once the decode has ended. The decode runs inline, and
+    # takes as long here as it took alone before.
+    ids = [HELLO, WORLD] * 1_000_000
+    start = time.perf_counter()
+    tokenizer.decode(ids)
+    alone = time.perf_counter() - start
+    calling = threading.Event()
+
+    def call() -> None:
+        calling.set()
+        tokenizer.decode(ids)
+
+    caller = threading.Thread(target=call)
+    caller.start()
+    calling.wait()
+    # The caller holds the GIL until its call releases it, so this thread
+    # wakes, at the earliest, with the call running.
+    time.sleep(0.01)
+    start = time.perf_counter()
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    waited = time.perf_counter() - start
+    os.waitpid(pid, 0)
+    caller.join()
+    assert waited > alone / 4, f"the fork waited {waited:.3f}s for a {alone:.3f}s call"
+
+
+FORK_AFTER_AN_EARLIER_HOOK = """
+import os, sys, threading, time
+# Registered before smg's hooks, so run after them, as logging's and
+# concurrent.futures' are: its sleep releases the GIL between smg's hook and
+# the fork, and the thread below calls in.
+os.register_at_fork(before=lambda: time.sleep(0.005))
+from smg.tokenizer import Tokenizer
+tokenizer = Tokenizer(sys.argv[1], model=sys.argv[2])
+names = iter(range(10**9))
+def request():
+    function = {"name": f"tool_{next(names)}", "parameters": {"type": "object"}}
+    tool = {"type": "function", "function": function}
+    return {"messages": [{"role": "user", "content": "hello"}], "tools": [tool]}
+stop = threading.Event()
+def keep_calling():
+    while not stop.is_set():
+        tokenizer.render_chat_batch([request() for _ in range(64)])
+caller = threading.Thread(target=keep_calling)
+caller.start()
+try:
+    for _ in range(20):
+        pid = os.fork()
+        if pid == 0:
+            code = 2
+            try:
+                tokenizer.render_chat_batch([request() for _ in range(8)])
+                code = 0
+            finally:
+                os._exit(code)
+        deadline = time.monotonic() + 20
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                if os.waitstatus_to_exitcode(status) != 0:
+                    sys.exit("a child forked after another before hook failed")
+                break
+            if time.monotonic() > deadline:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+                sys.exit("a child forked after another before hook released the GIL hung")
+            time.sleep(0.01)
+finally:
+    stop.set()
+    caller.join()
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="os.fork")
+def test_a_call_started_while_os_fork_runs_its_hooks_ends_before_the_fork(
+    checkpoint: Path,
+) -> None:
+    # Python runs the before hooks registered ahead of smg's after it, and one
+    # that releases the GIL lets another thread start a call between smg's
+    # hook and the fork: that call keeps the GIL, so it ends before the fork.
+    # Run without the GIL instead, it can still be running at the fork, and
+    # the child then waits forever: most runs hang one of the 20 children or
+    # more. A fresh interpreter, so that smg's hook is registered after the
+    # script's.
+    child = subprocess.run(
+        [sys.executable, "-c", FORK_AFTER_AN_EARLIER_HOOK, str(checkpoint), MODEL],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert child.returncode == 0, child.stderr
 
 
 POOL_THREADS = """

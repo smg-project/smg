@@ -7903,6 +7903,7 @@ dependencies = [
 name = "smg-python"
 version = "1.15.0-dev"
 dependencies = [
+ "blake3",
  "bytes",
  "engine-servicer",
  "llm-multimodal",

@@ -16,8 +16,10 @@ once_cell = "1.21"
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 # The tokenizer binding: the HTTP layer's own request types and checks, the
-# deserializer that names a refused field's path, and the pool that keeps
-# llm-tokenizer's rayon work off rayon's global pool.
+# deserializer that names a refused field's path, the pool that keeps
+# llm-tokenizer's rayon work off rayon's global pool, and the digest of the
+# files a tokenizer loads.
+blake3 = { workspace = true }
 rayon = "1.12"
 serde_path_to_error = "0.1"
 # openai-protocol's version (crates/protocols/Cargo.toml): its request types
