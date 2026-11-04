@@ -179,8 +179,10 @@ skips what is there, so the same command is run again after an interruption, and
    `release.sh notes --check` still finds) stop the ship before anything is published. A fresh
    render carries the template's author placeholders, so the first run stops here: write the
    notes (see [Writing the notes](#writing-the-notes)), then rerun the ship (`--from notes`).
-   The engine-image list fills in once those images exist: `scripts/release_docker_notes.sh
-   v<version>` and `gh release edit` after the dispatches.
+   Once the release exists (a rerun after an interruption in a later step), the step stands
+   down: the published notes stand, with or without `NOTES`. The engine-image list fills in once
+   those images exist: `scripts/release_docker_notes.sh v<version>` and `gh release edit` after
+   the dispatches.
 5. `release`: `gh release create --verify-tag` with the notes, `--prerelease` for a candidate and
    `--latest` for a final; an existing release is kept.
 6. `publish`: the dispatches of `release-publish-plan` against the tag, each one once: a

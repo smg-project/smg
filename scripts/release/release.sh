@@ -1382,8 +1382,18 @@ notes_unfilled() { # <file>: what keeps a notes file from publication, one line 
   fi
 }
 
-ship_notes() { # the notes file the GitHub release carries: NOTES when given, else rendered once (an existing render is kept: it may be edited)
-  local unfilled rendered
+release_existing() { # <tag>: "url (prerelease: bool)" of the GitHub release on <tag>; fails when there is none
+  "$GH" release view "$1" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null
+}
+
+ship_notes() { # the notes file the GitHub release carries: nothing once the release exists (its notes are out); else NOTES
+  # when given, else rendered once (an existing render is kept: it may be edited)
+  local unfilled rendered existing
+  if existing=$(release_existing "$ship_tag"); then
+    ship_say "notes: the GitHub release $ship_tag exists ($existing): its notes are out, nothing is read or rendered"
+    ship_notes_file=published # ship_release reads the release itself and never opens this
+    return 0
+  fi
   rendered=$(git rev-parse --git-path release) # under the git directory, out of the tree; relative to the root unless elsewhere
   case $rendered in /*) ;; *) rendered=$root/$rendered ;; esac
   ship_notes_file=${NOTES:-$rendered/notes-$ship_tag.md}
@@ -1410,7 +1420,7 @@ ship_release() { # the GitHub release on the tag: a prerelease for a candidate, 
   local flags=() existing url
   [ -n "$ship_notes_file" ] || ship_notes # --from release: the notes step ran in an earlier run, or runs now
   if is_final "$ship_version"; then flags=(--latest); else flags=(--prerelease); fi
-  if existing=$("$GH" release view "$ship_tag" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null); then
+  if existing=$(release_existing "$ship_tag"); then
     ship_say "release: done, $existing"
     return 0
   fi

@@ -2682,7 +2682,9 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
     assert "preflight: release/1.14 reads 1.14.0-rc.2 already; the CI of the bump's parent" in again
     assert "bump: done, release/1.14 reads 1.14.0-rc.2 at" in again
     assert "tag: done, v1.14.0-rc.2 is on origin at" in again
-    assert f"notes: {notes}, rendered by an earlier run" in again
+    assert "notes: the GitHub release v1.14.0-rc.2 exists (" in again and (
+        "its notes are out, nothing is read or rendered" in again
+    ), "the release is out: the kept render is not read again"
     assert (
         "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in again
     )
@@ -2899,6 +2901,43 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
     assert (
         "no release/1.15 on origin: cut it first"
         in repo.tool("ship", "1.15.0-rc.1", "--dry-run", check=False).stderr
+    )
+
+
+def test_ship_rerun_stands_down_at_the_notes_once_the_release_exists(repo: Sandbox) -> None:
+    """A rerun after an interruption in publish, with no kept render (the first run used NOTES, or the render was
+    deleted) or with a NOTES file that is not ready: the release is out with its notes, so the notes step reads
+    and renders nothing and the ship goes on to the dispatches instead of asking for notes that are published."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    out = repo.tool(
+        "ship", "1.14.0-rc.2", GH_STUB_RELEASES="v1.14.0-rc.2", GH_STUB_RELEASE_PRE="true"
+    ).stdout
+    assert (
+        "notes: the GitHub release v1.14.0-rc.2 exists (https://example.invalid/releases/v1.14.0-rc.2"
+        " (prerelease: true)): its notes are out, nothing is read or rendered"
+    ) in ship_lines(out)
+    assert not notes.exists(), "nothing is rendered"
+    assert "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in out
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in out
+    assert not [call for call in repo.gh_calls() if call.startswith("gh release create")]
+    half = repo.base / "half.md"
+    half.write_text(f"{TITLE}\n\n<!-- AUTHOR: the opening paragraph -->\n")
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--from",
+        "notes",
+        NOTES=str(half),
+        GH_STUB_RELEASES="v1.14.0-rc.2",
+        GH_STUB_RELEASE_PRE="true",
+    ).stdout
+    assert "its notes are out, nothing is read or rendered" in again and "release: done" in again, (
+        "a NOTES file that is not ready does not matter once the release is out"
     )
 
 
