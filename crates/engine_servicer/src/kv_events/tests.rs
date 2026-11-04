@@ -2372,3 +2372,15 @@ fn prefill_capacity_changes_use_the_throughput_tolerance() {
         assert_eq!(load_changed(&current, &last), changed);
     }
 }
+
+/// A running-count change alone must publish load in either direction.
+#[test]
+fn running_requests_alone_change_the_load_record() {
+    let idle = common::EngineLoad::default();
+    let running = common::EngineLoad {
+        running_requests: 1,
+        ..idle.clone()
+    };
+    assert!(load_changed(&idle, &running));
+    assert!(load_changed(&running, &idle));
+}

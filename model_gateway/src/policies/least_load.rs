@@ -439,7 +439,7 @@ impl LeastLoadPolicy {
                     .and_then(|load| Self::live_drain_rate(&workers[i], load))
             })
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
-        let nominal_throughput = if tp_count > 0 {
+        let nominal_throughput = if tp_count > 0 && tp_sum.is_finite() {
             tp_sum / tp_count as f64
         } else {
             self.default_throughput
@@ -780,6 +780,41 @@ mod tests {
             LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
             9_000.0
         );
+    }
+
+    /// Finite per-worker rates can overflow when summed; unmeasured peers must
+    /// still price their queued work at a finite, positive fallback rate.
+    #[test]
+    fn prefill_fleet_rate_overflow_uses_configured_capacity() {
+        let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2", "http://p3:3"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Prefill)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let inflight = HashMap::new();
+        for (measured, expected) in [(5_000.0, 5_000.0), (f64::MAX, 4_000.0)] {
+            let loads = workers
+                .iter()
+                .enumerate()
+                .map(|(index, worker)| {
+                    let mut load = one_rank_load(1_000, 0.0, 0.0);
+                    load.loads[0].prefill_throughput = (index < 2).then_some(measured);
+                    (worker.url().to_string(), load)
+                })
+                .collect();
+            feed.publish(&loads);
+            let snapshot = policy.snapshot().unwrap();
+            let inputs = policy.score_inputs(&workers, &[0, 1, 2], Some(&snapshot), &inflight);
+            assert_eq!(inputs.nominal_throughput, expected);
+            assert_eq!(policy.score(&workers[2], &inputs), 2_024.0 / expected);
+        }
     }
 
     /// Prefill scores and missing-peer estimates must not track output-token rates.
