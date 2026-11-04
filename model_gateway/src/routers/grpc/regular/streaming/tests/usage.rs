@@ -925,9 +925,9 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
 /// a streamed answer's are: the chat, completion, generate and messages
 /// shapes each render their counts and one generation observation under
 /// their own endpoint, a transcription (decoded through the generate
-/// processor) under its own; no TTFT or TPOT, which a collected answer has
-/// no first token for; and no prompt figures for generate, whose streamed
-/// answer counts none either.
+/// processor) under its own, the prompt and its cache hit included, as the
+/// streamed generate answer counts them; and no TTFT or TPOT, which a
+/// collected answer has no first token for.
 #[test]
 fn a_collected_answer_records_its_token_and_generation_families() {
     use crate::observability::metrics::test_support::render_with_recorder;
@@ -990,8 +990,12 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"output\"} 2",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"output\"} 4",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"output\"} 5",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\"} 1",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"input\"} 12",
@@ -1009,8 +1013,6 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_tpot_seconds",
         "smg_router_time_to_first_token_seconds",
         "smg_router_request_time_per_output_token_seconds",
-        "endpoint=\"generate\",token_type=\"input\"",
-        "endpoint=\"generate\",token_type=\"cached\"",
     ] {
         assert!(
             !rendered.contains(absent),

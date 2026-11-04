@@ -787,7 +787,7 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion = usage.completion_total();
+        let counts = usage.counts();
         usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
@@ -795,7 +795,7 @@ impl StreamingProcessor {
         if stream.client_left() {
             return Ok(());
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
+        Self::record_generate_metrics(start_time, first_token_time, counts, None, &ctx);
 
         Ok(())
     }
@@ -1019,7 +1019,7 @@ impl StreamingProcessor {
         stream.mark_completed();
 
         // Record streaming metrics
-        let total_completion = usage.completion_total();
+        let counts = usage.counts();
         usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
@@ -1030,7 +1030,7 @@ impl StreamingProcessor {
         Self::record_generate_metrics(
             start_time,
             first_token_time,
-            total_completion,
+            counts,
             pd_timing.as_ref(),
             &ctx,
         );
@@ -1042,11 +1042,14 @@ impl StreamingProcessor {
     // Helper Methods
     // ========================================================================
 
-    /// Record streaming metrics for generate endpoint
+    /// The token and latency records of a generate stream at its end, from
+    /// the tally's `counts`: the prompt and its cache hit once per request
+    /// (the tally's, shared by every index), the completion tokens of every
+    /// index.
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
-        total_completion: u32,
+        counts: TokenCounts,
         pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
@@ -1064,9 +1067,9 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
-            input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
-            cached_tokens: None,
-            output_tokens: total_completion as u64,
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
         });
     }
 
