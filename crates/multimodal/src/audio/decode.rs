@@ -41,16 +41,16 @@ pub struct DecodedAudio {
 }
 
 /// The clip as mono `f32` samples, by the in-process decoder first and the
-/// external one when it fails. The clip's buffer is read in place: the
-/// in-process decoder's cursor takes it as it is, and the external decoder
-/// writes it to its scratch file. What a decoder says about the clip is the
+/// external one when it fails. The clip's buffer is handed over, never
+/// copied: the in-process decoder's cursor reads it as it is, and the
+/// external decoder's scratch file is written from it. What a decoder says about the clip is the
 /// media's fault ([`MediaConnectorError::AudioDecode`]); this process's own
 /// scratch file, pipe or task, and a decoder it cannot start, are its own
 /// (see [`MediaConnectorError::fault`]).
 pub async fn decode_audio_mono_f32(bytes: Bytes) -> Result<DecodedAudio, MediaConnectorError> {
     match audio_decode_backend_override() {
         Some("symphonia") => decode_audio_with_symphonia_blocking(bytes).await,
-        Some("ffmpeg") => decode_audio_with_ffmpeg(&bytes).await,
+        Some("ffmpeg") => decode_audio_with_ffmpeg(bytes).await,
         Some(backend) => Err(MediaConnectorError::decoder_unavailable(format!(
             "unsupported SMG_AUDIO_DECODE_BACKEND={backend}; expected auto, symphonia, or ffmpeg"
         ))),
@@ -61,7 +61,7 @@ pub async fn decode_audio_mono_f32(bytes: Bytes) -> Result<DecodedAudio, MediaCo
                     error = %symphonia_error,
                     "smg_mm_timing audio_decode_auto_symphonia_fallback"
                 );
-                decode_audio_with_ffmpeg(&bytes).await.map_err(|ffmpeg_error| {
+                decode_audio_with_ffmpeg(bytes).await.map_err(|ffmpeg_error| {
                     let message = format!(
                         "Symphonia audio decode failed: {symphonia_error}; ffmpeg fallback failed: {ffmpeg_error}"
                     );
@@ -214,7 +214,7 @@ fn decode_audio_mono_f32_symphonia_with_limits(
     finish_decoded_audio(mono, sample_rate)
 }
 
-async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, MediaConnectorError> {
+async fn decode_audio_with_ffmpeg(bytes: Bytes) -> Result<DecodedAudio, MediaConnectorError> {
     let input_file = write_temp_audio_file_async(bytes).await?;
     let sample_rate = probe_audio_sample_rate(input_file.path()).await?;
     // Ask FFmpeg for one sample beyond our limit so a longer stream is
@@ -356,9 +356,8 @@ async fn probe_audio_sample_rate(input_path: &Path) -> Result<usize, MediaConnec
 }
 
 async fn write_temp_audio_file_async(
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
-    let bytes = bytes.to_vec();
     task::spawn_blocking(move || write_temp_audio_file(&std::env::temp_dir(), &bytes))
         .await
         .map_err(MediaConnectorError::Blocking)?
