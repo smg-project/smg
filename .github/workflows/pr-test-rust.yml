@@ -2543,46 +2543,23 @@ jobs:
 
       - name: Check CI result
         run: |
-          # This optional partial AMD lane has a typed verdict even while OFF.
-          # Unknown/empty results cannot be accepted as a successful invocation.
-          case "${{ needs.e2e-1gpu-responses-memory-core-amd.result }}" in
-            success|skipped) ;;
-            failure|cancelled)
-              echo "AMD Responses memory core failed or was cancelled"
-              exit 1 ;;
-            *)
-              echo "AMD Responses memory core returned an unknown CI result"
-              exit 1 ;;
-          esac
-          # This optional AMD PD lane rejects unknown or empty CI results.
-          case "${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}" in
-            success|skipped) ;;
-            failure|cancelled)
-              echo "AMD vLLM NIXL PD failed or was cancelled"
-              exit 1 ;;
-            *)
-              echo "AMD vLLM NIXL PD returned an unknown CI result"
-              exit 1 ;;
-          esac
-          case "${{ needs.e2e-2gpu-pd-vllm-mooncake-amd.result }}" in
-            success|skipped) ;;
-            failure|cancelled)
-              echo "AMD vLLM Mooncake PD failed or was cancelled"
-              exit 1 ;;
-            *)
-              echo "AMD vLLM Mooncake PD returned an unknown CI result"
-              exit 1 ;;
-          esac
-          # The independently gated AMD4 lane still has a closed result set.
-          case "${{ needs.e2e-4gpu-pd-vllm-nixl-amd.result }}" in
-            success|skipped) ;;
-            failure|cancelled)
-              echo "AMD NIXL four-GPU PD failed or was cancelled"
-              exit 1 ;;
-            *)
-              echo "AMD NIXL four-GPU PD returned an unknown CI result"
-              exit 1 ;;
-          esac
+          # Keep optional AMD verdicts closed, including empty or unknown results.
+          while read -r job result; do
+            case "$result" in
+              success|skipped) ;;
+              failure|cancelled)
+                echo "$job failed or was cancelled"
+                exit 1 ;;
+              *)
+                echo "$job returned an unknown CI result: ${result:-<empty>}"
+                exit 1 ;;
+            esac
+          done <<'AMD_RESULTS'
+          e2e-1gpu-responses-memory-core-amd ${{ needs.e2e-1gpu-responses-memory-core-amd.result }}
+          e2e-2gpu-pd-vllm-nixl-amd ${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}
+          e2e-2gpu-pd-vllm-mooncake-amd ${{ needs.e2e-2gpu-pd-vllm-mooncake-amd.result }}
+          e2e-4gpu-pd-vllm-nixl-amd ${{ needs.e2e-4gpu-pd-vllm-nixl-amd.result }}
+          AMD_RESULTS
           # A job that runs into its timeout-minutes ends "cancelled", not
           # "failure", and fails this gate the same way (smg-project/smg-lab#171).
           # A run cancelled as a whole ends with this gate failed too: it did
