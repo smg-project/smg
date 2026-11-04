@@ -188,7 +188,12 @@ fn the_backend_matches_tokenizers_on_real_vocabularies() {
             println!("{dir}: the backend declined the tokenizer, nothing to compare");
             continue;
         }
-        let reference = ours.tokenizers_pipeline();
+        let on_tokenizers =
+            HuggingFaceTokenizer::from_file_on_tokenizers(&format!("{dir}/tokenizer.json"))
+                .expect("the crate loads the file on tokenizers");
+        let reference = on_tokenizers
+            .tokenizers_pipeline()
+            .expect("the pipeline alone was asked for");
         let specials: Vec<String> = reference
             .get_added_vocabulary()
             .get_added_tokens_decoder()

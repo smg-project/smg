@@ -59,7 +59,8 @@ as of `tokenizer/src/*`.
   (`update_post_processor`), even where `tokenizer.json` alone has none or a plain `ByteLevel` one;
   `encode(text, false)` gives the ids of the file alone. The serving engine's tokenizer, not the bare
   file, is the reference, so a cross-check against the `tokenizers` crate compares with
-  `HuggingFaceTokenizer::tokenizers_pipeline()` (the same post-processor) or with the flag off.
+  `HuggingFaceTokenizer::tokenizers_pipeline()` (the same post-processor; for a file the backend
+  serves, whose pipeline is not kept, the pipeline of `from_file_on_tokenizers`) or with the flag off.
 - Supports optional chat templates: either auto-discovered next to the tokenizer via
   `tokenizer_config.json` or overridable with an explicit template path.
 - Exposes `apply_chat_template` for JSON message payloads and template parameters.

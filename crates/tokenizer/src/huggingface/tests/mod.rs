@@ -1,6 +1,9 @@
 mod segment;
 mod vllm;
 
+/// The pipeline a file the backend declines keeps.
+const PIPELINE: &str = "the pipeline serves a file the backend declines";
+
 use std::{collections::HashMap, fs};
 
 use serde_json::json;
@@ -329,7 +332,11 @@ fn a_llama_class_checkpoint_encodes_as_its_reference_class_not_as_its_file() {
         "llama",
     );
     let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
-    assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+    assert!(tokenizer
+        .tokenizers_pipeline()
+        .expect(PIPELINE)
+        .get_normalizer()
+        .is_none());
     // A space before a normalized marker is its own piece and the marker
     // is matched (file: [6, 7, 5, 6, 8], the marker's pattern took the
     // space).
@@ -421,10 +428,9 @@ fn other_checkpoints_keep_their_file_pipeline() {
         "phi3",
     );
     let other_model_type = HuggingFaceTokenizer::from_file(&path).unwrap();
-    assert!(other_model_type
-        .tokenizers_pipeline()
-        .get_normalizer()
-        .is_some());
+    // The file's own pipeline, normalizer included: the backend, which
+    // reads the file as it is, takes it.
+    assert_eq!(other_model_type.encode_path(), EncodePath::Vllm);
     assert_eq!(ids_of(&other_model_type, "a </think> b"), [6, 7, 5, 6, 8]);
     assert_eq!(ids_of(&other_model_type, "<|im_start|>a"), [3, 6, 7]);
 
@@ -461,7 +467,11 @@ fn the_reference_s_model_type_table_decides_between_the_class_and_the_file() {
             llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
         let class = HuggingFaceTokenizer::from_file(&path).unwrap();
         assert!(
-            class.tokenizers_pipeline().get_normalizer().is_none(),
+            class
+                .tokenizers_pipeline()
+                .expect(PIPELINE)
+                .get_normalizer()
+                .is_none(),
             "{model_type}"
         );
         // `legacy: true`: the marker before every split (file: [6, 7, 5, 6, 8]);
@@ -478,10 +488,8 @@ fn the_reference_s_model_type_table_decides_between_the_class_and_the_file() {
         let path =
             llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
         let file = HuggingFaceTokenizer::from_file(&path).unwrap();
-        assert!(
-            file.tokenizers_pipeline().get_normalizer().is_some(),
-            "{model_type}"
-        );
+        // The file's own pipeline, normalizer included: the backend takes it.
+        assert_eq!(file.encode_path(), EncodePath::Vllm, "{model_type}");
         assert_eq!(
             ids_of(&file, "a </think> b"),
             [6, 7, 5, 6, 8],
@@ -509,7 +517,8 @@ fn a_llama_class_file_replacing_more_than_the_space_keeps_its_own_pipeline() {
     .unwrap();
     let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
     assert_eq!(ids_of(&tokenizer, "ba"), [6, 8, 6]);
-    assert!(tokenizer.core.tokenizer.get_normalizer().is_some());
+    // The file's own pipeline, normalizer included: the backend takes it.
+    assert_eq!(tokenizer.encode_path(), EncodePath::Vllm);
 }
 
 /// A prompt rendered by segments encodes as its flat text does: the plain
@@ -610,7 +619,11 @@ fn a_llama_class_checkpoint_shipped_without_config_json_encodes_as_its_class() {
     let text = "> <s> </s> <|";
     let class = [1405, 29871, 1, 29871, 2, 529, 29989];
     let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
-    assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+    assert!(tokenizer
+        .tokenizers_pipeline()
+        .expect(PIPELINE)
+        .get_normalizer()
+        .is_none());
     assert_eq!(ids_of(&tokenizer, text), class);
 
     fs::write(

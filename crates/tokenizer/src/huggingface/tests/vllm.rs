@@ -33,9 +33,21 @@ const TEXTS: &[&str] = &["", "a", "b a", "ab ba", " a  b ", "a b b a"];
 #[test]
 fn a_file_s_own_pipeline_takes_the_backend_and_agrees_with_tokenizers() {
     for (name, json) in [("byte-level", BYTE_LEVEL_TOKENIZER_JSON)] {
-        let (_dir, ours) = checkpoint(json);
+        let (dir, ours) = checkpoint(json);
         assert_eq!(ours.encode_path(), EncodePath::Vllm, "{name}");
-        let reference = ours.tokenizers_pipeline();
+        assert!(
+            ours.tokenizers_pipeline().is_none(),
+            "{name}: the pipeline is not kept"
+        );
+        let path = dir.path().join("tokenizer.json");
+        let on_tokenizers =
+            HuggingFaceTokenizer::from_file_on_tokenizers(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            on_tokenizers.encode_path(),
+            EncodePath::Tokenizers,
+            "{name}"
+        );
+        let reference = on_tokenizers.tokenizers_pipeline().unwrap();
         for &text in TEXTS {
             for specials in [false, true] {
                 let expected = reference.encode(text, specials).unwrap();

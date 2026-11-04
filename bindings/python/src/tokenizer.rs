@@ -1104,7 +1104,7 @@ impl PyTokenizer {
     /// `transformers` tokenizer.
     fn __len__(&self) -> usize {
         match self.inner.as_any().downcast_ref::<HuggingFaceTokenizer>() {
-            Some(tokenizer) => tokenizer.tokenizers_pipeline().get_vocab_size(true),
+            Some(tokenizer) => tokenizer.vocab_size_with_added(),
             None => self.inner.vocab_size(),
         }
     }

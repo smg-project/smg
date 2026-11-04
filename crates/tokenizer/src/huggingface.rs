@@ -81,8 +81,13 @@ pub struct HuggingFaceTokenizer {
     /// prompt rendered by segments.
     core: Arc<EncoderCore>,
     special_tokens: SpecialTokens,
-    vocab: HashMap<String, TokenIdType>,
+    /// Every token and its id, the added tokens included; shared with the
+    /// core, whose segment encode reads the controls' ids from it.
+    vocab: Arc<HashMap<String, TokenIdType>>,
     reverse_vocab: HashMap<TokenIdType, String>,
+    /// The model's vocabulary size, the added tokens not counted
+    /// ([`TokenizerTrait::vocab_size`]).
+    model_vocab_size: usize,
     chat_template: ChatTemplateState,
     /// Raw `response_template` from the sibling tokenizer_config.json.
     response_template: Option<serde_json::Value>,
@@ -117,6 +122,9 @@ pub struct HuggingFaceTokenizer {
     /// The added tokens with the flags that place them in the pipeline (the
     /// cache's split rules read them, see [`TokenizerTrait::added_token_strings`]).
     added_tokens: Vec<FileAddedToken>,
+    /// The ids of the added tokens marked special: what `skip_special_tokens`
+    /// strips.
+    special_ids: HashSet<TokenIdType>,
 }
 
 /// The added tokens a built pipeline marks special, the only tokens a
@@ -218,27 +226,26 @@ fn choose_backend(vllm: VllmSource<'_>, frame: Option<Frame>) -> Option<crate::v
     backend
 }
 
-/// What an encode runs on, shared between the wrapper and the deferred
-/// encode of a prompt rendered by segments (an [`EncodeJob`] outlives the
-/// borrow of the wrapper that prepared it).
-struct EncoderCore {
+/// What an encode runs on: the `vllm-tokenizer` backend over the file,
+/// when it took it (see [`choose_backend`]), else the `tokenizers`
+/// pipeline.
+enum Engine {
+    /// Every flat encode, the plain regions of a segment encode and every
+    /// batch decode run on the backend; the pipeline the load read the
+    /// file into is not kept.
+    Vllm(crate::vllm::VllmBackend),
+    /// The `tokenizers` pipeline, for a tokenizer the backend declined
+    /// (boxed: the pipeline is thirty times the backend's handle).
+    Tokenizers(Box<Pipeline>),
+}
+
+/// The `tokenizers` pipeline as loaded, with the plain pipelines derived
+/// from it on first use.
+struct Pipeline {
     tokenizer: HfTokenizer,
-    /// The `vllm-tokenizer` backend, when it took the file (see
-    /// [`choose_backend`]): every flat encode, the plain regions of a
-    /// segment encode and every batch decode run on it. `None` keeps them
-    /// in `tokenizers`.
-    vllm: Option<crate::vllm::VllmBackend>,
-    /// Every added token, special or not, as one leftmost-longest matcher
-    /// over the raw text, built on first use (only a renderer with an
-    /// encoder of its own asks; a vocabulary can carry tens of thousands of
-    /// added tokens, which a Jinja-rendered model never pays for); `None`
-    /// for a vocabulary without added tokens. It tells whether the flat
-    /// encode of a prompt rendered by segments would cut out exactly the
-    /// renderer's control tokens.
-    added: OnceLock<Option<AddedTokens>>,
-    /// `tokenizer` without its added vocabulary, built on first use when
-    /// the backend is absent: the plain segments of a prompt rendered by
-    /// segments are encoded by it, every spelling in them as text.
+    /// `tokenizer` without its added vocabulary, built on first use: the
+    /// plain segments of a prompt rendered by segments are encoded by it,
+    /// every spelling in them as text.
     plain: OnceLock<HfTokenizer>,
     /// [`Self::plain`] for a plain segment after a control, under a
     /// `Metaspace` pre-tokenizer that prepends the word marker at the start
@@ -247,101 +254,13 @@ struct EncoderCore {
     plain_after_control: OnceLock<HfTokenizer>,
 }
 
-impl EncoderCore {
-    fn new(tokenizer: HfTokenizer, vllm: Option<crate::vllm::VllmBackend>) -> Self {
+impl Pipeline {
+    fn new(tokenizer: HfTokenizer) -> Self {
         Self {
             tokenizer,
-            vllm,
-            added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
         }
-    }
-
-    /// The matcher over the added vocabulary, built on first use.
-    fn added(&self) -> Option<&AddedTokens> {
-        self.added
-            .get_or_init(|| {
-                let added: Vec<&str> = self
-                    .tokenizer
-                    .get_added_vocabulary()
-                    .get_vocab()
-                    .keys()
-                    .map(String::as_str)
-                    .collect();
-                AddedTokens::build(&added).unwrap_or_else(|declined| {
-                    debug!(%declined, "no matcher over the added tokens; prompts rendered by segments are encoded by segments");
-                    None
-                })
-            })
-            .as_ref()
-    }
-
-    /// Whether the flat encode of `text` cuts out exactly the added tokens at
-    /// `controls` (the renderer's control tokens, in order): then it is the
-    /// segment encode and the text can be encoded as text, through every
-    /// path and cache a flat encode takes. False when another added-token
-    /// spelling occurs in the text (one a client typed), or a control is no
-    /// added token of this vocabulary.
-    fn flat_encode_is_segment_encode(&self, text: &str, controls: &[Range<usize>]) -> bool {
-        match self.added() {
-            Some(added) => added.ranges(text).eq(controls.iter().cloned()),
-            None => controls.is_empty(),
-        }
-    }
-
-    /// The ids of a prompt rendered by segments: each control segment as
-    /// the id of its spelling, the plain text between two controls through
-    /// the pre-tokenizer and the model as one text with no added token cut
-    /// out of it (the family's reference library encodes the plain regions
-    /// of a prompt the same way). A control spelling the vocabulary has no
-    /// token for is text, joined with the plain text around it so that its
-    /// pieces merge with their neighbours as the flat encode merged them.
-    fn encode_segments(&self, segments: &[PromptSegment]) -> Result<Vec<u32>> {
-        let mut ids = Vec::with_capacity(segments.iter().map(|s| s.text.len() / 3 + 1).sum());
-        let mut plain = String::new();
-        for segment in segments {
-            let control = segment
-                .allow_special
-                .then(|| self.tokenizer.token_to_id(&segment.text))
-                .flatten();
-            match control {
-                Some(id) => {
-                    if !plain.is_empty() {
-                        self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
-                        plain.clear();
-                    }
-                    ids.push(id);
-                }
-                None => {
-                    if segment.allow_special {
-                        debug!(token = %segment.text, "a control token the vocabulary lacks is encoded as text");
-                    }
-                    plain.push_str(&segment.text);
-                }
-            }
-        }
-        if !plain.is_empty() {
-            self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
-        }
-        Ok(ids)
-    }
-
-    /// Appends the ids of `text` with every spelling in it encoded as text:
-    /// the backend's ordinary encode (its added-token matchers bypassed),
-    /// else `tokenizers` without the added vocabulary, as the region at the
-    /// start of the prompt (`at_start`) or after a control.
-    fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
-        if let Some(vllm) = &self.vllm {
-            ids.extend(vllm.encode_ordinary(text)?);
-            return Ok(());
-        }
-        let encoding = self
-            .plain_tokenizer(at_start)
-            .encode(text, false)
-            .map_err(|e| Error::msg(format!("Encoding failed: {e}")))?;
-        ids.extend_from_slice(encoding.get_ids());
-        Ok(())
     }
 
     /// The pipeline without its added vocabulary, cloned once on first use:
@@ -379,29 +298,162 @@ impl EncoderCore {
     }
 }
 
+/// What an encode runs on, shared between the wrapper and the deferred
+/// encode of a prompt rendered by segments (an [`EncodeJob`] outlives the
+/// borrow of the wrapper that prepared it).
+struct EncoderCore {
+    engine: Engine,
+    /// The wrapper's vocabulary with the added tokens: the segment encode
+    /// reads the controls' ids from it.
+    vocab: Arc<HashMap<String, TokenIdType>>,
+    /// The spelling of every added token, special or not, for the matcher.
+    added_contents: Vec<String>,
+    /// Every added token, special or not, as one leftmost-longest matcher
+    /// over the raw text, built on first use (only a renderer with an
+    /// encoder of its own asks; a vocabulary can carry tens of thousands of
+    /// added tokens, which a Jinja-rendered model never pays for); `None`
+    /// for a vocabulary without added tokens. It tells whether the flat
+    /// encode of a prompt rendered by segments would cut out exactly the
+    /// renderer's control tokens.
+    added: OnceLock<Option<AddedTokens>>,
+}
+
+impl EncoderCore {
+    fn new(
+        engine: Engine,
+        vocab: Arc<HashMap<String, TokenIdType>>,
+        added_tokens: &[FileAddedToken],
+    ) -> Self {
+        Self {
+            engine,
+            vocab,
+            added_contents: added_tokens
+                .iter()
+                .map(|token| token.content.clone())
+                .collect(),
+            added: OnceLock::new(),
+        }
+    }
+
+    /// The matcher over the added vocabulary, built on first use.
+    fn added(&self) -> Option<&AddedTokens> {
+        self.added
+            .get_or_init(|| {
+                let added: Vec<&str> = self
+                    .added_contents
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                AddedTokens::build(&added).unwrap_or_else(|declined| {
+                    debug!(%declined, "no matcher over the added tokens; prompts rendered by segments are encoded by segments");
+                    None
+                })
+            })
+            .as_ref()
+    }
+
+    /// Whether the flat encode of `text` cuts out exactly the added tokens at
+    /// `controls` (the renderer's control tokens, in order): then it is the
+    /// segment encode and the text can be encoded as text, through every
+    /// path and cache a flat encode takes. False when another added-token
+    /// spelling occurs in the text (one a client typed), or a control is no
+    /// added token of this vocabulary.
+    fn flat_encode_is_segment_encode(&self, text: &str, controls: &[Range<usize>]) -> bool {
+        match self.added() {
+            Some(added) => added.ranges(text).eq(controls.iter().cloned()),
+            None => controls.is_empty(),
+        }
+    }
+
+    /// The ids of a prompt rendered by segments: each control segment as
+    /// the id of its spelling, the plain text between two controls through
+    /// the pre-tokenizer and the model as one text with no added token cut
+    /// out of it (the family's reference library encodes the plain regions
+    /// of a prompt the same way). A control spelling the vocabulary has no
+    /// token for is text, joined with the plain text around it so that its
+    /// pieces merge with their neighbours as the flat encode merged them.
+    fn encode_segments(&self, segments: &[PromptSegment]) -> Result<Vec<u32>> {
+        let mut ids = Vec::with_capacity(segments.iter().map(|s| s.text.len() / 3 + 1).sum());
+        let mut plain = String::new();
+        for segment in segments {
+            let control = segment
+                .allow_special
+                .then(|| self.vocab.get(&segment.text).copied())
+                .flatten();
+            match control {
+                Some(id) => {
+                    if !plain.is_empty() {
+                        self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
+                        plain.clear();
+                    }
+                    ids.push(id);
+                }
+                None => {
+                    if segment.allow_special {
+                        debug!(token = %segment.text, "a control token the vocabulary lacks is encoded as text");
+                    }
+                    plain.push_str(&segment.text);
+                }
+            }
+        }
+        if !plain.is_empty() {
+            self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// Appends the ids of `text` with every spelling in it encoded as text:
+    /// the backend's ordinary encode (its added-token matchers bypassed),
+    /// else `tokenizers` without the added vocabulary, as the region at the
+    /// start of the prompt (`at_start`) or after a control.
+    fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
+        match &self.engine {
+            Engine::Vllm(vllm) => ids.extend(vllm.encode_ordinary(text)?),
+            Engine::Tokenizers(pipeline) => {
+                let encoding = pipeline
+                    .plain_tokenizer(at_start)
+                    .encode(text, false)
+                    .map_err(|e| Error::msg(format!("Encoding failed: {e}")))?;
+                ids.extend_from_slice(encoding.get_ids());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl HuggingFaceTokenizer {
     /// The path this tokenizer's encodes take, chosen at load (see
     /// [`EncodePath`]).
     pub fn encode_path(&self) -> EncodePath {
-        if self.core.vllm.is_some() {
-            EncodePath::Vllm
-        } else {
-            EncodePath::Tokenizers
+        match self.core.engine {
+            Engine::Vllm(_) => EncodePath::Vllm,
+            Engine::Tokenizers(_) => EncodePath::Tokenizers,
         }
     }
 
-    /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
-    /// vocabulary and stages of `tokenizer.json`, with the post-processor
-    /// the configuration prescribes when `tokenizer_config.json` sets
-    /// `add_bos_token` or `add_eos_token`, and with the file's `truncation`
-    /// and `padding` blocks cleared (both rules are on [`Self::from_file`]).
-    /// A cross-check of the crate's ids against the `tokenizers` crate
-    /// compares with this pipeline, which adds the same special tokens on
-    /// request, or with `add_special_tokens` off, where it and
-    /// `tokenizer.json` read alone agree once that file's blocks are cleared
-    /// too.
-    pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
-        &self.core.tokenizer
+    /// The `tokenizers` pipeline behind a tokenizer the backend declined, as
+    /// loaded: the vocabulary and stages of `tokenizer.json`, with the
+    /// post-processor the configuration prescribes when
+    /// `tokenizer_config.json` sets `add_bos_token` or `add_eos_token`, and
+    /// with the file's `truncation` and `padding` blocks cleared (both rules
+    /// are on [`Self::from_file`]). `None` for a tokenizer the backend
+    /// serves, whose pipeline is not kept. A cross-check of the crate's ids
+    /// against the `tokenizers` crate compares with this pipeline (the one
+    /// of [`Self::from_file_on_tokenizers`] for a file the backend serves),
+    /// which adds the same special tokens on request, or with
+    /// `add_special_tokens` off, where it and `tokenizer.json` read alone
+    /// agree once that file's blocks are cleared too.
+    pub fn tokenizers_pipeline(&self) -> Option<&HfTokenizer> {
+        match &self.core.engine {
+            Engine::Vllm(_) => None,
+            Engine::Tokenizers(pipeline) => Some(&pipeline.tokenizer),
+        }
+    }
+
+    /// The vocabulary's size with the added tokens, as `len()` of a
+    /// `transformers` tokenizer.
+    pub fn vocab_size_with_added(&self) -> usize {
+        self.vocab.len()
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file.
@@ -448,7 +500,16 @@ impl HuggingFaceTokenizer {
     ) -> Result<Self> {
         let tokenizer = LoadingTokenizer::from_file(file_path)
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
-        Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path)
+        Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path, true)
+    }
+
+    /// The wrapper over the `tokenizers` pipeline alone, as [`Self::from_file`]
+    /// builds it for a file the backend declines: [`Self::tokenizers_pipeline`]
+    /// is then the pipeline a cross-check of the backend's ids compares with.
+    pub fn from_file_on_tokenizers(file_path: &str) -> Result<Self> {
+        let tokenizer = LoadingTokenizer::from_file(file_path)
+            .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
+        Self::from_built_tokenizer(tokenizer, Path::new(file_path), None, false)
     }
 
     /// Create a Qwen2-compatible byte-level BPE tokenizer from a Hugging Face
@@ -464,7 +525,7 @@ impl HuggingFaceTokenizer {
         // Shared initialization only needs this path to locate sibling config
         // files. The file itself intentionally does not exist in this layout.
         let logical_tokenizer_path = dir.join("tokenizer.json");
-        Self::from_built_tokenizer(tokenizer, &logical_tokenizer_path, chat_template_path)
+        Self::from_built_tokenizer(tokenizer, &logical_tokenizer_path, chat_template_path, true)
     }
 
     fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<LoadingTokenizer> {
@@ -655,11 +716,14 @@ impl HuggingFaceTokenizer {
         Ok(settled)
     }
 
-    /// Bind checkpoint metadata, the active template, and its cached renderer policy.
+    /// Bind checkpoint metadata, the active template, and its cached renderer
+    /// policy. `backend_allowed` is false for the pipeline alone
+    /// ([`Self::from_file_on_tokenizers`]).
     fn from_built_tokenizer(
         mut tokenizer: LoadingTokenizer,
         tokenizer_path: &Path,
         chat_template_path: Option<&str>,
+        backend_allowed: bool,
     ) -> Result<Self> {
         // The file's `truncation` and `padding` blocks are the defaults the
         // engine's tokenizer keeps for a call that asks to truncate or pad; a
@@ -686,9 +750,14 @@ impl HuggingFaceTokenizer {
         let file = file.flatten();
         // The vocabulary with the added tokens (`<|im_start|>` and the like):
         // the file's where there is one, else the pipeline's.
-        let vocab = file
-            .as_ref()
-            .map_or_else(|| tokenizer.get_vocab(true), TokenizerFile::vocab);
+        let vocab = Arc::new(
+            file.as_ref()
+                .map_or_else(|| tokenizer.get_vocab(true), TokenizerFile::vocab),
+        );
+        let model_vocab_size = file.as_ref().map_or_else(
+            || tokenizer.get_vocab_size(false),
+            |file| file.model_vocab.len(),
+        );
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
@@ -823,7 +892,9 @@ impl HuggingFaceTokenizer {
         // it takes the file where the pipeline is the file's, and declines
         // where the load built the pipeline from other files or changed it
         // beyond the file, so that its ids are the wrapper's (see `vllm`).
-        let vllm_source: VllmSource<'_> = if !tokenizer_path.is_file() {
+        let vllm_source: VllmSource<'_> = if !backend_allowed {
+            Err(Declined::from("the pipeline alone was asked for"))
+        } else if !tokenizer_path.is_file() {
             Err(Declined::from(
                 "no tokenizer.json (the vocabulary was read from vocab.json and merges.txt)",
             ))
@@ -835,20 +906,21 @@ impl HuggingFaceTokenizer {
             Err(Declined::from(
                 "added tokens with one normalized spelling were settled beyond the file",
             ))
+        } else if file.is_none() {
+            Err(Declined::from(
+                "the crate's reader did not take tokenizer.json; the pipeline describes the file",
+            ))
         } else {
             Ok(tokenizer_path)
         };
-        let vllm = choose_backend(vllm_source, configured_frame);
-        // The file's model moves into the built tokenizer with its word cache
-        // bounded, no copy of the model (see `word_cache`).
-        let tokenizer = HfTokenizer::from(tokenizer);
         // The backend took the file, so the file describes the pipeline: the
         // added tokens, the decoder's shape and the tables come from it and
-        // the vocabulary. A file the load changed beyond itself, or none,
-        // leaves them to the pipeline.
-        let (added_tokens, has_byte_fallback, byte_level, pieces) =
-            match file.filter(|_| vllm.is_some()) {
-                Some(file) => {
+        // the vocabulary, and the pipeline the load read the file into goes
+        // with this function's frame. A file the load changed beyond itself,
+        // or none, leaves them to the pipeline, which is the engine then.
+        let (engine, added_tokens, has_byte_fallback, byte_level, pieces) =
+            match (choose_backend(vllm_source, configured_frame), file) {
+                (Some(vllm), Some(file)) => {
                     let special: HashSet<&str> = file
                         .added_tokens
                         .iter()
@@ -865,14 +937,31 @@ impl HuggingFaceTokenizer {
                         PieceTable::from_vocabulary(chain, max_id, token_of, is_special)
                     });
                     let has_byte_fallback = file.has_byte_fallback();
-                    (file.added_tokens, has_byte_fallback, byte_level, pieces)
+                    (
+                        Engine::Vllm(vllm),
+                        file.added_tokens,
+                        has_byte_fallback,
+                        byte_level,
+                        pieces,
+                    )
                 }
-                None => (
-                    pipeline_added_tokens(&tokenizer),
-                    tokenizer.get_decoder().is_some_and(has_byte_fallback),
-                    ByteLevelTable::build(&tokenizer),
-                    PieceTable::build(&tokenizer),
-                ),
+                _ => {
+                    // The file's model moves into the built tokenizer with
+                    // its word cache bounded, no copy of the model (see
+                    // `word_cache`).
+                    let tokenizer = HfTokenizer::from(tokenizer);
+                    let added_tokens = pipeline_added_tokens(&tokenizer);
+                    let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
+                    let byte_level = ByteLevelTable::build(&tokenizer);
+                    let pieces = PieceTable::build(&tokenizer);
+                    (
+                        Engine::Tokenizers(Box::new(Pipeline::new(tokenizer))),
+                        added_tokens,
+                        has_byte_fallback,
+                        byte_level,
+                        pieces,
+                    )
+                }
             };
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
@@ -899,10 +988,11 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
-            core: Arc::new(EncoderCore::new(tokenizer, vllm)),
+            core: Arc::new(EncoderCore::new(engine, Arc::clone(&vocab), &added_tokens)),
             special_tokens,
             vocab,
             reverse_vocab,
+            model_vocab_size,
             chat_template,
             glm,
             media_handling,
@@ -914,6 +1004,11 @@ impl HuggingFaceTokenizer {
             renderer,
             has_byte_fallback,
             byte_fallback_values,
+            special_ids: added_tokens
+                .iter()
+                .filter(|token| token.special)
+                .map(|token| token.id)
+                .collect(),
             added_tokens,
         })
     }
@@ -954,13 +1049,7 @@ impl HuggingFaceTokenizer {
                 && token.starts_with("<0x")
                 && token.ends_with('>')
                 && token.as_bytes()[3..5].iter().all(u8::is_ascii_hexdigit);
-            byte_token
-                || (skip_special_tokens
-                    && self
-                        .core
-                        .tokenizer
-                        .get_added_vocabulary()
-                        .is_special_token(token))
+            byte_token || (skip_special_tokens && self.special_ids.contains(&token_id))
         })
     }
 
@@ -1149,7 +1238,9 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        let vllm = choose_backend(
+        // Built in memory: no file for the backend to read, so the pipeline
+        // is the engine (the choice is logged and counted as for a file).
+        let backend = choose_backend(
             Err(Declined::from(
                 "the tokenizer was built in memory, with no tokenizer.json to read",
             )),
@@ -1160,22 +1251,30 @@ impl HuggingFaceTokenizer {
             pipeline_special_tokens(&tokenizer),
             &ConfigTokens::default(),
         );
-        let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
+        let vocab = Arc::new(tokenizer.get_vocab(true)); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
             .collect();
+        let model_vocab_size = tokenizer.get_vocab_size(false);
 
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let added_tokens = pipeline_added_tokens(&tokenizer);
+        let byte_level = ByteLevelTable::build(&tokenizer);
+        let pieces = PieceTable::build(&tokenizer);
+        let engine = match backend {
+            Some(backend) => Engine::Vllm(backend),
+            None => Engine::Tokenizers(Box::new(Pipeline::new(tokenizer))),
+        };
         HuggingFaceTokenizer {
-            byte_level: ByteLevelTable::build(&tokenizer),
-            pieces: PieceTable::build(&tokenizer),
-            core: Arc::new(EncoderCore::new(tokenizer, vllm)),
+            byte_level,
+            pieces,
+            core: Arc::new(EncoderCore::new(engine, Arc::clone(&vocab), &added_tokens)),
             special_tokens,
             vocab,
             reverse_vocab,
+            model_vocab_size,
             chat_template: ChatTemplateState::empty(),
             response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
@@ -1187,6 +1286,11 @@ impl HuggingFaceTokenizer {
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
+            special_ids: added_tokens
+                .iter()
+                .filter(|token| token.special)
+                .map(|token| token.id)
+                .collect(),
             added_tokens,
         }
     }
@@ -1550,30 +1654,30 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-        if let Some(vllm) = &self.core.vllm {
-            return vllm.encode(input, add_special_tokens);
+        match &self.core.engine {
+            Engine::Vllm(vllm) => vllm.encode(input, add_special_tokens),
+            Engine::Tokenizers(pipeline) => pipeline
+                .tokenizer
+                .encode(input, add_special_tokens)
+                .map_err(|e| Error::msg(format!("Encoding failed: {e}")))
+                .map(|encoding| Encoding::Hf(Box::new(encoding))),
         }
-        self.core
-            .tokenizer
-            .encode(input, add_special_tokens)
-            .map_err(|e| Error::msg(format!("Encoding failed: {e}")))
-            .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-        if let Some(vllm) = &self.core.vllm {
-            return vllm.encode_batch(inputs, add_special_tokens);
+        match &self.core.engine {
+            Engine::Vllm(vllm) => vllm.encode_batch(inputs, add_special_tokens),
+            Engine::Tokenizers(pipeline) => pipeline
+                .tokenizer
+                .encode_batch(inputs.to_vec(), add_special_tokens)
+                .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))
+                .map(|encodings| {
+                    encodings
+                        .into_iter()
+                        .map(|e| Encoding::Hf(Box::new(e)))
+                        .collect()
+                }),
         }
-        self.core
-            .tokenizer
-            .encode_batch(inputs.to_vec(), add_special_tokens)
-            .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))
-            .map(|encodings| {
-                encodings
-                    .into_iter()
-                    .map(|e| Encoding::Hf(Box::new(e)))
-                    .collect()
-            })
     }
 }
 
@@ -1891,16 +1995,17 @@ impl Decoder for HuggingFaceTokenizer {
         // The backend decodes every batch, in front of the wrapper's own
         // tables; the streaming windows of a byte-fallback vocabulary keep
         // the piece table (see `window_decode`).
-        if let Some(vllm) = &self.core.vllm {
-            return vllm.decode(token_ids, skip_special_tokens);
-        }
+        let pipeline = match &self.core.engine {
+            Engine::Vllm(vllm) => return vllm.decode(token_ids, skip_special_tokens),
+            Engine::Tokenizers(pipeline) => pipeline,
+        };
         // A sentencepiece-style vocabulary with byte fallback decodes through
         // its piece table, as its streaming windows do: one pass over the ids
         // in place of the `tokenizers` decoder chain over every piece.
         if let Some(table) = &self.pieces {
             return Ok(table.render(token_ids, skip_special_tokens));
         }
-        self.core
+        pipeline
             .tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
@@ -2116,7 +2221,7 @@ impl HuggingFaceTokenizer {
 
 impl TokenizerTrait for HuggingFaceTokenizer {
     fn vocab_size(&self) -> usize {
-        self.core.tokenizer.get_vocab_size(false)
+        self.model_vocab_size
     }
 
     fn get_special_tokens(&self) -> &SpecialTokens {

@@ -137,7 +137,11 @@ fn a_cross_check_compares_with_the_same_pipeline_or_with_the_flag_off() {
     let (_dir, path) = checkpoint(Some((Some(true), None)));
     let bare = Tokenizer::from_file(&path).expect("the file loads");
     let ours = HuggingFaceTokenizer::from_file(&path).expect("the crate loads it");
-    let pipeline = ours.tokenizers_pipeline();
+    let on_tokenizers = HuggingFaceTokenizer::from_file_on_tokenizers(&path)
+        .expect("the crate loads it on tokenizers");
+    let pipeline = on_tokenizers
+        .tokenizers_pipeline()
+        .expect("the pipeline alone was asked for");
     let bos_id = bare.token_to_id(BOS).expect("the BOS id");
     for text in TEXTS {
         for add_special_tokens in [false, true] {
