@@ -937,6 +937,13 @@ impl TokenizerTrait for TiktokenTokenizer {
         self.template_answers().content_format()
     }
 
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        self.template_answers().content_format_for_tools(has_tools)
+    }
+
     fn thinking_toggle(&self) -> ThinkingToggle {
         self.template_answers().thinking_toggle()
     }
@@ -1150,6 +1157,34 @@ mod tests {
                 .apply_chat_template(&messages, with_tools())
                 .unwrap(),
             "f"
+        );
+    }
+
+    /// The content format a request's messages are shaped into follows the
+    /// template the request renders through: the `tool_use` template's for
+    /// a request that declares tools, the `default` one's otherwise, as the
+    /// Hugging Face tokenizer answers it; the plain question keeps answering
+    /// for the default template.
+    #[test]
+    fn the_content_format_of_a_tools_request_is_the_tool_use_template_s() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{"chat_template": [
+                {"name": "default", "template": "{% for message in messages %}{{ message['content'] }}{% endfor %}"},
+                {"name": "tool_use", "template": "{% for message in messages %}{% for part in message['content'] %}{{ part['text'] }}{% endfor %}{% endfor %}"}]}"#,
+            None,
+        );
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+        assert_eq!(
+            tokenizer.chat_template_content_format_for_request(false),
+            ChatTemplateContentFormat::String
+        );
+        assert_eq!(
+            tokenizer.chat_template_content_format_for_request(true),
+            ChatTemplateContentFormat::OpenAI
         );
     }
 
