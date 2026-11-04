@@ -2761,7 +2761,7 @@ impl RouterTrait for PDRouter {
     async fn route_messages_count_tokens(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         mut body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
@@ -2769,6 +2769,15 @@ impl RouterTrait for PDRouter {
         // holds the tokenizer and prompt template) and no KV handoff.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
+        // The queue timeout, judged before that worker is read, as the pair
+        // routes judge it; this route takes no admission wait.
+        if let Some(refused) = self
+            .queue_timeout
+            .acceptance_for_selection(Some(tenant_meta))
+            .and_then(|accepted| self.queue_timeout.refuse_if_expired(model_id, accepted))
+        {
+            return refused;
+        }
         let request_text = self
             .policies_need_request_text()
             .then(|| body.extract_text_for_routing());
@@ -7449,6 +7458,58 @@ mod tests {
                     && line.ends_with(" 1")
             }),
             "counted once under the selection-timeout reason:\n{rendered}"
+        );
+    }
+
+    /// The count-tokens route reads one prefill worker and no pair; the
+    /// bound is judged before that worker is read all the same.
+    #[tokio::test]
+    async fn a_count_tokens_request_held_past_the_queue_timeout_is_refused_before_the_prefill_is_read(
+    ) {
+        let (prefill_url, prefill_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+        let (decode_url, _decode_seen) = spawn_recording_stub("{}").await;
+        let router = PDRouter {
+            queue_timeout: QueueTimeout::from_secs(1),
+            ..create_test_pd_router()
+        };
+        register_pd_pair(&router, prefill_url, decode_url);
+        let body = || -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid count_tokens request")
+        };
+
+        let held = TenantRequestMeta::new(TenantKey::new("test-tenant"))
+            .with_extension(accepted_long_ago());
+        let response = router
+            .route_messages_count_tokens(None, &held, body(), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert!(
+            taken(&prefill_seen).is_empty(),
+            "refused before the prefill worker was read"
+        );
+
+        let fresh =
+            TenantRequestMeta::new(TenantKey::new("test-tenant")).with_extension(AcceptedAt::now());
+        let response = router
+            .route_messages_count_tokens(None, &fresh, body(), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "inside the bound the count is forwarded"
+        );
+        assert_eq!(
+            taken(&prefill_seen).len(),
+            1,
+            "one read of the prefill worker"
         );
     }
 
