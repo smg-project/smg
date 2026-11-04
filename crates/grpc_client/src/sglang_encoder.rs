@@ -72,7 +72,8 @@ impl SglangEncoderClient {
         }
         let mut client = self.client.clone();
         let mut request = Request::new(request);
-        request.set_timeout(remaining);
+        // The caller owns expiration; grpc-timeout would arm tonic's second,
+        // rounded local timer and lose the gateway timeout marker.
         if let Err(error) = self.trace_injector.inject(request.metadata_mut()) {
             tracing::warn!("Failed to inject trace context: {error}");
         }
