@@ -430,7 +430,11 @@ jobs:
           backend = inputs.get("kv_backend") or (
               inputs.get("vllm_kv_backend", "") if engine == "vllm" else ""
           )
-          mode = inputs.get("vllm_moriio_mode") or "auto" if engine == "vllm" and backend == "moriio" else ""
+          mode = (
+              (inputs.get("vllm_moriio_mode", "").strip().lower() or "read")
+              if engine == "vllm" and backend == "moriio"
+              else ""
+          )
           vendor = inputs.get("gpu_vendor") or "unknown"
           fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
                     vendor, inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
