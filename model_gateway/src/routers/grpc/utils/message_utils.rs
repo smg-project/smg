@@ -398,22 +398,6 @@ pub(crate) async fn resolve_media(
             .get_by_name(model_id)
             .or_else(|| components.tokenizer_registry.get_by_id(model_id))
     });
-    // The media-part order comes from the model registry so every path
-    // renders a model consistently.
-    let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
-        (Some(mm_components), Some(entry)) => {
-            multimodal::resolve_media_part_order(
-                model_id,
-                tokenizer,
-                mm_components,
-                &entry.id,
-                &entry.source,
-            )
-            .await
-        }
-        _ => MediaPartOrder::MediaFirst,
-    };
-
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -451,14 +435,31 @@ pub(crate) async fn resolve_media(
     )
     .await
     .map_err(|e| {
+        // The chain, not the outermost context alone: a hub failure's cause
+        // (the file, the hub's answer, its address) is answered generically
+        // below and lives here.
         error!(
             function = stage,
             model = %model_id,
-            error = %e,
+            error = %format!("{e:#}"),
             "Failed to prepare the multimodal prompt plan"
         );
-        invalid_multimodal_request(e)
+        multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
     })?;
+    // The media-part order comes from the model registry so every path
+    // renders a model consistently. It is looked up after the placeholders,
+    // whose preparation resolved the model's configs and cached them, so the
+    // lookup is a cache hit and a request resolves the checkpoint once: looked
+    // up first, it would resolve on its own, fall back to media-first on a
+    // failure it does not report, and leave the preparation to resolve again.
+    let media_order = multimodal::resolve_media_part_order(
+        model_id,
+        tokenizer,
+        mm_components,
+        &entry.id,
+        &entry.source,
+    )
+    .await;
 
     Ok(ResolvedMedia {
         media_order,
