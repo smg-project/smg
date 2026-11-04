@@ -208,7 +208,9 @@ jobs:
         run: |
           test "$CHECK_ENGINE" = sglang
           test "$CHECK_VENDOR" = amd
-          test "$CHECK_IMAGE" = 'lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d'
+          [[ "$CHECK_IMAGE" =~ ^[[:alnum:]][[:alnum:]_.:/-]*:[[:alnum:]_.-]+@sha256:[a-f0-9]{64}$ ]]
+          test "$(grep -Ec '^[[:space:]]*IMAGE([[:space:]:=]|$)' scripts/ci_verify_sglang_rocm_cohort.py)" = 1
+          grep -Fqx "IMAGE = \"$CHECK_IMAGE\"" scripts/ci_verify_sglang_rocm_cohort.py
           test -s scripts/ci_setup_sglang_rocm_image.sh
           test -s scripts/ci_verify_sglang_rocm_cohort.py
 
