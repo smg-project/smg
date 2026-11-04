@@ -562,3 +562,40 @@ def test_real_verifier_native_version_mismatch_reports_observed_and_expected(tmp
     assert "observed=('0.2.0', '0.1.16', '0.1.6')" in message
     assert "expected=('0.1.12', '0.1.15', '0.1.5')" in message
     assert "full cohort observed=" in message and "expected=" in message
+
+
+@pytest.mark.parametrize(
+    "package,bad_version,expected_version",
+    [("sglang", "0.5.22", "0.5.21"),
+     ("torch", "2.12.0+rocm10.0.0", "2.11.0+rocm10.0.0")],
+)
+def test_real_verifier_reports_changed_sglang_or_torch_before_native_context(
+    tmp_path, monkeypatch, package, bad_version, expected_version
+):
+    verifier = load_cohort_verifier()
+    constraint = tmp_path / "torch-rocm.txt"
+    constraint.write_bytes(b"fixture unchanged constraint")
+    monkeypatch.setattr(verifier, "CONSTRAINT", constraint)
+    monkeypatch.setattr(verifier, "CONSTRAINT_SHA", hashlib.sha256(constraint.read_bytes()).hexdigest())
+    monkeypatch.setattr(verifier.sys, "prefix", "/opt/venv")
+    monkeypatch.setenv("SMG_SGLANG_ROCM_IMAGE", verifier.IMAGE)
+    monkeypatch.setenv("PIP_CONSTRAINT", str(constraint))
+    versions = {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
+                "apache-tvm-ffi": "0.1.12", "tilelang": "0.1.15", "torch-c-dlpack-ext": "0.1.5"}
+    versions[package] = bad_version
+    monkeypatch.setattr(verifier.md, "version", versions.__getitem__)
+
+    def unexpected_distributions():
+        raise AssertionError("version mismatch reached installed/native inspection")
+
+    monkeypatch.setattr(verifier.md, "distributions", unexpected_distributions)
+    with pytest.raises(RuntimeError) as failure:
+        verifier.verify({})
+    message = str(failure.value)
+    leading_diagnostic = message.split(";", 1)[0]
+    assert repr(package) in leading_diagnostic
+    assert repr(bad_version) in leading_diagnostic and repr(expected_version) in leading_diagnostic
+    assert "apache-tvm-ffi" not in leading_diagnostic
+    assert "tilelang" not in leading_diagnostic and "torch-c-dlpack-ext" not in leading_diagnostic
+    assert "native dependency versions (TVM, TileLang, DLPack)" not in message
+    assert "full cohort observed=" in message and "expected=" in message
