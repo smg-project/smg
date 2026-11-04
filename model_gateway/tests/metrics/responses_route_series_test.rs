@@ -137,7 +137,7 @@ async fn responses_turn(
             body.lines()
                 .filter_map(|line| line.strip_prefix("data: "))
                 .map(|data| serde_json::from_str::<Value>(data).unwrap())
-                .last()
+                .next_back()
                 .map(|terminal| terminal["response"].clone())
                 .unwrap()
         } else {
