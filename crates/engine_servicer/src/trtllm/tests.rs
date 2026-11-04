@@ -756,6 +756,15 @@ async fn the_unimplemented_rpcs_say_why() {
         .expect_err("no publisher");
     assert_eq!(events.code(), Code::Unimplemented);
     assert_eq!(events.message(), kv_events::TRTLLM_DISABLED_MESSAGE);
+    // The refusal says what is served and what is not: the load records
+    // (served since the records-only stream) and the KV events, with the
+    // reason, never that the RPC is unimplemented.
+    assert!(
+        events.message().contains("loads_only")
+            && events.message().contains("no publisher endpoint")
+            && !events.message().contains("not implemented"),
+        "{events}"
+    );
     let bundle = h
         .client
         .get_tokenizer(common::GetTokenizerRequest::default())
