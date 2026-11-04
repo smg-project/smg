@@ -152,19 +152,23 @@ def with_servicer_switch(
         from smg_grpc_servicer.rust_lifecycle import (
             ServicerConfigError,
             announce_kv_events_default,
+            announce_servicer_impl,
             configuration_exit,
         )
         from smg_grpc_servicer.vllm.rust import (
             KV_EVENTS_ENV,
+            SERVICER_IMPL_ENV,
             configure_logging,
             default_kv_events_config,
             require_python_media_mode,
-            resolve_servicer_impl,
             serve_rust,
+            servicer_impl_source,
         )
 
         try:
-            if resolve_servicer_impl(args) == "rust":
+            impl, origin = servicer_impl_source(args)
+            announce_servicer_impl(impl, origin, SERVICER_IMPL_ENV, logger)
+            if impl == "rust":
                 raise SystemExit(await serve_rust(args))
             # The Python servicer's media mode is known here, from the flags
             # and the environment: one it cannot serve is refused now, before
@@ -455,9 +459,10 @@ def refusal_line(hook: LauncherHook) -> str:
     else:
         found = f"it has no gRPC launcher module under {' or '.join(LAUNCHER_MODULES)}"
     return (
-        f"--servicer-impl rust ({SERVICER_IMPL_ENV}=rust) refused: the servicer switch cannot "
+        f"the Rust servicer (the default; --servicer-impl rust / {SERVICER_IMPL_ENV}=rust) "
+        "refused: the servicer switch cannot "
         f"bind on the installed {installed}: {found}; {supported_launchers()}; {way_out}, or "
-        f"select --servicer-impl python (or unset {SERVICER_IMPL_ENV}) for the Python servicer"
+        f"select --servicer-impl python ({SERVICER_IMPL_ENV}=python) for the deprecated Python servicer"
     )
 
 

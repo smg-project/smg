@@ -114,6 +114,6 @@ impl GeneratePreparationStage {
         let encoding = utils::encode_blocking(tokenizer.clone(), text.to_string(), false)
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
-        Ok((text.to_string(), encoding.token_ids().to_vec()))
+        Ok((text.to_string(), encoding.into_token_ids()))
     }
 }

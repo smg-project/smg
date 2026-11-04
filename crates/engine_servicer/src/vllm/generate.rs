@@ -518,6 +518,7 @@ type ChoiceItem = Result<vllm::GenerateResponse, Status>;
 impl Stream for ChoiceStream {
     type Item = ChoiceItem;
 
+    /// Forward engine output and account for input capacity before frontend stop handling.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
@@ -531,6 +532,15 @@ impl Stream for ChoiceStream {
                 ControlFlow::Continue(item) => item,
                 ControlFlow::Break(poll) => return poll,
             };
+            if let Some((tokens, start, end)) = this
+                .inner
+                .as_mut()
+                .and_then(|inner| inner.take_prefill_sample())
+            {
+                this.state
+                    .loads
+                    .prefill_computed(this.rank, tokens, start, end);
+            }
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` (or an empty response)

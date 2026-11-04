@@ -2,7 +2,11 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer, PromptEncoding};
+use llm_tokenizer::{
+    chat_template::ChatTemplateParams,
+    traits::{Encoding, Tokenizer},
+    PromptEncoding,
+};
 use openai_protocol::decisions::{DecisionResponse, DecisionsRequest};
 use serde_json::{json, Map, Value};
 
@@ -300,7 +304,7 @@ fn suffixed_reasoning_markers(text: &str) -> impl Iterator<Item = (String, Strin
 async fn encode_ids(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Vec<u32>, String> {
     encode_blocking(tokenizer.clone(), text.to_owned(), false)
         .await
-        .map(|encoding| encoding.token_ids().to_vec())
+        .map(Encoding::into_token_ids)
         .map_err(|error| format!("Decisions tokenization failed: {error}"))
 }
 

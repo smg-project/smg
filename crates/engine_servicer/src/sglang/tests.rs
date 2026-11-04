@@ -832,8 +832,8 @@ fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
 /// `disaggregation_mode`) the room places the request: a request whose
 /// Router pin names rank 0 but whose room's residue over two ranks is 1
 /// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
-/// with one warning line naming the request; a request whose pin agrees
-/// logs nothing.
+/// with one warning line naming the request, and a second such request on
+/// the connection with no warning; a request whose pin agrees logs nothing.
 #[tokio::test]
 async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let logs = captured_logs();
@@ -878,6 +878,40 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
         lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
         "{}",
         lines[0]
+    );
+
+    // Room 9 is rank 1 again and the pin still says 0: the connection's
+    // second yield, logged below WARN (the capture reads WARN and above).
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room9", 9, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room9", Some(1), Some(9))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room9", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(
+        logs.lines_containing("room9").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("room9")
     );
 
     // Room 8 is rank 0; the pin agrees: nothing logged.

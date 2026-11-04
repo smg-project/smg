@@ -14,6 +14,7 @@ import dataclasses
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -60,7 +61,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -81,13 +83,16 @@ def test_a_launcher_flag_decision_is_written_back_for_the_python_guard():
     rust.require_python_impl(environ=environ)
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.resolve_servicer_impl(environ=environ) == "python"
+    assert rust.resolve_servicer_impl(environ=environ) == "rust"
     assert environ == {}
 
 
 def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
-    rust.require_python_impl(environ={})
     rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
+    # Nothing exported: the default is the Rust servicer, so a Python servicer
+    # starting here ran without the switch; the guard names the explicit choice.
+    with pytest.raises(RuntimeError, match="the Rust servicer is the default"):
+        rust.require_python_impl(environ={})
     with pytest.raises(RuntimeError, match="never ran"):
         rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "rust"})
 
@@ -110,10 +115,25 @@ def test_upstream_hook_is_detected_in_the_launcher_source(tmp_path):
 
 def test_require_upstream_hook_names_the_fix(monkeypatch):
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: False)
-    with pytest.raises(RuntimeError, match="consults this package's flag"):
+    with pytest.raises(RuntimeError, match="consults this package's flag") as explicit:
         rust.require_upstream_hook()
+    # An explicit rust is refused under the variable's name; the default under
+    # its own, the operator having set nothing; the way out names the Python
+    # servicer's flag and variable in both.
+    assert str(explicit.value).startswith("SMG_VLLM_SERVICER_IMPL=rust needs")
+    with pytest.raises(RuntimeError, match="consults this package's flag") as default:
+        rust.require_upstream_hook(explicit=False)
+    assert str(default.value).startswith(
+        "the Rust servicer (the default; --servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust) needs"
+    )
+    for refusal in (explicit.value, default.value):
+        assert str(refusal).endswith(
+            "select the deprecated Python servicer with --servicer-impl python / "
+            "SMG_VLLM_SERVICER_IMPL=python."
+        )
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: True)
     rust.require_upstream_hook()
+    rust.require_upstream_hook(explicit=False)
 
 
 def test_launcher_switch_binds_serve_grpc_during_the_launchers_import(monkeypatch):
@@ -1455,6 +1475,13 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     assert asyncio.run(rust.serve_rust(args)) == 0
     assert recorded["server"].events == ["ready:False"]
     assert callable(recorded["supervise_kwargs"]["warmup"])
+    # The server and the plan share the process's nonce: the hold admits the
+    # pass's own ids and nothing a client could spell.
+    nonce = recorded["server"].kwargs["warmup_nonce"]
+    assert re.fullmatch(r"[0-9a-z]+", nonce)
+    plan = recorded["supervise_kwargs"]["warmup"].args[0]
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(request_id.startswith(f"smg-warmup-{nonce}-") for request_id in ids)
 
     monkeypatch.setenv(rust.WARMUP_ENV, "off")
     assert asyncio.run(rust.serve_rust(args)) == 0
@@ -2003,7 +2030,7 @@ def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_
 
     from smg_grpc_servicer.vllm import launcher_switch
 
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
     refusal = "no block of 1 consecutive free ports for the KV event publishers"
 
@@ -2047,7 +2074,7 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
         served.append(args)
 
     switched = launcher_switch.with_servicer_switch(serve_grpc)
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
     # Nothing given: the launcher builds the engine from a namespace with the
     # publisher on (in whichever form the engine takes it: the typed one once

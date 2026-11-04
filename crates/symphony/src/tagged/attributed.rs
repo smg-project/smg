@@ -1208,6 +1208,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        json::{PartialJson, Prefix},
         tagged::{dropped, nothing_empty, refused, shown},
         testing::{arguments, bytes, malformed},
     };
@@ -1249,6 +1250,50 @@ mod tests {
             assembler.close(tags.invoke_close, &mut out);
         }
         out.drain()
+    }
+
+    /// An object-typed value nested past the bound the crate's JSON reader puts on a call's
+    /// arguments, the arguments object counted, and one the end of the stream cut right after a
+    /// `\u` escape short of its digits, which a strict reader reads past the text's end: neither
+    /// stands as written, since the fragments stay a prefix the crate's reader takes; each is a
+    /// string holding its text, whole at its closing tag and opened at the cut (the fuzz
+    /// campaign's `json-prefix` class on this syntax).
+    #[test]
+    fn an_object_value_the_json_reader_does_not_take_is_a_string_whole_and_cut() {
+        let past = PartialJson::DEFAULT_MAX_DEPTH;
+        let deep = format!("{}1{}", "[".repeat(past), "]".repeat(past));
+        let argument = |value: &str| {
+            format!(
+                "f\" index=\"1\"<|sep|><|open|>argument key=\"o\" type=\"object\"<|sep|>{value}"
+            )
+        };
+        let closed = format!("{}<|close|>argument<|sep|>", argument(&deep));
+        assert_eq!(
+            arguments(&run_with(Tags::XTML, &[&closed], false)),
+            format!("{{\"o\": \"{deep}\"}}")
+        );
+        for cut in [
+            "[".repeat(past),
+            "{\"\\u1\"=".to_string(),
+            "{\"\\u1\"".to_string(),
+            "[\"\\u1\"]".to_string(),
+        ] {
+            let events = run_with(Tags::XTML, &[&argument(&cut)], true);
+            let written = arguments(&events);
+            assert!(
+                written.starts_with("{\"o\": \""),
+                "{cut:?}: {written:?} does not open a string"
+            );
+            assert!(
+                Prefix::default().feed(&written).is_none(),
+                "{cut:?}: {written:?} is no prefix the crate's JSON judge takes"
+            );
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::UnterminatedRegion)],
+                "{cut:?}"
+            );
+        }
     }
 
     /// A streamed string still open at the invoke's own closing marker, with the start of a cut

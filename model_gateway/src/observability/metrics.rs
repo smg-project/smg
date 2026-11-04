@@ -20,7 +20,10 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
-use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
+use crate::{
+    config::{ConfigError, ConfigResult},
+    routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -386,6 +389,32 @@ impl Default for PrometheusConfig {
     }
 }
 
+impl PrometheusConfig {
+    /// Refuses a duration bucket list the exporter would render wrongly: a
+    /// bound that is not a finite number above 0, or bounds that do not
+    /// ascend strictly (the `le` labels of every duration histogram would
+    /// come out of order). The one check for every construction path, so
+    /// the CLI and the Python binding refuse the same list with the same
+    /// words.
+    pub fn validate_duration_buckets(buckets: &[f64]) -> ConfigResult<()> {
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                bad,
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Upkeep interval for histogram maintenance. Must match the value passed to
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
@@ -613,7 +642,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_connections_active",
-        "Currently active HTTP connections"
+        "HTTP requests in flight at the edge layer, not open connections: an idle keep-alive connection carries no request and one HTTP/2 connection carries many"
     );
     describe_counter!(
         "smg_http_connection_timeouts_total",
@@ -1774,7 +1803,9 @@ impl Metrics {
         });
     }
 
-    /// Set active HTTP connections count
+    /// Set `smg_http_connections_active`: the count of HTTP requests in flight
+    /// at the edge layer (the callers pass the in-flight request tracker's
+    /// count), not of open connections.
     pub fn set_http_connections_active(count: usize) {
         handles::with_single(
             &handles::HTTP_CONNECTIONS_ACTIVE,
@@ -1929,7 +1960,6 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
     }
 
-    /// Record where a multimodal request's media is processed and why.
     /// Count a Responses stream whose terminal event was `response.failed`.
     ///
     /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
@@ -1955,6 +1985,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record where a multimodal request's media is processed and why.
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -2702,7 +2733,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Set running requests per worker
     /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
@@ -2946,7 +2976,6 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
-    /// Count a KV event batch by what the subscriber did with it.
     /// One load-monitor tick decision for a worker (see `PollMode`).
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
@@ -2957,6 +2986,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Count a KV event batch by what the subscriber did with it.
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
@@ -3426,11 +3456,15 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out `smg_engine_*` series for a removed worker.
-    ///
-    /// metrics-rs cannot delete series, so per the `remove_worker_metrics`
-    /// convention we set each to -1 (an impossible value for these gauges, whose
-    /// 0 is meaningful) until <https://github.com/metrics-rs/metrics/issues/653>.
+    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
+    /// ended while its URL stays registered: its status left `Ready`, or a
+    /// same-URL replacement has not yet published its own load (see
+    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
+    /// those series, so the last load would read as live. Each gauge is set
+    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// worker needs no sentinel: the store drops every `worker`-labelled
+    /// series with the registration ([`Self::remove_worker_metrics`]) and
+    /// no-ops the writes that follow, this one included.
     /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
     /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
     /// label set must exactly match `record_engine_load` (including `model` and

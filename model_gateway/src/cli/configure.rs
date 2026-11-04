@@ -643,21 +643,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.serving.prometheus_duration_buckets;
-        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &bad.to_string(),
-                "every bucket bound must be a finite number above 0",
-            ));
-        }
-        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &format!("{} {}", pair[0], pair[1]),
-                "bucket bounds must ascend strictly",
-            ));
-        }
+        PrometheusConfig::validate_duration_buckets(&self.serving.prometheus_duration_buckets)?;
         for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
@@ -1099,9 +1085,9 @@ impl CliArgs {
             .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.workers.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
+            .worker_startup_timeout_secs(self.routing.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.routing.worker_startup_delay)
+            .worker_startup_check_interval_secs(self.routing.worker_startup_check_interval)
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
@@ -1309,24 +1295,13 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.routing.host.clone(),
-            port: self.routing.port,
-            health_check_port: self.routing.health_check_port,
-            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.serving.max_payload_size,
             log_dir: self.serving.log_dir.clone(),
             log_level: Some(self.serving.log_level.clone()),
             log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.serving.request_timeout_secs,
-            request_id_headers: if self.serving.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.serving.request_id_headers.clone())
-            },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,

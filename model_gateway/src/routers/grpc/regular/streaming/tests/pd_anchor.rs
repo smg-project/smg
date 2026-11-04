@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     super::*,
-    eof::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
+    eof::{chunk, complete, messages_spec, processor, scripted_stream, CharacterTokenizer},
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
@@ -114,22 +114,6 @@ fn harmony_frames() -> Vec<proto::GenerateResponse> {
 fn chat_request() -> ChatCompletionRequest {
     serde_json::from_value(json!({"model": MODEL, "messages": [], "stream": true}))
         .expect("chat request")
-}
-
-fn messages_spec() -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: false,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    }
 }
 
 /// A completion request over `prompt` (one string, or one per batched pair).
@@ -305,7 +289,7 @@ fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
         let response = Arc::new(processor(false))
             .process_messages_streaming_response(
                 result,
-                messages_spec(),
+                messages_spec(false),
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 false,

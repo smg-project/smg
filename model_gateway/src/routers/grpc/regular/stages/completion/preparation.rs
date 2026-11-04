@@ -56,7 +56,7 @@ impl PipelineStage for CompletionPreparationStage {
             .zip(encodings)
             .map(|(text, encoding)| CompletionItem {
                 text,
-                token_ids: encoding.token_ids().to_vec(),
+                token_ids: encoding.into_token_ids(),
             })
             .collect();
 

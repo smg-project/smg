@@ -29,6 +29,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llm_multimodal::{
     audio::{decode_audio_mono_f32, AudioPreProcessor, DecodedAudio, Qwen3AudioProcessor},
@@ -103,15 +104,18 @@ fn wav() -> Vec<u8> {
     bytes
 }
 
-/// The bytes decoded as the media connector decodes them.
-fn decode(runtime: &tokio::runtime::Runtime, bytes: &[u8]) -> DecodedAudio {
-    runtime.block_on(decode_audio_mono_f32(bytes)).unwrap()
+/// The bytes decoded as the media connector decodes them: the clip's buffer handed over by
+/// reference count, read in place.
+fn decode(runtime: &tokio::runtime::Runtime, bytes: &Bytes) -> DecodedAudio {
+    runtime
+        .block_on(decode_audio_mono_f32(bytes.clone()))
+        .unwrap()
 }
 
 /// The decoded clip as the gateway holds it for the frontend.
 fn clip(decoded: DecodedAudio) -> Arc<AudioClip> {
     Arc::new(AudioClip::new(
-        bytes::Bytes::new(),
+        Bytes::new(),
         decoded,
         AudioSource::InlineBytes,
         String::new(),
@@ -128,15 +132,15 @@ fn mel(processor: &Qwen3AudioProcessor, clips: &[Arc<AudioClip>]) -> Preprocesse
 fn concurrent(
     runtime: &tokio::runtime::Runtime,
     processor: &Arc<Qwen3AudioProcessor>,
-    bytes: &Arc<Vec<u8>>,
+    bytes: &Bytes,
     count: usize,
 ) -> Vec<PreprocessedEncoderInputs> {
     runtime.block_on(async {
         let tasks = (0..count).map(|_| {
             let processor = Arc::clone(processor);
-            let bytes = Arc::clone(bytes);
+            let bytes = bytes.clone();
             async move {
-                let decoded = decode_audio_mono_f32(&bytes).await.unwrap();
+                let decoded = decode_audio_mono_f32(bytes).await.unwrap();
                 tokio::task::spawn_blocking(move || mel(&processor, &[clip(decoded)]))
                     .await
                     .unwrap()
@@ -162,7 +166,7 @@ fn bench_audio_clip(c: &mut Criterion) {
         SAMPLE_RATE as usize,
         "the clip is at the frontend's rate, so no resample runs"
     );
-    let bytes = Arc::new(wav());
+    let bytes = Bytes::from(wav());
     let decoded = decode(&runtime, &bytes);
     assert_eq!(decoded.samples.len(), (SAMPLE_RATE * SECONDS) as usize);
     let clips = vec![clip(decoded)];

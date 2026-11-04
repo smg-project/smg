@@ -106,10 +106,14 @@ pub async fn priority_admission_middleware(
     let class = resolved.effective;
 
     if resolved.unknown {
-        sched_metrics::record_unknown_priority(tenant.as_str());
+        sched_metrics::record_unknown_priority(state.tenant_labels.intern(tenant.as_str()));
     }
     if class < resolved.requested {
-        sched_metrics::record_clamp(resolved.requested, class, tenant.as_str());
+        sched_metrics::record_clamp(
+            resolved.requested,
+            class,
+            state.tenant_labels.intern(tenant.as_str()),
+        );
     }
 
     // Per-second check (only set when an explicit rate is configured),

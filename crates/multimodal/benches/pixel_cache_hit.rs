@@ -91,7 +91,8 @@ fn layouts() -> HashMap<String, FieldLayout> {
 
 /// The cache's entry for the image in one form: the processor's own bytes, or the wire bytes.
 fn entry(processor: &Qwen3VLProcessor, wire: Option<EncoderDtype>) -> PreprocessedEncoderInputs {
-    let images = [image()];
+    let image = image();
+    let images = [&image];
     let preprocessed = match wire {
         Some(dtype) => processor
             .preprocess_wire(&images, dtype)

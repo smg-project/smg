@@ -53,6 +53,7 @@ from smg_grpc_servicer.warmup import (
     WarmupReport,
     WarmupSetting,
     WarmupWire,
+    draw_nonce,
     parse_setting,
     plan_for,
     run_warmup,
@@ -461,6 +462,17 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
 SOURCE_FLAG = "flag"
 SOURCE_ENV = "env"
 SOURCE_DEFAULT = "default"
+# The implementation a launcher runs when neither the flag nor the variable
+# selects one. The vLLM, SGLang and TokenSpeed launchers take it as it stands;
+# a launcher whose Rust path is not its default yet passes its own (``default=``).
+DEFAULT_IMPL = "rust"
+# The line a launcher whose default is the Rust servicer logs when the Python
+# servicer was chosen instead (by the flag or the variable).
+DEPRECATION_LINE = (
+    "The Python gRPC servicer is deprecated: the Rust servicer is the default and the Python "
+    "servicer will be removed in a later release; drop --servicer-impl python / %s=python to "
+    "run the default."
+)
 
 
 def servicer_switch(
@@ -469,13 +481,15 @@ def servicer_switch(
     environ: Mapping[str, str] | None = None,
     *,
     parsed_flag: str | None = None,
+    default: str = DEFAULT_IMPL,
 ) -> tuple[str, str]:
     """Which implementation serves this process and where the choice came
     from, as ``(impl, origin)``: the launcher's ``--servicer-impl``
     (``args.servicer_impl``, else ``parsed_flag``, the value a launcher's
     plugin kept when the engine's namespace carries only the engine's own
-    fields), else ``environ[env_name]``, else ``python``; the origin is
-    ``flag``, ``env`` or ``default``. A value outside :data:`IMPLS` is a
+    fields), else ``environ[env_name]``, else ``default`` (:data:`DEFAULT_IMPL`,
+    ``rust``, unless the launcher passes its own); the origin is ``flag``,
+    ``env`` or ``default``. A value outside :data:`IMPLS` is a
     :class:`ServicerConfigError` naming the variable.
 
     A decision made with the flag in hand is written back to the
@@ -493,12 +507,32 @@ def servicer_switch(
     if not value:
         value = source.get(env_name)
         origin = SOURCE_ENV if value else SOURCE_DEFAULT
-    value = str(value or "python").strip().lower()
+    value = str(value or default).strip().lower()
     if value not in IMPLS:
         raise ServicerConfigError(f"{env_name} must be one of {IMPLS}, got {value!r}")
     if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
         source[env_name] = value
     return value, origin
+
+
+def announce_servicer_impl(
+    impl: str,
+    origin: str,
+    env_name: str,
+    log: logging.Logger = logger,
+    *,
+    default: str = DEFAULT_IMPL,
+) -> None:
+    """The start-up log of a launcher's implementation choice: the
+    implementation and its origin in one line and, on a launcher whose
+    default is the Rust servicer, :data:`DEPRECATION_LINE` as a warning when
+    the Python servicer was chosen instead (by the flag or the variable; the
+    default never selects it, so nothing on defaults logs a deprecation). A
+    launcher whose default is still the Python servicer passes ``default``
+    and logs no deprecation."""
+    log.info("Servicer implementation: %s (source=%s)", impl, origin)
+    if impl == "python" and default == "rust":
+        log.warning(DEPRECATION_LINE, env_name)
 
 
 # The values of a launcher's KV-events variable (``RustLauncher.kv_events_env``)
@@ -1235,7 +1269,8 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 def hold_readiness(server: Any, ready: bool) -> None:
     """Hold (``False``) or release (``True``) the server's health answer
     alone, admission left open to the servicer's own requests (the planned
-    warm-up's ``smg-warmup-<n>``, over the server's own port) and closed to
+    warm-up's ``smg-warmup-<nonce>-<n>``, the nonce the server was constructed
+    with, over the server's own port) and closed to
     every other while readiness is held, so nothing shares the engine's
     steps with the warm-up: ``set_ready`` where the server has it.
     ``set_serving`` is the drain switch (it closes admission as well, and
@@ -1621,6 +1656,10 @@ class RustLauncher:
         tokenizer_dir = self.tokenizer_dir(args)
         self.announce_capabilities(facts, tokenizer_dir)
         plan = None
+        # One nonce per process marks the warm-up's request ids as this
+        # launcher's own: the server constructed with it admits those alone
+        # while readiness is held (``hold_readiness``).
+        warmup_nonce = draw_nonce()
         if self.warmup_env:
             # The inputs (a tokenizer load, the media material of a language-side
             # worker) are built only when the knob is on: plan_for logs the off
@@ -1629,6 +1668,7 @@ class RustLauncher:
                 warmup_setting,
                 self.warmup_inputs(args, facts) if warmup_setting.enabled else None,
                 knob=self.warmup_env,
+                nonce=warmup_nonce,
             )
         handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
@@ -1648,6 +1688,7 @@ class RustLauncher:
             engine_silence_timeout_secs=knobs.silence_timeout_secs,
             engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
             metrics_bind_address=metrics_bind_address,
+            warmup_nonce=warmup_nonce,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )

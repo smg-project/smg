@@ -2302,3 +2302,44 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
     assert!(node.touch_any_tenant(42, false).is_none());
     assert!(node.tenant_last_access_time.is_empty());
 }
+
+/// A miss of the `last_tenant` cache writes it, so the next lookup of the
+/// node takes the fast path instead of walking the tenant map's shards again
+/// (dashmap's walk allocates once per shard it enters, and a node whose
+/// touches never land on a multiple of sixteen never cached before).
+#[test]
+fn test_any_tenant_lookups_write_the_cache_on_a_miss() {
+    let node = Node::new(make_tokens(1, 1));
+    let w1 = intern_tenant("w1");
+    // ts 1: the one-in-sixteen refresh does not fire; the cache stays empty.
+    node.touch_tenant(&w1, 1, false);
+    assert!(node.last_tenant.read().is_none());
+
+    let picked = node.get_any_tenant().expect("owned node");
+    assert!(Arc::ptr_eq(&picked, &w1));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w1)));
+
+    // The cached tenant left the node: the miss replaces it with the tenant
+    // the touch stamped (ts 3 is no multiple of sixteen either).
+    let w2 = intern_tenant("w2");
+    node.touch_tenant(&w2, 2, false);
+    node.tenant_last_access_time.remove("w1");
+    let picked = node.touch_any_tenant(3, false).expect("w2 owns the node");
+    assert!(Arc::ptr_eq(&picked, &w2));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w2)));
+    assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 3);
+
+    // Nothing owns the node: nothing is picked and nothing attached.
+    node.tenant_last_access_time.remove("w2");
+    assert!(node.touch_any_tenant(4, false).is_none());
+    assert!(node.get_any_tenant().is_none());
+    assert!(node.tenant_last_access_time.is_empty());
+}

@@ -308,6 +308,18 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "Worker Configuration")]
+    worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "Worker Configuration")]
+    worker_startup_delay: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "Worker Configuration")]
+    worker_startup_check_interval: u64,
+
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
@@ -702,18 +714,6 @@ struct WorkerArgs {
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
-
-    /// Timeout in seconds for worker startup and registration
-    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
-    worker_startup_timeout_secs: u64,
-
-    /// Grace period in seconds before the first worker startup check
-    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
-    worker_startup_delay: u64,
-
-    /// Interval in seconds between worker startup checks
-    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
-    worker_startup_check_interval: u64,
 
     // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
@@ -1299,7 +1299,9 @@ struct ServingArgs {
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
-    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
@@ -1879,7 +1881,7 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 /// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = match server_config.runtime_worker_threads {
+    let runtime = match server_config.router_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
             .enable_all()
@@ -1954,7 +1956,6 @@ mod tests {
                         args.resolve_secret_sources(&|_| Ok(None)).unwrap();
                         let router = args.to_router_config(vec![], vec![]).unwrap();
                         let server = args.to_server_config(router).unwrap();
-                        assert_eq!(server.port, 31000);
                         assert_eq!(server.router_config.port, 31000);
                     }
                 })
@@ -3696,13 +3697,11 @@ mod tests {
         );
     }
 
-    /// `--health-check-port` must flow into BOTH conversion paths
-    /// (`to_router_config` and `to_server_config`), mirroring the main
-    /// listener `--port` field exactly. This is the two-path config-plumbing
-    /// guard: wiring only one path would let the flag be silently ignored on
-    /// the other.
+    /// `--health-check-port` reaches `RouterConfig`, the one home of the
+    /// listener settings, which the server configuration nests: there is no
+    /// second copy for a wiring to miss.
     #[test]
-    fn health_check_port_flows_into_both_configs() {
+    fn health_check_port_flows_into_the_router_config() {
         let cli = cli_args_from(&["--health-check-port", "8081"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -3713,24 +3712,20 @@ mod tests {
         );
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.health_check_port,
-            Some(8081),
-            "health_check_port must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.health_check_port, Some(8081));
     }
 
     /// Unset `--health-check-port` means the dedicated probe listener is off:
-    /// `None` propagates through both conversions (backward-compatible default).
+    /// `None` reaches the server configuration (backward-compatible default).
     #[test]
-    fn health_check_port_defaults_to_none_in_both_configs() {
+    fn health_check_port_defaults_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.health_check_port, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.health_check_port, None);
+        assert_eq!(server_config.router_config.health_check_port, None);
     }
 
     /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
@@ -4255,35 +4250,30 @@ mod tests {
         );
     }
 
-    /// The `--runtime-worker-threads` override must flow into BOTH conversion
-    /// paths (`to_router_config` and `to_server_config`); wiring only one path
-    /// would let the flag be silently ignored on the other (the two-path footgun).
+    /// The `--runtime-worker-threads` override reaches `RouterConfig`, from
+    /// which `serve` sizes the runtime; the server configuration nests it.
     #[test]
-    fn runtime_worker_threads_flows_into_both_configs() {
+    fn runtime_worker_threads_flows_into_the_router_config() {
         let cli = cli_args_from(&["--runtime-worker-threads", "3"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, Some(3));
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.runtime_worker_threads,
-            Some(3),
-            "runtime_worker_threads must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.runtime_worker_threads, Some(3));
     }
 
-    /// Unset, the flag propagates as `None` through both conversions, so the
+    /// Unset, the flag reaches the server configuration as `None`, so the
     /// runtime uses tokio's container-aware default.
     #[test]
-    fn runtime_worker_threads_default_to_none_in_both_configs() {
+    fn runtime_worker_threads_default_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.runtime_worker_threads, None);
+        assert_eq!(server_config.router_config.runtime_worker_threads, None);
     }
 
     /// Both values the validator bounds are checked on the command line's own
@@ -5092,5 +5082,69 @@ mod tests {
             assert!(help.contains(named), "{named} missing from the help");
         }
         assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
+    }
+
+    /// The three start-up bounds hold for every worker the gateway starts
+    /// with, so the help lists them with the worker settings and not under
+    /// the disaggregation heading.
+    #[test]
+    fn the_worker_start_up_bounds_are_listed_under_worker_configuration() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for id in [
+            "worker_startup_timeout_secs",
+            "worker_startup_delay",
+            "worker_startup_check_interval",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert_eq!(
+                arg.get_help_heading(),
+                Some("Worker Configuration"),
+                "{id} is listed under another heading"
+            );
+        }
+    }
+
+    /// The listener settings the server reads (the bind host and port, the
+    /// probe port, the body limit, the request timeout, the request-id
+    /// headers, the runtime size) live on the router configuration the
+    /// server configuration nests: the value the validator checked is the
+    /// one the listeners bind.
+    #[test]
+    fn the_server_configuration_reads_its_listener_settings_from_the_router_configuration() {
+        let cli = cli_args_from(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "31234",
+            "--health-check-port",
+            "31235",
+            "--max-payload-size",
+            "4096",
+            "--request-timeout-secs",
+            "7",
+            "--request-id-headers",
+            "x-trace-id",
+            "--runtime-worker-threads",
+            "2",
+        ]);
+        let server_config = cli.configure(vec![], vec![]).expect("configures");
+        let listener = &server_config.router_config;
+        assert_eq!(
+            (listener.host.as_str(), listener.port),
+            ("127.0.0.1", 31234)
+        );
+        assert_eq!(listener.health_check_port, Some(31235));
+        assert_eq!(listener.max_payload_size, 4096);
+        assert_eq!(listener.request_timeout_secs, 7);
+        assert_eq!(
+            listener.request_id_headers.as_deref(),
+            Some(&["x-trace-id".to_string()][..])
+        );
+        assert_eq!(listener.runtime_worker_threads, Some(2));
     }
 }

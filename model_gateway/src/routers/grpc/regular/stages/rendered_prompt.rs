@@ -59,7 +59,7 @@ pub(crate) async fn prepare_rendered_prompt(
             }
         };
 
-    let mut token_ids = encoding.token_ids().to_vec();
+    let mut token_ids = encoding.into_token_ids();
 
     if let Some(media) = media.as_ref() {
         multimodal::validate_rendered_media_anchors(

@@ -1,6 +1,11 @@
 //! `trtllm.TrtllmService` over the shared state: each RPC delegates to its
-//! handler module. What the engine's Python servicer does not serve either
-//! (`Embed`, `SubscribeKvEvents`) answers UNIMPLEMENTED here, with the reason.
+//! handler module. `Embed`, which the engine's Python servicer does not serve
+//! either, answers UNIMPLEMENTED here with the reason. `SubscribeKvEvents`
+//! streams the servicer's own load records for a `loads_only` request; any
+//! other is served by the KV-event relay when the launcher configured the
+//! engine's publisher endpoint, and answers UNIMPLEMENTED with the reason
+//! otherwise (the TensorRT-LLM launcher configures none: the wire has no
+//! publisher yet).
 
 use std::sync::Arc;
 

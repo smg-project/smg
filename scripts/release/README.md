@@ -18,7 +18,7 @@ release branch behind you, `bump` and `pick` leave you on the topic branch they 
 | candidate or final | `make release-bump VERSION=1.14.0-rc.2` (or `VERSION=1.14.0`) | the version bump on a topic branch off `release/1.14` and its pull request against the release branch; the body carries the release gate | the release owner |
 | tag | `make release-tag VERSION=1.14.0-rc.1 [PUSH=1]` | checks the versions at the branch head against the previous tag, creates the annotated tag `v1.14.0-rc.1` with a `Signed-off-by` line, prints the push command | a maintainer with tag rights (the tag ruleset) |
 | publish | `make release-publish-plan VERSION=1.14.0-rc.1` | prints the workflow dispatches to run against the tag and the artifact names they produce; runs nothing | the release owner dispatches them |
-| notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes skeleton: the merged pull requests since the previous final, by type, and the Docker image list; prints the `gh release create` line | the release owner |
+| notes | `make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md` | the release notes draft: `scripts/release/NOTES-TEMPLATE.md` with the merged pull requests since the previous final seeding Highlights, Notable fixes and Upgrade notes from their "## Release note" sections, the packages and images at the tag under Packages, and the list by type under What's Changed; the narrative stays as marked placeholders (see [Writing the notes](#writing-the-notes)); `scripts/release/release.sh notes --check notes.md` refuses a draft that still carries one | the release owner |
 | main follows | `make release-bump-main VERSION=1.14.0` | after a final: a pull request that moves `main`'s crates and packages to at least the release's; the gateway keeps its development version (it moves to the next one only when `main` still reads below the release) | the release owner |
 | ship | `make release-ship VERSION=1.14.1 [DRY_RUN=1] [FROM=<step>]` | the candidate, final or patch in one run on an existing release branch: the gate's CI rows for the commit the bump builds on, the bump (pushed to the branch when the rules allow the caller a push, else its pull request, waited for), the tag, the notes, the GitHub release and the publish dispatches; a rerun skips what is there ([Ship](#ship-the-release-in-one-run)) | the release owner, with push or bypass rights for the direct bump |
 
@@ -106,7 +106,13 @@ A candidate or a final is tagged when, on the branch head:
 1. CI is green on the head commit itself: a successful run of the `PR Test (SMG)` matrix for
    that commit (it runs on every push to `release/**` and every pull request against it, as for
    `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
-   `gh workflow run pr-test-rust.yml --ref release/<x.y>`);
+   `gh workflow run pr-test-rust.yml --ref release/<x.y>`). A bump commit changes nothing but
+   version strings (`scripts/ci_version_only.py` is the judge), so the workflow lets it inherit
+   the GPU lanes, the card tier, from the commit it was made on when that commit's push or
+   dispatch run passed (a pull request's run can pass with the card lanes skipped, so it stands
+   for nothing), and its own run covers the host rows alone; `make release-check` then reads the
+   parent's run for the card tier while the head's own checks are pending, provided the parent is
+   green on every check of its own (none red, none pending) besides that run, and says so;
 2. the versions are consistent (`make release-check` reads them; `make release-tag` refuses
    otherwise), and no crate or package sits at a version crates.io or PyPI hold already with
    changes after it (`make release-check` reads the registries; such a version is skipped by
@@ -131,15 +137,17 @@ Steps 2, 3, 5, 6 and 8 below are one command each with `make release-ship VERSIO
 2. `make release-check VERSION=1.14.0-rc.1`, then `make release-tag VERSION=1.14.0-rc.1` and
    its push (`PUSH=1`, by a maintainer with tag rights).
 3. `make release-publish-plan VERSION=1.14.0-rc.1` lists the dispatches for the candidate's
-   artifacts; `make release-notes VERSION=1.14.0-rc.1 > notes.md` and the printed
-   `gh release create ... --prerelease` line for the GitHub release.
+   artifacts; `make release-notes VERSION=1.14.0-rc.1 > notes.md` starts the notes draft
+   ([Writing the notes](#writing-the-notes)), and the printed `gh release create ... --prerelease`
+   line publishes it once `release.sh notes --check notes.md` passes.
 4. Fixes land on `main` first, then `make release-pick RELEASE=1.14 SHA=<sha>` brings them over
    through a pull request against the branch; `make release-status RELEASE=1.14` shows what is
    still on `main` only.
 5. The next candidate: `make release-bump VERSION=1.14.0-rc.2`, merge, step 2 and 3 again.
 6. The final: `make release-bump VERSION=1.14.0` (its pull request body carries the gate with
    the four verifier records), merge, `make release-tag VERSION=1.14.0`, the dispatches of
-   `make release-publish-plan VERSION=1.14.0`, `make release-notes VERSION=1.14.0`.
+   `make release-publish-plan VERSION=1.14.0`, the notes drafted during the cycle, refreshed
+   against `make release-notes VERSION=1.14.0`, reviewed, and checked before `gh release create`.
 7. `make release-bump-main VERSION=1.14.0`: the pull request that moves `main`'s crates and
    packages to at least the release's (the gateway keeps `1.15.0-dev`).
 8. A patch release later: `make release-bump VERSION=1.14.1` on the same branch, picks, step 2
@@ -173,9 +181,14 @@ skips what is there, so the same command is run again after an interruption, and
    repository at the head is kept; one anywhere else stops the ship (tags never move).
 4. `notes`: `release-notes` rendered once into `.git/release/notes-v<version>.md` (kept across
    reruns, so it can be edited), or the file `NOTES=<path>` names. Notes that are not ready (an
-   empty file, a heading that is not the release's) stop the ship before anything is published.
-   The engine-image list fills in once those images exist: `scripts/release_docker_notes.sh
-   v<version>` and `gh release edit` after the dispatches.
+   empty file, a first line that is not the template's for the release, a placeholder
+   `release.sh notes --check` still finds) stop the ship before anything is published. A fresh
+   render carries the template's author placeholders, so the first run stops here: write the
+   notes (see [Writing the notes](#writing-the-notes)), then rerun the ship (`--from notes`).
+   Once the release exists (a rerun after an interruption in a later step), the step stands
+   down: the published notes stand, with or without `NOTES`. The engine-image list fills in once
+   those images exist: `scripts/release_docker_notes.sh v<version>` and `gh release edit` after
+   the dispatches.
 5. `release`: `gh release create --verify-tag` with the notes, `--prerelease` for a candidate and
    `--latest` for a final; an existing release is kept.
 6. `publish`: the dispatches of `release-publish-plan` against the tag, each one once: a
@@ -192,6 +205,47 @@ branch that carries no such rule. Without that, the bump costs the review round 
 costs today, and the ship waits for it. The first candidate of a line is cut by `release-cut`
 (it also moves `main`); from then on the ship is the one command for every candidate, the final
 and the patches.
+
+## Writing the notes
+
+The published notes are a narrative, not a list. `scripts/release/NOTES-TEMPLATE.md` is their
+skeleton (the title and opening, Before you upgrade, Highlights with one `###` narrative each and
+how the release was validated, Notable fixes by area, Upgrade notes by kind (a Storage subsection
+opens the list only when a pull request declares a storage change), Packages, Known limits, then
+What's Changed), as the published notes are laid out, and `make release-notes` renders it:
+
+- every merged pull request's release note (one or two sentences on what a user gets, under a
+  `## Release note` heading or a `Release note:` line in the pull request body) seeds the
+  candidates: features and performance changes under Highlights, fixes under Notable fixes, each
+  under the area of its subject's scope (gateway, servicers and engines, Symphony, multimodal,
+  tokenizer, metrics and observability, bindings and crates, Helm and deploy); a pull request
+  whose note says `none` seeds nothing, and one without a note seeds its subject, marked for the
+  author;
+- a pull request that declares a breaking change (`feat(x)!:` or a `BREAKING CHANGE` line), a
+  removed or renamed flag or setting, a changed default or a configuration that now refuses to
+  start seeds Upgrade notes under the subsection its declaration suggests, with the declaration
+  named;
+- Packages reads the publish plan's crates and packages at the tag against the
+  previous final (new crates, moved versions), the engine images' bases from the workflow's table
+  and the published image list; What's Changed is the list by type, as before;
+- the opening paragraphs, Before you upgrade, every narrative, How this release was validated and
+  Known limits are `<!-- AUTHOR: ... -->` comments that say what goes there.
+
+The pull request bodies are read through `gh` in batches and kept under `NOTES_CACHE`
+(`~/.cache/smg-release/pull-requests`, one file per number); `NOTES_REFRESH=1` reads every body
+again (a note added to a pull request after the first draft), as deleting the directory does;
+without `gh`, or offline, every candidate falls back to its subject, marked, and the draft still
+renders.
+
+The flow: draft at the first candidate (`make release-notes VERSION=1.14.0-rc.1 > notes.md` reads
+the tag, or the branch head before it), write the narratives during the cycle as the candidates
+land, and before the final render again (`make release-notes VERSION=1.14.0 > fresh.md`) and diff
+its candidate lists and What's Changed against the draft for what landed since. The release
+manager reviews the draft before the tag. `scripts/release/release.sh notes --check notes.md`
+refuses a file that still carries an author comment or a template token, line by line, so neither
+a raw list nor a half-written draft reaches `gh release create`: run it before the release, and in
+any step that publishes the notes; `release.sh ship` runs it at its `notes` step and stops on what
+it finds.
 
 ## Branch protection a maintainer sets
 
