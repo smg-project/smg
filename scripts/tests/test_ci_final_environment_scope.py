@@ -34,7 +34,16 @@ def _original_pin():
     return source, pins[0]
 
 
-def _run(tmp_path, *, requested=None, declaration=None, vendor="amd", engine="sglang", helper=True):
+def _run(
+    tmp_path,
+    *,
+    requested=None,
+    declaration=None,
+    vendor="amd",
+    engine="sglang",
+    helper=True,
+    missing=None,
+):
     source, pin = _original_pin()
     work = tmp_path / "work"
     scripts = work / "scripts"
@@ -48,10 +57,11 @@ def _run(tmp_path, *, requested=None, declaration=None, vendor="amd", engine="sg
             "ci_setup_sglang_rocm_image.sh",
             "ci_setup_sglang_rocm_e2e.sh",
             "ci_verify_sglang_rocm_e2e.py",
+            "ci_setup_sglang_rocm_image_pin.sh",
         ):
-            if (ROOT / "scripts" / name).is_file():
+            if name != missing and (ROOT / "scripts" / name).is_file():
                 (scripts / name).write_text('#!/bin/sh\nprintf called > "$PROBE_MARKER"\nexit 97\n')
-    if declaration != "MISSING_FILE":
+    if declaration != "MISSING_FILE" and missing != "ci_verify_sglang_rocm_cohort.py":
         if declaration is not None:
             source = source.replace('IMAGE = "' + pin + '"', declaration, 1)
         (scripts / "ci_verify_sglang_rocm_cohort.py").write_text(source)
@@ -139,8 +149,19 @@ def test_scope_rejects_unsupported_verifier_pin_source(tmp_path, state):
     assert _run(tmp_path, declaration=declaration).returncode != 0
 
 
-def test_scope_requires_the_setup_helper(tmp_path):
-    assert _run(tmp_path, helper=False).returncode != 0
+@pytest.mark.parametrize(
+    "missing",
+    [
+        None,
+        "ci_setup_sglang_rocm_image.sh",
+        "ci_verify_sglang_rocm_cohort.py",
+        "ci_setup_sglang_rocm_e2e.sh",
+        "ci_verify_sglang_rocm_e2e.py",
+        "ci_setup_sglang_rocm_image_pin.sh",
+    ],
+)
+def test_scope_requires_each_helper_independently(tmp_path, missing):
+    assert _run(tmp_path, helper=missing is not None, missing=missing).returncode != 0
 
 
 def test_scope_stays_opt_in_with_typed_inputs():
@@ -150,6 +171,13 @@ def test_scope_stays_opt_in_with_typed_inputs():
     assert flag["type"] == "boolean" and flag["default"] is False
     scope = _scope()
     assert scope["if"] == "inputs.final_environment_check"
+    setups = {step["name"]: step for step in document["jobs"]["run"]["steps"] if "name" in step}
+    assert setups["Setup SGLang backend"]["if"] == (
+        "inputs.engine == 'sglang' && !inputs.final_environment_check"
+    )
+    assert (
+        setups["Setup AMD SGLang in its fixed ROCm image"]["if"] == "inputs.final_environment_check"
+    )
     assert scope["env"] == {
         "CHECK_ENGINE": "${{ inputs.engine }}",
         "CHECK_VENDOR": "${{ inputs.gpu_vendor }}",
@@ -233,6 +261,13 @@ def test_evidence_exposes_exact_artifact_outputs():
             "${{ steps." + upload + ".outputs.artifact-id != '' && "
             "steps.evidence-identity.outputs." + internal + " || '' }}"
         )
+    complete_upload = [
+        step for step in job["steps"] if step.get("id") == "upload-complete-evidence"
+    ]
+    assert len(complete_upload) == 1
+    assert complete_upload[0]["if"] == (
+        "always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'"
+    )
     uploads = [
         step["with"]["name"]
         for step in job["steps"]
@@ -251,6 +286,24 @@ def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
     assert "sglang-e2e_test-chat_completions" in first[0]
     assert first[1] != second[1]
     assert first[2] != second[2]
+
+
+@pytest.mark.parametrize("count", ["", "1", "2"])
+def test_evidence_readable_contract_identifies_grouped_zmq(tmp_path, count):
+    contract, _, artifacts = _evidence_identity(
+        tmp_path,
+        {
+            "engine": "vllm",
+            "gpu_tier": "1",
+            "gpu_vendor": "nvidia",
+            "test_dirs": "e2e_test/chat_completions",
+            "connection_mode": "zmq",
+            "zmq_engine_count": count,
+        },
+    )
+    assert ("-dp2-" in contract) is (count == "2")
+    assert "-dp1-" not in contract
+    assert all(contract in name for name in artifacts.values())
 
 
 def test_evidence_contract_ignores_json_key_order(tmp_path):

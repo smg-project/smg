@@ -12,7 +12,7 @@ import yaml
 SCRIPT = Path(__file__).resolve().parents[1] / "ci_run_sglang_rocm_units.sh"
 
 
-def run_units(tmp_path, *, status=0, xml=True, verify_status=0):
+def run_units(tmp_path, *, status=0, xml=True, verify_status=0, pip_status=0, provenance_status=0):
     binary = tmp_path / "bin"
     binary.mkdir(exist_ok=True)
     timeout = binary / "timeout"
@@ -35,6 +35,21 @@ def run_units(tmp_path, *, status=0, xml=True, verify_status=0):
         "raise SystemExit(int(os.environ['UNIT_VERIFY_STATUS']))\n"
     )
     checker.chmod(0o755)
+    python = binary / "python3"
+    python.write_text(
+        "#!/usr/bin/python3\n"
+        "import json, os, pathlib, sys\n"
+        "if sys.argv[1] == '-c':\n"
+        "    exec(sys.argv[2])\n"
+        "elif sys.argv[1:] == ['-m', 'pip', 'check']:\n"
+        "    raise SystemExit(int(os.environ['UNIT_PIP_STATUS']))\n"
+        "else:\n"
+        "    assert pathlib.Path(sys.argv[1]).name == 'ci_verify_sglang_rocm_e2e.py'\n"
+        "    assert sys.argv[2:5] == ['--verify', 'setup-baseline.json', '--root']\n"
+        "    pathlib.Path(os.environ['UNIT_PROVENANCE_ARGS']).write_text(json.dumps(sys.argv[1:]))\n"
+        "    raise SystemExit(int(os.environ['UNIT_PROVENANCE_STATUS']))\n"
+    )
+    python.chmod(0o755)
     result = subprocess.run(
         ["/bin/bash", str(SCRIPT)],
         cwd=tmp_path,
@@ -48,6 +63,10 @@ def run_units(tmp_path, *, status=0, xml=True, verify_status=0):
             "UNIT_ARGS": str(tmp_path / "arguments.json"),
             "UNIT_STATUS": str(status),
             "UNIT_VERIFY_STATUS": str(verify_status),
+            "UNIT_PIP_STATUS": str(pip_status),
+            "UNIT_PROVENANCE_STATUS": str(provenance_status),
+            "UNIT_PROVENANCE_ARGS": str(tmp_path / "provenance-arguments.json"),
+            "SMG_CI_SGLANG_E2E_SNAPSHOT": "setup-baseline.json",
             "UNIT_COHORT_ARGS": str(tmp_path / "cohort-arguments.json"),
             "UNIT_XML": "1" if xml else "0",
         },
@@ -162,31 +181,66 @@ def test_failed_post_install_cohort_check_blocks_unit_calls(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("status", [0, 44])
-def test_real_before_e2e_recheck_follows_oracle_and_model_preparation(tmp_path, status):
+@pytest.mark.parametrize("probe,code", [("pip", 43), ("provenance", 47)])
+def test_failed_pip_or_persistent_baseline_blocks_unit_calls_with_original_code(
+    tmp_path, probe, code
+):
+    result, arguments = run_units(tmp_path, **{probe + "_status": code})
+    assert result.returncode == code, result.stderr
+    assert arguments == []
+    assert not (tmp_path / "unit-junit/sglang.xml").exists()
+    statuses = json.loads((tmp_path / "unit-junit/environment-status.json").read_text())
+    assert statuses == {
+        "pip_returncode": code if probe == "pip" else 0,
+        "cohort_returncode": 0,
+        "provenance_returncode": code if probe == "provenance" else 0,
+    }
+    assert (tmp_path / "cohort-arguments.json").exists()
+    assert (tmp_path / "provenance-arguments.json").exists()
+
+
+@pytest.mark.parametrize("phase", ["prepared", "before-e2e", "final"])
+@pytest.mark.parametrize("failed", [None, "pip", "cohort", "provenance"])
+def test_real_environment_stages_capture_all_probes_and_block_on_failure(tmp_path, phase, failed):
     jobs = yaml.safe_load((SCRIPT.parents[1] / ".github/workflows/e2e-gpu-job.yml").read_text())[
         "jobs"
     ]
     steps = next(iter(jobs.values()))["steps"]
     names = [step["name"] for step in steps]
-    name = "Recheck AMD SGLang cohort before E2E"
-    assert names.index("Setup Oracle") < names.index(name) < names.index("Run E2E tests")
-    assert names.index("Download extra models") < names.index(name)
+    name = {
+        "prepared": "Check prepared AMD SGLang environment",
+        "before-e2e": "Recheck AMD SGLang cohort before E2E",
+        "final": "Check final AMD SGLang environment",
+    }[phase]
+    if phase == "before-e2e":
+        assert names.index("Setup Oracle") < names.index(name) < names.index("Run E2E tests")
+        assert names.index("Download extra models") < names.index(name)
     step = steps[names.index(name)]
-    assert step["if"] == "inputs.final_environment_check"
+    assert "inputs.final_environment_check" in step["if"]
     binary = tmp_path / "bin"
     binary.mkdir()
-    checker = binary / "bash"
-    checker.write_text(
-        "#!/usr/bin/python3\n"
-        "import json, os, pathlib, sys\n"
-        "assert sys.argv[1:] == [\n"
-        "    'scripts/ci_setup_sglang_rocm_image.sh', '--verify-only',\n"
-        "    'e2e-logs/sglang-native-environment.json']\n"
-        "pathlib.Path(os.environ['CHECK_LOG']).write_text(os.environ['SMG_SGLANG_ROCM_IMAGE'])\n"
-        "raise SystemExit(int(os.environ['CHECK_STATUS']))\n"
-    )
-    checker.chmod(0o755)
+    dispatcher = r"""#!/usr/bin/python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if pathlib.Path(sys.argv[0]).name == 'bash':
+    assert args[0] == 'scripts/ci_setup_sglang_rocm_image.sh'
+    assert args[1] == '--verify-only'
+    probe = 'cohort'
+elif args == ['-m', 'pip', 'check']:
+    probe = 'pip'
+else:
+    assert args == ['scripts/ci_verify_sglang_rocm_e2e.py', '--verify', 'setup-baseline.json', '--root', '.']
+    probe = 'provenance'
+with open(os.environ['CHECK_LOG'], 'a') as output:
+    output.write(json.dumps({'probe': probe, 'image': os.environ['SMG_SGLANG_ROCM_IMAGE']}) + '\n')
+print(probe + ' stdout')
+print(probe + ' stderr', file=sys.stderr)
+raise SystemExit({'pip': 43, 'cohort': 44, 'provenance': 47}[probe] if probe == os.environ['FAILED_PROBE'] else 0)
+"""
+    for command in ("bash", "python3"):
+        checker = binary / command
+        checker.write_text(dispatcher)
+        checker.chmod(0o755)
     log = tmp_path / "check.log"
     result = subprocess.run(
         ["/bin/bash", "-e", "-c", step["run"]],
@@ -197,10 +251,21 @@ def test_real_before_e2e_recheck_follows_oracle_and_model_preparation(tmp_path, 
         env={
             **os.environ,
             "PATH": str(binary) + ":/usr/bin:/bin",
-            "CHECK_STATUS": str(status),
+            "FAILED_PROBE": failed or "",
             "CHECK_LOG": str(log),
             "SMG_SGLANG_ROCM_IMAGE": "pinned-fixture",
+            "SMG_CI_SGLANG_E2E_SNAPSHOT": "setup-baseline.json",
         },
     )
-    assert result.returncode == status, result.stderr
-    assert log.read_text() == "pinned-fixture"
+    assert (result.returncode != 0) == (failed is not None), result.stderr
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert calls == [
+        {"probe": probe, "image": "pinned-fixture"} for probe in ("pip", "cohort", "provenance")
+    ]
+    status = json.loads((tmp_path / f"e2e-logs/{phase}-environment-status.json").read_text())
+    assert status == {
+        probe + "_returncode": code if failed == probe else 0
+        for probe, code in (("pip", 43), ("cohort", 44), ("provenance", 47))
+    }
+    for probe in ("pip", "cohort", "provenance"):
+        assert (tmp_path / f"e2e-logs/{phase}-{probe}.stderr").read_text() == probe + " stderr\n"

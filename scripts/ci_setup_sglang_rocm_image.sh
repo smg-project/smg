@@ -19,44 +19,14 @@ if [ "$#" -gt 0 ]; then
     fi
     verify_only=1
     [ "$#" -eq 1 ] || verify_output=("$2")
-    if [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
-        echo "unsupported E2E SGLang image" >&2
-        exit 1
-    fi
-    # Read the verifier's one immutable IMAGE literal as data, without running
-    # Python or any external tool before rejecting an unsupported image. A pin
-    # format change must fail closed rather than use a second, stale digest.
     case "${BASH_SOURCE[0]}" in
-        */*) verifier_source="${BASH_SOURCE[0]%/*}/ci_verify_sglang_rocm_cohort.py" ;;
-        *) verifier_source="./ci_verify_sglang_rocm_cohort.py" ;;
+        */*) pin_helper_directory="${BASH_SOURCE[0]%/*}" ;;
+        *) pin_helper_directory=. ;;
     esac
-    image_declaration='^[[:space:]]*IMAGE([[:space:]:=]|$)'
-    image_double='^IMAGE[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
-    image_single="^IMAGE[[:space:]]*=[[:space:]]*'([^']+)'[[:space:]]*$"
-    image_reference='^[[:alnum:]][[:alnum:]_.:/-]*:[[:alnum:]_.-]+@sha256:[a-f0-9]{64}$'
-    image_count=0
-    image_pin=
-    if [ ! -f "$verifier_source" ] || [ ! -r "$verifier_source" ]; then
-        echo "invalid verifier IMAGE pin: missing or unreadable source" >&2
-        exit 1
-    fi
-    while IFS= read -r image_line || [ -n "$image_line" ]; do
-        if [[ "$image_line" =~ $image_declaration ]]; then
-            image_count=$((image_count + 1))
-            if [[ "$image_line" =~ $image_double ]] || [[ "$image_line" =~ $image_single ]]; then
-                image_pin="${BASH_REMATCH[1]}"
-            else
-                echo "invalid verifier IMAGE pin: expected one quoted immutable literal" >&2
-                exit 1
-            fi
-        fi
-    done < "$verifier_source"
-    if [ "$image_count" -ne 1 ] || [[ ! "$image_pin" =~ $image_reference ]]; then
-        echo "invalid verifier IMAGE pin: expected one quoted immutable literal" >&2
-        exit 1
-    fi
-    if [ "$SMG_SGLANG_ROCM_IMAGE" != "$image_pin" ]; then
-        echo "unsupported E2E SGLang image" >&2
+    source "$pin_helper_directory/ci_setup_sglang_rocm_image_pin.sh"
+    image_pin="$(read_sglang_rocm_image_pin "$pin_helper_directory/ci_verify_sglang_rocm_cohort.py")"
+    if [ "${SMG_SGLANG_ROCM_IMAGE:-}" != "$image_pin" ]; then
+        echo "unsupported E2E SGLang image: observed ${SMG_SGLANG_ROCM_IMAGE-}; expected $image_pin" >&2
         exit 1
     fi
 fi
@@ -115,14 +85,15 @@ if [ "$verify_only" -eq 0 ]; then
 
 fi
 
+# Check selected NIXL in both setup and verify-only mode before publishing
+# either a verified cohort report or the next-step companion handoff.
+if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
+    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
+fi
+
 python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
 
 # Carry the observed image version into the next Actions step.
 if [ "$verify_only" -eq 0 ] && [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
-fi
-
-# Check the image's existing NIXL only on explicitly selected NIXL lanes.
-if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
-    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
 fi

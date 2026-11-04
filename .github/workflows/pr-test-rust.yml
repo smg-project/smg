@@ -986,6 +986,7 @@ jobs:
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
               ("scripts/ci_setup_sglang_rocm_e2e.sh", SGLANG),
+              ("scripts/ci_setup_sglang_rocm_image_pin.sh", SGLANG),
               ("scripts/ci_verify_sglang_rocm_e2e.py", SGLANG),
               ("scripts/ci_run_sglang_rocm_units.sh", SGLANG),
               ("scripts/ci_verify_sglang_rocm_cohort.py",          SGLANG),

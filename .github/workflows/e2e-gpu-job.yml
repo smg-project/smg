@@ -150,7 +150,7 @@ on:
         type: string
         default: ""
       final_environment_check:
-        description: "Opt in to fixed-image AMD SGLang setup, live JUnit/log capture and prepared/final pip/cohort verification"
+        description: "Opt in to fixed-image AMD SGLang setup, live JUnit/log capture and pip/cohort/provenance verification"
         required: false
         type: boolean
         default: false
@@ -280,6 +280,7 @@ jobs:
           test -s scripts/ci_setup_sglang_rocm_image.sh
           test -s scripts/ci_verify_sglang_rocm_cohort.py
           test -s scripts/ci_setup_sglang_rocm_e2e.sh
+          test -s scripts/ci_setup_sglang_rocm_image_pin.sh
           test -s scripts/ci_verify_sglang_rocm_e2e.py
 
       # Engine-specific setup
@@ -373,9 +374,13 @@ jobs:
           cohort_status=0
           bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-prepared.json \
             >e2e-logs/prepared-cohort.stdout 2>e2e-logs/prepared-cohort.stderr || cohort_status=$?
-          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/prepared-environment-status.json
+          provenance_status=0
+          python3 scripts/ci_verify_sglang_rocm_e2e.py --verify "${SMG_CI_SGLANG_E2E_SNAPSHOT:-}" --root . \
+            >e2e-logs/prepared-provenance.json 2>e2e-logs/prepared-provenance.stderr || provenance_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s,"provenance_returncode":%s}\n' "$pip_status" "$cohort_status" "$provenance_status" >e2e-logs/prepared-environment-status.json
           test "$pip_status" -eq 0
           test "$cohort_status" -eq 0
+          test "$provenance_status" -eq 0
 
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
@@ -435,7 +440,18 @@ jobs:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: |
           mkdir -p e2e-logs
-          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment.json
+          pip_status=0
+          python3 -m pip check >e2e-logs/before-e2e-pip.stdout 2>e2e-logs/before-e2e-pip.stderr || pip_status=$?
+          cohort_status=0
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment.json \
+            >e2e-logs/before-e2e-cohort.stdout 2>e2e-logs/before-e2e-cohort.stderr || cohort_status=$?
+          provenance_status=0
+          python3 scripts/ci_verify_sglang_rocm_e2e.py --verify "${SMG_CI_SGLANG_E2E_SNAPSHOT:-}" --root . \
+            >e2e-logs/before-e2e-provenance.json 2>e2e-logs/before-e2e-provenance.stderr || provenance_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s,"provenance_returncode":%s}\n' "$pip_status" "$cohort_status" "$provenance_status" >e2e-logs/before-e2e-environment-status.json
+          test "$pip_status" -eq 0
+          test "$cohort_status" -eq 0
+          test "$provenance_status" -eq 0
 
       # Run tests
       - name: Run E2E tests
@@ -569,9 +585,11 @@ jobs:
               else ""
           )
           vendor = inputs.get("gpu_vendor") or "unknown"
+          dp = str(inputs.get("zmq_engine_count") or "").strip()
           fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
-                    vendor, inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
-                    inputs.get("mm_processing", "")]
+                    vendor, inputs.get("connection_mode", ""),
+                    f"dp{dp}" if dp not in ("", "1") else "",
+                    inputs.get("servicer_impl", ""), inputs.get("mm_processing", "")]
           label = re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(fields)).strip("-.")[:96]
           tier = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(inputs.get("gpu_tier", "")))
           contract = f"{label}-gpu{tier}-{digest}"
@@ -584,7 +602,7 @@ jobs:
           PYTHON
 
       # This is deliberately after pytest and before marker-based process cleanup.
-      # Keep both return codes and streams even when pytest or either check fails.
+      # Keep all return codes and streams even when pytest or a check fails.
       - name: Check final AMD SGLang environment
         id: final-environment
         if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
@@ -598,9 +616,13 @@ jobs:
           cohort_status=0
           bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-final.json \
             >e2e-logs/final-cohort.stdout 2>e2e-logs/final-cohort.stderr || cohort_status=$?
-          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/final-environment-status.json
+          provenance_status=0
+          python3 scripts/ci_verify_sglang_rocm_e2e.py --verify "${SMG_CI_SGLANG_E2E_SNAPSHOT:-}" --root . \
+            >e2e-logs/final-provenance.json 2>e2e-logs/final-provenance.stderr || provenance_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s,"provenance_returncode":%s}\n' "$pip_status" "$cohort_status" "$provenance_status" >e2e-logs/final-environment-status.json
           test "$pip_status" -eq 0
           test "$cohort_status" -eq 0
+          test "$provenance_status" -eq 0
 
       - name: Upload AMD SGLang complete test and final-environment evidence
         id: upload-complete-evidence
