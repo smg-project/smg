@@ -11,7 +11,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, tokenizer_bundle, BoxStream};
+use crate::{kv_events, rpc, BoxStream};
 
 /// What neither servicer serves: the engine's Python servicer does not
 /// implement `Embed`, and the wire carries no embedding request.
@@ -35,10 +35,8 @@ impl TrtllmService for TrtllmServicer {
         request: Request<trt::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
-        generate::generate(&self.state, request.into_inner(), trace_headers)
-            .await
-            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
-            .map(Response::new)
+        let stream = generate::generate(&self.state, request.into_inner(), trace_headers).await;
+        rpc::generated(&self.state, stream)
     }
 
     async fn embed(
@@ -96,27 +94,13 @@ impl TrtllmService for TrtllmServicer {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
-            .await
-            .map(Response::new)
+        rpc::get_tokenizer(&self.state).await
     }
 
     async fn subscribe_kv_events(
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let request = request.into_inner();
-        // The load records alone are the servicer's own figures, served
-        // with or without a relay: an engine whose events are off streams
-        // its load all the same.
-        if request.loads_only {
-            return Ok(Response::new(crate::load_stream::load_records_of(
-                &self.state,
-            )));
-        }
-        let Some(relay) = &self.state.shared.kv_relay else {
-            return Err(Status::unimplemented(kv_events::TRTLLM_DISABLED_MESSAGE));
-        };
-        relay.subscribe(request).map(Response::new)
+        rpc::subscribe_kv_events(&self.state, request, kv_events::TRTLLM_DISABLED_MESSAGE)
     }
 }
