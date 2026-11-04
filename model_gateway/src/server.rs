@@ -3128,10 +3128,11 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
             ])
-            // The request id and the echoed trace context, readable by
-            // browser clients.
+            // The request id under both of its names and the echoed trace
+            // context, readable by browser clients.
             .expose_headers([
                 http::header::HeaderName::from_static("x-request-id"),
+                http::header::HeaderName::from_static("request-id"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
             ])
@@ -3312,6 +3313,15 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string();
+            // The Messages shape carries the id as `request-id` as well.
+            assert_eq!(
+                response
+                    .headers()
+                    .get("request-id")
+                    .map(|value| value.to_str().unwrap()),
+                messages_shape.then_some(request_id.as_str()),
+                "{method} {path}"
+            );
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -3458,6 +3468,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
+        assert_eq!(response.headers()["request-id"], request_id.as_str());
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["type"], "error", "{json}");
@@ -3637,6 +3648,7 @@ mod tests {
                     .expect("a configured origin list attaches the layer"),
             );
         let response = app
+            .clone()
             .oneshot(
                 http::Request::builder()
                     .method("OPTIONS")
@@ -3668,6 +3680,28 @@ mod tests {
         ] {
             assert!(
                 allowed.split(',').any(|value| value.trim() == header),
+                "missing {header}"
+            );
+        }
+
+        // A browser client may read the request id under both of its names.
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap();
+        for header in ["x-request-id", "request-id"] {
+            assert!(
+                exposed.split(',').any(|value| value.trim() == header),
                 "missing {header}"
             );
         }

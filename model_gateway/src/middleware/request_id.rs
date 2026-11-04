@@ -1,6 +1,9 @@
 //! Request ID middleware — pulls an existing request ID from configured
 //! headers or generates an OpenAI-compatible one, stores it in extensions,
-//! and echoes it back via `x-request-id`.
+//! and echoes it back via `x-request-id`; a request in the Messages API's
+//! shape gets the same id as `request-id` too, the header its SDKs read,
+//! unless the response already carries one (a proxying route's relayed
+//! upstream id, which is kept).
 //!
 //! An inbound id is honoured when it is one to
 //! `MAX_INBOUND_REQUEST_ID_LEN` visible-ASCII characters. Anything else
@@ -28,6 +31,8 @@ use rand::RngExt;
 // Re-export RequestId from auth crate for backward compatibility
 pub use smg_auth::RequestId;
 use tower::{Layer, Service};
+
+use super::messages_errors::wants_messages_envelope;
 
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -182,6 +187,15 @@ where
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id));
 
+        // The Anthropic SDKs read the request id from a `request-id` header
+        // and nothing else (`_request_id` on a success, `request_id` on an
+        // error), so a request in the Messages API's shape is answered with
+        // that header beside `x-request-id`, both carrying the one id. A
+        // response that already carries one (a proxying route relaying its
+        // upstream's) keeps it: that is the id the upstream's support asks
+        // for. Every other response keeps its bytes.
+        let speaks_messages = wants_messages_envelope(req.headers(), req.uri().path());
+
         // Call the inner service
         let future = self.inner.call(req);
 
@@ -189,6 +203,12 @@ where
             let mut response = future.await?;
 
             // The id the gateway chose, echoed to the client.
+            if speaks_messages {
+                response
+                    .headers_mut()
+                    .entry("request-id")
+                    .or_insert_with(|| header_value.clone());
+            }
             response.headers_mut().insert("x-request-id", header_value);
 
             Ok(response)
@@ -251,24 +271,26 @@ mod tests {
     /// [`app`] with its own list of configured request-id headers.
     fn app_with(names: Vec<String>) -> Router {
         Router::new()
-            .route(
-                "/v1/chat/completions",
-                get(|request: Request| async move {
-                    let extension = request
-                        .extensions()
-                        .get::<RequestId>()
-                        .map(|id| id.0.clone())
-                        .unwrap_or_default();
-                    let header = request
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("-");
-                    let count = request.headers().get_all("x-request-id").iter().count();
-                    format!("{extension}|{header}|{count}")
-                }),
-            )
+            .route("/v1/chat/completions", get(ids_seen))
+            .route("/v1/messages", get(ids_seen))
+            .route("/v1/models", get(ids_seen))
             .layer(RequestIdLayer::new(names))
+    }
+
+    /// The handler of [`app_with`]'s routes.
+    async fn ids_seen(request: Request) -> String {
+        let extension = request
+            .extensions()
+            .get::<RequestId>()
+            .map(|id| id.0.clone())
+            .unwrap_or_default();
+        let header = request
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-");
+        let count = request.headers().get_all("x-request-id").iter().count();
+        format!("{extension}|{header}|{count}")
     }
 
     /// (the echoed `x-request-id`, the id the handler saw in the extensions,
@@ -393,6 +415,81 @@ mod tests {
             (echoed.as_str(), 1),
             "one value, the fresh id"
         );
+    }
+
+    /// A request in the Messages API's shape (a Messages route, or any route
+    /// under the `anthropic-version` header the Anthropic SDKs send on every
+    /// call) is answered with the id as `request-id` as well: the header those
+    /// SDKs read for `_request_id` and for an error's `request_id`. Every other
+    /// response carries `x-request-id` alone, as before.
+    #[tokio::test]
+    async fn a_messages_api_request_is_echoed_its_id_as_request_id_too() {
+        for (path, version, as_request_id) in [
+            ("/v1/messages", None, true),
+            ("/v1/models", Some("2023-06-01"), true),
+            ("/v1/chat/completions", Some("2023-06-01"), true),
+            ("/v1/models", None, false),
+            ("/v1/chat/completions", None, false),
+        ] {
+            let mut request = Request::builder()
+                .uri(path)
+                .header("x-request-id", "req_client_1");
+            if let Some(version) = version {
+                request = request.header("anthropic-version", version);
+            }
+            let response = app()
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.headers()["x-request-id"], "req_client_1", "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("request-id")
+                    .map(|value| value.to_str().expect("visible ASCII")),
+                as_request_id.then_some("req_client_1"),
+                "{path} under anthropic-version {version:?}"
+            );
+        }
+
+        // A fresh id is echoed under both names too, the same value.
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let echoed = &response.headers()["x-request-id"];
+        assert!(echoed.to_str().expect("visible ASCII").starts_with("msg_"));
+        assert_eq!(&response.headers()["request-id"], echoed);
+    }
+
+    /// A response that already carries a `request-id` (a proxying route
+    /// relaying its upstream's) keeps it; `x-request-id` still names the id
+    /// the gateway chose.
+    #[tokio::test]
+    async fn a_request_id_already_on_the_response_is_kept() {
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async { ([("request-id", "req_upstream_1")], "relayed") }),
+            )
+            .layer(RequestIdLayer::new(vec!["x-request-id".into()]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .header("x-request-id", "req_client_1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.headers()["request-id"], "req_upstream_1");
+        assert_eq!(response.headers()["x-request-id"], "req_client_1");
     }
 
     /// A configured name that does not parse could never match a request;
