@@ -2,6 +2,7 @@
 use std::{hint::black_box, sync::Arc, thread};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use openai_protocol::worker::WorkerStatus;
 use smg::{
     policies::{LoadBalancingPolicy, ManualPolicy, SelectWorkerInfo},
     worker::{BasicWorkerBuilder, Worker, WorkerType},
@@ -11,12 +12,17 @@ use smg::{
 // Test Helpers
 // ============================================================================
 
+/// `count` workers the policy can route to. A health-checked worker is built
+/// `Pending` by default, which the policies skip; each is built `Ready` here,
+/// the state the health loop would give it, so the rows measure a selection
+/// and not the empty-pool path.
 fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
     (0..count)
         .map(|i| {
             Arc::new(
                 BasicWorkerBuilder::new(format!("http://worker-{}:8000", i))
                     .worker_type(WorkerType::Regular)
+                    .status(WorkerStatus::Ready)
                     .build(),
             ) as Arc<dyn Worker>
         })
@@ -132,7 +138,7 @@ fn bench_failover(c: &mut Criterion) {
                         let policy = ManualPolicy::new();
                         let workers = create_workers(count);
                         let idx = select_with_key(&policy, &workers, "failover-test").unwrap();
-                        workers[idx].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                        workers[idx].set_status(WorkerStatus::NotReady);
                         (policy, workers)
                     },
                     |(policy, workers)| {
