@@ -194,6 +194,14 @@ impl VllmTiktokenBackend {
             .map_err(|error| Error::msg(format!("tiktoken encode failed: {error}")))
     }
 
+    /// The ids of `text` with its special tokens read as text: a plain piece
+    /// of a prompt rendered by segments.
+    pub(crate) fn encode_ordinary(&self, text: &str) -> Result<Vec<TokenIdType>> {
+        self.tokenizer
+            .encode_ordinary(text)
+            .map_err(|error| Error::msg(format!("tiktoken encode failed: {error}")))
+    }
+
     /// The text of `token_ids`, every id kept (the wrapper strips what
     /// `skip_special_tokens` strips before, and rejects an id the vocabulary
     /// lacks, which the backend would skip).

@@ -192,9 +192,10 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
 
 /// Tiktoken tokenizer wrapper — supports both built-in OpenAI encodings and hub-loaded models.
 pub struct TiktokenTokenizer {
-    /// Shared so a deferred chat encode can own a handle and run on another
-    /// thread after the render call returned.
-    tokenizer: Arc<CoreBPE>,
+    /// What the encodes and batch decodes run on; shared so a deferred chat
+    /// encode can own a handle and run on another thread after the render
+    /// call returned.
+    engine: Arc<Engine>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
@@ -219,9 +220,22 @@ pub struct TiktokenTokenizer {
     /// `tokenization_kimi.py` sorts them in its `apply_chat_template`
     /// (Kimi K3's class, which renders its own format, does not).
     tools_key_sorted: bool,
-    /// The `vllm-tokenizer` backend, when the load took it: the flat
-    /// encodes and batch decodes run on it (see `vllm`).
-    vllm: Option<crate::vllm::VllmTiktokenBackend>,
+}
+
+/// What the wrapper's encodes and batch decodes run on: the `vllm-tokenizer`
+/// backend over the file, when the load took it (see `vllm`), else
+/// `tiktoken-rs`'s `CoreBPE`.
+enum Engine {
+    /// The backend, with the special tokens by spelling: a control piece of
+    /// a prompt rendered by segments that is one special token takes its id
+    /// from the map, in place of an encode that collects the allowed set.
+    Vllm {
+        backend: crate::vllm::VllmTiktokenBackend,
+        specials: HashMap<String, TokenIdType>,
+    },
+    /// The wrapper's own engine, for a file the backend declined and for the
+    /// built-in encodings.
+    TiktokenRs(CoreBPE),
 }
 
 /// Supported Tiktoken models
@@ -243,7 +257,7 @@ impl TiktokenTokenizer {
     /// Create a new Tiktoken tokenizer for the specified built-in model
     pub fn new(model: TiktokenModel) -> Result<Self> {
         let tokenizer =
-            Arc::new(match model {
+            match model {
                 TiktokenModel::O200kBase => o200k_base()
                     .map_err(|e| Error::msg(format!("Failed to load o200k_base: {e}")))?,
                 TiktokenModel::Cl100kBase => cl100k_base()
@@ -257,7 +271,7 @@ impl TiktokenTokenizer {
                 TiktokenModel::R50kBase => {
                     r50k_base().map_err(|e| Error::msg(format!("Failed to load r50k_base: {e}")))?
                 }
-            });
+            };
 
         let special_tokens = Self::get_special_tokens_for_model(model);
         // Built-in encodings have no tokenizer_config.json; every token the
@@ -274,10 +288,14 @@ impl TiktokenTokenizer {
             TiktokenModel::P50kBase | TiktokenModel::P50kEdit => 50281,
             TiktokenModel::R50kBase => 50257,
         };
-        let byte_level = byte_level_table(&tokenizer, vocab_size, &skip_token_ids);
+        let byte_level = byte_level_table(
+            |id| tokenizer.decode_bytes(&[id]).ok(),
+            vocab_size,
+            &skip_token_ids,
+        );
 
         Ok(TiktokenTokenizer {
-            tokenizer,
+            engine: Arc::new(Engine::TiktokenRs(tokenizer)),
             special_tokens,
             vocab: HashMap::new(),
             reverse_vocab: HashMap::new(),
@@ -290,7 +308,6 @@ impl TiktokenTokenizer {
             byte_level,
             checkpoint_pieces: false,
             tools_key_sorted: false,
-            vllm: None,
         })
     }
 
@@ -352,24 +369,33 @@ impl TiktokenTokenizer {
             CL100K_BASE_PATTERN
         };
 
-        // 3. Build special tokens encoder for CoreBPE (needs FxHashMap)
-        let special_tokens_encoder: FxHashMap<String, Rank> = config
-            .added_tokens
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
-
-        // 4. Calculate true vocab size from max token ID (handles sparse/reserved IDs),
-        //    build string-based vocab maps (borrows encoder), then pass encoder by value to CoreBPE
+        // 3. The ids' end, the largest rank or added id plus one (sparse and
+        //    reserved ids included), and the string-based vocabulary maps.
         let vocab_size = encoder
             .values()
             .copied()
-            .chain(special_tokens_encoder.values().copied())
+            .chain(config.added_tokens.values().copied())
             .max()
             .map(|id| id as usize + 1)
             .unwrap_or(0);
         let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &config.added_tokens);
-        let tokenizer = Arc::new(CoreBPE::new(encoder, special_tokens_encoder, pattern)?);
+        // 4. The per-id byte table of the per-stream decoder, from the file's
+        //    ranks and the added tokens.
+        let bytes_by_id: FxHashMap<TokenIdType, &[u8]> = encoder
+            .iter()
+            .map(|(bytes, &rank)| (rank, bytes.as_slice()))
+            .chain(
+                config
+                    .added_tokens
+                    .iter()
+                    .map(|(token, &id)| (id, token.as_bytes())),
+            )
+            .collect();
+        let byte_level = byte_level_table(
+            |id| bytes_by_id.get(&id).map(|bytes| bytes.to_vec()),
+            vocab_size,
+            &config.skip_token_ids,
+        );
 
         // 5. Load chat template — propagate errors for explicit paths,
         //    silently fall back for auto-discovery
@@ -402,12 +428,31 @@ impl TiktokenTokenizer {
 
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
-        let byte_level = byte_level_table(&tokenizer, vocab_size, &config.skip_token_ids);
-        let vllm =
-            Self::choose_vllm_backend(tiktoken_path, dir, vocab_size, kimi, byte_level.is_some());
+        // 5. The engine: the backend over the file, else `CoreBPE` over the
+        //    ranks and the special tokens (the encoder moves into it).
+        let engine = match Self::choose_vllm_backend(
+            tiktoken_path,
+            dir,
+            vocab_size,
+            kimi,
+            byte_level.is_some(),
+        ) {
+            Some(backend) => Engine::Vllm {
+                backend,
+                specials: config.added_tokens.clone(),
+            },
+            None => {
+                let special_tokens_encoder: FxHashMap<String, Rank> = config
+                    .added_tokens
+                    .iter()
+                    .map(|(k, &v)| (k.clone(), v))
+                    .collect();
+                Engine::TiktokenRs(CoreBPE::new(encoder, special_tokens_encoder, pattern)?)
+            }
+        };
 
         Ok(TiktokenTokenizer {
-            tokenizer,
+            engine: Arc::new(engine),
             special_tokens: config.special_tokens,
             vocab,
             reverse_vocab,
@@ -425,7 +470,6 @@ impl TiktokenTokenizer {
                 Renderer::KimiK3Xtml => false,
                 Renderer::Jinja => kimi,
             },
-            vllm,
         })
     }
 
@@ -470,7 +514,7 @@ impl TiktokenTokenizer {
     /// Whether the `vllm-tokenizer` backend serves this tokenizer's flat
     /// encodes and batch decodes.
     pub fn uses_vllm_backend(&self) -> bool {
-        self.vllm.is_some()
+        matches!(*self.engine, Engine::Vllm { .. })
     }
 
     /// Create a tokenizer from a model string (e.g., "gpt-4", "gpt-3.5-turbo")
@@ -633,13 +677,13 @@ fn build_vocab_maps(
 /// generic per-stream decoder instead.
 const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
 
-/// The bytes every id decodes to, read back from the BPE: a rank's byte
-/// string, a special token's text. Every id up to the largest rank or special
-/// id gets an entry; `skip_token_ids` marks the ones `skip_special_tokens`
-/// strips, as `decode` strips them. `None` when the ids reach past
-/// [`MAX_BYTE_LEVEL_TABLE_IDS`].
+/// The bytes every id decodes to, as `bytes_of` gives them: a rank's byte
+/// string, a special token's text, none for an id the vocabulary lacks.
+/// Every id up to the largest rank or special id gets an entry;
+/// `skip_token_ids` marks the ones `skip_special_tokens` strips, as `decode`
+/// strips them. `None` when the ids reach past [`MAX_BYTE_LEVEL_TABLE_IDS`].
 fn byte_level_table(
-    bpe: &CoreBPE,
+    bytes_of: impl Fn(TokenIdType) -> Option<Vec<u8>>,
     vocab_size: usize,
     skip_token_ids: &HashSet<TokenIdType>,
 ) -> Option<Arc<ByteLevelTable>> {
@@ -661,9 +705,9 @@ fn byte_level_table(
         let Ok(id) = TokenIdType::try_from(id) else {
             break;
         };
-        match bpe.decode_bytes(&[id]) {
-            Ok(bytes) => table.push(&bytes, skip_token_ids.contains(&id)),
-            Err(_) => table.push_absent(),
+        match bytes_of(id) {
+            Some(bytes) => table.push(&bytes, skip_token_ids.contains(&id)),
+            None => table.push_absent(),
         }
     }
     Some(table.finish())
@@ -777,34 +821,60 @@ fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
 
 /// Piecewise encode for a segmented prompt: control pieces with special
 /// tokens recognized, text pieces as ordinary BPE, each segment in the
-/// checkpoint's pieces when `checkpoint_pieces` is set. The allowed-special
-/// set is built once per prompt; `encode_with_special_tokens` would rebuild
-/// it for every piece, and a Kimi prompt has hundreds of control pieces.
+/// checkpoint's pieces when `checkpoint_pieces` is set. A control piece that
+/// is one special token takes its id from the engine's map (a Kimi prompt
+/// has hundreds of control pieces, and an encode with special tokens
+/// collects the allowed set each time); on the wrapper's own engine the
+/// allowed-special set is built once per prompt instead.
 fn encode_segments(
-    bpe: &CoreBPE,
+    engine: &Engine,
     segments: &[PromptSegment],
     checkpoint_pieces: bool,
 ) -> Result<Vec<TokenIdType>> {
-    let allowed = bpe.special_tokens();
     let mut ids = Vec::new();
-    for segment in segments {
+    match engine {
+        Engine::Vllm { backend, specials } => {
+            for (segment, piece) in pieces_of(segments, checkpoint_pieces) {
+                if !segment.allow_special {
+                    ids.extend(backend.encode_ordinary(piece)?);
+                } else if let Some(&id) = specials.get(piece) {
+                    ids.push(id);
+                } else {
+                    ids.extend(backend.encode(piece)?);
+                }
+            }
+        }
+        Engine::TiktokenRs(bpe) => {
+            let allowed = bpe.special_tokens();
+            for (segment, piece) in pieces_of(segments, checkpoint_pieces) {
+                if segment.allow_special {
+                    let (ids_of_piece, _) = bpe
+                        .encode(piece, &allowed)
+                        .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
+                    ids.extend(ids_of_piece);
+                } else {
+                    ids.extend(bpe.encode_ordinary(piece));
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Each segment with each of its pieces: the checkpoint's cut of its text
+/// when `checkpoint_pieces` is set, else the text whole.
+fn pieces_of(
+    segments: &[PromptSegment],
+    checkpoint_pieces: bool,
+) -> impl Iterator<Item = (&PromptSegment, &str)> {
+    segments.iter().flat_map(move |segment| {
         let pieces = if checkpoint_pieces {
             self::checkpoint_pieces(&segment.text)
         } else {
             vec![segment.text.as_str()]
         };
-        for piece in pieces {
-            if segment.allow_special {
-                let (ids_of_piece, _) = bpe
-                    .encode(piece, &allowed)
-                    .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
-                ids.extend(ids_of_piece);
-            } else {
-                ids.extend(bpe.encode_ordinary(piece));
-            }
-        }
-    }
-    Ok(ids)
+        pieces.into_iter().map(move |piece| (segment, piece))
+    })
 }
 
 impl Encoder for TiktokenTokenizer {
@@ -813,25 +883,28 @@ impl Encoder for TiktokenTokenizer {
         // backends, which tiktoken has no concept of) and always recognizes
         // special-token patterns, so chat-template tokens like <|media_pad|> stay
         // atomic instead of splitting into BPE sub-tokens.
-        if let Some(vllm) = &self.vllm {
-            let tokens = if self.checkpoint_pieces {
-                let mut tokens = Vec::new();
-                for piece in checkpoint_pieces(input) {
-                    tokens.extend(vllm.encode(piece)?);
+        let tokens = match &*self.engine {
+            Engine::Vllm { backend, .. } => {
+                if self.checkpoint_pieces {
+                    let mut tokens = Vec::new();
+                    for piece in checkpoint_pieces(input) {
+                        tokens.extend(backend.encode(piece)?);
+                    }
+                    tokens
+                } else {
+                    backend.encode(input)?
                 }
-                tokens
-            } else {
-                vllm.encode(input)?
-            };
-            return Ok(Encoding::Tiktoken(tokens));
-        }
-        let tokens = if self.checkpoint_pieces {
-            checkpoint_pieces(input)
-                .into_iter()
-                .flat_map(|piece| self.tokenizer.encode_with_special_tokens(piece))
-                .collect()
-        } else {
-            self.tokenizer.encode_with_special_tokens(input)
+            }
+            Engine::TiktokenRs(bpe) => {
+                if self.checkpoint_pieces {
+                    checkpoint_pieces(input)
+                        .into_iter()
+                        .flat_map(|piece| bpe.encode_with_special_tokens(piece))
+                        .collect()
+                } else {
+                    bpe.encode_with_special_tokens(input)
+                }
+            }
         };
         Ok(Encoding::Tiktoken(tokens))
     }
@@ -857,30 +930,32 @@ impl Decoder for TiktokenTokenizer {
         } else {
             token_ids
         };
-        if let Some(vllm) = &self.vllm {
-            // An id the vocabulary lacks fails the decode, as the wrapper's
-            // engine fails it below; the backend would skip it.
-            let absent = |id: &TokenIdType| {
-                self.byte_level
-                    .as_ref()
-                    .is_none_or(|table| table.is_absent(*id))
-            };
-            if let Some(unknown) = token_ids.iter().find(|id| absent(id)) {
-                return Err(Error::msg(format!(
-                    "tiktoken decode failed for unknown token id: {unknown}"
-                )));
+        let bpe = match &*self.engine {
+            Engine::Vllm { backend, .. } => {
+                // An id the vocabulary lacks fails the decode, as the wrapper's
+                // engine fails it below; the backend would skip it.
+                let absent = |id: &TokenIdType| {
+                    self.byte_level
+                        .as_ref()
+                        .is_none_or(|table| table.is_absent(*id))
+                };
+                if let Some(unknown) = token_ids.iter().find(|id| absent(id)) {
+                    return Err(Error::msg(format!(
+                        "tiktoken decode failed for unknown token id: {unknown}"
+                    )));
+                }
+                return backend.decode(token_ids);
             }
-            return vllm.decode(token_ids);
-        }
-        match self.tokenizer.decode(token_ids) {
+            Engine::TiktokenRs(bpe) => bpe,
+        };
+        match bpe.decode(token_ids) {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
                 "tiktoken decode failed for unknown token id: {err}"
             ))),
             Err(err) => {
                 // Fallback to lossy decoding for incomplete UTF-8 sequences
-                let bytes: Vec<u8> = self
-                    .tokenizer
+                let bytes: Vec<u8> = bpe
                     ._decode_native_and_split(token_ids.to_vec())
                     .flatten()
                     .collect();
@@ -995,10 +1070,10 @@ impl TokenizerTrait for TiktokenTokenizer {
         // Piecewise encoding makes the stub's own count its share of the full encode.
         let checkpoint_pieces = self.checkpoint_pieces;
         let unbilled_prompt_tokens =
-            encode_segments(&self.tokenizer, &segments[pending], checkpoint_pieces)?.len() as u32;
-        let bpe = Arc::clone(&self.tokenizer);
+            encode_segments(&self.engine, &segments[pending], checkpoint_pieces)?.len() as u32;
+        let engine = Arc::clone(&self.engine);
         let job = EncodeJob::new(move || {
-            encode_segments(&bpe, &segments, checkpoint_pieces).map(Encoding::Tiktoken)
+            encode_segments(&engine, &segments, checkpoint_pieces).map(Encoding::Tiktoken)
         });
         Ok(ChatTemplateOutput {
             text,
@@ -1675,12 +1750,13 @@ mod tests {
     #[test]
     fn test_encode_segments_keeps_control_tokens_out_of_text_segments() {
         let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
-        let bpe = &tokenizer.tokenizer;
+        let engine = &*tokenizer.engine;
 
-        let control = encode_segments(bpe, &[PromptSegment::control("<|open|>")], false).unwrap();
+        let control =
+            encode_segments(engine, &[PromptSegment::control("<|open|>")], false).unwrap();
         assert_eq!(control, vec![300]);
 
-        let text = encode_segments(bpe, &[PromptSegment::text("<|open|>")], false).unwrap();
+        let text = encode_segments(engine, &[PromptSegment::text("<|open|>")], false).unwrap();
         assert!(
             !text.contains(&300),
             "marker in a text segment must not become a control id: {text:?}"
@@ -1688,7 +1764,7 @@ mod tests {
         assert_eq!(tokenizer.decode(&text, false).unwrap(), "<|open|>");
 
         let mixed = encode_segments(
-            bpe,
+            engine,
             &[
                 PromptSegment::control("<|open|>"),
                 PromptSegment::text("message"),
@@ -1776,11 +1852,11 @@ mod tests {
         assert_eq!(other.encode(&text, false).unwrap().token_ids(), &whole[..]);
         let segment = [PromptSegment::text(&text)];
         assert_eq!(
-            encode_segments(&kimi.tokenizer, &segment, kimi.checkpoint_pieces).unwrap(),
+            encode_segments(&kimi.engine, &segment, kimi.checkpoint_pieces).unwrap(),
             pieces
         );
         assert_eq!(
-            encode_segments(&kimi.tokenizer, &segment, false).unwrap(),
+            encode_segments(&kimi.engine, &segment, false).unwrap(),
             whole
         );
         // Below the cut nothing changes.
@@ -1813,7 +1889,7 @@ mod tests {
         };
         let ids = job.run().unwrap();
         let expected = encode_segments(
-            &tokenizer.tokenizer,
+            &tokenizer.engine,
             &render_kimi_k3_xtml_prompt(&messages, &params(), None)
                 .unwrap()
                 .segments,
@@ -2244,6 +2320,42 @@ mod tests {
                 ours.encode("hello world", false).unwrap().token_ids(),
                 &[256, 257]
             );
+        }
+
+        /// A prompt rendered by segments encodes on the backend as on the
+        /// wrapper's engine: a control piece that is one special token by
+        /// its id, any other control piece with its special tokens
+        /// recognized, a text piece with every spelling as text, the
+        /// checkpoint's piece cut applied or not.
+        #[test]
+        fn a_segment_encode_on_the_backend_agrees_with_the_engine() {
+            let dir = kimi_dir();
+            let ours = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            assert!(ours.uses_vllm_backend());
+            let reference = Engine::TiktokenRs(reference(dir.path()));
+            let long_run = "a".repeat(CHECKPOINT_RUN_CHARS + 5);
+            let segments = [
+                PromptSegment::control("[BOS]"),
+                PromptSegment::text("hello world"),
+                PromptSegment::control("<|reserved_token_300|>"),
+                PromptSegment::control("[EOS]hello<|tool_call_begin|>"),
+                PromptSegment::text("[EOS] typed <|tool_call_begin|>{\"a\": 1}"),
+                PromptSegment::control("plain words"),
+                PromptSegment::text(long_run.as_str()),
+            ];
+            for checkpoint_pieces in [false, true] {
+                let ids = encode_segments(&ours.engine, &segments, checkpoint_pieces).unwrap();
+                let expected = encode_segments(&reference, &segments, checkpoint_pieces).unwrap();
+                assert_eq!(ids, expected, "checkpoint pieces {checkpoint_pieces}");
+            }
+            // A control piece that is one special token is its id; the
+            // typed spellings of a text piece are text.
+            assert_eq!(
+                encode_segments(&ours.engine, &segments[..1], false).unwrap(),
+                [259]
+            );
+            let typed = encode_segments(&ours.engine, &segments[4..5], false).unwrap();
+            assert!(!typed.contains(&260) && !typed.contains(&261), "{typed:?}");
         }
     }
 }
