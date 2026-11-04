@@ -219,7 +219,7 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
         ImageFrame::decode_all(std::slice::from_ref(&warm)).expect("decode");
         let image = warm.image().expect("image").clone();
         let inputs = processor
-            .preprocess_wire(std::slice::from_ref(&image), EncoderDtype::BFloat16)
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
             .expect("one-pass")
             .expect("preprocess");
         drop(inputs.encoder_input.into_bytes_as(EncoderDtype::BFloat16));
@@ -231,7 +231,7 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
     let decoded_bytes = image.as_bytes().len();
     let (inputs, preprocess) = counted(|| {
         processor
-            .preprocess_wire(std::slice::from_ref(&image), EncoderDtype::BFloat16)
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
             .expect("one-pass")
             .expect("preprocess")
     });

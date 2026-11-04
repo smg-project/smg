@@ -232,7 +232,7 @@ enum Work {
     },
     Audio {
         processor: Arc<Qwen3AudioProcessor>,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     },
 }
 
@@ -338,9 +338,10 @@ fn preprocess(
     images: &[DynamicImage],
     wire: EncoderDtype,
 ) -> Result<PreprocessedEncoderInputs, String> {
+    let images: Vec<&DynamicImage> = images.iter().collect();
     processor
-        .preprocess_wire(images, wire)
-        .unwrap_or_else(|| processor.preprocess(images))
+        .preprocess_wire(&images, wire)
+        .unwrap_or_else(|| processor.preprocess(&images))
         .map_err(|e| e.to_string())
 }
 
@@ -441,13 +442,13 @@ fn iterate(
         Work::Audio { processor, bytes } => {
             let started = Instant::now();
             let decoded = runtime
-                .block_on(decode_audio_mono_f32(bytes))
+                .block_on(decode_audio_mono_f32(bytes.clone()))
                 .map_err(|e| e.to_string())?;
             sample.decode_ms = ms(started);
             sample.decoded_bytes = decoded.samples.len() * size_of::<f32>();
             let started = Instant::now();
             let inputs = processor
-                .preprocess_decoded_clips(vec![decoded])
+                .preprocess_decoded_clips(&[&decoded])
                 .map_err(|e| e.to_string())?;
             sample.preprocess_ms = ms(started);
             (inputs, Instant::now())
@@ -469,7 +470,8 @@ fn facts(
 ) -> Result<Facts, String> {
     let encoded_bytes = match work {
         Work::Images { files, .. } => files.iter().map(Bytes::len).sum(),
-        Work::Video { bytes, .. } | Work::Audio { bytes, .. } => bytes.len(),
+        Work::Video { bytes, .. } => bytes.len(),
+        Work::Audio { bytes, .. } => bytes.len(),
     };
     let (_, one_pass) = iterate(work, wire, transparency, runtime)?;
     let wire_sha256 = sha256(&one_pass);
@@ -477,7 +479,8 @@ fn facts(
         Work::Images { processor, files } => {
             let (images, _, _) = decode_images(files, transparency)?;
             let rgb = images.first().map(|image| sha256(image.to_rgb8().as_raw()));
-            let two_pass = processor.preprocess(&images).map_err(|e| e.to_string())?;
+            let refs: Vec<&DynamicImage> = images.iter().collect();
+            let two_pass = processor.preprocess(&refs).map_err(|e| e.to_string())?;
             let u8_sha256 = match &two_pass.encoder_input {
                 EncoderInput::U8 { patches, .. } => Some(sha256(
                     &patches
@@ -531,10 +534,10 @@ fn facts(
         }
         Work::Audio { processor, bytes } => {
             let decoded = runtime
-                .block_on(decode_audio_mono_f32(bytes))
+                .block_on(decode_audio_mono_f32(bytes.clone()))
                 .map_err(|e| e.to_string())?;
             let inputs = processor
-                .preprocess_decoded_clips(vec![decoded])
+                .preprocess_decoded_clips(&[&decoded])
                 .map_err(|e| e.to_string())?;
             Ok(Facts {
                 shape: inputs.encoder_input.shape().to_vec(),
@@ -622,7 +625,7 @@ fn prepare(class: &Class, connector: &Arc<MediaConnector>) -> Result<Work, Fault
                     &configs.config,
                     &configs.image,
                 )),
-                bytes: read(path)?,
+                bytes: Bytes::from(read(path)?),
             }
         }
         other => return Err(format!("unknown class kind {other:?}").into()),
