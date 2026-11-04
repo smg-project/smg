@@ -25,7 +25,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client,
+            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -95,6 +95,14 @@ pub(crate) fn response_status(
         _ if cut_call => (ResponseStatus::Incomplete, None),
         _ => (ResponseStatus::Completed, None),
     }
+}
+
+/// The MCP tool calls a request may make in all: its `max_tool_calls`
+/// capped by the loop's safety limit, the safety limit when it names none.
+pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
+    max_tool_calls.map_or(DEFAULT_MAX_ITERATIONS, |user_max| {
+        user_max.min(DEFAULT_MAX_ITERATIONS)
+    })
 }
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
@@ -1250,6 +1258,17 @@ mod tests {
         assert_eq!(
             response_status(Some("error"), true),
             (ResponseStatus::Failed, None)
+        );
+    }
+
+    #[test]
+    fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
+        assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
+        assert_eq!(tool_call_limit(Some(3)), 3);
+        assert_eq!(tool_call_limit(Some(0)), 0);
+        assert_eq!(
+            tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
+            DEFAULT_MAX_ITERATIONS
         );
     }
 }
