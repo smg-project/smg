@@ -214,10 +214,10 @@ async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(chat_text(&events, 0, "content"), "abc");
     assert_eq!(chat_text(&events, 1, "content"), "xyz");
-    let mut finishes = finish_reasons(&events);
-    finishes.sort();
+    // The finish chunks go out in choice order, whatever order the choices
+    // closed in (choice 0 stopped before choice 1 completed here).
     assert_eq!(
-        finishes,
+        finish_reasons(&events),
         [(0, "stop".to_string()), (1, "length".to_string())],
         "{events:?}"
     );
@@ -226,6 +226,43 @@ async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     let usage = usage(&events);
     assert_eq!(usage["prompt_tokens"], 7);
     assert_eq!(usage["completion_tokens"], 10, "{usage}");
+}
+
+/// An engine message for a choice the request did not ask for ends the read
+/// as a decoding failure: the stream keeps one entry per expected choice.
+#[tokio::test]
+async fn a_choice_index_past_the_expected_choices_is_a_decoding_failure() {
+    let (gate_tx, gate) = oneshot::channel::<()>();
+    let (stream, server) = gated_stream(
+        vec![counted_chunk(0, "ab", 7), counted_chunk(1, "xy", 7)],
+        gate,
+        vec![complete_with_prompt(0, "length", 7)],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let result = timeout(
+        Duration::from_secs(5),
+        processor(false).process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            single_choice_spec(),
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the stream ends at the failure");
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    let error = format!("{result:?}");
+    assert!(result.is_err(), "{error}");
+    assert!(error.contains("choice index 1"), "{error}");
+    assert_eq!(chat_text(&events, 0, "content"), "ab", "{events:?}");
 }
 
 #[tokio::test]
