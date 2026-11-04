@@ -87,12 +87,15 @@ enum Mode {
     Messages,
     /// `POST /v1/embeddings` with the prompt as the input.
     Embeddings,
+    /// `POST /generate` (the engine-native route) with the prompt as its
+    /// `text`; a streamed answer repeats the whole text so far in every frame.
+    Generate,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings)"
+    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -408,6 +411,12 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
             Mode::Embeddings => json!({
                 "model": args.model,
                 "input": prompt(args, i),
+            }),
+            Mode::Generate => json!({
+                "model": args.model,
+                "text": prompt(args, i),
+                "sampling_params": {"max_new_tokens": args.max_tokens},
+                "stream": args.stream,
             }),
             Mode::Tools => json!({
                 "model": args.model,
@@ -998,6 +1007,7 @@ async fn run(args: Args) -> Result<Summary> {
         Mode::Responses => "/v1/responses",
         Mode::Messages => "/v1/messages",
         Mode::Embeddings => "/v1/embeddings",
+        Mode::Generate => "/generate",
         _ => "/v1/chat/completions",
     };
     let url = format!("{}{}", args.gateway.trim_end_matches('/'), path);
@@ -1174,6 +1184,15 @@ mod tests {
         let e = build_bodies(&args(Mode::Embeddings)).unwrap();
         let v: Value = serde_json::from_slice(&e[1]).unwrap();
         assert!(v["input"].as_str().unwrap().contains("[session 1]"));
+        assert!(v.get("messages").is_none());
+
+        let mut g = args(Mode::Generate);
+        g.stream = true;
+        let g = build_bodies(&g).unwrap();
+        let v: Value = serde_json::from_slice(&g[2]).unwrap();
+        assert!(v["text"].as_str().unwrap().contains("[session 2]"));
+        assert_eq!(v["sampling_params"]["max_new_tokens"], 8);
+        assert_eq!(v["stream"], true);
         assert!(v.get("messages").is_none());
 
         let mut c = args(Mode::Chat);
