@@ -23,8 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 
 jobs:
@@ -145,8 +143,8 @@ jobs:
       # source, so it missed on essentially every code PR (all-or-nothing), and
       # on a miss it *masked* the incremental compilation cache by skipping the
       # build entirely — which also meant rust-cache rarely got populated. The
-      # build now always runs and leans on rust-cache + sccache (set up in
-      # ./.github/actions/setup-rust), which degrade gracefully: with the
+      # build now always runs and leans on rust-cache (set up in
+      # ./.github/actions/setup-rust), which degrades gracefully: with the
       # dependency graph cached, only changed crates recompile.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
@@ -288,10 +286,9 @@ jobs:
   # rust-tests below runs the test shards of scripts/ci_rust_tests.sh. Both
   # restore the Rust cache entry the Rust Cache Warmer saves on main under the
   # key `unit-tests` (every shard's test profile and every lint leg's
-  # dependency artifacts; see rust-cache-warmer.yml) and share the
-  # content-addressed sccache namespace with every other job, so a leg
-  # compiles only the workspace crates it checks. A failed or cancelled leg
-  # fails finish.
+  # dependency artifacts; see rust-cache-warmer.yml), so each of their jobs
+  # compiles only the workspace crates it checks. A failed or cancelled job
+  # of either fails finish.
   rust-lint:
     name: rust-lint (${{ matrix.leg }})
     needs: [detect-changes]
@@ -526,12 +523,7 @@ jobs:
   # already keys by the runner's architecture, but this job's target
   # directory holds another crate set and profile than the rust-tests shards',
   # and the entry fills from the runs on main (the action saves on main
-  # only). sccache is off for this job (the wrapper unset, its GitHub cache
-  # disabled): the repository's Actions cache is over its budget, with
-  # `incremental = true` sccache would only add this architecture's
-  # dependency objects on every cold run, which rust-cache restores anyway,
-  # and a local sccache disk cache never outlives a hosted runner. The
-  # gateway binary's own AArch64 check
+  # only). The gateway binary's own AArch64 check
   # (model_gateway/tests/startup/allocator_artifact_test.rs: jemalloc's 64 KiB page
   # setting) is not run here: it builds the smg binary, which the hosted
   # runner cannot afford on every pull request; it stays with the nightly
@@ -550,9 +542,6 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    env:
-      SCCACHE_GHA_ENABLED: "false"
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -974,6 +963,7 @@ jobs:
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
               (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
+              (".github/versions/tokenspeed-engine.txt",         TOKENSPEED),
               (".github/**",                                     NONE),
               # the CI scripts: an engine's installers its rows; the agentic services the
               # Responses, Messages and vendor lanes; the scripts of other workflows none;
@@ -1251,6 +1241,9 @@ jobs:
             test_timeout: 26
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+            # The pinned engine runs on its Rust control plane and carries no
+            # in-process Python frontend, so its workers run the Rust servicer.
+            servicer_impl: rust
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1261,6 +1254,7 @@ jobs:
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
       enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
@@ -1340,15 +1334,9 @@ jobs:
             timeout: 32
             test_timeout: 24
             min_selected: 202 # the vllm chat row's floor: the same selection
-          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
-          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
-          # image, or the source build on a cold path, hence the budget), so
-          # the two rows differ by the servicer only. The admin-op and loads
-          # cases of that row stay on the Python servicer's row.
-          - engine: tokenspeed
-            timeout: 56
-            test_timeout: 26
-            min_selected: 114 # the tokenspeed chat row's floor: the same selection
+          # No tokenspeed row: e2e-1gpu-chat's tokenspeed row runs the Rust
+          # servicer itself (the pinned engine has no Python frontend), so a
+          # second row here would repeat it.
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1660,6 +1648,7 @@ jobs:
             timeout: 75
             test_timeout: 50
             min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
+            servicer_impl: rust # the pinned engine has no Python frontend
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1669,7 +1658,10 @@ jobs:
       test_timeout: ${{ matrix.test_timeout || 34 }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The rank-pin cases read the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
       min_selected: ${{ matrix.min_selected }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
@@ -1693,6 +1685,8 @@ jobs:
       test_timeout: 34
       test_dirs: e2e_test/router/test_pd_multimodal.py
       mm_processing: worker
+      # The placement assertion reads the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
       min_selected: 4 # the 4 PD multimodal cases
     secrets: inherit
 
@@ -1773,6 +1767,7 @@ jobs:
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
       tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
+      servicer_impl: rust # the pinned engine has no Python frontend
     secrets: inherit
 
   # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
@@ -1803,6 +1798,7 @@ jobs:
           - engine: tokenspeed
             timeout: 85
             test_timeout: 60
+            servicer_impl: rust # the pinned engine has no Python frontend
           # The other KV transport of each engine (TokenSpeed only has
           # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
@@ -1842,6 +1838,7 @@ jobs:
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own
       vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
     secrets: inherit
 
   # --- CPU E2E: the classes on the scripted mock worker ---
@@ -1891,6 +1888,7 @@ jobs:
         RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8@870a1177ed082c0ba5dbefd62573ab8f91803f6a
         deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
         Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
+        openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -1954,23 +1952,39 @@ jobs:
             bash scripts/ci_retry.sh 3 30 hf download "$repository" --revision "$revision" \
               --include '*.json' --local-dir "$ROUTER_LOCAL_MODEL_PATH/$repository"
           done
+          # The Harmony vocab the gateway loads when a gpt-oss worker registers
+          # (from this directory, TIKTOKEN_ENCODINGS_BASE on the test step; a
+          # download on first use otherwise). Fetched only when the restored
+          # copy is missing or wrong: the digest is the one the loader checks.
+          mkdir -p "$ROUTER_LOCAL_MODEL_PATH/tiktoken"
+          vocab="$ROUTER_LOCAL_MODEL_PATH/tiktoken/o200k_base.tiktoken"
+          echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  $vocab" | sha256sum -c --status 2>/dev/null \
+            || bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 120 -o "$vocab" \
+              https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
 
       - name: Run the mock e2e tests
         timeout-minutes: 15
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 223 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 471 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
-          # stripping, function-calling, tool-choice (three models) and
-          # multi-turn classes, the constraint-failure and the reader-panic
-          # classes, the completions classes, the context-length and
-          # load-report classes, and the Responses local classes (state,
-          # background, streaming events, sampling parameters, item
-          # references, the object shape)
-          E2E_MIN_SELECTED: "212"
+          # stripping, function-calling, tool-choice (three models),
+          # multi-turn and sampling-defaults classes, the constraint-failure
+          # and the reader-panic classes, the completions classes, the
+          # context-length and load-report classes (the disaggregated ones
+          # included), the disaggregated topology, pairing-protocol,
+          # runtime-assembled fleet, Messages and Responses classes on mock
+          # prefill and decode workers, the Responses local
+          # classes (state, background, streaming events, sampling
+          # parameters, item references, the object shape), and the gpt-oss
+          # classes of chat and Responses on the Harmony token stream (the
+          # mock's tokenizer turns a scripted answer's channel markers into
+          # the special tokens)
+          E2E_MIN_SELECTED: "447"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
+          TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
         run: |
           pytest e2e_test/chat_completions e2e_test/completions e2e_test/router e2e_test/responses \
             --reruns 2 --reruns-delay 5 \

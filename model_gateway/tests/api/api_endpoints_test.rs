@@ -1599,15 +1599,22 @@ mod pd_mode_tests {
         // Create app context
         let app_context = crate::common::create_test_context(config).await;
 
-        // Create router - this might fail due to health check issues
         let router_result = RouterFactory::create_router(&app_context).await;
 
         // Clean up workers
         prefill_worker.stop().await;
         decode_worker.stop().await;
 
-        // For now, just verify the configuration was attempted
-        assert!(router_result.is_err() || router_result.is_ok());
+        // A prefill-decode configuration over HTTP builds the prefill-decode router; what the
+        // pair then does with a request is pinned by the grpc_pd_tests binary and the
+        // disaggregated e2e classes.
+        let router =
+            router_result.expect("a prefill-decode configuration over HTTP builds its router");
+        assert_eq!(
+            router.router_type(),
+            "pd",
+            "the configuration names two roles, so the factory builds the prefill-decode router"
+        );
     }
 }
 

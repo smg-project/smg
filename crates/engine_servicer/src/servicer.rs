@@ -34,6 +34,28 @@ use crate::{
     ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
+/// The proto integers a handshake figure is read into, each with the value
+/// it saturates at.
+pub(crate) trait ProtoInt: Copy + Default + PartialEq + TryFrom<u64> {
+    const MAX: Self;
+}
+
+impl ProtoInt for i32 {
+    const MAX: Self = i32::MAX;
+}
+
+impl ProtoInt for u32 {
+    const MAX: Self = u32::MAX;
+}
+
+/// The proto's `int32` token ids of the launcher's ids, saturating: the
+/// `eos_token_ids` every wire's `GetModelInfo` reports.
+pub(crate) fn proto_token_ids(ids: &[u32]) -> Vec<i32> {
+    ids.iter()
+        .map(|&id| i32::try_from(id).unwrap_or(i32::MAX))
+        .collect()
+}
+
 /// A wire's state as the shared code sees it: where its shared half is.
 pub(crate) trait WireState: Send + Sync + 'static {
     fn shared(&self) -> &Shared;
@@ -68,13 +90,14 @@ impl Shared {
         kv_relay: Option<Arc<KvEventRelay>>,
         metrics: Arc<ServicerMetrics>,
         tokenizer_dir: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> Self {
         Self {
             kv_relay,
             tokenizer_dir,
             engine: EngineLink::default(),
             metrics,
-            registry: Arc::new(RequestRegistry::default()),
+            registry: Arc::new(RequestRegistry::with_warmup_nonce(warmup_nonce)),
             serving: AtomicBool::new(true),
             started: Instant::now(),
             started_at: SystemTime::now(),
@@ -118,6 +141,19 @@ impl Shared {
         self.ready()
             .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
             .unwrap_or(0)
+    }
+
+    /// The model's context length: the launcher's figure when it reported
+    /// one (zero means none), else the handshake's `max_model_len` in the
+    /// proto's integer, saturating; the launcher's zero before the engine is
+    /// up.
+    pub(crate) fn context_window<T: ProtoInt>(&self, launcher: T) -> T {
+        if launcher != T::default() {
+            return launcher;
+        }
+        self.ready()
+            .map(|ready| T::try_from(ready.max_model_len).unwrap_or(T::MAX))
+            .unwrap_or(launcher)
     }
 
     /// The engine version to report: the launcher's, else the handshake's
@@ -206,7 +242,8 @@ impl Shared {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.
@@ -480,7 +517,7 @@ mod tests {
             false,
         )
         .expect("metrics without a listener");
-        Shared::new(None, metrics, None)
+        Shared::new(None, metrics, None, None)
     }
 
     /// Before the engine is up every reader answers from the launcher's
@@ -591,6 +628,10 @@ mod tests {
 
         fn engine_link(&self) -> &EngineLink {
             &self.0.engine
+        }
+
+        fn rank_count(&self) -> usize {
+            1
         }
     }
 

@@ -97,7 +97,7 @@ pub(super) async fn route_responses_internal(
 }
 
 /// Execute request without MCP tool loop (simple pipeline execution)
-pub(super) async fn execute_without_mcp(
+async fn execute_without_mcp(
     ctx: &ResponsesContext,
     modified_request: &ResponsesRequest,
     original_request: &ResponsesRequest,

@@ -5,12 +5,13 @@ use serde_json::Value;
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        qwen3_omni::AUDIO_PAD_TOKEN, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::PreProcessorConfig,
 };
-
-const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
 
 /// Qwen3-ASR's transcription-side knowledge: the family's implementation of
 /// the contract in [`crate::registry::transcription`], plus the identifiers,

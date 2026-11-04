@@ -1,13 +1,14 @@
-"""The Rust request path of the SGLang gRPC servicer, behind one flag.
+"""The Rust request path of the SGLang gRPC servicer, behind one switch.
 
 ``sglang.launch_server --grpc-mode`` hands the process to this package's
 :func:`smg_grpc_servicer.sglang.server.serve_grpc`, which serves
 ``sglang.grpc.scheduler.SglangScheduler`` from Python over a request manager
-in front of the scheduler. With ``--servicer-impl rust`` (a flag this package
-adds to SGLang's parser as an SGLang plugin, see
-:mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL=rust`` is
-the fallback the flag overrides) the same entrypoint hands the process to
-:func:`serve_rust` before any of that exists:
+in front of the scheduler. When the switch selects the Rust servicer
+(``--servicer-impl``, a flag this package adds to SGLang's parser as an SGLang
+plugin, see :mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL``
+is the fallback the flag overrides; the launcher's default decides when neither
+is set) the same entrypoint hands the process to :func:`serve_rust` before any
+of that exists:
 the contract is served by the Rust :class:`smg.servicer.SglangGrpcServer` on a
 Rust-owned thread, and the scheduler ranks are started from this same process
 (SGLang's own spawner, the way this package's :mod:`headless` launcher starts
@@ -463,7 +464,7 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     args = EngineConfigView(server_args).server_args
     if args.encoder_only:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve an encoder-only worker: the engine's "
+            "The Rust servicer does not serve an encoder-only worker: the engine's "
             "entrypoint runs that role on its own encoder server, not on a servicer"
         )
     if args.language_only:
@@ -475,7 +476,7 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
         backend = resolve_encoder_transfer_backend(server_args)
         if backend not in SCHEDULER_RECEIVE_BACKENDS:
             raise ServicerConfigError(
-                f"{SERVICER_IMPL_ENV}=rust does not serve a language-only worker on the "
+                f"The Rust servicer does not serve a language-only worker on the "
                 f"{backend!r} encoder transfer backend (the frontend receives and processes "
                 "the embeddings itself there); use one of "
                 f"{', '.join(SCHEDULER_RECEIVE_BACKENDS)}"

@@ -318,6 +318,25 @@ impl GrpcClient {
         }
     }
 
+    /// The servicer's load records alone, no events (`SubscribeKvEvents`
+    /// with `loads_only`): what a worker streams when routing reads its load
+    /// and keeps no KV index. A servicer that predates the field streams its
+    /// events too; the subscriber drops them. `Unimplemented` on backends
+    /// without the stream.
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.subscribe_load_records().await,
+            Self::Vllm(client) => client.subscribe_load_records().await,
+            Self::Trtllm(client) => client.subscribe_load_records().await,
+            Self::TokenSpeed(client) => client.subscribe_load_records().await,
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Sglang(client) => Ok(ServerInfo::Sglang(Box::new(
@@ -556,10 +575,12 @@ impl GrpcClient {
         let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
-                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    MultimodalData::Sglang(data) => Some(data.into_protos()),
                     _ => None,
                 });
-                let req = sglang(
+                let (sglang_mm, extras) =
+                    sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+                let mut req = sglang(
                     client,
                     request_id,
                     body,
@@ -571,6 +592,7 @@ impl GrpcClient {
                         require_reasoning,
                     },
                 )?;
+                req.extra_mm_inputs = extras;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {

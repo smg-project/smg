@@ -242,10 +242,7 @@ pub(crate) fn worker_runs_gateway_pipeline(worker: &dyn Worker) -> bool {
 /// for the engine's prompt updates. Such a request is placed only on workers
 /// that run the pipeline ([`worker_runs_gateway_pipeline`]); a model without
 /// a spec renders the engine's own placeholders and needs no pin.
-pub(crate) fn plan_needs_gateway_pipeline(
-    plan: &MediaPlan,
-    placeholders: &PlaceholderTokens,
-) -> bool {
+fn plan_needs_gateway_pipeline(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
     !placeholders.is_worker_only()
         && plan
             .modalities()
@@ -269,7 +266,7 @@ fn fleet_runs_gateway_pipeline(registry: &WorkerRegistry, model_id: &str) -> boo
 /// `"true"`, see [`SUPPORTS_VISION_LABEL`]) on the gRPC pipeline and does not
 /// process media references: under worker-side placement no image or video
 /// ever reaches it. A worker without the label is unknown, never this.
-pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
+fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
     worker.connection_mode().uses_grpc_pipeline()
         && worker
             .metadata()
@@ -289,9 +286,7 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
 /// model is neither refused in preparation nor named as waiting for a
 /// media-capable worker (readiness, the registration warning): a capable
 /// worker changes nothing for it.
-pub(crate) fn pool_has_encode_worker<'a>(
-    workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
-) -> bool {
+fn pool_has_encode_worker<'a>(workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>) -> bool {
     workers
         .into_iter()
         .any(|worker| matches!(worker.worker_type(), WorkerType::Encode))
@@ -356,7 +351,7 @@ pub(crate) fn models_without_media_processing(
 }
 
 /// URL schemes `worker` advertised; empty when it advertised none.
-pub(crate) fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
+fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
     worker
         .metadata()
         .spec

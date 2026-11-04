@@ -4,9 +4,10 @@ The servicer class is imported lazily: SGLang loads this package's plugin
 submodules (``zmq_plugin``, ``plugin``) in every scheduler process, which
 must not pull the gRPC server and its dependencies along.
 
-``--servicer-impl rust`` on SGLang's launcher (a flag this package adds through
-its SGLang plugin) or ``SMG_SGLANG_SERVICER_IMPL=rust`` serves the same
-contract from Rust; see :mod:`smg_grpc_servicer.sglang.rust`.
+SGLang's launcher serves the same contract from Rust when the switch selects
+the Rust servicer (``--servicer-impl``, a flag this package adds through its
+SGLang plugin, else ``SMG_SGLANG_SERVICER_IMPL``, else the launcher's default);
+see :mod:`smg_grpc_servicer.sglang.rust`.
 """
 
 __all__ = [

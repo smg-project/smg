@@ -250,7 +250,7 @@ fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f
 /// Run the full MoonViT pipeline over a batch of images.
 pub fn preprocess(
     params: MoonVitParams,
-    images: &[DynamicImage],
+    images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
     if images.is_empty() {

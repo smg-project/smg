@@ -103,9 +103,11 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   with `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside
   the thought or in the content; bellwether has not recorded the group's set yet.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
-  `<｜Assistant｜>` and the thought's opener after a user message only: a conversation that ends with
-  a system message rendered in place (a coding agent's environment notes after the user turn, and
-  after every tool result) has no opener for the model's turn, and the model, which thinks unless
+  `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
+  ends the conversation or that an assistant turn follows (a coding agent's environment notes and
+  its notes after tool results take the opener); a system message a latest reminder follows stays
+  bare, and the checkpoint's own encoder file opens the turn after user and developer turns only,
+  so a prompt can still have no opener for the model's turn, and the model, which thinks unless
   told not to, writes its thought and `</think>` as it would after `<｜Assistant｜><think>`. The table
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
@@ -879,16 +881,22 @@ wrapper state for the block, an arguments state per call):
   `<|tool_call_argument_begin|>`, `<|tool_call_end|>` and `<|tool_calls_section_end|>` are each
   a token of the vocabulary, so a `max_tokens` cut cannot split one; the table declares no
   structural token.
-- **What the table stands on.** bellwether holds a manifest for each of the six checkpoints and
-  no recorded set yet, so the table stands on the module's tests, which hold a hand-picked set of
-  the turns the templates render for the shapes a tool-calling conversation takes (an answer, a
-  call, two calls, content before a call, a thought and a call, the turn after a tool result, a
-  call with thinking off, arguments that nest and hold text outside ASCII, a brace inside a string
-  value), read whole and at every cut, and on the id contract. Those shapes are hand-written cases
-  of bellwether's sets, which its recorder renders with each template at its pinned revision; the
-  six slugs are listed in the corpus harness (`tests/bellwether_parse_fixtures.rs`), which replays
-  the recorded sets from the fixture pin once it holds them, and the README rows say awaiting
-  fixtures until then. Two things the templates taught: K2
+- **What the table stands on.** bellwether records each of the six groups' hand-written sets with
+  the vendor's tokenizer class in its sandbox (the class is the checkpoint's own code, which the
+  reference recorder runs nowhere else): the render set whole, 24 cases a group, and of the parse
+  sets the content and reasoning cases, three to seven of the sixteen common cases and two or
+  three of the twelve turns. The call cases are refused at record time: the templates write a
+  call's id and its arguments and never its name (a served model puts the name inside the id,
+  `functions.NAME:N`, and the hand-written cases carry no id), so renaming a call leaves the
+  rendered turn as it was and the recorder refuses the case as lossy. The corpus harness
+  (`tests/bellwether_parse_fixtures.rs`) replays what is recorded from the fixture pin, five to
+  ten cases a group, each as the reference says but the listed reasoning probe (bellwether #16,
+  K2.7-Code, whose template alone renders a thought for that request). So the call shapes stand
+  on the module's tests, which hold a hand-picked set of the turns the templates render for the
+  shapes a tool-calling conversation takes (an answer, a call, two calls, content before a call, a
+  thought and a call, the turn after a tool result, a call with thinking off, arguments that nest
+  and hold text outside ASCII, a brace inside a string value), read whole and at every cut, and on
+  the id contract. Two things the templates taught: K2
   Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
   and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
   the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct

@@ -173,7 +173,7 @@ impl VisionPreProcessor for PixtralProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -334,9 +334,11 @@ mod tests {
     fn test_preprocess_batch() {
         let processor = PixtralProcessor::new();
 
-        let images = vec![create_test_image(200, 150), create_test_image(300, 100)];
+        let images = [create_test_image(200, 150), create_test_image(300, 100)];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         // First image: 150x200 -> 160x208
         // Second image: 100x300 -> 112x304 (ceil(100/16)=7, ceil(300/16)=19)

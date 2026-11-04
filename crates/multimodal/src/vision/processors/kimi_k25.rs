@@ -78,7 +78,7 @@ impl VisionPreProcessor for KimiK25Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         // K2.5 ships no `transparent_bg_config`, so alpha is dropped.
         moonvit::preprocess(self.params, images, None)
@@ -185,7 +185,7 @@ mod tests {
         let p = KimiK25Processor::from_preprocessor_config(&config);
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         // 4D output: [total_patches, 3, 14, 14]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -201,12 +201,12 @@ mod tests {
     #[test]
     fn test_preprocess_multiple_images() {
         let p = KimiK25Processor::new();
-        let images = vec![
+        let images = [
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = p.preprocess(&images).unwrap();
+        let result = p.preprocess(&images.iter().collect::<Vec<_>>()).unwrap();
 
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
@@ -264,7 +264,7 @@ mod tests {
         // 100x100 white image — after normalization: (255/255 - 0.5) / 0.5 = 1.0
         // Padded region: (0/255 - 0.5) / 0.5 = -1.0
         let image = create_test_image(100, 100, Rgb([255, 255, 255]));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         let flat = result.encoder_input_flat();
         // Padded region should be normalized black (-1.0)
@@ -292,7 +292,7 @@ mod tests {
         };
         let p = KimiK25Processor::from_preprocessor_config(&config);
         let image = create_test_image(1, 1, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
         assert_eq!(result.encoder_input.ndim(), 4);
         assert!(result.encoder_input.shape()[0] > 0);
         assert!(result.feature_token_counts[0] > 0);
@@ -322,7 +322,7 @@ mod tests {
             image::Rgba([255, 0, 0, 0]),
         ));
 
-        let result = p.preprocess(&[hidden_red]).unwrap();
+        let result = p.preprocess(&[&hidden_red]).unwrap();
         // [patches, 3, patch_size, patch_size]. 112px caps to 2 * 14 per side,
         // so every patch is content and none of it is padding.
         let &[patches, 3, ph, pw] = result.encoder_input.shape() else {

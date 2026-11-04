@@ -25,6 +25,7 @@ use engine_zmq_client::{
     },
     EngineId,
 };
+use futures::StreamExt;
 use smg_grpc_client::{
     common_proto as common,
     trtllm_proto::{self as trt, trtllm_service_client::TrtllmServiceClient},
@@ -483,6 +484,155 @@ async fn choices_fan_out_under_the_parent_id() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A shutdown with a stream still open is the engine side going away under
+/// the request, not an abort the caller asked for: the stream ends with
+/// `UNAVAILABLE` (the status the Router counts and logs as the worker's
+/// failure), never with a `Complete` whose finish reason is `abort`.
+#[tokio::test]
+async fn a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a shutdown ends the stream with a status, not a completion");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("shutting down"),
+        "{}",
+        status.message()
+    );
+    assert!(!h.server.running());
+}
+
+/// A request the engine finished on the tick before the shutdown keeps its
+/// completion: the finish tick's chunk went out and its `Complete` was
+/// parked for the next poll when `stop()` landed, so the stream ends with
+/// that `Complete` and no status (nothing was cut), never with `UNAVAILABLE`.
+#[tokio::test]
+async fn a_shutdown_keeps_the_completion_of_a_choice_the_engine_had_finished() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r11", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r11", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let done = complete(
+        stream
+            .message()
+            .bounded()
+            .await
+            .expect("the completion the engine had already produced, not a status")
+            .expect("a completion, not the end of the stream"),
+    );
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_token_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(!h.server.running());
+}
+
+/// The engine's own `Complete` went out and the shutdown lands before the
+/// poll that would have ended the stream (the gap h2 backpressure opens):
+/// the choice has ended and is not open, so the stream ends cleanly, never
+/// with `UNAVAILABLE` after a completion. Driven poll by poll with no
+/// transport in between, so nothing races; without the choice dropping its
+/// engine stream as the `Complete` goes out, this ends with a status.
+#[tokio::test]
+async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
+    let mut h = harness(model_info()).await;
+    let mut stream = generate::generate(&h.server.state, generate_request("r12", true), None)
+        .await
+        .expect("generate");
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r12", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk(stream.next().bounded().await.unwrap().unwrap()).token_ids,
+        vec![10]
+    );
+    let done = complete(stream.next().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_token_ids, vec![10]);
+    // The shutdown lands between the completion and the poll that ends the
+    // stream: `cancel_all` is what `stop()` fires first.
+    h.server
+        .state
+        .shared
+        .registry
+        .cancel_all()
+        .expect("cancel_all");
+    assert!(
+        stream.next().bounded().await.is_none(),
+        "a clean end after the completion, not a status"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// String stops ride the request to the engine, which keeps its tokenizer
+/// and reports the matched string back.
+#[tokio::test]
+async fn string_stops_reach_the_engine_and_its_match_comes_back() {
+    let mut h = harness(model_info()).await;
+    let mut request = generate_request("r3", false);
+    request.stop = vec!["###".to_string()];
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let (request, _) = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.sampling.stop, vec!["###".to_string()]);
+    send(
+        &mut h.engine_out,
+        &batch(
+            "r3",
+            vec![10, 11],
+            2,
+            Some("stop"),
+            Some(MatchedStop::Text("###".to_string())),
+        ),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(
+        done.matched_stop,
+        Some(trt::generate_complete::MatchedStop::MatchedStopStr(
+            "###".to_string()
+        ))
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `HealthCheck.status` is the Python servicer's `OK` while serving, and the
 /// shared message otherwise.
 #[tokio::test]
@@ -613,6 +763,105 @@ async fn the_unimplemented_rpcs_say_why() {
         .expect_err("no tokenizer dir");
     assert_eq!(bundle.code(), Code::FailedPrecondition);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record of a connected rank before any batch has carried a load tail
+/// is zero-filled (an idle scheduler, as on the other wires), what the
+/// records-only stream reads for it from its first tick; a rank past the
+/// connected ones has none.
+#[tokio::test]
+async fn a_connected_ranks_record_is_zero_filled_before_its_first_load_tail() {
+    let h = harness(model_info()).await;
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(
+        (
+            record.running_requests,
+            record.waiting_requests,
+            record.token_usage
+        ),
+        (0, 0, 0.0)
+    );
+    assert_eq!(
+        kv_events::LoadSource::load(&source, None).map(|record| record.running_requests),
+        Some(0)
+    );
+    assert!(kv_events::LoadSource::load(&source, Some(1)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two connected shims, one of which has reported a load tail: the record
+/// of the other stays zero-filled (an idle scheduler, not a gone one), never
+/// the sibling's figures; a rank past the connected ones has none.
+#[tokio::test]
+async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut config = config(dir.path(), &handshake, model);
+    config.servicer.engine_count = 2;
+    let server = TrtllmServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..ready_response()
+    };
+    let (first, second) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(0)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(1)),
+    );
+    let (mut rank0_in, mut rank0_out) = first.expect("shim 0 handshake").split();
+    let (mut rank1_in, mut rank1_out) = second.expect("shim 1 handshake").split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TrtllmServiceClient::new(grpc_channel(server.address()).await);
+
+    // The servicer places the request on either shim; that shim answers with
+    // a load tail (one running request) and the other stays silent.
+    let mut stream = client
+        .generate(generate_request("r0", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    let served: u32 = tokio::select! {
+        _ = recv_add(&mut rank0_in) => 0,
+        _ = recv_add(&mut rank1_in) => 1,
+    };
+    let out = if served == 0 {
+        &mut rank0_out
+    } else {
+        &mut rank1_out
+    };
+    send(
+        out,
+        &BatchTokenIDSlimOutput {
+            engine_index: served,
+            ..batch("r0", vec![10], 1, None, None)
+        },
+    )
+    .await;
+    stream.message().bounded().await.unwrap().unwrap();
+    let source = kv_events::LoadFromState(Arc::downgrade(&server.state));
+    let served_rank = i32::try_from(served).unwrap();
+    wait_until(|| {
+        kv_events::LoadSource::load(&source, Some(served_rank))
+            .is_some_and(|record| record.running_requests == 1)
+    })
+    .await;
+    let idle = kv_events::LoadSource::load(&source, Some(1 - served_rank))
+        .expect("the idle shim's record");
+    assert_eq!(
+        (
+            idle.running_requests,
+            idle.waiting_requests,
+            idle.token_usage
+        ),
+        (0, 0, 0.0),
+        "{idle:?}"
+    );
+    assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    drop(stream);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// An `abort` from the engine side (the shim refused the request while it

@@ -53,6 +53,7 @@ from smg_grpc_servicer.warmup import (
     WarmupReport,
     WarmupSetting,
     WarmupWire,
+    draw_nonce,
     parse_setting,
     plan_for,
     run_warmup,
@@ -1235,7 +1236,8 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 def hold_readiness(server: Any, ready: bool) -> None:
     """Hold (``False``) or release (``True``) the server's health answer
     alone, admission left open to the servicer's own requests (the planned
-    warm-up's ``smg-warmup-<n>``, over the server's own port) and closed to
+    warm-up's ``smg-warmup-<nonce>-<n>``, the nonce the server was constructed
+    with, over the server's own port) and closed to
     every other while readiness is held, so nothing shares the engine's
     steps with the warm-up: ``set_ready`` where the server has it.
     ``set_serving`` is the drain switch (it closes admission as well, and
@@ -1621,6 +1623,10 @@ class RustLauncher:
         tokenizer_dir = self.tokenizer_dir(args)
         self.announce_capabilities(facts, tokenizer_dir)
         plan = None
+        # One nonce per process marks the warm-up's request ids as this
+        # launcher's own: the server constructed with it admits those alone
+        # while readiness is held (``hold_readiness``).
+        warmup_nonce = draw_nonce()
         if self.warmup_env:
             # The inputs (a tokenizer load, the media material of a language-side
             # worker) are built only when the knob is on: plan_for logs the off
@@ -1629,6 +1635,7 @@ class RustLauncher:
                 warmup_setting,
                 self.warmup_inputs(args, facts) if warmup_setting.enabled else None,
                 knob=self.warmup_env,
+                nonce=warmup_nonce,
             )
         handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
@@ -1648,6 +1655,7 @@ class RustLauncher:
             engine_silence_timeout_secs=knobs.silence_timeout_secs,
             engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
             metrics_bind_address=metrics_bind_address,
+            warmup_nonce=warmup_nonce,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )

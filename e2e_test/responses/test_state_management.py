@@ -358,10 +358,10 @@ class TestStateManagementLocal:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
@@ -378,8 +378,9 @@ class TestStateManagementGptOss:
                 max_output_tokens=50,
             )
 
-    def test_basic_response_creation(self, model, api_client):
+    def test_basic_response_creation(self, model, api_client, mock_answers):
         """Test basic response creation without state."""
+        mock_answers.enqueue("2 + 2 = 4.")
         resp = api_client.responses.create(model=model, input="What is 2+2?")
 
         assert resp.id is not None
@@ -389,8 +390,9 @@ class TestStateManagementGptOss:
         assert resp.usage is not None
         assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
-    def test_streaming_response(self, model, api_client):
+    def test_streaming_response(self, model, api_client, mock_answers):
         """Test streaming response."""
+        mock_answers.enqueue("1, 2, 3, 4, 5.")
         resp = api_client.responses.create(
             model=model, input="Count to 5", stream=True, max_output_tokens=50
         )
@@ -401,8 +403,12 @@ class TestStateManagementGptOss:
 
         assert any(e.type in ["response.completed", "response.in_progress"] for e in events)
 
-    def test_previous_response_id_chaining(self, model, api_client):
+    def test_previous_response_id_chaining(self, model, api_client, mock_answers):
         """Test chaining responses using previous_response_id."""
+        # On the mock: the three turns' answers, in order.
+        mock_answers.enqueue("Noted: you are Alice, your friend is Bob.")
+        mock_answers.enqueue("Your name is Alice.")
+        mock_answers.enqueue("Your friend is Bob.")
         # First response
         resp1 = api_client.responses.create(
             model=model, input="My name is Alice and my friend is Bob. Remember it."
@@ -428,8 +434,9 @@ class TestStateManagementGptOss:
         assert resp3.status == "completed"
         assert "Bob" in resp3.output_text
 
-    def test_store_false_not_retrievable(self, model, api_client):
+    def test_store_false_not_retrievable(self, model, api_client, mock_answers):
         """Test that store=false responses cannot be retrieved."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
         assert resp.status == "completed"
@@ -437,8 +444,9 @@ class TestStateManagementGptOss:
         with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.retrieve(response_id=resp.id)
 
-    def test_store_false_previous_response_id_rejected(self, model, api_client):
+    def test_store_false_previous_response_id_rejected(self, model, api_client, mock_answers):
         """Test that store=false response id cannot be used as previous_response_id."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
@@ -449,8 +457,9 @@ class TestStateManagementGptOss:
                 previous_response_id=resp.id,
             )
 
-    def test_mutually_exclusive_parameters(self, model, api_client):
+    def test_mutually_exclusive_parameters(self, model, api_client, mock_answers):
         """Test that previous_response_id and conversation are mutually exclusive."""
+        mock_answers.enqueue("OK.")
         conversation_id = "conv_123"
         resp1 = api_client.responses.create(model=model, input="Test")
 

@@ -787,3 +787,44 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     assert raised.value.code == 2
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
     launched.assert_not_called()
+
+
+def test_the_sidecar_note_on_the_rust_servicer_names_metrics_and_warns_when_asked_for(
+    monkeypatch, server_mod, caplog
+):
+    """On the Rust servicer SGLang's HTTP sidecar never starts, so its /metrics,
+    admin and profiling endpoints stay off: a note on every launch that hands
+    the request-manager callback, naming the Rust servicer's own metrics
+    endpoint and the Python servicer as the way to keep the sidecar; a WARNING
+    when the launch asked for the sidecar's metrics (--enable-metrics), which
+    nothing serves then."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "rust")
+
+    async def rust_served(_server_args):
+        return 0
+
+    monkeypatch.setattr(server_mod, "serve_rust", rust_served)
+
+    def launch(enable_metrics):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(SystemExit) as raised:
+                asyncio.run(
+                    server_mod.serve_grpc(
+                        SimpleNamespace(disaggregation_mode="null", enable_metrics=enable_metrics),
+                        on_request_manager_ready=lambda _manager: None,
+                    )
+                )
+        assert raised.value.code == 0
+        return [r for r in caplog.records if "HTTP sidecar" in r.getMessage()]
+
+    (note,) = launch(False)
+    assert note.levelno == logging.INFO
+    assert "(its /metrics, admin and profiling endpoints stay off)" in note.getMessage()
+    assert "--metrics-port / SMG_SGLANG_SERVICER_METRICS_PORT" in note.getMessage()
+    assert "(--servicer-impl python / SMG_SGLANG_SERVICER_IMPL=python) keeps the sidecar" in (
+        note.getMessage()
+    )
+    (warning,) = launch(True)
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage() == note.getMessage()

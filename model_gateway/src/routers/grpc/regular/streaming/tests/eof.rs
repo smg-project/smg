@@ -11,7 +11,9 @@ use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::{chat::ChatCompletionRequest, worker::HealthCheckConfig};
+use openai_protocol::{
+    chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -565,6 +567,73 @@ pub(super) async fn collect_events(mut rx: SseReceiver) -> Vec<Value> {
     events
 }
 
+/// A Messages answer to `frames` over a scripted stream, under `spec` and
+/// `resolver`: the SSE events of the streaming path, or the content blocks
+/// of the unary one, as JSON values. The streaming path's events are
+/// collected beside the processor (the SSE channel is bounded).
+async fn messages_answer(
+    frames: Vec<proto::GenerateResponse>,
+    spec: MessagesResponseSpec,
+    resolver: utils::ParserResolver,
+    metadata: context::DispatchMetadata,
+    tokenizer: Arc<dyn Tokenizer>,
+    streaming: bool,
+) -> Vec<Value> {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let answer = if streaming {
+        let (tx, rx) = sse_channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fixture collector is joined before assertions"
+        )]
+        let collector = tokio::spawn(collect_events(rx));
+        let result = streaming_processor(resolver)
+            .process_messages_streaming_chunks(
+                stream,
+                metadata,
+                tokenizer,
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collector.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        events
+    } else {
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let (response, _) = unary_processor(resolver)
+            .process_non_streaming_messages_response(
+                context::ExecutionResult::Single { stream },
+                spec,
+                metadata,
+                tokenizer,
+                &mut decoder,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.status()));
+        let response = serde_json::to_value(response).unwrap();
+        response["content"].as_array().unwrap().clone()
+    };
+    server.abort();
+    answer
+}
+
+/// The thinking and the text of a Messages answer, each joined from its
+/// pieces: the deltas of a stream's events, the blocks of a unary answer.
+fn thinking_and_text(answer: &[Value], streaming: bool) -> (String, String) {
+    let joined = |field: &str| -> String {
+        answer
+            .iter()
+            .map(|item| if streaming { &item["delta"] } else { item })
+            .filter_map(|piece| piece[field].as_str())
+            .collect()
+    };
+    (joined("thinking"), joined("text"))
+}
+
 async fn chat_events(
     responses: Vec<proto::GenerateResponse>,
     with_tools: bool,
@@ -676,6 +745,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parser_names: None,
     };
     let result = processor(false)
         .process_messages_streaming_chunks(
@@ -773,6 +843,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parser_names: None,
     }
 }
 
@@ -2084,6 +2155,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             stop_sequences: None,
             symphony: None,
             first_tool_call_only: false,
+            parser_names: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -2170,6 +2242,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
             stop_sequences: Some(StringOrArray::Array(vec!["###".to_string()])),
             symphony: None,
             first_tool_call_only: false,
+            parser_names: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -2536,6 +2609,7 @@ async fn messages_blocks_and_inputs(
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parser_names: None,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));
@@ -2929,53 +3003,32 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                     gemma4_resolver_and_prefill(model, configured, prompt);
                 let mut spec = MessagesResponseSpec::from(&request);
                 spec.reasoning_in_prefill = reasoning_in_prefill;
-                let (stream, server) = scripted_stream(gemma4_frames(output, streaming), "0").await;
-                let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
                 let mut metadata = dispatch();
                 metadata.model = model.to_string();
+                let answer = messages_answer(
+                    gemma4_frames(output, streaming),
+                    spec,
+                    resolver,
+                    metadata,
+                    Arc::new(CharacterTokenizer::default()),
+                    streaming,
+                )
+                .await;
+                let (thinking, text) = thinking_and_text(&answer, streaming);
+                assert_eq!(thinking, reasoning);
+                assert_eq!(text, content);
                 if streaming {
-                    let (tx, rx) = sse_channel();
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "fixture collector is joined before assertions"
-                    )]
-                    let collector = tokio::spawn(collect_events(rx));
-                    let result = streaming_processor(resolver)
-                        .process_messages_streaming_chunks(
-                            stream,
-                            metadata,
-                            tokenizer,
-                            (None, None, false, false, false),
-                            spec,
-                            &tx,
-                            None,
-                        )
-                        .await;
-                    drop(tx);
-                    let events = collector.await.unwrap();
-                    server.abort();
-                    assert!(result.is_ok(), "{result:?}");
-                    let thinking: String = events
-                        .iter()
-                        .filter_map(|event| event["delta"]["thinking"].as_str())
-                        .collect();
-                    let text: String = events
-                        .iter()
-                        .filter_map(|event| event["delta"]["text"].as_str())
-                        .collect();
-                    assert_eq!(thinking, reasoning);
-                    assert_eq!(text, content);
-                    let calls: Vec<_> = events
+                    let calls: Vec<_> = answer
                         .iter()
                         .filter(|event| {
                             event["type"] == "content_block_start"
                                 && event["content_block"]["type"] == "tool_use"
                         })
                         .collect();
-                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{events:?}");
+                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{answer:?}");
                     if let Some(call) = calls.first() {
                         assert_eq!(call["content_block"]["name"], "lookup");
-                        let arguments: String = events
+                        let arguments: String = answer
                             .iter()
                             .filter_map(|event| event["delta"]["partial_json"].as_str())
                             .collect();
@@ -2985,36 +3038,11 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                         );
                     }
                 } else {
-                    let mut decoder =
-                        utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-                    let (response, _) = unary_processor(resolver)
-                        .process_non_streaming_messages_response(
-                            context::ExecutionResult::Single { stream },
-                            spec,
-                            metadata,
-                            tokenizer,
-                            &mut decoder,
-                        )
-                        .await
-                        .unwrap_or_else(|error| panic!("{}", error.status()));
-                    server.abort();
-                    let response = serde_json::to_value(response).unwrap();
-                    let blocks = response["content"].as_array().unwrap();
-                    let thinking: String = blocks
-                        .iter()
-                        .filter_map(|block| block["thinking"].as_str())
-                        .collect();
-                    let text: String = blocks
-                        .iter()
-                        .filter_map(|block| block["text"].as_str())
-                        .collect();
-                    assert_eq!(thinking, reasoning);
-                    assert_eq!(text, content);
-                    let calls: Vec<_> = blocks
+                    let calls: Vec<_> = answer
                         .iter()
                         .filter(|block| block["type"] == "tool_use")
                         .collect();
-                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{response}");
+                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{answer:?}");
                     if let Some(call) = calls.first() {
                         assert_eq!(call["name"], "lookup");
                         assert_eq!(call["input"], serde_json::json!({"q":"Paris"}));
@@ -3732,26 +3760,18 @@ async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool)
     }
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(last);
-    let (grpc_stream, server) = scripted_stream(frames, "0").await;
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
-    let inputs = if stream {
-        let processor = streaming_processor(qwen_resolver());
-        let (tx, rx) = sse_channel();
-        let result = processor
-            .process_messages_streaming_chunks(
-                grpc_stream,
-                dispatch(),
-                tokenizer,
-                (None, None, false, false, false),
-                spec,
-                &tx,
-                None,
-            )
-            .await;
-        drop(tx);
-        assert!(result.is_ok(), "{result:?}");
+    let answer = messages_answer(
+        frames,
+        spec,
+        qwen_resolver(),
+        dispatch(),
+        Arc::new(CharacterTokenizer::default()),
+        stream,
+    )
+    .await;
+    if stream {
         let mut inputs: Vec<String> = Vec::new();
-        for event in collect_events(rx).await {
+        for event in &answer {
             if event["content_block"]["type"] == "tool_use" {
                 inputs.push(String::new());
             }
@@ -3764,29 +3784,12 @@ async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool)
             .map(|json| serde_json::from_str(json).unwrap())
             .collect()
     } else {
-        let processor = unary_processor(qwen_resolver());
-        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-        let (message, _) = processor
-            .process_non_streaming_messages_response(
-                context::ExecutionResult::Single {
-                    stream: grpc_stream,
-                },
-                spec,
-                dispatch(),
-                tokenizer,
-                &mut decoder,
-            )
-            .await
-            .unwrap_or_else(|response| panic!("{}", response.status()));
-        let message = serde_json::to_value(message).unwrap();
-        let blocks = message["content"].as_array().unwrap().iter();
-        blocks
+        answer
+            .iter()
             .filter(|block| block["type"] == "tool_use")
             .map(|block| block["input"].clone())
             .collect()
-    };
-    server.abort();
-    inputs
+    }
 }
 
 /// `disable_parallel_tool_use: true` returns the first of the calls a model
@@ -3823,6 +3826,122 @@ async fn messages_with_parallel_tool_use_disabled_have_the_first_call() {
                 inputs,
                 "{tool_choice} stream={stream}"
             );
+        }
+    }
+}
+
+/// The response stages read the parser names the spec carries (the request's
+/// resolution, handed on by request building) in place of a resolution of
+/// their own. Under a resolver whose one card names the `qwen3` reasoning
+/// parser for the model and whose flags name none, on the chat and Messages
+/// paths, streaming and not: a spec carrying `qwen3` splits the thought (the
+/// carried names are read); a spec carrying an empty resolution leaves the
+/// output whole (the carried resolution wins, the cards are not walked
+/// again); a spec carrying none splits it (the fallback resolves from the
+/// cards as before).
+#[tokio::test]
+async fn the_response_reads_the_parser_names_the_spec_carries() {
+    let output = "<think>why</think>answer";
+    let registry = Arc::new(WorkerRegistry::new());
+    registry.register(Arc::new(
+        BasicWorkerBuilder::new("http://w1:8000")
+            .model(ModelCard::new("eof-test").with_reasoning_parser("qwen3"))
+            .build(),
+    ));
+    let resolver = || utils::ParserResolver::with_flags(Arc::clone(&registry), None, None);
+    let carried = utils::Names {
+        tool: None,
+        reasoning: Some("qwen3".to_string()),
+    };
+    for (names, reasoning, content) in [
+        (Some(carried), "why", "answer"),
+        (Some(utils::Names::default()), "", output),
+        (None, "why", "answer"),
+    ] {
+        for streaming in [false, true] {
+            let frames = || {
+                if streaming {
+                    vec![chunk(0, output), complete(0, "stop")]
+                } else {
+                    gemma4_frames(output, false)
+                }
+            };
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "eof-test", "messages": [], "separate_reasoning": true
+            }))
+            .unwrap();
+            let mut spec = ChatResponseSpec::from(&request);
+            spec.parser_names = names.clone();
+            let (stream, server) = scripted_stream(frames(), "0").await;
+            if streaming {
+                let (tx, rx) = sse_channel();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "fixture collector is joined before assertions"
+                )]
+                let collector = tokio::spawn(collect_events(rx));
+                let result = streaming_processor(resolver())
+                    .process_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        Arc::clone(&tokenizer),
+                        (None, None, false, false, false),
+                        spec,
+                        &tx,
+                        None,
+                    )
+                    .await;
+                drop(tx);
+                let events = collector.await.unwrap();
+                server.abort();
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
+                assert_eq!(chat_text(&events, 0, "content"), content);
+            } else {
+                let mut decoder =
+                    utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+                let (response, _) = unary_processor(resolver())
+                    .process_non_streaming_chat_response(
+                        context::ExecutionResult::Single { stream },
+                        spec,
+                        dispatch(),
+                        Arc::clone(&tokenizer),
+                        &mut decoder,
+                        false,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{}", error.status()));
+                server.abort();
+                let message = &response.choices[0].message;
+                assert_eq!(
+                    message.reasoning_content.as_deref().unwrap_or_default(),
+                    reasoning
+                );
+                assert_eq!(message.content.as_deref().unwrap_or_default(), content);
+            }
+
+            let request: messages::CreateMessageRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "eof-test", "max_tokens": 64, "messages": [],
+                    "thinking": {"type": "enabled", "budget_tokens": 1024}
+                }))
+                .unwrap();
+            let mut spec = MessagesResponseSpec::from(&request);
+            spec.parser_names = names.clone();
+            let answer = messages_answer(
+                frames(),
+                spec,
+                resolver(),
+                dispatch(),
+                Arc::clone(&tokenizer),
+                streaming,
+            )
+            .await;
+            let (thinking, text) = thinking_and_text(&answer, streaming);
+            assert_eq!(thinking, reasoning);
+            assert_eq!(text, content);
         }
     }
 }
