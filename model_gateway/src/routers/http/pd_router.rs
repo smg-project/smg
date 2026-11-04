@@ -231,7 +231,12 @@ struct PDRequestContext<'a> {
     /// receives the body with its media and expands it itself, the rule the
     /// gRPC stage applies to forwarded media references), and the context
     /// window where the body carries token ids. Judged over the pair index
-    /// ahead of the placement (`PairDemands::judge`).
+    /// ahead of the placement (`PairDemands::judge`): the prefill side's
+    /// demand refuses the request when no pair can meet it; the decode
+    /// side's keeps the side off the workers without the encoder while a
+    /// pair with the encoder on both sides exists, and with none the decode
+    /// pool is used as it is and the engine answers (this router has no
+    /// dispatch check for that side, unlike the gRPC pipeline).
     demand: PairDemands,
 }
 
@@ -269,16 +274,20 @@ trait PdRoute: GenerationRequest {
 impl PdRoute for GenerateRequest {
     const ROUTE: &'static str = "/generate";
 
-    /// The engine-native media fields: a value that is not null and not an
-    /// empty list.
+    /// The engine-native media fields: a value that is media at some depth
+    /// (a batch sends a list per sequence, and a sequence without media a
+    /// null or an empty list, which is no demand).
     fn carries_pixel_media(&self) -> bool {
+        fn has_media(value: &Value) -> bool {
+            match value {
+                Value::Null => false,
+                Value::Array(items) => items.iter().any(has_media),
+                _ => true,
+            }
+        }
         [&self.image_data, &self.video_data]
             .into_iter()
-            .any(|media| {
-                media.as_ref().is_some_and(|value| {
-                    !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty())
-                })
-            })
+            .any(|media| media.as_ref().is_some_and(has_media))
     }
 
     fn input_token_count(&self) -> Option<usize> {
@@ -7722,5 +7731,35 @@ mod tests {
         let response = router.route_generate(None, &tenant, text, "m").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(taken(&prefill_seen).len(), 1);
+    }
+
+    /// The generate route's media fields read as pixel media only where
+    /// something is in them: a batch's per-sequence placeholders (nulls,
+    /// empty lists) demand no encoder.
+    #[test]
+    fn the_generate_route_reads_its_media_fields_at_any_depth() {
+        let generate = |body: Value| -> GenerateRequest {
+            serde_json::from_value(body).expect("valid generate request")
+        };
+        assert!(!generate(json!({"text": "hi"})).carries_pixel_media());
+        assert!(!generate(json!({"text": "hi", "image_data": null})).carries_pixel_media());
+        assert!(!generate(json!({"text": "hi", "image_data": [null, null]})).carries_pixel_media());
+        assert!(!generate(json!({"text": "hi", "image_data": [[], []]})).carries_pixel_media());
+        assert!(
+            generate(json!({"text": "hi", "image_data": "data:image/png;base64,AAAA"}))
+                .carries_pixel_media()
+        );
+        assert!(generate(
+            json!({"text": "hi", "image_data": [null, ["data:image/png;base64,AAAA"]]})
+        )
+        .carries_pixel_media());
+        assert!(
+            generate(json!({"text": "hi", "video_data": "https://example.com/clip.mp4"}))
+                .carries_pixel_media()
+        );
+        assert!(
+            !generate(json!({"text": "hi", "audio_data": "https://example.com/clip.wav"}))
+                .carries_pixel_media()
+        );
     }
 }

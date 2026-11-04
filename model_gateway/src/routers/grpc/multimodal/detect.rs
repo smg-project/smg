@@ -12,7 +12,7 @@ use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
     messages::{ImageBlock, ImageSource, InputContent, InputContentBlock, InputMessage, Role},
-    responses::{ResponseContentPart, ResponseInputOutputItem},
+    responses::{ResponseContentPart, ResponseInputOutputItem, StringOrContentParts},
 };
 
 use super::plan::MediaPlan;
@@ -144,12 +144,22 @@ pub(crate) fn messages_carry_pixel_media(messages: &[InputMessage]) -> bool {
 }
 
 /// Whether Responses input items carry a pixel payload: an `input_image`
-/// part with an image URL, the one part the chat conversion carries as an
-/// image (`response_parts_to_message_content`); a file-id image and an
-/// `input_file` are not carried, so they demand nothing.
+/// part with an image URL in a message's parts, whichever message shape the
+/// client sent (the plain `{role, content}` item, or the one with an id and
+/// `type: "message"`), the one part the chat conversion carries as an image
+/// (`response_parts_to_message_content`, reached from both shapes); a
+/// file-id image and an `input_file` are not carried, so they demand nothing.
 pub(crate) fn responses_carry_pixel_media(items: &[ResponseInputOutputItem]) -> bool {
-    items.iter().any(|item| match item {
-        ResponseInputOutputItem::Message { content, .. } => content.iter().any(|part| {
+    items.iter().any(|item| {
+        let parts: &[ResponseContentPart] = match item {
+            ResponseInputOutputItem::Message { content, .. } => content,
+            ResponseInputOutputItem::SimpleInputMessage {
+                content: StringOrContentParts::Array(parts),
+                ..
+            } => parts,
+            _ => return false,
+        };
+        parts.iter().any(|part| {
             matches!(
                 part,
                 ResponseContentPart::InputImage {
@@ -157,8 +167,7 @@ pub(crate) fn responses_carry_pixel_media(items: &[ResponseInputOutputItem]) -> 
                     ..
                 }
             )
-        }),
-        _ => false,
+        })
     })
 }
 
@@ -604,5 +613,33 @@ mod tests {
             },
         ])]));
         assert!(!responses_carry_pixel_media(&[]));
+
+        // The plain message shape clients send, with no id and no type.
+        let simple = |content: StringOrContentParts| ResponseInputOutputItem::SimpleInputMessage {
+            content,
+            role: "user".to_string(),
+            r#type: None,
+            phase: None,
+        };
+        assert!(responses_carry_pixel_media(&[simple(
+            StringOrContentParts::Array(vec![
+                ResponseContentPart::InputText {
+                    text: "what is this?".to_string()
+                },
+                ResponseContentPart::InputImage {
+                    detail: None,
+                    file_id: None,
+                    image_url: Some("https://example.com/cat.jpg".to_string()),
+                },
+            ])
+        )]));
+        assert!(!responses_carry_pixel_media(&[simple(
+            StringOrContentParts::String("hi".to_string())
+        )]));
+        assert!(!responses_carry_pixel_media(&[simple(
+            StringOrContentParts::Array(vec![ResponseContentPart::InputText {
+                text: "hi".to_string()
+            }])
+        )]));
     }
 }
