@@ -374,7 +374,7 @@ fn every_stage_allocates_what_it_allocates_today() {
     );
     let config = PreProcessorConfig::from_json(CONFIG).expect("config");
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
-    let record = std::env::var_os("MM_PINS_RECORD").is_some();
+    let record = std::env::var_os("MM_PINS_RECORD").is_some_and(|value| value == "1");
     let mut failures = Vec::new();
     println!("class | stage | calls | bytes | large");
     for class in classes() {
