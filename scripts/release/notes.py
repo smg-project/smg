@@ -273,8 +273,16 @@ class Pull:
 
     @property
     def upgrade_line(self) -> str:
-        text = f"{self.text} (#{self.number})" if self.text else self.subject
-        return f"- {text} <!-- AUTHOR: declared: {', '.join(self.kinds)}; keep it here, move it or drop it -->"
+        """The Upgrade notes candidate: the release note, or the subject when there is none (a sentence that reads
+        as none rides in the comment, so the line still says what the declaration refers to)."""
+        if self.note:
+            text, said = f"{self.note} (#{self.number})", ""
+        else:
+            text = self.subject
+            quoted = (self.text or "").replace("-->", "--&gt;").replace("<!--", "&lt;!--")
+            said = f'; the release note says "{quoted}"' if quoted else ""
+        declared = f"declared: {', '.join(self.kinds)}{said}; keep it here, move it or drop it"
+        return f"- {text} <!-- AUTHOR: {declared} -->"
 
     def upgrade_slot(self) -> str:
         """The Upgrade notes subsection a declaring pull request sits under: its kind first, then its area."""

@@ -1787,6 +1787,7 @@ def test_notes_keep_what_a_sentence_that_reads_as_none_declares(
                 f"## Release note\n\n{conditional}\n",
             ),
             ("feat(gateway): the `--x` default moves (#218)", f"## Release note\n\n{none_but}\n"),
+            ("feat(gateway)!: remove the `--legacy-foo` flag (#219)", "## Release note\n\nnone\n"),
         ),
     )
     out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
@@ -1797,9 +1798,15 @@ def test_notes_keep_what_a_sentence_that_reads_as_none_declares(
     assert f"- {conditional} (#217) " + declared.format(
         "a configuration that now refuses to start"
     ) in subsection(upgrade, "### Configuration that now refuses to start")
-    assert f"- {none_but} (#218) " + declared.format("a changed default") in subsection(
-        upgrade, "### Changed defaults"
+    assert "- feat(gateway): the `--x` default moves (#218) " + declared.format(
+        f'a changed default; the release note says "{none_but}"'
+    ) in subsection(upgrade, "### Changed defaults"), (
+        "the subject leads, the sentence rides in the comment"
     )
+    assert "- feat(gateway)!: remove the `--legacy-foo` flag (#219) " + declared.format(
+        'a breaking change, a removed or renamed flag or setting; the release note says "none"'
+    ) in subsection(upgrade, "### API behavior"), "a bare none: the subject says what broke"
+    assert "(#219)" not in section(out, "## Highlights", "## Upgrade notes")
 
 
 def test_notes_read_each_pull_request_body_once(repo: Sandbox, tmp_path: Path) -> None:
@@ -1977,9 +1984,21 @@ def test_the_release_note_of_a_pull_request_body() -> None:
     pull.take("## Release note\n\nNo behavior change, but the default of `--x` moves to 5.\n")
     pull.declare()
     assert pull.note == "" and not pull.seeds and pull.kinds == ["a changed default"]
-    assert pull.upgrade_line.startswith(
-        "- No behavior change, but the default of `--x` moves to 5. (#7) <!-- AUTHOR: declared: a changed"
-        " default;"
+    assert pull.upgrade_line == (
+        "- feat(gateway): the `--x` default moves (#7) <!-- AUTHOR: declared: a changed default; the release"
+        ' note says "No behavior change, but the default of `--x` moves to 5."; keep it here, move it or drop'
+        " it -->"
+    ), "the subject leads when the section reads as none; the sentence rides in the comment"
+    # a bare none, or one with a reason: the subject says what the declaration refers to
+    pull = notes.Pull.of("refactor(config): remove the unused `--foo` flag (#10)")
+    pull.read = True
+    pull.take("## Release note\n\nnone: internal refactor\n")
+    pull.declare()
+    assert pull.kinds == ["a removed or renamed flag or setting"]
+    assert pull.upgrade_line == (
+        "- refactor(config): remove the unused `--foo` flag (#10) <!-- AUTHOR: declared: a removed or renamed"
+        ' flag or setting; the release note says "none: internal refactor"; keep it here, move it or drop'
+        " it -->"
     )
     pull = notes.Pull.of("fix(gateway): a set `--foo` needs its peer (#8)")
     pull.read = True
