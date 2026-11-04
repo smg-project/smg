@@ -1774,7 +1774,9 @@ impl Metrics {
         });
     }
 
-    /// Set active HTTP connections count
+    /// Set `smg_http_connections_active`: the count of HTTP requests in flight
+    /// at the edge layer (the callers pass the in-flight request tracker's
+    /// count), not of open connections.
     pub fn set_http_connections_active(count: usize) {
         handles::with_single(
             &handles::HTTP_CONNECTIONS_ACTIVE,
