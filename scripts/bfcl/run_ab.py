@@ -967,7 +967,9 @@ def main() -> int:
         print(f"[{arm.name}] scores -> {args.scores_out}: {arm.scores}")
         if arm.timed_out:
             print(f"WARNING: [{arm.name}] timed out during: {', '.join(arm.timed_out)}")
-        # Always 0: the gate runs once, on the --diff step that sees both arms.
+        # Legacy stage incompleteness is persisted for the final --diff gate.
+        # Lifecycle failures return 2 now, including unsettled legacy cleanup.
+        # Callers must retain partial evidence and stop before more native work.
         return EXIT_INCOMPLETE if lifecycle_failed(arm) else EXIT_OK
 
     # Mode: concurrent A/B — both arms serve at once on opposite GPU halves, so
