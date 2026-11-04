@@ -34,7 +34,7 @@ async fn encode_and_scheduler_registration_use_the_wire_contract() {
     .unwrap();
     assert_eq!(response, ep::EncodeResponse::default());
     assert_eq!(*peer.state.requests.lock().unwrap(), [request]);
-    assert!(!peer.state.timeouts.lock().unwrap()[0].is_empty());
+    assert!(peer.state.timeouts.lock().unwrap()[0].is_empty());
 }
 
 #[tokio::test]
@@ -57,6 +57,49 @@ async fn encode_uses_its_owner_deadline_and_marks_local_expiration() {
         .encode(request, RequestDeadline::after(Duration::from_millis(30)))
         .await
         .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded);
+    assert!(is_request_timeout(&error));
+}
+
+#[tokio::test]
+async fn a_rounded_transport_timeout_cannot_beat_the_owner_deadline() {
+    let peer = Peer::new().await.unwrap();
+    tokio::time::pause();
+    // Keep the runtime awake so real loopback I/O completes without advancing
+    // its paused clock to a timer automatically. Both sets abort on failure.
+    let mut awake = tokio::task::JoinSet::new();
+    awake.spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    // grpc-timeout has eight digits: this duration loses half a second when
+    // encoded in seconds. Virtual time makes that real tonic race bounded.
+    let deadline = RequestDeadline::after(Duration::from_millis(100_000_500));
+    let client = peer.client.clone();
+    let mut calls = tokio::task::JoinSet::new();
+    calls.spawn(async move { client.encode(ep::EncodeRequest::default(), deadline).await });
+    let entered_by = std::time::Instant::now() + Duration::from_secs(2);
+    while peer.state.requests.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < entered_by,
+            "encoder peer did not receive request"
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(100_000) + Duration::from_millis(20)).await;
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert!(tokio::time::Instant::now() < deadline.at());
+    let premature = calls.try_join_next();
+    assert!(
+        premature.is_none(),
+        "Encode ended before its owner deadline: {premature:?}; grpc-timeout={:?}",
+        peer.state.timeouts.lock().unwrap()
+    );
+    tokio::time::advance(Duration::from_millis(481)).await;
+    let error = calls.join_next().await.unwrap().unwrap().unwrap_err();
     assert_eq!(error.code(), Code::DeadlineExceeded);
     assert!(is_request_timeout(&error));
 }

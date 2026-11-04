@@ -52,7 +52,7 @@ tonic-prost-build = "0.14.6"
 [dev-dependencies]
 # The in-memory IO of the channel tests' raw HTTP/2 peer.
 hyper-util = { version = "0.1", features = ["tokio"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
 # Mock-server harness for the abort-on-drop behavioral tests.
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", default-features = false }
