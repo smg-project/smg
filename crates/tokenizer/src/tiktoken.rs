@@ -729,31 +729,81 @@ fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
 /// checkpoint's pieces when `checkpoint_pieces` is set. The allowed-special
 /// set is built once per prompt; `encode_with_special_tokens` would rebuild
 /// it for every piece, and a Kimi prompt has hundreds of control pieces.
+/// The ids are the segments' own encodes, one after another: a prompt's ids
+/// are the ids of any split of its segments, encoded apart and joined.
 fn encode_segments(
     bpe: &CoreBPE,
     segments: &[PromptSegment],
     checkpoint_pieces: bool,
 ) -> Result<Vec<TokenIdType>> {
-    let allowed = bpe.special_tokens();
-    let mut ids = Vec::new();
+    let mut ids = Vec::with_capacity(ids_capacity(segments));
+    encode_segments_into(
+        bpe,
+        &bpe.special_tokens(),
+        segments,
+        checkpoint_pieces,
+        &mut ids,
+    )?;
+    Ok(ids)
+}
+
+/// Room for the ids of `segments` before any is encoded: one id per three
+/// bytes of text, the direct encoder's rule for prose and code. A prompt
+/// denser than that grows the buffer once; nothing grows it per segment.
+fn ids_capacity(segments: &[PromptSegment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| segment.text.len())
+        .sum::<usize>()
+        / 3
+        + 8
+}
+
+/// [`encode_segments`], appending to `ids`, with the allowed-special set the
+/// caller built once for the prompt (`bpe.special_tokens()`): a caller that
+/// holds some of the segments' ids already writes the rest around them into
+/// one buffer.
+fn encode_segments_into(
+    bpe: &CoreBPE,
+    allowed: &HashSet<&str>,
+    segments: &[PromptSegment],
+    checkpoint_pieces: bool,
+    ids: &mut Vec<TokenIdType>,
+) -> Result<()> {
     for segment in segments {
-        let pieces = if checkpoint_pieces {
-            self::checkpoint_pieces(&segment.text)
-        } else {
-            vec![segment.text.as_str()]
-        };
-        for piece in pieces {
-            if segment.allow_special {
-                let (ids_of_piece, _) = bpe
-                    .encode(piece, &allowed)
-                    .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
-                ids.extend(ids_of_piece);
-            } else {
-                ids.extend(bpe.encode_ordinary(piece));
+        // The checkpoint cuts at a window of characters and at a run of them, both longer than
+        // this bound in bytes: a shorter segment is one piece, encoded without the cut's walk
+        // over its characters and the list of its pieces.
+        if checkpoint_pieces && segment.text.len() > CHECKPOINT_RUN_CHARS {
+            for piece in self::checkpoint_pieces(&segment.text) {
+                encode_piece(bpe, allowed, piece, segment.allow_special, ids)?;
             }
+        } else {
+            encode_piece(bpe, allowed, &segment.text, segment.allow_special, ids)?;
         }
     }
-    Ok(ids)
+    Ok(())
+}
+
+/// One piece's ids, appended: a control piece with the special tokens of
+/// `allowed` recognized, a text piece as ordinary BPE.
+#[inline(always)]
+fn encode_piece(
+    bpe: &CoreBPE,
+    allowed: &HashSet<&str>,
+    piece: &str,
+    allow_special: bool,
+    ids: &mut Vec<TokenIdType>,
+) -> Result<()> {
+    if allow_special {
+        let (ids_of_piece, _) = bpe
+            .encode(piece, allowed)
+            .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
+        ids.extend(ids_of_piece);
+    } else {
+        ids.extend(bpe.encode_ordinary(piece));
+    }
+    Ok(())
 }
 
 impl Encoder for TiktokenTokenizer {
@@ -914,13 +964,25 @@ impl TokenizerTrait for TiktokenTokenizer {
         let RenderedXtml { segments, pending } =
             render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
         let text = join_segments(&segments);
-        // Piecewise encoding makes the stub's own count its share of the full encode.
+        // Piecewise encoding makes the stub's own count its share of the full
+        // encode: its ids, encoded once here for the count, are kept for the
+        // job, which writes the segments before and after them around them.
         let checkpoint_pieces = self.checkpoint_pieces;
-        let unbilled_prompt_tokens =
-            encode_segments(&self.tokenizer, &segments[pending], checkpoint_pieces)?.len() as u32;
+        let pending_ids = encode_segments(
+            &self.tokenizer,
+            &segments[pending.clone()],
+            checkpoint_pieces,
+        )?;
+        let unbilled_prompt_tokens = pending_ids.len() as u32;
         let bpe = Arc::clone(&self.tokenizer);
         let job = EncodeJob::new(move || {
-            encode_segments(&bpe, &segments, checkpoint_pieces).map(Encoding::Tiktoken)
+            let allowed = bpe.special_tokens();
+            let mut ids = Vec::with_capacity(ids_capacity(&segments));
+            let (before, after) = (&segments[..pending.start], &segments[pending.end..]);
+            encode_segments_into(&bpe, &allowed, before, checkpoint_pieces, &mut ids)?;
+            ids.extend_from_slice(&pending_ids);
+            encode_segments_into(&bpe, &allowed, after, checkpoint_pieces, &mut ids)?;
+            Ok(Encoding::Tiktoken(ids))
         });
         Ok(ChatTemplateOutput {
             text,
@@ -1628,6 +1690,25 @@ mod tests {
         // The flat encode still maps every marker string to its control id.
         let flat = tokenizer.encode("<|open|>message<|open|>", false).unwrap();
         assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
+    }
+
+    /// The segment encode skips the checkpoint's cut for a segment of at most
+    /// `CHECKPOINT_RUN_CHARS` bytes: such a text holds at most that many
+    /// characters, so neither cut can fall inside it and it is one piece.
+    #[test]
+    fn a_segment_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
+        let at_the_bound = " ".repeat(CHECKPOINT_RUN_CHARS);
+        assert_eq!(
+            checkpoint_pieces(&at_the_bound),
+            vec![at_the_bound.as_str()]
+        );
+        let past_it = " ".repeat(CHECKPOINT_RUN_CHARS + 1);
+        assert_eq!(checkpoint_pieces(&past_it).len(), 2);
+        let two_byte_characters = "\u{e9}".repeat(CHECKPOINT_RUN_CHARS / 2);
+        assert_eq!(
+            checkpoint_pieces(&two_byte_characters),
+            vec![two_byte_characters.as_str()]
+        );
     }
 
     #[test]
