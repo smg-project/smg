@@ -5,7 +5,6 @@ on:
     types: [opened, synchronize, reopened]
     paths-ignore:
       - '*.md'
-      - 'docs/**'
       - '*.lock'
   issue_comment:
     types: [created]
