@@ -19,10 +19,12 @@ Three modes, each on a fresh bed:
 - ``burst``: two hundred image requests offered within one second, then the drain:
   the client's p50 and p99 and its failures by status, the gateway's resident-size
   peak, the time until the last request answered.
-- ``replay``: one conversation of twenty turns, turn k carrying the k screenshots seen
-  so far (k distinct crops of one page), sent one after another: the gateway's CPU per
-  turn, its media stage times per turn and its resident size per turn; once with the
-  router's pixel cache off (the default) and once with it on.
+- ``replay``: one conversation of twenty turns over twenty distinct crops of one page,
+  turn k carrying the last ``--window`` of the k screenshots seen so far (the model's
+  limit of image items per request bounds a turn, as an agent's context pruning would),
+  sent one after another: the gateway's CPU per turn, its media stage times per turn
+  and its resident size per turn; once with the router's pixel cache off (the default)
+  and once with it on.
 
     python3 scripts/bench/multimodal/gateway_seam.py --manifest <run>/resolved.json \\
         --config-dir <qwen3_vl dir> --smg <gateway binary> --mock <mock-worker binary> \\
@@ -68,6 +70,15 @@ def proc_mem_kb(pid: int) -> dict:
     return out
 
 
+def reset_peak(pid: int) -> None:
+    """Reset the process's resident high-water mark to its current size (Linux 4.0 and
+    later), so the next VmHWM read is this cell's peak and not the process's lifetime one."""
+    try:
+        Path(f"/proc/{pid}/clear_refs").write_text("5")
+    except OSError as error:
+        print(f"peak not reset ({error}): the lifetime high-water mark follows", file=sys.stderr)
+
+
 class Bed:
     """The bed's processes, through bed.sh with this run's ports, cores and flags."""
 
@@ -104,8 +115,14 @@ class Bed:
         self.pid = None
 
     def __enter__(self):
-        subprocess.run(["bash", str(BED_SH), "up"], env=self.env, check=True)
-        bed = json.loads((self.dir / "bed" / "bed.json").read_text())
+        try:
+            subprocess.run(["bash", str(BED_SH), "up"], env=self.env, check=True)
+            bed = json.loads((self.dir / "bed" / "bed.json").read_text())
+        except BaseException:
+            # `up` dies after starting the gateway or the fleet on three of its failure
+            # paths; left running, they would keep the ports from the next bed
+            self.__exit__()
+            raise
         self.pid = bed["gateway_pid"]
         self.log = self.dir / "bed" / "gateway.log"
         return self
@@ -207,6 +224,7 @@ def load_cell(
         cmd = ["taskset", "-c", args.load_cores, *cmd]
     _, line0 = bed.timing_lines(0)
     cpu0 = proc_cpu_ms(bed.pid)
+    reset_peak(bed.pid)
     mem0 = proc_mem_kb(bed.pid)
     started = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -220,7 +238,10 @@ def load_cell(
         else {"error": proc.stderr[-2000:]}
     )
     timing, _ = bed.timing_lines(line0)
-    done = summary.get("ok", 0) + summary.get("failed", 0)
+    # per request the gateway finished preprocessing inside the CPU window: an overload
+    # cell's abandoned requests (the client's `unfinished`) cost CPU too, so the column
+    # reads high there and the client keys say how many never finished
+    processed = len(timing)
     return {
         "rate": rate,
         "duration": duration,
@@ -230,15 +251,18 @@ def load_cell(
             for k in (
                 "sent",
                 "sampled",
+                "done",
                 "ok",
                 "failed",
+                "unfinished",
+                "skipped",
                 "achieved_rps",
                 "e2e_ms",
                 "ttfb_ms",
                 "errors",
             )
         },
-        "gateway_cpu_ms_per_request": (cpu1 - cpu0) / done if done else None,
+        "gateway_cpu_ms_per_request": (cpu1 - cpu0) / processed if processed else None,
         "gateway_cpu_ms_total": cpu1 - cpu0,
         "gateway_rss_kb": {
             "before": mem0.get("VmRSS"),
@@ -345,8 +369,10 @@ def scrape(url: str, names: tuple[str, ...]) -> dict:
     try:
         with urllib.request.urlopen(f"{url}/metrics", timeout=10) as resp:
             text = resp.read().decode()
-    except (urllib.error.URLError, OSError):
-        return out
+    except (urllib.error.URLError, OSError) as error:
+        # no counter at all, never a zero that reads as "the cache never hit"
+        print(f"scrape failed ({error}): the counters are unknown", file=sys.stderr)
+        return dict.fromkeys(names)
     for line in text.splitlines():
         for name in names:
             if line.startswith(name) and line[len(name)] in "{ ":
@@ -396,12 +422,14 @@ def mode_replay(args, manifest: dict, run_dir: Path) -> dict:
     ):
         turns = []
         with Bed(args, run_dir, f"replay-{label}", gw_args) as bed:
-            # one warm turn so the first measured turn does not pay the first-request costs
+            # one warm turn so the first measured turn does not pay the first-request costs;
+            # the uncropped page is an image the session never sends, so the cache-on
+            # run's first turn is a miss like the cache-off run's
             post_chat(
                 bed.gw,
                 args.model,
                 [
-                    {"type": "image_url", "image_url": {"url": urls[0]}},
+                    {"type": "image_url", "image_url": {"url": data_url(source)}},
                     {"type": "text", "text": "warm"},
                 ],
             )
@@ -414,6 +442,7 @@ def mode_replay(args, manifest: dict, run_dir: Path) -> dict:
                 parts.append(
                     {"type": "text", "text": f"turn {k}: what changed since the last screenshot?"}
                 )
+                reset_peak(bed.pid)
                 cpu0 = proc_cpu_ms(bed.pid)
                 status, latency = post_chat(bed.gw, args.model, parts)
                 cpu1 = proc_cpu_ms(bed.pid)
