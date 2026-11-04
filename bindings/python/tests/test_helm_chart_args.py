@@ -868,6 +868,27 @@ def test_a_prefill_only_policy_is_refused_by_the_schema():
 
 
 @needs_helm
+@pytest.mark.parametrize("value", [-1, 0, 4096])
+def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
+    """``router.maxConcurrentRequests`` is passed through as the launcher's
+    ``--max-concurrent-requests``, sentinels included: the gateway reads -1 as
+    the host-derived bound and 0 as no bound."""
+    _, documents = render(f"router.maxConcurrentRequests={value}")
+    assert launcher_args(router_container(documents)["args"]).max_concurrent_requests == value
+
+
+@needs_chart
+def test_the_schema_says_what_the_concurrency_sentinels_do():
+    """The schema describes the key with the gateway's rule for -1 and 0,
+    where the values comment used to say -1 meant unlimited."""
+    schema = json.loads(SCHEMA.read_text())
+    router = schema["properties"]["router"]["properties"]
+    description = router["maxConcurrentRequests"]["description"]
+    assert "-1 derives the bound from the host" in description, description
+    assert "0 lifts the bound" in description, description
+
+
+@needs_helm
 @pytest.mark.parametrize("settle", [None, 0, 5, 30])
 def test_shutdown_settle_window(settle):
     """Omit the optional window by default and preserve explicit values, including zero."""

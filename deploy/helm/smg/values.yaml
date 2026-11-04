@@ -149,7 +149,8 @@ router:
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
   grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
-  maxConcurrentRequests: -1    # -1 = unlimited
+  maxConcurrentRequests: -1    # in-flight requests admitted before shedding with 429 or 503;
+                               # -1 = the host-derived bound (1024 per available core, at least 4096), 0 = no bound
   queueSize: 100
   queueTimeoutSecs: 60
 
