@@ -2565,27 +2565,28 @@ impl StreamingProcessor {
         messages::Usage::from_counts(0, 0)
     }
 
-    /// Usage for the final `message_delta` event. `authoritative_input` is the
-    /// prompt count only when a `Complete` was seen; a clean EOF without one
-    /// must serialize `input_tokens: null` rather than claim a zero-token
-    /// prompt. `cache_read_input_tokens` is the engine's prefix-cache hit on
-    /// the prompt, read from the same frame as the prompt count and settled
-    /// as such; `cache_creation_input_tokens` stays zero, as the gateway
-    /// writes no breakpoint-driven cache entries of its own. Cache counters
-    /// follow the same integer-not-null contract as
-    /// [`Self::initial_messages_usage`]; `thinking_tokens` is reported when
-    /// the turn ran with thinking.
+    /// Usage for the final `message_delta` event. `authoritative_prompt` is
+    /// the engine's whole prompt count only when a `Complete` was seen; a
+    /// clean EOF without one must serialize `input_tokens: null` rather than
+    /// claim a zero-token prompt. `cached_tokens` is the engine's prefix-cache
+    /// hit on the prompt, read from the same frame and settled as such; the
+    /// Anthropic wire splits the two: `input_tokens` is the input outside the
+    /// cache and `cache_read_input_tokens` the hit, their sum the prompt.
+    /// `cache_creation_input_tokens` stays zero, as the gateway writes no
+    /// breakpoint-driven cache entries of its own. Cache counters follow the
+    /// same integer-not-null contract as [`Self::initial_messages_usage`];
+    /// `thinking_tokens` is reported when the turn ran with thinking.
     fn final_messages_delta_usage(
         output_tokens: u32,
-        authoritative_input: Option<u32>,
-        cache_read_input_tokens: u32,
+        authoritative_prompt: Option<u32>,
+        cached_tokens: u32,
         thinking_tokens: Option<u32>,
     ) -> MessageDeltaUsage {
         MessageDeltaUsage {
             output_tokens,
-            input_tokens: authoritative_input,
+            input_tokens: authoritative_prompt.map(|prompt| prompt.saturating_sub(cached_tokens)),
             cache_creation_input_tokens: Some(0),
-            cache_read_input_tokens: Some(cache_read_input_tokens),
+            cache_read_input_tokens: Some(cached_tokens),
             server_tool_use: None,
             output_tokens_details: thinking_tokens
                 .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),

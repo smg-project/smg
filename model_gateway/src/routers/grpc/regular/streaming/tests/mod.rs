@@ -259,8 +259,10 @@ fn messages_usage_cache_counters_serialize_as_integer_zeros() {
     assert_eq!(delta["cache_read_input_tokens"], 0);
 }
 
-/// The final message_delta carries the engine's prefix-cache hit as
-/// `cache_read_input_tokens`, an integer; the creation counter stays zero.
+/// The final message_delta splits the engine's prompt count as the wire
+/// does: the input outside the cache beside the hit as
+/// `cache_read_input_tokens`, both integers, their sum the prompt; the
+/// creation counter stays zero.
 #[test]
 fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
     let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
@@ -270,7 +272,7 @@ fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
         None,
     ))
     .unwrap();
-    assert_eq!(delta["input_tokens"], 945);
+    assert_eq!(delta["input_tokens"], 49);
     assert_eq!(delta["cache_read_input_tokens"], 896);
     assert_eq!(delta["cache_creation_input_tokens"], 0);
 }

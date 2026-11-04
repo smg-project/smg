@@ -1533,22 +1533,26 @@ fn normalize_assistant_content(text: String) -> Option<String> {
     }
 }
 
-/// Usage for a unary Messages response. Cache counters are integers, never
-/// null: the Anthropic wire contract has always-present cache counters and
-/// clients do arithmetic on them. `cache_read_input_tokens` is the engine's
-/// prefix-cache hit on the prompt, the count the settlement and the metrics
-/// take from the same frame; `cache_creation_input_tokens` stays zero, as the
+/// Usage for a unary Messages response, from the engine's counts: the whole
+/// prompt (`prompt_tokens`) and its prefix-cache hit (`cached_tokens`), the
+/// counts the settlement and the metrics keep whole. The Anthropic wire splits
+/// them: `input_tokens` is the input outside the cache and
+/// `cache_read_input_tokens` the hit, their sum the prompt (the HTTP tenant
+/// settlement sums them back that way). Cache counters are integers, never
+/// null: the wire contract has always-present cache counters and clients do
+/// arithmetic on them; `cache_creation_input_tokens` stays zero, as the
 /// gateway writes no breakpoint-driven cache entries of its own. The
 /// cache-creation breakdown, service tier and inference geography are always
 /// written too, and `output_tokens_details` when the turn ran with thinking.
 fn messages_usage_from_counts(
-    input_tokens: u32,
+    prompt_tokens: u32,
     output_tokens: u32,
-    cache_read_input_tokens: u32,
+    cached_tokens: u32,
     thinking_tokens: Option<u32>,
 ) -> messages::Usage {
-    let usage = messages::Usage::from_counts(input_tokens, output_tokens)
-        .with_cache_read_input_tokens(cache_read_input_tokens);
+    let usage =
+        messages::Usage::from_counts(prompt_tokens.saturating_sub(cached_tokens), output_tokens)
+            .with_cache_read_input_tokens(cached_tokens);
     match thinking_tokens {
         Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
         None => usage,
@@ -1618,16 +1622,23 @@ mod messages_usage_wire_tests {
         assert_eq!(v["cache_read_input_tokens"], 0);
     }
 
-    /// The cache-read counter is the engine's prefix-cache hit on the prompt,
-    /// zero included; the creation counter stays zero beside it.
+    /// The engine's whole prompt and its hit become the wire's split: the
+    /// input outside the cache beside the hit as the cache-read counter, their
+    /// sum the prompt; a miss leaves the whole prompt as input beside an
+    /// integer zero; a hit an engine reports above its prompt count leaves no
+    /// negative input; the creation counter stays zero throughout.
     #[test]
     fn cache_read_input_tokens_is_the_engines_prefix_cache_hit() {
         let v = serde_json::to_value(messages_usage_from_counts(945, 12, 896, None)).unwrap();
-        assert_eq!(v["input_tokens"], 945);
+        assert_eq!(v["input_tokens"], 49);
         assert_eq!(v["cache_read_input_tokens"], 896);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         let v = serde_json::to_value(messages_usage_from_counts(945, 12, 0, None)).unwrap();
+        assert_eq!(v["input_tokens"], 945);
         assert_eq!(v["cache_read_input_tokens"], 0);
+        let v = serde_json::to_value(messages_usage_from_counts(10, 1, 16, None)).unwrap();
+        assert_eq!(v["input_tokens"], 0);
+        assert_eq!(v["cache_read_input_tokens"], 16);
     }
 
     /// The public API writes these keys on every message; a typed client
