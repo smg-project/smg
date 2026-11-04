@@ -746,6 +746,9 @@ def _setup_pd(
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
                 raise
 
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's).
+        set_class_workers(all_workers)
         if moriio:
             _start_gateway(gateway, gateway_config, prefill_workers=[], decode_workers=[])
             _register_moriio_workers(gateway, prefill_workers, decode_workers)
@@ -760,6 +763,7 @@ def _setup_pd(
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s PD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)

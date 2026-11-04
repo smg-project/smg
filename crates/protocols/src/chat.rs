@@ -471,10 +471,14 @@ impl ChatCompletionRequest {
     /// a native template effort still ranks that effort above the toggle
     /// when it reads the prompt (the gateway's parser precedence).
     pub fn template_thinking(&self) -> Option<bool> {
-        self.thinking_toggle().or_else(|| {
-            ProviderProfile::for_model(&self.model)
-                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
-        })
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        self.thinking_toggle()
+            .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
     }
 
     /// Whether `continue_final_message` applies: it is set and the request

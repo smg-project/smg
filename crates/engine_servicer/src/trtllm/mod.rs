@@ -131,15 +131,36 @@ pub struct TrtllmServicerConfig {
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
         let client = self.shared.engine.client.get()?;
-        let load = client
-            .get_loads()
-            .loads
-            .into_iter()
-            .find(|load| dp_rank.is_none_or(|rank| rank == load.dp_rank))?;
+        let loads = client.get_loads().loads;
+        let reported = match dp_rank {
+            Some(rank) => loads.iter().find(|load| load.dp_rank == rank),
+            None => loads
+                .iter()
+                .find(|load| load.dp_rank == 0)
+                .or_else(|| loads.first()),
+        };
+        let (running_requests, waiting_requests, token_usage) = match reported {
+            Some(load) => (
+                u32::try_from(load.num_running_reqs).unwrap_or(0),
+                u32::try_from(load.num_waiting_reqs).unwrap_or(0),
+                load.token_usage,
+            ),
+            // A connected rank no batch has carried a load tail for yet (an
+            // idle scheduler, whether or not a sibling rank has reported)
+            // reads as zero, as on the other wires (`unreported_ranks`); a
+            // rank past the connected ones gets no record.
+            None => {
+                let rank = usize::try_from(dp_rank.unwrap_or(0)).ok()?;
+                if rank >= self.rank_count() {
+                    return None;
+                }
+                (0, 0, 0.0)
+            }
+        };
         Some(common::EngineLoad {
-            running_requests: u32::try_from(load.num_running_reqs).unwrap_or(0),
-            waiting_requests: u32::try_from(load.num_waiting_reqs).unwrap_or(0),
-            token_usage: load.token_usage,
+            running_requests,
+            waiting_requests,
+            token_usage,
             max_running_requests: u32::try_from(
                 self.shared.running_window(self.model.max_running_requests),
             )
@@ -150,6 +171,10 @@ impl crate::kv_events::RankLoads for State {
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -210,7 +235,12 @@ impl TrtllmServicerServer {
         )?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
         });
         let routes = Routes::new(
             TrtllmServiceServer::new(service::TrtllmServicer {
@@ -273,7 +303,8 @@ impl TrtllmServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else. `set_serving(false)` is the drain switch and closes
     /// admission as well.
     pub fn set_ready(&self, ready: bool) {

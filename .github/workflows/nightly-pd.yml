@@ -168,6 +168,11 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
+      # The pinned TokenSpeed engine runs on its Rust control plane and
+      # carries no in-process Python frontend, so its workers run the Rust
+      # servicer, as on the pull-request lanes; the other engines keep their
+      # servicer package's default.
+      servicer_impl: ${{ matrix.engine == 'tokenspeed' && 'rust' || '' }}
       gpu_tier: "4"
       runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
       # The AMD rows run in vLLM's ROCm image of the CI's vLLM pin

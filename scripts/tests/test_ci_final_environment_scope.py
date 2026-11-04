@@ -372,3 +372,17 @@ def test_evidence_output_requires_real_uploaded_artifact_id(public, outcome, art
 def test_evidence_success_without_artifact_id_has_empty_output():
     assert _artifact_output_value("complete_evidence_artifact", "", "success") == ""
     assert _artifact_output_value("worker_log_artifact", "", "success") == ""
+
+
+def test_evidence_empty_moriio_mode_uses_declared_read_default(tmp_path):
+    inputs = {
+        "engine": "vllm",
+        "gpu_tier": "2",
+        "test_dirs": "e2e_test/router",
+        "vllm_kv_backend": "moriio",
+        "gpu_vendor": "amd",
+    }
+    assert _effective_evidence_inputs(inputs)["vllm_moriio_mode"] == ""
+    contract = _evidence_identity(tmp_path, inputs)[0]
+    assert "-moriio-read-amd-" in contract
+    assert "-moriio-auto-" not in contract

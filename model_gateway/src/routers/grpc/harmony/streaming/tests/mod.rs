@@ -1,7 +1,10 @@
 mod client_leave;
+mod closed_message;
 mod local_stop;
 mod logprobs;
 mod lone_complete;
+mod responses_stop;
+mod status;
 mod usage;
 
 use super::*;

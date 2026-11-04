@@ -30,7 +30,8 @@ fn bench_clone_overhead(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("m3_image_batch");
     for &count in &[1usize, 4, 20] {
-        let images: Vec<DynamicImage> = (0..count).map(|_| make_test_image(1024, 768)).collect();
+        let owned: Vec<DynamicImage> = (0..count).map(|_| make_test_image(1024, 768)).collect();
+        let images: Vec<&DynamicImage> = owned.iter().collect();
 
         group.bench_with_input(
             BenchmarkId::new("preprocess_only", count),
@@ -44,8 +45,13 @@ fn bench_clone_overhead(c: &mut Criterion) {
             &images,
             |b, imgs| {
                 b.iter(|| {
-                    let copies: Vec<DynamicImage> = imgs.to_vec();
-                    processor.preprocess(&copies).unwrap()
+                    // What the gateway paid before it handed the processor
+                    // borrowed frames: one deep copy of every decoded image.
+                    let copies: Vec<DynamicImage> =
+                        imgs.iter().map(|image| (*image).clone()).collect();
+                    processor
+                        .preprocess(&copies.iter().collect::<Vec<_>>())
+                        .unwrap()
                 });
             },
         );
@@ -176,7 +182,7 @@ fn bench_source_resize(c: &mut Criterion) {
                                 .expect("image fixture");
                             tokio::task::spawn_blocking(move || {
                                 let pixels = frame.image().unwrap();
-                                processor.preprocess(std::slice::from_ref(pixels)).unwrap()
+                                processor.preprocess(&[pixels]).unwrap()
                             })
                             .await
                             .unwrap()

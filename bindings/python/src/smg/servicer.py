@@ -8,8 +8,9 @@ the headless engine, construct the server, poll ``engine_ready`` /
 ``active_requests`` to reach zero (or the drain deadline) before ``stop``.
 The count includes aborted requests until their response streams are released.
 ``set_ready(False)`` holds the health answer alone, admission open to the
-launcher's own requests before SERVING (its planned warm-up's, ``smg-warmup-<n>``)
-and to nothing else; ``set_ready(True)`` releases it. ``kv_relay_subscribed``
+launcher's own requests before SERVING (its planned warm-up's,
+``smg-warmup-<nonce>-<n>`` under the constructor's ``warmup_nonce``, else
+``smg-warmup-<n>``) and to nothing else; ``set_ready(True)`` releases it. ``kv_relay_subscribed``
 says whether the KV-event relay's subscription reached the engine's publisher
 (or there is none to wait for), which the launcher reads before it starts the
 warm-up.

@@ -1,6 +1,10 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/structured_outputs.rs.
 
+//! Structured outputs on the engine's wire: the backend, the constraint (a JSON schema, free-form
+//! JSON, a regex, a choice list, a grammar or a structural tag) a request binds its output to, and
+//! the schema features the xgrammar backend does not support.
+
 use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
 
 use memchr::memmem;

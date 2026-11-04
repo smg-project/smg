@@ -239,7 +239,7 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         let name = &case.name;
         let images = images_for(case);
         let out = processor
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap_or_else(|e| panic!("{name}: preprocess: {e}"));
         let grid: Vec<i64> = match &case.grid_thw {
             serde_json::Value::Array(rows) if rows.first().is_some_and(|v| v.is_array()) => rows

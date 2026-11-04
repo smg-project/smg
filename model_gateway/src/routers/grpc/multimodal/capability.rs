@@ -63,7 +63,7 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// workers unhealthy): its image requests go on to worker selection, which
 /// keeps them off the workers without the encoder ([`request_needs_vision`]
 /// is the demand) and refuses them the same way once no candidate has one.
-pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
+fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
     let workers = registry.get_by_model(model_id);
     !workers.is_empty()
         && workers
@@ -280,7 +280,7 @@ pub(crate) fn ensure_backend_supports_modalities(
 /// pre-computed image embeddings are not: an engine may take those with its
 /// visual inputs disabled, and whether a runtime takes them at all is
 /// [`runtime_supports_modality`]'s call.
-pub(crate) fn is_pixel_modality(modality: Modality) -> bool {
+fn is_pixel_modality(modality: Modality) -> bool {
     matches!(modality, Modality::Image | Modality::Video)
 }
 

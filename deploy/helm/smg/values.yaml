@@ -27,7 +27,10 @@ router:
   #    Deadlines). The mesh StatefulSet has no such field.
   progressDeadlineSeconds: 1920
 
-  # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
+  # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
+  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
+  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
+  #    --prefill-policy bucket through extraArgs.
   policy: cache_aware
 
   # -- Enable IGW (Inference Gateway) mode for multi-model support
@@ -146,7 +149,8 @@ router:
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
   grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
-  maxConcurrentRequests: -1    # -1 = unlimited
+  maxConcurrentRequests: -1    # in-flight requests admitted before shedding with 429 or 503;
+                               # -1 = the host-derived bound (1024 per available core, at least 4096), 0 = no bound
   queueSize: 100
   queueTimeoutSecs: 60
 

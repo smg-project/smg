@@ -53,7 +53,7 @@ pub use endpoint::{endpoint_key, EndpointError, EndpointKey};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
-pub use kv_event_monitor::KvEventMonitor;
+pub use kv_event_monitor::{KvEventMonitor, SubscriptionKind};
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
 pub use manager::WorkerManager;

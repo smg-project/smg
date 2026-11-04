@@ -387,7 +387,6 @@ impl CliArgs {
                 kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
                 default_throughput: self.routing.least_load_default_throughput,
-                max_waiting_requests: self.routing.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.routing.balance_abs_threshold,
@@ -644,21 +643,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.serving.prometheus_duration_buckets;
-        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &bad.to_string(),
-                "every bucket bound must be a finite number above 0",
-            ));
-        }
-        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &format!("{} {}", pair[0], pair[1]),
-                "bucket bounds must ascend strictly",
-            ));
-        }
+        PrometheusConfig::validate_duration_buckets(&self.serving.prometheus_duration_buckets)?;
         for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
@@ -706,10 +691,9 @@ impl CliArgs {
         let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
         let selectors = match provider {
             None => "without --service-discovery".to_string(),
-            Some(provider) => format!(
-                "under --discovery-provider {}: it selects Kubernetes pods",
-                provider.flag_value()
-            ),
+            Some(provider) => {
+                format!("under --discovery-provider {provider}: it selects Kubernetes pods")
+            }
         };
         // Two worker sources are both honoured, which is worth a line of its
         // own, naming the source as it was given.
@@ -717,7 +701,7 @@ impl CliArgs {
             "--service-discovery".to_string()
         } else {
             provider.map_or_else(String::new, |provider| {
-                format!("--discovery-provider {}", provider.flag_value())
+                format!("--discovery-provider {provider}")
             })
         };
         let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
@@ -1101,9 +1085,9 @@ impl CliArgs {
             .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.workers.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
+            .worker_startup_timeout_secs(self.routing.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.routing.worker_startup_delay)
+            .worker_startup_check_interval_secs(self.routing.worker_startup_check_interval)
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)

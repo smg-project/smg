@@ -147,7 +147,7 @@ fn run_golden_test(mode: &str, image_name: &str) {
         _ => panic!("Unknown test mode: {mode}"),
     };
 
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     let diff = max_diff(&golden, &result.encoder_input.as_f32());
     println!("{mode} - {image_name} image - Max difference: {diff:.6}");
@@ -339,7 +339,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -488,7 +488,7 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -730,7 +730,7 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -898,7 +898,7 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -1091,7 +1091,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check aspect_ratios
     let rust_aspect_ratios: Vec<(i64, i64)> = match result.model_specific.get("aspect_ratios") {
@@ -1269,7 +1269,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = PixtralProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check image_sizes from model_specific
     let rust_image_sizes: Vec<(usize, usize)> = match result.model_specific.get("image_sizes") {

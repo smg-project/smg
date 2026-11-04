@@ -67,19 +67,40 @@ The serving keys and the store URLs need not be on the command line, where other
 - The Oracle credentials have no file source; the launcher and the binary (`--oracle-dsn`, `--oracle-user`, `--oracle-password`) read the `ATP_*` variables when the flags are absent, as they always did, and use them exactly as set, with no trimming: a Secret for them is made with `--from-literal`, or from a file that ends without a newline (a password that ends in one is a wrong password to the database).
 - No value is echoed: a refusal names the sources and the path, and `--help` shows no value of a variable. The Rust binary's start-up record (`CREDENTIAL SOURCES`) names each secret's source as `flag`, `env` or `file`; the Python launcher emits no such record.
 
+## Tokenizer
+
+`smg.tokenizer.Tokenizer` is the tokenizer SMG serves with, for Python: the same Rust code (`llm-tokenizer`) loads the checkpoint, encodes and decodes, so a training or evaluation pipeline gets the token ids SMG feeds the model without running a gateway.
+
+```python
+from smg.tokenizer import Tokenizer
+
+tokenizer = Tokenizer("/models/Qwen3-8B")  # what the gateway loads
+ids = tokenizer.encode("hello world")  # list[int]
+batch = tokenizer.encode_batch(texts)  # parallel, on a Rust thread pool
+text = tokenizer.decode(ids)
+```
+
+- Parity holds against a gateway built from the same smg commit (`Tokenizer.smg_build`; compare the gateway's `--version-verbose`) that loads the same files: pass what the gateway loads (its tokenizer path, else its model path; `config.json` and `generation_config.json` beside the tokenizer files select the stop ids, `eos_token_ids`).
+- `encode` adds the post-processor's special tokens by default (`add_special_tokens=True`), as `transformers` does; SMG encodes `/v1/completions`, `/generate` and `/v1/tokenize` text with `add_special_tokens=False` and embedding input with `True`. Special-token text in the input encodes to the special token. `decode` takes a list, a numpy array or a torch tensor of ids, and does not apply `transformers`' `clean_up_tokenization_spaces`. A legacy-format Llama-class `tokenizer.json` (a `Prepend` normalizer) is encoded as `transformers`' `LlamaTokenizer` class builds it, the pipeline the engines load, which can differ from `transformers` 4.x in leading-space pieces.
+- Short calls (an encode of less than 16 KiB, a decode of fewer than 4096 ids) run on the calling thread with the GIL held, as Hugging Face's `tokenizers` runs a single encode: releasing it would cost more than the work, since a thread that releases the GIL takes it back only when the thread running Python meanwhile gives it up (up to the 5 ms switch interval later). Encode many texts with `encode_batch`. The batch methods, longer texts and loading release the GIL and run on the binding's own Rust thread pool, one per process, of `SMG_TOKENIZER_THREADS` threads (one when `TOKENIZERS_PARALLELISM` is off, rayon's default otherwise: `RAYON_NUM_THREADS`, else the CPU count); each worker of a multi-process pipeline builds its own on first use, so size it for the workers it runs beside. A process forked after the parent used the tokenizer (torch `DataLoader` workers, `datasets.map(num_proc=...)`) builds a pool of its own, where rayon's global pool would leave it hanging.
+- Hub model ids download as the gateway downloads them (`HF_TOKEN`, `HF_HOME` and `HF_ENDPOINT` are honoured, the revision is always `main`); for a pinned revision or an offline host, download with `huggingface_hub.snapshot_download` and pass the directory.
+- Importing the tokenizer loads the whole `smg` extension: its jemalloc settings apply to the Rust side's allocations (`_RJEM_MALLOC_CONF` overrides them), and the wheel's dependencies (`grpcio`, `grpcio-health-checking`, `setproctitle`, `PyYAML`) come with it.
+
 ## Directory Structure
 
 ```
 bindings/python/
 ├── src/                    # Source code (src layout)
 │   ├── lib.rs              # Rust/PyO3 bindings implementation
+│   ├── tokenizer.rs        # The tokenizer binding (Rust half)
 │   └── smg/                # Python source code
 │       ├── __init__.py
 │       ├── cli.py          # CLI entry point
 │       ├── serve.py        # smg serve implementation
 │       ├── launch_router.py
 │       ├── router.py
-│       └── router_args.py
+│       ├── router_args.py
+│       └── tokenizer.py    # smg.tokenizer.Tokenizer
 ├── tests/                  # Python unit tests
 ├── Cargo.toml              # Rust package configuration
 ├── pyproject.toml          # Python package configuration

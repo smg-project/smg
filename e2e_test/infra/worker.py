@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
     ENV_VLLM_SERVICER_IMPL,
+    ENV_WORKER_RUST_LOG,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
@@ -38,6 +39,7 @@ from .constants import (
     host_port,
     moriio_host,
     sglang_transfer_backend,
+    trtllm_runs_engines_own_servicer,
     vllm_kv_backend,
     vllm_moriio_backend,
     vllm_moriio_mode,
@@ -72,14 +74,6 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # the exception marker only: a level word inside the message (torch's NCCL error
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
-
-# The engines whose gRPC server carries no ``grpc.health.v1`` service:
-# TRT-LLM, whose upstream server registers its own service and no standard
-# health (it answers its own proto's HealthCheck, the one the gateway
-# probes). For these alone a ready channel that answers UNIMPLEMENTED counts
-# as the worker, until the harness asks their own HealthCheck instead. The
-# scripted mock worker hosts the standard service like the engine servicers.
-ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
 
 
 def _excerpt(line: str) -> str:
@@ -140,9 +134,6 @@ class Worker:
     # KV transfer backend for this PD worker ("nixl", "mooncake" or "moriio");
     # None takes the lane's default, so one fleet can mix transports.
     kv_backend: str | None = None
-    # In-engine RL control app port (TokenSpeed gRPC workers). None allocates
-    # one at launch; SMG discovers it from the engine's server info.
-    rl_control_port: int | None = None
     # Environment for the engine process on top of the infra's own settings
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
@@ -164,6 +155,8 @@ class Worker:
     # handle, the ports) runs once per start, and once for a worker that never
     # started; a second ``stop`` finds nothing to do.
     _torn_down: bool = field(default=False, repr=False)
+    # Last native model answer during this wait, for identity failure diagnostics.
+    _last_trt_model_identity: tuple[str, str] | None = field(default=None, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -383,9 +376,6 @@ class Worker:
         from .process_utils import release_port
 
         release_port(self.port)
-        if self.rl_control_port is not None:
-            release_port(self.rl_control_port)
-            self.rl_control_port = None
         if self.bootstrap_port is not None:
             release_port(self.bootstrap_port)
         if self.nixl_port is not None:
@@ -451,6 +441,10 @@ class Worker:
         if self.engine == "tokenspeed":
             # TokenSpeed moves KV over Mooncake only; the lane-wide setting
             # exists for the engines that have a choice.
+            return "mooncake"
+        if self.engine == "mock":
+            # The mock engine moves no KV; the gateway pairs it on the
+            # scheduler wire it speaks, whose one transport is Mooncake.
             return "mooncake"
         return vllm_kv_backend()
 
@@ -713,6 +707,17 @@ class Worker:
             cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
         else:
             cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
+        # The disaggregation role, as the engines take theirs: a prefill
+        # worker also binds the bootstrap port the gateway is told of, where
+        # the probe finds it; both advertise the role in their server args.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+            if self.mode != ConnectionMode.GRPC:
+                raise ValueError("the mock engine's prefill and decode roles are gRPC workers")
+            cmd += ["--worker-type", self.worker_type.value]
+            if self.worker_type == WorkerType.PREFILL and self.bootstrap_port is not None:
+                cmd += ["--bootstrap-base-port", str(self.bootstrap_port)]
+        elif self.worker_type == WorkerType.ENCODE:
+            raise ValueError("the mock engine has no encode role")
         return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
@@ -780,9 +785,10 @@ class Worker:
     def _build_tokenspeed_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TokenSpeed gRPC server command.
 
-        Launches ``smg_grpc_servicer.tokenspeed`` which wraps TokenSpeed's
-        ``AsyncLLM`` behind the dedicated ``tokenspeed.grpc.scheduler``
-        service.
+        Launches ``smg_grpc_servicer.tokenspeed``, which serves the dedicated
+        ``tokenspeed.grpc.scheduler`` service over the engine's ranks (the
+        Rust servicer under ``--servicer-impl rust``, the harness's setting
+        for TokenSpeed).
         """
         cmd = [
             "python3",
@@ -807,14 +813,10 @@ class Worker:
             # ``logprobs=True`` requests get real per-token data back.
             "--enable-output-logprobs",
         ]
-        # Only the port: without ``--rl-control-host`` the engine binds the
-        # control app on its own ``--host`` (the harness address the gateway
-        # already dials) and advertises that URL; a wildcard bind would not be
-        # advertised at all. ``ts serve`` always enables the control app, so
-        # every lane runs the engine as deployed.
-        if self.rl_control_port is None:
-            self.rl_control_port = get_engine_port()
-        cmd.extend(["--rl-control-port", str(self.rl_control_port)])
+        # No ``--rl-control-port``: the pinned engine has no in-engine control
+        # app any more (its RL and weight operations are control calls on its
+        # wire), and every flag this entrypoint does not own goes to the
+        # engine's parser, which rejects what it no longer defines.
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:
@@ -833,16 +835,39 @@ class Worker:
         return cmd
 
     def _build_trtllm_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
-        """Build TensorRT-LLM gRPC server command."""
-        # Create config file to enable xgrammar guided decoding
-        config_path = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
-        )
-        config = {"guided_decoding_backend": "xgrammar"}
-        config.update(spec.get("trtllm_extra_config", {}))
-        yaml.dump(config, config_path, default_flow_style=False)
-        config_path.close()
+        """Build the TensorRT-LLM gRPC worker command: this repository's
+        launcher serving the Rust servicer when the lane says ``rust``
+        (``E2E_TRTLLM_SERVICER_IMPL``), else the engine's own gRPC server.
 
+        The engine release the lane pins carries no servicer switch, so for
+        this engine the choice is the command, not a variable the engine's
+        entrypoint reads (``_build_env`` exports it all the same, for the
+        launcher). Both commands take the same LLM API options, xgrammar
+        guided decoding and the spec's ``trtllm_extra_config``, from a YAML
+        file.
+        """
+        options = {"guided_decoding_backend": "xgrammar"}
+        options.update(spec.get("trtllm_extra_config", {}))
+        if trtllm_runs_engines_own_servicer():
+            return self._build_trtllm_engine_cmd(model_path, tp_size, spec, options)
+        return self._build_trtllm_launcher_cmd(model_path, tp_size, spec, options)
+
+    @staticmethod
+    def _write_trtllm_options(options: dict) -> str:
+        """Write the LLM API options to a YAML file (the shape of the engine's
+        ``--extra_llm_api_options``, which the launcher's ``--llm-args @file``
+        reads as well) and return its path."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, prefix="trtllm_"
+        ) as options_file:
+            yaml.dump(options, options_file, default_flow_style=False)
+        return options_file.name
+
+    def _build_trtllm_engine_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """The engine's own gRPC server (``tensorrt_llm.commands.serve``),
+        with the spec's ``trtllm_args`` as its CLI's flags."""
         cmd = [
             "python3",
             "-m",
@@ -859,12 +884,48 @@ class Worker:
             "--tp_size",
             str(tp_size),
             "--extra_llm_api_options",
-            config_path.name,
+            self._write_trtllm_options(options),
         ]
         extra = spec.get("trtllm_args", [])
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_trtllm_launcher_cmd(
+        self, model_path: str, tp_size: int, spec: dict, options: dict
+    ) -> list[str]:
+        """This repository's launcher (``smg_grpc_servicer.trtllm``) with the
+        Rust servicer. The LLM API's keywords ride ``--llm-args``, the
+        parallel size among them: the launcher has no engine flags of its
+        own and hands none through, so a spec's ``trtllm_args`` (the engine
+        CLI's flags) are refused by name rather than dropped."""
+        extra = spec.get("trtllm_args", [])
+        if extra:
+            raise ValueError(
+                f"the spec's trtllm_args {extra} are the engine CLI's flags, which the "
+                "launcher does not take; name the LLM API keyword in trtllm_extra_config"
+            )
+        options = {**options, "tensor_parallel_size": tp_size}
+        return [
+            "python3",
+            "-m",
+            "smg_grpc_servicer.trtllm",
+            "--model",
+            model_path,
+            "--host",
+            DEFAULT_HOST,
+            "--port",
+            str(self.port),
+            "--servicer-impl",
+            "rust",
+            "--llm-args",
+            f"@{self._write_trtllm_options(options)}",
+        ]
+
+    def _serves_no_standard_health(self) -> bool:
+        """Only TRT's own server uses native health RPCs; its Rust servicer
+        hosts ``grpc.health.v1`` like the other repository servicers."""
+        return self.engine == "trtllm" and trtllm_runs_engines_own_servicer()
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the worker process."""
@@ -989,6 +1050,12 @@ class Worker:
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
 
+        # The lane's tracing filter for the Rust servicer this worker hosts (the
+        # per-request line's target, say); the shell's own RUST_LOG yields to it,
+        # the worker's extra_env below still wins.
+        if worker_rust_log := os.environ.get(ENV_WORKER_RUST_LOG, "").strip():
+            env["RUST_LOG"] = worker_rust_log
+
         if self.extra_env:
             env.update(self.extra_env)
         return env
@@ -1082,22 +1149,18 @@ class Worker:
                 self._log_file = None
             raise
 
-    def grpc_serving(self, timeout: float = 5.0) -> bool:
-        """One health answer of a gRPC worker: ``True`` on SERVING from its
-        ``grpc.health.v1`` service, ``False`` on anything else: a NOT_SERVING,
-        a refused connection, and an answer without the health service.
+    def grpc_serving(self, timeout: float = 5.0, *, _deadline: float | None = None) -> bool:
+        """Require the engine's health answer, within one probe deadline.
 
-        Every engine servicer of this repository hosts the health service, so
-        UNIMPLEMENTED is not this worker speaking. An engine binds its port
-        only once it has loaded its model, and another process's listener can
-        sit on the number until then: an HTTP/2 server's 404 reads as
-        UNIMPLEMENTED through grpc, and the ready channel behind it is the
-        stranger's, which the nightly PD sweep once certified as a decode
-        worker. One engine's server carries no such service, TRT-LLM
-        (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
-        HealthCheck, the one the gateway probes); for it alone a ready
-        channel that answers UNIMPLEMENTED counts.
+        TRT's own server must answer its HealthCheck and name the launched
+        model. The Rust TRT servicer and other repository servicers require
+        the standard SERVING answer.
         """
+        native_trt = self._serves_no_standard_health()
+        if native_trt:
+            deadline = time.monotonic() + timeout
+            if _deadline is not None:
+                deadline = min(deadline, _deadline)
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -1108,23 +1171,46 @@ class Worker:
 
         channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
+            if native_trt:
+                try:
+                    from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
+                except ImportError as error:
+                    raise RuntimeError("TRT gRPC health check requires smg-grpc-proto") from error
+
+                # The launcher's positional model argument; configuration errors
+                # must propagate instead of looking like a not-yet-ready worker.
+                expected_model = get_model_spec(self.model_id)["model"]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                stub = trtllm_service_pb2_grpc.TrtllmServiceStub(channel)
+                try:
+                    health = stub.HealthCheck(
+                        trtllm_service_pb2.HealthCheckRequest(), timeout=remaining
+                    )
+                    if health.status != "OK":
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    info = stub.GetModelInfo(
+                        trtllm_service_pb2.GetModelInfoRequest(), timeout=remaining
+                    )
+                    self._last_trt_model_identity = (info.model_id, expected_model)
+                    return (
+                        time.monotonic() < deadline
+                        and isinstance(expected_model, str)
+                        and bool(expected_model.strip())
+                        and info.model_id == expected_model
+                    )
+                except Exception:
+                    return False
+
             try:
                 stub = health_pb2_grpc.HealthStub(channel)
                 request = health_pb2.HealthCheckRequest(service="")
                 response = stub.Check(request, timeout=timeout)
                 return response.status == health_pb2.HealthCheckResponse.SERVING
-            except grpc.RpcError as e:
-                if (
-                    self.engine in ENGINES_WITHOUT_GRPC_HEALTH
-                    and hasattr(e, "code")
-                    and e.code() == grpc.StatusCode.UNIMPLEMENTED
-                ):
-                    try:
-                        grpc.channel_ready_future(channel).result(timeout=timeout)
-                        return True
-                    except Exception:
-                        return False
-                return False
             except Exception:
                 return False
         finally:
@@ -1132,16 +1218,41 @@ class Worker:
 
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
-        start = time.perf_counter()
-        while time.perf_counter() - start < timeout:
+        if self.engine == "trtllm":
+            self._last_trt_model_identity = None
+            deadline = time.monotonic() + timeout
+            while (remaining := deadline - time.monotonic()) > 0:
+                self.raise_if_exited()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if (
+                    self.grpc_serving(timeout=min(5.0, remaining), _deadline=deadline)
+                    and time.monotonic() < deadline
+                ):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(HEALTH_CHECK_INTERVAL, remaining))
+            # A launcher can exit while the final probe consumes the deadline.
+            # Prefer its exit status and log over a generic readiness timeout.
             self.raise_if_exited()
-            if self.grpc_serving():
-                return
-            time.sleep(HEALTH_CHECK_INTERVAL)
+        else:
+            start = time.perf_counter()
+            while time.perf_counter() - start < timeout:
+                self.raise_if_exited()
+                if self.grpc_serving():
+                    return
+                time.sleep(HEALTH_CHECK_INTERVAL)
 
+        identity_detail = ""
+        if self.engine == "trtllm" and self._last_trt_model_identity is not None:
+            actual_model, expected_model = self._last_trt_model_identity
+            if actual_model != expected_model:
+                identity_detail = f"; answered as {actual_model!r}, expected {expected_model!r}"
         raise TimeoutError(
             f"gRPC worker {self.model_id} on port {self.port} "
-            f"did not become healthy within {timeout}s"
+            f"did not become healthy within {timeout}s{identity_detail}"
         )
 
 

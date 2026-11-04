@@ -128,6 +128,7 @@ fn messages_spec() -> MessagesResponseSpec {
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parser_names: None,
     }
 }
 
@@ -428,6 +429,7 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
                 &tx,
                 None,
                 None,
+                &[],
             )
             .await;
             drop(tx);

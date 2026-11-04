@@ -146,7 +146,7 @@ impl VisionPreProcessor for KimiK3Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         moonvit::preprocess(self.params, images, self.transparent_bg)
     }
@@ -230,7 +230,7 @@ mod tests {
         // 56x56 is factor-aligned (28*2), so there is no padding to confuse the
         // check, and 8px squares tile it exactly.
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         let values: Vec<f32> = result
             .encoder_input_flat()
@@ -269,7 +269,7 @@ mod tests {
         // "both values present" check, hence this one.
         let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         // Patch 0 is the top-left 14x14 block, channel-first: element 0 is
         // R at (0,0), and element 8 is R at (8,0) — the next square over.
@@ -282,7 +282,7 @@ mod tests {
     fn test_opaque_pixels_are_untouched() {
         let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         let opaque = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([255, 255, 255, 255])));
-        let result = p.preprocess(&[opaque]).unwrap();
+        let result = p.preprocess(&[&opaque]).unwrap();
         assert!(
             result
                 .encoder_input_flat()
@@ -297,7 +297,7 @@ mod tests {
         let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         // Half-opaque black over the board: 0.5*0 + 0.5*bg → 90 or 127.
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 128])));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
         let values: Vec<f32> = result
             .encoder_input_flat()
             .iter()
@@ -322,10 +322,10 @@ mod tests {
         let image = DynamicImage::from(RgbImage::from_pixel(196, 140, Rgb([37, 211, 102])));
 
         let k3 = KimiK3Processor::from_preprocessor_config(&config)
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap();
         let k25 = KimiK25Processor::from_preprocessor_config(&config)
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
 
         assert_eq!(k3.encoder_input.shape(), k25.encoder_input.shape());
@@ -341,7 +341,7 @@ mod tests {
         );
         let p = KimiK3Processor::from_preprocessor_config(&config);
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image]).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
         assert!(
             result
                 .encoder_input_flat()
@@ -363,7 +363,7 @@ mod tests {
 
         let image = DynamicImage::from(RgbaImage::from_pixel(560, 560, Rgba([0, 0, 0, 0])));
         let after = KimiK3Processor::from_preprocessor_config(&config)
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap();
 
         config.extra.insert(
@@ -371,7 +371,7 @@ mod tests {
             json!("before_resize"),
         );
         let before = KimiK3Processor::from_preprocessor_config(&config)
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
 
         assert_eq!(after.encoder_input.shape(), before.encoder_input.shape());
@@ -410,7 +410,7 @@ mod tests {
 
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
         let result = KimiK3Processor::from_preprocessor_config(&config)
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
         assert!(
             result
@@ -443,7 +443,7 @@ mod tests {
                     Rgba([hidden[0], hidden[1], hidden[2], 0])
                 };
             }
-            p.preprocess(&[DynamicImage::from(img)]).unwrap()
+            p.preprocess(&[&DynamicImage::from(img)]).unwrap()
         });
 
         assert_eq!(

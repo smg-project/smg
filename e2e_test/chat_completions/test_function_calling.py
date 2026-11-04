@@ -119,8 +119,8 @@ class TestOpenAIServerFunctionCalling:
     """Tests for OpenAI-compatible function calling with the llama tool parser.
 
     On the mock engine each test states the model's answer first, in the
-    llama parser's syntax (``mock_answers`` does nothing on a real engine);
-    the ``n=2`` cases skip there, the mock answering one choice per request.
+    llama parser's syntax (``mock_answers`` does nothing on a real engine), one
+    answer per choice the request samples.
 
     On a real engine the cases that leave the choice to the model
     (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
@@ -547,12 +547,17 @@ class TestOpenAIServerFunctionCalling:
         assert function_name == "get_weather", "Function name should be 'get_weather'"
         assert "city" in args_obj, "Function arguments should have 'city'"
 
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
-    def test_streaming_multiple_choices_finish_reason(self, model, api_client):
+    def test_streaming_multiple_choices_finish_reason(self, model, api_client, mock_answers):
         """Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
 
         This tests the fix for the bug where only the last index got a finish_reason chunk.
         """
+        # One answer per choice; under a required choice the gateway constrains
+        # the engine to a JSON array of calls and reads it as one.
+        for _ in range(2):
+            mock_answers.enqueue(
+                '[{"name": "get_current_weather", "parameters": {"location": "Los Angeles, CA"}}]'
+            )
         tools = [
             {
                 "type": "function",
@@ -683,12 +688,14 @@ class TestOpenAIServerFunctionCalling:
             "Final response of no function calling should have finish_reason 'stop'"
         )
 
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
-    def test_streaming_multiple_choices_without_tools(self, model, api_client):
+    def test_streaming_multiple_choices_without_tools(self, model, api_client, mock_answers):
         """Test: Verify that each choice gets its own finish_reason chunk without tool calls.
 
         This tests the fix for regular content streaming with multiple choices.
         """
+        # One answer per choice.
+        mock_answers.enqueue("Hello.")
+        mock_answers.enqueue("Hi.")
 
         messages = [{"role": "user", "content": "Say hello in one word."}]
 

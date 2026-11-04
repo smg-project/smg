@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install CPU test dependencies
-        run: python -m pip install pytest pyyaml ./e2e_test
+        run: python -m pip install pytest pyyaml ./e2e_test ./crates/grpc_client/python
       # Unlike the main GPU workflow, this accepts PRs against stacked branches.
       # Only the explicitly selected CPU fixtures run; no engine is installed.
       - name: Run available CI tooling contracts

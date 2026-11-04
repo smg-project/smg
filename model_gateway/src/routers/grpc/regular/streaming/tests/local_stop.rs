@@ -287,6 +287,7 @@ fn messages_spec() -> MessagesResponseSpec {
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parser_names: None,
     }
 }
 
