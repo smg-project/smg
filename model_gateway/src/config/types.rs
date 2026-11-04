@@ -499,8 +499,9 @@ pub struct RouterConfig {
     /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
-    /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
-    /// by inflight; the remainder bucket under `tenant="other"`).
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
     pub priority_scheduler_tenant_metric_top_n: u32,
     /// Enable per-tenant LLM token/request rate limiting. When false
@@ -1422,13 +1423,6 @@ pub enum PolicyConfig {
         /// separate values.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
-        /// Per-worker waiting-queue cap: skip workers whose reported waiting
-        /// requests, plus dispatches since their last poll, have reached this
-        /// count; when every candidate is at the cap, selection fails and the
-        /// request falls to the router's admission queue. `0` disables. Set
-        /// below the engine's max batch size.
-        #[serde(default)]
-        max_waiting_requests: u32,
     },
 
     #[serde(rename = "bucket")]
@@ -1582,6 +1576,13 @@ fn default_least_load_throughput() -> f64 {
 /// sets this key is refused with that knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
+/// least_load's per-worker waiting-queue cap of earlier releases. The router's
+/// overload veto skips a worker whose waiting queue has reached
+/// `worker_overload_waiting_requests` for every policy and, under
+/// `worker_overload_shed`, refuses an all-vetoed pool; a policy configuration
+/// that still sets this key is refused with those knobs named.
+pub const RETIRED_LEAST_LOAD_CAP_KEY: &str = "max_waiting_requests";
+
 /// The checked reader. `remote = "Self"` leaves the derived reader on the
 /// type as an inherent `PolicyConfig::deserialize`, which a path call would
 /// pick over this trait method and so skip the check: read a policy through
@@ -1595,6 +1596,13 @@ impl<'de> Deserialize<'de> for PolicyConfig {
             return Err(de::Error::custom(format!(
                 "`{RETIRED_POLICY_INTERVAL_KEY}` is no longer a policy setting: the load monitor \
                  polls every worker at `load_monitor_interval_secs`; remove the key"
+            )));
+        }
+        if value.get(RETIRED_LEAST_LOAD_CAP_KEY).is_some() {
+            return Err(de::Error::custom(format!(
+                "`{RETIRED_LEAST_LOAD_CAP_KEY}` is no longer a least_load setting: the overload \
+                 veto skips a worker at `worker_overload_waiting_requests` waiting requests for \
+                 every policy, and `worker_overload_shed` refuses an all-vetoed pool; remove the key"
             )));
         }
         PolicyConfig::deserialize(value).map_err(de::Error::custom)
@@ -3968,6 +3976,32 @@ discovery:
         let json: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type": "power_of_two"})).unwrap();
         assert_eq!(json.name(), "power_of_two");
+    }
+
+    #[test]
+    fn a_retired_least_load_waiting_cap_is_refused_with_the_overload_veto_named() {
+        let err =
+            serde_yaml::from_str::<PolicyConfig>("type: least_load\nmax_waiting_requests: 48\n")
+                .expect_err("the retired key is refused")
+                .to_string();
+        assert!(err.contains("max_waiting_requests"), "{err}");
+        assert!(err.contains("worker_overload_waiting_requests"), "{err}");
+        assert!(err.contains("worker_overload_shed"), "{err}");
+        let json = serde_json::from_value::<PolicyConfig>(
+            serde_json::json!({"type": "least_load", "max_waiting_requests": 0}),
+        )
+        .expect_err("even zero is refused: the key no longer exists")
+        .to_string();
+        assert!(json.contains("max_waiting_requests"), "{json}");
+        let least_load: PolicyConfig =
+            serde_yaml::from_str("type: least_load\nmean_prefill_tokens: 2048\n").unwrap();
+        assert!(matches!(
+            least_load,
+            PolicyConfig::LeastLoad {
+                mean_prefill_tokens: 2048,
+                ..
+            }
+        ));
     }
 
     #[test]

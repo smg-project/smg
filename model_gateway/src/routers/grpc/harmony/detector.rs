@@ -18,15 +18,11 @@ impl HarmonyDetector {
         // The cards are read in place: this runs on every chat request, for
         // every worker of the model, and `models()` would clone each card.
         let harmony_card = worker.any_model(&mut |model_card| {
-            // 1. Check architectures for GptOssForCausalLM
-            model_card
-                .architectures
-                .iter()
-                .any(|arch| arch == "GptOssForCausalLM")
-                // 2. Check hf_model_type for gpt_oss
-                || model_card.hf_model_type.as_deref() == Some("gpt_oss")
-                // 3. Check model id for gpt-oss substring
-                || Self::is_harmony_model(&model_card.id)
+            is_harmony_card(
+                &model_card.architectures,
+                model_card.hf_model_type.as_deref(),
+                &model_card.id,
+            )
         });
         if harmony_card {
             return true;
@@ -68,6 +64,17 @@ impl HarmonyDetector {
             .iter()
             .any(|worker| Self::is_harmony_worker(worker.as_ref()))
     }
+}
+
+/// Whether a model card describes a Harmony/GPT-OSS model: an architecture
+/// `GptOssForCausalLM`, the Hugging Face model type `gpt_oss`, or an id that
+/// contains `gpt-oss` (any case). `pub` (re-exported as
+/// `routers::grpc::is_harmony_card`) so that the Python binding reads a
+/// checkpoint's `config.json` by the rule serving reads a worker's cards by.
+pub fn is_harmony_card(architectures: &[String], hf_model_type: Option<&str>, id: &str) -> bool {
+    architectures.iter().any(|arch| arch == "GptOssForCausalLM")
+        || hf_model_type == Some("gpt_oss")
+        || HarmonyDetector::is_harmony_model(id)
 }
 
 #[cfg(test)]

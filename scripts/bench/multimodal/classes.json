@@ -1,0 +1,227 @@
+{
+  "_doc": "The multimodal baseline classes. Paths are relative to the corpus directory (the fixture repository's corpus/ tree: images/<set>/<name>, videos/<set>/<name>, audios/<set>/<name>). A class with a `synthetic` recipe is materialized from its `from` file by the entry point when the corpus has no public file of that shape yet; its provenance stays the source file's. `processor` names the model family whose preprocessing the class runs through; `config` names the directory holding that checkpoint's config.json and preprocessor configs (given to the entry point as --config-dir <name>=<dir>).",
+  "configs": {
+    "qwen3_vl": {
+      "checkpoint": "Qwen/Qwen3-VL-8B-Instruct",
+      "files": [
+        "config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json"
+      ]
+    },
+    "qwen3_asr": {
+      "checkpoint": "Qwen/Qwen3-ASR-1.7B",
+      "files": [
+        "config.json",
+        "preprocessor_config.json"
+      ]
+    }
+  },
+  "classes": [
+    {
+      "name": "jpeg-0.3mp",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/coco/coco-00001-ffe0f0ce.jpg"
+      ],
+      "note": "a 640x426 photo, 4:2:0"
+    },
+    {
+      "name": "jpeg-1mp",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "images/derived/huge-jpeg-coco-02771-4a563683.jpg",
+        "resize": [
+          1216,
+          816
+        ],
+        "format": "jpeg",
+        "quality": 90,
+        "subsampling": "4:2:0"
+      },
+      "note": "the 4096x2304 photo scaled to 1216x816 (0.99 MP); no 1 MP photo in the corpus yet"
+    },
+    {
+      "name": "jpeg-4mp",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "images/derived/huge-jpeg-coco-02771-4a563683.jpg",
+        "resize": [
+          2432,
+          1632
+        ],
+        "format": "jpeg",
+        "quality": 90,
+        "subsampling": "4:2:0"
+      },
+      "note": "the same photo at 2432x1632 (3.97 MP)"
+    },
+    {
+      "name": "jpeg-12mp",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "images/derived/huge-jpeg-coco-02771-4a563683.jpg",
+        "resize": [
+          4224,
+          2816
+        ],
+        "format": "jpeg",
+        "quality": 90,
+        "subsampling": "4:2:0"
+      },
+      "note": "the same photo at 4224x2816 (11.9 MP)"
+    },
+    {
+      "name": "png-screenshot-1080p",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "images/websight/websight-00001-02f1d586.jpg",
+        "resize": [
+          1920,
+          1080
+        ],
+        "format": "png"
+      },
+      "note": "a rendered web page (2560x1440 JPEG in the corpus) at 1920x1080 as an 8-bit RGB PNG"
+    },
+    {
+      "name": "png-screenshot-4k",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "images/websight/websight-00001-02f1d586.jpg",
+        "resize": [
+          3840,
+          2160
+        ],
+        "format": "png"
+      },
+      "note": "the same page at 3840x2160"
+    },
+    {
+      "name": "png-rgba",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/derived/png-rgba-coco-01512-5730afc6.png"
+      ],
+      "note": "640x511 RGBA, composited over white as the engine's loader does"
+    },
+    {
+      "name": "jpeg-cmyk",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/derived/cmyk-pillow-coco-01911-81b9254c.jpg"
+      ],
+      "note": "640x480 CMYK (Adobe APP14)"
+    },
+    {
+      "name": "jpeg-exif-rotated",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/derived/exif6-jpeg-coco-02261-ffd34ec0.jpg"
+      ],
+      "note": "427x640 stored, orientation 6 (rotate 90)"
+    },
+    {
+      "name": "webp",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/derived/webp-q85-coco-00001-ffe0f0ce.webp"
+      ],
+      "note": "640x426 lossy WebP, quality 85"
+    },
+    {
+      "name": "gif",
+      "kind": "image",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/derived/gif-static-coco-02805-349e8a6b.gif"
+      ],
+      "note": "640x427 static GIF, palette"
+    },
+    {
+      "name": "batch-10",
+      "kind": "batch",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "images/coco/coco-00001-ffe0f0ce.jpg",
+        "images/coco/coco-00002-f3a2974c.jpg",
+        "images/coco/coco-00003-a4cd7f45.jpg",
+        "images/coco/coco-00004-5c0e559c.jpg",
+        "images/coco/coco-00005-1dd31e90.jpg",
+        "images/coco/coco-00006-83981537.jpg",
+        "images/coco/coco-00007-d5b79e7f.jpg",
+        "images/coco/coco-00008-c2aa138e.jpg",
+        "images/coco/coco-00009-1c67b783.jpg",
+        "images/coco/coco-00010-24bb77a3.jpg"
+      ],
+      "note": "ten photos of about 0.3 MP in one request"
+    },
+    {
+      "name": "video-10s",
+      "kind": "video",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "videos/clips/mp4-h264-720p-10s.mp4"
+      ],
+      "note": "1280x720, 10 s, H.264",
+      "repeats": 3
+    },
+    {
+      "name": "video-60s",
+      "kind": "video",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "synthetic": {
+        "from": "videos/clips/mp4-h264-30s.mp4",
+        "concat": 2,
+        "format": "mp4"
+      },
+      "note": "the 30 s clip (320x240) played twice; no 60 s clip in the corpus yet",
+      "repeats": 3
+    },
+    {
+      "name": "video-10min",
+      "kind": "video",
+      "processor": "qwen3_vl",
+      "config": "qwen3_vl",
+      "files": [
+        "videos/clips/mp4-h264-600s.mp4"
+      ],
+      "note": "320x240, 600 s, H.264",
+      "repeats": 3
+    },
+    {
+      "name": "audio-30s",
+      "kind": "audio",
+      "processor": "qwen3_asr",
+      "config": "qwen3_asr",
+      "files": [
+        "audios/librispeech/librispeech-00319-b4b8df67.flac"
+      ],
+      "note": "16 kHz mono FLAC, 30.6 s"
+    }
+  ]
+}

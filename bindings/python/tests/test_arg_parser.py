@@ -1849,6 +1849,36 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestHelpGroups:
+    """The launcher's --help lists an option under the heading of what it bounds."""
+
+    @staticmethod
+    def options_by_group() -> dict[str, set[str]]:
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return {
+            group.title: {
+                spelling for action in group._group_actions for spelling in action.option_strings
+            }
+            for group in parser._action_groups
+            if group.title is not None
+        }
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--worker-startup-timeout-secs",
+            "--worker-startup-delay",
+            "--worker-startup-check-interval",
+        ],
+    )
+    def test_the_worker_start_up_bounds_are_worker_configuration_options(self, flag):
+        """They bound every worker's start-up, not a disaggregated deployment's."""
+        groups = self.options_by_group()
+        assert flag in groups["Worker Configuration"], f"{flag} is listed under another heading"
+        assert flag not in groups["PD/EPD Disaggregation"]
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""
@@ -1927,6 +1957,21 @@ class TestPrometheusHostDefault:
         RouterArgs.add_cli_args(parser, use_router_prefix=True)
         args = RouterArgs.from_cli_args(parser.parse_args([]), use_router_prefix=True)
         assert args.prometheus_host is None
+
+
+class TestPrometheusBucketsReachNativeValidation:
+    """The launcher passes the bucket list through; the native router refuses
+    the shapes the binary refuses at parse time, before anything binds."""
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "1", "0.5"])
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            Router.from_args(args).start()
+
+    def test_a_bucket_bound_of_zero_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "0", "1"])
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            Router.from_args(args).start()
 
 
 class TestControlPlaneApiKeyEntryErrors:

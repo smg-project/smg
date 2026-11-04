@@ -27,6 +27,10 @@ impl RankLoads for FixedLoads {
     fn engine_link(&self) -> &EngineLink {
         &self.engine
     }
+
+    fn rank_count(&self) -> usize {
+        1
+    }
 }
 
 #[test]
@@ -192,6 +196,7 @@ async fn a_relay_that_gave_up_has_nothing_to_wait_for() {
         .subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
         .err()
         .expect("a down relay refuses");
@@ -760,6 +765,7 @@ impl Lab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 
@@ -772,6 +778,7 @@ impl Lab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: true,
+            loads_only: false,
         })
     }
 
@@ -1737,6 +1744,7 @@ impl RankLab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 }
@@ -2138,6 +2146,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
         let stream = relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         });
         (stream, started.elapsed())
     });

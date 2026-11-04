@@ -365,3 +365,46 @@ def test_interleaved_order(mod):
 
 def test_executable_bit(mod):
     assert os.access(SCRIPT, os.X_OK)
+
+
+# ---------------------------------------------------------------- other units
+
+
+def test_a_zero_base_median_is_judged_on_the_absolute_values(mod, gates):
+    gated_zero = results({"encode/zero": [0.0, 0.0, 0.0]}, {"encode/zero": [0.0, 0.0, 0.0]})
+    assert verdicts(mod, gates, gated_zero) == {"encode/zero": "ok"}
+    grown = results({"encode/zero": [0.0, 0.0, 0.0]}, {"encode/zero": [2.0, 2.0, 2.0]})
+    assert verdicts(mod, gates, grown) == {"encode/zero": "regression"}
+    text = mod.markdown(grown, mod.compare(grown, gates))
+    assert "| - |" in text  # no relative change to print
+    # An increase whose runs overlap the base's is suspect, as beyond a threshold.
+    overlapping = results({"encode/zero": [0.0, 0.0, 0.0]}, {"encode/zero": [2.0, 0.0, 2.0]})
+    assert verdicts(mod, gates, overlapping) == {"encode/zero": "suspect (runs overlap)"}
+    # An idle-subtracted count can go below zero: separated, that is an improvement.
+    below = results({"encode/zero": [0.0, 0.0, 0.0]}, {"encode/zero": [-1.0, -1.0, -1.0]})
+    assert verdicts(mod, gates, below) == {"encode/zero": "improvement"}
+
+
+def test_a_negative_base_median_keeps_the_direction(mod, gates):
+    # An idle-subtracted count can sit below zero on both sides: a rise from -2 to -1 is a
+    # rise still (a regression when the runs are separated), a fall an improvement, and the
+    # spread is never negative; the change is read against the base median's magnitude.
+    rose = results({"encode/neg": [-2.0, -2.0, -2.0]}, {"encode/neg": [-1.0, -1.0, -1.0]})
+    assert mod.compare(rose, gates)[0].change == pytest.approx(0.5)
+    assert verdicts(mod, gates, rose) == {"encode/neg": "regression"}
+    fell = results({"encode/neg": [-1.0, -1.0, -1.0]}, {"encode/neg": [-2.0, -2.0, -2.0]})
+    assert verdicts(mod, gates, fell) == {"encode/neg": "improvement"}
+    noisy = results({"encode/neg": [-2.2, -2.0, -1.8]}, {"encode/neg": [-2.0, -2.0, -2.0]})
+    assert mod.compare(noisy, gates)[0].spread == pytest.approx(0.2)
+
+
+def test_a_results_file_that_names_its_unit_prints_plain_values(mod, gates):
+    res = results({"encode/calls": [300.0, 301.0]}, {"encode/calls": [290.0, 289.0]})
+    res["unit"] = ""
+    text = mod.markdown(res, mod.compare(res, gates))
+    assert "| 300.5 (300 - 301) | 289.5 (289 - 290) |" in text
+    res["unit"] = "KiB"
+    text = mod.markdown(res, mod.compare(res, gates))
+    assert "| 300.5 KiB (300 KiB - 301 KiB) |" in text
+    timed = results({"encode/t": [1500.0, 1600.0]}, {"encode/t": [1550.0, 1650.0]})
+    assert "1.55 µs (1.5 µs - 1.6 µs)" in mod.markdown(timed, mod.compare(timed, gates))

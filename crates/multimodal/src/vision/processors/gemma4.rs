@@ -510,7 +510,7 @@ impl VisionPreProcessor for Gemma4Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -518,10 +518,14 @@ impl VisionPreProcessor for Gemma4Processor {
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
-            .map(|image| encode(image, params, &self.pixels))
+            .map(|image| encode(*image, params, &self.pixels))
             .collect::<Result<Vec<_>, _>>()?;
         let (tensor, positions, tokens) = stack(encoded, params)?;
-        let sizes = images.iter().map(GenericImageView::dimensions).collect();
+        let sizes = images
+            .iter()
+            .copied()
+            .map(GenericImageView::dimensions)
+            .collect();
         Ok(PreprocessedEncoderInputs::new(tensor, tokens, sizes)
             .with_extra("pixel_position_ids", positions))
     }
@@ -662,7 +666,7 @@ mod tests {
         let image = solid(512, 512, [255, 0, 51]);
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[1, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256]);
@@ -694,7 +698,7 @@ mod tests {
         let images = [solid(64, 64, [1, 2, 3]), solid(1920, 1080, [4, 5, 6])];
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[2, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256, 264]);
@@ -785,12 +789,12 @@ mod tests {
         let no_resize: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"do_resize": false})).unwrap();
         let no_resize = Gemma4Processor::from_config_for(&no_resize, Modality::Image).unwrap();
-        assert!(no_resize.preprocess(&[solid(100, 100, [0; 3])]).is_err());
-        let aligned = no_resize.preprocess(&[solid(96, 48, [0; 3])]).unwrap();
+        assert!(no_resize.preprocess(&[&solid(100, 100, [0; 3])]).is_err());
+        let aligned = no_resize.preprocess(&[&solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
         assert!(no_resize
-            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])])
+            .preprocess(&[&solid(48 * 60, 48 * 20, [0; 3])])
             .is_err());
     }
 

@@ -130,17 +130,25 @@ async def serve_grpc(
             callback signature is a public contract.
     """
 
-    # One flag selects the Rust request path (--servicer-impl, this package's
-    # flag on SGLang's parser, else the environment); the entrypoint and every
-    # ServerArgs flag stay the same, and the Router cannot tell them apart.
+    # The switch picks the request path (--servicer-impl, this package's flag
+    # on SGLang's parser, else the environment, else the launcher's default);
+    # the entrypoint and every ServerArgs flag stay the same, and the Router
+    # cannot tell them apart.
     try:
         impl, origin = servicer_impl_source(server_args)
         logger.info("Servicer implementation: %s (source=%s)", impl, origin)
         if impl == "rust":
             if on_request_manager_ready is not None:
-                logger.warning(
-                    "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
-                    "the Rust servicer has no request manager to wire it to",
+                # The state of every launch on the Rust servicer, so a note; a
+                # warning when the launch asked for the sidecar's own /metrics
+                # (--enable-metrics), which nothing serves then.
+                asked_for_metrics = bool(getattr(server_args, "enable_metrics", False))
+                (logger.warning if asked_for_metrics else logger.info)(
+                    "The Rust servicer has no request manager to wire SGLang's HTTP sidecar "
+                    "to (its /metrics, admin and profiling endpoints stay off); its own "
+                    "metrics endpoint is --metrics-port / %s; the Python servicer "
+                    "(--servicer-impl python / %s=python) keeps the sidecar",
+                    METRICS_PORT_ENV,
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))

@@ -14,6 +14,7 @@ import dataclasses
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -1455,6 +1456,13 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     assert asyncio.run(rust.serve_rust(args)) == 0
     assert recorded["server"].events == ["ready:False"]
     assert callable(recorded["supervise_kwargs"]["warmup"])
+    # The server and the plan share the process's nonce: the hold admits the
+    # pass's own ids and nothing a client could spell.
+    nonce = recorded["server"].kwargs["warmup_nonce"]
+    assert re.fullmatch(r"[0-9a-z]+", nonce)
+    plan = recorded["supervise_kwargs"]["warmup"].args[0]
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(request_id.startswith(f"smg-warmup-{nonce}-") for request_id in ids)
 
     monkeypatch.setenv(rust.WARMUP_ENV, "off")
     assert asyncio.run(rust.serve_rust(args)) == 0

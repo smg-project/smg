@@ -13,7 +13,9 @@ Usage:
     sync_versions.py <ref> <gateway-version>
 
     ref               the release's tag or branch (its version files are read with git show)
-    gateway-version   the version the gateway and its mirrors take (X.Y.Z)
+    gateway-version   the version the gateway and its mirrors take: X.Y.Z after a final, or main's
+                      next development version X.Y.Z-dev when a release branch is cut (main reads
+                      above everything the branch will release: 1.15.0-dev once release/1.14 exists)
 
 Exit code 0 = the files follow the release (a report of what moved is printed), 1 = a rewrite
 did not take.
@@ -27,7 +29,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-VERSION_PARTS = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
+VERSION_PARTS = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+)|-(dev))?$")
 
 
 def _checker():
@@ -42,12 +44,16 @@ def _checker():
 
 
 def version_key(version: str) -> tuple[int, ...]:
-    """Orders X.Y.Z and X.Y.Z-rc.N: a final sorts above its candidates."""
+    """Orders X.Y.Z, X.Y.Z-rc.N and X.Y.Z-dev: a final sorts above its candidates, a candidate above the
+    development version of the same number (1.15.0-dev < 1.15.0-rc.1 < 1.15.0), as cargo and PEP 440 order them."""
     match = VERSION_PARTS.match(version)
     if not match:
-        raise SystemExit(f"sync_versions: not a version: {version!r} (X.Y.Z or X.Y.Z-rc.N)")
-    major, minor, patch, rc = match.groups()
-    return (int(major), int(minor), int(patch), 1 if rc is None else 0, int(rc or 0))
+        raise SystemExit(
+            f"sync_versions: not a version: {version!r} (X.Y.Z, X.Y.Z-rc.N or X.Y.Z-dev)"
+        )
+    major, minor, patch, rc, dev = match.groups()
+    stage = 0 if dev else 1 if rc else 2
+    return (int(major), int(minor), int(patch), stage, int(rc or 0))
 
 
 def main(argv: list[str] | None = None) -> int:

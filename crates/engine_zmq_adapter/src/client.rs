@@ -1,6 +1,6 @@
 //! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
-//! surface (vLLM and TokenSpeed today), plus the connect entry points and
-//! metadata reads.
+//! surface, one connection for any of the four dialects of [`ZmqDialect`],
+//! plus the connect entry points and metadata reads.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,6 +16,7 @@ use engine_zmq_client::{
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
         handshake::{EngineCoreReadyResponse, REQUEST_KIND_ENCODE},
+        kv_transfer::KvTransferStats,
         sglang::{request::SglangRequest, SglangProtocol},
         tokenspeed::{
             request::TokenSpeedRequestType, wire_carries_control_calls, TokenSpeedProtocol,
@@ -1162,7 +1163,7 @@ impl ZmqEngineClient {
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
                 .mm_inputs
-                .as_ref()
+                .as_deref()
                 .map(encode_media_refs)
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?
@@ -1646,6 +1647,30 @@ impl ZmqEngineClient {
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
             loads,
             ..Default::default()
+        }
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`] ([`Client::keep_kv_transfer`]): the taker
+    /// asks once; a client nobody drains keeps none.
+    pub fn keep_kv_transfer(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.keep_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.keep_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.keep_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.keep_kv_transfer(),
+        }
+    }
+
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call ([`Client::take_kv_transfer`]), by engine index; empty for an
+    /// engine family whose wire carries none or a client that never asked.
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.take_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.take_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.take_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.take_kv_transfer(),
         }
     }
 

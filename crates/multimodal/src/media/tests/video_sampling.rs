@@ -946,7 +946,7 @@ fn mp4_child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, u
 
 /// The payload bounds of the box at the end of `kinds`, each kind
 /// the first of its name inside the previous one.
-fn mp4_payload(bytes: &[u8], kinds: &[[u8; 4]]) -> (usize, usize) {
+pub(super) fn mp4_payload(bytes: &[u8], kinds: &[[u8; 4]]) -> (usize, usize) {
     let (mut start, mut end) = (0, bytes.len());
     for kind in kinds {
         let (offset, header, size) = mp4_child(bytes, start, end, *kind);

@@ -8,7 +8,6 @@ set -euo pipefail
 if [ -f "$HOME/.cargo/env" ]; then
     source "$HOME/.cargo/env"
 fi
-export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
 
 # Activate venv if it exists
 if [ -f ".venv/bin/activate" ]; then

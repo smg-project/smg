@@ -92,7 +92,7 @@ fn is_store_prefill_worker(worker: &dyn Worker) -> bool {
 /// worker on another connector (NIXL, MoRI-IO, a store, none) carries its own
 /// side channel or meets its partners in the store and is never handed a
 /// bootstrap port, and neither is a decode or a regular worker.
-pub(crate) fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSource)> {
+fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSource)> {
     if is_store_prefill_worker(worker) {
         return None;
     }
@@ -170,11 +170,7 @@ pub(crate) async fn probe_partners_bootstrap_port(
 
 /// Connect to `host:port` once, within `timeout`. `Ok` when the port accepted
 /// the connection; otherwise why it did not, in words for a log line.
-pub(crate) async fn probe_bootstrap_port(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<(), String> {
+async fn probe_bootstrap_port(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
     let address = format!("{host}:{port}");
     match tokio::time::timeout(timeout, TcpStream::connect(address.as_str())).await {
         Ok(Ok(_connected)) => Ok(()),
@@ -222,7 +218,7 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
 /// registered without one) and the error, and one count under
 /// `smg_pd_rendezvous_failures_total{leg, phase="probe"}`; a port that did is
 /// a DEBUG line. Returns whether the port accepted.
-pub(crate) async fn report_bootstrap_port_probe(
+async fn report_bootstrap_port_probe(
     url: &str,
     worker_type: &'static str,
     host: &str,

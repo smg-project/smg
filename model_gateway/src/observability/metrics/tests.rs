@@ -40,15 +40,13 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
             "missing path {path}: {rendered}"
         );
     }
-    for reason in ["not_nfc", "piece_declined"] {
-        assert!(
-            rendered.lines().any(|line| {
-                line.starts_with("smg_tokenizer_encode_fallbacks_total{")
-                    && line.contains(&format!("reason=\"{reason}\""))
-            }),
-            "missing reason {reason}: {rendered}"
-        );
-    }
+    assert!(
+        rendered.lines().any(|line| {
+            line.starts_with("smg_tokenizer_encode_fallbacks_total{")
+                && line.contains("reason=\"piece_declined\"")
+        }),
+        "missing reason piece_declined: {rendered}"
+    );
 }
 
 #[test]
@@ -1613,4 +1611,25 @@ fn time_per_request_records() {
     handles::force_on_this_thread(Some(true));
     time("handles kept per thread");
     handles::reset();
+}
+
+#[test]
+fn a_duration_bucket_list_is_refused_unless_finite_positive_and_strictly_ascending() {
+    for (buckets, reason) in [
+        (vec![0.5, f64::NAN], "finite number above 0"),
+        (vec![0.5, f64::INFINITY], "finite number above 0"),
+        (vec![0.0, 1.0], "finite number above 0"),
+        (vec![-1.0], "finite number above 0"),
+        (vec![1.0, 1.0], "ascend strictly"),
+        (vec![2.0, 1.0], "ascend strictly"),
+    ] {
+        let err = PrometheusConfig::validate_duration_buckets(&buckets)
+            .expect_err("the list is refused")
+            .to_string();
+        assert!(err.contains(reason), "{buckets:?}: {err}");
+    }
+    for buckets in [&[][..], &[0.1, 0.5, 2.0][..]] {
+        PrometheusConfig::validate_duration_buckets(buckets)
+            .expect("an empty or strictly ascending list is accepted");
+    }
 }

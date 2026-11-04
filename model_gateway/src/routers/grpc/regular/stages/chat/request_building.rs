@@ -246,6 +246,7 @@ impl ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
 
         Ok(BuildOutput {
             plan,

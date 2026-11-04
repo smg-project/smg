@@ -424,7 +424,6 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
-    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
@@ -885,6 +884,27 @@ class RouterArgs:
             default=RouterArgs.admin_host,
             help="Bind host of the admin listener (needs --admin-port). Defaults to --host.",
         )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.worker_startup_timeout_secs,
+            help=(
+                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
+                " Large models can take significant time to load into GPU memory."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-delay",
+            type=int,
+            default=RouterArgs.worker_startup_delay,
+            help="Grace period in seconds before the first worker startup check (default: 0)",
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-check-interval",
+            type=int,
+            default=RouterArgs.worker_startup_check_interval,
+            help="Interval in seconds between checks for worker startup",
+        )
 
         # Routing policy configuration
         routing_group.add_argument(
@@ -989,16 +1009,6 @@ class RouterArgs:
             help=(
                 "Mean prefill tokens for least_load's in-flight estimate when a"
                 " request's token count is unknown at routing"
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}least-load-max-waiting-requests",
-            type=int,
-            default=RouterArgs.least_load_max_waiting_requests,
-            help=(
-                "Per-worker waiting-queue cap for least_load: skip workers whose"
-                " reported waiting requests (plus dispatches since their last"
-                " poll) have reached this count; 0 disables"
             ),
         )
         routing_group.add_argument(
@@ -1571,27 +1581,6 @@ class RouterArgs:
                 "Maximum time in seconds a request may wait for Prefill admission."
                 " Defaults to 60 when Prefill admission is enabled."
             ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-timeout-secs",
-            type=int,
-            default=RouterArgs.worker_startup_timeout_secs,
-            help=(
-                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
-                " Large models can take significant time to load into GPU memory."
-            ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-delay",
-            type=int,
-            default=RouterArgs.worker_startup_delay,
-            help="Grace period in seconds before the first worker startup check (default: 0)",
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-check-interval",
-            type=int,
-            default=RouterArgs.worker_startup_check_interval,
-            help="Interval in seconds between checks for worker startup",
         )
         parser.add_argument(
             f"--{prefix}job-queue-capacity",
@@ -2305,7 +2294,11 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
-            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+            help=(
+                "Cap on the distinct tenants the scheduler's clamp and unknown-priority "
+                "counters keep as tenant series of their own (the first N seen; the remainder "
+                'bucket under tenant="other").'
+            ),
         )
 
         # Tenant rate limit configuration

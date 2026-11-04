@@ -20,7 +20,7 @@ use symphony::{formats::qwen3, CallSyntax};
 use super::{
     super::*,
     eof::{chat_spec, chunk, complete, dispatch, processor, scripted_stream, CharacterTokenizer},
-    symphony::{assigned, assigned_message, scraped, series_line},
+    symphony_chat::{assigned, assigned_message, scraped, series_line},
 };
 use crate::routers::{
     common::retry::is_retryable_response,

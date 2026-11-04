@@ -66,9 +66,14 @@ The whole-JSON promise breaks under three names, so that an allowance is exact: 
 (a call ended with no arguments fragment at all), `tolerated-json` (arguments whose shape closed,
 or one scalar token, but which JSON refuses: a value left out, a trailing comma, an escape JSON
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
-committed prefix of a value that never closed). `json-prefix` holds until a call's
-`Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being JSON;
-from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
+committed prefix of a value that never closed). Every fragment is judged by the crate's own judge
+of a JSON prefix (`json::Prefix`, the one the readers hold their fragments to), which refuses at the
+first byte a strict reader refuses and from the backslash of an escape no continuation completes:
+a refusal the partial parser shares is `json-prefix`, and one it tolerates (the shapes above, the
+short `\u` included) is `tolerated-json` at the fragment that brings it, as it would be at the
+call's end, so that an allowance means one thing at a cut and at a close. `json-prefix` holds until
+a call's `Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being
+JSON; from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
 `pythonic-cut-call-closed` is a pythonic call that ended without its own `)` and had its object
 closed for it (one that said nothing and left it open is a breach of the whole-JSON names, so no
 event carries two names). A name is a shape, from any reader on every target, not a reader's own.

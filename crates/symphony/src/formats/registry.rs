@@ -513,6 +513,11 @@ mod tests {
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
+        // DeepSeek-V4-Pro ships the V4-Flash group's encoder, tokenizer and configuration files:
+        // the V4 table, by the member's name alone as well.
+        for v4 in ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-v4-pro"] {
+            assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
+        }
         // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
         // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
         for v3_2 in [

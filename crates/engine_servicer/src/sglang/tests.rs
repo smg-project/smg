@@ -1376,7 +1376,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
         input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
     });
     request.sampling_params.as_mut().unwrap().n = 2;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         pixel_values: Some(sg::TensorData {
             data: pixels.clone().into(),
@@ -1399,7 +1399,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             length: 3,
         }],
         ..Default::default()
-    });
+    }));
     let _stream = h
         .client
         .generate(request)
@@ -1569,11 +1569,11 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         input_ids: vec![1, 7, 7, 7, 2],
     });
     request.sampling_params.as_mut().unwrap().n = n;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         image_urls: vec![IMAGE_REFERENCE.to_string()],
         ..Default::default()
-    });
+    }));
     request
 }
 
@@ -3451,7 +3451,10 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
 /// Two connected schedulers whose handshakes each say a data-parallel size
 /// of one: the zero-filled `GetLoads` before the first snapshot names the
 /// ranks the servicer serves (one per connected scheduler), as the pinned
-/// request path counts them.
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
 #[tokio::test]
 async fn the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();
@@ -3474,6 +3477,92 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 struct NativeVideoProcessor;
@@ -3495,7 +3584,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
             assert!(refs.pixel_values.is_none());
             assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
             request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
-            request.mm_inputs = Some(sg::MultimodalInputs {
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
                 modalities: vec!["video".into()],
                 pixel_values: Some(sg::TensorData {
                     data: vec![0; 32].into(),
@@ -3522,7 +3611,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
                     length: 3,
                 }],
                 ..Default::default()
-            });
+            }));
             Ok(request)
         })
     }
@@ -3548,10 +3637,10 @@ async fn native_video_refs_expand_before_scheduler_dispatch() {
     );
     let mut request = generate_request("native-video", true, Vec::new());
     request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     let _stream = h.client.generate(request).await.unwrap().into_inner();
     let received = recv_add(&mut h.engine_in).await;
     assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
@@ -3584,10 +3673,10 @@ async fn abort_during_native_media_processing_never_submits_to_scheduler() {
     })
     .await;
     let mut request = generate_request("pending-media", true, Vec::new());
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         image_urls: vec!["https://example.test/image.png".into()],
         ..Default::default()
-    });
+    }));
     let mut client = h.client.clone();
     #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
     let pending = tokio::spawn(async move { client.generate(request).await });
@@ -3638,10 +3727,10 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     .await;
     let mut original = generate_request("reuse-video", true, Vec::new());
     original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    original.mm_inputs = Some(sg::MultimodalInputs {
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     original.disaggregated_params = Some(sg::DisaggregatedParams {
         bootstrap_host: "127.0.0.1".into(),
         bootstrap_port: 8998,
@@ -3674,7 +3763,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     )
     .await;
     let mut decode = original.clone();
-    decode.media_identity = Some(identity.clone());
+    decode.media_identity = Some(Box::new(identity.clone()));
     let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
     let wire = recv_add(&mut d.engine_in).await;
     assert_eq!(wire.input_ids, prefill_wire.input_ids);
@@ -3706,7 +3795,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
                 .clear(),
             _ => bad.version += 1,
         }
-        req.media_identity = Some(bad);
+        req.media_identity = Some(Box::new(bad));
         fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
         let wire = recv_add(&mut d.engine_in).await;
         assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);

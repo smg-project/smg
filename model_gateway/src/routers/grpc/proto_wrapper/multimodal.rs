@@ -77,11 +77,7 @@ impl MultimodalData {
     /// Bytes of media the request body itself carries.
     pub fn inline_bytes(&self) -> usize {
         match self {
-            Self::Sglang(data) => {
-                data.image_data.iter().map(Vec::len).sum::<usize>()
-                    + data.pixel_values.len()
-                    + tensor_bytes(&data.model_specific_tensors)
-            }
+            Self::Sglang(data) => data.inline_bytes(),
             Self::Vllm(data) => data.inline_bytes(),
             Self::Trtllm(data) => data.image_data.iter().map(Vec::len).sum(),
             Self::TokenSpeed(data) => data
@@ -119,6 +115,7 @@ impl VllmMultimodalData {
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
 #[derive(Debug)]
 pub struct SglangMultimodalData {
+    pub extra_batches: Vec<SglangMultimodalData>,
     pub modality: String,
     pub image_data: Vec<Vec<u8>>,
     pub pixel_values: Vec<u8>,
@@ -265,8 +262,28 @@ impl TokenSpeedTensor {
 }
 
 impl SglangMultimodalData {
-    /// Convert to SGLang proto MultimodalInputs.
-    pub fn into_proto(self) -> sglang::MultimodalInputs {
+    fn inline_bytes(&self) -> usize {
+        self.image_data.iter().map(Vec::len).sum::<usize>()
+            + self.pixel_values.len()
+            + tensor_bytes(&self.model_specific_tensors)
+            + self
+                .extra_batches
+                .iter()
+                .map(Self::inline_bytes)
+                .sum::<usize>()
+    }
+
+    /// Convert to the request's mm_inputs and extra_mm_inputs, as for vLLM.
+    pub fn into_protos(mut self) -> (sglang::MultimodalInputs, Vec<sglang::MultimodalInputs>) {
+        let extras = std::mem::take(&mut self.extra_batches)
+            .into_iter()
+            .map(Self::into_proto)
+            .collect();
+        (self.into_proto(), extras)
+    }
+
+    /// Convert one modality batch to SGLang proto MultimodalInputs.
+    pub(super) fn into_proto(self) -> sglang::MultimodalInputs {
         let model_specific_tensors = self
             .model_specific_tensors
             .into_iter()
