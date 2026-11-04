@@ -143,6 +143,13 @@ def test_scope_stays_opt_in_with_typed_inputs():
     assert flag["type"] == "boolean" and flag["default"] is False
     scope = _scope()
     assert scope["if"] == "inputs.final_environment_check"
+    setups = {step["name"]: step for step in document["jobs"]["run"]["steps"] if "name" in step}
+    assert setups["Setup SGLang backend"]["if"] == (
+        "inputs.engine == 'sglang' && !inputs.final_environment_check"
+    )
+    assert (
+        setups["Setup AMD SGLang in its fixed ROCm image"]["if"] == "inputs.final_environment_check"
+    )
     assert scope["env"] == {
         "CHECK_ENGINE": "${{ inputs.engine }}",
         "CHECK_VENDOR": "${{ inputs.gpu_vendor }}",
@@ -226,6 +233,13 @@ def test_evidence_exposes_exact_artifact_outputs():
             "${{ steps." + upload + ".outputs.artifact-id != '' && "
             "steps.evidence-identity.outputs." + internal + " || '' }}"
         )
+    complete_upload = [
+        step for step in job["steps"] if step.get("id") == "upload-complete-evidence"
+    ]
+    assert len(complete_upload) == 1
+    assert complete_upload[0]["if"] == (
+        "always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'"
+    )
     uploads = [
         step["with"]["name"]
         for step in job["steps"]
