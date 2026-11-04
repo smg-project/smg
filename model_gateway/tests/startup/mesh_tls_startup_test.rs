@@ -429,13 +429,28 @@ fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
     )
 }
 
+/// `signal` (as `kill` spells it) to `gateway`'s process.
+fn signal(gateway: &Gateway, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &gateway.child.id().to_string()])
+        .status()
+        .expect("send the signal");
+    assert!(status.success(), "kill {signal} failed: {status}");
+}
+
 /// SIGTERM to `gateway`, the way an orchestrator stops it.
 fn terminate(gateway: &Gateway) {
-    let status = Command::new("kill")
-        .args(["-TERM", &gateway.child.id().to_string()])
-        .status()
-        .expect("send SIGTERM");
-    assert!(status.success(), "kill -TERM failed: {status}");
+    signal(gateway, "-TERM");
+}
+
+/// `gateway` held (SIGSTOP) until [`resume`]: it runs nothing meanwhile,
+/// probes nobody and answers nothing.
+fn pause(gateway: &Gateway) {
+    signal(gateway, "-STOP");
+}
+
+fn resume(gateway: &Gateway) {
+    signal(gateway, "-CONT");
 }
 
 /// What the mesh listener made of a handshake.
@@ -734,6 +749,128 @@ fn a_worker_registered_on_one_gateway_is_served_through_the_other() {
     assert!(
         wait_until(MESH_TIMEOUT, || lists_no_worker_at(&b, &engine.url)),
         "{} kept the worker {} removed: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+}
+
+/// An owner that comes back under its name after a crash registers its
+/// worker under a fresh id, and the key of its earlier life, which it could
+/// not tombstone, gossips back to it from its peer: it tombstones that key,
+/// so the peer rebinds its import to the new id and the owner's later
+/// removal reaches it. Before, the peer kept the import under the old id for
+/// good, deaf to the owner's tombstones.
+///
+/// The peer is paused across the restart so its probes do not see the owner
+/// go: a probe that fails marks the owner Suspected, a second Down, and no
+/// probe heals a Down member (a gap of the membership layer's own, not of
+/// this lane). The test reads the worker lane; the restart must be invisible
+/// to the membership for that.
+#[test]
+fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_peer_follows_its_removal(
+) {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    // The worker's bind is a port pick too: under the guard, like the
+    // gateways' (the guard is not re-entrant, so it is let go before them).
+    let engine = {
+        let _serial = serial();
+        MockHttpWorker::start()
+    };
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[&engine.url]);
+
+    let mut first_id = None;
+    assert!(
+        wait_until(STARTUP_TIMEOUT, || {
+            first_id = healthy_worker_id(&a, &engine.url);
+            first_id.is_some()
+        }),
+        "{} did not register its worker: {:?}\n{}",
+        a.name,
+        workers_on(&a),
+        logs(&[&a, &b])
+    );
+    let first_id = first_id.expect("registered");
+    assert!(
+        wait_until(MESH_TIMEOUT, || healthy_worker_id(&b, &engine.url)
+            .as_deref()
+            == Some(first_id.as_str())),
+        "{} did not import {}'s worker under its id {first_id}: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+
+    // The crash and the return, on the same name and ports, with the peer
+    // held meanwhile. The ports are free for a moment: no other launch of
+    // this binary may pick them.
+    let first_life = a.log();
+    let ports = [a.http_port, a.mesh_port, a.metrics_port];
+    pause(&b);
+    let a = {
+        let _serial = serial();
+        drop(a);
+        let mut a = spawn_gateway("nodea", &certs, ports, None, Mesh::Plain, &[&engine.url]);
+        let failure = a.start_up(&certs, &probe, Mesh::Plain);
+        assert!(
+            failure.is_none() && !a.lost_a_port(),
+            "{} did not come back after its crash: {failure:?}\n{}\n--- {} before the crash ---\n{first_life}",
+            a.name,
+            logs(&[&a]),
+            a.name
+        );
+        a
+    };
+    resume(&b);
+
+    let mut second_id = None;
+    assert!(
+        wait_until(STARTUP_TIMEOUT, || {
+            second_id = healthy_worker_id(&a, &engine.url);
+            second_id.is_some()
+        }),
+        "{} did not register its worker again: {:?}\n{}",
+        a.name,
+        workers_on(&a),
+        logs(&[&a, &b])
+    );
+    let second_id = second_id.expect("registered again");
+    assert_ne!(
+        second_id, first_id,
+        "a gateway back from a crash registers its worker under a fresh id"
+    );
+
+    // The owner tombstones the key of its earlier life; the peer's import
+    // follows the live key.
+    assert!(
+        wait_until(MESH_TIMEOUT, || healthy_worker_id(&b, &engine.url)
+            .as_deref()
+            == Some(second_id.as_str())),
+        "{} kept its import of {}'s worker under the earlier id {first_id}: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+
+    let removal = http_request(
+        a.http_port,
+        "DELETE",
+        &format!("/workers/{second_id}"),
+        None,
+    );
+    assert!(
+        is_success(removal.as_deref()),
+        "{} did not accept the removal of its worker: {removal:?}\n{}",
+        a.name,
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(MESH_TIMEOUT, || lists_no_worker_at(&b, &engine.url)),
+        "{} kept the worker {} removed after its restart: {:?}\n{}",
         b.name,
         a.name,
         workers_on(&b),
