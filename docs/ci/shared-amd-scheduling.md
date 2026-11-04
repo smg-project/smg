@@ -29,7 +29,8 @@ made effective by this document or the cron patch. Unknown eligible work must
 remain queued. Do not substitute one global benchmark cutoff for all profiles.
 
 Every enabled AMD PR/manual job follows the same Router reservation. The hosted
-configuration check prints only effective boolean gate values; it uses no GPU.
+configuration check prints effective boolean gate values and runs the holder
+fault controls using isolated temporary locks on Ubuntu; it uses no GPU.
 Do not enable AMD PR jobs solely to test scheduling. Repository and organization
 configuration may both affect the resolved value.
 
