@@ -68,7 +68,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
+`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.extraArgs`), not for `--policy`.
 
 ### Workers
 
