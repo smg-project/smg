@@ -91,10 +91,16 @@ impl std::fmt::Display for DiscoveryProvider {
 
 /// A value's spelling on the command line is its one spelling: `Display` writes
 /// the name clap parses, so a message that names a flag's value prints what the
-/// flag takes. A variant clap skips has no name and does not format.
-fn write_flag_value<V: ValueEnum>(value: &V, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let name = value.to_possible_value().ok_or(std::fmt::Error)?;
-    f.write_str(name.get_name())
+/// flag takes. A variant clap skips has no command-line name and prints as its
+/// `Debug` form, so a formatter that has not failed never reports an error.
+fn write_flag_value<V: ValueEnum + std::fmt::Debug>(
+    value: &V,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match value.to_possible_value() {
+        Some(name) => f.write_str(name.get_name()),
+        None => write!(f, "{value:?}"),
+    }
 }
 
 #[derive(Parser, Debug)]
