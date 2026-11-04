@@ -52,7 +52,7 @@ expected = [
     "e2e_test/chat_completions", "--ignore=e2e_test/benchmarks",
     "--ignore=e2e_test/bindings_go", "-k", "original_case",
     "--reruns", "2", "--reruns-delay", "5", "-s", "-vv",
-    "--junitxml=e2e-logs/sglang-pd.xml",
+    "--junitxml=e2e-logs/sglang-results.xml",
 ]
 if args != expected:
     reject()

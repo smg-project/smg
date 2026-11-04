@@ -1,6 +1,9 @@
 """Exercise the actual opt-in scope Bash without a container or backend."""
 
+import json
+import os
 import re
+import sys
 import subprocess
 from pathlib import Path
 
@@ -146,3 +149,103 @@ def test_scope_stays_opt_in_with_typed_inputs():
         "CHECK_VENDOR": "${{ inputs.gpu_vendor }}",
         "CHECK_IMAGE": "${{ inputs.container_image }}",
     }
+
+
+def _evidence_step():
+    steps = [step for step in _document()["jobs"]["run"]["steps"]
+             if step.get("id") == "evidence-identity"]
+    assert len(steps) == 1
+    return steps[0]
+
+
+def _evidence_identity(tmp_path, inputs, attempt="1"):
+    work = tmp_path / str(len(list(tmp_path.iterdir())))
+    work.mkdir()
+    binary = work / "bin"
+    binary.mkdir()
+    (binary / "python3").symlink_to(sys.executable)
+    output = work / "output"
+    script = work / "identity.bash"
+    script.write_text(_evidence_step()["run"])
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
+        env={"PATH": str(binary), "EVIDENCE_INPUTS": json.dumps(inputs),
+             "GITHUB_RUN_ATTEMPT": attempt, "GITHUB_OUTPUT": str(output),
+             "PYTHONDONTWRITEBYTECODE": "1"},
+        cwd=work, capture_output=True, text=True, timeout=3,
+    )
+    assert result.returncode == 0, result.stderr
+    fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert set(fields) == {"complete_artifact", "worker_artifact"}
+    complete = fields["complete_artifact"].removeprefix("sglang-complete-results-")
+    worker = fields["worker_artifact"].removeprefix("e2e-worker-logs-")
+    assert complete == worker
+    assert re.fullmatch(r"[A-Za-z0-9_.-]+", complete)
+    contract, actual_attempt, unique = complete.rsplit("-", 2)
+    assert actual_attempt == attempt
+    assert re.fullmatch(r"[0-9a-f]{32}", unique)
+    return contract, unique, fields
+
+
+def test_evidence_exposes_exact_artifact_outputs():
+    document = _document()
+    trigger = document.get("on", document.get(True))["workflow_call"]
+    job = document["jobs"]["run"]
+    for public, internal in [("complete_evidence_artifact", "complete_artifact"),
+                             ("worker_log_artifact", "worker_artifact")]:
+        assert trigger["outputs"][public]["value"] == "${{ jobs.run.outputs." + public + " }}"
+        assert job["outputs"][public] == "${{ steps.evidence-identity.outputs." + internal + " }}"
+    uploads = [step["with"]["name"] for step in job["steps"]
+               if step.get("uses", "").startswith("actions/upload-artifact@")]
+    assert "${{ steps.evidence-identity.outputs.complete_artifact }}" in uploads
+    assert "${{ steps.evidence-identity.outputs.worker_artifact }}" in uploads
+    assert _evidence_step()["env"] == {"EVIDENCE_INPUTS": "${{ toJSON(inputs) }}"}
+
+
+def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
+    inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/chat_completions"}
+    first = _evidence_identity(tmp_path, inputs)
+    second = _evidence_identity(tmp_path, inputs)
+    assert first[0] == second[0]
+    assert "sglang-e2e_test-chat_completions" in first[0]
+    assert first[1] != second[1]
+    assert first[2] != second[2]
+
+
+def test_evidence_contract_ignores_json_key_order(tmp_path):
+    inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/router"}
+    assert _evidence_identity(tmp_path, inputs)[0] == _evidence_identity(
+        tmp_path, dict(reversed(list(inputs.items())))
+    )[0]
+
+
+@pytest.mark.parametrize("field", ["test_dirs", "test_filter", "kv_backend", "connection_mode",
+                                   "servicer_impl", "mm_processing"])
+def test_evidence_contract_distinguishes_effective_rows(tmp_path, field):
+    inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/chat_completions"}
+    changed = {**inputs, field: "changed"}
+    assert _evidence_identity(tmp_path, inputs)[0] != _evidence_identity(tmp_path, changed)[0]
+
+
+def test_evidence_attempt_and_source_looking_json_remain_data(tmp_path):
+    marker = tmp_path / "must-not-execute"
+    inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/chat: weird/paths",
+              "test_filter": "$(touch " + str(marker) + "); `false`\n'\""}
+    first = _evidence_identity(tmp_path, inputs, "1")
+    second = _evidence_identity(tmp_path, inputs, "2")
+    assert first[0] == second[0]
+    assert first[2] != second[2]
+    assert not marker.exists()
+
+
+def test_evidence_identity_retains_opt_in_or_failure_boundary():
+    step = _evidence_step()
+    assert step["if"] == (
+        "always() && ((inputs.final_environment_check && inputs.engine == 'sglang' "
+        "&& inputs.gpu_vendor == 'amd') || failure() || cancelled())"
+    )
+    names = [step.get("name") for step in _document()["jobs"]["run"]["steps"]]
+    assert names.index("Identify row evidence") < names.index("Check final AMD SGLang environment")
+    assert names.index("Check final AMD SGLang environment") < names.index(
+        "Stop every process this job started"
+    )
