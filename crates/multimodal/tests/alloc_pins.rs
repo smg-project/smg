@@ -13,7 +13,9 @@
 //!
 //! `MM_PINS_RECORD=1 cargo test -p llm-multimodal --test alloc_pins -- --nocapture`
 //! prints the table instead of asserting, for re-pinning after a change that moves a
-//! count on purpose.
+//! count on purpose. The preprocess calls are pinned per resize row path (scalar, NEON):
+//! a re-pin records each count on its own architecture, and a failing run prints its
+//! table with the failure.
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
@@ -259,16 +261,37 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 ///   not.
 /// - copy: one call, one large buffer: the gateway's per-frame clone before the processor
 ///   (the first copy to go; its pin falls to zero calls when it does).
-/// - preprocess: the calls of the resize, the layout and the wire write of one image, and
-///   the large buffers among them (the same under either decoder: both hand the
-///   processor RGB8 pixels).
+/// - preprocess: the calls of the resize, the layout and the wire write of one image, one
+///   count per resize row path (`Calls`), and the large buffers among them (the same
+///   under either decoder and on either path: both hand the processor RGB8 pixels).
 /// - serialize: zero: the wire bytes move.
 struct Pin {
     class: &'static str,
     decode_large: usize,
     copy: (usize, usize),
-    preprocess: (usize, usize),
+    preprocess_calls: Calls,
+    preprocess_large: usize,
     serialize_calls: usize,
+}
+
+/// A call count per resize row path. The resize's rows run through NEON on aarch64
+/// (`vision/torch_resample.rs`): its width pass collects wide taps and a scratch row of
+/// its own, and its height pass skips the scalar path's sums buffer, so a class counts
+/// one or two calls more or fewer than on the scalar path. Both counts are recorded on
+/// their own architecture; CI runs this test on each.
+struct Calls {
+    scalar: usize,
+    neon: usize,
+}
+
+impl Calls {
+    fn here(&self) -> usize {
+        if cfg!(target_arch = "aarch64") {
+            self.neon
+        } else {
+            self.scalar
+        }
+    }
 }
 
 const PINS: &[Pin] = &[
@@ -276,42 +299,66 @@ const PINS: &[Pin] = &[
         class: "jpeg-large",
         decode_large: 2,
         copy: (1, 1),
-        preprocess: (6039, 2),
+        preprocess_calls: Calls {
+            scalar: 6039,
+            neon: 6038,
+        },
+        preprocess_large: 2,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-small",
         decode_large: 0,
         copy: (1, 0),
-        preprocess: (1052, 1),
+        preprocess_calls: Calls {
+            scalar: 1052,
+            neon: 1053,
+        },
+        preprocess_large: 1,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-grayscale",
         decode_large: 1,
         copy: (1, 1),
-        preprocess: (1372, 3),
+        preprocess_calls: Calls {
+            scalar: 1372,
+            neon: 1373,
+        },
+        preprocess_large: 3,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-cmyk",
         decode_large: 0,
         copy: (1, 0),
-        preprocess: (1052, 1),
+        preprocess_calls: Calls {
+            scalar: 1052,
+            neon: 1053,
+        },
+        preprocess_large: 1,
         serialize_calls: 0,
     },
     Pin {
         class: "png-rgb",
         decode_large: 2,
         copy: (1, 1),
-        preprocess: (1431, 2),
+        preprocess_calls: Calls {
+            scalar: 1431,
+            neon: 1430,
+        },
+        preprocess_large: 2,
         serialize_calls: 0,
     },
     Pin {
         class: "png-rgba",
         decode_large: 3,
         copy: (1, 1),
-        preprocess: (17, 1),
+        preprocess_calls: Calls {
+            scalar: 17,
+            neon: 17,
+        },
+        preprocess_large: 1,
         serialize_calls: 0,
     },
 ];
@@ -320,7 +367,11 @@ const PINS: &[Pin] = &[
 fn every_stage_allocates_what_it_allocates_today() {
     let _window = window();
     // Every task on this thread: no pool thread allocates into a measured window.
-    let _ = configure_parallelism(Parallelism::Inline);
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
     let config = PreProcessorConfig::from_json(CONFIG).expect("config");
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
     let record = std::env::var_os("MM_PINS_RECORD").is_some();
@@ -361,12 +412,12 @@ fn every_stage_allocates_what_it_allocates_today() {
             (
                 "preprocess calls",
                 measured.preprocess.calls,
-                pin.preprocess.0,
+                pin.preprocess_calls.here(),
             ),
             (
                 "preprocess large buffers",
                 measured.preprocess.large,
-                pin.preprocess.1,
+                pin.preprocess_large,
             ),
             (
                 "serialize calls",
