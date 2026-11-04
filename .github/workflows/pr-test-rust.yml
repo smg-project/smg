@@ -1720,7 +1720,8 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
-  # Qualify the pinned HIP Mooncake cohort and shared-runner admission before enabling.
+  # HIP Mooncake availability in this image is unqualified; keep this lane off.
+  # Image/transfer qualification and shared-runner admission are separate requirements.
   e2e-2gpu-pd-vllm-mooncake-amd:
     name: e2e-2gpu-pd-vllm-mooncake-amd (vllm)
     needs: [build-wheel, e2e-1gpu-gateway, detect-changes]
