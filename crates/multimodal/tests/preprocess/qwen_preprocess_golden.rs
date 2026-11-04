@@ -90,7 +90,7 @@ fn config(mean: [f64; 3], std: [f64; 3]) -> PreProcessorConfig {
 
 fn check_case(processor: &dyn VisionPreProcessor, case: &GoldenCase) {
     let result = processor
-        .preprocess(&[make_image(case.width, case.height)])
+        .preprocess(&[&make_image(case.width, case.height)])
         .expect("Qwen golden preprocessing failed");
     assert_eq!(result.encoder_input.shape(), case.shape);
 

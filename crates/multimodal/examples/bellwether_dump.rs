@@ -291,9 +291,7 @@ fn process(processor: &dyn VisionPreProcessor, bytes: Vec<u8>) -> Result<Artifac
     let alpha = image.color().has_alpha();
     let rgb = image.to_rgb8();
     let (width, height) = rgb.dimensions();
-    let inputs = processor
-        .preprocess(std::slice::from_ref(&image))
-        .map_err(|e| e.to_string())?;
+    let inputs = processor.preprocess(&[&image]).map_err(|e| e.to_string())?;
     let u8 = match &inputs.encoder_input {
         EncoderInput::U8 { patches, .. } => {
             Some(patches.as_standard_layout().iter().copied().collect())

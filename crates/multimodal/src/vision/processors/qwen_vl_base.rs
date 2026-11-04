@@ -1278,7 +1278,7 @@ impl QwenVLProcessorBase {
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
-    fn plan_image_batch(&self, images: &[DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
+    fn plan_image_batch(&self, images: &[&DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
@@ -1355,7 +1355,7 @@ impl QwenVLProcessorBase {
     /// themselves, [`preprocess`](VisionPreProcessor::preprocess)'s form).
     fn preprocess_into_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         let batch = match self.plan_image_batch(images) {
@@ -1592,7 +1592,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let batch = self.plan_image_batch(images)?;
         let ImageBatchPlan {
@@ -1695,7 +1695,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.preprocess_into_wire(images, dtype)
@@ -1963,13 +1963,15 @@ mod tests {
             };
             let processor = build(&config);
             assert!(processor.supports_per_image_preprocessing());
-            let images = vec![
+            let images = [
                 create_sized_pattern_frame(7, 9, 3),
                 create_sized_pattern_frame(12, 6, 42),
                 create_sized_pattern_frame(8, 8, 250),
             ];
 
-            let batched = processor.preprocess(&images).unwrap();
+            let batched = processor
+                .preprocess(&images.iter().collect::<Vec<_>>())
+                .unwrap();
 
             let layouts = std::collections::HashMap::from([
                 ("image_grid_thw".to_string(), FieldLayout::Batched),
@@ -1977,7 +1979,7 @@ mod tests {
             ]);
             let parts = images
                 .iter()
-                .map(|image| processor.preprocess(std::slice::from_ref(image)).unwrap())
+                .map(|image| processor.preprocess(&[image]).unwrap())
                 .collect::<Vec<_>>();
             let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
 
@@ -2177,7 +2179,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let result = processor.preprocess(std::slice::from_ref(&image)).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
         let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
@@ -2671,14 +2673,15 @@ mod wire_tests {
         ];
         for processor in &processors {
             for images in &batches {
-                let two_pass = processor.preprocess(images).unwrap();
+                let images: Vec<&DynamicImage> = images.iter().collect();
+                let two_pass = processor.preprocess(&images).unwrap();
                 for dtype in [
                     EncoderDtype::BFloat16,
                     EncoderDtype::Float16,
                     EncoderDtype::Float32,
                 ] {
                     let wire = processor
-                        .preprocess_wire(images, dtype)
+                        .preprocess_wire(&images, dtype)
                         .expect("the Qwen base writes wires")
                         .unwrap();
                     assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
@@ -2700,7 +2703,7 @@ mod wire_tests {
                     );
                 }
                 assert!(processor
-                    .preprocess_wire(images, EncoderDtype::Uint8)
+                    .preprocess_wire(&images, EncoderDtype::Uint8)
                     .is_none());
             }
         }
