@@ -1002,7 +1002,8 @@ impl NativeEncoder {
                 .map(|unit| {
                     let mut ids = Vec::new();
                     let mut mapped = String::new();
-                    self.encode_unit(model, unit, &mut mapped, &mut ids)
+                    let mut cache = self.thread_piece_cache().borrow_mut();
+                    self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)
                         .map(|()| ids)
                 })
                 .collect::<Result<_, _>>()?;
@@ -1018,8 +1019,9 @@ impl NativeEncoder {
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
         let mut mapped = String::new();
+        let mut cache = self.thread_piece_cache().borrow_mut();
         for unit in &units {
-            self.encode_unit(model, unit, &mut mapped, &mut ids)?;
+            self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)?;
         }
         ids.extend_from_slice(after);
         Ok(ids)
@@ -1193,18 +1195,20 @@ impl NativeEncoder {
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
     /// (the pieces after it are tokenized all the same, as in the whole-text
-    /// encode).
+    /// encode). `cache` is the encoding thread's piece cache
+    /// ([`Self::thread_piece_cache`]), borrowed by the caller for the unit.
     fn encode_unit(
         &self,
         model: &ModelWrapper,
         unit: &Segment<'_>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
             let mut per_piece = |piece: &str| {
-                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids) {
+                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
                     fallback = Some(declined);
                 }
             };
@@ -1261,29 +1265,30 @@ impl NativeEncoder {
     /// thread's cache comes first because it is small and hot: the pieces of
     /// the prompts a thread encodes, a few hundred KB, where the seed is
     /// several MB of lines a warm encode would read at random (measured:
-    /// the seed first cost a warm prose encode a tenth more).
+    /// the seed first cost a warm prose encode a tenth more). `cache` is the
+    /// thread's own ([`Self::thread_piece_cache`]), looked up and borrowed by
+    /// the encode once rather than here once per piece (measured: 4 % of the
+    /// instructions per token of a warm encode on a 151k byte-level
+    /// vocabulary).
     fn tokenize_piece(
         &self,
         model: &ModelWrapper,
         piece: &str,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
         let key = ShortPieceKey::of(bytes);
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        let cache = self.piece_cache.get_or(|| {
-            self.threads.fetch_add(1, Ordering::Relaxed);
-            RefCell::default()
-        });
         if let Some(key) = key {
-            if let Some(packed) = &cache.borrow().packed {
+            if let Some(packed) = &cache.packed {
                 if packed.ids_into(key, ids) {
                     return Ok(());
                 }
             }
         } else if cacheable {
-            if let Some(found) = cache.borrow().get(bytes) {
+            if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
             }
@@ -1312,35 +1317,42 @@ impl NativeEncoder {
         }
         if let Some(key) = key {
             let share = self.piece_cache_share();
-            let mut pieces = cache.borrow_mut();
-            if pieces.short_entries() >= share {
-                pieces.clear_short(share);
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
             }
-            pieces
+            cache
                 .packed
                 .get_or_insert_with(ShortPieceTable::new)
                 .insert(key, &ids[start..], share);
         } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
             let share = self.piece_cache_share();
-            let mut pieces = cache.borrow_mut();
-            if pieces.short_entries() >= share {
-                pieces.clear_short(share);
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
             }
-            pieces.short.insert(bytes.into(), ids[start..].into());
+            cache.short.insert(bytes.into(), ids[start..].into());
         } else if cacheable {
             let entry = LONG_PIECE_ENTRY_BYTES + bytes.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
             if entry <= share {
-                let mut pieces = cache.borrow_mut();
-                if pieces.long_bytes + entry > share {
-                    pieces.long.clear();
-                    pieces.long_bytes = 0;
+                if cache.long_bytes + entry > share {
+                    cache.long.clear();
+                    cache.long_bytes = 0;
                 }
-                pieces.long_bytes += entry;
-                pieces.long.insert(bytes.into(), ids[start..].into());
+                cache.long_bytes += entry;
+                cache.long.insert(bytes.into(), ids[start..].into());
             }
         }
         Ok(())
+    }
+
+    /// The calling thread's piece cache for this encoder, made at the
+    /// thread's first encode with it (from then on the thread counts toward
+    /// every thread's share, see [`Self::piece_cache_share`]).
+    fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
+        self.piece_cache.get_or(|| {
+            self.threads.fetch_add(1, Ordering::Relaxed);
+            RefCell::default()
+        })
     }
 
     /// The piece in the byte-level alphabet, the form the model's vocabulary
