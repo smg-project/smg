@@ -99,7 +99,7 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
 
     for text in texts {
         // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding = match encode_blocking(tokenizer.clone(), text.to_string(), false).await {
+        let encoding = match encode_blocking(tokenizer.clone(), text, false).await {
             Ok(enc) => enc,
             Err(e) => {
                 error!("Tokenization failed: {}", e);

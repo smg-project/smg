@@ -314,16 +314,25 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
+/// Whether a prompt of `len` bytes is encoded on the blocking pool: at or above
+/// [`ENCODE_OFFLOAD_MIN_BYTES`]; a shorter one runs inline, so the offload's
+/// round trip does not dominate it. The one rule [`offload`] and
+/// [`encode_blocking`] read.
+fn offloads(len: usize) -> bool {
+    len >= ENCODE_OFFLOAD_MIN_BYTES
+}
+
 /// Run CPU-bound tokenizer work, an encode or a decode, off the async worker
 /// threads so it cannot stall the runtime, bounded by [`encode_permits`] so
 /// concurrent offloaded jobs cannot oversubscribe the CPU. Inputs below the
-/// threshold run inline to avoid the offload round-trip dominating.
+/// threshold ([`offloads`]) run inline to avoid the offload round-trip
+/// dominating.
 async fn offload<T, F>(len: usize, work: F) -> anyhow::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    if len < ENCODE_OFFLOAD_MIN_BYTES {
+    if !offloads(len) {
         return work();
     }
     let _permit = encode_permits()
@@ -335,12 +344,19 @@ where
         .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
 }
 
-/// Tokenize `text` through the offload policy of [`offload`].
+/// Tokenize `text` through the offload policy of [`offload`]: a prompt below
+/// the threshold ([`offloads`]) encodes in place, from the caller's own text;
+/// one at or above it is copied once, for the blocking task, which outlives
+/// the borrow.
 pub(crate) async fn encode_blocking(
     tokenizer: Arc<dyn Tokenizer>,
-    text: String,
+    text: &str,
     add_special_tokens: bool,
 ) -> anyhow::Result<Encoding> {
+    if !offloads(text.len()) {
+        return tokenizer.encode(text, add_special_tokens);
+    }
+    let text = text.to_string();
     offload(text.len(), move || {
         tokenizer.encode(&text, add_special_tokens)
     })
@@ -369,7 +385,7 @@ pub(crate) async fn encode_prompt_blocking(
     encoding: PromptEncoding,
 ) -> anyhow::Result<Encoding> {
     match encoding {
-        PromptEncoding::FromText => encode_blocking(tokenizer, text.to_string(), false).await,
+        PromptEncoding::FromText => encode_blocking(tokenizer, text, false).await,
         PromptEncoding::Deferred(job) => offload(text.len(), move || job.run()).await,
     }
 }

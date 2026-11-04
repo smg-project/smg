@@ -2252,3 +2252,100 @@ fn a_tool_declared_without_a_schema_reaches_the_template_with_a_null_schema() {
         );
     }
 }
+
+/// A tokenizer that records, for every encode, the thread it ran on and the
+/// address of the text it was handed: the caller's own buffer, or a copy.
+struct RecordsEncodes {
+    inner: llm_tokenizer::MockTokenizer,
+    seen: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,
+}
+
+impl RecordsEncodes {
+    fn new() -> Self {
+        Self {
+            inner: llm_tokenizer::MockTokenizer::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl llm_tokenizer::traits::Encoder for RecordsEncodes {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.seen
+            .lock()
+            .push((std::thread::current().id(), input.as_ptr() as usize));
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for RecordsEncodes {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for RecordsEncodes {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn a_prompt_below_the_offload_threshold_is_encoded_from_the_callers_own_text() {
+    let recorder = Arc::new(RecordsEncodes::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::clone(&recorder) as Arc<dyn Tokenizer>;
+    let short = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES - 1);
+    let long = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES);
+    block_on(encode_prompt_blocking(
+        Arc::clone(&tokenizer),
+        &short,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    block_on(encode_prompt_blocking(
+        tokenizer,
+        &long,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    let seen = recorder.seen.lock();
+    let here = std::thread::current().id();
+    assert_eq!(
+        seen[0],
+        (here, short.as_ptr() as usize),
+        "a prompt below the threshold encodes in place, from the caller's own text, not a copy"
+    );
+    assert_ne!(
+        seen[1].0, here,
+        "a prompt at the threshold encodes on the blocking pool"
+    );
+    assert_ne!(
+        seen[1].1,
+        long.as_ptr() as usize,
+        "the blocking task reads a copy of its own, which outlives the caller's borrow"
+    );
+}
