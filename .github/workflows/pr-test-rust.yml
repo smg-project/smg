@@ -570,8 +570,11 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: [build-wheel, detect-changes]
+    # Neither for a docs-only change nor for a version-only one: its numbers are
+    # the commit's it inherits the card tier from.
     if: >-
       needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.card-tier-from == ''
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -639,10 +642,14 @@ jobs:
       contents: read
       pull-requests: read
       packages: read
+      actions: read # the runs of the commit a version-only change inherits its card tier from
     outputs:
       # The docs-only shortcut (defined in the "Decide the e2e lanes" step): a
       # pull request that changes docs alone.
       docs-only: ${{ steps.lanes.outputs.docs-only }}
+      # The version-only shortcut (the "Classify a version-only change" step): the
+      # commit whose passed run stands for this change's card tier; empty otherwise.
+      card-tier-from: ${{ steps.version-only.outputs.card-tier-from }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
       # The rust-tests matrix: the shards of scripts/ci_rust_tests.sh a pull
       # request can affect (every shard on a push or a dispatch); '[]' skips the job.
@@ -836,6 +843,45 @@ jobs:
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
 
+      # The version-only shortcut: a change that moves nothing but the release version
+      # carriers (scripts/ci_version_only.py: the manifests' version lines and workspace
+      # pins, the lock file's entries for the workspace crates, the Python packages'
+      # version fields, the chart, the engine-image workflow's release tag) leaves every
+      # tested code path as the commit it was made on had it. When that commit's own run
+      # of this workflow passed, the lanes on GPU runners (the card tier) are inherited
+      # from it, on a push as on a pull request, and the host rows run as the tier table
+      # says. The commit is the pull request's base, or the tip a push replaced; a manual
+      # run, a new branch and a commit with no passed run keep every lane. release.sh
+      # check reads the same classifier when it takes the parent's run for such a head.
+      - name: Classify a version-only change
+        id: version-only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The label ci:full: every lane and nothing inherited, decided here so the
+          # output, the summary and the lanes agree (the same expression the "Decide
+          # the e2e lanes" step reads for its own shortcut).
+          FORCE_FULL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          from=""
+          if [ "$FORCE_FULL" = "true" ]; then
+            echo "the label ci:full: every lane"
+          elif [[ ! "$BASE" =~ ^[0-9a-f]{40}$ || "$BASE" =~ ^0{40}$ ]]; then
+            echo "no commit to classify against (${BASE:-none}): every lane"
+          elif ! git fetch --quiet --depth=1 origin "$BASE"; then
+            echo "cannot fetch $BASE: every lane"
+          elif python3 scripts/ci_version_only.py "$BASE" HEAD; then
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-rust.yml/runs?head_sha=$BASE&per_page=20" \
+                    --jq '[.workflow_runs[] | select(.conclusion == "success")][0].html_url // empty' 2>/dev/null || true)
+            if [ -n "$run" ]; then
+              from=$BASE
+              echo "card tier inherited from $BASE ($run)" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "version-only on $BASE, which has no passed run of this workflow: every lane"
+            fi
+          fi
+          echo "card-tier-from=$from" >> "$GITHUB_OUTPUT"
+
       # The docs-only shortcut and whether each GPU e2e lane skips, decided here once:
       # the tier table below maps a changed path to the lanes it can reach. A
       # lane's `if:` reads its `skip-<area>` output and adds only what is its
@@ -860,14 +906,19 @@ jobs:
           DOCS: ${{ steps.filter.outputs.docs }}
           NON_DOCS: ${{ steps.filter.outputs.non-docs }}
           TESTS: ${{ steps.filter.outputs.tests }}
+          CARD_TIER_FROM: ${{ steps.version-only.outputs.card-tier-from }}
         run: |
           python3 - <<'EOF'
           import json, os, re, sys
 
           env = os.environ
           pull_request = env.get("PULL_REQUEST") == "true"
-          # The label: every lane, and no docs-only shortcut.
+          # The label: every lane, and no docs-only shortcut (the version-only one
+          # yields to the label in its own step, so its output is read as it is).
           force_full = pull_request and env.get("FORCE_FULL") == "true"
+          # The version-only shortcut (the step above): the commit whose passed run
+          # stands for this change's card tier; the lanes on GPU runners skip then.
+          card_tier_from = env.get("CARD_TIER_FROM", "")
 
           # Only pull requests take the docs-only shortcut; a push keeps its coverage.
           docs_only = (
@@ -890,6 +941,8 @@ jobs:
           #                     providers (CPU)
           AREAS = ("chat-one-engine", "chat-completions", "completions",
                    "embeddings", "realtime", "agentic", "vendor", "go-bindings")
+          # The card tier: the areas whose lanes take a GPU runner (the vendor lanes run on CPU).
+          CARD_AREAS = tuple(area for area in AREAS if area != "vendor")
           FULL = " ".join(AREAS)
           NONE = ""
           # A gateway module no suite targets: one engine's chat and router suites, the
@@ -1164,11 +1217,17 @@ jobs:
               reached.add("chat-one-engine")
           print(f"{why}: lanes reached: {named(reached)}")
 
-          # No lane for a docs-only change; otherwise the lanes of the areas the
-          # changed paths reach (the tier table decides, Symphony's crate included).
-          skip = {area: docs_only or area not in reached for area in AREAS}
+          # No lane for a docs-only change; the host rows alone for a version-only one
+          # (its card tier is inherited); otherwise the lanes of the areas the changed
+          # paths reach (the tier table decides, Symphony's crate included).
+          skip = {
+              area: docs_only or (bool(card_tier_from) and area in CARD_AREAS) or area not in reached
+              for area in AREAS
+          }
           # The vendor lanes have no docs-only shortcut.
           skip["vendor"] = "vendor" not in reached
+          if card_tier_from:
+              print(f"card tier inherited from {card_tier_from}: the lanes on GPU runners skip")
 
           decided = {"docs-only": docs_only}
           decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
