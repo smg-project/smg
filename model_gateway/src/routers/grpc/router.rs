@@ -56,7 +56,7 @@ use crate::{
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
-/// gRPC router implementation for SGLang.
+/// The gRPC family router: one router over the gRPC request pipelines, built for one `Mode`.
 ///
 /// A single `Mode`-parameterized router serving Regular, PrefillDecode, and
 /// EncodePrefillDecode. `mode` selects the disaggregation params baked into
