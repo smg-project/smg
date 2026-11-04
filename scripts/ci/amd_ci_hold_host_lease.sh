@@ -50,14 +50,26 @@ process_matches() {
 
 write_status() {
   local status=$1
-  local temporary_path="${READY_PATH}.tmp.$$"
+  local temporary_directory
 
   if [[ ${READY_PATH} == "${lock_path}" || ${READY_PATH} -ef ${lock_path} ]]; then
     printf '%s\n' "ERROR: ready path aliases the lease lock" >&2 || true
     return 2
   fi
-  printf '%s\n' "${status}" >"${temporary_path}"
-  mv -f "${temporary_path}" "${READY_PATH}"
+  # A fresh private directory prevents following a pre-created status entry.
+  # The ready parent directory must still be trusted by this holder's owner.
+  temporary_directory=$(mktemp -d -- "${READY_PATH}.tmp.XXXXXXXXXX" 9>&-) || return 1
+  if ! printf '%s\n' "${status}" >"${temporary_directory}/status"; then
+    rm -f -- "${temporary_directory}/status" 9>&- || true
+    rmdir -- "${temporary_directory}" 9>&- || true
+    return 1
+  fi
+  if ! mv -fT -- "${temporary_directory}/status" "${READY_PATH}" 9>&-; then
+    rm -f -- "${temporary_directory}/status" 9>&- || true
+    rmdir -- "${temporary_directory}" 9>&- || true
+    return 1
+  fi
+  rmdir -- "${temporary_directory}" 9>&-
 }
 
 lease_acquired=0

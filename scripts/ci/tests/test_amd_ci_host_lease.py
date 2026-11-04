@@ -3,7 +3,9 @@
 import json
 import os
 import signal
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -132,11 +134,18 @@ def run_case(directory, logger_body, closed_stderr=False, blocked=False, require
 
 def lifecycle_cases(directory):
     directory.mkdir()
+    bindir = directory / "bin"
+    bindir.mkdir()
+    logger = bindir / "logger"
+    logger.write_text("#!/bin/sh\nexit 0\n")
+    logger.chmod(0o700)
+    env = {**os.environ, "PATH": str(bindir) + ":/usr/bin:/bin"}
     owner = subprocess.Popen(["sleep", "30"])
     start = Path(f"/proc/{owner.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
     lock, ready = directory / "lock", directory / "ready"
     holder = subprocess.Popen(
         ["bash", str(SCRIPT), "--lock-path", str(lock), str(owner.pid), start, str(ready), "2"],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -166,12 +175,36 @@ def lifecycle_cases(directory):
         alias.hardlink_to(lock)
         collision = subprocess.run(
             ["bash", str(SCRIPT), "--lock-path", str(lock), str(owner.pid), start, str(alias), "0"],
+            env=env,
             capture_output=True,
             timeout=4,
         )
         assert collision.returncode == 2
         assert (lock.stat().st_dev, lock.stat().st_ino) == identity
         assert alias.samefile(lock)
+        # Keep /./ in the literal argument: Path joining would normalize it.
+        literal_alias = str(directory) + "/./lock"
+        assert literal_alias != str(lock)
+        lock.write_bytes(b"private-lock-sentinel\n")
+        before_alias = lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes()
+        spelling_collision = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "--lock-path",
+                str(lock),
+                str(owner.pid),
+                start,
+                literal_alias,
+                "0",
+            ],
+            env=env,
+            capture_output=True,
+            timeout=4,
+        )
+        assert spelling_collision.returncode == 2
+        assert (lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes()) == before_alias
+        assert alias.samefile(lock) and alias.read_bytes() == before_alias[2]
     finally:
         owner.terminate()
         owner.wait(timeout=2)
@@ -194,6 +227,7 @@ def lifecycle_cases(directory):
                 str(directory / "gone"),
                 "0",
             ],
+            env=env,
             capture_output=True,
             timeout=3,
         )
@@ -205,28 +239,196 @@ def lifecycle_cases(directory):
         "polling_child_does_not_retain_lock": True,
         "ready_alias_rejected_without_inode_change": True,
         "zombie_owner_rejected": True,
+        "literal_same_dentry_alias_rejected_content_preserved": True,
     }
+
+
+def ready_tempfile_cases(directory):
+    directory.mkdir()
+    bindir = directory / "bin"
+    bindir.mkdir()
+    logger = bindir / "logger"
+    logger.write_text("#!/bin/sh\nexit 0\n")
+    logger.chmod(0o700)
+    outcomes = []
+    for index, (mask, collision_kind) in enumerate(
+        [("022", "symlink"), ("077", "symlink"), ("022", "regular")]
+    ):
+        case = directory / str(index)
+        case.mkdir()
+        sentinel, lock, ready = case / "sentinel", case / "lock", case / "ready"
+        sentinel.write_bytes(b"private-sentinel-unchanged\n")
+        lock.write_bytes(b"private-lease-unchanged\n")
+        sentinel_before = sentinel.stat().st_dev, sentinel.stat().st_ino, sentinel.read_bytes()
+        lock_before = lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes()
+        owner = subprocess.Popen(["true"])
+        try:
+            procstat = Path(f"/proc/{owner.pid}/stat")
+            until(lambda: procstat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+            birth = procstat.read_text().rsplit(")", 1)[1].split()[19]
+            env = {**os.environ, "PATH": str(bindir) + ":/usr/bin:/bin"}
+            # exec preserves the wrapper PID, reproducing READY.tmp.$$ exactly.
+            wrapper = r"""umask "$1"
+if [ "$2" = symlink ]; then
+  ln -s -- "$3" "$5.tmp.$$"
+else
+  printf 'preexisting-regular\n' > "$5.tmp.$$"
+fi
+exec bash "$6" --lock-path "$4" "$7" "$8" "$5" 0
+"""
+            holder = subprocess.Popen(
+                [
+                    "bash",
+                    "-c",
+                    wrapper,
+                    "ready-fixture",
+                    mask,
+                    collision_kind,
+                    str(sentinel),
+                    str(lock),
+                    str(ready),
+                    str(SCRIPT),
+                    str(owner.pid),
+                    birth,
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = holder.communicate(timeout=4)
+            old_temporary = Path(str(ready) + ".tmp." + str(holder.pid))
+            observation = {
+                "umask": mask,
+                "collision": collision_kind,
+                "returncode": holder.returncode,
+                "sentinel_unchanged": (
+                    sentinel.stat().st_dev,
+                    sentinel.stat().st_ino,
+                    sentinel.read_bytes(),
+                )
+                == sentinel_before,
+                "lock_unchanged": (lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes())
+                == lock_before,
+                "ready_is_symlink": ready.is_symlink(),
+            }
+            print("READY_TEMPFILE_OBSERVATION " + json.dumps(observation), flush=True)
+            assert observation["sentinel_unchanged"], (
+                "preexisting status symlink clobbered private sentinel"
+            )
+            assert observation["lock_unchanged"], "status publication changed private lease"
+            assert holder.returncode == 1, (stdout, stderr)
+            assert stat.S_ISREG(ready.lstat().st_mode) and not ready.is_symlink()
+            assert ready.read_text().strip() == "owner-gone"
+            assert stat.S_IMODE(ready.stat().st_mode) == (0o666 & ~int(mask, 8))
+            if collision_kind == "symlink":
+                assert old_temporary.is_symlink() and old_temporary.samefile(sentinel)
+            else:
+                assert old_temporary.read_bytes() == b"preexisting-regular\n"
+            assert set(case.glob("ready.tmp.*")) == {old_temporary}
+            outcomes.append(observation)
+        finally:
+            owner.wait(timeout=2)
+    return {"exclusive_regular_status": True, "private_cases": outcomes}
+
+
+def partial_write_failure_case(directory):
+    directory.mkdir()
+    bindir = directory / "bin"
+    bindir.mkdir()
+    logger = bindir / "logger"
+    logger.write_text("#!/bin/sh\nexit 0\n")
+    logger.chmod(0o700)
+    lock, ready = directory / "lock", directory / "ready"
+    lock.write_bytes(b"private-lock-unchanged\n")
+    ready.write_bytes(b"previous-ready-unchanged\n")
+    lock_before = lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes()
+    ready_before = ready.stat().st_dev, ready.stat().st_ino, ready.read_bytes()
+    owner = subprocess.Popen(["true"])
+    try:
+        procstat = Path(f"/proc/{owner.pid}/stat")
+        until(lambda: procstat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+        birth = procstat.read_text().rsplit(")", 1)[1].split()[19]
+        # Only this private process overrides printf. It writes partial data to
+        # the actual redirected status FD and returns a controlled failure.
+        wrapper = r"""printf() {
+  if [[ $# == 2 && $1 == '%s\n' && $2 == owner-gone ]]; then
+    builtin printf 'controlled-partial-status\n'
+    return 23
+  fi
+  builtin printf "$@"
+}
+export -f printf
+exec bash "$1" --lock-path "$2" "$3" "$4" "$5" 0
+"""
+        failed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                wrapper,
+                "partial-status-fixture",
+                str(SCRIPT),
+                str(lock),
+                str(owner.pid),
+                birth,
+                str(ready),
+            ],
+            env={**os.environ, "PATH": str(bindir) + ":/usr/bin:/bin"},
+            capture_output=True,
+            timeout=4,
+        )
+        leftovers = sorted(directory.glob("ready.tmp.*"))
+        observation = {
+            "returncode": failed.returncode,
+            "ready_unchanged": (ready.stat().st_dev, ready.stat().st_ino, ready.read_bytes())
+            == ready_before,
+            "lock_unchanged": (lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes())
+            == lock_before,
+            "owned_leftovers": [
+                {
+                    "name": path.name,
+                    "partial_contents": (path / "status").read_text()
+                    if (path / "status").is_file()
+                    else None,
+                }
+                for path in leftovers
+            ],
+        }
+        print("PARTIAL_WRITE_OBSERVATION " + json.dumps(observation), flush=True)
+        assert failed.returncode == 1
+        assert observation["ready_unchanged"] and observation["lock_unchanged"]
+        assert not leftovers, "failed status write leaked owned temporary directory"
+        return {"controlled_partial_write_rc1_cleanup": True, "observation": observation}
+    finally:
+        owner.wait(timeout=2)
 
 
 with tempfile.TemporaryDirectory(prefix="lease-audit-tests-") as scratch:
     root = Path(scratch)
-    results = {
-        "lifecycle": lifecycle_cases(root / "lifecycle"),
-        "normal": run_case(
-            root / "normal", 'printf "%s\\n" "$*" >> "$TEST_EVENTS"\n', require_events=True
-        ),
-        "logger_failure_closed_stderr": run_case(root / "failure", "exit 1\n", True),
-        "blocked_logger_holder_death": run_case(
-            root / "blocked",
-            """
-if [[ "$*" == *event=acquired* ]]; then
-  echo $$ > "$TEST_LOGGER_PID"
-  trap '' TERM
-  sleep 20
-fi
-exit 0
-""",
-            blocked=True,
-        ),
-    }
+    if sys.argv[1:] == ["--partial-write-only"]:
+        results = {"partial_write_cleanup": partial_write_failure_case(root / "partial-write")}
+    elif sys.argv[1:] == ["--ready-tempfile-only"]:
+        results = {"ready_tempfiles": ready_tempfile_cases(root / "ready-tempfiles")}
+    else:
+        assert not sys.argv[1:]
+        results = {
+            "lifecycle": lifecycle_cases(root / "lifecycle"),
+            "normal": run_case(
+                root / "normal", 'printf "%s\\n" "$*" >> "$TEST_EVENTS"\n', require_events=True
+            ),
+            "logger_failure_closed_stderr": run_case(root / "failure", "exit 1\n", True),
+            "blocked_logger_holder_death": run_case(
+                root / "blocked",
+                """
+    if [[ "$*" == *event=acquired* ]]; then
+      echo $$ > "$TEST_LOGGER_PID"
+      trap '' TERM
+      sleep 20
+    fi
+    exit 0
+    """,
+                blocked=True,
+            ),
+            "ready_tempfiles": ready_tempfile_cases(root / "ready-tempfiles"),
+            "partial_write_cleanup": partial_write_failure_case(root / "partial-write"),
+        }
 print(json.dumps({"PASS": True, "results": results, "actual_GPU_or_shared_lock": False}))
