@@ -567,13 +567,13 @@ impl GossipController {
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
                         let mut sender = SenderState::default();
-                        let mut last_heartbeat = Instant::now();
+                        let mut last_heartbeat = tokio::time::Instant::now();
 
                         loop {
                             interval.tick().await;
 
                             if last_heartbeat.elapsed() >= STREAM_HEARTBEAT_INTERVAL {
-                                last_heartbeat = Instant::now();
+                                last_heartbeat = tokio::time::Instant::now();
                                 let heartbeat = build_heartbeat(
                                     shared_sequence.fetch_add(1, Ordering::Relaxed),
                                     &self_name_incremental,
@@ -1113,3 +1113,7 @@ mod dial_tests {
         assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/heartbeat_integration.rs"]
+mod heartbeat_tests;
