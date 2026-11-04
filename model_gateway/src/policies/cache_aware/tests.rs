@@ -4731,7 +4731,14 @@ fn merge_rows_unions_the_eligible_sample_with_the_holders_in_slice_order() {
 /// Prefill miss routing compares input work per measured second.
 #[test]
 fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
-    for computed_rate in [None, Some(4_000.0), Some(40_000.0)] {
+    for (less_rate, more_rate, expected) in [
+        (None, None, 0),
+        (Some(4_000.0), Some(4_000.0), 0),
+        (Some(4_000.0), Some(40_000.0), 1),
+        // An uncalibrated worker is priced like its measured peers so it can warm up.
+        (None, Some(40_000.0), 0),
+        (Some(40_000.0), None, 0),
+    ] {
         for generated in [0.0, 0.5, 10_000.0] {
             let policy = CacheAwarePolicy::with_config(test_config());
             let workers: Vec<Arc<dyn Worker>> = ["http://p1:8000", "http://p2:8000"]
@@ -4748,8 +4755,8 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             policy.init_workers(&workers);
             let mut less_work = expected_wait_load(2_000, 0.0, generated);
             let mut more_work = expected_wait_load(4_000, 0.0, 2_000.0);
-            less_work.loads[0].prefill_throughput = computed_rate.map(|_| 4_000.0);
-            more_work.loads[0].prefill_throughput = computed_rate;
+            less_work.loads[0].prefill_throughput = less_rate;
+            more_work.loads[0].prefill_throughput = more_rate;
             let feed = TestFeed::attached_to(&policy.load_scorer);
             feed.publish(&HashMap::from([
                 (workers[0].url().to_string(), less_work),
@@ -4757,11 +4764,6 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             ]));
             // A faster worker wins despite more queued work; equal or missing
             // input rates preserve the lower-work choice, regardless of generation.
-            let expected = if computed_rate == Some(40_000.0) {
-                1
-            } else {
-                0
-            };
             assert_eq!(
                 route_text(&policy, &workers, "new prefill prompt"),
                 Some(expected)

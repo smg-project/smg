@@ -350,10 +350,15 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: any queue, running or window change, KV usage by half a percent,
-/// the rate by 5 % or 50 tokens per second.
+/// either throughput by 5 % or 50 tokens per second, or measured input
+/// capacity appearing/disappearing.
 pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.prefill_throughput != current.prefill_throughput
-        || last.running_requests != current.running_requests
+    let prefill_changed = match (last.prefill_throughput, current.prefill_throughput) {
+        (Some(last), Some(current)) => throughput_changed(last, current),
+        (None, None) => false,
+        _ => true,
+    };
+    prefill_changed || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
@@ -362,15 +367,18 @@ pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLo
             - current.active_token_usage.unwrap_or(current.token_usage))
         .abs()
             > 0.005
-        || {
-            let delta = (last.gen_throughput - current.gen_throughput).abs();
-            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
-        }
+        || throughput_changed(last.gen_throughput, current.gen_throughput)
         // A growing engine silence goes out once a second, so a subscriber's
         // wedge bound is met within a second of the engine crossing it.
         || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
         || last.engine_reports_steps != current.engine_reports_steps
         || last.prefill_pending_tokens != current.prefill_pending_tokens
+}
+
+/// Ignore rate noise while publishing meaningful absolute or relative movement.
+fn throughput_changed(last: f64, current: f64) -> bool {
+    let delta = (last - current).abs();
+    delta > 50.0 || delta > 0.05 * last.max(current)
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.

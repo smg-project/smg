@@ -120,7 +120,8 @@ impl SincePollDispatch {
 ///   at `running_reqs · p̄`: a poll releases dispatch credit but does not mean
 ///   the request finished. This is a fallback estimate, not remaining prefill;
 /// - prefill workers: the sum of valid computed input rates across all DP
-///   ranks, or configured `default_throughput` when that capacity is unavailable;
+///   ranks, or the candidate fleet's nominal input rate when unavailable;
+///   without any measured candidate, use configured `default_throughput`;
 /// - zero/absent generation throughput (the backend reports no rate, or
 ///   reports one for a rank with nothing running, which is a stale gauge
 ///   rather than a rate; see `live_throughput`): the fleet's nominal rate,
@@ -144,8 +145,7 @@ impl SincePollDispatch {
 ///   barrier. Raise it to steer harder away from near-full KV; lower it to
 ///   weight raw drain time more.
 /// - `default_throughput` (default `2000` tok/s) — drain rate used when no
-///   candidate reports a live `gen_throughput`, or a prefill worker lacks valid
-///   computed input capacity.
+///   candidate reports a live `gen_throughput` or measured prefill capacity.
 ///   Set it to per-replica input tokens/s for prefill, output tokens/s otherwise;
 ///   it co-tunes with `kv_pressure_weight`.
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
@@ -351,7 +351,7 @@ impl LeastLoadPolicy {
                         * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
-                    self.drain_rate(worker, load, nominal_throughput),
+                    Self::drain_rate(worker, load, nominal_throughput),
                     load.effective_kv_pressure(),
                     self.kv_pressure_weight,
                 )
@@ -402,20 +402,16 @@ impl LeastLoadPolicy {
         (live > 0.0).then_some(live)
     }
 
-    /// Prefill uses computed input capacity or its configured default; other roles prefer live output
-    /// rate, else `nominal_throughput`. No live rate (none reported, or only
+    /// Prefill prefers computed input capacity; other roles prefer live output
+    /// rate. Both fall back to `nominal_throughput`. No live rate (none reported, or only
     /// idle ranks) means the fleet's nominal rate, so an idle worker beside
     /// busy peers reads as fast as they are, not slower; with no live rate
     /// anywhere that is the configured default.
     fn drain_rate(
-        &self,
         worker: &Arc<dyn Worker>,
         load: &WorkerLoadResponse,
         nominal_throughput: f64,
     ) -> f64 {
-        if worker.worker_type() == &WorkerType::Prefill {
-            return Self::live_drain_rate(worker, load).unwrap_or(self.default_throughput);
-        }
         Self::live_drain_rate(worker, load).unwrap_or(nominal_throughput)
     }
 
@@ -607,7 +603,7 @@ impl LeastLoadPolicy {
                     "kv_pressure": load.map(WorkerLoadResponse::effective_kv_pressure),
                     "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
                     "drain_rate": load
-                        .map(|load| self.drain_rate(&workers[idx], load, inputs.nominal_throughput)),
+                        .map(|load| Self::drain_rate(&workers[idx], load, inputs.nominal_throughput)),
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
                     "unaccounted_requests": load.map(|load| {
                         let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
@@ -725,10 +721,9 @@ mod tests {
         },
     };
 
-    /// Invalid or incomplete rank capacity falls back to configured input rate.
+    /// Invalid or incomplete rank capacity falls back to the fleet input rate.
     #[test]
     fn prefill_uses_only_valid_complete_input_capacity() {
-        let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://prefill:1")
                 .worker_type(WorkerType::Prefill)
@@ -745,25 +740,46 @@ mod tests {
             Some(f64::INFINITY),
         ] {
             load.loads[0].prefill_throughput = rate;
-            assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 4_000.0);
+            assert_eq!(
+                LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+                9_000.0
+            );
         }
         load.loads[0].prefill_throughput = Some(5_000.0);
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 5_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            5_000.0
+        );
         load.dp_rank_count = 2;
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 4_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            9_000.0
+        );
         let mut second = load.loads[0].clone();
         second.dp_rank = 1;
         second.prefill_throughput = Some(7_000.0);
         load.loads.push(second);
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 12_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            12_000.0
+        );
         load.loads[1].prefill_throughput = None;
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 4_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            9_000.0
+        );
         for rank in &mut load.loads {
             rank.prefill_throughput = Some(f64::MAX);
         }
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 4_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            9_000.0
+        );
         load.loads.clear();
-        assert_eq!(policy.drain_rate(&prefill, &load, 9_000.0), 4_000.0);
+        assert_eq!(
+            LeastLoadPolicy::drain_rate(&prefill, &load, 9_000.0),
+            9_000.0
+        );
     }
 
     /// Prefill scores and missing-peer estimates must not track output-token rates.
@@ -823,7 +839,7 @@ mod tests {
                     DEFAULT_THROUGHPUT
                 };
                 assert_eq!(
-                    policy.drain_rate(&workers[0], &load, DEFAULT_THROUGHPUT),
+                    LeastLoadPolicy::drain_rate(&workers[0], &load, DEFAULT_THROUGHPUT),
                     expected
                 );
                 feed.publish(&HashMap::from([(workers[0].url().to_string(), load)]));
