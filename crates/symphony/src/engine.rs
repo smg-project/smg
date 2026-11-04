@@ -451,12 +451,12 @@ impl Engine {
     /// scan stands where the old one cut the text with nothing held, from which on the two cut it
     /// alike; at the end of the stream everything is scanned to the end, and a header still
     /// undecided is decided once nothing more comes.
-    fn run(&mut self, scanned: &Scanned<'_>, end: Option<Closed>, out: &mut Events) {
+    fn run<'d>(&mut self, scanned: &Scanned<'d>, end: Option<Closed>, out: &mut Events<'d>) {
         // The pieces are taken as scanned until a header decides; from then on, what the scan
         // that reads again gives and the pieces not reached yet stand in a queue, which nothing
         // is allocated for before.
-        let mut pieces = scanned.pieces();
-        let mut queue = VecDeque::new();
+        let mut pieces = scanned.pieces_of_delta();
+        let mut queue: VecDeque<Piece<'d>> = VecDeque::new();
         while let Some(piece) = pieces.next() {
             if let Some(again) = self.step(piece, end, out) {
                 queue.extend(pieces.by_ref());
@@ -483,7 +483,12 @@ impl Engine {
     /// Takes one piece: at the end of the stream (`end` says how it ended) a tag the end cut
     /// short is dropped, anything else is taken as the table says ([`Self::take`]). What a header
     /// that decided hands back to read again.
-    fn step(&mut self, piece: Piece<'_>, end: Option<Closed>, out: &mut Events) -> Option<String> {
+    fn step<'d>(
+        &mut self,
+        piece: Piece<'d>,
+        end: Option<Closed>,
+        out: &mut Events<'d>,
+    ) -> Option<String> {
         match (piece, end) {
             (Piece::Text(text), Some(closed)) if self.cut_tag(&text) => {
                 self.drop_cut_tag(text.into_owned(), closed, out);
@@ -524,10 +529,16 @@ impl Engine {
     }
 
     /// Takes one piece, and says what to read again when a shaped call's header decided.
-    fn take(&mut self, piece: Piece<'_>, out: &mut Events) -> Option<String> {
+    fn take<'d>(&mut self, piece: Piece<'d>, out: &mut Events<'d>) -> Option<String> {
         if self.pending.is_some() {
-            let text = piece_text(&self.format, &piece).to_string();
-            return self.read_header(&text, out);
+            // The header reads the piece's bytes as they are: a marker's are the table's.
+            return match piece {
+                Piece::Text(text) => self.read_header(&text, out),
+                Piece::Marker(index) => {
+                    let format = Arc::clone(&self.format);
+                    self.read_header(format.terminal_text(index), out)
+                }
+            };
         }
         if let Piece::Marker(index) = piece {
             let leaves = self.format.next(self.state, index).is_some();
@@ -550,11 +561,13 @@ impl Engine {
     }
 
     /// Takes one piece where the turn and the table put it: the turn's first piece decides where
-    /// the turn starts, then text is the state's and a terminal moves the engine or is text.
-    fn place(&mut self, piece: Piece<'_>, out: &mut Events) {
+    /// the turn starts, then text is the state's and a terminal moves the engine or is text. A
+    /// text piece keeps what it has: the delta's bytes when the scan cut them in place, its own
+    /// when the engine held or joined them.
+    fn place<'d>(&mut self, piece: Piece<'d>, out: &mut Events<'d>) {
         self.open_turn(&piece, out);
         match piece {
-            Piece::Text(text) => self.text(Cow::Owned(text.into_owned()), out),
+            Piece::Text(text) => self.text(text, out),
             Piece::Marker(index) => self.terminal(index, out),
         }
     }
@@ -662,12 +675,13 @@ impl Engine {
             declared: self.declared.clone(),
         });
         self.take_row(terminal, to, Some(call), out);
-        let mut started = Events::new();
+        let mut started: Events<'static> = std::mem::take(&mut self.scratch);
         let again = self
             .call
             .as_mut()
             .map_or_else(String::new, |call| call.start(&mut started));
-        self.push_call_events(started.drain(), out);
+        self.push_call_events(started.consume(), out);
+        self.scratch = started.recycle();
         // The header's bytes went to the shape, not through `feed`: the start's events carried
         // them out, so the region counts them as taken too.
         self.region.fed = self.region.fed.max(self.region.out);
@@ -690,8 +704,8 @@ impl Engine {
         again
     }
 
-    /// Text of the state the engine is in: borrowed from the delta when it came whole, owned when
-    /// the scan cut it or the engine held it.
+    /// Text of the state the engine is in: borrowed from the delta when it came whole or the scan
+    /// cut it from the delta alone, owned when the engine held, joined or re-scanned it.
     fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         if self.format.is_framing(self.state) {
             out.push(Event::Dropped {
@@ -715,8 +729,8 @@ impl Engine {
                     return;
                 };
                 // The assembler's events of this piece fill the engine's own buffer, then go out
-                // counted and placed. A piece the delta carries whole is fed as the delta's bytes,
-                // so a fragment within it borrows them; one the engine held or merged is its own,
+                // counted and placed. A piece the delta carries, whole or cut from it, is fed as the
+                // delta's bytes, so a fragment within it borrows them; one the engine held or merged is its own,
                 // and the events that borrow it are taken owned.
                 let taken = match &text {
                     Cow::Borrowed(piece) => {
@@ -912,11 +926,12 @@ impl Engine {
         out: &mut Events<'d>,
     ) {
         let mut released = self.stay.begun;
-        let mut events = Events::new();
+        let mut events: Events<'d> = std::mem::take(&mut self.scratch);
         release_between(before, &mut released, text, why, &mut events);
-        for event in events.drain() {
+        for event in events.consume() {
             out.push(self.tokens.relabel(event));
         }
+        self.scratch = events.recycle();
         self.stay.begun = released;
     }
 
@@ -930,9 +945,10 @@ impl Engine {
             let text = self.format.terminal_text(index).to_string();
             if self.emits() == Emits::Arguments {
                 if let Some(call) = &mut self.call {
-                    let mut events = Events::new();
+                    let mut events: Events<'static> = std::mem::take(&mut self.scratch);
                     call.ignored(&text, &self.declared, &mut events);
-                    self.push_call_events(events.drain(), out);
+                    self.push_call_events(events.consume(), out);
+                    self.scratch = events.recycle();
                     if self.region.out < self.region.fed {
                         self.region.carried.push((self.region.fed, text));
                         return;
@@ -1087,7 +1103,7 @@ impl Engine {
             };
             self.push_carried_out(dropped, out);
         }
-        let mut finished = Events::new();
+        let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
@@ -1107,17 +1123,18 @@ impl Engine {
         if taken {
             self.region.fed += terminal.len();
         }
-        let mut finished = finished.drain();
-        if as_marker {
-            for event in &mut finished {
-                if let Event::Malformed { why, .. } = event {
+        let closed_by_marker = |mut event: Event<'static>| {
+            if as_marker {
+                if let Event::Malformed { why, .. } = &mut event {
                     if *why == MalformedReason::UnterminatedRegion {
                         *why = MalformedReason::BlockWithoutACompleteCall;
                     }
                 }
             }
-        }
-        self.push_call_events(finished, out);
+            event
+        };
+        self.push_call_events(finished.consume().map(closed_by_marker), out);
+        self.scratch = finished.recycle();
         // An ignored terminal no event carried out leaves here, before the region's close.
         for (_, marker) in std::mem::take(&mut self.region.carried) {
             out.push(Event::Dropped {
