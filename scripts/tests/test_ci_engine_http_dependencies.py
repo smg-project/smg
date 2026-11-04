@@ -1232,3 +1232,31 @@ def test_direct_verify_checks_pip_after_real_filesystem_and_cpu_guards(
         "torch_c_dlpack_ext.core",
     ]
     assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("replacement", ["own-library", "builtin-api"])
+def test_direct_verify_rejects_dlpack_replacements_before_pip(tmp_path, monkeypatch, replacement):
+    verifier, _, native_calls, pip_calls = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    original_import = verifier.importlib.import_module
+    imported = {}
+
+    def import_module(name):
+        module = original_import(name)
+        imported[name] = module
+        if name == "torch_c_dlpack_ext.core":
+            if replacement == "own-library":
+                module._lib = "fixture-owned-addon"
+            else:
+                imported["torch"].Tensor.__dlpack_c_exchange_api__ = object()
+        return module
+
+    monkeypatch.setattr(verifier.importlib, "import_module", import_module)
+    message = (
+        "DLPack extension loaded its own library"
+        if replacement == "own-library"
+        else "DLPack extension replaced the Torch builtin C API"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        verifier.verify({})
+    assert native_calls[-1] == "torch_c_dlpack_ext.core"
+    assert pip_calls == []
