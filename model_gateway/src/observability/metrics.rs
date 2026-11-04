@@ -833,7 +833,7 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
-         other_rank)"
+         other_rank, not_indexed: a batch of events on a stream opened for load records alone)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",

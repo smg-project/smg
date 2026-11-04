@@ -1095,12 +1095,12 @@ class ServeOrchestrator:
                 )
                 router_args.disable_circuit_breaker = True
             # A single backend has nothing to balance across, so force the
-            # passthrough policy (overriding any --policy). It skips load
-            # monitoring and KV-event subscription, dropping that overhead.
+            # passthrough policy (overriding any --policy). It keeps no KV
+            # index; the worker's load is read as under any policy (polled, or
+            # streamed by a servicer that pushes its records).
             if router_args.policy != "passthrough":
                 logger.info(
-                    "dp=%d: forcing router policy to passthrough (single backend; "
-                    "skips load monitoring and KV-event subscription)",
+                    "dp=%d: forcing router policy to passthrough (single backend; no KV index)",
                     self.args.data_parallel_size,
                 )
                 router_args.policy = "passthrough"
