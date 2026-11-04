@@ -260,6 +260,24 @@ def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
     assert first[2] != second[2]
 
 
+@pytest.mark.parametrize("count", ["", "1", "2"])
+def test_evidence_readable_contract_identifies_grouped_zmq(tmp_path, count):
+    contract, _, artifacts = _evidence_identity(
+        tmp_path,
+        {
+            "engine": "vllm",
+            "gpu_tier": "1",
+            "gpu_vendor": "nvidia",
+            "test_dirs": "e2e_test/chat_completions",
+            "connection_mode": "zmq",
+            "zmq_engine_count": count,
+        },
+    )
+    assert ("-dp2-" in contract) is (count == "2")
+    assert "-dp1-" not in contract
+    assert all(contract in name for name in artifacts.values())
+
+
 def test_evidence_contract_ignores_json_key_order(tmp_path):
     inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/router"}
     assert (

@@ -443,9 +443,11 @@ jobs:
               else ""
           )
           vendor = inputs.get("gpu_vendor") or "unknown"
+          dp = str(inputs.get("zmq_engine_count") or "").strip()
           fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
-                    vendor, inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
-                    inputs.get("mm_processing", "")]
+                    vendor, inputs.get("connection_mode", ""),
+                    f"dp{dp}" if dp not in ("", "1") else "",
+                    inputs.get("servicer_impl", ""), inputs.get("mm_processing", "")]
           label = re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(fields)).strip("-.")[:96]
           tier = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(inputs.get("gpu_tier", "")))
           contract = f"{label}-gpu{tier}-{digest}"
