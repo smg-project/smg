@@ -5151,85 +5151,45 @@ mod tests {
     /// `configure` validates the configuration once, through the builder's
     /// `build()`: a second pass over the same value repeats every file read
     /// of the validators (the scheduler YAML, the log-directory probe) for no
-    /// second opinion. A FIFO as the scheduler file counts the reads: each
-    /// open of it is served by one write.
+    /// second opinion. An inotify watch on the scheduler file counts the
+    /// read-only opens `configure` closes; the count does not depend on
+    /// timing, since the events queue until they are read.
     #[cfg(target_os = "linux")]
     #[test]
     fn configure_reads_the_scheduler_file_once() {
-        use std::{
-            io::Write,
-            os::unix::fs::OpenOptionsExt,
-            sync::{
-                atomic::{AtomicBool, AtomicUsize, Ordering},
-                Arc,
-            },
-            time::Duration,
-        };
+        use std::mem::MaybeUninit;
 
-        // Linux's `O_NONBLOCK` and `ENXIO`: a non-blocking open of a FIFO for
-        // writing fails with `ENXIO` while no reader holds it.
-        const O_NONBLOCK: i32 = 0o4000;
-        const ENXIO: i32 = 6;
+        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 
         let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("scheduler.yaml");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap()
-            .success());
-        let served = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let writer = {
-            let (fifo, served, stop) = (fifo.clone(), Arc::clone(&served), Arc::clone(&stop));
-            // Blocks in `open` until a reader opens the FIFO, serves that one
-            // read, waits for the reader to leave (a reader still draining
-            // would take the next document too), and goes back to waiting
-            // until told to stop.
-            std::thread::spawn(move || {
-                while let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(&fifo) {
-                    // The release open below is the reader that ends the wait.
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    served.fetch_add(1, Ordering::SeqCst);
-                    writer.write_all(b"{}\n").unwrap();
-                    drop(writer);
-                    while std::fs::OpenOptions::new()
-                        .write(true)
-                        .custom_flags(O_NONBLOCK)
-                        .open(&fifo)
-                        .map_or_else(|e| e.raw_os_error() != Some(ENXIO), |_| true)
-                    {
-                        if stop.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            })
-        };
+        let scheduler = dir.path().join("scheduler.yaml");
+        std::fs::write(&scheduler, "{}\n").unwrap();
+        let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &scheduler, WatchFlags::CLOSE_NOWRITE).unwrap();
 
         let cli = cli_args_from(&[
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
-            fifo.to_str().unwrap(),
+            scheduler.to_str().unwrap(),
         ]);
         cli.configure(vec![], vec![]).expect("configures");
-        let reads = served.load(Ordering::SeqCst);
 
-        // Release the writer, whatever it is doing: a read-write open of a FIFO
-        // never blocks on Linux and counts as a reader, so an `open` the writer
-        // is blocked in returns, a drain poll finds the reader, and either path
-        // reads the stop flag. A blocking read-only open could wait for a
-        // writer that read the flag in its drain loop and left.
-        stop.store(true, Ordering::SeqCst);
-        let _release = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fifo)
-            .unwrap();
-        writer.join().unwrap();
+        // Every read-only open `configure` made has closed by now; the
+        // non-blocking read drains what queued and stops at an empty queue.
+        let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut events = inotify::Reader::new(&watch, &mut buf);
+        let mut reads = 0;
+        loop {
+            match events.next() {
+                Ok(event) => {
+                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                        reads += 1;
+                    }
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => break,
+                Err(error) => panic!("reading the inotify events: {error}"),
+            }
+        }
         assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
     }
 }
