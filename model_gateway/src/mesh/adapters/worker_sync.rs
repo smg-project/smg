@@ -303,14 +303,25 @@ impl WorkerSyncAdapter {
         // to test membership, and feeds the backfill below so the
         // namespace is scanned once per pass.
         let live: HashSet<String> = self.workers.keys("").into_iter().collect();
-        for (id, _) in self.worker_registry.get_all_with_ids() {
+        for (id, worker) in self.worker_registry.get_all_with_ids() {
             let key = format!("{PREFIX}{}", id.as_str());
-            if !live.contains(&key) {
-                // Missing backing key: same handling as a live tombstone
-                // event — imports are removed, locally-owned state is
-                // re-asserted.
-                self.sync_key_from_store(&key, id.as_str());
+            if live.contains(&key) {
+                continue;
             }
+            // A local worker this node never publishes (`is_publishable`
+            // keeps a host-local ZMQ worker off the mesh) has no key by
+            // design: nothing is missing for it, where a published worker's
+            // missing key is a foreign tombstone to re-assert and an
+            // import's a tombstone to apply.
+            let never_published = self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local)
+                && !self.is_publishable(&id, &worker);
+            if never_published {
+                continue;
+            }
+            // Missing backing key: same handling as a live tombstone
+            // event — imports are removed, locally-owned state is
+            // re-asserted.
+            self.sync_key_from_store(&key, id.as_str());
         }
         self.backfill_keys(live);
     }
@@ -809,6 +820,7 @@ mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::BasicWorkerBuilder;
@@ -1219,6 +1231,47 @@ mod tests {
         assert!(
             registry.get_by_url("http://remote:8080").is_none(),
             "reconcile recovers a missed tombstone"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn the_reconcile_pass_leaves_a_local_zmq_worker_alone_which_it_never_published() {
+        // A host-local ZMQ worker has no key by design (it is never
+        // published); its absent key is not a missed remote tombstone, so a
+        // pass neither asks the registry to remove it nor warns of a refused
+        // tombstone no peer sent.
+        let (ns, registry, adapter) = setup();
+        let zmq: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/smg-local.sock")
+                .model(ModelCard::new("llama-3"))
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let zmq_id = registry.register(zmq).unwrap();
+        let http_id = registry
+            .register(local_worker("http://local:8080"))
+            .unwrap();
+
+        adapter.reconcile_once();
+        adapter.reconcile_once();
+
+        assert!(
+            registry.get(&zmq_id).is_some() && registry.get(&http_id).is_some(),
+            "both local workers stay registered"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", zmq_id.as_str())).is_none(),
+            "the pass does not publish the ZMQ worker either"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", http_id.as_str())).is_some(),
+            "the pass re-asserts the published worker whose key is missing"
+        );
+        assert!(
+            !logs_contain("Refusing remote tombstone"),
+            "a pass must not take the absent key of a worker this node never publishes \
+             for a remote tombstone"
         );
     }
 
