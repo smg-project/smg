@@ -7,10 +7,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
-        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
-        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
-        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
+        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
+        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
+        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
+        Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -593,13 +594,16 @@ fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError>
     }
 }
 
-/// Schema-level validation for cross-field dependencies
+/// Schema-level validation for cross-field dependencies. Each rule names the
+/// field it is about (`invalid_at`), which the error envelope reports as
+/// `param`; the provider profiles' rules keep their own form.
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        return Err(invalid(
+        return Err(invalid_at(
+            "top_logprobs",
             "top_logprobs_requires_logprobs",
             "top_logprobs is only allowed when logprobs is enabled",
         ));
@@ -607,7 +611,8 @@ fn validate_chat_cross_parameters(
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        return Err(invalid(
+        return Err(invalid_at(
+            "stream_options",
             "stream_options_requires_stream",
             "The 'stream_options' parameter is only allowed when 'stream' is enabled",
         ));
@@ -616,7 +621,8 @@ fn validate_chat_cross_parameters(
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
-            return Err(invalid(
+            return Err(invalid_at(
+                "min_tokens",
                 "min_tokens_exceeds_max",
                 "min_tokens cannot exceed max_tokens/max_completion_tokens",
             ));
@@ -630,14 +636,16 @@ fn validate_chat_cross_parameters(
     );
 
     if has_json_format && req.regex.is_some() {
-        return Err(invalid(
+        return Err(invalid_at(
+            "regex",
             "regex_conflicts_with_json",
             "cannot use regex constraint with JSON response format",
         ));
     }
 
     if has_json_format && req.ebnf.is_some() {
-        return Err(invalid(
+        return Err(invalid_at(
+            "ebnf",
             "ebnf_conflicts_with_json",
             "cannot use EBNF constraint with JSON response format",
         ));
@@ -653,8 +661,11 @@ fn validate_chat_cross_parameters(
     .filter(|&&x| x)
     .count();
 
+    // Only `regex` beside `ebnf` reaches this rule (a JSON format beside
+    // either was refused above); the second constraint is the one named.
     if constraint_count > 1 {
-        return Err(invalid(
+        return Err(invalid_at(
+            "ebnf",
             "multiple_constraints",
             "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
         ));
@@ -662,7 +673,8 @@ fn validate_chat_cross_parameters(
 
     // 6. Validate response format JSON schema name and shape
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
-        validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)
+            .map_err(|error| on_field(error, "response_format"))?;
     }
 
     // 7. A tool_choice against the tools the model will see
@@ -677,7 +689,8 @@ fn validate_chat_cross_parameters(
             continue;
         };
         if !schema.is_object() {
-            return Err(invalid(
+            return Err(invalid_at(
+                format!("tools[{index}].function.parameters"),
                 "invalid_type",
                 format!(
                     "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
@@ -696,7 +709,8 @@ fn validate_chat_cross_parameters(
         .map(|(key, _)| key)
         .find(|key| key.parse::<u64>().is_err())
     {
-        return Err(invalid(
+        return Err(invalid_at(
+            "logit_bias",
             "logit_bias_invalid_key",
             format!(
                 "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
@@ -709,7 +723,8 @@ fn validate_chat_cross_parameters(
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
-        return Err(invalid(
+        return Err(invalid_at(
+            "add_generation_prompt",
             "add_generation_prompt_conflicts_with_continue_final_message",
             "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
         ));
@@ -742,7 +757,8 @@ fn validate_tool_choice(
         ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
     );
     if requires_tools && !has_tools {
-        return Err(invalid(
+        return Err(invalid_at(
+            "tool_choice",
             "tool_choice_requires_tools",
             "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
         ));
@@ -754,7 +770,8 @@ fn validate_tool_choice(
         effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
     };
     match tool_choice {
-        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid(
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid_at(
+            "tool_choice",
             "tool_choice_function_not_found",
             format!(
                 "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
@@ -762,7 +779,8 @@ fn validate_tool_choice(
             ),
         )),
         ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
-            Err(invalid(
+            Err(invalid_at(
+                "tool_choice.mode",
                 "tool_choice_invalid_mode",
                 format!(
                     "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
@@ -771,12 +789,14 @@ fn validate_tool_choice(
         }
         // The Chat Completions API takes function tools only in an allowed-tools choice.
         ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
-            ToolReference::Function { name } if !declared(name) => Err(invalid(
+            ToolReference::Function { name } if !declared(name) => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_tool_not_found",
                 format!("Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."),
             )),
             ToolReference::Function { .. } => Ok(()),
-            _ => Err(invalid(
+            _ => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_invalid_tool_type",
                 format!(
                     "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",

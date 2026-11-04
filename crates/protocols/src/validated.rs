@@ -12,6 +12,9 @@ pub trait Normalizable {
 }
 
 #[cfg(feature = "axum")]
+use std::borrow::Cow;
+
+#[cfg(feature = "axum")]
 use axum::{
     body::Bytes,
     extract::{
@@ -28,6 +31,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 #[cfg(feature = "axum")]
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
+
+#[cfg(feature = "axum")]
+use crate::common::FIELD_PARAM;
 
 /// A JSON extractor that automatically validates and normalizes the request body
 ///
@@ -195,26 +201,62 @@ fn param_from_deserialize_message(message: &str) -> Option<String> {
     }
 }
 
+/// The key the validator crate files a rule over the whole request under
+/// (and a rule over one nested value, under that value's path). It is the
+/// crate's own and names no field of the public API: it is never printed
+/// and never a `param`.
+#[cfg(feature = "axum")]
+const WHOLE_REQUEST_KEY: &str = "__all__";
+
+/// `key` under `prefix`: the key alone at the top, else `prefix.key`.
+#[cfg(feature = "axum")]
+fn join(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// The path of a report entry: a field's key under its prefix; the prefix
+/// itself for a rule over the whole value.
+#[cfg(feature = "axum")]
+fn path_of(prefix: &str, key: &str) -> String {
+    if key == WHOLE_REQUEST_KEY {
+        prefix.to_string()
+    } else {
+        join(prefix, key)
+    }
+}
+
+/// The report's entries in sorted key order, so that the same report always
+/// reads the same way.
+#[cfg(feature = "axum")]
+fn sorted_entries(errors: &ValidationErrors) -> Vec<(&Cow<'static, str>, &ValidationErrorsKind)> {
+    let mut entries: Vec<_> = errors.errors().iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+}
+
 /// The first violation of a validation report, as the public API's
-/// (`param`, `code`): the path of the field (`items[1].role`; None for a rule
-/// over the whole request) and the code of the rule, validator's built-in
-/// rules named the way the public API names them. Keys are visited in sorted
-/// order, so the same report always yields the same pair.
+/// (`param`, `code`): the path of the field (`items[1].role`; the field a
+/// rule checked across fields names for itself, `FIELD_PARAM`; None for a
+/// rule over the whole request that names none) and the code of the rule,
+/// validator's built-in rules named the way the public API names them. Keys
+/// are visited in sorted order, so the same report always yields the same
+/// pair.
 #[cfg(feature = "axum")]
 fn first_violation(errors: &ValidationErrors) -> (Option<String>, String) {
     fn walk(errors: &ValidationErrors, prefix: &str) -> Option<(Option<String>, String)> {
-        let mut entries: Vec<_> = errors.errors().iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (key, kind) in entries {
-            let path = match (key.as_ref(), prefix.is_empty()) {
-                ("__all__", _) => prefix.to_string(),
-                (key, true) => key.to_string(),
-                (key, false) => format!("{prefix}.{key}"),
-            };
+        for (key, kind) in sorted_entries(errors) {
+            let path = path_of(prefix, key);
             match kind {
                 ValidationErrorsKind::Field(field_errors) => {
                     if let Some(error) = field_errors.first() {
-                        let param = (!path.is_empty()).then_some(path);
+                        let param = match error.params.get(FIELD_PARAM).and_then(Value::as_str) {
+                            Some(field) => Some(join(&path, field)),
+                            None => (!path.is_empty()).then_some(path),
+                        };
                         return Some((param, public_code(error)));
                     }
                 }
@@ -235,6 +277,48 @@ fn first_violation(errors: &ValidationErrors) -> (Option<String>, String) {
         None
     }
     walk(errors, "").unwrap_or_else(|| (None, "invalid_value".to_string()))
+}
+
+/// The refusal's message for a validation report: the violations each on a
+/// line of their own, in the order [`first_violation`] visits them (the
+/// first line is the violation whose `param` and `code` the envelope
+/// carries); `field: message` for a field's rule, a nested field by its path
+/// (`items[1].role: ...`), and the message alone for a rule over the whole
+/// request, whose key in the report is the validator crate's own
+/// (`WHOLE_REQUEST_KEY`) and no field of the public API.
+#[cfg(feature = "axum")]
+fn message_of(errors: &ValidationErrors) -> String {
+    fn walk(out: &mut String, errors: &ValidationErrors, prefix: &str) {
+        for (key, kind) in sorted_entries(errors) {
+            let path = path_of(prefix, key);
+            match kind {
+                ValidationErrorsKind::Field(field_errors) => {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    if !path.is_empty() {
+                        out.push_str(&path);
+                        out.push_str(": ");
+                    }
+                    for (index, error) in field_errors.iter().enumerate() {
+                        if index > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(&error.to_string());
+                    }
+                }
+                ValidationErrorsKind::Struct(inner) => walk(out, inner, &path),
+                ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        walk(out, inner, &format!("{path}[{index}]"));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&mut out, errors, "");
+    out
 }
 
 /// The public API's code for a validation error: a custom rule's own code
@@ -443,7 +527,7 @@ where
                 StatusCode::BAD_REQUEST,
                 &code,
                 param,
-                validation_errors.to_string(),
+                message_of(&validation_errors),
             )
         })?;
 
@@ -593,24 +677,7 @@ mod tests {
     /// The status and body of a rejected body; an accepted body shows up as
     /// a 200 with a null body (and fails the caller's assertions).
     async fn reject(body: &str) -> (StatusCode, Value) {
-        let request = Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap_or_default();
-        let response = match ValidatedJson::<BodyRequest>::from_request(request, &()).await {
-            Ok(_) => return (StatusCode::OK, Value::Null),
-            Err(response) => response,
-        };
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap_or_default();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        rejected::<BodyRequest>(body).await
     }
 
     /// The body of a request under `content_type`, through the extractor.
@@ -972,6 +1039,181 @@ mod tests {
             json["error"]["message"]
                 .as_str()
                 .is_some_and(|m| m.starts_with("JSON syntax error")),
+            "{json}"
+        );
+    }
+
+    /// A request whose rule checked across fields names its field
+    /// (`invalid_at`), and one whose rule over the whole request names none.
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    #[validate(schema(function = "crossed"))]
+    struct CrossRequest {
+        #[serde(default)]
+        base: bool,
+        #[serde(default)]
+        top: bool,
+        #[serde(default)]
+        whole: bool,
+        #[serde(default)]
+        #[validate(range(min = 1, max = 3))]
+        level: Option<u32>,
+    }
+
+    impl Normalizable for CrossRequest {}
+
+    fn crossed(request: &CrossRequest) -> Result<(), ValidationError> {
+        if request.top && !request.base {
+            return Err(crate::common::invalid_at(
+                "top",
+                "top_requires_base",
+                "top is only allowed when base is set",
+            ));
+        }
+        if request.whole {
+            return Err(crate::common::invalid(
+                "whole_request_refused",
+                "the request as a whole is refused",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The status and body of a rejected body of type `T`.
+    async fn rejected<T>(body: &str) -> (StatusCode, Value)
+    where
+        T: DeserializeOwned + Validate + Normalizable + Send,
+    {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_default();
+        let response = match ValidatedJson::<T>::from_request(request, &()).await {
+            Ok(_) => return (StatusCode::OK, Value::Null),
+            Err(response) => response,
+        };
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// A rule checked across fields names its field, which the envelope
+    /// reports as `param`; a rule over the whole request that names none
+    /// keeps `param` null; neither prints the key the validator crate files
+    /// them under. A field's rule prints `field: message` as before, a nested
+    /// one by its path, several violations each on a line in key order.
+    #[tokio::test]
+    async fn request_level_refusals_name_their_field_and_print_no_internal_key() {
+        let (status, json) = rejected::<CrossRequest>(r#"{"top": true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "top_requires_base", "{json}");
+        assert_eq!(json["error"]["param"], "top", "{json}");
+        assert_eq!(
+            json["error"]["message"], "top is only allowed when base is set",
+            "{json}"
+        );
+
+        let (status, json) = rejected::<CrossRequest>(r#"{"whole": true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "whole_request_refused", "{json}");
+        assert!(json["error"]["param"].is_null(), "{json}");
+        assert_eq!(
+            json["error"]["message"], "the request as a whole is refused",
+            "{json}"
+        );
+
+        let (_, json) = rejected::<CrossRequest>(r#"{"level": 9}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("level: Validation error: range"),
+            "{json}"
+        );
+        assert_eq!(json["error"]["param"], "level", "{json}");
+
+        let (_, json) = reject(r#"{"value": 0.5, "name": "x", "items": [{"role": ""}]}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("items[0].role: "), "{json}");
+
+        let (_, json) = reject(r#"{"value": 1.5, "name": ""}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(lines.len(), 2, "{json}");
+        assert!(lines[0].starts_with("name: "), "{json}");
+        assert!(lines[1].starts_with("value: "), "{json}");
+        assert_eq!(json["error"]["param"], "name", "{json}");
+    }
+
+    /// The Chat Completions rules checked across fields name their field;
+    /// a provider profile's rule keeps its code and message with nothing in
+    /// front; the Messages rules print the public API's words alone.
+    #[tokio::test]
+    async fn the_public_requests_refusals_name_the_field_without_the_internal_key() {
+        use crate::{chat::ChatCompletionRequest, messages::CreateMessageRequest};
+
+        for (body, code, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"top_logprobs":2}"#,
+                "top_logprobs_requires_logprobs",
+                "top_logprobs",
+                "top_logprobs is only allowed when logprobs is enabled",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}"#,
+                "stream_options_requires_stream",
+                "stream_options",
+                "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#,
+                "tool_choice_requires_tools",
+                "tool_choice",
+                "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"nope"}}}"#,
+                "tool_choice_function_not_found",
+                "tool_choice",
+                "Invalid value for 'tool_choice': function 'nope' not found in 'tools'.",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]}"#,
+                "invalid_type",
+                "tools[0].function.parameters",
+                "Invalid 'tools[0].function.parameters': expected an object, but got an array instead",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"regex":"a+","ebnf":"root ::= \"a\""}"#,
+                "multiple_constraints",
+                "ebnf",
+                "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert_eq!(json["error"]["message"], message, "{json}");
+        }
+
+        let body = r#"{"model":"kimi-k2","messages":[{"role":"root","content":"hi"}]}"#;
+        let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "invalid_role", "{json}");
+        assert_eq!(json["error"]["message"], "invalid role: root", "{json}");
+        assert!(json["error"]["param"].is_null(), "{json}");
+
+        let body = r#"{"model":"m","max_tokens":8,"temperature":1.5,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, json) = rejected::<CreateMessageRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "value_out_of_range", "{json}");
+        assert_eq!(
+            json["error"]["message"], "temperature: range: 0..1",
             "{json}"
         );
     }

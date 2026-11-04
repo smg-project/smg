@@ -281,6 +281,32 @@ pub(crate) fn invalid(
     e
 }
 
+/// The parameter under which a validation error of a rule checked across
+/// fields names the field the refusal is about: the error envelope's
+/// `param`. The validator crate files such a rule's error under the whole
+/// request (`__all__`), a key that names no field.
+pub(crate) const FIELD_PARAM: &str = "field";
+
+/// [`invalid`] for a rule checked across fields, naming the field the
+/// refusal is about (the envelope's `param`); the message names it too, in
+/// the public API's words.
+pub(crate) fn invalid_at(
+    field: impl Into<String>,
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    on_field(invalid(code, message), field)
+}
+
+/// `error`, naming `field` as the field it is about (see [`invalid_at`]).
+pub(crate) fn on_field(
+    mut error: validator::ValidationError,
+    field: impl Into<String>,
+) -> validator::ValidationError {
+    error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
+    error
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
