@@ -705,10 +705,9 @@ impl CliArgs {
         let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
         let selectors = match provider {
             None => "without --service-discovery".to_string(),
-            Some(provider) => format!(
-                "under --discovery-provider {}: it selects Kubernetes pods",
-                provider.flag_value()
-            ),
+            Some(provider) => {
+                format!("under --discovery-provider {provider}: it selects Kubernetes pods")
+            }
         };
         // Two worker sources are both honoured, which is worth a line of its
         // own, naming the source as it was given.
@@ -716,7 +715,7 @@ impl CliArgs {
             "--service-discovery".to_string()
         } else {
             provider.map_or_else(String::new, |provider| {
-                format!("--discovery-provider {}", provider.flag_value())
+                format!("--discovery-provider {provider}")
             })
         };
         let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
