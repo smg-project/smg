@@ -121,7 +121,7 @@ if sys.argv[1:3] == ['-m', 'venv']:
     failed = pathlib.Path(os.environ['TEST_LOG'] + '.venv-failed')
     if os.environ.get('TEST_FAIL_VENV') == '1' and not failed.exists():
         failed.touch(); sys.exit(1)
-    target = pathlib.Path(sys.argv[3]).resolve()
+    target = pathlib.Path(sys.argv[-1]).resolve()
     target.joinpath('bin').mkdir(parents=True, exist_ok=True)
     for name in ('python', 'python3'):
         shutil.copy(sys.argv[0], target / 'bin' / name)
@@ -360,6 +360,96 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.run_script("ci_ensure_python_headers.sh", TEST_UID="0")
         self.assertIn("apt-get install", self.commands())
         self.assertNotIn("sudo ", self.commands())
+
+    def prepare_vllm_rocm_image(self, *, mooncake_available):
+        # Only the ROCm controls replace these packages and stub pip.
+        Path(self.env["GITHUB_PATH"]).unlink(missing_ok=True)
+        Path(self.env["TEST_LOG"]).unlink(missing_ok=True)
+        self.env.update(
+            E2E_VLLM_EXTRA_KV_BACKENDS="",
+            E2E_VLLM_KV_BACKEND="",
+            E2E_KV_BACKEND="",
+        )
+        self.packages.joinpath("torch.py").write_text(
+            "class version: hip = 'fixture'\n",
+        )
+        self.packages.joinpath("vllm.py").write_text("__version__ = 'fixture'\n")
+        self.packages.joinpath("smg_grpc_servicer.py").touch()
+        self.packages.joinpath("mooncake/engine.py").write_text(
+            "TransferEngine = object\n"
+            if mooncake_available
+            else "raise ImportError('fixture HIP Mooncake unavailable')\n"
+        )
+        self.write_tool("pip", '#!/bin/sh\necho "pip $*" >> "$TEST_LOG"\n')
+
+    def test_rocm_requested_mooncake_fails_before_path_export(self):
+        for transport in (
+            {"E2E_VLLM_KV_BACKEND": " MoonCake "},
+            {"E2E_KV_BACKEND": "MOONCAKE"},
+            {"E2E_VLLM_EXTRA_KV_BACKENDS": "nixl, MoonCake "},
+        ):
+            with self.subTest(transport=transport):
+                self.prepare_vllm_rocm_image(mooncake_available=False)
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    self.run_script(
+                        "ci_setup_vllm_rocm_image.sh",
+                        **transport,
+                    )
+                self.assertIn("vllm fixture", error.exception.stdout)
+                self.assertIn(
+                    "fixture HIP Mooncake unavailable",
+                    error.exception.stderr,
+                )
+                self.assertFalse(Path(self.env["GITHUB_PATH"]).exists())
+                self.assertNotIn("mooncake", self.commands().lower())
+
+    def test_rocm_available_mooncake_checks_without_installing_it(self):
+        for transport in (
+            {"E2E_VLLM_KV_BACKEND": " MoonCake "},
+            {"E2E_KV_BACKEND": "MOONCAKE"},
+            {"E2E_VLLM_EXTRA_KV_BACKENDS": "nixl, MoonCake "},
+        ):
+            with self.subTest(transport=transport):
+                self.prepare_vllm_rocm_image(mooncake_available=True)
+                result = self.run_script(
+                    "ci_setup_vllm_rocm_image.sh",
+                    **transport,
+                )
+                self.assertIn("mooncake import canary OK", result.stdout)
+                self.assertEqual(
+                    self.commands().splitlines(),
+                    [
+                        "pip install -e crates/grpc_client/python/ -e grpc_servicer/",
+                        "pip install --ignore-installed pytest",
+                    ],
+                )
+                self.assertEqual(
+                    Path(self.env["GITHUB_PATH"]).read_text(),
+                    f"{self.job}/.venv/bin\n",
+                )
+
+    def test_rocm_unrequested_mooncake_is_not_probed(self):
+        for transport in (
+            {},
+            {
+                "E2E_VLLM_KV_BACKEND": "nixl",
+                "E2E_KV_BACKEND": " NIXL ",
+                "E2E_VLLM_EXTRA_KV_BACKENDS": "nixl",
+            },
+            {
+                "E2E_VLLM_KV_BACKEND": "notmooncake",
+                "E2E_KV_BACKEND": "mooncakeish",
+                "E2E_VLLM_EXTRA_KV_BACKENDS": "notmooncake,mooncakeish",
+            },
+        ):
+            with self.subTest(transport=transport):
+                self.prepare_vllm_rocm_image(mooncake_available=False)
+                result = self.run_script(
+                    "ci_setup_vllm_rocm_image.sh",
+                    **transport,
+                )
+                self.assertNotIn("Checking requested Mooncake backend", result.stdout)
+                self.assertNotIn("mooncake import canary OK", result.stdout)
 
 
 if __name__ == "__main__":
