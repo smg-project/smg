@@ -369,20 +369,35 @@ fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A thinking budget starts at 1024 tokens. (That it stays under
+/// `enabled` needs a budget of at least 1024 tokens (that it stays under
 /// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
-/// handler checks it.)
+/// handler checks it); `between_tools` takes `type` alone (the public API
+/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
 fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    if let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking {
-        if *budget_tokens < 1024 {
-            return Err(invalid(
+    match &req.thinking {
+        Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
+            Err(invalid(
                 "thinking_budget_too_small",
                 "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
                     .to_owned(),
-            ));
+            ))
         }
+        Some(ThinkingConfig::BetweenTools { other }) if !other.is_empty() => {
+            let mut fields: Vec<&str> = other.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            let refusals: Vec<String> = fields
+                .iter()
+                .map(|field| {
+                    format!("thinking.between_tools.{field}: Extra inputs are not permitted")
+                })
+                .collect();
+            Err(invalid(
+                "thinking_between_tools_takes_no_other_field",
+                refusals.join("; "),
+            ))
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -702,5 +717,25 @@ mod tests {
         .expect_err("the public API refuses an unknown field in a message")
         .to_string();
         assert!(err.contains("extra"), "{err}");
+    }
+
+    /// `between_tools` passes with `type` alone and is refused, naming each
+    /// field the way the module's other refusals do, with anything else
+    /// beside it.
+    #[test]
+    fn between_tools_takes_no_other_field() {
+        assert!(request(json!({"thinking": {"type": "between_tools"}}))
+            .validate()
+            .is_ok());
+        let refusal = rejection(json!({
+            "thinking": {"type": "between_tools", "display": "omitted", "budget_tokens": 2048}
+        }));
+        assert!(
+            refusal.contains(
+                "thinking.between_tools.budget_tokens: Extra inputs are not permitted; \
+                 thinking.between_tools.display: Extra inputs are not permitted"
+            ),
+            "{refusal}"
+        );
     }
 }

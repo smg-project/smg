@@ -1095,20 +1095,35 @@ pub enum ThinkingConfig {
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
     },
+    /// No thinking up front; the model may think between its tool calls.
+    /// The public API takes `type` alone here: the `/v1/messages` request
+    /// validation (`messages_validation`) refuses any other field, which is
+    /// why the variant keeps what else was sent instead of letting the
+    /// reader drop it (`count_tokens` runs no thinking validation, this rule
+    /// and the budget floor alike, and counts the request as read). Where
+    /// the gateway renders the prompt (the gRPC path) the shape reads as
+    /// thinking off; the HTTP relay hands it to the engine's own
+    /// `/v1/messages` as written, for the engine's reading.
+    BetweenTools {
+        /// Every field beside `type`, for the validation to refuse.
+        #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+        other: Map<String, Value>,
+    },
 }
 
 impl ThinkingConfig {
-    /// `enabled` and `adaptive` ask for thinking, `disabled` turns it off.
+    /// `enabled` and `adaptive` ask for thinking, `disabled` and
+    /// `between_tools` (no thinking up front) turn it off.
     pub fn enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
 
     /// The `display` the block states, under `enabled` and `adaptive` alike;
-    /// `disabled` states none.
+    /// `disabled` and `between_tools` state none.
     pub fn display(&self) -> Option<ThinkingDisplay> {
         match self {
             Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
-            Self::Disabled => None,
+            Self::Disabled | Self::BetweenTools { .. } => None,
         }
     }
 }
@@ -3182,7 +3197,7 @@ mod tests {
                 let parsed = match &cfg {
                     ThinkingConfig::Adaptive { display }
                     | ThinkingConfig::Enabled { display, .. } => *display,
-                    ThinkingConfig::Disabled => None,
+                    ThinkingConfig::Disabled | ThinkingConfig::BetweenTools { .. } => None,
                 };
                 assert_eq!(parsed, Some(display), "{input}");
                 assert_eq!(serde_json::to_value(&cfg).unwrap(), input);
@@ -3257,7 +3272,34 @@ mod tests {
         );
         assert_eq!(display(json!({"type": "adaptive"})), None);
         assert_eq!(display(json!({"type": "disabled"})), None);
+        assert_eq!(display(json!({"type": "between_tools"})), None);
         assert_eq!(display(Value::Null), None);
+    }
+
+    /// `between_tools` is the public API's fourth thinking shape: no thinking
+    /// up front, so the request's toggle reads off as under `disabled`, no
+    /// display; it writes back as `type` alone, and what else was sent with
+    /// it is kept for the validation to refuse.
+    #[test]
+    fn between_tools_is_thinking_off_up_front() {
+        let cfg: ThinkingConfig = serde_json::from_value(json!({"type": "between_tools"})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.is_empty()));
+        assert!(!cfg.enabled());
+        assert_eq!(cfg.display(), None);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            json!({"type": "between_tools"})
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 16, "messages": [], "thinking": {"type": "between_tools"}
+        }))
+        .unwrap();
+        assert_eq!(request.thinking_toggle(), Some(false));
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "between_tools", "display": "omitted"})).unwrap();
+        assert!(
+            matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.contains_key("display"))
+        );
     }
 
     /// The first request of a coding agent: an adaptive thinking with
