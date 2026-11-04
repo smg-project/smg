@@ -1,4 +1,4 @@
-"""Validate pytest phase reports and JUnit XML against 128 reference Responses cases."""
+"""Validate pytest phases and JUnit against original and optional extra Responses cases."""
 
 import json
 import os
@@ -55,13 +55,13 @@ def junit_identity(nodeid):
     return (".".join([module, *parts[:-1]]), parts[-1])
 
 
-def verify(directory, xml_path, original_path):
+def verify(directory, xml_path, original_path, required_extra_path=None):
     global DIRECTORY
     DIRECTORY = directory
     errors = []
     result = {
         "business_verified": False,
-        "scope": "Validate pytest phases and JUnit XML against the 128 reference Responses cases",
+        "scope": "Validate pytest phases and JUnit XML against Original128 and optional required extras",
     }
     try:
         for path in [
@@ -69,6 +69,7 @@ def verify(directory, xml_path, original_path):
             directory / "outcomes.json",
             xml_path,
             original_path,
+            *([required_extra_path] if required_extra_path is not None else []),
         ]:
             if not path.is_file() or path.is_symlink():
                 raise ValueError(f"Missing or symlinked evidence: {path}")
@@ -93,7 +94,7 @@ def verify(directory, xml_path, original_path):
             rootpath=str(rootpath),
             original_reference_comparison_nodeids=original_comparison,
             identity_scope=(
-                "Only historical Original128 subset uses source-root-relative paths; "
+                "Original128 and required extra references use source-root-relative paths; "
                 "selected/JUnit/phases retain raw identities"
             ),
         )
@@ -126,6 +127,25 @@ def verify(directory, xml_path, original_path):
                 "Original128 identities are missing from final selection: "
                 f"{missing}; reference list: {original_path}"
             )
+        required_extra = []
+        if required_extra_path is not None:
+            required_extra = json.loads(required_extra_path.read_text())
+            if (
+                not isinstance(required_extra, list)
+                or not required_extra
+                or any(not isinstance(item, str) for item in required_extra)
+                or len(set(required_extra)) != len(required_extra)
+            ):
+                raise ValueError(
+                    f"{required_extra_path}: required extra identities must be nonempty unique strings"
+                )
+            missing_extra = sorted(set(required_extra) - set(original_comparison))
+            if missing_extra:
+                errors.append(
+                    "Required extra identities are missing from final selection: "
+                    f"{missing_extra}; reference list: {required_extra_path}"
+                )
+        result.update(required_extra_count=len(required_extra))
         wanted = {junit_identity(nodeid) for nodeid in selected}
         if len(wanted) != len(selected):
             errors.append("Final selection has ambiguous JUnit identities")
@@ -198,6 +218,9 @@ def verify(directory, xml_path, original_path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5 or sys.argv[1] != "verify":
-        raise SystemExit("usage: ci_responses_evidence.py verify DIRECTORY JUNIT ORIGINAL128_JSON")
+    if len(sys.argv) not in (5, 6) or sys.argv[1] != "verify":
+        raise SystemExit(
+            "usage: ci_responses_evidence.py verify DIRECTORY JUNIT ORIGINAL128_JSON "
+            "[REQUIRED_EXTRA_JSON]"
+        )
     raise SystemExit(verify(*map(Path, sys.argv[2:])))

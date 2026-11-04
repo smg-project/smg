@@ -1,0 +1,7 @@
+[
+  "e2e_test/responses/test_original_request_caps.py::TestOriginalStreamingCapsGptOss::test_output_item_event_emitted[openai-grpc]",
+  "e2e_test/responses/test_original_request_caps.py::TestOriginalStreamingCapsGptOss::test_output_item_event_emitted[smg-grpc]",
+  "e2e_test/responses/test_original_request_caps.py::TestOriginalStreamingCapsGptOss::test_reasoning_content[openai-grpc]",
+  "e2e_test/responses/test_original_request_caps.py::TestOriginalStreamingCapsGptOss::test_reasoning_content[smg-grpc]",
+  "e2e_test/responses/test_original_request_caps.py::TestOriginalSamplingCapHarmony::test_temperature_zero_is_deterministic[grpc]"
+]

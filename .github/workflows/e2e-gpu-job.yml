@@ -616,7 +616,7 @@ jobs:
         if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success' && steps.e2e_tests.outcome != 'skipped'
         env:
           RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
-        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json
+        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json scripts/ci_responses_required_cap5.json
 
       - name: Upload Responses evidence
         if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'

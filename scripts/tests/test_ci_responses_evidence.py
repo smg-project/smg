@@ -75,6 +75,7 @@ def run_validator(evidence):
             str(directory),
             str(xml_path),
             str(evidence.get("original_path", ORIGINAL_PATH)),
+            *([str(evidence["required_extra_path"])] if "required_extra_path" in evidence else []),
         ],
         cwd=evidence["source"],
         stdin=subprocess.DEVNULL,
@@ -435,3 +436,46 @@ def test_malformed_nodeid_diagnostic_names_the_case(evidence, nodeid, diagnostic
             str(selected_path) in message and detail in message for message in report["errors"]
         )
     assert json.loads(selected_path.read_text())["nodeids"][0] == nodeid
+
+
+REQUIRED_CAPS_PATH = SCRIPTS / "ci_responses_required_cap5.json"
+
+
+def add_required_original_caps(evidence):
+    required = json.loads(REQUIRED_CAPS_PATH.read_text())
+    assert len(required) == len(set(required)) == 5
+    evidence["required_extra_path"] = REQUIRED_CAPS_PATH
+    evidence["selection"]["nodeids"].extend(nodeid.removeprefix("e2e_test/") for nodeid in required)
+    return required
+
+
+def test_original128_plus_required_caps_is_complete(evidence):
+    add_required_original_caps(evidence)
+    complete_records(evidence)
+    report = verify(evidence)
+    assert report["required_extra_count"] == 5
+    assert report["final_selected"] == 133
+
+
+def test_missing_required_cap_rejects_otherwise_all_passing_evidence(evidence):
+    required = add_required_original_caps(evidence)
+    missing = evidence["selection"]["nodeids"].pop()
+    evidence["selection"]["nodeids"].append(EXTRA)
+    complete_records(evidence)
+    report = verify(evidence, "Required extra identities are missing from final selection")
+    assert report["final_selected"] == 133
+    assert any(
+        missing in message and str(REQUIRED_CAPS_PATH) in message for message in report["errors"]
+    )
+    assert missing == required[-1].removeprefix("e2e_test/")
+
+
+def test_required_caps_allow_future_current_cases_above137(evidence):
+    add_required_original_caps(evidence)
+    evidence["selection"]["nodeids"].extend(
+        f"responses/test_current_extra.py::test_current_extra_{index}" for index in range(5)
+    )
+    complete_records(evidence)
+    report = verify(evidence)
+    assert report["required_extra_count"] == 5
+    assert report["final_selected"] == 138

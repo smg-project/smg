@@ -221,7 +221,8 @@ def test_services_and_always_verifier_keep_unique_evidence_contract():
     assert verify["if"].startswith("always() && inputs.responses_evidence")
     assert "steps.e2e_tests.outcome != 'skipped'" in verify["if"]
     assert verify["run"].endswith(
-        '"$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json'
+        '"$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json '
+        "scripts/ci_responses_required_cap5.json"
     )
     assert upload["with"]["name"] == "${{ steps.responses-evidence.outputs.artifact }}"
     assert upload["with"]["if-no-files-found"] == "error"
