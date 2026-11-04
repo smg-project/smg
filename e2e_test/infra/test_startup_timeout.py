@@ -539,8 +539,8 @@ def test_absent_profile_definition_rejects_before_model_lookup(monkeypatch):
         )
 
 
-def _mooncake_pd2_profile(monkeypatch):
-    return set_profile_lane(monkeypatch, "vllm-mooncake-pd2")
+def _mooncake_pd2_profile(monkeypatch, floor=None):
+    return set_profile_lane(monkeypatch, "vllm-mooncake-pd2", floor=floor)
 
 
 @pytest.mark.parametrize(
@@ -553,11 +553,10 @@ def _mooncake_pd2_profile(monkeypatch):
     ],
 )
 def test_mooncake_pd2_worker_wait_cannot_inherit_model_or_warmup_headroom(monkeypatch, model):
-    _mooncake_pd2_profile(monkeypatch)
+    _mooncake_pd2_profile(monkeypatch, floor="60")
     monkeypatch.setattr(
         worker_module, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 9999}
     )
-    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "60")
     assert worker_startup_timeout(model, timeout=9999) == 300
 
 
@@ -575,8 +574,11 @@ def test_mooncake_pd2_worker_wait_cannot_inherit_model_or_warmup_headroom(monkey
     ],
 )
 def test_mooncake_pd2_rejects_a_changed_contract_before_resolving_wait(monkeypatch, key, value):
-    _mooncake_pd2_profile(monkeypatch)
-    monkeypatch.setenv(key, value)
+    config = _mooncake_pd2_profile(monkeypatch)
+    if key == "TEST_FILTER":
+        config.option.keyword = value
+    else:
+        monkeypatch.setenv(key, value)
     with pytest.raises(ValueError):
         worker_startup_timeout("meta-llama/Llama-3.1-8B-Instruct")
 
