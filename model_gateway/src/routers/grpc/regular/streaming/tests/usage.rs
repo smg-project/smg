@@ -859,9 +859,9 @@ async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
 /// frames carry none. The Messages usage reports the same cache hit as
 /// `cache_read_input_tokens` beside `input_tokens` = the prompt outside the
 /// cache, on the final `message_delta` and on the collected message (integers
-/// either way; the `message_start` skeleton stays at zero, as it precedes the
-/// engine's frames), and the greater of the engine's and the parser's
-/// thinking count.
+/// either way; the `message_start` skeleton, which precedes the engine's
+/// frames, reports the whole rendered prompt and a zero cache hit), and
+/// the greater of the engine's and the parser's thinking count.
 #[tokio::test]
 async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
     let texts = ["<think>", "ab", "</think>", "de"];
@@ -875,8 +875,13 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
                 None => engine_stream(frames(&texts, 1, counters)).await,
             }
         };
+        let spec = || {
+            let mut spec = messages_spec(true);
+            spec.prompt_tokens = counters.prompt;
+            spec
+        };
         let (handle, backend) = RecordingBackend::reservation();
-        let events = streamed_messages(scripted().await, messages_spec(true), Some(handle)).await;
+        let events = streamed_messages(scripted().await, spec(), Some(handle)).await;
         assert_eq!(backend.settlements(), vec![expected], "{name}: streamed");
         let delta = events
             .iter()
@@ -897,10 +902,14 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
             .find(|event| event["type"] == "message_start")
             .expect("a message_start event");
         assert_eq!(
+            start["message"]["usage"]["input_tokens"], expected.actual_input_tokens,
+            "{name}: the skeleton reports the whole rendered prompt"
+        );
+        assert_eq!(
             start["message"]["usage"]["cache_read_input_tokens"], 0,
             "{name}: the skeleton precedes the engine's frames"
         );
-        let (message, counts) = non_streamed_messages(scripted().await, messages_spec(true)).await;
+        let (message, counts) = non_streamed_messages(scripted().await, spec()).await;
         assert_eq!(counts.settlement(), expected, "{name}: non-streamed");
         assert_eq!(
             message.usage.cache_read_input_tokens,

@@ -88,6 +88,7 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
         weight_version: None,
     };
     let spec = MessagesResponseSpec {
+        prompt_tokens: 0,
         thinking_requested: scenario.thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,

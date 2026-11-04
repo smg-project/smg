@@ -683,6 +683,7 @@ pub(super) fn assigned_message(
     thinking: bool,
 ) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        prompt_tokens: 0,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,

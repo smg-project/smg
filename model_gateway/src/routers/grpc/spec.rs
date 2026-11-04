@@ -201,6 +201,13 @@ pub(crate) struct MessagesResponseSpec {
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
+    /// The rendered prompt's whole token count, set by request building:
+    /// what the stream's `message_start` reports as `input_tokens` before
+    /// the engine has said anything. The final `message_delta` carries the
+    /// engine's count, split on a prefix-cache hit into `input_tokens`
+    /// outside the cache and `cache_read_input_tokens`, which this count
+    /// includes.
+    pub prompt_tokens: u32,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -231,6 +238,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .thinking_display()
                 .is_none_or(messages::ThinkingDisplay::returns_text),
             reasoning_in_prefill: false,
+            prompt_tokens: 0,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: request.history_tool_calls_count(),
