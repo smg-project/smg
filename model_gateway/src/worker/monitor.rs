@@ -1034,8 +1034,11 @@ impl WorkerMonitor {
     }
 
     /// Apply every queued eviction in one snapshot rebuild, and sentinel the
-    /// `smg_engine_*` series of workers whose own entry was removed —
-    /// metrics-rs cannot delete series. A same-URL replacement that already
+    /// `smg_engine_*` series of workers whose own entry was removed: a worker
+    /// whose status left `Ready` keeps its registration and so its series,
+    /// which would otherwise read its last load as live (a removed worker's
+    /// series the worker series store drops with the registration, and the
+    /// sentinel write is a no-op). A same-URL replacement that already
     /// republished keeps its entry, and its series continues uninterrupted.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
