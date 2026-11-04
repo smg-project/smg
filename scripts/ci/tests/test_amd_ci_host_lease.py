@@ -19,7 +19,7 @@ def until(predicate, seconds=6):
         time.sleep(0.02)
 
 
-def run_case(directory, logger_body, closed_stderr=False, blocked=False):
+def run_case(directory, logger_body, closed_stderr=False, blocked=False, require_events=False):
     directory.mkdir()
     bindir = directory / "bin"
     bindir.mkdir()
@@ -45,12 +45,21 @@ def run_case(directory, logger_body, closed_stderr=False, blocked=False):
     try:
         if blocked:
             pidfile = directory / "logger-pid"
-            until(pidfile.exists)
+
+            def logger_started():
+                try:
+                    return pidfile.read_text().strip().isdigit()
+                except FileNotFoundError:
+                    return False
+
+            until(logger_started)
             logger_pid = int(pidfile.read_text())
-            inode = lock.stat().st_ino
+            info = lock.stat()
+            identity = info.st_dev, info.st_ino
             for fd in Path(f"/proc/{logger_pid}/fd").iterdir():
                 try:
-                    assert fd.stat().st_ino != inode, "logger retained the lease"
+                    info = fd.stat()
+                    assert (info.st_dev, info.st_ino) != identity, "logger retained the lease"
                 except FileNotFoundError:
                     pass
             holder.kill()
@@ -104,7 +113,8 @@ def run_case(directory, logger_body, closed_stderr=False, blocked=False):
         )
         assert gone.returncode == 1
         assert (directory / "gone").read_text().strip() == "owner-gone"
-        if events.exists():
+        if require_events:
+            assert events.is_file(), "normal audit log missing"
             text = events.read_text()
             assert all(
                 "event=" + word in text
@@ -120,10 +130,91 @@ def run_case(directory, logger_body, closed_stderr=False, blocked=False):
             holder.communicate(timeout=2)
 
 
+def lifecycle_cases(directory):
+    directory.mkdir()
+    owner = subprocess.Popen(["sleep", "30"])
+    start = Path(f"/proc/{owner.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    lock, ready = directory / "lock", directory / "ready"
+    holder = subprocess.Popen(
+        ["bash", str(SCRIPT), "--lock-path", str(lock), str(owner.pid), start, str(ready), "2"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        until(ready.exists)
+        assert ready.read_text().strip() == "acquired"
+        children = Path(f"/proc/{holder.pid}/task/{holder.pid}/children")
+
+        def sleeping_child():
+            for child in children.read_text().split():
+                try:
+                    if Path(f"/proc/{child}/cmdline").read_bytes().split(b"\0")[:2] == [
+                        b"sleep",
+                        b"2",
+                    ]:
+                        return True
+                except FileNotFoundError:
+                    pass
+            return False
+
+        until(sleeping_child)
+        holder.kill()
+        holder.wait(timeout=2)
+        assert subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0
+        identity = lock.stat().st_dev, lock.stat().st_ino
+        alias = directory / "alias"
+        alias.hardlink_to(lock)
+        collision = subprocess.run(
+            ["bash", str(SCRIPT), "--lock-path", str(lock), str(owner.pid), start, str(alias), "0"],
+            capture_output=True,
+            timeout=4,
+        )
+        assert collision.returncode == 2
+        assert (lock.stat().st_dev, lock.stat().st_ino) == identity
+        assert alias.samefile(lock)
+    finally:
+        owner.terminate()
+        owner.wait(timeout=2)
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=2)
+    zombie = subprocess.Popen(["true"])
+    try:
+        statfile = Path(f"/proc/{zombie.pid}/stat")
+        until(lambda: statfile.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+        start = statfile.read_text().rsplit(")", 1)[1].split()[19]
+        stopped = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "--lock-path",
+                str(lock),
+                str(zombie.pid),
+                start,
+                str(directory / "gone"),
+                "0",
+            ],
+            capture_output=True,
+            timeout=3,
+        )
+        assert stopped.returncode == 1
+        assert (directory / "gone").read_text().strip() == "owner-gone"
+    finally:
+        zombie.wait(timeout=2)
+    return {
+        "polling_child_does_not_retain_lock": True,
+        "ready_alias_rejected_without_inode_change": True,
+        "zombie_owner_rejected": True,
+    }
+
+
 with tempfile.TemporaryDirectory(prefix="lease-audit-tests-") as scratch:
     root = Path(scratch)
     results = {
-        "normal": run_case(root / "normal", 'printf "%s\\n" "$*" >> "$TEST_EVENTS"\n'),
+        "lifecycle": lifecycle_cases(root / "lifecycle"),
+        "normal": run_case(
+            root / "normal", 'printf "%s\\n" "$*" >> "$TEST_EVENTS"\n', require_events=True
+        ),
         "logger_failure_closed_stderr": run_case(root / "failure", "exit 1\n", True),
         "blocked_logger_holder_death": run_case(
             root / "blocked",

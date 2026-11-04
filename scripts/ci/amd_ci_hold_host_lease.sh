@@ -45,13 +45,17 @@ process_matches() {
   stat_line=$(<"/proc/${OWNER_PID}/stat")
   stat_tail=${stat_line##*) }
   read -r -a fields <<<"${stat_tail}"
-  [[ ${#fields[@]} -ge 20 && ${fields[19]} == "${OWNER_STARTTIME}" ]]
+  [[ ${#fields[@]} -ge 20 && ${fields[0]} != Z && ${fields[19]} == "${OWNER_STARTTIME}" ]]
 }
 
 write_status() {
   local status=$1
   local temporary_path="${READY_PATH}.tmp.$$"
 
+  if [[ ${READY_PATH} == "${lock_path}" || ${READY_PATH} -ef ${lock_path} ]]; then
+    printf '%s\n' "ERROR: ready path aliases the lease lock" >&2 || true
+    return 2
+  fi
   printf '%s\n' "${status}" >"${temporary_path}"
   mv -f "${temporary_path}" "${READY_PATH}"
 }
@@ -104,5 +108,5 @@ process_matches || {
 write_status acquired
 
 while process_matches; do
-  sleep 2
+  sleep 2 9>&-
 done
