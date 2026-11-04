@@ -80,8 +80,8 @@ mod frames;
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
-        assistant_choice, forces_tool_call, opening_choice, ChatChunkFrame, CompletionChunkFrame,
-        FrameSink, CHUNK_FLUSH_BYTES,
+        assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
+        CompletionChunkFrame, FrameSink, TextDelta, CHUNK_FLUSH_BYTES,
     },
 };
 
@@ -1439,6 +1439,29 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), ()> {
         frame.write_chunk(buffer, choice, usage, emit_usage_null);
+        Self::flush_when_full(tx, buffer).await
+    }
+
+    /// [`Self::push_chunk`] for a bare text delta, written in one pass
+    /// ([`ChatChunkFrame::write_text_delta`]).
+    #[expect(clippy::too_many_arguments)]
+    async fn push_text_delta(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        frame: &ChatChunkFrame,
+        index: u32,
+        field: TextDelta,
+        text: &str,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) -> Result<(), ()> {
+        frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
+        Self::flush_when_full(tx, buffer).await
+    }
+
+    /// Hand the buffered chunks to the channel as one frame once they hold
+    /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst.
+    async fn flush_when_full(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
         }
@@ -1455,7 +1478,9 @@ impl StreamingProcessor {
     /// allocation per delta saved). The step's events are consumed
     /// out of the buffer, which keeps its room for the next step: what an event
     /// owns moves into its chunk, and a text the event borrows from the delta
-    /// is written from there, with no copy of its own.
+    /// is written from there, with no copy of its own. A bare text delta, the
+    /// per-token case, is written in one pass ([`ChatChunkFrame::write_text_delta`]);
+    /// every other chunk goes through serde.
     #[expect(clippy::too_many_arguments)]
     async fn push_events(
         tx: &SseSender,
@@ -1475,9 +1500,23 @@ impl StreamingProcessor {
                 continue;
             }
             choice.logprobs = logprobs.take();
-            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
-                .await
-                .map_err(|()| "Failed to send chunk".to_string())?;
+            match text_delta(&choice) {
+                Some((field, text)) => {
+                    Self::push_text_delta(
+                        tx,
+                        buffer,
+                        frame,
+                        index,
+                        field,
+                        text,
+                        usage,
+                        emit_usage_null,
+                    )
+                    .await
+                }
+                None => Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null).await,
+            }
+            .map_err(|()| "Failed to send chunk".to_string())?;
         }
         if utils::has_entries(logprobs.as_ref()) {
             let mut choice = assistant_choice(index, None, None, None);
