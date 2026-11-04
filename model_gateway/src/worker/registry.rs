@@ -1338,7 +1338,7 @@ impl WorkerRegistry {
         // tombstone could delete a locally-configured worker. The promotion
         // happens inside replace_inner, under the per-worker mutation lock.
         if let Some(existing_id) = self.url_to_id.get(worker.url()).map(|e| e.clone()) {
-            if !self.replace_inner(&existing_id, worker, Some(WorkerOrigin::Local), None) {
+            if !self.replace_inner(&existing_id, worker, Some(WorkerOrigin::Local), None, None) {
                 // replace() returned false — worker was removed concurrently.
                 // The mutation lock prevents stale indexes, so this is safe to ignore.
                 tracing::warn!(
@@ -1375,7 +1375,7 @@ impl WorkerRegistry {
     /// Emits [`WorkerEvent::Replaced`] on success. Holds the per-worker
     /// mutation lock for the entire diff + broadcast sequence.
     pub fn replace(&self, worker_id: &WorkerId, new_worker: Arc<dyn Worker>) -> bool {
-        self.replace_inner(worker_id, new_worker, None, None)
+        self.replace_inner(worker_id, new_worker, None, None, None)
     }
 
     /// Replace an existing worker and claim local ownership of its URL.
@@ -1407,6 +1407,7 @@ impl WorkerRegistry {
             new_worker,
             Some(WorkerOrigin::Local),
             Some(expected_revision),
+            None,
         )
     }
 
@@ -1415,13 +1416,18 @@ impl WorkerRegistry {
     /// per-worker mutation lock, before the `Replaced` event, so consumers
     /// observing the event see the final origin (the outbound mesh sync
     /// publishes a claimed worker immediately) and a concurrent `remove()`
-    /// cannot orphan the entry.
+    /// cannot orphan the entry. When `expect_origin` is set, the origin is
+    /// read again under the lock and the replacement aborts if it changed:
+    /// a caller that decided on the origin before the lock (the rebuild of a
+    /// mesh import) must not write over a local claim that landed in between,
+    /// as for `remove_inner`.
     fn replace_inner(
         &self,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
         expected_revision: Option<u64>,
+        expect_origin: Option<WorkerOrigin>,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
         // Lock is held only during the in-memory diff (no I/O, microseconds).
@@ -1431,6 +1437,16 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
+
+        if let Some(expected) = expect_origin {
+            if self.origin_of(worker_id) != Some(expected) {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    "Aborting replacement: worker origin changed before the lock was acquired"
+                );
+                return false;
+            }
+        }
 
         let old_worker = match self.workers.get(worker_id) {
             Some(entry) => entry.clone(),
@@ -2643,26 +2659,54 @@ impl WorkerRegistry {
             // the worker no longer serves. The rebuild goes through the
             // replacement path, so the id, the origin and the shared
             // runtime state (status, breaker, counters) stay; the health
-            // hint below then applies to the rebuilt import.
-            if self.is_newer_publication_of_import(&existing_id, state) {
-                let Some(spec) = Self::importable_spec(state) else {
-                    return;
-                };
-                let replacement: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
-                if !self.replace_inner(&existing_id, replacement, None, None) {
-                    // Removed between the read and the lock: the key's
-                    // next event or pass imports it anew.
-                    return;
+            // hint below then applies to the rebuilt import. The decision
+            // is taken outside the lock and checked again inside it: the
+            // revision read first aborts the replacement when another one
+            // (a local claim, a newer state on another task) landed in
+            // between, and the origin is read again under the lock so a
+            // claim is never written over. A record that lands on a worker
+            // claimed right after the replacement is never read (the local
+            // check above comes first) and goes with the worker's removal.
+            let revision_before = self.get(&existing_id).map(|import| import.revision());
+            if let Some(revision) =
+                revision_before.filter(|_| self.is_newer_publication_of_import(&existing_id, state))
+            {
+                match Self::importable_spec(state) {
+                    None => return,
+                    // A replacement whose spec does not decode here (a newer
+                    // owner's field, a rolling upgrade) must not downgrade
+                    // the import to the minimal worker: it keeps the
+                    // specification it has, the hint applies, and the
+                    // version stays unrecorded so a later publication that
+                    // decodes still rebuilds it.
+                    Some(None) => tracing::warn!(
+                        worker_id = %existing_id.as_str(),
+                        url = %state.url,
+                        version = state.version,
+                        "keeping the mesh-synced worker as built: its owner's replacement carries a spec this node cannot decode"
+                    ),
+                    Some(Some(spec)) => {
+                        let replacement: Arc<dyn Worker> =
+                            Arc::new(Self::import_from(state, Some(spec)));
+                        if self.replace_inner(
+                            &existing_id,
+                            replacement,
+                            None,
+                            Some(revision),
+                            Some(WorkerOrigin::Mesh),
+                        ) {
+                            self.import_versions
+                                .insert(existing_id.clone(), state.version);
+                            tracing::info!(
+                                worker_id = %existing_id.as_str(),
+                                url = %state.url,
+                                model = %state.model_id,
+                                version = state.version,
+                                "Rebuilt mesh-synced worker from its owner's replacement"
+                            );
+                        }
+                    }
                 }
-                self.import_versions
-                    .insert(existing_id.clone(), state.version);
-                tracing::info!(
-                    worker_id = %existing_id.as_str(),
-                    url = %state.url,
-                    model = %state.model_id,
-                    version = state.version,
-                    "Rebuilt mesh-synced worker from its owner's replacement"
-                );
             }
             // The status is read and the write decided under the worker's
             // mutation lock, in one step with the write: decided outside
