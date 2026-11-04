@@ -29,7 +29,7 @@ launch them. Example::
         --out /tmp/bfcl_ab.md --json-out /tmp/bfcl_ab.json
 
 Exit codes: ``0`` clean, ``1`` score regression beyond ``--tolerance``, ``2`` an
-arm did not finish (timed out or scored nothing), so there is nothing to compare.
+arm or the driver did not complete, including a failure to write its reports.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1000,4 +1001,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except Exception:
+        # Exit 1 is reserved for a completed comparison's score regression.
+        traceback.print_exc()
+        exit_code = EXIT_INCOMPLETE
+    raise SystemExit(exit_code)
