@@ -115,13 +115,16 @@ class Bed:
         self.pid = None
 
     def __enter__(self):
+        already_up = (self.dir / "bed" / "gateway.pid").exists()
         try:
             subprocess.run(["bash", str(BED_SH), "up"], env=self.env, check=True)
             bed = json.loads((self.dir / "bed" / "bed.json").read_text())
         except BaseException:
             # `up` dies after starting the gateway or the fleet on three of its failure
-            # paths; left running, they would keep the ports from the next bed
-            self.__exit__()
+            # paths; left running, they would keep the ports from the next bed. A bed
+            # that was up before this call is not ours to stop.
+            if not already_up:
+                self.__exit__()
             raise
         self.pid = bed["gateway_pid"]
         self.log = self.dir / "bed" / "gateway.log"
