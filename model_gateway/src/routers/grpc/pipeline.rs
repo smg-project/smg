@@ -945,7 +945,9 @@ impl RequestPipeline {
         }
     }
 
-    fn record_duration(&self, endpoint: &'static str, model: &str, start: Instant) {
+    /// The duration of an answered request under this pipeline's labels,
+    /// from `start` to its answer's head.
+    pub(crate) fn record_duration(&self, endpoint: &'static str, model: &str, start: Instant) {
         Metrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,

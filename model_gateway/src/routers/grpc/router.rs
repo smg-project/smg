@@ -1,4 +1,9 @@
-use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -1176,8 +1181,27 @@ impl RouterTrait for GrpcRouter {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_responses_impl(headers, tenant_meta, body, model_id)
-            .await
+        // One router request per client request, counted at the route as the
+        // HTTP router counts this route: a tool loop runs the pipeline once
+        // per iteration, under no metrics endpoint, so the route is where a
+        // turn of several iterations counts once, the refusals the route
+        // answers on its own included. The duration is the route's, to the
+        // answer's head, as the pipeline's own records are; a refused answer
+        // counts under its class and reason instead.
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_RESPONSES;
+        let start = Instant::now();
+        self.pipeline
+            .record_request(ENDPOINT, model_id, body.stream.unwrap_or(false));
+        let response = self
+            .route_responses_impl(headers, tenant_meta, body, model_id)
+            .await;
+        if response.status().is_success() {
+            self.pipeline.record_duration(ENDPOINT, model_id, start);
+        } else {
+            self.pipeline
+                .record_error(Some(ENDPOINT), model_id, &response);
+        }
+        response
     }
 
     async fn cancel_response(
