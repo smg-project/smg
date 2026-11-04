@@ -955,7 +955,9 @@ impl LoadGuards {
 /// Response processing state (Step 6)
 #[derive(Default)]
 pub(crate) struct ResponseState {
-    /// Stop sequence decoder
+    /// The collected answer's stop sequence decoder: set by preparation for
+    /// a non-streamed request only; a stream builds one per choice and
+    /// leaves this `None`.
     pub stop_decoder: Option<StopSequenceDecoder>,
 
     /// String stops the engine will never match, reported by
