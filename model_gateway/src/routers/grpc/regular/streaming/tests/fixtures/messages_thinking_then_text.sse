@@ -10,6 +10,9 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" of this"}}
 
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}
+
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
