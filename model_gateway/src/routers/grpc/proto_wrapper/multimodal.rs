@@ -7,6 +7,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
+use bytes::Bytes;
 use rand::RngExt;
 use smg_grpc_client::{
     common_proto as common, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
@@ -79,7 +80,7 @@ impl MultimodalData {
         match self {
             Self::Sglang(data) => data.inline_bytes(),
             Self::Vllm(data) => data.inline_bytes(),
-            Self::Trtllm(data) => data.image_data.iter().map(Vec::len).sum(),
+            Self::Trtllm(data) => data.image_data.iter().map(Bytes::len).sum(),
             Self::TokenSpeed(data) => data
                 .items
                 .iter()
@@ -165,10 +166,11 @@ pub struct VllmMultimodalData {
     pub extra_batches: Vec<VllmMultimodalData>,
 }
 
-/// TRT-LLM multimodal data: raw image bytes only.
+/// TRT-LLM multimodal data: raw image bytes only, each image's file as the
+/// frame holds it (shared, not copied).
 #[derive(Debug)]
 pub struct TrtllmMultimodalData {
-    pub image_data: Vec<Vec<u8>>,
+    pub image_data: Vec<Bytes>,
 }
 
 /// TokenSpeed multimodal data: preprocessed encoder input with patch-only placeholders.
