@@ -34,7 +34,16 @@ def _original_pin():
     return source, pins[0]
 
 
-def _run(tmp_path, *, requested=None, declaration=None, vendor="amd", engine="sglang", helper=True):
+def _run(
+    tmp_path,
+    *,
+    requested=None,
+    declaration=None,
+    vendor="amd",
+    engine="sglang",
+    helper=True,
+    missing=None,
+):
     source, pin = _original_pin()
     work = tmp_path / "work"
     scripts = work / "scripts"
@@ -48,10 +57,11 @@ def _run(tmp_path, *, requested=None, declaration=None, vendor="amd", engine="sg
             "ci_setup_sglang_rocm_image.sh",
             "ci_setup_sglang_rocm_e2e.sh",
             "ci_verify_sglang_rocm_e2e.py",
+            "ci_setup_sglang_rocm_image_pin.sh",
         ):
-            if (ROOT / "scripts" / name).is_file():
+            if name != missing and (ROOT / "scripts" / name).is_file():
                 (scripts / name).write_text('#!/bin/sh\nprintf called > "$PROBE_MARKER"\nexit 97\n')
-    if declaration != "MISSING_FILE":
+    if declaration != "MISSING_FILE" and missing != "ci_verify_sglang_rocm_cohort.py":
         if declaration is not None:
             source = source.replace('IMAGE = "' + pin + '"', declaration, 1)
         (scripts / "ci_verify_sglang_rocm_cohort.py").write_text(source)
@@ -139,8 +149,19 @@ def test_scope_rejects_unsupported_verifier_pin_source(tmp_path, state):
     assert _run(tmp_path, declaration=declaration).returncode != 0
 
 
-def test_scope_requires_the_setup_helper(tmp_path):
-    assert _run(tmp_path, helper=False).returncode != 0
+@pytest.mark.parametrize(
+    "missing",
+    [
+        None,
+        "ci_setup_sglang_rocm_image.sh",
+        "ci_verify_sglang_rocm_cohort.py",
+        "ci_setup_sglang_rocm_e2e.sh",
+        "ci_verify_sglang_rocm_e2e.py",
+        "ci_setup_sglang_rocm_image_pin.sh",
+    ],
+)
+def test_scope_requires_each_helper_independently(tmp_path, missing):
+    assert _run(tmp_path, helper=missing is not None, missing=missing).returncode != 0
 
 
 def test_scope_stays_opt_in_with_typed_inputs():

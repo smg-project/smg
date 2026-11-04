@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,8 +106,56 @@ def test_a_missing_proto_inventory_is_not_empty_success(rpc_sources):
         VERIFIER.verify_rpc_sources(root)
 
 
-@pytest.mark.parametrize("failed_stage", [None, "snapshot", "cohort", "verify"])
-def test_real_setup_wrapper_preserves_order_failure_and_snapshot_cleanup(tmp_path, failed_stage):
+@pytest.mark.parametrize(
+    "changed", ["torch", "torchaudio", "torchvision", "requires", "constraint", "rpc"]
+)
+def test_persistent_setup_baseline_rejects_later_install_drift(
+    metadata, rpc_sources, monkeypatch, changed
+):
+    versions, requirements, constraint = metadata
+    root, _, _, modules = rpc_sources
+    baseline = root / "baseline.json"
+    monkeypatch.setattr(sys, "argv", ["verifier", "--snapshot", str(baseline)])
+    VERIFIER.main()
+    monkeypatch.setattr(
+        sys, "argv", ["verifier", "--verify", str(baseline), "--capture-rpc", "--root", str(root)]
+    )
+    VERIFIER.main()
+    frozen = baseline.read_bytes()
+    if changed == "requires":
+        requirements["torchvision"] = ["changed==2"]
+    elif changed == "constraint":
+        constraint.write_text("changed\n")
+    elif changed == "rpc":
+        modules["smg_grpc_servicer"].__file__ = "/wrong/origin.py"
+    else:
+        versions[changed] = "changed"
+    monkeypatch.setattr(sys, "argv", ["verifier", "--verify", str(baseline), "--root", str(root)])
+    with pytest.raises(RuntimeError, match="expected"):
+        VERIFIER.main()
+    assert baseline.read_bytes() == frozen, "a failed check must not reset the setup baseline"
+
+
+def test_rpc_baseline_must_be_bound_once_and_cannot_refresh(metadata, rpc_sources, monkeypatch):
+    root, _, _, _ = rpc_sources
+    baseline = root / "baseline.json"
+    monkeypatch.setattr(sys, "argv", ["verifier", "--snapshot", str(baseline)])
+    VERIFIER.main()
+    monkeypatch.setattr(sys, "argv", ["verifier", "--verify", str(baseline), "--root", str(root)])
+    with pytest.raises(RuntimeError, match="RPC provenance differs"):
+        VERIFIER.main()
+    monkeypatch.setattr(
+        sys, "argv", ["verifier", "--verify", str(baseline), "--capture-rpc", "--root", str(root)]
+    )
+    VERIFIER.main()
+    frozen = baseline.read_bytes()
+    with pytest.raises(RuntimeError, match="already captured"):
+        VERIFIER.main()
+    assert baseline.read_bytes() == frozen
+
+
+@pytest.mark.parametrize("failed_stage", [None, "snapshot", "cohort", "verify", "pip"])
+def test_real_setup_wrapper_preserves_order_failure_and_persistent_snapshot(tmp_path, failed_stage):
     binary = tmp_path / "bin"
     binary.mkdir()
     dispatcher = """#!/usr/bin/python3
@@ -125,7 +174,9 @@ else:
 with open(os.environ["WRAPPER_LOG"], "a") as output:
     output.write(json.dumps({"stage": stage, "args": args}) + "\\n")
 if stage == os.environ.get("FAILED_STAGE"):
-    raise SystemExit({"snapshot": 17, "cohort": 42, "verify": 47}[stage])
+    raise SystemExit({"snapshot": 17, "cohort": 42, "verify": 47, "pip": 43}[stage])
+if stage == "snapshot":
+    pathlib.Path(args[-1]).write_text('{"torch": "fixture"}')
 """
     for name in ("python3", "bash"):
         stub = binary / name
@@ -134,6 +185,7 @@ if stage == os.environ.get("FAILED_STAGE"):
     log = tmp_path / "commands.jsonl"
     result = subprocess.run(
         ["/bin/bash", str(SOURCE.with_name("ci_setup_sglang_rocm_e2e.sh"))],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         env={
@@ -141,6 +193,7 @@ if stage == os.environ.get("FAILED_STAGE"):
             "PATH": str(binary) + ":/usr/bin:/bin",
             "WRAPPER_LOG": str(log),
             "FAILED_STAGE": failed_stage or "",
+            "GITHUB_ENV": str(tmp_path / "github.env"),
             "SMG_SGLANG_ROCM_IMAGE": (
                 "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:"
                 "4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
@@ -149,14 +202,58 @@ if stage == os.environ.get("FAILED_STAGE"):
         timeout=10,
     )
     assert (
-        result.returncode == {None: 0, "snapshot": 17, "cohort": 42, "verify": 47}[failed_stage]
+        result.returncode
+        == {None: 0, "snapshot": 17, "cohort": 42, "verify": 47, "pip": 43}[failed_stage]
     ), result.stderr
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     order = ["snapshot", "cohort", "verify", "pip"]
     assert [command["stage"] for command in commands] == (
         order if failed_stage is None else order[: order.index(failed_stage) + 1]
     )
-    assert not Path(commands[0]["args"][-1]).exists()
+    snapshot = tmp_path / commands[0]["args"][-1]
+    assert snapshot.exists() == (failed_stage != "snapshot")
+    if failed_stage is None:
+        assert "--capture-rpc" in commands[2]["args"]
+        assert (tmp_path / "github.env").read_text() == (
+            "SMG_CI_SGLANG_E2E_SNAPSHOT=e2e-logs/sglang-rocm-e2e-baseline.json\n"
+        )
+
+
+@pytest.mark.parametrize("requested", ["new-pin", "old-pin", "invalid-source"])
+def test_wrapper_follows_authoritative_pin_before_any_python_or_setup(tmp_path, requested):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("ci_setup_sglang_rocm_e2e.sh", "ci_setup_sglang_rocm_image_pin.sh"):
+        (scripts / name).write_bytes(SOURCE.with_name(name).read_bytes())
+    old = "example/sglang:cohort@sha256:" + "a" * 64
+    new = old[:-64] + "b" * 64
+    declaration = f'IMAGE = "{new}"\n'
+    if requested == "invalid-source":
+        declaration += f'IMAGE = "{old}"\n'
+    (scripts / "ci_verify_sglang_rocm_cohort.py").write_text(declaration)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (binary / "mkdir").symlink_to("/usr/bin/mkdir")
+    marker = tmp_path / "python-called"
+    python = binary / "python3"
+    python.write_text('#!/bin/bash\nprintf called > "$PROBE_MARKER"\nexit 73\n')
+    python.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/bash", str(scripts / "ci_setup_sglang_rocm_e2e.sh")],
+        cwd=tmp_path,
+        env={
+            "PATH": str(binary),
+            "PROBE_MARKER": str(marker),
+            "SMG_SGLANG_ROCM_IMAGE": old if requested == "old-pin" else new,
+        },
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert result.returncode == (73 if requested == "new-pin" else 1), result.stderr
+    assert marker.exists() == (requested == "new-pin")
+    if requested == "old-pin":
+        assert f"observed {old}; expected {new}" in result.stderr
 
 
 @pytest.mark.parametrize(

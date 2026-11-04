@@ -857,7 +857,11 @@ def _pin_source_fixture(tmp_path, monkeypatch, declaration, *, missing_file=Fals
     source = tmp_path / "source"
     scripts = source / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("ci_setup_sglang_rocm_image.sh", "ci_retry.sh"):
+    for name in (
+        "ci_setup_sglang_rocm_image.sh",
+        "ci_retry.sh",
+        "ci_setup_sglang_rocm_image_pin.sh",
+    ):
         original = ROOT / "scripts" / name
         (scripts / name).write_bytes(original.read_bytes())
     verifier = (ROOT / "scripts/ci_verify_sglang_rocm_cohort.py").read_text()

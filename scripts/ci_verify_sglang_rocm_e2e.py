@@ -23,8 +23,12 @@ def torch_snapshot():
 
 
 def verify_torch_snapshot(before):
-    if before != torch_snapshot():
-        raise RuntimeError("ROCm Torch packages or constraints changed during setup")
+    after = torch_snapshot()
+    if before != after:
+        raise RuntimeError(
+            f"ROCm Torch packages or constraints changed: expected={before!r} observed={after!r}"
+        )
+    return after
 
 
 def verify_rpc_sources(root):
@@ -71,13 +75,30 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--snapshot", type=Path)
     mode.add_argument("--verify", type=Path)
+    parser.add_argument("--capture-rpc", action="store_true")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
+    if args.capture_rpc and not args.verify:
+        parser.error("--capture-rpc requires --verify")
     if args.snapshot:
-        args.snapshot.write_text(json.dumps(torch_snapshot()) + "\n")
+        snapshot = {"torch": torch_snapshot()}
+        with args.snapshot.open("x") as stream:
+            stream.write(json.dumps(snapshot, indent=2) + "\n")
     else:
-        verify_torch_snapshot(json.loads(args.verify.read_text()))
-        print(json.dumps(verify_rpc_sources(args.root), indent=2))
+        before = json.loads(args.verify.read_text())
+        observed_torch = verify_torch_snapshot(before["torch"])
+        observed_rpc = verify_rpc_sources(args.root)
+        if args.capture_rpc:
+            if "rpc" in before:
+                raise RuntimeError("RPC provenance baseline was already captured; refusing refresh")
+            before["rpc"] = observed_rpc
+            args.verify.write_text(json.dumps(before, indent=2) + "\n")
+        elif before.get("rpc") != observed_rpc:
+            raise RuntimeError(
+                "RPC provenance differs from setup baseline: "
+                f"expected={before.get('rpc')!r} observed={observed_rpc!r}"
+            )
+        print(json.dumps({"torch": observed_torch, "rpc": observed_rpc}, indent=2))
 
 
 if __name__ == "__main__":
