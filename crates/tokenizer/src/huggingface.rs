@@ -37,7 +37,7 @@ use crate::{
     encode_path::{self, EncodePath},
     encoders::{
         deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
-        PromptSegment, RendererProfile,
+        PromptSegment, RendererProfile, TemplateAnswers,
     },
     native::{AddedTokens, NativeEncoder},
     traits::{
@@ -2093,6 +2093,16 @@ impl HuggingFaceTokenizer {
     }
 }
 
+impl HuggingFaceTokenizer {
+    /// The template questions, answered by the profile or by the template.
+    fn template_answers(&self) -> TemplateAnswers<'_> {
+        TemplateAnswers {
+            profile: self.profile.as_ref(),
+            template: &self.chat_template,
+        }
+    }
+}
+
 impl TokenizerTrait for HuggingFaceTokenizer {
     fn vocab_size(&self) -> usize {
         self.core.tokenizer.get_vocab_size(false)
@@ -2194,78 +2204,45 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         })
     }
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        self.profile
-            .and_then(|profile| profile.content_format)
-            .unwrap_or_else(|| self.chat_template.content_format())
+        self.template_answers().content_format()
     }
 
     fn chat_template_content_format_for_request(
         &self,
         has_tools: bool,
     ) -> ChatTemplateContentFormat {
-        self.profile
-            .and_then(|profile| profile.content_format)
-            .unwrap_or_else(|| self.chat_template.content_format_for_tools(has_tools))
+        self.template_answers().content_format_for_tools(has_tools)
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        self.profile.map_or_else(
-            || self.chat_template.thinking_toggle(),
-            |profile| profile.thinking_toggle,
-        )
+        self.template_answers().thinking_toggle()
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        self.profile.map_or_else(
-            || self.chat_template.thinking_key_name(),
-            |profile| Some(profile.thinking_key_name),
-        )
+        self.template_answers().thinking_key_name()
     }
 
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-        self.profile.map_or_else(
-            || self.chat_template.native_reasoning_effort_values(),
-            |profile| profile.native_effort_values,
-        )
+        self.template_answers().native_reasoning_effort_values()
     }
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
-        self.profile.map_or_else(
-            || self.chat_template.native_reasoning_effort_off_values(),
-            |profile| profile.native_effort_off_values,
-        )
+        self.template_answers().native_reasoning_effort_off_values()
     }
 
     fn think_in_prefill(&self) -> bool {
-        self.profile.map_or_else(
-            || self.chat_template.think_in_prefill(),
-            |profile| profile.think_in_prefill,
-        )
+        self.template_answers().think_in_prefill()
     }
 
     fn prefill_opens_think_block(&self) -> bool {
-        self.profile.map_or_else(
-            || self.chat_template.prefill_opens_think_block(),
-            |profile| profile.think_in_prefill,
-        )
+        self.template_answers().prefill_opens_think_block()
     }
 
-    /// Combine native profiles with what the Jinja template answers for the
-    /// checkpoint: its media handling and how it takes tool-call arguments.
+    /// The profile's, or the Jinja template's with the media handling resolved
+    /// for this checkpoint.
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
-        // A renderer with an encoder of its own answers from its profile; the
-        // Jinja renderer continues a trailing assistant message the way
-        // transformers' `continue_final_message` does, and takes a history
-        // call's arguments as the text the request sent when its template
-        // writes them that way.
-        self.profile.map_or_else(
-            || crate::traits::RendererCapabilities {
-                media_handling: self.media_handling,
-                raw_tool_call_arguments: self.chat_template.raw_tool_call_arguments(),
-                ..RendererProfile::TEMPLATE_CAPABILITIES
-            },
-            |profile| profile.capabilities,
-        )
+        self.template_answers()
+            .renderer_capabilities(self.media_handling)
     }
 
     fn native_thinking_mode(
@@ -2273,9 +2250,8 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         template_kwargs: Option<&HashMap<String, serde_json::Value>>,
         thinking: Option<bool>,
     ) -> Option<bool> {
-        self.profile
-            .and_then(|profile| profile.thinking_mode)
-            .map(|resolve| resolve(template_kwargs, thinking))
+        self.template_answers()
+            .native_thinking_mode(template_kwargs, thinking)
     }
 
     /// Refresh media handling and the tools block only after a replacement
