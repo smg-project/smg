@@ -300,10 +300,7 @@ impl L0Cache {
     /// path uses `L0Cache::lookup` and `L0Cache::fill`, which hash the
     /// text once between them.
     pub fn insert(&self, key: String, add_special_tokens: bool, value: Encoding) {
-        let ids = match value {
-            Encoding::Plain(ids) => ids,
-            other => other.token_ids().to_vec(),
-        };
+        let ids = value.into_token_ids();
         let miss = L0Miss {
             hash: self.key(&key, add_special_tokens),
             add_special_tokens,
