@@ -1159,12 +1159,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_sglang_http_metadata_uses_models_identity() {
-        use axum::{routing::get, Json, Router};
+        use http::StatusCode;
         use serde_json::json;
-        use tokio::net::TcpListener;
 
-        async fn models() -> Json<serde_json::Value> {
-            Json(json!({
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![(
+            "/v1/models",
+            StatusCode::OK,
+            json!({
                 "data": [{
                     "id": "test-model",
                     "max_model_len": 4096,
@@ -1173,28 +1176,11 @@ mod tests {
                     "root": "test-root"
                 }],
                 "object": "list"
-            }))
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only mock /v1/models server; handle is aborted at test end"
-        )]
-        let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/v1/models", get(models)))
-                .await
-                .unwrap();
-        });
-
-        let labels = fetch_sglang_http_metadata(
-            &crate::clients::http_client(),
-            &format!("http://{addr}"),
-            None,
-        )
+            }),
+        )])
         .await;
-        server.abort();
+
+        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),
