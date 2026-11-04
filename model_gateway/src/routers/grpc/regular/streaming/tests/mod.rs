@@ -4,6 +4,7 @@ mod failure;
 mod generate_finish;
 mod isolation;
 mod local_stop;
+mod messages_bytes;
 mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;
