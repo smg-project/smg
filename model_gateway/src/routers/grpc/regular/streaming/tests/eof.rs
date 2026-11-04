@@ -2226,11 +2226,13 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             .iter()
             .filter_map(|event| event["type"].as_str())
             .collect();
+        // The tail, then the block's signature, then the stop.
         assert_eq!(
             types,
             [
                 "message_start",
                 "content_block_start",
+                "content_block_delta",
                 "content_block_delta",
                 "content_block_delta",
                 "content_block_stop",
@@ -2239,8 +2241,9 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             ]
         );
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+        assert_eq!(events[4]["delta"]["type"], "signature_delta");
         assert_eq!(
-            events[5]["delta"]["stop_reason"],
+            events[6]["delta"]["stop_reason"],
             if send_complete {
                 "max_tokens"
             } else {
