@@ -135,14 +135,12 @@ pub(super) fn bandlimited_resample(
     // `0.0f32.mul_add(coefficient, acc)` is `acc` exactly for the finite
     // coefficients this kernel holds, and the accumulator starts at `+0.0`, so
     // no signed-zero difference arises either.
+    // The last block starts at most `orig_freq - 1` samples before the input's end, so the
+    // last window ends before `len + kernel_len` of the padded input.
     let blocks = samples.len().div_ceil(orig_freq);
-    let padded_len = width
-        .checked_add(samples.len())
-        .and_then(|value| value.checked_add(kernel_len))
-        .and_then(|value| value.checked_add(blocks.checked_mul(orig_freq)?))
-        .ok_or_else(|| {
-            TransformError::ShapeError("padded resample input size overflow".to_string())
-        })?;
+    let padded_len = samples.len().checked_add(kernel_len).ok_or_else(|| {
+        TransformError::ShapeError("padded resample input size overflow".to_string())
+    })?;
     let mut padded: Vec<f32> = Vec::new();
     padded.try_reserve_exact(padded_len).map_err(|error| {
         TransformError::ShapeError(format!("failed to allocate padded resample input: {error}"))
