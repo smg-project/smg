@@ -458,9 +458,10 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     /// Longest a request may wait inside the gateway: in the admission queue,
-    /// and, in the gRPC router, from its admission (its acceptance without an
-    /// admission layer) to worker selection: a request still ahead of
-    /// selection after this long is refused with a 503, once per request.
+    /// and from its admission (its acceptance without an admission layer) to
+    /// worker selection on the gRPC routers, the HTTP router's typed routes
+    /// and the HTTP prefill-decode router: a request still ahead of selection
+    /// after this long is refused with a 503, once per request.
     pub queue_timeout_secs: u64,
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
     /// A non-positive value disables the limit.

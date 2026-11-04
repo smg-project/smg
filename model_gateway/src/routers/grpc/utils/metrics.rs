@@ -15,9 +15,9 @@ use crate::{
             placement::{
                 MODEL_NOT_FOUND_CODE, NO_AVAILABLE_WORKERS_CODE, NO_MEDIA_REF_CAPABLE_WORKER_CODE,
             },
+            queue_timeout::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
         },
         error::extract_error_code_from_response,
-        grpc::common::stages::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
         PD_PREFILL_QUEUE_FULL, PD_PREFILL_QUEUE_TIMEOUT,
     },
 };

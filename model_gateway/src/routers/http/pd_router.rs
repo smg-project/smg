@@ -65,6 +65,7 @@ use crate::{
             overload,
             pd_failure::{PdSide, SidePhase},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
+            queue_timeout::QueueTimeout,
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
@@ -178,6 +179,10 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
+    /// The bound on a request's wait inside the gateway ahead of pair
+    /// selection (`--queue-timeout-secs`), the one the gRPC selection stage
+    /// holds.
+    queue_timeout: QueueTimeout,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
     moriio_dp_turn: AtomicUsize,
     /// The tenant rate limiter, when configured: every route that charges a
@@ -214,6 +219,9 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+    /// The request's route meta, read for the acceptance stamp the queue
+    /// timeout is judged on; a route that carries none runs unbounded.
+    tenant_meta: Option<&'a TenantRequestMeta>,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -449,6 +457,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             prefill_admission: ctx.prefill_admission.clone(),
+            queue_timeout: QueueTimeout::from_secs(ctx.router_config.queue_timeout_secs),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
@@ -623,6 +632,7 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
+            tenant_meta,
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
@@ -799,27 +809,42 @@ impl PDRouter {
             )
         });
         let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
+        // The queue timeout, judged before either role is read and over the
+        // prefill admission wait, as the gRPC selection stage judges it.
+        let accepted = self
+            .queue_timeout
+            .acceptance_for_selection(context.tenant_meta);
+        if let Some(refused) = accepted.and_then(|accepted| {
+            self.queue_timeout
+                .refuse_if_expired(context.model_id, accepted)
+        }) {
+            return refused;
+        }
         let selected = self
-            .select_pd_pair_with_admission(
-                context.model_id,
-                PlacementInputs {
-                    text: text.as_deref(),
-                    tokens: tokens.as_deref(),
-                    headers: context.headers.as_ref(),
-                    rid_key: rid_key.as_deref(),
-                    cache_namespace,
-                    candidate_filter: None,
-                    tried: &[],
-                },
-                sticky_key,
-            )
+            .queue_timeout
+            .admit_selection_within_budget(context.model_id, accepted, async {
+                self.select_pd_pair_with_admission(
+                    context.model_id,
+                    PlacementInputs {
+                        text: text.as_deref(),
+                        tokens: tokens.as_deref(),
+                        headers: context.headers.as_ref(),
+                        rid_key: rid_key.as_deref(),
+                        cache_namespace,
+                        candidate_filter: None,
+                        tried: &[],
+                    },
+                    sticky_key,
+                )
+                .await
+                .map_err(|e| {
+                    self.report_refusal(context.model_id, Self::handle_server_selection_error(*e))
+                })
+            })
             .await;
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
-            Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
-            }
+            Err(refusal) => return refusal,
         };
 
         debug!(
@@ -2922,9 +2947,11 @@ mod tests {
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
-        middleware::ReportedRefusal,
+        middleware::{tenant_resolution::AcceptedAt, ReportedRefusal},
         observability::logging::test_support::test_subscriber,
-        routers::common::sse::SSE_CHANNEL_BUFFER,
+        routers::common::{
+            queue_timeout::SELECTION_QUEUE_TIMEOUT_ERROR_CODE, sse::SSE_CHANNEL_BUFFER,
+        },
         tenant::TenantKey,
         test_support::RefusedAddress,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
@@ -3116,6 +3143,8 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             prefill_admission: None,
+            // The flag's default; the tests' metas carry no acceptance stamp.
+            queue_timeout: QueueTimeout::from_secs(60),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
         }
@@ -5934,6 +5963,7 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
+            tenant_meta: None,
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -6026,6 +6056,7 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    tenant_meta: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -6122,6 +6153,7 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
+                            tenant_meta: None,
                         },
                         prefill,
                         decode,
@@ -6203,6 +6235,7 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    tenant_meta: None,
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -7320,6 +7353,178 @@ mod tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A stamp five seconds old: a request that waited longer than any bound
+    /// the tests below set.
+    fn accepted_long_ago() -> AcceptedAt {
+        AcceptedAt::at(
+            AcceptedAt::clock_now()
+                .checked_sub(std::time::Duration::from_secs(5))
+                .expect("the clock has been running for five seconds"),
+        )
+    }
+
+    fn plain_chat() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request")
+    }
+
+    /// A request that reaches the router more than the queue timeout after
+    /// the gateway accepted it is refused before either role is read: the
+    /// gRPC selection stage's 503, with its code, its back-off hint and its
+    /// counter, terminal for the retry layer, so no pair ever sees it.
+    #[test]
+    fn a_request_held_past_the_queue_timeout_is_refused_before_the_pair_is_read() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (router, prefill_seen, decode_seen) = runtime.block_on(async {
+            let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+            let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+            let router = PDRouter {
+                queue_timeout: QueueTimeout::from_secs(1),
+                retry_config: RetryConfig {
+                    max_retries: 3,
+                    initial_backoff_ms: 1,
+                    max_backoff_ms: 2,
+                    ..Default::default()
+                },
+                ..create_test_pd_router()
+            };
+            register_pd_pair(&router, prefill_url, decode_url);
+            (router, prefill_seen, decode_seen)
+        });
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"))
+            .with_extension(accepted_long_ago());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_chat(None, &tenant, plain_chat(), UNKNOWN_MODEL_ID))
+        });
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "the admission queue's back-off hint"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "terminal: a retry would only find the same wait"
+        );
+        assert!(
+            taken(&prefill_seen).is_empty() && taken(&decode_seen).is_empty(),
+            "refused before either side was read, on every attempt"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_admission_queue_rejected_total{")
+                    && line.contains("reason=\"selection_timeout\"")
+                    && line.ends_with(" 1")
+            }),
+            "counted once under the selection-timeout reason:\n{rendered}"
+        );
+    }
+
+    /// Inside the bound the pair is read as before; a router whose bound is
+    /// zero, and a request without an acceptance stamp, are never refused,
+    /// however long the request waited.
+    #[tokio::test]
+    async fn a_request_inside_the_queue_timeout_is_dispatched_as_before() {
+        for (queue_timeout, accepted) in [
+            (QueueTimeout::from_secs(60), Some(AcceptedAt::now())),
+            (QueueTimeout::from_secs(0), Some(accepted_long_ago())),
+            (QueueTimeout::from_secs(1), None),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+            let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+            let router = PDRouter {
+                queue_timeout,
+                ..create_test_pd_router()
+            };
+            register_pd_pair(&router, prefill_url, decode_url);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let tenant = match accepted {
+                Some(accepted) => tenant.with_extension(accepted),
+                None => tenant,
+            };
+
+            let response = router
+                .route_chat(None, &tenant, plain_chat(), UNKNOWN_MODEL_ID)
+                .await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{queue_timeout:?}");
+            assert_eq!(taken(&prefill_seen).len(), 1, "{queue_timeout:?}");
+            assert_eq!(taken(&decode_seen).len(), 1, "{queue_timeout:?}");
+        }
+    }
+
+    /// A request that passes the check and then waits for prefill admission
+    /// is held to the remaining budget, as on the gRPC stage: it leaves the
+    /// prefill queue at the bound, refused with the selection code, while
+    /// the seat is still taken, holding no claim and no load.
+    #[tokio::test]
+    async fn the_prefill_admission_wait_is_held_to_the_remaining_budget() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = PDRouter {
+            queue_timeout: QueueTimeout::new(std::time::Duration::from_millis(200)),
+            ..admission_test_router(prefill_url, decode_url)
+        };
+        let admission = router.prefill_admission.as_ref().unwrap();
+        // The one seat, taken for the whole test: the only way out of the
+        // queue for the request below is the bound.
+        let ((prefill, decode), seat) = router
+            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
+            .await
+            .unwrap();
+        let tenant =
+            TenantRequestMeta::new(TenantKey::new("test-tenant")).with_extension(AcceptedAt::now());
+
+        let response = tokio::time::timeout(
+            HANG_GUARD,
+            router.route_chat(None, &tenant, plain_chat(), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("refused at the bound, while the seat is still taken");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert_eq!(
+            admission.queued_requests(),
+            0,
+            "the expired waiter left the queue"
+        );
+        assert_eq!(
+            (prefill.load(), decode.load()),
+            (1, 1),
+            "the seat's own load alone; the refused request left none"
+        );
+        assert!(
+            taken(&prefill_seen).is_empty() && taken(&decode_seen).is_empty(),
+            "no side was read"
+        );
+        drop(seat);
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
 
     /// What every dispatch body takes from the setup: the sides and the

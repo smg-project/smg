@@ -7,17 +7,16 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderValue},
     response::Response,
 };
 use openai_protocol::profile::ProviderProfile;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
-    middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
     routers::{
@@ -26,6 +25,7 @@ use crate::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
             },
+            queue_timeout::QueueTimeout,
             retry::mark_non_retryable,
         },
         error,
@@ -102,20 +102,15 @@ type EncodePrefillDecodeWorkerSelection = (
     RuntimeType,
 );
 
-/// Client-visible, gateway-owned code for a request refused ahead of worker
-/// selection because it had already waited longer than the queue timeout
-/// inside the gateway.
-pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
-
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
     prefill_admission: Option<Arc<PrefillAdmission>>,
-    /// The longest a request may have waited inside the gateway when it
-    /// reaches selection; `None` leaves the wait unbounded.
-    queue_timeout: Option<Duration>,
+    /// The bound on a request's wait inside the gateway when it reaches
+    /// selection (`--queue-timeout-secs`).
+    queue_timeout: QueueTimeout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,7 +135,7 @@ impl WorkerSelectionStage {
             policy_registry,
             mode,
             prefill_admission,
-            queue_timeout: None,
+            queue_timeout: QueueTimeout::UNBOUNDED,
         }
     }
 
@@ -148,128 +143,9 @@ impl WorkerSelectionStage {
     /// gateway accepted it (`--queue-timeout-secs`); zero leaves the wait
     /// unbounded.
     pub(crate) fn with_queue_timeout(mut self, timeout: Duration) -> Self {
-        self.queue_timeout = (!timeout.is_zero()).then_some(timeout);
+        self.queue_timeout = QueueTimeout::new(timeout);
         self
     }
-
-    /// The acceptance stamp this selection is bounded by, taken from the
-    /// request's meta once: the first selection of a request takes it, a later
-    /// pipeline run of the same request (a Responses tool loop iteration, with
-    /// the same meta) finds it spent and runs unbounded, as it did not wait
-    /// inside the gateway. `None` without a bound, a meta or a fresh stamp.
-    fn acceptance_for_selection(&self, ctx: &RequestContext) -> Option<Instant> {
-        self.queue_timeout?;
-        ctx.input
-            .tenant_request_meta
-            .as_ref()?
-            .extension::<AcceptedAt>()?
-            .take_for_selection()
-    }
-
-    /// The 503 for a request held past the queue timeout since `accepted`
-    /// (the admission grant where there is one, else the gateway's acceptance),
-    /// before any worker is read: the admission bound caps how many requests
-    /// the gateway holds, not for how long, and a gateway that falls behind
-    /// its own ingress (tokenization, selection) would otherwise dispatch
-    /// requests that waited minutes to workers that are not overloaded at all,
-    /// so neither the overload shed nor the admission queue ever answers.
-    /// Checked again after the prefill admission wait of a PD or EPD request,
-    /// which can outlast the bound. Terminal for the retry layer, like every
-    /// shed, with the same back-off hint as the admission queue's refusals.
-    fn refuse_if_expired(&self, ctx: &RequestContext, accepted: Instant) -> Option<Response> {
-        let timeout = self.queue_timeout?;
-        let waited = waited_past_timeout(accepted, AcceptedAt::clock_now(), timeout)?;
-        Some(Self::queue_timeout_refusal(ctx, waited, timeout))
-    }
-
-    /// The 503 of a request that waited `waited`, past the queue timeout.
-    fn queue_timeout_refusal(
-        ctx: &RequestContext,
-        waited: Duration,
-        timeout: Duration,
-    ) -> Response {
-        Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_SELECTION_TIMEOUT);
-        debug!(
-            model_id = %ctx.input.model_id,
-            waited_secs = waited.as_secs_f64(),
-            timeout_secs = timeout.as_secs_f64(),
-            "Refused ahead of worker selection: waited longer than the queue timeout"
-        );
-        let mut response = error::service_unavailable(
-            SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
-            format!(
-                "The request waited {:.1} s inside the gateway before worker selection, longer \
-                 than the queue timeout of {} s",
-                waited.as_secs_f64(),
-                timeout.as_secs()
-            ),
-        );
-        response
-            .headers_mut()
-            .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
-        mark_non_retryable(&mut response);
-        response
-    }
-
-    /// `admission`, a prefill admission wait, held to the remaining budget of
-    /// the bound: when the budget runs out the waiter is dropped (its queue
-    /// ticket goes with it) and the request is refused as one held past the
-    /// queue timeout; without a bound the wait is the prefill queue's own.
-    async fn admit_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
-        accepted: Option<Instant>,
-        admission: F,
-    ) -> Result<T, Response>
-    where
-        F: std::future::Future<Output = Result<T, Response>>,
-    {
-        let (Some(timeout), Some(accepted)) = (self.queue_timeout, accepted) else {
-            return admission.await;
-        };
-        let budget =
-            timeout.saturating_sub(AcceptedAt::clock_now().saturating_duration_since(accepted));
-        match tokio::time::timeout(budget, admission).await {
-            Ok(result) => result,
-            Err(_) => Err(Self::queue_timeout_refusal(
-                ctx,
-                AcceptedAt::clock_now().saturating_duration_since(accepted),
-                timeout,
-            )),
-        }
-    }
-
-    /// A disaggregated selection admitted within the budget
-    /// ([`Self::admit_within_budget`]) and still within it afterwards: an
-    /// admission that lands right at the bound gives its claim back instead
-    /// of taking a worker.
-    async fn admit_selection_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
-        accepted: Option<Instant>,
-        admission: F,
-    ) -> Result<(T, PrefillLoadGuard), Response>
-    where
-        F: std::future::Future<Output = Result<(T, PrefillLoadGuard), Response>>,
-    {
-        let (selected, guard) = self.admit_within_budget(ctx, accepted, admission).await?;
-        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
-            drop(guard);
-            return Err(refused);
-        }
-        Ok((selected, guard))
-    }
-}
-
-/// How long a request accepted at `accepted` has waited by `now`, when that
-/// exceeds `timeout`.
-pub(crate) fn waited_past_timeout(
-    accepted: Instant,
-    now: Instant,
-    timeout: Duration,
-) -> Option<Duration> {
-    let waited = now.saturating_duration_since(accepted);
-    (waited > timeout).then_some(waited)
 }
 
 fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelection {
@@ -476,8 +352,13 @@ impl WorkerSelectionStage {
     /// against the request's modalities and media references before it is
     /// stored.
     async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
-        let accepted = self.acceptance_for_selection(ctx);
-        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
+        let accepted = self
+            .queue_timeout
+            .acceptance_for_selection(ctx.input.tenant_request_meta.as_ref());
+        if let Some(refused) = accepted.and_then(|accepted| {
+            self.queue_timeout
+                .refuse_if_expired(&ctx.input.model_id, accepted)
+        }) {
             return Err(refused);
         }
         let prep = stage_output(
@@ -582,8 +463,9 @@ impl WorkerSelectionStage {
             }
             WorkerSelectionMode::PrefillDecode => {
                 let (pair, guard) = self
+                    .queue_timeout
                     .admit_selection_within_budget(
-                        ctx,
+                        model_id,
                         accepted,
                         self.admit_pd_pair(
                             model_id,
@@ -618,8 +500,9 @@ impl WorkerSelectionStage {
                     }
                 };
                 let ((encode_assignments, prefill, decode, runtime_type), guard) = self
+                    .queue_timeout
                     .admit_selection_within_budget(
-                        ctx,
+                        model_id,
                         accepted,
                         self.admit_encode_prefill_decode_workers(
                             model_id,
@@ -2174,12 +2057,13 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
-        middleware::{ReportedRefusal, TenantRequestMeta},
+        middleware::{tenant_resolution::AcceptedAt, ReportedRefusal, TenantRequestMeta},
         observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
+                queue_timeout::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
                 retry::is_retryable_response,
             },
             grpc::{
@@ -5953,31 +5837,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_wait_counts_only_once_it_exceeds_the_timeout() {
-        let accepted = Instant::now();
-        let timeout = Duration::from_secs(60);
-        assert_eq!(waited_past_timeout(accepted, accepted, timeout), None);
-        assert_eq!(
-            waited_past_timeout(accepted, accepted + Duration::from_secs(60), timeout),
-            None,
-            "exactly the timeout is still inside the bound"
-        );
-        assert_eq!(
-            waited_past_timeout(accepted, accepted + Duration::from_secs(61), timeout),
-            Some(Duration::from_secs(61))
-        );
-        assert_eq!(
-            waited_past_timeout(
-                accepted + Duration::from_secs(5),
-                accepted,
-                Duration::from_secs(1)
-            ),
-            None,
-            "a clock that reads before the acceptance is a zero wait, not a refusal"
-        );
-    }
-
     /// A request that reaches selection after waiting longer than the queue
     /// timeout inside the gateway is refused with the distinct 503 before any
     /// worker is read, terminal for the retry layer and with a back-off hint.
@@ -6181,7 +6040,8 @@ mod tests {
         assert_eq!(prefill.load(), 1, "the admission holds its claim");
 
         let Err(refused) = stage
-            .admit_selection_within_budget(&ctx, accepted, async { Ok(((), guard)) })
+            .queue_timeout
+            .admit_selection_within_budget(&ctx.input.model_id, accepted, async { Ok(((), guard)) })
             .await
         else {
             panic!("admitted past the bound, the request is refused");

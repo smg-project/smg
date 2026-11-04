@@ -71,6 +71,7 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
+            queue_timeout::QueueTimeout,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -132,6 +133,9 @@ struct StreamRelayMode {
 /// tried list are the state the attempts share.
 struct TypedAttempt<'a, T> {
     headers: Option<&'a HeaderMap>,
+    /// The request's route meta, read for the acceptance stamp the queue
+    /// timeout is judged on; a route that carries none runs unbounded.
+    tenant_meta: Option<&'a TenantRequestMeta>,
     /// The parsed request and its routing derivatives, held until the
     /// lease's release point.
     lease: &'a RequestLease<T>,
@@ -171,6 +175,10 @@ pub struct Router {
     /// take a tenant reservation reserve through it in
     /// [`Router::route_typed_request`].
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// The bound on a request's wait inside the gateway ahead of worker
+    /// selection (`--queue-timeout-secs`), the one the gRPC selection stage
+    /// holds; the typed routes judge it.
+    queue_timeout: QueueTimeout,
 }
 
 trait RealtimeRestRequest: serde::Serialize + Clone {
@@ -239,6 +247,7 @@ impl Router {
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
+            queue_timeout: QueueTimeout::from_secs(ctx.router_config.queue_timeout_secs),
         })
     }
 
@@ -483,6 +492,7 @@ impl Router {
         let ledger = AttemptLedger::default();
         let attempt = TypedAttempt {
             headers,
+            tenant_meta,
             lease: &lease,
             route,
             model_id,
@@ -687,6 +697,18 @@ impl Router {
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
+        // The queue timeout, judged before any worker is read, as the gRPC
+        // selection stage judges it; the first attempt takes the stamp.
+        if let Some(refused) = self
+            .queue_timeout
+            .acceptance_for_selection(attempt.tenant_meta)
+            .and_then(|accepted| {
+                self.queue_timeout
+                    .refuse_if_expired(attempt.model_id, accepted)
+            })
+        {
+            return refused;
+        }
         let worker = match self.select_worker_for_attempt(attempt) {
             Ok(worker) => worker,
             Err(refusal) => return refusal,
@@ -2864,7 +2886,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        middleware::ReportedRefusal,
+        middleware::{tenant_resolution::AcceptedAt, ReportedRefusal},
         observability::logging::test_support::test_subscriber,
         policies::CacheAwarePolicy,
         routers::common::{
@@ -2872,6 +2894,7 @@ mod tests {
                 REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
                 REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
             },
+            queue_timeout::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
         service_discovery::testing::create_test_app_context,
@@ -2985,6 +3008,7 @@ mod tests {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
             rate_limit_manager: None,
+            queue_timeout: QueueTimeout::from_secs(60),
         }
     }
 
@@ -3380,6 +3404,7 @@ mod tests {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
             rate_limit_manager: None,
+            queue_timeout: QueueTimeout::from_secs(60),
         }
     }
 
@@ -3491,6 +3516,75 @@ mod tests {
         );
         assert!(!is_retryable_response(&response));
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// A request that reaches the typed route more than the queue timeout
+    /// after the gateway accepted it is refused before any worker is read:
+    /// the gRPC selection stage's 503, with its code and back-off hint,
+    /// terminal for the retry layer, so no worker sees it on any attempt. A
+    /// stamp inside the bound dispatches as before.
+    #[tokio::test]
+    async fn a_request_held_past_the_queue_timeout_is_refused_before_a_worker_is_read() {
+        let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
+        let router = Router {
+            queue_timeout: QueueTimeout::from_secs(1),
+            ..breaker_router(&[&url], fast_retries(3), u32::MAX)
+        };
+        let long_ago = AcceptedAt::clock_now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("the clock has been running for five seconds");
+        let held = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"))
+            .with_extension(AcceptedAt::at(long_ago));
+
+        let response = router
+            .route_typed_request(
+                None,
+                Some(&held),
+                DropProbeRequest {
+                    text: "late".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "the admission queue's back-off hint"
+        );
+        assert!(!is_retryable_response(&response), "terminal, no replay");
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            0,
+            "refused before the worker was read, on every attempt"
+        );
+
+        let fresh = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"))
+            .with_extension(AcceptedAt::now());
+        let response = router
+            .route_typed_request(
+                None,
+                Some(&fresh),
+                DropProbeRequest {
+                    text: "in time".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "dispatched as before");
     }
 
     /// A worker that answers `/generate` with a 200 after `delay`, counting
@@ -3877,6 +3971,7 @@ mod tests {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
             rate_limit_manager: None,
+            queue_timeout: QueueTimeout::from_secs(60),
         }
     }
 

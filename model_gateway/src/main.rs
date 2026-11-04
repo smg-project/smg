@@ -1262,10 +1262,11 @@ struct ServingArgs {
     queue_size: usize,
 
     /// Maximum time in seconds a request can wait in queue, and the longest a
-    /// request may sit inside the gRPC router ahead of worker selection (counted
+    /// request may sit inside the gateway ahead of worker selection (counted
     /// from its admission, or its acceptance without an admission layer) before
-    /// it is refused with a 503, the prefill admission wait of a PD or EPD request
-    /// included; the HTTP relay and the HTTP PD router are not bounded
+    /// it is refused with a 503, the prefill admission wait of a disaggregated
+    /// request included: on the gRPC routers, the HTTP router's typed routes
+    /// and the HTTP prefill-decode router
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 

@@ -20,6 +20,9 @@
 //!   guard, shared by the HTTP and gRPC selection paths
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
 //!   post more bootstrap rooms to a pair than its decode engine can admit
+//! - `queue_timeout` — the bound on a request's wait ahead of worker
+//!   selection (`--queue-timeout-secs`), the one refusal the gRPC selection
+//!   stage and both HTTP routers answer with
 //! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
 //!   named by (the side, the phase, the failure's own status), the HTTP and
 //!   gRPC prefill-decode paths' answers built from it
@@ -57,6 +60,7 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub(crate) mod queue_timeout;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
