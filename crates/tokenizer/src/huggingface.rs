@@ -110,9 +110,6 @@ pub struct HuggingFaceTokenizer {
     /// byte fallback (see `byte_fallback`): the streaming step's window
     /// decodes read it instead of running the `tokenizers` decode.
     pieces: Option<Arc<PieceTable>>,
-    /// The `vllm-tokenizer` backend, when it took the file (see
-    /// [`choose_backend`]); `None` keeps every encode in `tokenizers`.
-    vllm: Option<crate::vllm::VllmBackend>,
     has_byte_fallback: bool,
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
@@ -226,6 +223,11 @@ fn choose_backend(vllm: VllmSource<'_>, frame: Option<Frame>) -> Option<crate::v
 /// borrow of the wrapper that prepared it).
 struct EncoderCore {
     tokenizer: HfTokenizer,
+    /// The `vllm-tokenizer` backend, when it took the file (see
+    /// [`choose_backend`]): every flat encode, the plain regions of a
+    /// segment encode and every batch decode run on it. `None` keeps them
+    /// in `tokenizers`.
+    vllm: Option<crate::vllm::VllmBackend>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
     /// encoder of its own asks; a vocabulary can carry tens of thousands of
@@ -234,9 +236,9 @@ struct EncoderCore {
     /// encode of a prompt rendered by segments would cut out exactly the
     /// renderer's control tokens.
     added: OnceLock<Option<AddedTokens>>,
-    /// `tokenizer` without its added vocabulary, built on first use: the
-    /// plain segments of a prompt rendered by segments are encoded by it,
-    /// every spelling in them as text.
+    /// `tokenizer` without its added vocabulary, built on first use when
+    /// the backend is absent: the plain segments of a prompt rendered by
+    /// segments are encoded by it, every spelling in them as text.
     plain: OnceLock<HfTokenizer>,
     /// [`Self::plain`] for a plain segment after a control, under a
     /// `Metaspace` pre-tokenizer that prepends the word marker at the start
@@ -246,9 +248,10 @@ struct EncoderCore {
 }
 
 impl EncoderCore {
-    fn new(tokenizer: HfTokenizer) -> Self {
+    fn new(tokenizer: HfTokenizer, vllm: Option<crate::vllm::VllmBackend>) -> Self {
         Self {
             tokenizer,
+            vllm,
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
@@ -325,9 +328,14 @@ impl EncoderCore {
     }
 
     /// Appends the ids of `text` with every spelling in it encoded as text:
-    /// `tokenizers` without the added vocabulary, as the region at the start
-    /// of the prompt (`at_start`) or after a control.
+    /// the backend's ordinary encode (its added-token matchers bypassed),
+    /// else `tokenizers` without the added vocabulary, as the region at the
+    /// start of the prompt (`at_start`) or after a control.
     fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
+        if let Some(vllm) = &self.vllm {
+            ids.extend(vllm.encode_ordinary(text)?);
+            return Ok(());
+        }
         let encoding = self
             .plain_tokenizer(at_start)
             .encode(text, false)
@@ -375,7 +383,7 @@ impl HuggingFaceTokenizer {
     /// The path this tokenizer's encodes take, chosen at load (see
     /// [`EncodePath`]).
     pub fn encode_path(&self) -> EncodePath {
-        if self.vllm.is_some() {
+        if self.core.vllm.is_some() {
             EncodePath::Vllm
         } else {
             EncodePath::Tokenizers
@@ -891,8 +899,7 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
-            vllm,
-            core: Arc::new(EncoderCore::new(tokenizer)),
+            core: Arc::new(EncoderCore::new(tokenizer, vllm)),
             special_tokens,
             vocab,
             reverse_vocab,
@@ -1165,8 +1172,7 @@ impl HuggingFaceTokenizer {
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
-            vllm,
-            core: Arc::new(EncoderCore::new(tokenizer)),
+            core: Arc::new(EncoderCore::new(tokenizer, vllm)),
             special_tokens,
             vocab,
             reverse_vocab,
@@ -1544,7 +1550,7 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-        if let Some(vllm) = &self.vllm {
+        if let Some(vllm) = &self.core.vllm {
             return vllm.encode(input, add_special_tokens);
         }
         self.core
@@ -1555,7 +1561,7 @@ impl Encoder for HuggingFaceTokenizer {
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-        if let Some(vllm) = &self.vllm {
+        if let Some(vllm) = &self.core.vllm {
             return vllm.encode_batch(inputs, add_special_tokens);
         }
         self.core
@@ -1882,10 +1888,10 @@ impl Decoder for HuggingFaceTokenizer {
     }
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        // The opt-in backend decodes every batch, in front of the wrapper's
-        // own tables; the streaming windows of a byte-fallback vocabulary
-        // keep the piece table (see `window_decode`).
-        if let Some(vllm) = &self.vllm {
+        // The backend decodes every batch, in front of the wrapper's own
+        // tables; the streaming windows of a byte-fallback vocabulary keep
+        // the piece table (see `window_decode`).
+        if let Some(vllm) = &self.core.vllm {
             return vllm.decode(token_ids, skip_special_tokens);
         }
         // A sentencepiece-style vocabulary with byte fallback decodes through

@@ -105,6 +105,15 @@ impl VllmBackend {
         }))
     }
 
+    /// The ids of `text` with every added-token matcher bypassed: each
+    /// spelling in it is text, as the pipeline without its added vocabulary
+    /// encodes it (the plain regions of a prompt rendered by segments).
+    pub(crate) fn encode_ordinary(&self, text: &str) -> Result<Vec<TokenIdType>> {
+        self.tokenizer
+            .encode_ordinary(text)
+            .map_err(|error| Error::msg(format!("Encoding failed: {error}")))
+    }
+
     /// Input by input on the calling thread: the gateway fans a batch out
     /// over `encode` itself.
     pub(crate) fn encode_batch(

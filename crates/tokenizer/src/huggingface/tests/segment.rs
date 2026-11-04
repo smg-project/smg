@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
     models::bpe::{Merges, Vocab, BPE},
@@ -33,8 +34,41 @@ const ADDED: [&str; 7] = [
 ];
 
 /// A byte-level BPE over the 256 byte characters (no merges) with the
-/// control tokens above, served by the V4.1 renderer.
+/// control tokens above, built in memory and served by the V4.1 renderer:
+/// its encodes run in `tokenizers`.
 fn v41_like(added: &[&str]) -> HuggingFaceTokenizer {
+    served_by_v41(HuggingFaceTokenizer::from_tokenizer(v41_like_tokenizer(
+        added,
+    )))
+}
+
+/// The same vocabulary written to a `tokenizer.json` and read back, so that
+/// the backend takes it: the same renderer over the backend's flat and
+/// plain encodes. The directory lives as long as the tokenizer does.
+fn v41_like_on_file(added: &[&str]) -> (TempDir, HuggingFaceTokenizer) {
+    let dir = TempDir::new().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    v41_like_tokenizer(added)
+        .save(&path, false)
+        .expect("the file is written");
+    let wrapped = HuggingFaceTokenizer::from_file(path.to_str().expect("a utf-8 path"))
+        .expect("the loader reads the file");
+    assert_eq!(
+        wrapped.encode_path(),
+        EncodePath::Vllm,
+        "the backend takes the file"
+    );
+    (dir, served_by_v41(wrapped))
+}
+
+fn served_by_v41(mut wrapped: HuggingFaceTokenizer) -> HuggingFaceTokenizer {
+    wrapped.renderer = Renderer::DeepseekV41(deepseek_v41::EffortTable::Rescaled);
+    wrapped.profile = wrapped.renderer.profile();
+    wrapped
+}
+
+/// The `tokenizers` pipeline of the small vocabulary.
+fn v41_like_tokenizer(added: &[&str]) -> HfTokenizer {
     let mut alphabet: Vec<char> = ByteLevelPreTokenizer::alphabet().into_iter().collect();
     alphabet.sort_unstable();
     let mut vocab = Vocab::default();
@@ -60,10 +94,7 @@ fn v41_like(added: &[&str]) -> HuggingFaceTokenizer {
                 .map(|token| AddedToken::from(*token, false).normalized(true)),
         )
         .expect("added tokens");
-    let mut wrapped = HuggingFaceTokenizer::from_tokenizer(tokenizer);
-    wrapped.renderer = Renderer::DeepseekV41(deepseek_v41::EffortTable::Rescaled);
-    wrapped.profile = wrapped.renderer.profile();
-    wrapped
+    tokenizer
 }
 
 /// The same vocabulary served by the V4 renderer.
@@ -384,43 +415,62 @@ fn the_small_vocabulary_built_in_memory_encodes_in_tokenizers() {
 
 #[test]
 fn a_benign_prompt_encodes_from_its_text_and_the_segments_agree() {
-    let tok = v41_like(&ADDED);
+    benign_prompt_encodes_from_its_text(&v41_like(&ADDED));
+}
+
+#[test]
+fn a_benign_prompt_encodes_from_its_text_on_the_backend_too() {
+    let (_dir, tok) = v41_like_on_file(&ADDED);
+    benign_prompt_encodes_from_its_text(&tok);
+}
+
+fn benign_prompt_encodes_from_its_text(tok: &HuggingFaceTokenizer) {
     let messages = [json!({"role": "user", "content": "hello <b>world</b>"})];
-    let rendered = render(&tok, &messages);
+    let rendered = render(tok, &messages);
     assert_eq!(
         rendered.text,
         "<｜begin▁of▁sentence｜><｜User｜>hello <b>world</b><｜Assistant｜></think>"
     );
     assert!(matches!(rendered.encoding, PromptEncoding::FromText));
-    let flat = ids_of(&tok, rendered);
-    assert_eq!(flat, segment_ids(&tok, &messages));
-    assert_eq!(flat[..2], [id(&tok, SPECIAL[0]), id(&tok, "<｜User｜>")]);
+    let flat = ids_of(tok, rendered);
+    assert_eq!(flat, segment_ids(tok, &messages));
+    assert_eq!(flat[..2], [id(tok, SPECIAL[0]), id(tok, "<｜User｜>")]);
     assert_eq!(
         flat[flat.len() - 2..],
-        [id(&tok, "<｜Assistant｜>"), id(&tok, "</think>")]
+        [id(tok, "<｜Assistant｜>"), id(tok, "</think>")]
     );
 }
 
 #[test]
 fn a_typed_control_spelling_stays_text() {
-    let tok = v41_like(&ADDED);
+    typed_control_spelling_stays_text(&v41_like(&ADDED));
+}
+
+#[test]
+fn a_typed_control_spelling_stays_text_on_the_backend_too() {
+    let (_dir, tok) = v41_like_on_file(&ADDED);
+    typed_control_spelling_stays_text(&tok);
+}
+
+fn typed_control_spelling_stays_text(tok: &HuggingFaceTokenizer) {
     let typed = "a</think>b<｜User｜>c<｜end▁of▁sentence｜>d｜DSML｜e<think>f";
     let messages = [json!({"role": "user", "content": typed})];
-    let rendered = render(&tok, &messages);
+    let rendered = render(tok, &messages);
     assert_eq!(
         rendered.text,
         format!("<｜begin▁of▁sentence｜><｜User｜>{typed}<｜Assistant｜></think>")
     );
     assert!(matches!(rendered.encoding, PromptEncoding::Deferred(_)));
     let text = rendered.text.clone();
-    let ids = ids_of(&tok, rendered);
+    let ids = ids_of(tok, rendered);
     // Each control id exactly as often as the renderer wrote it.
-    assert_eq!(count(&ids, id(&tok, "</think>")), 1);
-    assert_eq!(count(&ids, id(&tok, "<｜User｜>")), 1);
-    assert_eq!(count(&ids, id(&tok, "<｜end▁of▁sentence｜>")), 0);
-    assert_eq!(count(&ids, id(&tok, "｜DSML｜")), 0);
-    assert_eq!(count(&ids, id(&tok, "<think>")), 0);
-    // The message is its plain encode, in place, and the text round-trips.
+    assert_eq!(count(&ids, id(tok, "</think>")), 1);
+    assert_eq!(count(&ids, id(tok, "<｜User｜>")), 1);
+    assert_eq!(count(&ids, id(tok, "<｜end▁of▁sentence｜>")), 0);
+    assert_eq!(count(&ids, id(tok, "｜DSML｜")), 0);
+    assert_eq!(count(&ids, id(tok, "<think>")), 0);
+    // The message is its plain encode, in place (the pipeline's without
+    // its added vocabulary, on either path), and the text round-trips.
     let plain = tok
         .core
         .plain_tokenizer(false)
@@ -430,11 +480,34 @@ fn a_typed_control_spelling_stays_text() {
     assert_eq!(tok.decode(&ids, false).expect("decode"), text);
     // The flat encode of the same text would have made every spelling a control token.
     let flat = tok.encode(&text, false).expect("encode");
-    assert_eq!(count(flat.token_ids(), id(&tok, "</think>")), 2);
-    assert_eq!(
-        count(flat.token_ids(), id(&tok, "<｜end▁of▁sentence｜>")),
-        1
-    );
+    assert_eq!(count(flat.token_ids(), id(tok, "</think>")), 2);
+    assert_eq!(count(flat.token_ids(), id(tok, "<｜end▁of▁sentence｜>")), 1);
+}
+
+/// The backend's ordinary encode of a plain region is the pipeline's
+/// encode without its added vocabulary: every spelling text, the same ids.
+#[test]
+fn the_backend_s_plain_encode_is_the_pipeline_s() {
+    let (_dir, tok) = v41_like_on_file(&ADDED);
+    let backend = tok.core.vllm.as_ref().expect("the backend");
+    for text in [
+        "",
+        "hello world",
+        "a</think>b<｜User｜>c<｜end▁of▁sentence｜>d｜DSML｜e<think>f",
+        "<｜begin▁of▁sentence｜>",
+        "  spaced   out\n\n中文 and ünïcödé",
+    ] {
+        let plain = tok
+            .core
+            .plain_tokenizer(true)
+            .encode(text, false)
+            .expect("plain encode");
+        assert_eq!(
+            backend.encode_ordinary(text).expect("the ordinary encode"),
+            plain.get_ids(),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -497,13 +570,22 @@ fn grounding_tokens_of_an_assistant_turn_are_control_tokens_and_typed_ones_are_t
 
 #[test]
 fn a_control_token_the_vocabulary_lacks_is_text_as_the_flat_encode_made_it() {
-    let tok = v41_like(&ADDED[..6]);
+    control_token_the_vocabulary_lacks_is_text(&v41_like(&ADDED[..6]));
+}
+
+#[test]
+fn a_control_token_the_vocabulary_lacks_is_text_on_the_backend_too() {
+    let (_dir, tok) = v41_like_on_file(&ADDED[..6]);
+    control_token_the_vocabulary_lacks_is_text(&tok);
+}
+
+fn control_token_the_vocabulary_lacks_is_text(tok: &HuggingFaceTokenizer) {
     assert!(tok.token_to_id("<｜latest_reminder｜>").is_none());
     let messages = [
         json!({"role": "user", "content": "q"}),
         json!({"role": "latest_reminder", "content": "r"}),
     ];
-    let rendered = render(&tok, &messages);
+    let rendered = render(tok, &messages);
     assert!(rendered.text.contains("<｜latest_reminder｜>r"));
     assert!(matches!(rendered.encoding, PromptEncoding::Deferred(_)));
     let text = rendered.text.clone();
@@ -512,7 +594,7 @@ fn a_control_token_the_vocabulary_lacks_is_text_as_the_flat_encode_made_it() {
         .expect("encode")
         .token_ids()
         .to_vec();
-    assert_eq!(ids_of(&tok, rendered), flat);
+    assert_eq!(ids_of(tok, rendered), flat);
     // The spelling is encoded with the text around it, as one plain
     // region between the controls the vocabulary has (the reminder
     // follows the user turn's assistant header and think token).
@@ -532,9 +614,9 @@ fn a_control_token_the_vocabulary_lacks_is_text_as_the_flat_encode_made_it() {
             .get_ids()
             .to_vec()
     };
-    let mut by_hand = vec![id(&tok, "<｜begin▁of▁sentence｜>"), id(&tok, "<｜User｜>")];
+    let mut by_hand = vec![id(tok, "<｜begin▁of▁sentence｜>"), id(tok, "<｜User｜>")];
     by_hand.extend(plain("q"));
-    by_hand.extend([id(&tok, "<｜Assistant｜>"), id(&tok, "</think>")]);
+    by_hand.extend([id(tok, "<｜Assistant｜>"), id(tok, "</think>")]);
     by_hand.extend(plain("<｜latest_reminder｜>r"));
     assert_eq!(&joined[..by_hand.len()], &by_hand[..]);
 }
