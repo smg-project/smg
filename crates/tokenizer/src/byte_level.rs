@@ -246,6 +246,13 @@ impl ByteLevelTable {
         Some((kind, start as usize..end as usize))
     }
 
+    /// Whether the vocabulary lacks `id`.
+    #[cfg(feature = "vllm")]
+    #[inline]
+    pub(crate) fn is_absent(&self, id: TokenIdType) -> bool {
+        self.locate(id).is_none()
+    }
+
     /// The bytes of `id` from whichever store holds them, and whether it is
     /// special. The whole-sequence decode reads every id through this rather
     /// than through [`Self::entry`]: its loop stays one kind test, one span

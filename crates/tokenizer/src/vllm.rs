@@ -6,6 +6,12 @@
 //! wrapper, so there is one source of semantics (the shape of the v1
 //! opt-in, see `v1`).
 //!
+//! The frontend's tiktoken backend (`riptoken`) serves the tiktoken wrapper
+//! the same way ([`VllmTiktokenBackend`]): the wrapper keeps the Kimi
+//! family's piece cut, its special-token and vocabulary tables, chat
+//! templates, renderers and the per-stream decoder, and hands the backend a
+//! file it reads as the wrapper does.
+//!
 //! The backend reads `tokenizer.json` alone, so the load hands it the file
 //! only where the wrapper's pipeline is the file's: a tokenizer built in
 //! memory, a vocabulary read from `vocab.json` and `merges.txt`, the Llama
@@ -16,8 +22,13 @@
 //! the `tokenizers` crate with its default per-thread word cache, which the
 //! wrapper bounds on its own pipeline and could not on the frontend's.
 
+use std::path::Path;
+
 use anyhow::{Error, Result};
-use vllm_tokenizer::{HuggingFaceTokenizer as VllmHuggingFaceTokenizer, Tokenizer as _};
+use vllm_tokenizer::{
+    HuggingFaceTokenizer as VllmHuggingFaceTokenizer, TiktokenTokenizer as VllmTiktokenTokenizer,
+    Tokenizer as _,
+};
 
 use crate::{
     encode_path::{Declined, VllmSource},
@@ -79,4 +90,91 @@ impl VllmBackend {
             .decode(token_ids, skip_special_tokens)
             .map_err(|error| Error::msg(format!("Decoding failed: {error}")))
     }
+}
+
+/// The frontend's tiktoken backend over one BPE file (`tiktoken.model`,
+/// `*.tiktoken`), read by `riptoken`.
+pub(crate) struct VllmTiktokenBackend {
+    tokenizer: VllmTiktokenTokenizer,
+}
+
+impl VllmTiktokenBackend {
+    /// The backend over the BPE file at `path`, or why it declines: a file
+    /// `riptoken` does not read, or one the frontend reads otherwise than the
+    /// wrapper. The wrapper applies the Kimi family's pre-tokenizer pattern
+    /// where `kimi` says so (the configuration names the family's tokenizer
+    /// class, or `config.json` its model type); the frontend reads the model
+    /// type alone ([`frontend_kimi_pattern`]). The wrapper's ids end at
+    /// `ids_end` (its largest rank or added id, plus one, the Kimi family's
+    /// reserved slots included); the frontend registers a reserved special
+    /// token for every id from the ranks' end to the configuration's
+    /// `vocab_size`, so where the two ends differ a spelling or an id reads
+    /// differently.
+    pub(crate) fn load(
+        path: &Path,
+        ids_end: usize,
+        kimi: bool,
+        frontend_kimi: bool,
+    ) -> Result<Self, Declined> {
+        if kimi != frontend_kimi {
+            return Err(Declined::from(if kimi {
+                "the Kimi family's pattern applies, which the frontend reads from config.json's \
+                 model_type alone"
+            } else {
+                "the frontend would apply the Kimi family's pattern (config.json's model_type) \
+                 where the cl100k pattern applies"
+            }));
+        }
+        let tokenizer = VllmTiktokenTokenizer::new_riptoken(path).map_err(|error| {
+            Declined::from(format!(
+                "vllm-tokenizer's riptoken backend did not load the file: {error}"
+            ))
+        })?;
+        let frontend_ids_end = tokenizer.vocab_size();
+        if frontend_ids_end != ids_end {
+            return Err(Declined::from(format!(
+                "the frontend's ids end at {frontend_ids_end} where the file's and the \
+                 configuration's end at {ids_end}"
+            )));
+        }
+        Ok(Self { tokenizer })
+    }
+
+    /// The ids of `text`, its special tokens recognized (tiktoken has no
+    /// `add_special_tokens`: the wrapper's engine recognizes them too).
+    pub(crate) fn encode(&self, text: &str) -> Result<Vec<TokenIdType>> {
+        self.tokenizer
+            .encode(text, false)
+            .map_err(|error| Error::msg(format!("tiktoken encode failed: {error}")))
+    }
+
+    /// The text of `token_ids`, every id kept (the wrapper strips what
+    /// `skip_special_tokens` strips before, and rejects an id the vocabulary
+    /// lacks, which the backend would skip).
+    pub(crate) fn decode(&self, token_ids: &[TokenIdType]) -> Result<String> {
+        self.tokenizer
+            .decode(token_ids, false)
+            .map_err(|error| Error::msg(format!("tiktoken decode failed: {error}")))
+    }
+}
+
+/// Whether the frontend applies the Kimi family's pre-tokenizer pattern to
+/// the tiktoken file in `dir`: its rule reads `config.json`'s `model_type`
+/// (or `text_config.model_type`) alone, as the Dynamo reference does.
+pub(crate) fn frontend_kimi_pattern(dir: &Path) -> bool {
+    fn model_type(config: &serde_json::Value) -> Option<&str> {
+        config
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| config.get("text_config").and_then(model_type))
+    }
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|config| {
+            matches!(
+                model_type(&config),
+                Some("kimi" | "kimi_k2" | "kimi_k25" | "kimi_k3" | "deepseek_v3")
+            )
+        })
 }

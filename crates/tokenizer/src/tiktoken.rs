@@ -219,6 +219,10 @@ pub struct TiktokenTokenizer {
     /// `tokenization_kimi.py` sorts them in its `apply_chat_template`
     /// (Kimi K3's class, which renders its own format, does not).
     tools_key_sorted: bool,
+    /// The opt-in `vllm-tokenizer` backend, when the load took it: the flat
+    /// encodes and batch decodes run on it (see `vllm`).
+    #[cfg(feature = "vllm")]
+    vllm: Option<crate::vllm::VllmTiktokenBackend>,
 }
 
 /// Supported Tiktoken models
@@ -287,6 +291,8 @@ impl TiktokenTokenizer {
             byte_level,
             checkpoint_pieces: false,
             tools_key_sorted: false,
+            #[cfg(feature = "vllm")]
+            vllm: None,
         })
     }
 
@@ -399,6 +405,9 @@ impl TiktokenTokenizer {
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
         let byte_level = byte_level_table(&tokenizer, vocab_size, &config.skip_token_ids);
+        #[cfg(feature = "vllm")]
+        let vllm =
+            Self::choose_vllm_backend(tiktoken_path, dir, vocab_size, kimi, byte_level.is_some());
 
         Ok(TiktokenTokenizer {
             tokenizer,
@@ -419,7 +428,61 @@ impl TiktokenTokenizer {
                 Renderer::KimiK3Xtml => false,
                 Renderer::Jinja => kimi,
             },
+            #[cfg(feature = "vllm")]
+            vllm,
         })
+    }
+
+    /// The opt-in `vllm-tokenizer` backend over the same file, where it
+    /// reads it as the wrapper does and the wrapper has the per-id byte
+    /// table its decode checks unknown ids against; else the reason is
+    /// logged once and the wrapper's own engine serves (see `vllm`).
+    #[cfg(feature = "vllm")]
+    fn choose_vllm_backend(
+        tiktoken_path: &Path,
+        dir: &Path,
+        ids_end: usize,
+        kimi: bool,
+        byte_table: bool,
+    ) -> Option<crate::vllm::VllmTiktokenBackend> {
+        let backend = if byte_table {
+            crate::vllm::VllmTiktokenBackend::load(
+                tiktoken_path,
+                ids_end,
+                kimi,
+                crate::vllm::frontend_kimi_pattern(dir),
+            )
+        } else {
+            Err(crate::encode_path::Declined::from(
+                "the ids are too sparse for the per-id byte table the decode checks unknown ids against",
+            ))
+        };
+        match backend {
+            Ok(backend) => {
+                tracing::info!(path = %tiktoken_path.display(), "tiktoken backend: vllm-tokenizer");
+                Some(backend)
+            }
+            Err(declined) => {
+                tracing::info!(
+                    vllm_declined = %declined,
+                    "the opt-in vllm-tokenizer backend declined this tiktoken tokenizer; the wrapper's engine serves it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether the opt-in `vllm-tokenizer` backend serves this tokenizer's
+    /// flat encodes and batch decodes (feature `vllm`).
+    pub fn uses_vllm_backend(&self) -> bool {
+        #[cfg(feature = "vllm")]
+        let uses = self.vllm.is_some();
+        #[cfg(not(feature = "vllm"))]
+        let uses = {
+            let _ = self;
+            false
+        };
+        uses
     }
 
     /// Create a tokenizer from a model string (e.g., "gpt-4", "gpt-3.5-turbo")
@@ -762,6 +825,19 @@ impl Encoder for TiktokenTokenizer {
         // backends, which tiktoken has no concept of) and always recognizes
         // special-token patterns, so chat-template tokens like <|media_pad|> stay
         // atomic instead of splitting into BPE sub-tokens.
+        #[cfg(feature = "vllm")]
+        if let Some(vllm) = &self.vllm {
+            let tokens = if self.checkpoint_pieces {
+                let mut tokens = Vec::new();
+                for piece in checkpoint_pieces(input) {
+                    tokens.extend(vllm.encode(piece)?);
+                }
+                tokens
+            } else {
+                vllm.encode(input)?
+            };
+            return Ok(Encoding::Tiktoken(tokens));
+        }
         let tokens = if self.checkpoint_pieces {
             checkpoint_pieces(input)
                 .into_iter()
@@ -794,6 +870,22 @@ impl Decoder for TiktokenTokenizer {
         } else {
             token_ids
         };
+        #[cfg(feature = "vllm")]
+        if let Some(vllm) = &self.vllm {
+            // An id the vocabulary lacks fails the decode, as the wrapper's
+            // engine fails it below; the backend would skip it.
+            let absent = |id: &TokenIdType| {
+                self.byte_level
+                    .as_ref()
+                    .is_none_or(|table| table.is_absent(*id))
+            };
+            if let Some(unknown) = token_ids.iter().find(|id| absent(id)) {
+                return Err(Error::msg(format!(
+                    "tiktoken decode failed for unknown token id: {unknown}"
+                )));
+            }
+            return vllm.decode(token_ids);
+        }
         match self.tokenizer.decode(token_ids) {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
@@ -2036,5 +2128,137 @@ mod tests {
             ids.contains(&100257),
             "Special token <|endoftext|> should be recognized as single token, got: {ids:?}"
         );
+    }
+    /// The opt-in `vllm-tokenizer` backend over a Kimi-style file: the
+    /// ids and text are those of the wrapper's own engine.
+    #[cfg(feature = "vllm")]
+    mod vllm_backend {
+        use tiktoken_rs::CoreBPE;
+
+        use super::*;
+        use crate::kimi_k2_tokenizer::KIMI_K2_PATTERN;
+
+        /// A tiktoken file with every byte as a rank (0..256) and the given
+        /// multi-byte tokens at the ranks after them.
+        fn full_byte_model(extra: &[&[u8]]) -> String {
+            let mut out = String::new();
+            for b in 0u32..256 {
+                out.push_str(&format!("{} {}\n", STANDARD.encode([b as u8]), b));
+            }
+            for (offset, bytes) in extra.iter().enumerate() {
+                out.push_str(&format!("{} {}\n", STANDARD.encode(bytes), 256 + offset));
+            }
+            out
+        }
+
+        const TOKENIZER_CONFIG: &str = r#"{
+            "tokenizer_class": "TikTokenTokenizer",
+            "bos_token": "[BOS]", "eos_token": "[EOS]",
+            "added_tokens_decoder": {
+                "259": {"content": "[BOS]", "special": true},
+                "260": {"content": "[EOS]", "special": true},
+                "261": {"content": "<|tool_call_begin|>", "special": false}
+            }
+        }"#;
+
+        const TEXTS: &[&str] = &[
+            "",
+            "hello world",
+            "hello  world\n\n!",
+            "\u{4f60}\u{597d}\u{4e16}\u{754c}, hello",
+            "[BOS]hello[EOS]",
+            "<|tool_call_begin|>{\"a\": 1}",
+            "<|reserved_token_300|> text",
+            "   leading and trailing   ",
+        ];
+
+        /// A Kimi K2 checkpoint of the file and the configuration: the
+        /// family's pattern, the 256 reserved slots after the ranks.
+        fn kimi_dir() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("tiktoken.model"),
+                full_byte_model(&[b"hello", b" world", b"ll"]),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("tokenizer_config.json"), TOKENIZER_CONFIG).unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                r#"{"model_type": "kimi_k2", "vocab_size": 515}"#,
+            )
+            .unwrap();
+            dir
+        }
+
+        /// The wrapper's own engine over the same checkpoint, built as the
+        /// loader builds it.
+        fn reference(dir: &Path) -> CoreBPE {
+            let encoder = load_tiktoken_bpe(dir.join("tiktoken.model").to_str().unwrap()).unwrap();
+            let (mut config, _) = load_tiktoken_config_from_dir(dir).unwrap();
+            kimi_k2_tokenizer::apply_reserved_special_tokens(
+                &mut config.added_tokens,
+                encoder.len(),
+            );
+            let specials: FxHashMap<String, Rank> = config.added_tokens.into_iter().collect();
+            CoreBPE::new(encoder, specials, KIMI_K2_PATTERN).unwrap()
+        }
+
+        #[test]
+        fn a_kimi_checkpoint_takes_the_backend_and_agrees_with_the_engine() {
+            let dir = kimi_dir();
+            let ours = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            assert!(ours.uses_vllm_backend());
+            assert_eq!(ours.vocab_size(), 515);
+            let reference = reference(dir.path());
+            for &text in TEXTS {
+                let expected = reference.encode_with_special_tokens(text);
+                let ids = ours.encode(text, false).unwrap();
+                assert_eq!(ids.token_ids(), &expected[..], "{text:?}");
+                for skip in [false, true] {
+                    let kept: Vec<TokenIdType> = expected
+                        .iter()
+                        .copied()
+                        .filter(|id| !skip || !ours.skip_token_ids.contains(id))
+                        .collect();
+                    assert_eq!(
+                        ours.decode(&expected, skip).unwrap(),
+                        reference.decode(&kept).unwrap(),
+                        "{text:?}, skip={skip}"
+                    );
+                }
+            }
+            // A byte sequence cut inside a character decodes lossily on both.
+            let ids = ours.encode("\u{4f60}", false).unwrap();
+            let cut = &ids.token_ids()[..ids.token_ids().len() - 1];
+            assert_eq!(
+                ours.decode(cut, false).unwrap(),
+                String::from_utf8_lossy(&reference.decode_bytes(cut).unwrap())
+            );
+            // An id the vocabulary lacks fails the decode, as before.
+            let err = ours.decode(&[515], false).unwrap_err();
+            assert!(err.to_string().contains("unknown token id"), "{err}");
+        }
+
+        /// A file the frontend reads otherwise than the wrapper keeps the
+        /// wrapper's engine: without `config.json` the frontend reserves 256
+        /// slots after the ranks while the wrapper, seeing no Kimi family,
+        /// ends its ids at the configuration's last added token.
+        #[test]
+        fn a_checkpoint_the_frontend_bounds_differently_keeps_the_engine() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("tiktoken.model"),
+                full_byte_model(&[b"hello", b" world", b"ll"]),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("tokenizer_config.json"), TOKENIZER_CONFIG).unwrap();
+            let ours = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            assert!(!ours.uses_vllm_backend());
+            assert_eq!(ours.vocab_size(), 262);
+            assert_eq!(
+                ours.encode("hello world", false).unwrap().token_ids(),
+                &[256, 257]
+            );
+        }
     }
 }

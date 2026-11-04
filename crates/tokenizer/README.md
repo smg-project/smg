@@ -25,7 +25,7 @@ as of `tokenizer/src/*`.
 - `factory.rs` – backend discovery, file/model heuristics, and tokio-aware creation helpers
 - `hub.rs` – Hugging Face Hub downloads via `hf_hub`
 - `huggingface.rs` – wrapper over `tokenizers::Tokenizer`, chat template loading, vocab access
-- `vllm.rs` – the opt-in `vllm-tokenizer` backend (feature `vllm`): the vLLM Rust frontend's Hugging Face tokenizer serving a tokenizer's flat encodes and batch decodes
+- `vllm.rs` – the opt-in `vllm-tokenizer` backend (feature `vllm`): the vLLM Rust frontend's Hugging Face tokenizer (`fastokens`) and tiktoken tokenizer (`riptoken`) serving a tokenizer's flat encodes and batch decodes
 - `tiktoken.rs` – wrapper over `tiktoken-rs` encoders for OpenAI model families and hub-loaded tiktoken models (includes `tokenizer_config.json` parsing for the tiktoken path)
 - `chat_template.rs` – AST-driven Jinja template inspection, rendering utilities, shared `ChatTemplateState`, and template file loading
 - `registry.rs` – thread-safe tokenizer registry with deduplication for IGW mode, supporting lookup by UUID or name
@@ -259,6 +259,8 @@ flat encodes and batch decodes for; it takes a checkpoint's `tokenizer.json`
 where the wrapper's pipeline is the file's and `fastokens` reads it, and the
 load logs why it declined the rest (a tokenizer built in memory or from
 `vocab.json`, the Llama class's pipeline, a configured post-processor, settled
-added tokens, a file `fastokens` does not read).
+added tokens, a file `fastokens` does not read). A tiktoken tokenizer read from a
+file takes the frontend's `riptoken` backend the same way, where the frontend
+reads the file as the wrapper does (the Kimi family's pattern, the ids' end).
 `smg_tokenizer_encode_fallbacks_total` counts the inputs that still left the
 direct encoder afterwards, each encoded a second time by `tokenizers`.
