@@ -203,10 +203,9 @@ struct ModelConfigs {
 impl ModelConfigs {
     fn load(dir: &Path) -> Result<Self, Fault> {
         let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
-        let image = match fs::read_to_string(dir.join("preprocessor_config.json")) {
-            Ok(text) => PreProcessorConfig::from_json(&text)?,
-            Err(_) => PreProcessorConfig::default(),
-        };
+        let image = PreProcessorConfig::from_json(&fs::read_to_string(
+            dir.join("preprocessor_config.json"),
+        )?)?;
         let video = fs::read_to_string(dir.join("video_preprocessor_config.json"))
             .ok()
             .map(|text| PreProcessorConfig::from_json(&text))
@@ -611,6 +610,12 @@ fn prepare(class: &Class, connector: &Arc<MediaConnector>) -> Result<Work, Fault
             }
         }
         "audio" => {
+            // the crate arm runs the Qwen3 audio frontend: the families whose audio
+            // processor it is are named here, so another family's clip cannot run
+            // through it under that family's name
+            if !matches!(spec.name(), "qwen3_asr" | "qwen3_omni") {
+                return Err(format!("no audio arm for the {} family", spec.name()).into());
+            }
             let path = class.files.first().ok_or("an audio class names one file")?;
             Work::Audio {
                 processor: Arc::new(Qwen3AudioProcessor::from_configs(

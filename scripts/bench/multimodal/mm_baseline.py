@@ -82,7 +82,12 @@ def materialize(cls: dict, corpus: Path, out_dir: Path, ffmpeg: str) -> tuple[li
         raise FileNotFoundError(f"class {cls['name']}: source file missing: {source}")
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = recipe["format"]
-    target = out_dir / f"{cls['name']}.{'jpg' if fmt == 'jpeg' else fmt}"
+    # the recipe's digest in the name: a changed recipe derives a new file instead of
+    # reusing the old one; the file is written beside its name and moved into place whole,
+    # so an interrupted write is never taken for the input
+    recipe_id = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()[:12]
+    target = out_dir / f"{cls['name']}-{recipe_id}.{'jpg' if fmt == 'jpeg' else fmt}"
+    partial = target.with_name(f"{target.stem}.partial{target.suffix}")
     if not target.exists():
         if cls["kind"] == "video":
             concat = recipe.get("concat", 1)
@@ -102,11 +107,12 @@ def materialize(cls: dict, corpus: Path, out_dir: Path, ffmpeg: str) -> tuple[li
                     str(listing),
                     "-c",
                     "copy",
-                    str(target),
+                    str(partial),
                 ],
                 check=True,
             )
             listing.unlink()
+            partial.replace(target)
         else:
             from PIL import (
                 Image,  # noqa: PLC0415  (the materializer runs under the pinned environment)
@@ -119,16 +125,17 @@ def materialize(cls: dict, corpus: Path, out_dir: Path, ffmpeg: str) -> tuple[li
                 image = image.resize((width, height), Image.LANCZOS)
                 if fmt == "jpeg":
                     image.save(
-                        target,
+                        partial,
                         "JPEG",
                         quality=recipe.get("quality", 90),
                         subsampling=recipe.get("subsampling", "4:2:0"),
                         optimize=False,
                     )
                 elif fmt == "png":
-                    image.save(target, "PNG", compress_level=6)
+                    image.save(partial, "PNG", compress_level=6)
                 else:
                     raise ValueError(f"class {cls['name']}: no recipe for format {fmt!r}")
+                partial.replace(target)
     provenance = {
         "source": "derived",
         "from": {"path": recipe["from"], "sha256": sha256_file(source)},

@@ -29,6 +29,7 @@ import json
 import multiprocessing as mp
 import os
 import platform
+import queue as queue_mod
 import sys
 import time
 from pathlib import Path
@@ -36,9 +37,10 @@ from pathlib import Path
 # One compute thread per process at the library level too, before the libraries load: the
 # worker pools OpenBLAS and OpenMP start at import survive a fork as bookkeeping only, and
 # the first call in a forked worker that needs them waits forever (the audio feature
-# extractor's matmul, on a torch build over OpenBLAS).
+# extractor's matmul, on a torch build over OpenBLAS). Set outright: an inherited pool
+# size would bring the hang back and belie the table's one compute thread per process.
 for _pool in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_pool, "1")
+    os.environ[_pool] = "1"
 
 import numpy as np  # noqa: E402
 from PIL import Image, ImageOps  # noqa: E402
@@ -250,26 +252,25 @@ def run_once(cls: dict, family: Family, blobs: list[bytes], tmp_dir: Path) -> di
 
 
 def worker(cls: dict, repeats: int, barrier, queue, tmp_dir: str) -> None:
-    import torch  # noqa: PLC0415
-
-    torch.set_num_threads(1)
-    family = Family(cls["config_dir"])
-    blobs = [Path(path).read_bytes() for path in cls["files"]]
     try:
+        # the setup inside the try too: a failure there aborts the barrier and reports,
+        # rather than leaving the parent waiting for a result that never comes
+        import torch  # noqa: PLC0415
+
+        torch.set_num_threads(1)
+        family = Family(cls["config_dir"])
+        blobs = [Path(path).read_bytes() for path in cls["files"]]
         run_once(cls, family, blobs, Path(tmp_dir))  # warm-up, not recorded
         barrier.wait()
-        before = os.times()
+        # CLOCK_PROCESS_CPUTIME_ID (user + system, every thread of the process), the
+        # clock the crate arm reads; times(2) counts in 10 ms ticks
+        before = time.process_time()
         samples = []
         for _ in range(repeats):
             result = run_once(cls, family, blobs, Path(tmp_dir))
             samples.append((result["decode_ms"], result["preprocess_ms"]))
-        after = os.times()
-        queue.put(
-            {
-                "samples": samples,
-                "cpu_ms": (after.user - before.user + after.system - before.system) * 1000.0,
-            }
-        )
+        after = time.process_time()
+        queue.put({"samples": samples, "cpu_ms": (after - before) * 1000.0})
     except Exception as error:  # noqa: BLE001  (reported as the class's error)
         with contextlib.suppress(Exception):
             barrier.abort()
@@ -342,7 +343,17 @@ def run_class(cls: dict, threads: int, repeats: int, tmp_dir: Path) -> dict:
     except Exception:  # noqa: BLE001  (a worker failed before the barrier)
         pass
     started = time.perf_counter()
-    results = [queue.get() for _ in procs]
+    results: list[dict] = []
+    while len(results) < len(procs):
+        try:
+            results.append(queue.get(timeout=5))
+        except queue_mod.Empty:
+            # a worker that died without reporting (the OOM killer, a native crash)
+            # would hold this read forever otherwise
+            dead = [proc.exitcode for proc in procs if proc.exitcode not in (None, 0)]
+            if dead:
+                results.append({"error": f"a worker exited with code {dead[0]} before it reported"})
+                break
     wall_ms = (time.perf_counter() - started) * 1000.0
     for proc in procs:
         proc.join()
