@@ -494,6 +494,17 @@ impl Encoding {
         }
     }
 
+    /// The token ids, taken out of the encoding: the vector itself for the
+    /// encodings that own one (the direct and tiktoken paths, and every
+    /// exact-cache hit), a copy for the library's own encoding, which keeps
+    /// its ids behind a borrow.
+    pub fn into_token_ids(self) -> Vec<TokenIdType> {
+        match self {
+            Encoding::Hf(inner) => inner.get_ids().to_vec(),
+            Encoding::Plain(inner) | Encoding::Tiktoken(inner) => inner,
+        }
+    }
+
     /// Get a hash of the token IDs for caching purposes
     pub fn get_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -523,4 +534,20 @@ pub struct SpecialTokens {
     pub cls_token: Option<String>,
     pub mask_token: Option<String>,
     pub additional_special_tokens: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_encoding_that_owns_its_ids_hands_them_out_without_a_copy() {
+        for owned in [Encoding::Plain, Encoding::Tiktoken] {
+            let ids = vec![7u32, 8, 9];
+            let buffer = ids.as_ptr();
+            let taken = owned(ids).into_token_ids();
+            assert_eq!(taken, [7, 8, 9]);
+            assert_eq!(taken.as_ptr(), buffer, "the vector moved, not copied");
+        }
+    }
 }
