@@ -3799,7 +3799,8 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
-    /// Build a loopback test server without discovery, mesh, or authentication.
+    /// Build a test server config without discovery, mesh, or authentication;
+    /// the listener is the one `router_config` names.
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
             router_config,
@@ -3829,6 +3830,7 @@ mod tests {
     #[tokio::test]
     async fn startup_validates_directly_constructed_router_config() {
         let router_config = RouterConfig {
+            host: "127.0.0.1".to_string(),
             tenant_api_keys: vec![TenantApiKeyEntry {
                 tenant_id: "team-a".to_string(),
                 key: String::new(),
@@ -3836,10 +3838,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = startup(minimal_server_config(router_config)).await;
+        // The refusal named, not any error: a listener that failed to bind
+        // would also be one.
+        let error = startup(minimal_server_config(router_config))
+            .await
+            .expect_err("startup must validate router_config even when constructed directly");
         assert!(
-            result.is_err(),
-            "startup must validate router_config even when constructed directly"
+            error.to_string().contains("must have a non-empty key"),
+            "startup refused for another reason: {error}"
         );
     }
 }

@@ -2086,8 +2086,9 @@ impl Router {
             .transpose()?;
 
         // The runtime's default size unless a thread count is given (the
-        // validation above refused 0), as the CLI's `serve` builds it.
-        let runtime = match self.runtime_worker_threads {
+        // validation above refused 0), read from the validated config as the
+        // CLI's `serve` reads it.
+        let runtime = match router_config.runtime_worker_threads {
             Some(threads) => tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(threads)
                 .enable_all()
