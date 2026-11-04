@@ -158,6 +158,10 @@ def backend_from_str(backend_str: str | None) -> BackendType:
         # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
         "vllm": BackendType.Vllm,
         "tokenspeed": BackendType.Tokenspeed,
+        # As on the Rust CLI: trtllm labels the start-up record and pins no
+        # wire; gemini selects the Gemini provider route.
+        "trtllm": BackendType.Trtllm,
+        "gemini": BackendType.Gemini,
     }
     backend_lower = backend_str.lower()
     if backend_lower not in backend_map:

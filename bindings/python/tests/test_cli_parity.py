@@ -356,6 +356,13 @@ def test_every_option_has_its_router_prefixed_spelling():
     assert not missing, f"options without a --router- spelling: {missing}"
 
 
+def test_the_launcher_backend_choices_are_the_cli_backends(launcher):
+    """``--backend`` takes the same names on both sides, in the CLI's order, so a
+    provider route the binary runs can be chosen from Python and the chart."""
+    enum = MAIN_RS.read_text().split("pub enum Backend {", 1)[1].split("}", 1)[0]
+    assert launcher["--backend"].choices == re.findall(r'#\[value\(name = "([a-z]+)"\)\]', enum)
+
+
 @pytest.mark.parametrize("use_router_prefix", [False, True])
 @pytest.mark.parametrize("settle", [None, 0, 5, 30, 120])
 def test_shutdown_settle_option(use_router_prefix, settle):
