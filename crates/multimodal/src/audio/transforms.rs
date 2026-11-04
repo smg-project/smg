@@ -34,7 +34,6 @@ fn mel_to_hz(mel: f64) -> f64 {
     }
 }
 
-/// Build a Slaney-normalized mel filter bank.
 /// Per filter of `filters` (`n_mels` rows of `fft_bins` weights), the half-open
 /// bin range `[first, last)` outside which its weight is zero. A filter is a
 /// triangle over the bins, so its weight is one contiguous band and a bin
@@ -60,6 +59,7 @@ pub(super) fn mel_bands(filters: &[f32], n_mels: usize, fft_bins: usize) -> Vec<
         .collect()
 }
 
+/// Build a Slaney-normalized mel filter bank.
 pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     let fft_bins = n_fft / 2 + 1;
     let mut fft_freqs = Vec::with_capacity(fft_bins);
