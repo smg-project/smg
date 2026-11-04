@@ -16,8 +16,12 @@
 #                                          its tags, the open pull requests against it
 #   release.sh tag <version>               check the versions at release/<x.y>'s head and tag it v<version>
 #                                          (annotated, signed off; pushed only with PUSH=1)
-#   release.sh notes <version> [<since>]   the release notes skeleton on stdout: the merged pull requests since the
-#                                          previous final (or <since>) by type, the Docker image list
+#   release.sh notes <version> [<since>]   the release notes draft on stdout: scripts/release/NOTES-TEMPLATE.md with the
+#                                          merged pull requests since the previous final (or <since>) seeding Highlights,
+#                                          Notable fixes and Upgrade notes from their "## Release note" sections, and
+#                                          listed by type under What's Changed; the narrative paragraphs stay as marked
+#                                          placeholders for the author
+#   release.sh notes --check <file>        refuse notes that still carry a placeholder (before gh release create)
 #   release.sh bump-main <version>         after a final: a pull request that moves main's crates and packages to
 #                                          at least the release's; the gateway keeps its development version, or
 #                                          moves to the one after <version> when main reads below the release
@@ -50,7 +54,9 @@
 #
 # Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1, the cut's main-move pull request
 # included; bump, pick and bump-main push their topic branch and open the pull request unless PUSH=0; the ship pushes);
-# REGISTRY=0 (check, publish-plan and the ship do not read crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
+# REGISTRY=0 (check, publish-plan and the ship do not read crates.io and PyPI); NOTES_CACHE (where notes keeps the pull request
+# bodies it read, ~/.cache/smg-release/pull-requests by default), NOTES_REFRESH=1 (notes reads every body again);
+# GH, CARGO, CURL, PYTHON, MAKE (the tools).
 # The ship's: NOTES (an authored notes file, instead of the one it renders); BUMP_PUSH=1 (push the bump to the release
 # branch without reading the rules) or 0 (always its pull request); MERGE_WAIT (minutes it waits for the bump pull
 # request's merge, 120) and MERGE_POLL (seconds between two reads of it, 30).
@@ -64,6 +70,8 @@ CARGO=${CARGO:-cargo}
 CURL=${CURL:-curl}
 PYTHON=${PYTHON:-python3}
 MAKE=${MAKE:-make}
+# The pull request bodies notes reads, one file per number: a second render of the same release reads no body twice.
+NOTES_CACHE=${NOTES_CACHE:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/smg-release/pull-requests}
 VERSION_RE='^([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$'
 RELEASE_RE='^[0-9]+\.[0-9]+$'
 GATEWAY_MANIFEST=model_gateway/Cargo.toml
@@ -107,6 +115,18 @@ fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
 has_ref() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
 remote_has_branch() { git ls-remote --exit-code --heads "$REMOTE" "$1" >/dev/null 2>&1; }
 remote_has_tag() { git ls-remote --exit-code --tags "$REMOTE" "refs/tags/$1" >/dev/null 2>&1; }
+repo_slug() { # owner/name of the GitHub repository $REMOTE points at, from its URL, else as gh names it; empty when neither says
+  local url slug=""
+  url=$(git remote get-url "$REMOTE" 2>/dev/null || true)
+  case $url in
+    https://github.com/*) slug=${url#https://github.com/} ;;
+    git@github.com:*) slug=${url#git@github.com:} ;;
+    ssh://git@github.com/*) slug=${url#ssh://git@github.com/} ;;
+  esac
+  slug=${slug%/}; slug=${slug%.git}
+  [ -n "$slug" ] || slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+  printf '%s' "$slug"
+}
 release_base() { # the remote-tracking release branch, fetched: what a bump, a pick or a tag builds on
   local branch="release/$1"
   has_ref "$REMOTE/$branch" || die "no $branch on $REMOTE: cut it first (release.sh cut <version> [<from>])"
@@ -551,18 +571,24 @@ cmd_tag() {
 }
 
 cmd_notes() {
+  if [ "${1:-}" = --check ]; then
+    [ -n "${2:-}" ] || die "usage: release.sh notes --check <file>"
+    [ -f "$2" ] || die "no such file: $2"
+    "$PYTHON" "$root/scripts/release/notes.py" check "$2"
+    return
+  fi
   local version=${1:-} since=${2:-}
-  [ -n "$version" ] || die "usage: release.sh notes <version> [<since>]"
+  [ -n "$version" ] || die "usage: release.sh notes <version> [<since>], or notes --check <file>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref subject type count picked full original unknown line path seen=' '
-  local lines=() subjects=()
-  local feat=() fix=() perf=() docs=() maint=() other=()
+  local release tagname ref subject count picked full original unknown line path seen=' ' scratch slug compare chart rust contributors
+  local lines=() subjects=() refresh=()
+  [ "${NOTES_REFRESH:-0}" = 0 ] || refresh=(--refresh)
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
-    ref=$tagname
+    ref=$tagname; compare=$tagname
   else
-    ref=$(release_ref "$release")
+    ref=$(release_ref "$release"); compare="release/$release"
     note "notes: $tagname is not tagged yet; reading release/$release's head"
   fi
   if [ -z "$since" ]; then
@@ -579,6 +605,8 @@ cmd_notes() {
   # $since carries it; a pick landed as its own commits reads the same through its trailer, and a trailer whose
   # original the fetch did not bring keeps the commit's own subject.
   picked=$(picked_into "$since")
+  scratch=$(mktemp -d)
+  : > "$scratch/subjects"
   count=0
   while read -r full subject; do
     case "$picked" in *" $full "*) continue ;; esac
@@ -595,46 +623,38 @@ cmd_notes() {
     if [ ${#lines[@]} = 0 ] || [ "$unknown" = 1 ]; then subjects+=("$subject"); fi
     for subject in ${subjects[@]+"${subjects[@]}"}; do
       count=$((count + 1))
-      case "$subject" in 'chore(release): bump versions'*) continue ;; esac
-      type=${subject%%[(:!]*}
-      case "$type" in
-        feat) feat+=("$subject") ;;
-        fix) fix+=("$subject") ;;
-        perf) perf+=("$subject") ;;
-        docs) docs+=("$subject") ;;
-        ci | chore | build | test | refactor | style) maint+=("$subject") ;;
-        *) other+=("$subject") ;;
-      esac
+      printf '%s\n' "$subject" >> "$scratch/subjects"
     done
   done < <(git log --cherry-pick --right-only --first-parent --no-merges --format='%H %s' "$since...$ref")
-  say "## SMG $tagname"
-  say ""
-  say "$count commits since $since on \`release/$release\` (the merged pull requests, by type):"
-  section() { # <title> <subjects...>
-    local title=$1; shift
-    [ $# -gt 0 ] || return 0
-    say ""
-    say "### $title"
-    say ""
-    printf -- '- %s\n' "$@"
-  }
-  section "Features" ${feat[@]+"${feat[@]}"}
-  section "Fixes" ${fix[@]+"${fix[@]}"}
-  section "Performance" ${perf[@]+"${perf[@]}"}
-  section "Documentation" ${docs[@]+"${docs[@]}"}
-  section "Maintenance" ${maint[@]+"${maint[@]}"}
-  section "Other" ${other[@]+"${other[@]}"}
-  say ""
-  if ! "$root/scripts/release_docker_notes.sh" "$tagname" 2>/dev/null; then
-    say "### Docker images"
-    say ""
-    say "(no engine images for $tagname yet: run \`scripts/release_docker_notes.sh $tagname\` once they are published)"
+  # The subjects seed the template (scripts/release/NOTES-TEMPLATE.md) through notes.py, with the rest of the draft's
+  # inputs: who wrote the commits; the crates and packages at both ends (the publish plan's list; the previous tag's
+  # may predate a component and read shorter, or not at all); the engine-image table, the chart and the toolchain at
+  # the release; the published images. The pull request bodies are read through gh and kept under $NOTES_CACHE.
+  contributors=$(git shortlog -s --no-merges "$since..$ref" | grep -c . || true)
+  component_list "$ref" "$scratch/components-ref" \
+    || { note "notes: Packages names the gateway alone"; : > "$scratch/components-ref"; }
+  component_list "$since" "$scratch/components-since" 2>/dev/null || : > "$scratch/components-since"
+  git show "$ref:.github/workflows/release-engine-docker.yml" > "$scratch/engine-workflow" 2>/dev/null || : > "$scratch/engine-workflow"
+  chart=$(git show "$ref:deploy/helm/smg/Chart.yaml" 2>/dev/null | sed -n 's/^version: *//p' | head -n 1)
+  rust=$(git show "$ref:Cargo.toml" 2>/dev/null | sed -n 's/^rust-version *= *"\(.*\)"/\1/p' | head -n 1)
+  if ! "$root/scripts/release_docker_notes.sh" "$tagname" > "$scratch/docker" 2>/dev/null; then
+    printf '### Docker images\n\n(no engine images for %s yet: run %s once they are published)\n' \
+      "$tagname" "\`scripts/release_docker_notes.sh $tagname\`" > "$scratch/docker"
   fi
-  say ""
+  slug=$(repo_slug)
+  "$PYTHON" "$root/scripts/release/notes.py" render --version "$version" --since "$since" --release "$release" \
+    --template "$root/scripts/release/NOTES-TEMPLATE.md" --subjects "$scratch/subjects" --count "$count" \
+    --contributors "$contributors" --components-since "$scratch/components-since" --components-ref "$scratch/components-ref" \
+    --engine-workflow "$scratch/engine-workflow" --docker "$scratch/docker" --chart "$chart" --rust-version "$rust" \
+    --repo "$slug" --gh "$GH" --cache "$NOTES_CACHE" --compare-url "${slug:+https://github.com/$slug/compare/$since...$compare}" \
+    ${refresh[@]+"${refresh[@]}"} \
+    || die "notes: the draft was not rendered (the cause is above); its inputs stay under $scratch"
+  rm -rf -- "$scratch"
+  note "a draft: replace every <!-- AUTHOR: --> comment, then 'release.sh notes --check <file>' before the GitHub release:"
   if is_final "$version"; then
-    note "the GitHub release: gh release create $tagname --verify-tag --title 'SMG $tagname' --notes-file <this output>"
+    note "  gh release create $tagname --verify-tag --title '$tagname' --notes-file <file>"
   else
-    note "the GitHub release: gh release create $tagname --verify-tag --prerelease --title 'SMG $tagname' --notes-file <this output>"
+    note "  gh release create $tagname --verify-tag --prerelease --title '$tagname' --notes-file <file>"
   fi
 }
 
@@ -1349,13 +1369,31 @@ ship_tag() { # the tag at the branch head, pushed; a tag that exists elsewhere s
 }
 
 notes_unfilled() { # <file>: what keeps a notes file from publication, one line each (nothing when it is ready): an empty file, a
-  # heading that is not the release's; the notes template's unfilled placeholders join here once the notes render it
+  # first line that is not the template's for this release, a placeholder the template's check still finds (a fresh render
+  # carries the author's, so the ship stops here until the notes are written; the check's lines go to stderr for them)
+  local first left
   [ -s "$1" ] || { say "the file is empty"; return 0; }
-  head -n 1 "$1" | grep -qx "## SMG $ship_tag" || say "the first line is not '## SMG $ship_tag'"
+  first=$(head -n 1 "$root/scripts/release/NOTES-TEMPLATE.md" | sed "s/{{version}}/$ship_version/g")
+  head -n 1 "$1" | grep -qxF -- "$first" || say "the first line is not '$first'"
+  if ! left=$("$PYTHON" "$root/scripts/release/notes.py" check "$1" 2>&1 >/dev/null); then
+    printf '%s\n' "$left" >&2
+    left=${left%%$'\n'*} left=${left#notes: }
+    say "${left#"$1" } (listed above)"
+  fi
 }
 
-ship_notes() { # the notes file the GitHub release carries: NOTES when given, else rendered once (an existing render is kept: it may be edited)
-  local unfilled rendered
+release_existing() { # <tag>: "url (prerelease: bool)" of the GitHub release on <tag>; fails when there is none
+  "$GH" release view "$1" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null
+}
+
+ship_notes() { # the notes file the GitHub release carries: nothing once the release exists (its notes are out); else NOTES
+  # when given, else rendered once (an existing render is kept: it may be edited)
+  local unfilled rendered existing
+  if existing=$(release_existing "$ship_tag"); then
+    ship_say "notes: the GitHub release $ship_tag exists ($existing): its notes are out, nothing is read or rendered"
+    ship_notes_file=published # ship_release reads the release itself and never opens this
+    return 0
+  fi
   rendered=$(git rev-parse --git-path release) # under the git directory, out of the tree; relative to the root unless elsewhere
   case $rendered in /*) ;; *) rendered=$root/$rendered ;; esac
   ship_notes_file=${NOTES:-$rendered/notes-$ship_tag.md}
@@ -1375,19 +1413,19 @@ ship_notes() { # the notes file the GitHub release carries: NOTES when given, el
     ship_say "notes: rendered into $ship_notes_file ($(grep -c . "$ship_notes_file") lines)"
   fi
   unfilled=$(notes_unfilled "$ship_notes_file")
-  [ -z "$unfilled" ] || die "the notes at $ship_notes_file are not ready for publication: $(tr '\n' ';' <<< "$unfilled") (fill them, then rerun the ship: --from notes)"
+  [ -z "$unfilled" ] || die "the notes at $ship_notes_file are not ready for publication: ${unfilled//$'\n'/; } (fill them, then rerun the ship: --from notes)"
 }
 
 ship_release() { # the GitHub release on the tag: a prerelease for a candidate, latest for a final; one that exists is kept
   local flags=() existing url
   [ -n "$ship_notes_file" ] || ship_notes # --from release: the notes step ran in an earlier run, or runs now
   if is_final "$ship_version"; then flags=(--latest); else flags=(--prerelease); fi
-  if existing=$("$GH" release view "$ship_tag" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null); then
+  if existing=$(release_existing "$ship_tag"); then
     ship_say "release: done, $existing"
     return 0
   fi
-  if [ "$ship_dry" -eq 1 ]; then ship_would "create the GitHub release: gh release create $ship_tag --verify-tag ${flags[*]} --title 'SMG $ship_tag' --notes-file $ship_notes_file"; return 0; fi
-  url=$("$GH" release create "$ship_tag" --verify-tag "${flags[@]}" --title "SMG $ship_tag" --notes-file "$ship_notes_file") \
+  if [ "$ship_dry" -eq 1 ]; then ship_would "create the GitHub release: gh release create $ship_tag --verify-tag ${flags[*]} --title '$ship_tag' --notes-file $ship_notes_file"; return 0; fi
+  url=$("$GH" release create "$ship_tag" --verify-tag "${flags[@]}" --title "$ship_tag" --notes-file "$ship_notes_file") \
     || die "gh release create $ship_tag failed (its message is above): rerun the ship once the cause is fixed (--from release)"
   ship_say "release: created $url (${flags[*]#--})"
 }
