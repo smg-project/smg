@@ -3,8 +3,10 @@
 //! off the LLM API's arguments and tokenizer) and from the handshake.
 
 use smg_grpc_client::trtllm_proto as trt;
+use tonic::Status;
 
 use super::{State, HEALTHY};
+use crate::load_report::rank_entries;
 
 /// `HealthCheck`: `OK` only with the engine link up and no drain announced,
 /// else the shared message (the Python servicer's status is its message too).
@@ -117,4 +119,57 @@ pub(super) fn server_info(state: &State) -> trt::GetServerInfoResponse {
 
 fn world_of(tensor: i32, pipeline: i32, context: i32) -> i32 {
     tensor.saturating_mul(pipeline).saturating_mul(context)
+}
+
+/// `GetLoads`: the per-rank load from the shims' load tails (the figures the
+/// pushed record carries) in the gRPC response shape: every connected rank,
+/// zero-filled before its first tail, with the window and the KV capacity
+/// the servicer knows; the rank the request names alone when it names one.
+/// No queued token-work, rate or capacity yet: the shim's wire carries no
+/// timings for them.
+pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoadsResponse, Status> {
+    let client = state.shared.engine()?;
+    let max_running_requests = state
+        .shared
+        .running_window(state.model.max_running_requests);
+    let max_total_num_tokens = state.shared.kv_capacity_tokens();
+    let ranks = state.shared.rank_count(state.model.data_parallel_size);
+    let entry = |dp_rank: i32, running: i32, waiting: i32, used_tokens: i32, usage: f64| {
+        trt::SchedulerLoad {
+            dp_rank,
+            num_running_reqs: running,
+            num_waiting_reqs: waiting,
+            num_total_reqs: running.saturating_add(waiting),
+            num_used_tokens: used_tokens,
+            max_total_num_tokens,
+            token_usage: usage,
+            utilization: usage,
+            max_running_requests,
+            ..Default::default()
+        }
+    };
+    let (loads, _) = rank_entries(
+        client.get_loads().loads,
+        max_total_num_tokens,
+        ranks,
+        dp_rank,
+        |_, figures| {
+            entry(
+                figures.dp_rank,
+                figures.running,
+                figures.waiting,
+                figures.used_tokens,
+                figures.usage,
+            )
+        },
+        |dp_rank| entry(dp_rank, 0, 0, 0, 0.0),
+    );
+    Ok(trt::GetLoadsResponse {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        version: state
+            .shared
+            .engine_version(&state.model.trtllm_version, "trtllm-"),
+        dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+        loads,
+    })
 }
