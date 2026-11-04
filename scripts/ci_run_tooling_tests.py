@@ -1,4 +1,5 @@
-"""Run bounded CPU tooling suites available at this PR's stack layer."""
+"""Run the bounded CPU tooling suites: the baseline, then the suite of each component
+and regression pair, every one of which the tree must hold."""
 
 import subprocess
 import sys
@@ -16,8 +17,9 @@ COMPONENTS = (
     ("e2e_test/infra/mcp_readiness.py", "e2e_test/infra/test_mcp_readiness.py"),
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
 )
-# These scripts predate their regression suites. Earlier stack layers must not
-# claim to have run the later suites, or be required to contain later fixes.
+# Regression suites of scripts that predate them. A pair is named in the change
+# that brings the suite, and both paths must exist: a suite the tree lacks is an
+# error, not a notice, so a deleted or renamed suite is noticed at once.
 REGRESSIONS = (
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
@@ -30,20 +32,14 @@ REGRESSIONS = (
 
 def test_paths(root):
     tests = list(BASELINE)
-    for source, suite in COMPONENTS + REGRESSIONS:
-        available = (root / suite).is_file()
-        if (source, suite) in COMPONENTS and (root / source).is_file():
-            available = True
-        if available:
-            for path in (source, suite):
-                if not (root / path).is_file():
-                    raise ValueError(f"CPU test component is incomplete: {path}")
-            tests.append(suite)
-        else:
-            print(f"Suite not present at this stack layer (not tested): {suite}", flush=True)
     for path in tests:
         if not (root / path).is_file():
             raise ValueError(f"Required CPU suite is missing: {path}")
+    for source, suite in COMPONENTS + REGRESSIONS:
+        for path in (source, suite):
+            if not (root / path).is_file():
+                raise ValueError(f"CPU test component is incomplete: {path}")
+        tests.append(suite)
     return tests
 
 

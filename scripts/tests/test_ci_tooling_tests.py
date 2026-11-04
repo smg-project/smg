@@ -1,6 +1,7 @@
-"""A stack layer cannot silently drop a baseline or installed component's tests, the
-runner names no suite the tree lacks, and the main workflow's tooling step runs the
-whole test directory rather than a list kept by hand."""
+"""The tooling runner runs the baseline and every component's suite, errors on a
+source or suite the tree lacks instead of noting it, and names no path this tree
+lacks; the main workflow's tooling step runs the whole test directory rather than a
+list kept by hand."""
 
 import importlib.util
 from pathlib import Path
@@ -24,15 +25,15 @@ def create(root, *paths):
         file.touch()
 
 
-def test_early_stack_always_runs_baseline_and_reports_absent_suites(tmp_path, capsys):
+def test_a_pair_the_tree_lacks_is_an_error_not_a_notice(tmp_path, capsys):
     create(tmp_path, *RUNNER.BASELINE)
-    assert RUNNER.test_paths(tmp_path) == list(RUNNER.BASELINE)
-    output = capsys.readouterr().out
-    for _, suite in RUNNER.COMPONENTS + RUNNER.REGRESSIONS:
-        assert f"not tested): {suite}" in output
+    source, _ = (RUNNER.COMPONENTS + RUNNER.REGRESSIONS)[0]
+    with pytest.raises(ValueError, match=f"CPU test component is incomplete: {source}"):
+        RUNNER.test_paths(tmp_path)
+    assert "not tested" not in capsys.readouterr().out
 
 
-def test_late_stack_includes_every_available_component(tmp_path):
+def test_every_component_runs_when_the_tree_holds_them_all(tmp_path):
     create(tmp_path, *RUNNER.BASELINE)
     for source, suite in RUNNER.COMPONENTS + RUNNER.REGRESSIONS:
         create(tmp_path, source, suite)
@@ -63,8 +64,8 @@ def test_suite_without_its_source_is_an_error(tmp_path, source, suite):
 
 
 def test_every_path_the_runner_names_exists_on_the_tree():
-    """A pair whose suite is gone prints "not present" on every run and is never
-    missed; the tables name files of this tree only."""
+    """The tables name files of this tree only; the runner stops at the first
+    missing path, this names them all."""
     named = set(RUNNER.BASELINE)
     for source, suite in RUNNER.COMPONENTS + RUNNER.REGRESSIONS:
         named.update((source, suite))
@@ -81,6 +82,8 @@ def test_the_tooling_step_runs_the_whole_directory_and_every_shell_test():
         for step in jobs["python-unit-tests"]["steps"]
         if step.get("name") == "Run CI tooling unit tests"
     )
-    assert "pytest -q -rs scripts/tests\n" in step["run"], step["run"]
+    # `python -m pytest`: the console script leaves the repository root off sys.path,
+    # and the tests that import `scripts.<module>` then fail to collect.
+    assert "python -m pytest -q -rs scripts/tests\n" in step["run"], step["run"]
     assert 'for test in scripts/tests/test_*.sh; do bash "$test"; done' in step["run"], step["run"]
     assert sorted((ROOT / "scripts" / "tests").glob("test_*.sh")), "the glob has shell tests to run"

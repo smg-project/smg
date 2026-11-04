@@ -269,9 +269,11 @@ jobs:
       # test that needs a tool this runner lacks skips itself and says so under -rs),
       # the shell tests one by one. A new test file runs from its first commit instead
       # of waiting for a name here; scripts/tests/test_ci_tooling_tests.py pins this step.
+      # `python -m pytest`, not the console script: it puts the repository root on
+      # sys.path, which the tests that import `scripts.<module>` need to collect.
       - name: Run CI tooling unit tests
         run: |
-          pytest -q -rs scripts/tests
+          python -m pytest -q -rs scripts/tests
           for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
