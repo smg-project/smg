@@ -82,7 +82,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -271,6 +271,16 @@ pub struct CacheAwarePolicy {
     /// cloned inner handle stays canonical and walking it never holds
     /// an outer-shard guard.
     placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+    /// The pool this policy routes, as its cache metrics label it
+    /// (`worker_type`): set once by the registry when it installs the policy
+    /// for a PD role, "regular" until then. Shared with the eviction task,
+    /// which starts before the role is known.
+    metrics_role: Arc<OnceLock<&'static str>>,
+}
+
+/// The `worker_type` label of a policy's cache metrics, from its role cell.
+fn metrics_role_of(role: &OnceLock<&'static str>) -> &'static str {
+    role.get().copied().unwrap_or("regular")
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -368,20 +378,28 @@ impl CacheAwarePolicy {
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
         let placement_index = Arc::new(DashMap::<String, Arc<PlacementMap>>::new());
+        let metrics_role = Arc::new(OnceLock::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.cache_index == CacheIndexKind::Hash {
             (config.eviction_interval_secs > 0).then(|| {
                 let placement_clone = Arc::clone(&placement_index);
+                let role = Arc::clone(&metrics_role);
                 let ttl = Duration::from_secs(config.cache_ttl_secs);
                 PeriodicTask::spawn(config.eviction_interval_secs, "PlacementSweep", move || {
-                    Self::sweep_placement_index(&placement_clone, ttl, Instant::now());
+                    Self::sweep_placement_index(
+                        &placement_clone,
+                        ttl,
+                        Instant::now(),
+                        metrics_role_of(&role),
+                    );
                 })
             })
         } else if config.eviction_interval_secs > 0 {
             let string_trees_clone = Arc::clone(&string_trees);
             let token_trees_clone = Arc::clone(&token_trees);
             let hash_index_clone = Arc::clone(&hash_index);
+            let role = Arc::clone(&metrics_role);
             let max_tree_size = config.max_tree_size;
 
             Some(PeriodicTask::spawn(
@@ -394,6 +412,15 @@ impl CacheAwarePolicy {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+                        // The oldest stamp still held, as the hash mode's sweep
+                        // reports its oldest live placement: one meaning of
+                        // retention across the three indexes.
+                        Metrics::set_cache_tree_retention_seconds(
+                            model_id,
+                            "string",
+                            metrics_role_of(&role),
+                            tree.oldest_stamp_age_secs().unwrap_or(0),
+                        );
 
                         let (chars, tenants) = string_tree_totals(tree);
                         total_chars += chars;
@@ -411,6 +438,15 @@ impl CacheAwarePolicy {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+                        // The oldest stamp still held, as the hash mode's sweep
+                        // reports its oldest live placement: one meaning of
+                        // retention across the three indexes.
+                        Metrics::set_cache_tree_retention_seconds(
+                            model_id,
+                            "token",
+                            metrics_role_of(&role),
+                            tree.oldest_stamp_age_secs().unwrap_or(0),
+                        );
 
                         let (tokens, tenants) = token_tree_totals(tree);
                         total_tokens += tokens;
@@ -504,7 +540,15 @@ impl CacheAwarePolicy {
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
             placement_index,
+            metrics_role,
         }
+    }
+
+    /// Label this policy's cache metrics with the pool it routes
+    /// (`worker_type`: "prefill", "decode", "encode"). Set once, when the
+    /// registry installs the policy for a role; later calls are ignored.
+    pub fn set_metrics_role(&self, role: &'static str) {
+        let _ = self.metrics_role.set(role);
     }
 
     /// Enable request-hot-path `hash_index` population without attaching
@@ -3185,14 +3229,14 @@ impl CacheAwarePolicy {
                 boundary,
                 hash_token_head(info.cache_namespace, &tokens[..boundary]),
             );
-            let holder_candidates = self.live_holder_candidates(&url_to_idx, model_id, key, now);
+            let holder_candidates = self.live_holders(&url_to_idx, model_id, key, now);
             if holder_candidates.is_empty() {
                 continue;
             }
             // A holder of this boundary holds `boundary` tokens of the prompt.
             let holders: Vec<(usize, f64)> = holder_candidates
                 .iter()
-                .map(|&idx| (idx, boundary as f64))
+                .map(|&(idx, _)| (idx, boundary as f64))
                 .collect();
             let selected = self.select_final_from_affinity(
                 workers,
@@ -3201,11 +3245,25 @@ impl CacheAwarePolicy {
                 avg_load,
                 info,
             )?;
-            let branch = if holder_candidates.contains(&selected) {
+            // Only a request that lands on a holder reuses the head, as old as
+            // that holder's last dispatch of it; a spill (or a declined
+            // selection, returned above) reuses nothing.
+            let reuse_age = holder_candidates
+                .iter()
+                .find(|&&(idx, _)| idx == selected)
+                .map(|&(_, age)| age);
+            let branch = if reuse_age.is_some() {
                 "hash_hit"
             } else {
                 "hash_spill"
             };
+            if let Some(age) = reuse_age {
+                Metrics::record_cache_tree_reuse_age(
+                    "hash",
+                    metrics_role_of(&self.metrics_role),
+                    age.as_secs(),
+                );
+            }
             self.record_placement(
                 model_id,
                 info.cache_namespace,
@@ -3279,6 +3337,7 @@ impl CacheAwarePolicy {
     /// Every healthy worker whose URL is a live holder of `key`.
     /// Expired holders are pruned in place (lazy expiry on read). Guarded
     /// work is O(holder cap): resolution goes through `url_to_idx`.
+    #[cfg(test)]
     fn live_holder_candidates(
         &self,
         url_to_idx: &HashMap<&str, Vec<usize>>,
@@ -3286,6 +3345,21 @@ impl CacheAwarePolicy {
         key: (usize, u64),
         now: Instant,
     ) -> Vec<usize> {
+        self.live_holders(url_to_idx, model_id, key, now)
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// [`Self::live_holder_candidates`], each with how long ago its holder
+    /// last dispatched the head: the reuse age of a hit on that worker.
+    fn live_holders(
+        &self,
+        url_to_idx: &HashMap<&str, Vec<usize>>,
+        model_id: &str,
+        key: (usize, u64),
+        now: Instant,
+    ) -> Vec<(usize, Duration)> {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
         let Some(model) = self
             .placement_index
@@ -3298,12 +3372,14 @@ impl CacheAwarePolicy {
             return Vec::new();
         };
         holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
-        holders
-            .iter()
-            .filter_map(|h| url_to_idx.get(h.worker_url.as_str()))
-            .flatten()
-            .copied()
-            .collect()
+        let mut candidates = Vec::new();
+        for holder in holders.iter() {
+            if let Some(indices) = url_to_idx.get(holder.worker_url.as_str()) {
+                let age = now.duration_since(holder.last_touch);
+                candidates.extend(indices.iter().map(|&idx| (idx, age)));
+            }
+        }
+        candidates
     }
 
     /// Record/touch `worker_url` at every applicable boundary of this
@@ -3354,11 +3430,13 @@ impl CacheAwarePolicy {
     }
 
     /// Drop expired holders and empty keys; refresh the per-model entry
-    /// gauge. Returns total live entries across models.
+    /// gauge and the retention (the age of the oldest live holder, at most
+    /// the TTL). Returns total live entries across models.
     fn sweep_placement_index(
         index: &DashMap<String, Arc<PlacementMap>>,
         ttl: Duration,
         now: Instant,
+        role: &'static str,
     ) -> usize {
         let models: Vec<(String, Arc<PlacementMap>)> = index
             .iter()
@@ -3366,13 +3444,23 @@ impl CacheAwarePolicy {
             .collect();
         let mut total = 0usize;
         for (model_id, placements) in models {
+            let mut oldest: Option<Duration> = None;
             placements.retain(|_, holders| {
                 holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
+                for holder in holders.iter() {
+                    oldest = oldest.max(Some(now.duration_since(holder.last_touch)));
+                }
                 !holders.is_empty()
             });
             let entries = placements.len();
             total += entries;
             Metrics::set_cache_placement_entries(&model_id, entries);
+            Metrics::set_cache_tree_retention_seconds(
+                &model_id,
+                "hash",
+                role,
+                oldest.map_or(0, |age| age.as_secs()),
+            );
         }
         total
     }
@@ -3439,6 +3527,13 @@ impl CacheAwarePolicy {
             &result.matched_tenants,
             model_id,
         );
+        self.record_tree_reuse_age(
+            "token",
+            result.matched_token_count.saturating_sub(marker_len),
+            result.input_token_count.saturating_sub(marker_len),
+            result.reuse_age_secs,
+            selected_idx.is_some(),
+        );
 
         let idx = selected_idx?;
         if self.should_populate_hash_index() {
@@ -3460,6 +3555,32 @@ impl CacheAwarePolicy {
             );
         }
         Some(idx)
+    }
+
+    /// Record a tree decision's reuse age when the decision reuses the
+    /// prefix: its match rate (namespace marker excluded) is over
+    /// `cache_threshold`, the rate at which the selection holds a request to
+    /// the prefix's holders, and the selected worker is one of those holders.
+    /// The tree reads the age from the selected worker's own stamp, and has
+    /// none for a worker without the prefix. A shorter match (a few chars of a
+    /// common opening in the string tree), a spill to a worker without the
+    /// prefix, or a declined selection (whose result still carries the
+    /// resolved holder's age) says nothing about how far back the cache
+    /// reaches.
+    fn record_tree_reuse_age(
+        &self,
+        tree: &'static str,
+        matched: usize,
+        input: usize,
+        reuse_age_secs: Option<u64>,
+        selected: bool,
+    ) {
+        let (Some(age), true) = (reuse_age_secs, selected) else {
+            return;
+        };
+        if input > 0 && matched as f32 / input as f32 > self.config.cache_threshold {
+            Metrics::record_cache_tree_reuse_age(tree, metrics_role_of(&self.metrics_role), age);
+        }
     }
 
     /// Select worker using string-based tree (HTTP path)
@@ -3519,6 +3640,13 @@ impl CacheAwarePolicy {
             result.input_char_count.saturating_sub(marker_len),
             &result.matched_tenants,
             model_id,
+        );
+        self.record_tree_reuse_age(
+            "string",
+            result.matched_char_count.saturating_sub(marker_len),
+            result.input_char_count.saturating_sub(marker_len),
+            result.reuse_age_secs,
+            selected_idx.is_some(),
         );
 
         let idx = selected_idx?;

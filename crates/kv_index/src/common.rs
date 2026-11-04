@@ -1,10 +1,18 @@
 //! Common types shared between radix tree implementations.
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Once,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rustc_hash::FxBuildHasher;
+use tracing::warn;
 
 /// Interned tenant identifier for efficient comparison and storage.
 ///
@@ -62,3 +70,92 @@ pub trait MatchResult {
 /// pressure selection to discriminate, small enough to bound the per-match
 /// allocation.
 pub const MATCHED_TENANTS_CAP: usize = 8;
+
+/// Origin of the seconds an access stamp carries: the process start, with the
+/// wall-clock seconds since [`STAMP_ORIGIN_UNIX_SECS`] at that moment. Seconds
+/// then advance by the monotonic clock, so a stamp never runs backwards with
+/// the wall clock, yet reads about the same in every process.
+static STAMP_EPOCH: Lazy<(Instant, u64)> = Lazy::new(|| {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    (
+        Instant::now(),
+        unix_secs.saturating_sub(STAMP_ORIGIN_UNIX_SECS),
+    )
+});
+
+/// 2025-01-01T00:00:00Z. Counting from here keeps the seconds below 2^31 (a
+/// shifted stamp below `i64::MAX`, as eviction's priority cast needs) until
+/// 2093.
+const STAMP_ORIGIN_UNIX_SECS: u64 = 1_735_689_600;
+
+/// The clock's current seconds, counted from 1: a stamp whose seconds are 0
+/// (the root's) carries no time.
+fn clock_seconds() -> u64 {
+    let (started, offset) = *STAMP_EPOCH;
+    offset + started.elapsed().as_secs() + 1
+}
+
+/// [`clock_seconds`] as of the stamp clock's last tick; 0 until the ticker
+/// thread first publishes (and for good if it cannot start). A stamp reads
+/// this one atomic instead of the clock, which on the request path cost
+/// about 8% of a match.
+static STAMP_SECONDS: AtomicU64 = AtomicU64::new(0);
+static STAMP_CLOCK: Once = Once::new();
+
+/// How far [`STAMP_SECONDS`] may lag the clock.
+const STAMP_TICK: Duration = Duration::from_millis(250);
+
+/// Seconds since [`STAMP_ORIGIN_UNIX_SECS`], counted from 1, to within a
+/// [`STAMP_TICK`]: the clock the access stamps carry. Inline, as both trees
+/// call it on every stamp from other modules: the hot path is the one load.
+/// Public for a caller that needs whole seconds on the request path on the
+/// stamps' own boundaries (the gateway's reuse-age peak).
+#[inline]
+pub fn stamp_seconds() -> u64 {
+    match STAMP_SECONDS.load(Ordering::Relaxed) {
+        0 => start_stamp_clock(),
+        secs => secs,
+    }
+}
+
+/// The path while [`STAMP_SECONDS`] is 0: start the ticker thread once, and
+/// read the clock itself until the ticker has published (or for good, if the
+/// thread could not start, so ages keep advancing either way).
+#[cold]
+#[inline(never)]
+fn start_stamp_clock() -> u64 {
+    STAMP_CLOCK.call_once(|| {
+        let ticker = thread::Builder::new()
+            .name("kv-index-stamp-clock".into())
+            .spawn(|| loop {
+                STAMP_SECONDS.store(clock_seconds(), Ordering::Relaxed);
+                thread::sleep(STAMP_TICK);
+            });
+        if let Err(err) = ticker {
+            warn!(%err, "stamp clock thread failed to start; access stamps read the clock instead");
+        }
+    });
+    match STAMP_SECONDS.load(Ordering::Relaxed) {
+        0 => clock_seconds(),
+        secs => secs,
+    }
+}
+
+/// An access stamp: the seconds in the high 32 bits, `sequence`'s low 32
+/// bits below. Stamps order by second, then by sequence within it, so
+/// eviction compares them as it compared bare sequence values; the seconds
+/// give a stamp's age.
+#[inline]
+pub(super) fn compose_stamp(sequence: u64) -> u64 {
+    (stamp_seconds() << 32) | (sequence & 0xFFFF_FFFF)
+}
+
+/// Seconds since `stamp` was taken; `None` for a stamp that carries no time
+/// (0, or an intermediate tenant attachment no access has stamped).
+#[inline]
+pub(super) fn stamp_age_secs(stamp: u64) -> Option<u64> {
+    let secs = stamp >> 32;
+    (secs != 0).then(|| stamp_seconds().saturating_sub(secs))
+}

@@ -45,7 +45,7 @@ fn overlap_affinity_group(
     CacheAwarePolicy::affinity_score_group(&candidates, tuning.selection_temperature)
 }
 use crate::{
-    observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
+    observability::metrics::{CACHE_AWARE_MATCH_RATIO_BUCKETS, CACHE_TREE_REUSE_AGE_BUCKETS},
     worker::{
         runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerBlocks,
         WorkerType,
@@ -1176,6 +1176,117 @@ fn token_tree_selection_records_branch_and_match_ratio_metrics() {
         "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 2",
         "smg_cache_aware_match_ratio_bucket{le=\"1\"} 3",
         "smg_cache_aware_match_ratio_count 3",
+    ] {
+        assert!(
+            rendered.lines().any(|l| l == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+}
+
+/// A tree decision that reuses a prefix records its reuse age; one that
+/// matches nothing records none. Seeding and the routes run in the same
+/// second or the next, so the age lands in `le="1"`.
+#[test]
+fn token_tree_selection_records_reuse_age_on_a_match() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let tokens: Vec<u32> = (0..32).collect();
+    seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+    let novel: Vec<u32> = (1000..1064).collect();
+
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
+            CACHE_TREE_REUSE_AGE_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        route_tokens(&policy, &workers, &tokens);
+        route_tokens(&policy, &workers, &novel);
+    });
+    let rendered = handle.render();
+
+    for series in [
+        "smg_cache_tree_reuse_age_seconds_bucket{tree=\"token\",worker_type=\"regular\",le=\"1\"} 1",
+        "smg_cache_tree_reuse_age_seconds_count{tree=\"token\",worker_type=\"regular\"} 1",
+    ] {
+        assert!(
+            rendered.lines().any(|l| l == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+}
+
+/// A policy installed for a PD role labels its reuse age with that role, so
+/// a PD router's prefill and decode policies report as separate series.
+#[test]
+fn role_policy_labels_reuse_age_with_its_worker_type() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    policy.set_metrics_role("prefill");
+    policy.set_metrics_role("decode"); // set once: ignored
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let prompt = "You are a helpful assistant. User: hello there";
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        route_text(&policy, &workers, prompt);
+        route_text(&policy, &workers, prompt);
+    });
+    let rendered = handle.render();
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.starts_with("smg_cache_tree_reuse_age_seconds")
+                && l.contains("worker_type=\"prefill\"")),
+        "no prefill series; rendered:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("worker_type=\"decode\""),
+        "the role is set once; rendered:\n{rendered}"
+    );
+}
+
+/// The string path records the reuse age of a request that reuses the
+/// prefix an earlier one ended on, by tree; a novel prompt, and one sharing
+/// less than the cache threshold of its text, record none.
+#[test]
+fn text_selection_records_reuse_age_on_a_match() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let prompt = "You are a helpful assistant. User: hello there";
+
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
+            CACHE_TREE_REUSE_AGE_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        route_text(&policy, &workers, prompt);
+        route_text(&policy, &workers, prompt);
+        route_text(&policy, &workers, "zzz entirely novel");
+        // Shares the prompt's opening words only, under the cache threshold:
+        // not a reuse of the prefix.
+        route_text(
+            &policy,
+            &workers,
+            "You are a different kind of request, with a long body of its own that \
+             shares nothing past the first few words of the cached prompt at all",
+        );
+    });
+    let rendered = handle.render();
+
+    for series in [
+        "smg_cache_tree_reuse_age_seconds_bucket{tree=\"string\",worker_type=\"regular\",le=\"1\"} 1",
+        "smg_cache_tree_reuse_age_seconds_count{tree=\"string\",worker_type=\"regular\"} 1",
     ] {
         assert!(
             rendered.lines().any(|l| l == series),
@@ -3503,6 +3614,56 @@ fn hash_miss_uses_expected_wait_and_records_final_holder() {
     assert_eq!(holders[0].worker_url, workers[1].url());
 }
 
+/// A spill reuses nothing: no reuse age is recorded when the request lands
+/// on a worker that does not hold the head (hash mode) or the matched prefix
+/// (tree mode, its holder unhealthy).
+#[test]
+fn spill_to_a_non_holder_records_no_reuse_age() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        // Hash mode: the holder is loaded past the gate, the request spills.
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..16).collect();
+        policy.record_placement(
+            model,
+            None,
+            &tokens,
+            &[16],
+            workers[0].url(),
+            Instant::now(),
+        );
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
+        assert_ne!(
+            route_tokens(&policy, &workers, &tokens),
+            0,
+            "the request spills"
+        );
+
+        // Tree mode: the only holder of the prefix is unhealthy.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        workers[0].set_status(WorkerStatus::NotReady);
+        assert_eq!(
+            route_tokens(&policy, &workers, &tokens),
+            1,
+            "the request spills"
+        );
+    });
+    let rendered = handle.render();
+    assert!(
+        !rendered.contains("smg_cache_tree_reuse_age_seconds"),
+        "a spill recorded a reuse age; rendered:\n{rendered}"
+    );
+}
+
 #[test]
 fn hash_spill_uses_expected_wait_and_records_only_final_holder() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
@@ -3580,6 +3741,58 @@ fn hash_multiple_holders_use_expected_wait_only_within_affinity_set() {
     let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1, "non-holder w3 must not break cache affinity");
     assert_only_final_worker_credited(&policy, &workers, 1, 16);
+}
+
+/// With two holders of a head, a hit records the age of the holder it lands
+/// on, not the newest holder's.
+#[test]
+fn hash_mode_hit_records_the_selected_holders_age() {
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let model = normalize_model_key(workers[0].model_id());
+    let tokens: Vec<u32> = (0..32).collect();
+    let now = Instant::now();
+    let ago = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+    policy.record_placement(model, None, &tokens, &[16], workers[0].url(), ago(30));
+    policy.record_placement(model, None, &tokens, &[16], workers[1].url(), ago(5));
+    // The newer holder is busier, so the hit lands on the older one.
+    workers[1].increment_load();
+
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_tree_reuse_age_seconds")),
+            CACHE_TREE_REUSE_AGE_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    let before = Instant::now();
+    let selected =
+        metrics::with_local_recorder(&recorder, || route_tokens(&policy, &workers, &tokens));
+    let after = Instant::now();
+    assert_eq!(selected, 0);
+    let rendered = handle.render();
+    let sum: f64 = rendered
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(
+                "smg_cache_tree_reuse_age_seconds_sum{tree=\"hash\",worker_type=\"regular\"} ",
+            )
+        })
+        .unwrap_or_else(|| panic!("no hash reuse age; rendered:\n{rendered}"))
+        .parse()
+        .unwrap();
+    // The routing reads its clock between `before` and `after`: w1's age then
+    // lies between the two readings of it, whatever the run's delay (w2's
+    // would lie 25 s below).
+    let (low, high) = (
+        before.duration_since(ago(30)).as_secs(),
+        after.duration_since(ago(30)).as_secs(),
+    );
+    assert!(
+        (low as f64..=high as f64).contains(&sum),
+        "{sum}: w1's age ({low}..={high} s), not w2's"
+    );
 }
 
 #[test]
@@ -3884,6 +4097,7 @@ fn sweep_placement_index_drops_expired_and_empty_keys() {
         &policy.placement_index,
         Duration::from_secs(180),
         t0 + Duration::from_secs(200),
+        "regular",
     );
     assert_eq!(live, 1);
     let placements = policy.placement_index.get("m").unwrap();
@@ -3954,7 +4168,12 @@ fn concurrent_record_and_sweep_keeps_live_placements() {
                     let base = t * 1000 + i * 16;
                     let tokens: Vec<u32> = (base..base + 16).collect();
                     policy.record_placement("m", None, &tokens, &[16], "http://w1:8000", now);
-                    CacheAwarePolicy::sweep_placement_index(&policy.placement_index, ttl, now);
+                    CacheAwarePolicy::sweep_placement_index(
+                        &policy.placement_index,
+                        ttl,
+                        now,
+                        "regular",
+                    );
                 }
             });
         }

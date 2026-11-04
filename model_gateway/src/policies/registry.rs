@@ -592,6 +592,15 @@ impl PolicyRegistry {
         }
     }
 
+    /// Label a cache-aware role policy's cache metrics with its pool, so the
+    /// prefill and decode policies of a PD router (each with its own index)
+    /// report apart rather than as one series.
+    fn label_cache_metrics(policy: &Arc<dyn LoadBalancingPolicy>, role: &'static str) {
+        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            cache_aware.set_metrics_role(role);
+        }
+    }
+
     /// Inject the mesh adapter into a policy if it's cache-aware.
     /// The setter also flips `populate_hash_index` to match adapter
     /// presence, so callers do not need to touch that flag directly.
@@ -865,6 +874,7 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        Self::label_cache_metrics(&policy, "prefill");
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup
@@ -890,6 +900,7 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        Self::label_cache_metrics(&policy, "decode");
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup
@@ -904,6 +915,7 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        Self::label_cache_metrics(&policy, "encode");
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup

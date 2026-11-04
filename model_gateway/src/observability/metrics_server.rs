@@ -19,6 +19,7 @@ async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoRespo
     super::metrics::record_tokenizer_cache_activity();
     super::metrics::record_detokenize_activity();
     super::metrics::record_tokenizer_encode_activity();
+    super::metrics::record_cache_tree_reuse_age_peak();
     let mut body = state.handle.render();
     super::worker_metrics::render_into(&mut body);
     (
