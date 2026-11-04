@@ -761,7 +761,11 @@ fn a_worker_registered_on_one_gateway_is_served_through_the_other() {
 /// not tombstone, gossips back to it from its peer: it tombstones that key,
 /// so the peer rebinds its import to the new id and the owner's later
 /// removal reaches it. Before, the peer kept the import under the old id for
-/// good, deaf to the owner's tombstones.
+/// good, deaf to the owner's tombstones. The test pins the registration-first
+/// ordering (the re-registration is awaited while the peer is still paused);
+/// the key-first ordering, where the start-up upsert claims the key under
+/// its id, is the adapter's unit test
+/// `a_key_back_before_the_new_life_registers_its_endpoint_is_claimed_under_its_id`.
 ///
 /// The peer is paused across the restart so its probes do not see the owner
 /// go: a probe that fails marks the owner Suspected, a second Down, and no
@@ -824,8 +828,11 @@ fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_pee
         );
         a
     };
-    resume(&b);
-
+    // The re-registration lands while the peer is still paused: A has no
+    // peer URL and a stopped B cannot dial it, so nothing gossips the old
+    // key to A before its start-up job has registered the endpoint again.
+    // That pins the registration-first ordering this test is about; the
+    // key-first one has its own test in the adapter's module.
     let mut second_id = None;
     assert!(
         wait_until(STARTUP_TIMEOUT, || {
@@ -842,6 +849,7 @@ fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_pee
         second_id, first_id,
         "a gateway back from a crash registers its worker under a fresh id"
     );
+    resume(&b);
 
     // The owner tombstones the key of its earlier life; the peer's import
     // follows the live key.
