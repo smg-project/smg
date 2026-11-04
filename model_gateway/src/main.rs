@@ -696,7 +696,8 @@ struct WorkerArgs {
     prefill_queue_size: Option<usize>,
 
     /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled);
-    /// in the gRPC router the wait is also held to --queue-timeout-secs, counted from admission
+    /// on the gRPC routers and the HTTP prefill-decode router the wait is also held to
+    /// --queue-timeout-secs, counted from admission
     #[arg(long, help_heading = "PD Disaggregation")]
     prefill_queue_timeout_secs: Option<u64>,
 

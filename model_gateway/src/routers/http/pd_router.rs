@@ -219,9 +219,9 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
-    /// The request's route meta, read for the acceptance stamp the queue
-    /// timeout is judged on; a route that carries none runs unbounded.
-    tenant_meta: Option<&'a TenantRequestMeta>,
+    /// The route's meta, read for the acceptance stamp the queue timeout is
+    /// judged on (every route carries it, charged or not).
+    route_meta: &'a TenantRequestMeta,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -602,12 +602,14 @@ impl PDRouter {
     }
 
     /// Every PD route: the routing derivatives and the request context from
-    /// the request, then the dual dispatch under the tenant's reservation
-    /// (`tenant_meta`: the routes that charge a tenant).
+    /// the request, then the dual dispatch under the tenant's reservation on
+    /// a `charged` route (the routes that charge a tenant); `tenant_meta` is
+    /// the route's meta, read for the queue timeout's stamp on every route.
     async fn route_pd<R: PdRoute + TenantCharge + Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+        tenant_meta: &TenantRequestMeta,
+        charged: bool,
         body: R,
         model_id: &str,
     ) -> Response {
@@ -632,10 +634,16 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
-            tenant_meta,
+            route_meta: tenant_meta,
         };
-        self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
-            .await
+        self.execute_dual_dispatch(
+            headers,
+            charged.then_some(tenant_meta),
+            body,
+            routing,
+            context,
+        )
+        .await
     }
 
     /// The dual dispatch of one request, retried as the model's retry config
@@ -813,7 +821,7 @@ impl PDRouter {
         // prefill admission wait, as the gRPC selection stage judges it.
         let accepted = self
             .queue_timeout
-            .acceptance_for_selection(context.tenant_meta);
+            .acceptance_for_selection(Some(context.route_meta));
         if let Some(refused) = accepted.and_then(|accepted| {
             self.queue_timeout
                 .refuse_if_expired(context.model_id, accepted)
@@ -2715,7 +2723,7 @@ impl RouterTrait for PDRouter {
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
+        self.route_pd(headers, tenant_meta, true, body, model_id)
             .await
     }
 
@@ -2728,7 +2736,8 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         self.route_pd(
             headers,
-            Some(tenant_meta),
+            tenant_meta,
+            true,
             super::chat_for_upstream(body),
             model_id,
         )
@@ -2745,7 +2754,7 @@ impl RouterTrait for PDRouter {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
+        self.route_pd(headers, tenant_meta, true, body, model_id)
             .await
     }
 
@@ -2890,7 +2899,7 @@ impl RouterTrait for PDRouter {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
+        self.route_pd(headers, tenant_meta, true, body, model_id)
             .await
     }
 
@@ -2901,18 +2910,19 @@ impl RouterTrait for PDRouter {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
+        self.route_pd(headers, tenant_meta, true, body, model_id)
             .await
     }
 
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, None, body, model_id).await
+        self.route_pd(headers, tenant_meta, false, body, model_id)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -5963,7 +5973,7 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
-            tenant_meta: None,
+            route_meta: &TenantRequestMeta::new(TenantKey::new("test-tenant")),
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -6056,7 +6066,7 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
-                    tenant_meta: None,
+                    route_meta: &TenantRequestMeta::new(TenantKey::new("test-tenant")),
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -6153,7 +6163,7 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
-                            tenant_meta: None,
+                            route_meta: &TenantRequestMeta::new(TenantKey::new("test-tenant")),
                         },
                         prefill,
                         decode,
@@ -6235,7 +6245,7 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
-                    tenant_meta: None,
+                    route_meta: &TenantRequestMeta::new(TenantKey::new("test-tenant")),
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;

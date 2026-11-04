@@ -134,8 +134,9 @@ struct StreamRelayMode {
 struct TypedAttempt<'a, T> {
     headers: Option<&'a HeaderMap>,
     /// The request's route meta, read for the acceptance stamp the queue
-    /// timeout is judged on; a route that carries none runs unbounded.
-    tenant_meta: Option<&'a TenantRequestMeta>,
+    /// timeout is judged on (every typed route carries it, whether or not
+    /// the route charges the tenant).
+    route_meta: &'a TenantRequestMeta,
     /// The parsed request and its routing derivatives, held until the
     /// lease's release point.
     lease: &'a RequestLease<T>,
@@ -446,15 +447,17 @@ impl Router {
     }
 
     /// Route a typed request to a worker serving `model_id`, retried as the
-    /// model's retry config allows. With `tenant_meta` (the routes that take a
-    /// tenant reservation) and the tenant rate limiter on, the request
-    /// reserves its estimate once, before any dispatch, and the one answer the
-    /// dispatch paths converge on resolves the reservation once
-    /// (`tenant_rate_limit::resolve`).
+    /// model's retry config allows. `tenant_meta` is the route's meta, read
+    /// for the queue timeout's acceptance stamp on every route; on a `charged`
+    /// route (the routes that take a tenant reservation) with the tenant rate
+    /// limiter on, the request also reserves its estimate once, before any
+    /// dispatch, and the one answer the dispatch paths converge on resolves
+    /// the reservation once (`tenant_rate_limit::resolve`).
     pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+        tenant_meta: &TenantRequestMeta,
+        charged: bool,
         typed_req: T,
         route: &'static str,
         model_id: &str,
@@ -477,7 +480,12 @@ impl Router {
             .unwrap_or(&self.retry_config);
 
         let (reservation, denial) = self
-            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
+            .reserve_tenant_estimate(
+                charged.then_some(tenant_meta),
+                &typed_req,
+                model_id,
+                routing.text.as_deref(),
+            )
             .await;
 
         // The lease owns the parsed request and its routing derivatives for
@@ -492,7 +500,7 @@ impl Router {
         let ledger = AttemptLedger::default();
         let attempt = TypedAttempt {
             headers,
-            tenant_meta,
+            route_meta: tenant_meta,
             lease: &lease,
             route,
             model_id,
@@ -701,7 +709,7 @@ impl Router {
         // selection stage judges it; the first attempt takes the stamp.
         if let Some(refused) = self
             .queue_timeout
-            .acceptance_for_selection(attempt.tenant_meta)
+            .acceptance_for_selection(Some(attempt.route_meta))
             .and_then(|accepted| {
                 self.queue_timeout
                     .refuse_if_expired(attempt.model_id, accepted)
@@ -2564,7 +2572,7 @@ impl RouterTrait for Router {
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, Some(tenant_meta), body, "/generate", model_id)
+        self.route_typed_request(headers, tenant_meta, true, body, "/generate", model_id)
             .await
     }
 
@@ -2577,7 +2585,8 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(
             headers,
-            Some(tenant_meta),
+            tenant_meta,
+            true,
             super::chat_for_upstream(body),
             "/v1/chat/completions",
             model_id,
@@ -2595,19 +2604,26 @@ impl RouterTrait for Router {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
+        self.route_typed_request(headers, tenant_meta, true, body, "/v1/messages", model_id)
             .await
     }
 
     async fn route_messages_count_tokens(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, None, body, "/v1/messages/count_tokens", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            tenant_meta,
+            false,
+            body,
+            "/v1/messages/count_tokens",
+            model_id,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -2619,7 +2635,8 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(
             headers,
-            Some(tenant_meta),
+            tenant_meta,
+            true,
             body,
             "/v1/completions",
             model_id,
@@ -2634,7 +2651,7 @@ impl RouterTrait for Router {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
+        self.route_typed_request(headers, tenant_meta, true, body, "/v1/responses", model_id)
             .await
     }
 
@@ -2655,7 +2672,7 @@ impl RouterTrait for Router {
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, tenant_meta, true, body, "/v1/embeddings", model_id)
             .await
     }
 
@@ -2666,25 +2683,25 @@ impl RouterTrait for Router {
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/classify", model_id)
+        self.route_typed_request(headers, tenant_meta, true, body, "/v1/classify", model_id)
             .await
     }
 
     async fn route_decisions(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: DecisionsRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, None, body, "/v1/decisions", model_id)
+        self.route_typed_request(headers, tenant_meta, false, body, "/v1/decisions", model_id)
             .await
     }
 
     async fn route_systemone(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: SystemOneRequest,
         model_id: &str,
     ) -> Response {
@@ -2699,7 +2716,7 @@ impl RouterTrait for Router {
         {
             return error::model_not_found(model_id);
         }
-        self.route_typed_request(headers, None, body, "/v1/systemone", model_id)
+        self.route_typed_request(headers, tenant_meta, false, body, "/v1/systemone", model_id)
             .await
     }
 
@@ -2724,14 +2741,14 @@ impl RouterTrait for Router {
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response_spec = RerankResponseSpec::from(&body);
         let response = self
-            .route_typed_request(headers, None, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, tenant_meta, false, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
@@ -3295,7 +3312,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 DropProbeRequest {
                     text: "unavailable".to_string(),
                     _probe: Arc::new(()),
@@ -3412,7 +3430,8 @@ mod tests {
         router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 DropProbeRequest {
                     text: text.to_string(),
                     _probe: Arc::new(()),
@@ -3539,7 +3558,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                Some(&held),
+                &held,
+                false,
                 DropProbeRequest {
                     text: "late".to_string(),
                     _probe: Arc::new(()),
@@ -3574,7 +3594,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                Some(&fresh),
+                &fresh,
+                false,
                 DropProbeRequest {
                     text: "in time".to_string(),
                     _probe: Arc::new(()),
@@ -4186,7 +4207,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 req,
                 "/generate",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -4561,7 +4583,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 req,
                 "/generate",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -4668,7 +4691,8 @@ mod tests {
         let typed = router
             .route_typed_request(
                 Some(&headers),
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 DropProbeRequest {
                     text: "hello".to_string(),
                     _probe: Arc::new(()),
@@ -4846,7 +4870,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 req,
                 "/generate",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5066,7 +5091,8 @@ mod tests {
             let response = router
                 .route_typed_request(
                     Some(&headers),
-                    None,
+                    &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                    false,
                     DropProbeRequest {
                         text: "pinned".to_string(),
                         _probe: Arc::new(()),
@@ -5408,7 +5434,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5536,7 +5563,8 @@ mod tests {
             let response = router
                 .route_typed_request(
                     None,
-                    None,
+                    &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                    false,
                     streaming_chat_request(),
                     "/v1/chat/completions",
                     crate::worker::UNKNOWN_MODEL_ID,
@@ -5614,7 +5642,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5666,7 +5695,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5712,7 +5742,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 request,
                 "/v1/messages",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5760,7 +5791,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5795,7 +5827,8 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5870,7 +5903,8 @@ mod tests {
                 let response = router
                     .route_typed_request(
                         None,
-                        None,
+                        &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                        false,
                         DropProbeRequest {
                             text: "refused".to_string(),
                             _probe: Arc::new(()),
@@ -5917,7 +5951,8 @@ mod tests {
         let response = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(router.route_typed_request(
                 None,
-                None,
+                &TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant")),
+                false,
                 DropProbeRequest {
                     text: "refused".to_string(),
                     _probe: Arc::new(()),
