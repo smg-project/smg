@@ -253,6 +253,10 @@ class Sandbox:
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base),
         }
+        # The interpreter put on PATH above may be a relocatable build that finds
+        # its shared library through LD_LIBRARY_PATH (a runner's tool cache).
+        if library_path := os.environ.get("LD_LIBRARY_PATH"):
+            env["LD_LIBRARY_PATH"] = library_path
         env.update(extra)
         return env
 
