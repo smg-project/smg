@@ -41,8 +41,9 @@ use crate::{
     },
     native::{AddedTokens, NativeEncoder},
     traits::{
-        ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
-        PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
+        append_step_text, AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob,
+        Encoder, Encoding, IncrementalDecoder, PromptEncoding, SpecialTokens, TokenIdType,
+        Tokenizer as TokenizerTrait,
     },
     word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
@@ -1584,7 +1585,7 @@ impl HuggingFaceTokenizer {
     /// them for token accounting, which no client sees).
     fn step_decode_lenient(
         &self,
-        new_ids: Vec<TokenIdType>,
+        new_ids: &[TokenIdType],
         skip_special_tokens: bool,
         ids: &mut Vec<TokenIdType>,
         prefix: &mut String,
@@ -1599,7 +1600,7 @@ impl HuggingFaceTokenizer {
             }
         }
         let token_id = new_ids.last().copied();
-        ids.extend(new_ids);
+        ids.extend_from_slice(new_ids);
         let string = self.window_decode(ids, skip_special_tokens)?;
         if string.ends_with('\u{FFFD}') {
             return Ok(DecodeStep::default());
@@ -1728,6 +1729,40 @@ impl HuggingFaceTokenizer {
         eager: bool,
         count: bool,
     ) -> Result<DecodeStep> {
+        Ok(
+            match self.stepped(
+                token_id,
+                ids,
+                prefix,
+                prefix_index,
+                skip_special_tokens,
+                eager,
+                count,
+            )? {
+                Stepped::Piece(text) => DecodeStep {
+                    text: Some(text.to_owned()),
+                    prefix_mismatch: false,
+                },
+                Stepped::Step(step) => step,
+            },
+        )
+    }
+
+    /// One token through the step algorithm, with its text where the step
+    /// found it: a plain piece borrowed from the piece table, or the step as
+    /// the window decode made it. The one algorithm behind
+    /// [`Self::client_step`] and `Decoder::decode_step_into`.
+    #[expect(clippy::too_many_arguments)]
+    fn stepped(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        count: bool,
+    ) -> Result<Stepped<'_>> {
         // Pending byte tokens from which a ByteFallback run can be lost: a
         // valid character has at most four bytes, a complete one streams at once.
         const LOST_RUN_BYTES: usize = 4;
@@ -1781,33 +1816,31 @@ impl HuggingFaceTokenizer {
             ids.push(token_id);
             prefix.push('\u{FFFD}');
             *prefix_index = ids.len();
-            return Ok(DecodeStep {
+            return Ok(Stepped::Step(DecodeStep {
                 text: Some('\u{FFFD}'.to_string()),
                 prefix_mismatch: false,
-            });
+            }));
         }
         if let Some(table) = &self.pieces {
             // Nothing pending and a plain piece: the window's text grows by
             // exactly this piece's text (the leading-space strip touched the
             // window's first piece, which this one is not), so it streams at
-            // once and becomes the window on its own, where the strip applies
-            // to it: the prefix the full step would record.
+            // once, borrowed from the table, and becomes the window on its
+            // own, where the strip applies to it: the prefix the full step
+            // would record, written without a render.
             if *prefix_index == ids.len() && !prefix.is_empty() && !prefix.ends_with('\u{FFFD}') {
                 if let Some(text) = table.plain_text(token_id, skip_special_tokens) {
-                    let text = text.to_owned();
                     ids.clear();
                     ids.push(token_id);
-                    *prefix = table.render(ids, skip_special_tokens);
+                    prefix.clear();
+                    prefix.push_str(table.at_window_start(text));
                     *prefix_index = 1;
-                    return Ok(DecodeStep {
-                        text: Some(text),
-                        prefix_mismatch: false,
-                    });
+                    return Ok(Stepped::Piece(text));
                 }
             }
         }
         let step = self.step_decode_lenient(
-            vec![token_id],
+            &[token_id],
             skip_special_tokens,
             ids,
             prefix,
@@ -1862,15 +1895,22 @@ impl HuggingFaceTokenizer {
                     if rewritten && count {
                         crate::decode_activity::note_prefix_mismatch(true);
                     }
-                    return Ok(DecodeStep {
+                    return Ok(Stepped::Step(DecodeStep {
                         text: Some(replacements),
                         prefix_mismatch: rewritten,
-                    });
+                    }));
                 }
             }
         }
-        Ok(step)
+        Ok(Stepped::Step(step))
     }
+}
+
+/// What a step gave ([`HuggingFaceTokenizer::stepped`]): a plain piece's text,
+/// borrowed from the piece table, or the step as the full algorithm made it.
+enum Stepped<'t> {
+    Piece(&'t str),
+    Step(DecodeStep),
 }
 
 impl Decoder for HuggingFaceTokenizer {
@@ -1939,7 +1979,7 @@ impl Decoder for HuggingFaceTokenizer {
     ) -> Result<Option<String>> {
         Ok(self
             .step_decode_lenient(
-                vec![token_id],
+                &[token_id],
                 skip_special_tokens,
                 ids,
                 prefix,
@@ -1966,6 +2006,44 @@ impl Decoder for HuggingFaceTokenizer {
             skip_special_tokens,
             eager,
             true,
+        )
+    }
+
+    /// The reporting step with its text appended to `out`: a plain piece on a
+    /// vocabulary with a piece table goes from the table into the buffer, so a
+    /// stream of such pieces allocates nothing per token.
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        Ok(
+            match self.stepped(
+                token_id,
+                ids,
+                prefix,
+                prefix_index,
+                skip_special_tokens,
+                eager,
+                true,
+            )? {
+                Stepped::Piece(text) => {
+                    out.push_str(text);
+                    AppendedStep {
+                        appended: true,
+                        prefix_mismatch: false,
+                    }
+                }
+                Stepped::Step(step) => AppendedStep {
+                    appended: append_step_text(step.text, out),
+                    prefix_mismatch: step.prefix_mismatch,
+                },
+            },
         )
     }
 

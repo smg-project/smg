@@ -2,8 +2,8 @@
 //! change that adds a copy fails a test rather than moving a bench gate
 //! inside its noise. An exact-cache hit hands out one copy of the prompt's
 //! ids; a decode step on a byte-level vocabulary allocates nothing; a decode
-//! step on a byte-fallback vocabulary pays two strings on its fast path, and a
-//! third for a piece longer than four bytes. Each
+//! step on a byte-fallback vocabulary allocates nothing either on its plain-piece
+//! path, the piece going from the table into the stream's buffer. Each
 //! pin states the count it reads today and what moves it, so the change that
 //! removes a copy flips the pin in the same commit. A separate executable, so
 //! it can declare the counting allocator the pins need.
@@ -194,15 +194,16 @@ fn a_decode_step_on_a_byte_level_vocabulary_allocates_nothing() {
 }
 
 #[test]
-fn a_decode_step_on_a_byte_fallback_vocabulary_costs_two_strings_today() {
+fn a_decode_step_on_a_byte_fallback_vocabulary_allocates_nothing_on_a_plain_piece() {
     let tokenizer = byte_fallback();
     // Word pieces only: the fast path of the step, a plain piece after a
     // settled window, which is what a stream of prose is almost everywhere.
     // Two streams, by the length of the piece's text: up to four bytes, and
-    // longer.
-    for (pieces, name, expected, growth) in [
-        (SHORT_PIECES, "up to four bytes", 2, "fits"),
-        (LONG_PIECES, "longer than four bytes", 3, "grows once"),
+    // longer, since a prefix rendered into a new string would grow for the
+    // longer one.
+    for (pieces, name) in [
+        (SHORT_PIECES, "up to four bytes"),
+        (LONG_PIECES, "longer than four bytes"),
     ] {
         let count = pieces.len() as u32;
         let ids: Vec<u32> = (0..1_000).map(|k| pieces.start + k % count).collect();
@@ -214,14 +215,14 @@ fn a_decode_step_on_a_byte_fallback_vocabulary_costs_two_strings_today() {
         );
         let (first, steady) = steps.split_first().expect("a thousand steps");
         assert!(
-            steady.iter().all(|&calls| calls == expected),
+            steady.iter().all(|&calls| calls == 0),
             "a 1,000-token stream of pieces {name} on a byte-fallback vocabulary allocated {:?} \
-             times per steady step (and {first} on the first): today each step copies the \
-             piece's text out of the table and renders the one-id window into a new prefix \
-             string sized at four bytes per id, which {growth} for such a piece: {expected} \
-             allocations per token where the byte-level decoder makes none; a step that borrows \
-             the piece and keeps its window takes this to 0, and a step that goes back to the \
-             two window decodes per token takes it to 4 or more",
+             times per steady step (and {first} on the first): today a plain piece after a \
+             settled window goes from the table into the stream's buffer and becomes the window \
+             on its own without a render, as the byte-level decoder streams a whole token; a \
+             step that copies the piece out of the table or renders the one-id window into a \
+             new prefix string takes this to 2 (and to 3 for a piece longer than four bytes), \
+             and a step that goes back to the two window decodes per token to 4 or more",
             distinct(steady)
         );
     }

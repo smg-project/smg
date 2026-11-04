@@ -37,8 +37,8 @@ use crate::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
     traits::{
-        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
-        SpecialTokens, TokenIdType, Tokenizer,
+        AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding,
+        IncrementalDecoder, SpecialTokens, TokenIdType, Tokenizer,
     },
 };
 
@@ -436,6 +436,27 @@ impl Decoder for CachedTokenizer {
             prefix_index,
             skip_special_tokens,
             eager,
+        )
+    }
+
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        self.inner.decode_step_into(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+            out,
         )
     }
 
