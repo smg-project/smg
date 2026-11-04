@@ -2230,7 +2230,8 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
 
 def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo: Sandbox) -> None:
     """The plan is read whole, with its status, before the first dispatch, and a failed read of a workflow's runs is
-    not an empty list: either failure stops the ship with nothing dispatched (a rerun would double a run otherwise)."""
+    not an empty list: either failure stops the ship with nothing dispatched (a rerun would double a run otherwise).
+    The plan half runs against a final: its plan prints the registry dispatch lines, then reads the component list."""
     repo.cut()
     repo.tool("bump", "1.14.0-rc.2", PUSH="0")
     repo.land_on_release()
@@ -2244,9 +2245,19 @@ def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo
     assert "the runs of release-docker.yml on v1.14.0-rc.2 could not be read" in unread.stderr
     assert "gh: no answer" in unread.stderr, "gh's own message is shown"
     assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
-    broken = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False, PYTHON="false")
+    # the plan of a final reads the component list after it has printed the first dispatch lines: a list that cannot
+    # be read stops the plan there (a candidate's plan never reads it, so this half runs against the final)
+    repo.tool("bump", "1.14.0", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0", PUSH="1")
+    before = len(repo.gh_calls())
+    broken = repo.tool("ship", "1.14.0", "--from", "publish", check=False, PYTHON="false")
     assert broken.returncode == 1
-    assert "the publish plan of v1.14.0-rc.2 could not be read" in broken.stderr
+    assert "the crates and packages at v1.14.0 are unknown" in broken.stderr, (
+        "the final's plan died in its component list, not in the engine table"
+    )
+    assert "the publish plan of v1.14.0 could not be read" in broken.stderr
     assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
 
 
