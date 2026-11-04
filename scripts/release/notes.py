@@ -696,7 +696,8 @@ def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, st
     A sentence may quote a template expression of its own (`{{ bos_token }}`): only the names the notes template
     defines are placeholders, every token-shaped text when the names are unknown. An author comment counts wherever
     "AUTHOR:" sits in it (a stray opener before it would swallow it), and an opener without a closer is reported
-    too: published, it hides everything after it. Backtick spans are skipped: a comment quoted in code hides nothing.
+    too: published, it hides everything after it, or up to the closer of the next comment, which absorbs it (a
+    second opener inside one matched comment). Backtick spans are skipped: a comment quoted in code hides nothing.
     A candidate line whose sentence reads as a declared none (NONE_NOTE) is reported as well: the renderer seeds
     none, so one in a draft came from an older render or a hand, and it is not a release note.
     """
@@ -707,9 +708,19 @@ def placeholders(text: str, names: set[str] | None = None) -> list[tuple[int, st
     closed_to = 0
     for match in COMMENT.finditer(scanned):
         closed_to = match.end()
-        if "AUTHOR:" in match.group(0).upper():
-            excerpt = text[match.start() : match.end()].split("\n")[0]
-            found.append((text.count("\n", 0, match.start()) + 1, excerpt))
+        # the last opener in the match is the comment's; one before it had no closer and hides the prose between
+        opener = match.group(0).rfind("<!--")
+        if opener:
+            found.append(
+                (
+                    text.count("\n", 0, match.start()) + 1,
+                    "<!-- (an opener without a closer: it hides everything up to the next closer)",
+                )
+            )
+        start = match.start() + opener
+        if "AUTHOR:" in scanned[start : match.end()].upper():
+            excerpt = text[start : match.end()].split("\n")[0]
+            found.append((text.count("\n", 0, start) + 1, excerpt))
     stray = scanned.find("<!--", closed_to)
     if stray != -1:
         found.append(

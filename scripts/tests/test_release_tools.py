@@ -2015,12 +2015,18 @@ def test_the_release_note_of_a_pull_request_body() -> None:
         notes.release_note("## Release note\n\nA --> closer first, then a <!-- opener.\n")
         == "A --&gt; closer first, then a &lt;!-- opener."
     )
-    assert notes.placeholders("a <!-- x\n<!-- AUTHOR: y -->") == [(1, "<!-- x")], (
-        "AUTHOR: anywhere in a comment"
-    )
+    absorbed = "<!-- (an opener without a closer: it hides everything up to the next closer)"
+    assert notes.placeholders("a <!-- x\n<!-- AUTHOR: y -->") == [
+        (1, absorbed),
+        (2, "<!-- AUTHOR: y -->"),
+    ], "the opener without a closer, and the author comment that absorbed it"
+    assert notes.placeholders("a <!-- x\nprose the draft loses\n<!-- plain -->\nmore") == [
+        (1, absorbed)
+    ], "a plain comment that absorbs an unclosed opener does not pass it"
     assert notes.placeholders("text <!-- open\nmore") == [
         (1, "<!-- (an opener without a closer: it hides everything after it)")
     ]
+    assert notes.placeholders("a `<!--` in code\n<!-- plain -->\n") == [], "code spans open nothing"
     assert notes.placeholders("<!-- see AUTHOR: later -->\n<!-- not one -->") == [
         (1, "<!-- see AUTHOR: later -->")
     ]
