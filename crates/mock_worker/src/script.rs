@@ -923,9 +923,11 @@ pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option
 }
 
 /// `answer` with its ids for a token wire: a text-only answer encoded with
-/// the worker's tokenizer, any other as it is.
-fn encode_for_wire(cfg: &Config, worker: &str, answer: Answer) -> Result<Answer, String> {
+/// the worker's tokenizer, any other as it is, its sampled logprobs made up
+/// once the ids are known either way.
+fn encode_for_wire(cfg: &Config, worker: &str, mut answer: Answer) -> Result<Answer, String> {
     if !answer.output_ids.is_empty() || answer.output_text.is_none() {
+        answer.synthesize_logprobs();
         return Ok(answer);
     }
     tokenizer(cfg)
@@ -1413,6 +1415,26 @@ mod tests {
         assert_eq!(with_ids.logprobs, Some(vec![-0.125, -0.25]));
         assert_eq!(with_ids.token_frames().len(), 2, "one logprob per frame");
         assert!(parse(r#"{"output_text": "x", "logprobs": "random"}"#).is_err());
+    }
+
+    #[test]
+    fn an_answer_scripted_with_ids_gets_its_sampled_logprobs_on_the_wire() {
+        // Through `take_ids`, the token wires' path: an answer that carries
+        // ids skips the encode, and its sampled logprobs are made up all the
+        // same, so a request that asks for logprobs is answered with them.
+        let worker = "zmq:sampled-logprobs";
+        register(worker);
+        let scripted = parse(
+            r#"{"input_ids": [4101, 4102, 4103], "output_ids": [4, 5], "logprobs": "sampled"}"#,
+        )
+        .expect("answer");
+        assert!(enqueue(worker, vec![scripted]).is_some());
+        let answer = take_ids(&Config::default(), worker, &[4101, 4102, 4103])
+            .expect("nothing to encode, so no tokenizer is needed")
+            .expect("the scripted answer");
+        assert_eq!(answer.output_ids, vec![4, 5]);
+        assert_eq!(answer.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(answer.token_frames().len(), 2, "one logprob per frame");
     }
 
     #[test]
