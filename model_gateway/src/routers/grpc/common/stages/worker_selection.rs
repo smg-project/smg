@@ -13,7 +13,7 @@ use axum::{
 use openai_protocol::profile::ProviderProfile;
 use tracing::{debug, error, warn};
 
-use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
+use super::{helpers, ContextRequirements, PipelineStage};
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
@@ -22,6 +22,10 @@ use crate::{
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
     routers::{
         common::{
+            pair_demands::{
+                accepts_media_refs, no_vision_capable_workers, pipeline_admits, vision_capable,
+                PairDemands, PairSelectionFailure,
+            },
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
@@ -40,10 +44,10 @@ use crate::{
         prefill_queue_full, prefill_queue_timeout,
     },
     worker::{
-        acquire_prefill, ConnectionMode, ConnectionModeExt, HashRing, ModelWorkerSnapshot,
-        PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType,
-        Worker, WorkerRegistry, WorkerType,
+        acquire_prefill, ConnectionMode, ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire,
+        PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillCandidateError,
+        PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -69,28 +73,6 @@ enum EpdSelectionFailure {
 impl PrefillCandidateError for EpdSelectionFailure {
     fn is_at_capacity(&self) -> bool {
         matches!(self, Self::PrefillAtCapacity)
-    }
-}
-
-/// Why a prefill/decode selection produced nothing: the placement's own
-/// verdict for the role that failed, or a request carrying pixel media for a
-/// model that pairs no prefill worker with a vision encoder.
-#[derive(Debug)]
-enum PdSelectionFailure {
-    Placement(Box<PairFailure>),
-    NoVisionCapablePrefill,
-    Context(Box<Response>),
-}
-
-impl From<Box<PairFailure>> for PdSelectionFailure {
-    fn from(failure: Box<PairFailure>) -> Self {
-        Self::Placement(failure)
-    }
-}
-
-impl PrefillCandidateError for PdSelectionFailure {
-    fn is_at_capacity(&self) -> bool {
-        matches!(self, Self::Placement(failure) if failure.is_at_capacity())
     }
 }
 
@@ -882,19 +864,6 @@ impl WorkerSelectionStage {
     }
 }
 
-/// Candidate predicate for requests carrying media references.
-fn accepts_media_refs(worker: &dyn Worker) -> bool {
-    multimodal::worker_accepts_media_refs(worker)
-}
-
-/// Candidate predicate for a request, or a disaggregated side of one, that
-/// needs a vision encoder: a worker that advertises none
-/// (`supports_vision=false`) admits such a request and never schedules it. A
-/// worker without the label reads as capable, as today.
-fn vision_capable(worker: &dyn Worker) -> bool {
-    !multimodal::worker_language_model_only(worker)
-}
-
 /// Whether a request's disaggregated decode side cannot be served by a decode
 /// worker that accepts no vision input: the shapes dispatch refuses with a
 /// non-retryable 400 once such a worker is selected (media references, which
@@ -911,100 +880,6 @@ fn decode_needs_vision(
     media_refs
         || intermediate
             .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
-}
-
-/// Context bounds for both token-processing sides, and which sides need a vision
-/// encoder. The prefill side takes the request's media whole (the processed
-/// pixel tensors, or the references it expands itself), so any image or
-/// video is a demand on it: a prefill worker without the encoder admits
-/// such a request and never schedules it, and no dispatch check catches
-/// that. The decode side's demand is [`decode_needs_vision`]'s, and holds
-/// on the prefill side too (neither side runs those shapes without the
-/// encoder).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PairDemands {
-    context: ContextRequirements,
-    prefill: bool,
-    decode: bool,
-    /// The request forwards media references, which only a worker that
-    /// processes them can take: the prefill side's refusal check then wants
-    /// a worker with the encoder among those, or the request could never
-    /// pair and a retryable 503 would send the client back for ever.
-    refs: bool,
-    /// With `refs`: which of the workers that process them the plan may use
-    /// ([`pipeline_admits`]); the probes count only the pairs on that side,
-    /// so a pair the pin excludes never stands in for one it admits.
-    pipeline: PipelinePin,
-}
-
-impl PairDemands {
-    /// The demand of a request that carries pixel media (`pixel_media`, see
-    /// [`multimodal::request_needs_vision`]) and whose decode side needs the encoder
-    /// (`decode`, see [`decode_needs_vision`]).
-    fn new(pixel_media: bool, decode: bool) -> Self {
-        Self {
-            context: ContextRequirements::default(),
-            prefill: pixel_media || decode,
-            decode,
-            refs: false,
-            pipeline: PipelinePin::Any,
-        }
-    }
-
-    /// The same demand for a request that forwards media references (`refs`,
-    /// the caller's references predicate) on the side of `pipeline`: the
-    /// prefill side's refusal and the capacity refusal are judged among the
-    /// workers that take them there.
-    fn with_media_refs(self, refs: bool, pipeline: PipelinePin) -> Self {
-        Self {
-            refs,
-            pipeline: if refs { pipeline } else { PipelinePin::Any },
-            ..self
-        }
-    }
-
-    /// Context bounds shared by both token-processing sides, never the encoder.
-    fn with_context(self, context: ContextRequirements) -> Self {
-        Self { context, ..self }
-    }
-
-    /// The demand on the side `worker` serves.
-    fn on(self, worker: &dyn Worker) -> bool {
-        match worker.worker_type() {
-            WorkerType::Prefill => self.prefill,
-            _ => self.decode,
-        }
-    }
-}
-
-/// The predicate of a request whose prefill side needs a vision encoder, on
-/// either side: a prefill worker with the encoder, any decode worker.
-fn prefill_vision_capable(worker: &dyn Worker) -> bool {
-    !matches!(worker.worker_type(), WorkerType::Prefill) || vision_capable(worker)
-}
-
-/// Whether `pairs` holds a prefill that `accepts` admits with a partner it
-/// admits too, both on `wire` when a retry pins one. Read from the index,
-/// not the pools, so a worker that pairs with nothing cannot shut the pool.
-fn pair_admitted_by(
-    pairs: &PdPairIndex,
-    wire: Option<WireConstraint>,
-    accepts: &dyn Fn(&dyn Worker) -> bool,
-) -> bool {
-    let admitted = |worker: &Arc<dyn Worker>| {
-        WireConstraint::admits(wire, worker.as_ref()) && accepts(worker.as_ref())
-    };
-    pairs
-        .prefill
-        .iter()
-        .zip(&pairs.partners)
-        .filter(|(prefill, _)| admitted(prefill))
-        .any(|(prefill, partners)| {
-            let runtime = prefill.metadata().spec.runtime_type;
-            partners
-                .iter()
-                .any(|decode| admitted(decode) && decode.metadata().spec.runtime_type == runtime)
-        })
 }
 
 /// What a request's media demands of a regular-mode candidate, beyond the
@@ -1058,17 +933,6 @@ impl MediaDemands {
     /// Whether `worker` meets every demand.
     fn accepts(self, worker: &dyn Worker) -> bool {
         self.accepts_refs(worker) && (!self.vision || vision_capable(worker))
-    }
-}
-
-/// Whether `worker` is on the side of `pin`: running the gateway's own
-/// pipeline for [`PipelinePin::Only`], not running it for
-/// [`PipelinePin::Never`], anything for [`PipelinePin::Any`].
-fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
-    match pin {
-        PipelinePin::Any => true,
-        PipelinePin::Only => multimodal::worker_runs_gateway_pipeline(worker),
-        PipelinePin::Never => !multimodal::worker_runs_gateway_pipeline(worker),
     }
 }
 
@@ -1471,15 +1335,15 @@ impl WorkerSelectionStage {
     fn pd_selection_failure(
         &self,
         model_id: &str,
-        failure: PdSelectionFailure,
+        failure: PairSelectionFailure,
         media: MediaDemands,
     ) -> Response {
         match failure {
-            PdSelectionFailure::Placement(failure) => {
+            PairSelectionFailure::Placement(failure) => {
                 self.pd_pair_failure(model_id, *failure, media)
             }
-            PdSelectionFailure::Context(response) => *response,
-            PdSelectionFailure::NoVisionCapablePrefill => {
+            PairSelectionFailure::Context(response) => *response,
+            PairSelectionFailure::NoVisionCapablePrefill => {
                 self.vision_refusal(model_id, "prefill workers")
             }
         }
@@ -1491,21 +1355,8 @@ impl WorkerSelectionStage {
     /// of a dispatch the engine admits and never schedules. A 400 is
     /// terminal for the retry layer by status.
     fn vision_refusal(&self, model_id: &str, workers: &str) -> Response {
-        warn!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            workers,
-            "No worker that accepts vision input for a request carrying pixel media"
-        );
-        error::bad_request(
-            "multimodal_not_supported",
-            format!(
-                "image or video input is not supported by model '{model_id}': none of its \
-                 {workers} accept vision input (the engine runs as a language model only, or \
-                 its servicer does not carry media to it)"
-            ),
-        )
+        let site = self.refusal_site("WorkerSelectionStage::execute");
+        no_vision_capable_workers(site.function, site.mode, model_id, workers)
     }
 
     /// The response for a failed pair placement. The verdict was judged from
@@ -1761,7 +1612,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
-    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+    ) -> Result<PdWorkerPair, PairSelectionFailure> {
         // Both pools derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools hold the workers whose wire carries
@@ -1772,92 +1623,10 @@ impl WorkerSelectionStage {
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        // A side that needs a vision encoder (see `PairDemands`) is kept off
-        // the workers without one. The prefill side must find one: a request
-        // carrying pixel media is refused when the index pairs no prefill
-        // worker with the encoder (a role nobody serves and a fleet without a
-        // shared transport keep the placement's own verdicts), since no
-        // dispatch check would catch the side landing on a worker without it.
-        // The decode side is kept off such workers while the index holds a
-        // pair with the encoder on both sides that the caller's own predicate
-        // admits too; with none the decode pool is used as it is, and
-        // dispatch refuses the side naming the gap, as it does for a pool
-        // with no such worker at all. With media references the worker must
-        // take them too (`PairDemands::refs`): a pool whose referencing
-        // prefill worker lacks the encoder and whose encoder-bearing one
-        // takes no references can never pair the request, and the verdict
-        // of the unfiltered pool would be a retryable 503 over healthy
-        // workers. A pool with no pair that takes the references at all is
-        // not this refusal: the placement's media-references verdict names
-        // that gap, and the fix that applies to it.
-        let takes_refs = |worker: &dyn Worker| {
-            !demand.refs || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
-        };
-        if demand.prefill
-            && !pairs.prefill_pool.is_empty()
-            && !pairs.decode_pool.is_empty()
-            && pairs.refusal.is_none()
-            && pair_admitted_by(&pairs, wire, &takes_refs)
-            && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
-                prefill_vision_capable(worker) && takes_refs(worker)
-            })
-        {
-            return Err(PdSelectionFailure::NoVisionCapablePrefill);
-        }
-        let caller = inputs.candidate_filter;
-        let admitted = move |worker: &dyn Worker| caller.is_none_or(|accepts| accepts(worker));
-        let with_vision = move |worker: &dyn Worker| {
-            (!demand.on(worker) || vision_capable(worker)) && admitted(worker)
-        };
-        let prefill_with_vision =
-            move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let require_decode_vision = demand.decode && pair_admitted_by(&pairs, wire, &with_vision);
-        let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
-            Some(&with_vision)
-        } else if demand.prefill {
-            Some(&prefill_with_vision)
-        } else {
-            inputs.candidate_filter
-        };
-        // Capacity refusal ignores attempt-local exclusions (the ledger):
-        // a failed large worker does not make the client's prompt oversized.
-        let takes_media = |worker: &dyn Worker| {
-            takes_refs(worker)
-                && (!demand.prefill || prefill_vision_capable(worker))
-                && (!require_decode_vision || !demand.on(worker) || vision_capable(worker))
-        };
-        let fits = |worker: &dyn Worker| {
-            candidate_filter.is_none_or(|accepts| accepts(worker))
-                && demand.context.admits(worker, model_id)
-        };
-        // Membership, not health, decides whether a request can ever fit.
-        // Inspect actual partners: independently large pools need not pair.
-        if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
-            takes_media(worker) && demand.context.admits(worker, model_id)
-        }) {
-            let mut largest = None;
-            for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
-                if !WireConstraint::admits(wire, prefill.as_ref()) || !takes_media(prefill.as_ref())
-                {
-                    continue;
-                }
-                for decode in partners.iter().filter(|decode| {
-                    WireConstraint::admits(wire, decode.as_ref())
-                        && takes_media(decode.as_ref())
-                        && decode.metadata().spec.runtime_type
-                            == prefill.metadata().spec.runtime_type
-                }) {
-                    let limit = pair_context_length(prefill.as_ref(), decode.as_ref(), model_id);
-                    largest = largest.max(limit);
-                }
-            }
-            if let Some(limit) = largest {
-                demand
-                    .context
-                    .enforce(limit, model_id)
-                    .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
-            }
-        }
+        // The request's demands narrow the index first, or refuse it
+        // (`PairDemands::judge`).
+        let admission = demand.judge(&pairs, wire, inputs.candidate_filter, model_id)?;
+        let fits = |worker: &dyn Worker| admission.fits(worker);
         let inputs = PlacementInputs {
             candidate_filter: Some(&fits),
             ..inputs
@@ -2180,6 +1949,7 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
+                pair_demands::prefill_vision_capable,
                 retry::is_retryable_response,
             },
             grpc::{
@@ -4703,7 +4473,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    matches!(selected, Err(PdSelectionFailure::NoVisionCapablePrefill)),
+                    matches!(selected, Err(PairSelectionFailure::NoVisionCapablePrefill)),
                     "{pin:?}: no pipeline prefill worker has the encoder"
                 );
             }
@@ -5009,7 +4779,7 @@ mod tests {
             .select_pd_pair(uniform, PlacementInputs::default(), None, None, image)
             .expect_err("no prefill worker with the encoder");
         assert!(
-            matches!(failure, PdSelectionFailure::NoVisionCapablePrefill),
+            matches!(failure, PairSelectionFailure::NoVisionCapablePrefill),
             "{failure:?}"
         );
         let response = stage.pd_selection_failure(uniform, failure, MediaDemands::NONE);
@@ -5039,7 +4809,7 @@ mod tests {
         assert!(
             matches!(
                 &failure,
-                PdSelectionFailure::Placement(failure)
+                PairSelectionFailure::Placement(failure)
                     if matches!(failure.verdict, PlacementFailure::NoCandidates)
             ),
             "{failure:?}"
@@ -5161,7 +4931,7 @@ mod tests {
             )
             .expect_err("no prefill worker that takes references has the encoder");
         assert!(
-            matches!(failure, PdSelectionFailure::NoVisionCapablePrefill),
+            matches!(failure, PairSelectionFailure::NoVisionCapablePrefill),
             "the terminal refusal, not the unfiltered pool's verdict"
         );
 

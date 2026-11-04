@@ -18,6 +18,11 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_demands` — what a request demands of a prefill/decode pair
+//!   beyond the pool and the wire (a vision encoder per side, forwarded
+//!   media references, the context window), judged over the pair index
+//!   ahead of the placement by the gRPC selection stage and the HTTP
+//!   prefill-decode router alike
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
 //!   post more bootstrap rooms to a pair than its decode engine can admit
 //! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
@@ -53,6 +58,7 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_demands;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;

@@ -60,10 +60,22 @@ impl ContextRequirements {
         }
     }
 
+    /// The exact count of a prompt a router reads as token ids, with no
+    /// output budget: the HTTP prefill-decode router's generate route.
+    pub(crate) fn of_tokens(input_tokens: usize) -> Self {
+        Self {
+            input_tokens,
+            scoring_position: false,
+            output_tokens: None,
+        }
+    }
+
     /// Unknown windows remain eligible; no character estimate or token sum is used.
-    /// Direct-ZMQ workers in the shared pipeline retain post-selection validation.
+    /// Direct-ZMQ workers in the shared pipeline retain post-selection validation;
+    /// every other worker with a known window is judged here (an HTTP worker
+    /// reaches it through the HTTP prefill-decode router's pair selection).
     pub(crate) fn admits(self, worker: &dyn Worker, model_id: &str) -> bool {
-        if !matches!(worker.connection_mode(), ConnectionMode::Grpc) {
+        if matches!(worker.connection_mode(), ConnectionMode::Zmq) {
             return true;
         }
         worker.context_length(model_id).is_none_or(|limit| {
@@ -252,7 +264,7 @@ fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option
 
 /// Tightest known bound of two token-processing sides. An unknown side adds no
 /// bound, but cannot erase the known constraint on its partner.
-pub(super) fn pair_context_length(
+pub(crate) fn pair_context_length(
     prefill: &dyn Worker,
     decode: &dyn Worker,
     model_id: &str,
@@ -298,6 +310,46 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    /// A worker's window is judged on every wire but the direct ZMQ lane,
+    /// whose post-selection check stays: an HTTP worker with a known
+    /// window refuses a longer prompt at selection, as a gRPC one does.
+    #[test]
+    fn an_exact_token_count_is_judged_against_every_wire_but_zmq() {
+        let on = |mode: ConnectionMode, scheme: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("{scheme}://127.0.0.1:1"))
+                    .connection_mode(mode)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new(MODEL).with_context_length(8))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let http = on(ConnectionMode::Http, "http");
+        let grpc = on(ConnectionMode::Grpc, "grpc");
+        let zmq = on(ConnectionMode::Zmq, "ipc");
+
+        assert!(ContextRequirements::of_tokens(8).admits(http.as_ref(), MODEL));
+        assert!(!ContextRequirements::of_tokens(9).admits(http.as_ref(), MODEL));
+        assert!(!ContextRequirements::of_tokens(9).admits(grpc.as_ref(), MODEL));
+        assert!(ContextRequirements::of_tokens(9).admits(zmq.as_ref(), MODEL));
+        assert!(
+            ContextRequirements::of_tokens(usize::MAX).admits(http.as_ref(), "unknown-model")
+                == ContextRequirements::of_tokens(usize::MAX)
+                    .admits(grpc.as_ref(), "unknown-model"),
+            "a model without a card falls back to the primary card on both wires"
+        );
+        assert_eq!(
+            ContextRequirements::of_tokens(9)
+                .enforce(8, MODEL)
+                .map_err(|r| r.status()),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     fn single(context_length: Option<u32>) -> WorkerSelection {

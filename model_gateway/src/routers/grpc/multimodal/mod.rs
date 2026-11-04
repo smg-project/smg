@@ -82,7 +82,10 @@ pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
-pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use detect::{
+    chat_carries_pixel_media, media_plan_chat, media_plan_messages, messages_carry_pixel_media,
+    responses_carry_pixel_media,
+};
 pub(crate) use encoder_budget::engine_encoder_budget;
 pub(crate) use inflight::{
     reserve_multimodal_inflight, InflightPermit, UNIT_BYTES as INFLIGHT_UNIT_BYTES,

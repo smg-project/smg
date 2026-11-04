@@ -3,72 +3,96 @@
 //! Both the chat completion pipeline (`ChatMessage`) and the Messages API
 //! pipeline (`InputMessage`) funnel into the shared processing core; only the
 //! detection and extraction differ, because the input message types differ.
+//! The pixel predicates read the same parts without building a plan, for the
+//! HTTP prefill-decode router, which forwards a body as is and only needs
+//! to know whether its pair must have a vision encoder.
 
 use llm_multimodal::{ImageDetail, MediaContentPart};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
     messages::{ImageBlock, ImageSource, InputContent, InputContentBlock, InputMessage, Role},
+    responses::{ResponseContentPart, ResponseInputOutputItem},
 };
 
 use super::plan::MediaPlan;
 use crate::routers::grpc::utils::message_utils::tool_result_image_blocks;
+
+/// The content parts of OpenAI chat messages, in message order: those of
+/// every role whose content the model reads as parts (an assistant's and a
+/// function message's carry no media).
+fn chat_content_parts(messages: &[ChatMessage]) -> impl Iterator<Item = &ContentPart> {
+    messages
+        .iter()
+        .filter_map(|msg| match msg {
+            ChatMessage::User { content, .. }
+            | ChatMessage::System { content, .. }
+            | ChatMessage::Developer { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Root { content, .. } => Some(content),
+            ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => None,
+        })
+        .filter_map(|content| match content {
+            MessageContent::Parts(parts) => Some(parts.iter()),
+            MessageContent::Text(_) => None,
+        })
+        .flatten()
+}
+
+/// Whether chat messages carry a pixel payload, an image or a video part:
+/// the inputs that need a vision encoder (audio does not, see
+/// `capability::is_pixel_modality`).
+pub(crate) fn chat_carries_pixel_media(messages: &[ChatMessage]) -> bool {
+    chat_content_parts(messages).any(|part| {
+        matches!(
+            part,
+            ContentPart::ImageUrl { .. } | ContentPart::VideoUrl { .. }
+        )
+    })
+}
 
 /// Extract media parts from OpenAI chat messages,
 /// converting protocol `ContentPart` to multimodal crate `MediaContentPart`.
 fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     let mut parts = Vec::new();
 
-    for msg in messages {
-        let content = match msg {
-            ChatMessage::User { content, .. } => Some(content),
-            ChatMessage::System { content, .. } => Some(content),
-            ChatMessage::Developer { content, .. } => Some(content),
-            ChatMessage::Tool { content, .. } => Some(content),
-            ChatMessage::Root { content, .. } => Some(content),
-            ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => None,
-        };
-
-        if let Some(MessageContent::Parts(message_parts)) = content {
-            for part in message_parts {
-                match part {
-                    ContentPart::ImageUrl { image_url } => {
-                        let detail = image_url.detail.as_deref().and_then(parse_detail);
-                        parts.push(MediaContentPart::ImageUrl {
-                            url: image_url.url.clone(),
-                            detail,
-                            uuid: None,
-                            max_long_side_pixel: image_url.max_long_side_pixel,
-                        });
-                    }
-                    ContentPart::AudioUrl { audio_url } => {
-                        parts.push(MediaContentPart::AudioUrl {
-                            url: audio_url.url.clone(),
-                            uuid: None,
-                        });
-                    }
-                    ContentPart::InputAudio { input_audio } => {
-                        parts.push(MediaContentPart::AudioUrl {
-                            url: format!(
-                                "data:audio/{};base64,{}",
-                                input_audio.format, input_audio.data
-                            ),
-                            uuid: None,
-                        });
-                    }
-                    ContentPart::VideoUrl { video_url } => {
-                        parts.push(MediaContentPart::VideoUrl {
-                            url: video_url.url.clone(),
-                            uuid: None,
-                            fps: video_url.fps,
-                            max_long_side_pixel: video_url.max_long_side_pixel,
-                        });
-                    }
-                    ContentPart::Text { .. } => {}
-                    // Chat preparation rejects unknown parts before building the media plan.
-                    ContentPart::Unknown(_) => {}
-                }
+    for part in chat_content_parts(messages) {
+        match part {
+            ContentPart::ImageUrl { image_url } => {
+                let detail = image_url.detail.as_deref().and_then(parse_detail);
+                parts.push(MediaContentPart::ImageUrl {
+                    url: image_url.url.clone(),
+                    detail,
+                    uuid: None,
+                    max_long_side_pixel: image_url.max_long_side_pixel,
+                });
             }
+            ContentPart::AudioUrl { audio_url } => {
+                parts.push(MediaContentPart::AudioUrl {
+                    url: audio_url.url.clone(),
+                    uuid: None,
+                });
+            }
+            ContentPart::InputAudio { input_audio } => {
+                parts.push(MediaContentPart::AudioUrl {
+                    url: format!(
+                        "data:audio/{};base64,{}",
+                        input_audio.format, input_audio.data
+                    ),
+                    uuid: None,
+                });
+            }
+            ContentPart::VideoUrl { video_url } => {
+                parts.push(MediaContentPart::VideoUrl {
+                    url: video_url.url.clone(),
+                    uuid: None,
+                    fps: video_url.fps,
+                    max_long_side_pixel: video_url.max_long_side_pixel,
+                });
+            }
+            ContentPart::Text { .. } => {}
+            // Chat preparation rejects unknown parts before building the media plan.
+            ContentPart::Unknown(_) => {}
         }
     }
 
@@ -94,32 +118,66 @@ fn parse_detail(detail: &str) -> Option<ImageDetail> {
 // Messages API multimodal detection and extraction
 // ---------------------------------------------------------------------------
 
+/// The content blocks of the user messages of Messages API input, in
+/// block order (a string content carries no media).
+fn user_content_blocks(messages: &[InputMessage]) -> impl Iterator<Item = &InputContentBlock> {
+    messages
+        .iter()
+        .filter(|msg| msg.role == Role::User)
+        .filter_map(|msg| match &msg.content {
+            InputContent::Blocks(blocks) => Some(blocks.iter()),
+            InputContent::String(_) => None,
+        })
+        .flatten()
+}
+
+/// Whether Messages API input carries a pixel payload: an image block of a
+/// user message, its own or inside one of its tool results.
+pub(crate) fn messages_carry_pixel_media(messages: &[InputMessage]) -> bool {
+    user_content_blocks(messages).any(|block| match block {
+        InputContentBlock::Image(_) => true,
+        InputContentBlock::ToolResult(tool_result) => {
+            tool_result_image_blocks(tool_result).next().is_some()
+        }
+        _ => false,
+    })
+}
+
+/// Whether Responses input items carry a pixel payload: an `input_image`
+/// part with an image URL, the one part the chat conversion carries as an
+/// image (`response_parts_to_message_content`); a file-id image and an
+/// `input_file` are not carried, so they demand nothing.
+pub(crate) fn responses_carry_pixel_media(items: &[ResponseInputOutputItem]) -> bool {
+    items.iter().any(|item| match item {
+        ResponseInputOutputItem::Message { content, .. } => content.iter().any(|part| {
+            matches!(
+                part,
+                ResponseContentPart::InputImage {
+                    image_url: Some(_),
+                    ..
+                }
+            )
+        }),
+        _ => false,
+    })
+}
+
 /// Extract media parts from Messages API input messages,
 /// converting `InputContentBlock::Image` to multimodal crate `MediaContentPart`.
 fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPart> {
     let mut parts = Vec::new();
 
-    for msg in messages {
-        if msg.role != Role::User {
-            continue;
-        }
-        let blocks = match &msg.content {
-            InputContent::Blocks(blocks) => blocks,
-            InputContent::String(_) => continue,
-        };
-
-        for block in blocks {
-            match block {
-                InputContentBlock::Image(image_block) => parts.push(image_media_part(image_block)),
-                // Images inside a tool result enter the plan where the tool
-                // result stands, in block order: `convert_user_message` renders
-                // them into the user content at that same position.
-                InputContentBlock::ToolResult(tool_result) => {
-                    parts.extend(tool_result_image_blocks(tool_result).map(image_media_part));
-                }
-                InputContentBlock::Text(_) => {}
-                _ => {}
+    for block in user_content_blocks(messages) {
+        match block {
+            InputContentBlock::Image(image_block) => parts.push(image_media_part(image_block)),
+            // Images inside a tool result enter the plan where the tool
+            // result stands, in block order: `convert_user_message` renders
+            // them into the user content at that same position.
+            InputContentBlock::ToolResult(tool_result) => {
+                parts.extend(tool_result_image_blocks(tool_result).map(image_media_part));
             }
+            InputContentBlock::Text(_) => {}
+            _ => {}
         }
     }
 
@@ -415,5 +473,136 @@ mod tests {
         }];
 
         assert!(media_plan_messages(&messages).is_empty());
+    }
+
+    /// The pixel predicates read what the plans count as image or video,
+    /// and nothing else: audio parts, text, an assistant's parts, a
+    /// file-id image and an input file demand no encoder.
+    #[test]
+    fn the_pixel_predicates_read_image_and_video_parts_only() {
+        use openai_protocol::messages::{
+            ToolResultBlock, ToolResultContent, ToolResultContentBlock,
+        };
+
+        let user = |parts: Vec<ContentPart>| ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Parts(parts),
+            name: None,
+        };
+        let image = ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/cat.jpg".to_string(),
+                detail: None,
+                max_long_side_pixel: None,
+            },
+        };
+        let video = ContentPart::VideoUrl {
+            video_url: VideoUrl {
+                url: "https://example.com/clip.mp4".to_string(),
+                fps: None,
+                max_long_side_pixel: None,
+            },
+        };
+        let audio = ContentPart::AudioUrl {
+            audio_url: AudioUrl {
+                url: "https://example.com/clip.wav".to_string(),
+            },
+        };
+        let text = ContentPart::Text {
+            text: "hi".to_string(),
+        };
+        assert!(chat_carries_pixel_media(&[user(vec![
+            text.clone(),
+            image.clone()
+        ])]));
+        assert!(chat_carries_pixel_media(&[user(vec![video])]));
+        assert!(!chat_carries_pixel_media(&[user(vec![
+            text.clone(),
+            audio
+        ])]));
+        assert!(!chat_carries_pixel_media(&[ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Text("hi".to_string()),
+            name: None,
+        }]));
+        assert!(!chat_carries_pixel_media(&[ChatMessage::Assistant {
+            ext: Default::default(),
+            content: Some(MessageContent::Parts(vec![image])),
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }]));
+
+        let block = ImageBlock {
+            source: ImageSource::Url {
+                url: "https://example.com/cat.jpg".to_string(),
+            },
+            cache_control: None,
+        };
+        let tool_result = |blocks: Vec<ToolResultContentBlock>| {
+            InputContentBlock::ToolResult(ToolResultBlock {
+                tool_use_id: "tu_1".to_string(),
+                content: Some(ToolResultContent::Blocks(blocks)),
+                is_error: None,
+                cache_control: None,
+            })
+        };
+        let input = |content: InputContent| {
+            vec![InputMessage {
+                role: Role::User,
+                content,
+            }]
+        };
+        assert!(messages_carry_pixel_media(&input(InputContent::Blocks(
+            vec![InputContentBlock::Image(block.clone())]
+        ))));
+        assert!(messages_carry_pixel_media(&input(InputContent::Blocks(
+            vec![tool_result(vec![ToolResultContentBlock::Image(
+                block.clone()
+            )])]
+        ))));
+        assert!(!messages_carry_pixel_media(&input(InputContent::Blocks(
+            vec![tool_result(vec![])]
+        ))));
+        assert!(!messages_carry_pixel_media(&input(InputContent::String(
+            "hi".to_string()
+        ))));
+        assert!(!messages_carry_pixel_media(&[InputMessage {
+            role: Role::Assistant,
+            content: InputContent::Blocks(vec![InputContentBlock::Image(block)]),
+        }]));
+
+        let message = |content: Vec<ResponseContentPart>| ResponseInputOutputItem::Message {
+            id: "msg_1".to_string(),
+            role: "user".to_string(),
+            content,
+            status: None,
+            phase: None,
+        };
+        assert!(responses_carry_pixel_media(&[message(vec![
+            ResponseContentPart::InputText {
+                text: "hi".to_string()
+            },
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: None,
+                image_url: Some("https://example.com/cat.jpg".to_string()),
+            },
+        ])]));
+        assert!(!responses_carry_pixel_media(&[message(vec![
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: Some("file_1".to_string()),
+                image_url: None,
+            },
+            ResponseContentPart::InputFile {
+                detail: None,
+                file_data: None,
+                file_id: Some("file_2".to_string()),
+                file_url: None,
+                filename: None,
+            },
+        ])]));
+        assert!(!responses_carry_pixel_media(&[]));
     }
 }

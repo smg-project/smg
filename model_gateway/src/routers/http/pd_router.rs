@@ -26,7 +26,7 @@ use openai_protocol::{
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
-    responses::ResponsesRequest,
+    responses::{ResponseInput, ResponsesRequest},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{
@@ -63,6 +63,7 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            pair_demands::{no_vision_capable_workers, PairDemands, PairSelectionFailure},
             pd_failure::{PdSide, SidePhase},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
@@ -74,9 +75,15 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{
-            error_reason_for_response, error_type_for_response, error_type_from_status,
-            route_to_endpoint,
+        grpc::{
+            common::stages::ContextRequirements,
+            multimodal::{
+                chat_carries_pixel_media, messages_carry_pixel_media, responses_carry_pixel_media,
+            },
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
         },
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
@@ -155,12 +162,17 @@ enum PdSelectionFailure {
     QueueFull,
     /// The request waited out its Prefill admission timeout.
     QueueTimeout,
+    /// The request carries pixel media and the index pairs no prefill
+    /// worker with a vision encoder (`PairSelectionFailure`).
+    NoVisionCapablePrefill,
+    /// The prompt fits no pair's context window: the 400 as judged.
+    Context(Box<Response>),
 }
 
-impl From<PrefillAcquireError<Box<PairFailure>>> for PdSelectionFailure {
-    fn from(error: PrefillAcquireError<Box<PairFailure>>) -> Self {
+impl From<PrefillAcquireError<PairSelectionFailure>> for PdSelectionFailure {
+    fn from(error: PrefillAcquireError<PairSelectionFailure>) -> Self {
         match error {
-            PrefillAcquireError::Candidate(failure) => PDRouter::pair_failure(*failure),
+            PrefillAcquireError::Candidate(failure) => PDRouter::pair_refusal(failure),
             PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueFull) => Self::QueueFull,
             PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueTimeout) => {
                 Self::QueueTimeout
@@ -214,6 +226,13 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+    /// What the request demands of its pair beyond the pools: a vision
+    /// encoder on both sides when the body carries pixel media (each side
+    /// receives the body with its media and expands it itself, the rule the
+    /// gRPC stage applies to forwarded media references), and the context
+    /// window where the body carries token ids. Judged over the pair index
+    /// ahead of the placement (`PairDemands::judge`).
+    demand: PairDemands,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -230,6 +249,17 @@ trait PdRoute: GenerationRequest {
     /// merged instead of drained early).
     fn returns_logprob(&self) -> bool;
 
+    /// Whether the body carries pixel media (an image or a video part), the
+    /// demand for a vision encoder on the pair.
+    fn carries_pixel_media(&self) -> bool;
+
+    /// The prompt's length in tokens when the body carries token ids (the
+    /// longest sequence of a batch), for the context-window check; `None`
+    /// leaves the check to the engine, as this router does not tokenize.
+    fn input_token_count(&self) -> Option<usize> {
+        None
+    }
+
     /// The (text, tokens) the policies route on, read only when one asks.
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
         (Some(self.extract_text_for_routing()), None)
@@ -238,6 +268,26 @@ trait PdRoute: GenerationRequest {
 
 impl PdRoute for GenerateRequest {
     const ROUTE: &'static str = "/generate";
+
+    /// The engine-native media fields: a value that is not null and not an
+    /// empty list.
+    fn carries_pixel_media(&self) -> bool {
+        [&self.image_data, &self.video_data]
+            .into_iter()
+            .any(|media| {
+                media.as_ref().is_some_and(|value| {
+                    !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty())
+                })
+            })
+    }
+
+    fn input_token_count(&self) -> Option<usize> {
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) => Some(ids.len()),
+            Some(InputIds::Batch(seqs)) => seqs.iter().map(Vec::len).max(),
+            None => None,
+        }
+    }
 
     fn batch_size(&self) -> Option<usize> {
         // GenerateRequest doesn't support batch via arrays, only via input_ids
@@ -262,6 +312,10 @@ impl PdRoute for GenerateRequest {
 impl PdRoute for ChatCompletionRequest {
     const ROUTE: &'static str = "/v1/chat/completions";
 
+    fn carries_pixel_media(&self) -> bool {
+        chat_carries_pixel_media(&self.messages)
+    }
+
     fn batch_size(&self) -> Option<usize> {
         self.n.filter(|&n| n > 1).map(|n| n as usize)
     }
@@ -273,6 +327,10 @@ impl PdRoute for ChatCompletionRequest {
 
 impl PdRoute for CreateMessageRequest {
     const ROUTE: &'static str = "/v1/messages";
+
+    fn carries_pixel_media(&self) -> bool {
+        messages_carry_pixel_media(&self.messages)
+    }
 
     fn batch_size(&self) -> Option<usize> {
         None
@@ -286,6 +344,13 @@ impl PdRoute for CreateMessageRequest {
 impl PdRoute for ResponsesRequest {
     const ROUTE: &'static str = "/v1/responses";
 
+    fn carries_pixel_media(&self) -> bool {
+        match &self.input {
+            ResponseInput::Items(items) => responses_carry_pixel_media(items),
+            ResponseInput::Text(_) => false,
+        }
+    }
+
     fn batch_size(&self) -> Option<usize> {
         None
     }
@@ -297,6 +362,10 @@ impl PdRoute for ResponsesRequest {
 
 impl PdRoute for CompletionRequest {
     const ROUTE: &'static str = "/v1/completions";
+
+    fn carries_pixel_media(&self) -> bool {
+        false
+    }
 
     fn batch_size(&self) -> Option<usize> {
         match &self.prompt {
@@ -320,6 +389,10 @@ impl PdRoute for CompletionRequest {
 
 impl PdRoute for RerankRequest {
     const ROUTE: &'static str = "/v1/rerank";
+
+    fn carries_pixel_media(&self) -> bool {
+        false
+    }
 
     fn batch_size(&self) -> Option<usize> {
         None
@@ -464,7 +537,7 @@ impl PDRouter {
             )
     }
 
-    fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
+    fn handle_server_selection_error(model_id: &str, failure: PdSelectionFailure) -> Response {
         match failure {
             // Already a decision-logged 503 with the overload error code and
             // counter; re-describing it as a circuit-breaker/health failure is
@@ -476,6 +549,14 @@ impl PDRouter {
             }
             PdSelectionFailure::QueueFull => prefill_queue_full(),
             PdSelectionFailure::QueueTimeout => prefill_queue_timeout(),
+            // The gRPC stage's answers for the same two judgements.
+            PdSelectionFailure::NoVisionCapablePrefill => no_vision_capable_workers(
+                "PDRouter::execute_dual_dispatch_attempt",
+                "PrefillDecode",
+                model_id,
+                "prefill workers",
+            ),
+            PdSelectionFailure::Context(response) => *response,
             PdSelectionFailure::Unavailable(error) => {
                 // Same code the regular HTTP router and the gRPC routers use
                 // for a role that is merely down, so a client can key its
@@ -616,6 +697,10 @@ impl PDRouter {
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
+        let pixel_media = body.carries_pixel_media();
+        let context_requirements = body
+            .input_token_count()
+            .map_or_else(ContextRequirements::default, ContextRequirements::of_tokens);
         let context = PDRequestContext {
             route: R::ROUTE,
             batch_size: body.batch_size(),
@@ -623,6 +708,7 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
+            demand: PairDemands::new(pixel_media, pixel_media).with_context(context_requirements),
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
@@ -812,13 +898,16 @@ impl PDRouter {
                     tried: &[],
                 },
                 sticky_key,
+                context.demand,
             )
             .await;
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
+                return self.report_refusal(
+                    context.model_id,
+                    Self::handle_server_selection_error(context.model_id, *e),
+                );
             }
         };
 
@@ -2126,12 +2215,13 @@ impl PDRouter {
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
+        demand: PairDemands,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &PdPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+            |capacity| self.select_pd_pair(model_id, inputs, capacity, demand),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -2142,12 +2232,15 @@ impl PDRouter {
         Ok(((prefill, decode), guards))
     }
 
+    /// Select a pair for the request's `demand` ([`PairDemands::judge`]),
+    /// under the configured policies.
     fn select_pd_pair(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
+        demand: PairDemands,
+    ) -> Result<PdPair, PairSelectionFailure> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
@@ -2176,6 +2269,10 @@ impl PDRouter {
             _ => Arc::new(PdPairIndex::empty()),
         };
 
+        // The request's demands narrow the index first, or refuse it
+        // (`PairDemands::judge`); this router pins no wire.
+        let admission = demand.judge(&pairs, None, inputs.candidate_filter, model_id)?;
+        let fits = |worker: &dyn Worker| admission.fits(worker);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -2184,10 +2281,26 @@ impl PDRouter {
             None,
             false,
             prefill_capacity,
-            inputs,
+            PlacementInputs {
+                candidate_filter: Some(&fits),
+                ..inputs
+            },
         )?;
 
         Ok((pair.prefill, pair.decode))
+    }
+
+    /// Map a pair selection's failure to this router's: the placement's
+    /// verdict through [`Self::pair_failure`], the demand refusals as they
+    /// are.
+    fn pair_refusal(failure: PairSelectionFailure) -> PdSelectionFailure {
+        match failure {
+            PairSelectionFailure::Placement(failure) => Self::pair_failure(*failure),
+            PairSelectionFailure::NoVisionCapablePrefill => {
+                PdSelectionFailure::NoVisionCapablePrefill
+            }
+            PairSelectionFailure::Context(response) => PdSelectionFailure::Context(response),
+        }
     }
 
     /// Map a role's placement verdict to this router's selection failure,
@@ -2576,30 +2689,37 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) =
-            match self.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None) {
-                Ok(pair) => pair,
-                // A deep probe that generates gets the same answer routing does:
-                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-                // broken one already did.
-                Err(failure) => match Self::pair_failure(*failure) {
-                    PdSelectionFailure::Shed(shed) => return shed,
-                    PdSelectionFailure::Incompatible(e) => {
-                        return error::service_unavailable("no_compatible_pd_pair", e);
-                    }
-                    PdSelectionFailure::Unavailable(e) => {
-                        return error::service_unavailable(
-                            "no_healthy_worker_pair",
-                            format!("No healthy worker pair available: {e}"),
-                        );
-                    }
-                    // The probe does not go through admission.
-                    rejection @ (PdSelectionFailure::QueueFull
-                    | PdSelectionFailure::QueueTimeout) => {
-                        return Self::handle_server_selection_error(rejection);
-                    }
-                },
-            };
+        let (prefill, decode) = match self.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            PairDemands::default(),
+        ) {
+            Ok(pair) => pair,
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(failure) => match Self::pair_refusal(failure) {
+                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Incompatible(e) => {
+                    return error::service_unavailable("no_compatible_pd_pair", e);
+                }
+                PdSelectionFailure::Unavailable(e) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {e}"),
+                    );
+                }
+                // The probe does not go through admission and makes no
+                // demand.
+                rejection @ (PdSelectionFailure::QueueFull
+                | PdSelectionFailure::QueueTimeout
+                | PdSelectionFailure::NoVisionCapablePrefill
+                | PdSelectionFailure::Context(_)) => {
+                    return Self::handle_server_selection_error(UNKNOWN_MODEL_ID, rejection);
+                }
+            },
+        };
 
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
@@ -3126,9 +3246,10 @@ mod tests {
     /// whatever the transport.
     #[test]
     fn an_unavailable_role_answers_503_with_retry_after() {
-        let response = PDRouter::handle_server_selection_error(PdSelectionFailure::Unavailable(
-            "No prefill workers available".to_string(),
-        ));
+        let response = PDRouter::handle_server_selection_error(
+            "m",
+            PdSelectionFailure::Unavailable("No prefill workers available".to_string()),
+        );
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -3439,7 +3560,12 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            PairDemands::default(),
+        );
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -3464,13 +3590,23 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair("GLM-5.2-Coding", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Coding",
+                PlacementInputs::default(),
+                None,
+                PairDemands::default(),
+            )
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair("GLM-5.2-Unknown", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Unknown",
+                PlacementInputs::default(),
+                None,
+                PairDemands::default()
+            )
             .is_err());
     }
 
@@ -3478,16 +3614,24 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            PairDemands::default(),
+        );
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
         // an empty pool has nothing to be overloaded.
-        match PDRouter::pair_failure(*result.unwrap_err()) {
+        match PDRouter::pair_refusal(result.unwrap_err()) {
             PdSelectionFailure::Unavailable(error) => {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::NoVisionCapablePrefill | PdSelectionFailure::Context(_) => {
+                panic!("a request without a demand is not refused for one")
+            }
             PdSelectionFailure::Incompatible(_) => {
                 panic!("an empty fleet has no pairing to be incompatible about")
             }
@@ -5934,6 +6078,7 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
+            demand: PairDemands::default(),
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -6016,6 +6161,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        PairDemands::default(),
                     )
                     .await
                     .unwrap();
@@ -6026,6 +6172,7 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    demand: PairDemands::default(),
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -6043,6 +6190,7 @@ mod tests {
                     UNKNOWN_MODEL_ID,
                     PlacementInputs::default(),
                     None,
+                    PairDemands::default(),
                 );
                 tokio::pin!(next);
                 tokio::select! {
@@ -6107,6 +6255,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        PairDemands::default(),
                     )
                     .await
                     .unwrap();
@@ -6122,6 +6271,7 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
+                            demand: PairDemands::default(),
                         },
                         prefill,
                         decode,
@@ -6193,6 +6343,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        PairDemands::default(),
                     )
                     .await
                     .unwrap();
@@ -6203,6 +6354,7 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    demand: PairDemands::default(),
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -7372,5 +7524,203 @@ mod tests {
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         drop(setup);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
+    }
+
+    /// A worker for the demand rows: labeled, serving `m` (with a context
+    /// window when one is given), ready, with a one-second client.
+    fn demand_worker(
+        url: String,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+        context_length: Option<u32>,
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .runtime_type(RuntimeType::Sglang)
+            .http_client(Arc::new(
+                crate::clients::http_client_builder()
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            ));
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        let mut card = ModelCard::new("m");
+        if let Some(window) = context_length {
+            card = card.with_context_length(window);
+        }
+        let worker = builder.model(card).build();
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        Arc::new(worker)
+    }
+
+    fn image_chat() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ]}],
+        }))
+        .expect("valid chat request")
+    }
+
+    fn text_chat() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request")
+    }
+
+    /// A request carrying pixel media is kept off a prefill worker without a
+    /// vision encoder (`supports_vision=false`) and lands on the one with
+    /// it, as the gRPC stage pairs it; a text request still uses both.
+    #[tokio::test]
+    async fn a_pixel_request_s_prefill_side_lands_on_the_worker_with_a_vision_encoder() {
+        let (no_encoder_url, no_encoder_seen) = spawn_recording_stub("{}").await;
+        let (encoder_url, encoder_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = single_attempt_router();
+        for worker in [
+            demand_worker(
+                no_encoder_url,
+                WorkerType::Prefill,
+                &[("supports_vision", "false")],
+                None,
+            ),
+            demand_worker(
+                encoder_url,
+                WorkerType::Prefill,
+                &[("supports_vision", "true")],
+                None,
+            ),
+            demand_worker(decode_url, WorkerType::Decode, &[], None),
+        ] {
+            router.worker_registry.register_or_replace(worker);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        for _ in 0..3 {
+            let response = router.route_chat(None, &tenant, image_chat(), "m").await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            taken(&no_encoder_seen).is_empty(),
+            "the worker without the encoder never saw a pixel request"
+        );
+        assert_eq!(taken(&encoder_seen).len(), 3);
+        assert_eq!(taken(&decode_seen).len(), 3);
+
+        for _ in 0..2 {
+            let response = router.route_chat(None, &tenant, text_chat(), "m").await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            !taken(&no_encoder_seen).is_empty(),
+            "a text request uses the worker without the encoder as before"
+        );
+    }
+
+    /// A pool whose prefill workers all lack the encoder refuses a pixel
+    /// request before either role is read, with the gRPC stage's 400; a
+    /// text request on the same pool is dispatched.
+    #[tokio::test]
+    async fn a_pixel_request_on_a_pool_without_a_vision_capable_prefill_is_refused_before_dispatch()
+    {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = single_attempt_router();
+        for worker in [
+            demand_worker(
+                prefill_url,
+                WorkerType::Prefill,
+                &[("supports_vision", "false")],
+                None,
+            ),
+            demand_worker(
+                decode_url,
+                WorkerType::Decode,
+                &[("supports_vision", "true")],
+                None,
+            ),
+        ] {
+            router.worker_registry.register_or_replace(worker);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router.route_chat(None, &tenant, image_chat(), "m").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_not_supported"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "capability cannot change inside a retry window"
+        );
+        assert!(taken(&prefill_seen).is_empty() && taken(&decode_seen).is_empty());
+
+        let response = router.route_chat(None, &tenant, text_chat(), "m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(taken(&prefill_seen).len(), 1);
+    }
+
+    /// A generate prompt the body carries as token ids is held to the pair's
+    /// context window, the longest sequence of a batch deciding: over it the
+    /// request is refused before dispatch with the pipeline's 400, within it
+    /// the pair is read as before. A prompt the router only has as text is
+    /// left to the engine.
+    #[tokio::test]
+    async fn a_generate_prompt_over_the_pair_s_window_is_refused_before_dispatch() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = single_attempt_router();
+        for worker in [
+            demand_worker(prefill_url, WorkerType::Prefill, &[], Some(8)),
+            demand_worker(decode_url, WorkerType::Decode, &[], Some(16)),
+        ] {
+            router.worker_registry.register_or_replace(worker);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let generate = |input_ids: Value| -> GenerateRequest {
+            serde_json::from_value(json!({"input_ids": input_ids, "stream": false}))
+                .expect("valid generate request")
+        };
+
+        for over in [
+            json!([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            json!([[1, 2], [1, 2, 3, 4, 5, 6, 7, 8, 9]]),
+        ] {
+            let response = router
+                .route_generate(None, &tenant, generate(over), "m")
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "context_length_exceeded"
+            );
+            assert!(taken(&prefill_seen).is_empty() && taken(&decode_seen).is_empty());
+        }
+
+        let response = router
+            .route_generate(
+                None,
+                &tenant,
+                generate(json!([1, 2, 3, 4, 5, 6, 7, 8])),
+                "m",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(taken(&prefill_seen).len(), 1);
+        assert_eq!(taken(&decode_seen).len(), 1);
+
+        let text: GenerateRequest =
+            serde_json::from_value(json!({"text": "a prompt of more than eight tokens, surely, in any tokenizer", "stream": false}))
+                .expect("valid generate request");
+        let response = router.route_generate(None, &tenant, text, "m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(taken(&prefill_seen).len(), 1);
     }
 }
