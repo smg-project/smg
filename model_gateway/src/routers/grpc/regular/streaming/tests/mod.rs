@@ -322,10 +322,10 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
         bytes
     }
     fn formatted(event: &MessageStreamEvent) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(64);
+        let mut buffer = BytesMut::with_capacity(64);
         StreamingProcessor::format_messages_sse_into(&mut buffer, event)
             .expect("the event formats");
-        buffer
+        buffer.to_vec()
     }
     let texts = [
         "",

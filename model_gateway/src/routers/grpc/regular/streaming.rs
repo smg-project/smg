@@ -80,7 +80,7 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, ChatChunkFrame, CompletionChunkFrame,
-        CHUNK_FLUSH_BYTES,
+        FrameSink, CHUNK_FLUSH_BYTES,
     },
 };
 
@@ -1458,10 +1458,11 @@ impl StreamingProcessor {
         }
     }
 
-    /// Format a `MessageStreamEvent` as Anthropic SSE into a reusable buffer.
+    /// Format a `MessageStreamEvent` as Anthropic SSE into `buffer`.
     ///
-    /// Writes `event: {type}\ndata: {json}\n\n` into `buffer`, avoiding per-event
-    /// allocations by reusing the same buffer across multiple events.
+    /// Writes `event: {type}\ndata: {json}\n\n` into `buffer`, which the
+    /// sender splits off to the channel without a copy
+    /// ([`Self::send_messages_event`]); the buffer keeps its room.
     ///
     /// The `content_block_delta` frames of the four string deltas, the frames a
     /// stream sends per token, are written in one pass: their constant text
@@ -1473,7 +1474,7 @@ impl StreamingProcessor {
     /// pins; every other event, `citations_delta` included, is serialized whole.
     #[inline]
     pub(crate) fn format_messages_sse_into(
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
         fn failed(e: serde_json::Error) -> String {
@@ -1510,9 +1511,9 @@ impl StreamingProcessor {
             buffer.extend_from_slice(
                 b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
             );
-            serde_json::to_writer(&mut *buffer, index).map_err(failed)?;
+            serde_json::to_writer(FrameSink(buffer), index).map_err(failed)?;
             buffer.extend_from_slice(delta_head);
-            serde_json::to_writer(&mut *buffer, text).map_err(failed)?;
+            serde_json::to_writer(FrameSink(buffer), text).map_err(failed)?;
             buffer.extend_from_slice(b"}}\n\n");
             return Ok(());
         }
@@ -1520,7 +1521,7 @@ impl StreamingProcessor {
         buffer.extend_from_slice(b"event: ");
         buffer.extend_from_slice(event_type.as_bytes());
         buffer.extend_from_slice(b"\ndata: ");
-        serde_json::to_writer(&mut *buffer, event).map_err(failed)?;
+        serde_json::to_writer(FrameSink(buffer), event).map_err(failed)?;
         buffer.extend_from_slice(b"\n\n");
         Ok(())
     }
@@ -1534,7 +1535,7 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
         (delta, spare, blocks): (
             &mut Delta,
@@ -1572,7 +1573,7 @@ impl StreamingProcessor {
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     async fn send_symphony_blocks(
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         (machine, blocks): (&mut adapt::messages::Stream, &mut Vec<MessageStreamEvent>),
         events: &[Event<'_>],
         thinking_text: bool,
@@ -1598,14 +1599,17 @@ impl StreamingProcessor {
         Ok(stop)
     }
 
-    /// Send a `MessageStreamEvent` through the SSE channel using a reusable buffer.
+    /// Write a `MessageStreamEvent` into `buffer` and hand it to the SSE
+    /// channel as one frame: the written bytes are split off, no copy, and
+    /// the buffer keeps its room for the next event (the chat stream's
+    /// `push_chunk` does the same).
     async fn send_messages_event(
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
         Self::format_messages_sse_into(buffer, event)?;
-        tx.send(Ok(Bytes::from(buffer.clone())))
+        tx.send(Ok(buffer.split().freeze()))
             .await
             .map_err(|_| "Client disconnected".to_string())
     }
@@ -1614,7 +1618,7 @@ impl StreamingProcessor {
     /// index: reasoning, text and tool calls can alternate.
     async fn stop_open_block(
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         index: &mut u32,
         open: [&mut bool; 3],
     ) -> Result<(), String> {
@@ -1634,7 +1638,7 @@ impl StreamingProcessor {
     /// have no block to go to, so they are dropped.
     async fn send_tool_arguments(
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         index: u32,
         tool_block_open: bool,
         partial_json: String,
@@ -1782,7 +1786,7 @@ impl StreamingProcessor {
                                 message: failure.to_string(),
                             },
                         };
-                        let mut buf = Vec::with_capacity(256);
+                        let mut buf = BytesMut::with_capacity(256);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
@@ -1833,7 +1837,7 @@ impl StreamingProcessor {
                                 message: failure.to_string(),
                             },
                         };
-                        let mut buf = Vec::with_capacity(256);
+                        let mut buf = BytesMut::with_capacity(256);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                 });
@@ -1845,7 +1849,7 @@ impl StreamingProcessor {
                         message: "Embeddings not supported for Messages API".to_string(),
                     },
                 };
-                let mut buf = Vec::with_capacity(256);
+                let mut buf = BytesMut::with_capacity(256);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
             // Batch results exist only on the completions pipeline.
@@ -1856,7 +1860,7 @@ impl StreamingProcessor {
                         message: "Batched results not supported for Messages API".to_string(),
                     },
                 };
-                let mut buf = Vec::with_capacity(256);
+                let mut buf = BytesMut::with_capacity(256);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
         }
@@ -3861,7 +3865,7 @@ struct ContentBlocks {
 impl ContentBlocks {
     /// Stop the open content block, if any, so the next block gets the next
     /// index.
-    async fn stop_open(&mut self, tx: &SseSender, buffer: &mut Vec<u8>) -> Result<(), String> {
+    async fn stop_open(&mut self, tx: &SseSender, buffer: &mut BytesMut) -> Result<(), String> {
         StreamingProcessor::stop_open_block(
             tx,
             buffer,
@@ -3880,7 +3884,7 @@ impl ContentBlocks {
     async fn start(
         &mut self,
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         content_block: ContentBlock,
     ) -> Result<(), String> {
         self.stop_open(tx, buffer).await?;
@@ -3896,7 +3900,7 @@ impl ContentBlocks {
     }
 
     /// A thinking block opens.
-    async fn open_thinking(&mut self, tx: &SseSender, buffer: &mut Vec<u8>) -> Result<(), String> {
+    async fn open_thinking(&mut self, tx: &SseSender, buffer: &mut BytesMut) -> Result<(), String> {
         self.start(
             tx,
             buffer,
@@ -3914,7 +3918,7 @@ impl ContentBlocks {
     async fn open_tool(
         &mut self,
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         tool_call_id: &str,
         name: String,
     ) -> Result<(), String> {
@@ -3938,7 +3942,7 @@ impl ContentBlocks {
     async fn text_delta(
         &mut self,
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         text: String,
     ) -> Result<(), String> {
         if !self.text_open {
@@ -3969,7 +3973,7 @@ impl ContentBlocks {
     async fn tool_arguments(
         &mut self,
         tx: &SseSender,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         partial_json: String,
     ) -> Result<(), String> {
         StreamingProcessor::send_tool_arguments(
@@ -4007,8 +4011,9 @@ struct MessagesStream<'a> {
     start_time: Instant,
     first_token_time: Option<Instant>,
 
-    /// Reusable SSE formatting buffer to avoid allocations per event
-    sse_buffer: Vec<u8>,
+    /// The buffer every event is written into and split off from without a
+    /// copy, as the chat stream's (`StreamingProcessor::send_messages_event`).
+    sse_buffer: BytesMut,
 
     blocks: ContentBlocks,
     has_tool_calls: bool,
@@ -4214,7 +4219,7 @@ impl<'a> MessagesStream<'a> {
             pd_timing,
             start_time,
             first_token_time: None,
-            sse_buffer: Vec::with_capacity(512),
+            sse_buffer: BytesMut::with_capacity(4096),
             blocks: ContentBlocks::default(),
             has_tool_calls: false,
             reasoning_parser: None,

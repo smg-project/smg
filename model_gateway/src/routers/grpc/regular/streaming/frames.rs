@@ -23,7 +23,7 @@ use crate::routers::grpc::spec::ChatResponseSpec;
 /// each write to the buffer's remaining room before it appends, which costs the
 /// length bookkeeping on every JSON token and turns the one-byte constant tokens
 /// into libc calls: about 7 % of a 128-delta stream request's user instructions.
-struct FrameSink<'a>(&'a mut BytesMut);
+pub(super) struct FrameSink<'a>(pub(super) &'a mut BytesMut);
 
 impl io::Write for FrameSink<'_> {
     #[inline]
