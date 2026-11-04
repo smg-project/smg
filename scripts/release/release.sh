@@ -26,11 +26,22 @@
 #   release.sh check <version>             the release gate for v<version>: what the repository can read (the versions
 #                                          at the branch head, its CI, the tag, main's drift) and the lines the release
 #                                          owner fills (the four model-provider verifiers)
+#   release.sh ship <version> [--dry-run] [--from <step>]
+#                                          the release in one run, on an existing release/<x.y>: the preflight (the CI of
+#                                          the commit the bump builds on, read and reported: a red row stops the ship, a
+#                                          pending one does not), the bump commit (pushed to the branch when no rule the
+#                                          caller cannot bypass requires a pull request, else its pull request, waited
+#                                          for), the tag, the notes, the GitHub release (a prerelease for a candidate,
+#                                          latest for a final) and the publish plan's dispatches, with the runs listed;
+#                                          every step reads the remote first and skips what is there, so an interrupted
+#                                          run is rerun as it stands; --from <step> starts at that step (preflight, bump,
+#                                          tag, notes, release, publish); --dry-run prints each step with the values it
+#                                          reads and writes nothing
 #
 # No push publishes anything: a bump on a release branch runs CI; the artifacts (wheels, crates, images, the chart)
-# come from the release-* workflows dispatched by hand against the release tag, as publish-plan lists them. A candidate
-# (X.Y.Z-rc.N) is never published to PyPI or crates.io: publish-plan leaves those dispatches out, and release-pypi,
-# release-crates and release-grpc refuse a ref named -rc.
+# come from the release-* workflows dispatched by hand against the release tag, as publish-plan lists them and the ship
+# dispatches them. A candidate (X.Y.Z-rc.N) is never published to PyPI or crates.io: publish-plan leaves those dispatches
+# out, and release-pypi, release-crates and release-grpc refuse a ref named -rc.
 #
 # <version> is X.Y.Z or X.Y.Z-rc.N; the release branch is release/X.Y. Every version file carries the one
 # string as written (Python tooling normalizes 1.14.0-rc.1 to 1.14.0rc1 on its own). Between cuts main reads
@@ -38,8 +49,11 @@
 # (a semver pre-release for cargo and Helm, X.Y.Z.dev0 once Python tooling normalizes it).
 #
 # Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1, the cut's main-move pull request
-# included; bump, pick and bump-main push their topic branch and open the pull request unless PUSH=0);
-# REGISTRY=0 (check and publish-plan do not read crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
+# included; bump, pick and bump-main push their topic branch and open the pull request unless PUSH=0; the ship pushes);
+# REGISTRY=0 (check, publish-plan and the ship do not read crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
+# The ship's: NOTES (an authored notes file, instead of the one it renders); BUMP_PUSH=1 (push the bump to the release
+# branch without reading the rules) or 0 (always its pull request); MERGE_WAIT (minutes it waits for the bump pull
+# request's merge, 120) and MERGE_POLL (seconds between two reads of it, 30).
 # The commits, the picks and the tag carry the caller's git identity and sign-off.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1 # the version checker is imported from the tree; no scripts/__pycache__ left behind
@@ -350,19 +364,28 @@ cmd_bump() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh bump <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch base since topic body kind
-  release=$(release_of "$version"); branch="release/$release"
   require_identity; require_clean; fetch
+  make_bump "$version"
+  open_pr "$bump_topic" "release/$(release_of "$version")" "$bump_title" "$bump_body"
+}
+
+# The bump commit the bump and the ship share: its topic, the title and the body file of its pull request.
+bump_topic="" bump_title="" bump_body=""
+make_bump() { # <version>: the bump commit on its topic branch off the release branch (the clone is left on the topic);
+  # bump_topic, bump_title and bump_body name it and its pull request for the caller to open, or to push past
+  local version=$1 release branch base since kind
+  release=$(release_of "$version"); branch="release/$release"
   base=$(release_base "$release")
   [ "$(manifest_version "$base")" != "$version" ] || die "$branch already reads $version"
   since=$(since_tag "$base" "$version")
-  topic="chore/release-$version"
-  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
+  bump_topic="chore/release-$version"
+  bump_title="chore(release): bump versions for v$version"
+  has_ref "refs/heads/$bump_topic" && die "the branch $bump_topic exists: delete it or finish it"
   if is_final "$version"; then kind="the final"; else kind="the next candidate"; fi
   note "bump: $kind on $branch, versions since $since"
-  git switch --quiet --no-track -c "$topic" "$base"
+  git switch --quiet --no-track -c "$bump_topic" "$base"
   bump_tree "$version" "$since"
-  body=$(mktemp)
+  bump_body=$(mktemp)
   {
     say "The version bump for v$version on \`$branch\` ($kind). Versions since $since:"
     say ""
@@ -373,10 +396,9 @@ cmd_bump() {
     say "Merging it makes \`$branch\` read v$version (nothing is published by the merge); then \`make release-tag VERSION=$version\` and \`make release-publish-plan VERSION=$version\`."
     say ""
     gate_section "$version" "$base"
-  } > "$body"
-  commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since." \
-    "$(commit_command "chore(release): bump versions for v$version"; pr_commands "$topic" "$branch" "chore(release): bump versions for v$version" "$body")"
-  open_pr "$topic" "$branch" "chore(release): bump versions for v$version" "$body"
+  } > "$bump_body"
+  commit_all "$bump_title" "$kind on $branch. Versions since $since." \
+    "$(commit_command "$bump_title"; pr_commands "$bump_topic" "$branch" "$bump_title" "$bump_body")"
 }
 
 cmd_pick() {
@@ -856,7 +878,7 @@ cmd_publish_plan() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh publish-plan <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref latest proto servicer list marks crate_name crate_version n=0
+  local release tagname ref
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
@@ -866,6 +888,13 @@ cmd_publish_plan() {
     note "publish-plan: $tagname is not tagged yet; the plan reads release/$release's head and names the tag as the ref to dispatch on"
   fi
   [ "$(manifest_version "$ref")" = "$version" ] || die "$ref reads $(manifest_version "$ref"), not $version"
+  publish_plan "$version" "$ref"
+}
+
+publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (the tag; the branch head before it exists; for the
+  # ship's dry run the head before the bump, whose dispatch lines are the tag's already)
+  local version=$1 ref=$2 tagname latest proto servicer list marks crate_name crate_version n=0
+  tagname="v$version"
   if is_final "$version"; then latest="and latest"; else latest="(a candidate: latest does not move)"; fi
   proto=$(ref_version "$ref" crates/grpc_client/python/pyproject.toml)
   servicer=$(ref_version "$ref" grpc_servicer/pyproject.toml)
@@ -898,7 +927,9 @@ cmd_publish_plan() {
   say "$((n += 1)). Engine images (ghcr.io/smg-project/smg:$version-<engine>-<engine version>, built from SMG_RELEASE_TAG = $tagname at that ref;"
   say "   one dispatch per engine and release base, the table of .github/workflows/release-engine-docker.yml at $tagname: a dispatch"
   say "   without base_image_ref builds the engine's first base only, so every other base is a dispatch of its own)"
-  engine_dispatches "$ref" "$tagname" | sed 's/^/   /'
+  # explicit, so that a table the Python cannot read stops the plan on every call path (under `if` and `||`, where set -e is off)
+  engine_dispatches "$ref" "$tagname" | sed 's/^/   /' \
+    || die "publish-plan: the engine table of .github/workflows/release-engine-docker.yml at $ref could not be read (its message is above); no engine dispatch listed"
   if ! is_candidate "$version"; then
     say "$((n += 1)). gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}$(registry_mark "$marks" smg-grpc-proto PyPI), smg-grpc-servicer==${servicer:-?}$(registry_mark "$marks" smg-grpc-servicer PyPI); versions already on PyPI are skipped)"
     say "   gh workflow run release-grpc.yml --ref $tagname"
@@ -931,79 +962,69 @@ gate_section() { # <version> <ref>: the release gate as a pull request body sect
   done
 }
 
-publish_rule() { # <version>: the gate's line on what the registries take: a candidate never, the final by its dispatches
-  if is_candidate "$1"; then
-    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub pre-release"
-  else
-    say "[note] publish: the final publishes to PyPI and crates.io by its dispatches (release.sh publish-plan $1 lists them; a candidate never does)"
+versions_row() { # <head> <version>: the gate's versions row for <head>; 0 when it is green
+  local head=$1 version=$2 carried since scratch
+  carried=$(manifest_version "$head")
+  if [ "$carried" != "$version" ]; then
+    say "[FAIL] versions: the branch reads $carried, not $version (release.sh bump $version)"
+    return 1
   fi
+  since=$(since_tag "$head" "$version")
+  scratch=$(mktemp -d)
+  git worktree add --quiet --detach "$scratch" "$head"
+  if (cd "$scratch" && "$PYTHON" scripts/check_release_versions.py --check "$since" >/dev/null 2>&1); then
+    git worktree remove --force "$scratch"
+    say "[ok]   versions: the branch reads $version and every crate, package and mirror is consistent with $since"
+    return 0
+  fi
+  git worktree remove --force "$scratch"
+  say "[FAIL] versions: the branch reads $version but scripts/check_release_versions.py --check $since finds issues (a bump pull request fixes them)"
+  return 1
 }
 
-cmd_check() {
-  local version=${1:-}
-  [ -n "$version" ] || die "usage: release.sh check <version>"
-  version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch base head tagname carried since scratch slug checks runs drift=0 family failed=0 full picked
-  local name state after from list listed held="" quiet="" unread=0 read=0
-  release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
-  fetch
-  base=$(release_ref "$release"); head=$(git rev-parse "$base")
-  say "Release gate for v$version ($branch at $(git rev-parse --short "$head"): $(git log -1 --format=%s "$head"))"
-  say ""
-  # 1. the versions at the head
-  carried=$(manifest_version "$head")
-  if [ "$carried" = "$version" ]; then
-    since=$(since_tag "$head" "$version")
-    scratch=$(mktemp -d)
-    git worktree add --quiet --detach "$scratch" "$head"
-    if (cd "$scratch" && "$PYTHON" scripts/check_release_versions.py --check "$since" >/dev/null 2>&1); then
-      say "[ok]   versions: the branch reads $version and every crate, package and mirror is consistent with $since"
-    else
-      say "[FAIL] versions: the branch reads $version but scripts/check_release_versions.py --check $since finds issues (a bump pull request fixes them)"
-      failed=1
-    fi
-    git worktree remove --force "$scratch"
-  else
-    say "[FAIL] versions: the branch reads $carried, not $version (release.sh bump $version)"
-    failed=1
-  fi
-  # 1b. the registries: a component at a version crates.io or PyPI hold already is skipped by its publish dispatch;
-  # with changes after that version was published, the release ships none of them. REGISTRY=0 skips the reads.
-  # The component list is read first, with its exit status: a list the checker could not produce is a failure of
-  # this item, never a shorter list that passes.
+registry_rows() { # <ref> <branch>: the gate's registry rows for the crates and packages at <ref>: a component at a version
+  # crates.io or PyPI hold already is skipped by its publish dispatch; with changes after that version was published, the
+  # release ships none of them. 0 when the row is green, 1 when it is red, 2 when the registries were not read (REGISTRY=0,
+  # an answer missing). The component list is read first, with its exit status: a list the checker could not produce is a
+  # failure of this item, never a shorter list that passes.
+  local ref=$1 branch=$2 list listed name carried state after from held="" quiet="" unread=0 read=0 failed=0
   list=$(mktemp)
-  if ! listed=$(component_list "$head" "$list" 2>&1); then
+  if ! listed=$(component_list "$ref" "$list" 2>&1); then
     say "[FAIL] registry: $listed; nothing was compared with crates.io or PyPI"
-    failed=1
-  else
-    while read -r name carried state after from; do
-      read=$((read + 1))
-      case $state in
-        held) if [ "$after" -gt 0 ]; then held="$held, $name $carried ($(after_text "$after" "$from"))"; else quiet="$quiet, $name $carried"; fi ;;
-        unread) unread=$((unread + 1)) ;;
-      esac
-    done < <(registry_report "$head" "$list")
-    if [ "$read" -ne "$(grep -c . "$list")" ]; then
-      say "[FAIL] registry: $read of $(grep -c . "$list") crates and packages compared with crates.io / PyPI (the report is short)"
-      failed=1
-    elif [ "${REGISTRY:-1}" = 0 ]; then
-      say "[....] registry: crates.io and PyPI not read (REGISTRY=0): a version they hold already is skipped by its publish dispatch"
-      failed=1
-    elif [ -n "$held" ]; then
-      say "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish dispatch skips them and ships none of those changes; a bump pull request against $branch moves them): ${held#, }"
-      failed=1
-    elif [ "$unread" -gt 0 ]; then
-      say "[....] registry: $unread of $read read(s) of crates.io / PyPI did not answer; read again before the tag"
-      failed=1
-    else
-      say "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already with changes after it ($read of $read read)"
-    fi
-    [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
+    return 1
   fi
-  publish_rule "$version"
-  # 2. CI on the head
+  while read -r name carried state after from; do
+    read=$((read + 1))
+    case $state in
+      held) if [ "$after" -gt 0 ]; then held="$held, $name $carried ($(after_text "$after" "$from"))"; else quiet="$quiet, $name $carried"; fi ;;
+      unread) unread=$((unread + 1)) ;;
+    esac
+  done < <(registry_report "$ref" "$list")
+  if [ "$read" -ne "$(grep -c . "$list")" ]; then
+    say "[FAIL] registry: $read of $(grep -c . "$list") crates and packages compared with crates.io / PyPI (the report is short)"
+    failed=1
+  elif [ "${REGISTRY:-1}" = 0 ]; then
+    say "[....] registry: crates.io and PyPI not read (REGISTRY=0): a version they hold already is skipped by its publish dispatch"
+    failed=2
+  elif [ -n "$held" ]; then
+    say "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish dispatch skips them and ships none of those changes; a bump pull request against $branch moves them): ${held#, }"
+    failed=1
+  elif [ "$unread" -gt 0 ]; then
+    say "[....] registry: $unread of $read read(s) of crates.io / PyPI did not answer; read again before the tag"
+    failed=2
+  else
+    say "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already with changes after it ($read of $read read)"
+  fi
+  [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
+  return "$failed"
+}
+
+ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, and the test matrix on this very commit (a
+  # documentation-only merge runs none, the push trigger's paths-ignore, and the pull request's run was for the merge ref,
+  # not the branch head, so a run is required by head sha). 0 when green; 1 when a row is red (a failed or cancelled run,
+  # no run of the matrix at all, a read that failed); 2 when a row is pending or the head is not on the repository gh reads.
+  local head=$1 branch=$2 slug checks runs ok=0 bad=0 pending=0 line read_rc=0 error state=0
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
-    local ok=0 bad=0 pending=0 line read_rc=0 error
     # On an API error gh leaves the error body on stdout ({"message": ...}) and exits non-zero: the read is reported
     # as the failure it is, never counted as a check run (a head the remote does not have yet answers 422).
     checks=$("$GH" api --paginate "repos/$slug/commits/$head/check-runs?per_page=100" --jq '.check_runs[] | "\(.conclusion // .status) \(.name)"' 2>/dev/null) || read_rc=$?
@@ -1013,13 +1034,14 @@ cmd_check() {
         # Two causes, both outside this read: the head is not pushed (a cut rehearsed locally, a stale or hand-made
         # remote-tracking ref), or gh reads another repository than $REMOTE (a fork as the remote, GH_REPO, gh repo set-default).
         say "[....] CI: $(git rev-parse --short "$head") is not on $slug, the repository gh reads ($REMOTE is $(git remote get-url "$REMOTE")): either the head is not pushed yet, or gh is pointed at another repository than $REMOTE (GH_REPO, gh repo set-default, a fork as the remote); its checks and its PR Test (SMG) run are read here once they agree"
+        state=2
       else
         say "[FAIL] CI: the check-runs read failed (${error:-gh exited $read_rc}); the checks and the PR Test (SMG) run of $(git rev-parse --short "$head") are at https://github.com/$slug/commits/$head"
+        state=1
       fi
-      failed=1
     elif [ -z "$checks" ]; then
       say "[....] CI: no check run on $(git rev-parse --short "$head") yet (https://github.com/$slug/commits/$head)"
-      failed=1
+      state=2
     else
       while IFS= read -r line; do
         case "$line" in
@@ -1032,31 +1054,67 @@ cmd_check() {
         say "[ok]   CI: $ok check(s) green on $(git rev-parse --short "$head")"
       else
         say "[FAIL] CI: $ok green, $bad red, $pending pending on $(git rev-parse --short "$head") (https://github.com/$slug/commits/$head)"
-        failed=1
+        if [ "$bad" -gt 0 ]; then state=1; else state=2; fi
       fi
     fi
-    # The test matrix on this very commit: a documentation-only merge runs none (the push trigger's paths-ignore)
-    # and the pull request's run was for the merge ref, not the branch head, so a run is required by head sha.
-    # A head the remote lacks has none, and a read that failed above fails here the same way: one line says so.
+    # A head the remote lacks has no run, and a read that failed above fails here the same way: one line says so.
     if [ "$read_rc" -eq 0 ]; then
       runs=$("$GH" api "repos/$slug/actions/workflows/pr-test-rust.yml/runs?head_sha=$head&per_page=20" --jq '.workflow_runs[] | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null) || read_rc=$?
       if [ "$read_rc" -ne 0 ]; then
         error=$(api_message "$runs")
         say "[FAIL] PR Test (SMG): the workflow-runs read failed (${error:-gh exited $read_rc}); the runs of $(git rev-parse --short "$head") are at https://github.com/$slug/actions/workflows/pr-test-rust.yml"
-        failed=1
+        state=1
       elif [ -z "$runs" ]; then
+        # an absent matrix is not a queued one: nothing arrives by waiting
         say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
-        failed=1
+        state=1
       elif grep -q '^success ' <<< "$runs"; then
         say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
       else
         say "[FAIL] PR Test (SMG): no successful run on $(git rev-parse --short "$head") yet: $(tr '\n' ';' <<< "$runs")"
-        failed=1
+        # a run still going is waited for; runs that all ended without a success are red
+        if grep -Eq '^(queued|in_progress|waiting|requested|pending) ' <<< "$runs"; then [ "$state" -eq 1 ] || state=2; else state=1; fi
       fi
     fi
   else
     say "[....] CI: not readable here (gh is not installed or not logged in): read the checks of $(git rev-parse --short "$head") on the branch page"
   fi
+  return "$state"
+}
+
+verifier_rows() { # the provider verifiers: the release owner's lines, as the gate prints them
+  local family
+  say "[....] model-provider verifiers against this candidate build (the release owner fills the record links; they go into the final's bump pull request):"
+  for family in $VERIFIER_FAMILIES; do
+    say "       [ ] $family provider verifier: <record link>"
+  done
+}
+
+publish_rule() { # <version>: the gate's line on what the registries take: a candidate never, the final by its dispatches
+  if is_candidate "$1"; then
+    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub pre-release"
+  else
+    say "[note] publish: the final publishes to PyPI and crates.io by its dispatches (release.sh publish-plan $1 lists them; a candidate never does)"
+  fi
+}
+
+cmd_check() {
+  local version=${1:-}
+  [ -n "$version" ] || die "usage: release.sh check <version>"
+  version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
+  local release branch base head tagname drift=0 failed=0 full picked
+  release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
+  fetch
+  base=$(release_ref "$release"); head=$(git rev-parse "$base")
+  say "Release gate for v$version ($branch at $(git rev-parse --short "$head"): $(git log -1 --format=%s "$head"))"
+  say ""
+  # 1. the versions at the head
+  versions_row "$head" "$version" || failed=1
+  # 1b. the registries
+  registry_rows "$head" "$branch" || failed=1
+  publish_rule "$version"
+  # 2. CI on the head
+  ci_rows "$head" "$branch" || failed=1
   # 3. the tag
   if has_ref "refs/tags/$tagname" || remote_has_tag "$tagname"; then
     if [ "$(git rev-parse "$tagname^{commit}" 2>/dev/null)" = "$head" ]; then
@@ -1074,10 +1132,7 @@ cmd_check() {
   done < <(git log --cherry-pick --right-only --no-merges --format=%H "$base...$REMOTE/main")
   say "[note] main: $drift commit(s) on $REMOTE/main are not on $branch (release.sh status $release lists them; release.sh pick $release <sha> brings one over)"
   # 5. the provider verifiers: the release owner's lines
-  say "[....] model-provider verifiers against this candidate build (the release owner fills the record links; they go into the final's bump pull request):"
-  for family in $VERIFIER_FAMILIES; do
-    say "       [ ] $family provider verifier: <record link>"
-  done
+  verifier_rows
   say ""
   if [ "$failed" -eq 0 ]; then
     say "The repository-readable items pass; the verifier lines are the release owner's."
@@ -1085,6 +1140,328 @@ cmd_check() {
     say "A repository-readable item is not green yet."
   fi
   return "$failed"
+}
+
+# --- the ship --------------------------------------------------------------------------------
+# One run takes a release from the bump to the dispatches. Every step reads the remote first and skips what is there
+# already (the branch reads the version, the tag, the GitHub release, a dispatch's run), so an interrupted run is rerun
+# as it stands, or from a step with --from; nothing outward happens before the rows the bumped tree answers are green.
+# A dry run reads and prints each step with the values it would use; it writes nothing, in the clone or on the remote.
+
+SHIP_STEPS="preflight bump tag notes release publish"
+ship_dry=0 ship_version="" ship_release="" ship_branch="" ship_tag="" ship_head="" ship_notes_file="" ship_new=0 ship_had=0
+push_block="" dispatched_run=""
+
+ship_say() { say "ship: $*"; }
+ship_would() { say "ship: would $*"; }
+
+cmd_ship() {
+  local version="" from=preflight step started=0 kind base
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run) ship_dry=1 ;;
+      --from) shift; from=${1:-} ;;
+      --from=*) from=${1#--from=} ;;
+      -*) die "usage: release.sh ship <version> [--dry-run] [--from <step>] (unknown option $1)" ;;
+      *) [ -z "$version" ] || die "usage: release.sh ship <version> [--dry-run] [--from <step>]"; version=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$version" ] || die "usage: release.sh ship <version> [--dry-run] [--from <step>]"
+  version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
+  case " $SHIP_STEPS " in *" $from "*) ;; *) die "unknown step '$from': --from takes one of: $SHIP_STEPS" ;; esac
+  command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
+  # the account the ship acts as, read as the rules probe reads it (one host, one token): a bare `gh auth status` judges every host and account gh knows
+  "$GH" api user --jq .id >/dev/null 2>&1 || die "'$GH' is not logged in (gh auth login, or GH_TOKEN): the ship reads the repository's rules and runs, opens the release and dispatches the workflows through it"
+  ship_version=$version; ship_release=$(release_of "$version"); ship_branch="release/$ship_release"; ship_tag="v$version"
+  [ "$ship_dry" -eq 1 ] || require_identity
+  fetch
+  base=$(release_base "$ship_release"); ship_head=$(git rev-parse "$base")
+  PUSH=1 # the ship is the push: the tag's and the bump pull request's helpers push and open
+  if is_final "$version"; then kind="the final"; else kind="a candidate"; fi
+  ship_say "v$version, $kind on $ship_branch at $(git rev-parse --short "$ship_head") ($(git log -1 --format=%s "$ship_head"))"
+  [ "$ship_dry" -eq 0 ] || ship_say "dry run: each step prints what it would do with what it reads now; nothing is written"
+  for step in $SHIP_STEPS; do
+    [ "$step" != "$from" ] || started=1
+    if [ "$started" -eq 0 ]; then ship_say "$step: skipped (--from $from)"; continue; fi
+    "ship_$step"
+  done
+  if [ "$ship_dry" -eq 1 ]; then
+    ship_say "dry run of v$version done: nothing was committed, pushed, tagged, created or dispatched"
+  else
+    ship_say "v$version is out: $ship_branch at $(git rev-parse --short "$ship_head"), the tag $ship_tag, its GitHub release, $ship_new new dispatch(es) ($ship_had were there already); a run that fails is dispatched again by 'release.sh ship $version --from publish'"
+  fi
+}
+
+ship_preflight() { # the CI of the commit the bump builds on: the bump moves version files only and ships on its parent's run
+  local parent=$ship_head ci=0
+  if [ "$(manifest_version "$ship_head")" = "$ship_version" ]; then
+    parent=$(git rev-parse "$ship_head^")
+    ship_say "preflight: $ship_branch reads $ship_version already; the CI of the bump's parent $(git rev-parse --short "$parent") is read"
+  else
+    ship_say "preflight: the CI of $ship_branch's head $(git rev-parse --short "$parent"), the commit the bump builds on"
+  fi
+  ci_rows "$parent" "$ship_branch" || ci=$?
+  case $ci in
+    1) die "a CI row of $(git rev-parse --short "$parent") is red (above): fix it, or run the matrix (gh workflow run pr-test-rust.yml --ref $ship_branch), then rerun the ship; --from bump skips this preflight once the state is read by hand" ;;
+    2) ship_say "preflight: the pending rows above do not hold the ship (the bump changes version files only and ships on its parent's run)" ;;
+  esac
+  verifier_rows
+}
+
+ship_rows() { # <ref> <what it is>: the gate rows a bumped tree answers (its versions, the registries) at <ref>; a row that is not
+  # green stops the ship before anything leaves the clone (REGISTRY=0 skips the registry reads and says so)
+  local ref=$1 what=$2 state=0 registry=0
+  versions_row "$ref" "$ship_version" || state=1
+  registry_rows "$ref" "$ship_branch" || registry=$?
+  if [ "$registry" -eq 2 ] && [ "${REGISTRY:-1}" = 0 ]; then
+    ship_say "the registries were not read (REGISTRY=0): the ship goes on"
+  elif [ "$registry" -ne 0 ]; then
+    state=1
+  fi
+  [ "$state" -eq 0 ] || die "a row of $what is not green (above): fix it, then rerun the ship (a bump pull request moves a held version; REGISTRY=0 skips the registry reads)"
+}
+
+release_push_allowed() { # <branch>: 0 when the repository's rules let the caller move <branch> by a push: no branch protection of
+  # the classic kind, and no pull-request or status-check rule, or the caller on the always-bypass list of every ruleset that
+  # carries one. push_block says what stands in the way otherwise. A bypass by team or role is not read here: BUMP_PUSH=1 names it.
+  local branch=$1 slug protected rules type id me actors
+  push_block=""
+  if ! slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) || [ -z "$slug" ]; then
+    push_block="gh does not read the repository (not logged in?)"; return 1
+  fi
+  protected=$("$GH" api "repos/$slug/branches/${branch//\//%2F}" --jq .protected 2>/dev/null) \
+    || { push_block="the branch page of $branch could not be read"; return 1; }
+  [ "$protected" = false ] || { push_block="$branch carries branch protection (the classic kind)"; return 1; }
+  rules=$("$GH" api "repos/$slug/rules/branches/${branch//\//%2F}" \
+    --jq '.[] | select(.type == "pull_request" or .type == "required_status_checks") | "\(.type) \(.ruleset_id)"' 2>/dev/null) \
+    || { push_block="the rules of $branch could not be read"; return 1; }
+  [ -n "$rules" ] || return 0
+  me=$("$GH" api user --jq .id 2>/dev/null) || { push_block="the caller's account could not be read"; return 1; }
+  while read -r type id; do
+    actors=$("$GH" api "repos/$slug/rulesets/$id" \
+      --jq '.bypass_actors[]? | select(.actor_type == "User" and .bypass_mode == "always") | .actor_id' 2>/dev/null) || actors=""
+    grep -qx "$me" <<< "$actors" \
+      || { push_block="the rule '$type' of ruleset $id applies to $branch and the caller is not on its bypass list"; return 1; }
+  done <<< "$rules"
+  return 0
+}
+
+wait_for_merge() { # <pull request number>: returns once it is merged; MERGE_WAIT minutes at most, read every MERGE_POLL seconds
+  local number=$1 state deadline
+  deadline=$(( $(date +%s) + ${MERGE_WAIT:-120} * 60 ))
+  while :; do
+    state=$("$GH" pr view "$number" --json state --jq .state 2>/dev/null) \
+      || die "gh pr view $number failed: the bump pull request's state is unknown; rerun the ship once gh answers (an open pull request is waited for)"
+    case $state in
+      MERGED) return 0 ;;
+      CLOSED) die "the bump pull request #$number was closed without a merge: reopen it, or delete its topic branch and rerun the ship" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || die "the bump pull request #$number is not merged after ${MERGE_WAIT:-120} min: merge it, then rerun the ship (it reads the branch bumped and goes on from the tag)"
+    sleep "${MERGE_POLL:-30}"
+  done
+}
+
+bump_landed() { # <topic>: the branch after the bump landed: the remote's head reads the version; a topic the branch carries is dropped
+  local base
+  fetch
+  base=$(release_base "$ship_release"); ship_head=$(git rev-parse "$base")
+  [ "$(manifest_version "$ship_head")" = "$ship_version" ] \
+    || die "$ship_branch reads $(manifest_version "$ship_head") at $(git rev-parse --short "$ship_head") after the bump landed, not $ship_version: the branch moved under the ship; read it (release.sh status $ship_release) before a rerun"
+  ship_say "bump: $ship_branch reads $ship_version at $(git rev-parse --short "$ship_head")"
+  if has_ref "refs/heads/$1" && git merge-base --is-ancestor "refs/heads/$1" "$ship_head"; then
+    git branch --quiet -D "$1"
+  fi
+}
+
+ship_bump() { # the bump commit reaches the branch: by a push when the rules allow the caller one, else by its pull request
+  local topic="chore/release-$ship_version" number direct reason out url start start_branch
+  if [ "$(manifest_version "$ship_head")" = "$ship_version" ]; then
+    ship_say "bump: done, $ship_branch reads $ship_version at $(git rev-parse --short "$ship_head")"
+    ship_rows "$ship_head" "the branch head"
+    return 0
+  fi
+  number=$("$GH" pr list --head "$topic" --base "$ship_branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  if [ -n "$number" ]; then
+    if [ "$ship_dry" -eq 1 ]; then ship_would "wait for the merge of the open bump pull request #$number ($topic), ${MERGE_WAIT:-120} min at most"; return 0; fi
+    ship_say "bump: the pull request #$number of $topic is open (an earlier run): waiting for its merge (${MERGE_WAIT:-120} min at most, read every ${MERGE_POLL:-30} s)"
+    wait_for_merge "$number"
+    bump_landed "$topic"
+    return 0
+  fi
+  case "${BUMP_PUSH:-}" in
+    1) direct=1; reason="directly (BUMP_PUSH=1)" ;;
+    0) direct=0; reason="by a pull request (BUMP_PUSH=0)" ;;
+    *) if release_push_allowed "$ship_branch"; then direct=1; reason="directly: no rule the caller cannot bypass requires a pull request on $ship_branch"
+       else direct=0; reason="by a pull request: $push_block"; fi ;;
+  esac
+  if [ "$ship_dry" -eq 1 ]; then
+    ship_would "commit 'chore(release): bump versions for v$ship_version' on $topic off $ship_branch (make bump-version, check_release_versions.py --fix, cargo update --workspace), check the versions and the registries at it, and move $ship_branch to it $reason"
+    return 0
+  fi
+  has_ref "refs/heads/$topic" && die "the branch $topic exists (a bump that did not land): delete it (git branch -D $topic; the ship remakes the commit) and rerun"
+  require_clean
+  start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
+  make_bump "$ship_version"
+  back_to "$start_branch" "$start"
+  ship_rows "refs/heads/$topic" "the bump commit (nothing is pushed; it sits on $topic)"
+  if [ "$direct" -eq 1 ]; then
+    ship_say "bump: pushing $topic to $ship_branch $reason"
+    if out=$(git push "$REMOTE" "refs/heads/$topic:refs/heads/$ship_branch" 2>&1); then
+      bump_landed "$topic"
+      return 0
+    fi
+    grep -q 'remote rejected' <<< "$out" || die "the push of $topic to $ship_branch failed:
+$out"
+    ship_say "bump: $REMOTE refused the push ($(grep -m1 'remote rejected' <<< "$out" | sed 's/^ *//')): opening the bump pull request instead"
+  else
+    ship_say "bump: opening the pull request of $topic against $ship_branch ($reason)"
+  fi
+  url=$(open_pr "$topic" "$ship_branch" "$bump_title" "$bump_body") \
+    || die "the bump pull request of $topic was not opened (its cause is above): rerun the ship once it is fixed; an open pull request is waited for"
+  url=$(tail -n 1 <<< "$url"); number=${url##*/}
+  ship_say "bump: pull request #$number opened ($url): waiting for its merge (${MERGE_WAIT:-120} min at most, read every ${MERGE_POLL:-30} s)"
+  wait_for_merge "$number"
+  bump_landed "$topic"
+}
+
+ship_tag() { # the tag at the branch head, pushed; a tag that exists elsewhere stops the ship (tags never move)
+  local at
+  if remote_has_tag "$ship_tag"; then
+    at=$(git ls-remote --tags "$REMOTE" "refs/tags/$ship_tag" "refs/tags/$ship_tag^{}" | tail -n 1 | cut -f1)
+    [ "$at" = "$ship_head" ] \
+      || die "$ship_tag is on $REMOTE at ${at:0:7}, not at $ship_branch's head $(git rev-parse --short "$ship_head"): tags never move; the ship stops"
+    ship_say "tag: done, $ship_tag is on $REMOTE at $(git rev-parse --short "$ship_head")"
+    return 0
+  fi
+  if has_ref "refs/tags/$ship_tag"; then
+    at=$(git rev-parse "$ship_tag^{commit}")
+    [ "$at" = "$ship_head" ] \
+      || die "the tag $ship_tag exists here at ${at:0:7}, not at $ship_branch's head $(git rev-parse --short "$ship_head"): delete it (git tag -d $ship_tag) and rerun"
+    if [ "$ship_dry" -eq 1 ]; then ship_would "push the tag $ship_tag (made by an earlier run, at the branch head) to $REMOTE"; return 0; fi
+    ship_say "tag: $ship_tag exists here at the branch head (an earlier run): pushing it"
+    push_release_ref "refs/tags/$ship_tag" "makes the tag public"
+    return 0
+  fi
+  if [ "$ship_dry" -eq 1 ]; then ship_would "tag $ship_tag at $ship_branch's head once it reads $ship_version (the versions checked against the previous tag) and push it to $REMOTE"; return 0; fi
+  cmd_tag "$ship_version"
+}
+
+notes_unfilled() { # <file>: what keeps a notes file from publication, one line each (nothing when it is ready): an empty file, a
+  # heading that is not the release's; the notes template's unfilled placeholders join here once the notes render it
+  [ -s "$1" ] || { say "the file is empty"; return 0; }
+  head -n 1 "$1" | grep -qx "## SMG $ship_tag" || say "the first line is not '## SMG $ship_tag'"
+}
+
+ship_notes() { # the notes file the GitHub release carries: NOTES when given, else rendered once (an existing render is kept: it may be edited)
+  local unfilled rendered
+  rendered=$(git rev-parse --git-path release) # under the git directory, out of the tree; relative to the root unless elsewhere
+  case $rendered in /*) ;; *) rendered=$root/$rendered ;; esac
+  ship_notes_file=${NOTES:-$rendered/notes-$ship_tag.md}
+  if [ -n "${NOTES:-}" ]; then
+    [ -s "$NOTES" ] || die "NOTES=$NOTES is missing or empty"
+    ship_say "notes: $NOTES (NOTES)"
+  elif [ -s "$ship_notes_file" ]; then
+    ship_say "notes: $ship_notes_file, rendered by an earlier run (edit it, or delete it for a fresh render)"
+  elif [ "$ship_dry" -eq 1 ]; then
+    ship_would "render the notes (release.sh notes $ship_version) into $ship_notes_file"
+    return 0
+  else
+    mkdir -p "$(dirname "$ship_notes_file")"
+    # rendered beside its place and moved there once whole: a render that stops halfway leaves no file a rerun would keep
+    cmd_notes "$ship_version" > "$ship_notes_file.partial"
+    mv "$ship_notes_file.partial" "$ship_notes_file"
+    ship_say "notes: rendered into $ship_notes_file ($(grep -c . "$ship_notes_file") lines)"
+  fi
+  unfilled=$(notes_unfilled "$ship_notes_file")
+  [ -z "$unfilled" ] || die "the notes at $ship_notes_file are not ready for publication: $(tr '\n' ';' <<< "$unfilled") (fill them, then rerun the ship: --from notes)"
+}
+
+ship_release() { # the GitHub release on the tag: a prerelease for a candidate, latest for a final; one that exists is kept
+  local flags=() existing url
+  [ -n "$ship_notes_file" ] || ship_notes # --from release: the notes step ran in an earlier run, or runs now
+  if is_final "$ship_version"; then flags=(--latest); else flags=(--prerelease); fi
+  if existing=$("$GH" release view "$ship_tag" --json url,isPrerelease --jq '"\(.url) (prerelease: \(.isPrerelease))"' 2>/dev/null); then
+    ship_say "release: done, $existing"
+    return 0
+  fi
+  if [ "$ship_dry" -eq 1 ]; then ship_would "create the GitHub release: gh release create $ship_tag --verify-tag ${flags[*]} --title 'SMG $ship_tag' --notes-file $ship_notes_file"; return 0; fi
+  url=$("$GH" release create "$ship_tag" --verify-tag "${flags[@]}" --title "SMG $ship_tag" --notes-file "$ship_notes_file") \
+    || die "gh release create $ship_tag failed (its message is above): rerun the ship once the cause is fixed (--from release)"
+  ship_say "release: created $url (${flags[*]#--})"
+}
+
+run_rows() { # <tag> <workflow file>: the workflow's runs on <tag>, "id<TAB>title<TAB>status<TAB>conclusion" per line, with gh's
+  # status: a read that failed is not an empty list (an empty list would dispatch the whole plan again)
+  "$GH" run list --workflow "$2" --branch "$1" --limit 100 --json databaseId,displayTitle,status,conclusion \
+    --jq '.[] | "\(.databaseId)\t\(.displayTitle)\t\(.status)\t\(.conclusion // "")"'
+}
+dispatched() { # <dispatch line> <its workflow's runs>: 0 when a run of this dispatch that did not fail is among them (dispatched_run
+  # names it). An engine-image dispatch is told by its run name, which carries the engine and the base image.
+  local line=$1 rows=$2 engine="" base="engine default" id title status conclusion
+  case "$line" in *" -f engine="*) engine=${line#* -f engine=}; engine=${engine%% *} ;; esac
+  case "$line" in *" -f base_image_ref="*) base=${line#* -f base_image_ref=}; base=${base%% *} ;; esac
+  while IFS=$'\t' read -r id title status conclusion; do
+    [ -n "$id" ] || continue
+    if [ -n "$engine" ]; then case "$title" in *"SMG+$engine | base=$base |"*) ;; *) continue ;; esac; fi
+    case "$conclusion" in failure | cancelled | timed_out | startup_failure | action_required | stale) continue ;; esac
+    dispatched_run="$id (${conclusion:-$status})"
+    return 0
+  done < "$rows"
+  return 1
+}
+
+ship_publish() { # the publish plan's dispatches against the tag, each once; then the runs on the tag
+  local ref=$ship_tag plan cache line words file failed=0 id workflow status conclusion title table
+  local lines=()
+  if ! has_ref "refs/tags/$ship_tag"; then
+    [ "$ship_dry" -eq 1 ] || die "the tag $ship_tag does not exist: the dispatches run against it (release.sh ship $ship_version --from tag)"
+    ref=$ship_head
+    ship_say "publish: the plan is read at $(git rev-parse --short "$ref"), before the bump: its dispatch lines are the tag's, its crate versions the bump's once it exists"
+  fi
+  # The plan is read whole, with its exit status, before the first dispatch: a plan that fails after its first lines
+  # (the component list, a registry) dispatches nothing. Its dispatch lines are read from the file, without the comments.
+  plan=$(mktemp)
+  if ! (publish_plan "$ship_version" "$ref") > "$plan"; then
+    die "the publish plan of v$ship_version could not be read (its message is above): nothing is dispatched"
+  fi
+  mapfile -t lines < <(sed -n 's/^ *\(gh workflow run .*\)$/\1/p' "$plan" | sed 's/ *#.*$//')
+  [ ${#lines[@]} -gt 0 ] || die "the publish plan of v$ship_version names no dispatch"
+  cache=$(mktemp -d)
+  for line in ${lines[@]+"${lines[@]}"}; do
+    read -r -a words <<< "$line" # gh workflow run <file> --ref <tag> [-f <input>=<value>]...
+    file=${words[3]}
+    if [ ! -f "$cache/$file" ] && ! run_rows "$ship_tag" "$file" > "$cache/$file"; then
+      die "the runs of $file on $ship_tag could not be read (gh run list --workflow $file --branch $ship_tag; its message is above): a run that is there must not be dispatched twice, so nothing more is dispatched; rerun the ship (--from publish) once gh answers (what was dispatched is skipped then)"
+    fi
+    if dispatched "$line" "$cache/$file"; then
+      ship_say "publish: done, $line: run $dispatched_run"
+      ship_had=$((ship_had + 1))
+    elif [ "$ship_dry" -eq 1 ]; then
+      ship_would "dispatch: $line"
+    elif "$GH" "${words[@]:1}" >/dev/null; then
+      ship_say "publish: dispatched $line"
+      ship_new=$((ship_new + 1))
+    else
+      ship_say "publish: FAILED $line (gh's message is above)"
+      failed=$((failed + 1))
+    fi
+  done
+  [ "$ship_dry" -eq 0 ] || return 0
+  ship_say "publish: $ship_new dispatched, $ship_had there already, $failed failed"
+  [ "$ship_new" -eq 0 ] || sleep 5 # a dispatch's run is listed a moment after gh returns
+  say "the runs on $ship_tag (gh run list --branch $ship_tag):"
+  if table=$("$GH" run list --branch "$ship_tag" --limit 100 --json databaseId,workflowName,status,conclusion,displayTitle \
+    --jq '.[] | "\(.databaseId)\t\(.workflowName)\t\(.status)\t\(.conclusion // "")\t\(.displayTitle)"'); then
+    while IFS=$'\t' read -r id workflow status conclusion title; do
+      [ -n "$id" ] || continue
+      printf '  %-12s %-36s %-20s %s\n' "$id" "$workflow" "$status${conclusion:+ $conclusion}" "$title"
+    done <<< "$table"
+  else
+    say "  (the run list could not be read; the dispatches above stand)"
+  fi
+  [ "$failed" -eq 0 ] || die "$failed dispatch(es) failed: rerun the ship (--from publish) once the cause is fixed; the ones that ran are skipped"
 }
 
 command=${1:-help}
@@ -1100,6 +1477,7 @@ case "$command" in
   bump-main) cmd_bump_main "$@" ;;
   publish-plan) cmd_publish_plan "$@" ;;
   check) cmd_check "$@" ;;
+  ship) cmd_ship "$@" ;;
   help | -h | --help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;
 esac
