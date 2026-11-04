@@ -586,7 +586,7 @@ jobs:
             case "$rc" in
               0) ;;
               1) echo "::warning::BFCL A/B score regression beyond tolerance — see job summary" ;;
-              *) echo "::error::BFCL A/B incomplete (run_ab exit $rc): an arm timed out or produced no scores"
+              *) echo "::error::BFCL A/B incomplete (run_ab exit $rc): an arm or the driver did not complete; see the step log"
                  AB_RC=$rc ;;
             esac
           }
