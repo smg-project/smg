@@ -249,6 +249,7 @@ fn messages_usage_cache_counters_serialize_as_integer_zeros() {
     let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         None,
     ))
     .unwrap();
@@ -256,6 +257,24 @@ fn messages_usage_cache_counters_serialize_as_integer_zeros() {
     assert_eq!(delta["input_tokens"], 25);
     assert_eq!(delta["cache_creation_input_tokens"], 0);
     assert_eq!(delta["cache_read_input_tokens"], 0);
+}
+
+/// The final message_delta splits the engine's prompt count as the wire
+/// does: the input outside the cache beside the hit as
+/// `cache_read_input_tokens`, both integers, their sum the prompt; the
+/// creation counter stays zero.
+#[test]
+fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
+    let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+        15,
+        Some(945),
+        896,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(delta["input_tokens"], 49);
+    assert_eq!(delta["cache_read_input_tokens"], 896);
+    assert_eq!(delta["cache_creation_input_tokens"], 0);
 }
 
 /// The `message_start` skeleton carries every key the public API writes
@@ -274,6 +293,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
     let plain = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         None,
     ))
     .unwrap();
@@ -281,6 +301,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
     let thinking = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         Some(9),
     ))
     .unwrap();
@@ -292,7 +313,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
 #[test]
 fn message_delta_input_tokens_null_without_authoritative_usage() {
     let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-        15, None, None,
+        15, None, 0, None,
     ))
     .unwrap();
     assert!(delta.get("input_tokens").is_some_and(Value::is_null));

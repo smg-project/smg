@@ -2553,31 +2553,40 @@ impl StreamingProcessor {
             .map_err(|_| "Channel closed".to_string())
     }
 
-    /// Skeleton usage for the `message_start` event. Cache counters are
-    /// integer zeros, never null: the Anthropic wire contract has
-    /// always-present cache counters and clients do arithmetic on them; the
-    /// cache-creation breakdown, service tier and inference geography are
-    /// written on the skeleton too, as the public API writes them.
+    /// Skeleton usage for the `message_start` event, written before the
+    /// engine's first frame: every count zero. Cache counters are integer
+    /// zeros, never null: the Anthropic wire contract has always-present
+    /// cache counters and clients do arithmetic on them; the cache-creation
+    /// breakdown, service tier and inference geography are written on the
+    /// skeleton too, as the public API writes them. The measured prompt and
+    /// cache-read counts come with the final `message_delta`
+    /// ([`Self::final_messages_delta_usage`]).
     fn initial_messages_usage() -> messages::Usage {
         messages::Usage::from_counts(0, 0)
     }
 
-    /// Usage for the final `message_delta` event. `authoritative_input` is the
-    /// prompt count only when a `Complete` was seen; a clean EOF without one
-    /// must serialize `input_tokens: null` rather than claim a zero-token
-    /// prompt. Cache counters follow the same integer-not-null contract as
-    /// [`Self::initial_messages_usage`]; `thinking_tokens` is reported when
-    /// the turn ran with thinking.
+    /// Usage for the final `message_delta` event. `authoritative_prompt` is
+    /// the engine's whole prompt count only when a `Complete` was seen; a
+    /// clean EOF without one must serialize `input_tokens: null` rather than
+    /// claim a zero-token prompt. `cached_tokens` is the engine's prefix-cache
+    /// hit on the prompt, read from the same frame and settled as such; the
+    /// Anthropic wire splits the two: `input_tokens` is the input outside the
+    /// cache and `cache_read_input_tokens` the hit, their sum the prompt.
+    /// `cache_creation_input_tokens` stays zero, as the gateway writes no
+    /// breakpoint-driven cache entries of its own. Cache counters follow the
+    /// same integer-not-null contract as [`Self::initial_messages_usage`];
+    /// `thinking_tokens` is reported when the turn ran with thinking.
     fn final_messages_delta_usage(
         output_tokens: u32,
-        authoritative_input: Option<u32>,
+        authoritative_prompt: Option<u32>,
+        cached_tokens: u32,
         thinking_tokens: Option<u32>,
     ) -> MessageDeltaUsage {
         MessageDeltaUsage {
             output_tokens,
-            input_tokens: authoritative_input,
+            input_tokens: authoritative_prompt.map(|prompt| prompt.saturating_sub(cached_tokens)),
             cache_creation_input_tokens: Some(0),
-            cache_read_input_tokens: Some(0),
+            cache_read_input_tokens: Some(cached_tokens),
             server_tool_use: None,
             output_tokens_details: thinking_tokens
                 .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),
@@ -4188,8 +4197,9 @@ struct MessagesStream<'a> {
     /// else the tokens the parser routed to thinking, chunk by chunk.
     parsed_thinking_tokens: u32,
     engine_thinking_tokens: u32,
-    /// The engine's cache hit on the prompt, for the settlement: the
-    /// Messages usage reports none.
+    /// The engine's cache hit on the prompt, read from the frame that carries
+    /// the prompt count: the settlement's cached count and the final
+    /// `message_delta` usage's `cache_read_input_tokens`.
     cached_tokens: u32,
     was_in_reasoning: bool,
     held_tokens: u32,
@@ -5020,8 +5030,10 @@ impl<'a> MessagesStream<'a> {
                 usage: StreamingProcessor::final_messages_delta_usage(
                     self.completion_tokens.total(),
                     // The input count is the engine's Complete's, or the
-                    // count of the chunk the gateway's own stop matched in.
+                    // count of the chunk the gateway's own stop matched in;
+                    // the cache hit came with the same frame.
                     (self.saw_complete || self.closed_by_stop).then_some(self.prompt_tokens),
+                    self.cached_tokens,
                     self.spec
                         .thinking_requested
                         .then_some(self.engine_thinking_tokens.max(self.parsed_thinking_tokens)),
