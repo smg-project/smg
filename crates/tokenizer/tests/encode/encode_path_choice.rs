@@ -28,18 +28,24 @@ enum Expected {
 
 use Expected::{Hf, Tiktoken};
 
-/// Slug and the path it takes: the backend reads the byte-level BPE files
-/// of the common shape and declines the rest to `tokenizers`.
+/// Slug and the path it takes: the backend reads every BPE file
+/// `fastokens` takes, the byte-level and the byte-fallback shapes alike,
+/// and declines the rest to `tokenizers` (the Llama class's rewritten
+/// pipeline, settled ties, a pre-tokenizer pattern anchored to the piece).
+/// Every row but three was checked against the
+/// Hub's `main` revision of its model on 2026-11-04 (`kimi-k3` reads a
+/// tiktoken file; the two `qwen3-omni` repositories keep no `tokenizer.json`
+/// at their root).
 const EXPECTED: &[(&str, Expected)] = &[
-    ("ai21-jamba2-3b", Hf(EncodePath::Tokenizers)),
+    ("ai21-jamba2-3b", Hf(EncodePath::Vllm)),
     ("apertus-8b-instruct-2509", Hf(EncodePath::Vllm)),
     ("deepseek-r1", Hf(EncodePath::Vllm)),
     ("deepseek-v3-0324", Hf(EncodePath::Vllm)),
     ("deepseek-v3.1", Hf(EncodePath::Vllm)),
     ("deepseek-v4.1-flash", Hf(EncodePath::Vllm)),
     ("dots3-note-prev", Hf(EncodePath::Vllm)),
-    ("ernie-4.5-21b-a3b-thinking", Hf(EncodePath::Tokenizers)),
-    ("gemma-4-e4b-it", Hf(EncodePath::Tokenizers)),
+    ("ernie-4.5-21b-a3b-thinking", Hf(EncodePath::Vllm)),
+    ("gemma-4-e4b-it", Hf(EncodePath::Vllm)),
     ("glm-4.6", Hf(EncodePath::Vllm)),
     ("glm-4.7-flash", Hf(EncodePath::Vllm)),
     ("glm-5.3-flash", Hf(EncodePath::Vllm)),
@@ -49,14 +55,14 @@ const EXPECTED: &[(&str, Expected)] = &[
     ("hy4-preview", Hf(EncodePath::Vllm)),
     ("inkling", Hf(EncodePath::Vllm)),
     ("iquest-q1", Hf(EncodePath::Vllm)),
-    ("k-exaone-236b-a23b", Hf(EncodePath::Tokenizers)),
-    ("k2-horizon-36b", Hf(EncodePath::Tokenizers)),
+    ("k-exaone-236b-a23b", Hf(EncodePath::Vllm)),
+    ("k2-horizon-36b", Hf(EncodePath::Vllm)),
     ("kimi-k3", Tiktoken),
-    ("laguna-xs.2", Hf(EncodePath::Tokenizers)),
+    ("laguna-xs.2", Hf(EncodePath::Vllm)),
     ("lfm2.5-1.2b-instruct", Hf(EncodePath::Vllm)),
-    ("ling-3.0-flash", Hf(EncodePath::Tokenizers)),
+    ("ling-3.0-flash", Hf(EncodePath::Vllm)),
     ("llama-xlam-2-8b-fc-r", Hf(EncodePath::Vllm)),
-    ("llava-1.5-7b-hf", Hf(EncodePath::Tokenizers)),
+    ("llava-1.5-7b-hf", Hf(EncodePath::Vllm)),
     ("mimo-v2.5", Hf(EncodePath::Vllm)),
     ("minicpm5-2b", Hf(EncodePath::Vllm)),
     ("minimax-m2", Hf(EncodePath::Vllm)),
@@ -67,8 +73,8 @@ const EXPECTED: &[(&str, Expected)] = &[
     ("nanbeige4.2-3b", Hf(EncodePath::Tokenizers)),
     ("nvidia-nemotron-3-nano-30b-a3b-bf16", Hf(EncodePath::Vllm)),
     ("olmo-3-7b-instruct", Hf(EncodePath::Vllm)),
-    ("phi-4-mini-instruct", Hf(EncodePath::Tokenizers)),
-    ("phi-4-multimodal-instruct", Hf(EncodePath::Tokenizers)),
+    ("phi-4-mini-instruct", Hf(EncodePath::Vllm)),
+    ("phi-4-multimodal-instruct", Hf(EncodePath::Vllm)),
     ("qwen-agentworld-35b-a3b", Hf(EncodePath::Vllm)),
     ("qwen-drive-1.0-4b", Hf(EncodePath::Vllm)),
     ("qwen2.5-7b-instruct-1m", Hf(EncodePath::Vllm)),
@@ -107,6 +113,7 @@ const EXPECTED: &[(&str, Expected)] = &[
     ("step-3.5-flash", Hf(EncodePath::Vllm)),
     ("step3", Hf(EncodePath::Vllm)),
     ("tinyllama-1.1b-chat-v1.0", Hf(EncodePath::Tokenizers)),
+    // A pre-tokenizer pattern anchored to the piece (digits grouped by threes).
     ("trinity-mini", Hf(EncodePath::Tokenizers)),
     ("webworld-32b", Hf(EncodePath::Vllm)),
 ];

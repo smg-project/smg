@@ -11,11 +11,14 @@
 //! templates, renderers and the per-stream decoder, and hands the backend a
 //! file it reads as the wrapper does.
 //!
-//! The backend reads `tokenizer.json` alone, so the load hands it the file
-//! only where the wrapper's pipeline is the file's: a tokenizer built in
-//! memory, a vocabulary read from `vocab.json` and `merges.txt`, the Llama
-//! class's pipeline installed over a legacy file, or added tokens settled
-//! beyond the file keep the established paths, with the reason logged once
+//! The backend reads `tokenizer.json` (and the added tokens
+//! `tokenizer_config.json` names beyond it, which the wrapper adds too), so
+//! the load hands it the file only where the wrapper's pipeline is the
+//! file's: a tokenizer built in memory, a vocabulary read from `vocab.json`
+//! and `merges.txt`, the Llama class's pipeline installed over a legacy
+//! file, added tokens settled beyond the file, or configured tokens whose
+//! ids the wrapper could not place keep the established paths, with the
+//! reason logged once
 //! at load. The BOS and EOS the configuration prescribes on request, where
 //! the file's post-processor does not frame an encode the same way, reach
 //! the backend as a [`Frame`] of ids it puts around its bare encode. So does a

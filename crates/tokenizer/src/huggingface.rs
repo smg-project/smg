@@ -77,8 +77,8 @@ impl Renderer {
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
-    /// The `tokenizers` pipeline, shared with the deferred encode of a
-    /// prompt rendered by segments.
+    /// The engine (the backend or the pipeline), shared with the deferred
+    /// encode of a prompt rendered by segments.
     core: Arc<EncoderCore>,
     special_tokens: SpecialTokens,
     /// Every token and its id, the added tokens included; shared with the
@@ -213,17 +213,28 @@ struct AddedTokenConfig {
 /// choice is logged once, with the reason the backend declined, and counted
 /// per path ([`encode_path::encode_path_loads`]).
 fn choose_backend(vllm: VllmSource<'_>, frame: Option<Frame>) -> Option<crate::vllm::VllmBackend> {
-    let (backend, path, declined) = match crate::vllm::VllmBackend::load(vllm, frame) {
-        Ok(backend) => (Some(backend), EncodePath::Vllm, None),
-        Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
-    };
-    encode_path::note_load(path);
+    match crate::vllm::VllmBackend::load(vllm, frame) {
+        Ok(backend) => {
+            encode_path::note_load(EncodePath::Vllm);
+            info!(path = %EncodePath::Vllm, "tokenizer encode path");
+            Some(backend)
+        }
+        Err(declined) => {
+            note_tokenizers_path(&declined);
+            None
+        }
+    }
+}
+
+/// Logs and counts a load that ends on the `tokenizers` pipeline, with the
+/// reason the backend declined.
+fn note_tokenizers_path(declined: &Declined) {
+    encode_path::note_load(EncodePath::Tokenizers);
     info!(
-        path = %path,
-        vllm_declined = declined.as_deref(),
+        path = %EncodePath::Tokenizers,
+        vllm_declined = %declined,
         "tokenizer encode path"
     );
-    backend
 }
 
 /// What an encode runs on: the `vllm-tokenizer` backend over the file,
@@ -716,6 +727,77 @@ impl HuggingFaceTokenizer {
         Ok(settled)
     }
 
+    /// Adds the tokens `tokenizer_config.json` names beyond the file's
+    /// (`added_tokens_decoder`, the Qwen3.5 checkpoints' audio markers for
+    /// one) to the pipeline and to `file`'s list, where their ids follow on
+    /// from the vocabulary's end in id order, as `transformers` assigns them
+    /// at load and as the backend reads them. Returns whether any were left
+    /// out: ids that do not follow on, which the wrapper cannot place where
+    /// the backend would.
+    fn add_configured_tokens(
+        tokenizer: &mut LoadingTokenizer,
+        file: Option<&mut TokenizerFile>,
+        configured: Vec<(TokenIdType, AddedTokenConfig)>,
+    ) -> Result<bool> {
+        let known: HashSet<TokenIdType> = match &file {
+            Some(file) => file.added_tokens.iter().map(|token| token.id).collect(),
+            None => tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .keys()
+                .copied()
+                .collect(),
+        };
+        let mut beyond: Vec<(TokenIdType, AddedTokenConfig)> = configured
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .collect();
+        if beyond.is_empty() {
+            return Ok(false);
+        }
+        beyond.sort_unstable_by_key(|(id, _)| *id);
+        let mut next = tokenizer.get_vocab_size(true);
+        let follow_on = beyond.iter().all(|(id, _)| {
+            let follows = *id as usize == next;
+            next += 1;
+            follows
+        });
+        if !follow_on {
+            warn!(
+                beyond = beyond.len(),
+                "tokenizer_config.json names added tokens beyond the file whose ids do not follow \
+                 the vocabulary's; they are left out"
+            );
+            return Ok(true);
+        }
+        // `transformers` reads an entry without `normalized` as normalized
+        // unless special.
+        let normalized = |entry: &AddedTokenConfig| entry.normalized.unwrap_or(!entry.special);
+        tokenizer
+            .add_tokens(beyond.iter().map(|(_, entry)| {
+                AddedToken::from(entry.content.clone(), entry.special)
+                    .single_word(entry.single_word)
+                    .lstrip(entry.lstrip)
+                    .rstrip(entry.rstrip)
+                    .normalized(normalized(entry))
+            }))
+            .map_err(|error| Error::msg(format!("Failed to add configured tokens: {error}")))?;
+        if let Some(file) = file {
+            file.added_tokens
+                .extend(beyond.iter().map(|(id, entry)| FileAddedToken {
+                    id: *id,
+                    content: entry.content.clone(),
+                    special: entry.special,
+                    normalized: normalized(entry),
+                }));
+        }
+        debug!(
+            added = beyond.len(),
+            "added tokens the configuration names beyond the file"
+        );
+        Ok(false)
+    }
+
     /// Bind checkpoint metadata, the active template, and its cached renderer
     /// policy. `backend_allowed` is false for the pipeline alone
     /// ([`Self::from_file_on_tokenizers`]).
@@ -747,7 +829,22 @@ impl HuggingFaceTokenizer {
                 )
                 .ok()
         });
-        let file = file.flatten();
+        let mut file = file.flatten();
+
+        // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
+        let mut config_result =
+            Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
+        // `tokenizer_config.json` can name added tokens beyond the file's
+        // (`added_tokens_decoder`): `transformers` adds them at load, with
+        // the ids after the file's, and the backend reads them the same way.
+        // The wrapper adds them to the pipeline and to the file's list where
+        // the ids follow on; where they do not, it leaves them out, and the
+        // backend, which would read them, is declined below.
+        let config_adds_tokens = Self::add_configured_tokens(
+            &mut tokenizer,
+            file.as_mut(),
+            std::mem::take(&mut config_result.added_tokens_decoder),
+        )?;
         // The vocabulary with the added tokens (`<|im_start|>` and the like):
         // the file's where there is one, else the pipeline's.
         let vocab = Arc::new(
@@ -762,9 +859,6 @@ impl HuggingFaceTokenizer {
             .iter()
             .map(|(token, &id)| (id, token.clone()))
             .collect();
-
-        // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
-        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
         let class_pipeline =
@@ -910,6 +1004,19 @@ impl HuggingFaceTokenizer {
             Err(Declined::from(
                 "the crate's reader did not take tokenizer.json; the pipeline describes the file",
             ))
+        } else if config_adds_tokens {
+            Err(Declined::from(
+                "tokenizer_config.json names added tokens beyond the file whose ids do not \
+                 follow the vocabulary's: left out by the wrapper, read by the backend",
+            ))
+        } else if let Some(pattern) = file
+            .as_ref()
+            .and_then(TokenizerFile::anchored_split_pattern)
+        {
+            Err(Declined::from(format!(
+                "the pre-tokenizer pattern {pattern:?} anchors to the piece, which the backend \
+                 does not split as tokenizers does"
+            )))
         } else {
             Ok(tokenizer_path)
         };
@@ -1240,12 +1347,9 @@ impl HuggingFaceTokenizer {
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
         // Built in memory: no file for the backend to read, so the pipeline
         // is the engine (the choice is logged and counted as for a file).
-        let backend = choose_backend(
-            Err(Declined::from(
-                "the tokenizer was built in memory, with no tokenizer.json to read",
-            )),
-            None,
-        );
+        note_tokenizers_path(&Declined::from(
+            "the tokenizer was built in memory, with no tokenizer.json to read",
+        ));
         Self::bound_bpe_cache(&mut tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
         let special_tokens = Self::extract_special_tokens(
             pipeline_special_tokens(&tokenizer),
@@ -1263,10 +1367,7 @@ impl HuggingFaceTokenizer {
         let added_tokens = pipeline_added_tokens(&tokenizer);
         let byte_level = ByteLevelTable::build(&tokenizer);
         let pieces = PieceTable::build(&tokenizer);
-        let engine = match backend {
-            Some(backend) => Engine::Vllm(backend),
-            None => Engine::Tokenizers(Box::new(Pipeline::new(tokenizer))),
-        };
+        let engine = Engine::Tokenizers(Box::new(Pipeline::new(tokenizer)));
         HuggingFaceTokenizer {
             byte_level,
             pieces,
@@ -1375,6 +1476,21 @@ impl HuggingFaceTokenizer {
                 .map(String::from);
             let legacy = config.get("legacy").and_then(|v| v.as_bool());
             let add_prefix_space = config.get("add_prefix_space").and_then(|v| v.as_bool());
+            let added_tokens_decoder = config
+                .get("added_tokens_decoder")
+                .and_then(serde_json::Value::as_object)
+                .map(|decoder| {
+                    decoder
+                        .iter()
+                        .filter_map(|(id, entry)| {
+                            let id = id.parse::<TokenIdType>().ok()?;
+                            let entry: AddedTokenConfig =
+                                serde_json::from_value(entry.clone()).ok()?;
+                            Some((id, entry))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let config_tokens = ConfigTokens {
                 bos_token: ConfigToken::read(&config, "bos_token"),
@@ -1393,6 +1509,7 @@ impl HuggingFaceTokenizer {
                 legacy,
                 add_prefix_space,
                 config_tokens,
+                added_tokens_decoder,
             })
         })()
         .unwrap_or_default()
@@ -1511,6 +1628,10 @@ struct TokenizerConfigResult {
     /// `add_prefix_space`, when the configuration sets it.
     add_prefix_space: Option<bool>,
     config_tokens: ConfigTokens,
+    /// The `added_tokens_decoder` entries, by id: `transformers` adds the
+    /// ones the file lacks at load, with the ids after the file's, and so
+    /// does the backend (see [`HuggingFaceTokenizer::add_configured_tokens`]).
+    added_tokens_decoder: Vec<(TokenIdType, AddedTokenConfig)>,
 }
 
 /// `model_type` of the checkpoint's `config.json` in `dir`, if the file is

@@ -16,8 +16,6 @@ categories = ["text-processing", "parsing"]
 [lib]
 name = "llm_tokenizer"
 
-[features]
-
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true

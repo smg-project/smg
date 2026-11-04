@@ -30,6 +30,8 @@ struct FileShape {
     #[serde(default)]
     added_tokens: Vec<AddedToken>,
     #[serde(default)]
+    pre_tokenizer: Option<Value>,
+    #[serde(default)]
     decoder: Option<Value>,
     model: Value,
 }
@@ -37,12 +39,15 @@ struct FileShape {
 /// The parts of `tokenizer.json` the wrapper keeps.
 pub(crate) struct TokenizerFile {
     pub(crate) added_tokens: Vec<AddedToken>,
+    /// The pre-tokenizer as the file writes it; `None` for a file without
+    /// one.
+    pub(crate) pre_tokenizer: Option<Value>,
     /// The decoder as the file writes it; `None` for a file without one.
     pub(crate) decoder: Option<Value>,
     /// The model's vocabulary (`model.vocab`): the token strings of a BPE,
     /// WordPiece or WordLevel model and their ids. A Unigram model lists
-    /// pieces with scores instead; such a vocabulary stays empty here, and
-    /// no backend reads it.
+    /// pieces with scores instead; the reader declines such a file, and the
+    /// pipeline describes it.
     pub(crate) model_vocab: HashMap<String, TokenIdType>,
 }
 
@@ -52,26 +57,55 @@ impl TokenizerFile {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let shape: FileShape =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let model_vocab = shape
-            .model
-            .get("vocab")
-            .and_then(Value::as_object)
-            .map(|vocab| {
-                vocab
-                    .iter()
-                    .filter_map(|(token, id)| {
-                        id.as_u64()
-                            .and_then(|id| TokenIdType::try_from(id).ok())
-                            .map(|id| (token.clone(), id))
-                    })
-                    .collect()
+        let Some(vocab) = shape.model.get("vocab").and_then(Value::as_object) else {
+            anyhow::bail!(
+                "the model's vocabulary in {} is not an object of token to id (a Unigram model \
+                 lists pieces with scores)",
+                path.display()
+            );
+        };
+        let model_vocab = vocab
+            .iter()
+            .filter_map(|(token, id)| {
+                id.as_u64()
+                    .and_then(|id| TokenIdType::try_from(id).ok())
+                    .map(|id| (token.clone(), id))
             })
-            .unwrap_or_default();
+            .collect();
         Ok(Self {
             added_tokens: shape.added_tokens,
+            pre_tokenizer: shape.pre_tokenizer,
             decoder: shape.decoder,
             model_vocab,
         })
+    }
+
+    /// The first `Split` pattern of the pre-tokenizer (through a
+    /// `Sequence`) anchored to the piece it runs on: `\A`, `\z`, `\Z`,
+    /// `\G`, or `^` and `$` outside a class. `tokenizers` runs each `Split`
+    /// on each piece the steps before it cut, where such an anchor holds at
+    /// the piece's ends; the backend splits a run of seven or more digits
+    /// otherwise under one (a checkpoint grouping digits by threes with
+    /// `\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)`), so the load keeps the pipeline for
+    /// such a file.
+    pub(crate) fn anchored_split_pattern(&self) -> Option<&str> {
+        fn walk(step: &Value) -> Option<&str> {
+            match step.get("type").and_then(Value::as_str) {
+                Some("Sequence") => step
+                    .get("pretokenizers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find_map(walk),
+                Some("Split") => step
+                    .get("pattern")
+                    .and_then(|pattern| pattern.get("Regex"))
+                    .and_then(Value::as_str)
+                    .filter(|pattern| pattern_has_piece_anchor(pattern)),
+                _ => None,
+            }
+        }
+        self.pre_tokenizer.as_ref().and_then(walk)
     }
 
     /// Every token and its id: the model's vocabulary with the added tokens
@@ -116,6 +150,27 @@ impl TokenizerFile {
         }
         self.decoder.as_ref().is_some_and(holds)
     }
+}
+
+/// Whether `pattern` anchors to the start or the end of its subject: the
+/// escapes `\A`, `\z`, `\Z` and `\G`, or `^` and `$` outside a character
+/// class (`[^...]` negates a class, so it is not an anchor).
+pub(crate) fn pattern_has_piece_anchor(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('A' | 'z' | 'Z' | 'G') if !in_class => return true,
+                _ => {}
+            },
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '^' | '$' if !in_class => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The added tokens matched on the raw text that are not special: strings
@@ -179,8 +234,47 @@ mod tests {
         assert!(file.has_byte_fallback());
     }
 
+    /// The GPT-2 and Qwen patterns (a lookahead, a negated class) carry no
+    /// anchor; a pattern anchored to the piece does, escaped or bare.
     #[test]
-    fn a_unigram_model_leaves_the_vocabulary_empty() {
+    fn a_pattern_anchored_to_the_piece_is_told_from_one_that_is_not() {
+        for pattern in [
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            r"\\A[\^$]",
+        ] {
+            assert!(!pattern_has_piece_anchor(pattern), "{pattern}");
+        }
+        for pattern in [
+            r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)",
+            r"\A\p{Nd}{3}|\G\p{Nd}{3}",
+            r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))",
+            r"^\s+",
+        ] {
+            assert!(pattern_has_piece_anchor(pattern), "{pattern}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"added_tokens": [], "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Digits", "individual_digits": false},
+                {"type": "Split", "pattern": {"Regex": "\\A\\p{Nd}{3}|\\G\\p{Nd}{3}"}, "behavior": "Isolated", "invert": false}]},
+                "model": {"type": "BPE", "vocab": {"a": 0}, "merges": []}}"#,
+        )
+        .unwrap();
+        let file = TokenizerFile::read(&path).unwrap();
+        assert_eq!(
+            file.anchored_split_pattern(),
+            Some(r"\A\p{Nd}{3}|\G\p{Nd}{3}")
+        );
+    }
+
+    /// A Unigram model's vocabulary is a list of pieces with scores: the
+    /// reader declines the file rather than reading an empty vocabulary,
+    /// so the pipeline describes the tokenizer.
+    #[test]
+    fn a_unigram_model_is_not_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         std::fs::write(
@@ -189,9 +283,9 @@ mod tests {
                 "model": {"type": "Unigram", "vocab": [["a", -1.0], ["b", -2.0]]}}"#,
         )
         .unwrap();
-        let file = TokenizerFile::read(&path).unwrap();
-        assert!(file.model_vocab.is_empty());
-        assert!(file.decoder_is_byte_level());
-        assert!(!file.has_byte_fallback());
+        let Err(error) = TokenizerFile::read(&path) else {
+            panic!("a Unigram file is not read");
+        };
+        assert!(error.to_string().contains("not an object"), "{error}");
     }
 }

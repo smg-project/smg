@@ -30,9 +30,19 @@ fn checkpoint(tokenizer_json: &str) -> (TempDir, HuggingFaceTokenizer) {
 /// byte-level vocabulary of a checkpoint (all 256 byte tokens) reaches.
 const TEXTS: &[&str] = &["", "a", "b a", "ab ba", " a  b ", "a b b a"];
 
+/// Texts within the byte-fallback fixture's vocabulary (its pieces are the
+/// text `> <s> </s> <|`'s).
+const BYTE_FALLBACK_TEXTS: &[&str] = &["", "<", "> <", "<|", "> <s> </s> <|", " < > "];
+
 #[test]
 fn a_file_s_own_pipeline_takes_the_backend_and_agrees_with_tokenizers() {
-    for (name, json) in [("byte-level", BYTE_LEVEL_TOKENIZER_JSON)] {
+    // The byte-fallback fixture renumbered to contiguous ids, as
+    // `fastokens` reads a vocabulary (see `contiguous_ids`).
+    let byte_fallback = contiguous_ids(BYTE_FALLBACK_TOKENIZER_JSON);
+    for (name, json, texts) in [
+        ("byte-level", BYTE_LEVEL_TOKENIZER_JSON, TEXTS),
+        ("byte-fallback", byte_fallback.as_str(), BYTE_FALLBACK_TEXTS),
+    ] {
         let (dir, ours) = checkpoint(json);
         assert_eq!(ours.encode_path(), EncodePath::Vllm, "{name}");
         assert!(
@@ -48,7 +58,7 @@ fn a_file_s_own_pipeline_takes_the_backend_and_agrees_with_tokenizers() {
             "{name}"
         );
         let reference = on_tokenizers.tokenizers_pipeline().unwrap();
-        for &text in TEXTS {
+        for &text in texts {
             for specials in [false, true] {
                 let expected = reference.encode(text, specials).unwrap();
                 let ids = ours.encode(text, specials).unwrap();
@@ -109,6 +119,76 @@ fn a_pipeline_the_load_changed_beyond_the_file_declines_the_backend() {
 
     let (_dir, ours) = checkpoint(NORMALIZED_TIE_TOKENIZER_JSON);
     assert_ne!(ours.encode_path(), EncodePath::Vllm, "a settled tie");
+}
+
+/// `tokenizer_config.json` can name added tokens beyond the file's
+/// (`added_tokens_decoder`), as the Qwen3.5 checkpoints name their audio
+/// markers: `transformers` and the backend add them with the ids after the
+/// file's, and so does the wrapper, on the backend and on the pipeline
+/// alike. Ids that do not follow on are left out, and the backend, which
+/// would read them, is declined.
+#[test]
+fn the_added_tokens_the_configuration_names_beyond_the_file_are_added_on_both_paths() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    fs::write(&path, BYTE_LEVEL_TOKENIZER_JSON).unwrap();
+    let config = dir.path().join("tokenizer_config.json");
+    // The file's vocabulary ends at 4: the configuration's token takes 5.
+    fs::write(
+        &config,
+        r#"{"added_tokens_decoder": {"5": {"content": "<|extra|>", "special": true, "normalized": false}}}"#,
+    )
+    .unwrap();
+    let path = path.to_str().unwrap();
+    let ours = HuggingFaceTokenizer::from_file(path).unwrap();
+    assert_eq!(ours.encode_path(), EncodePath::Vllm);
+    let on_tokenizers = HuggingFaceTokenizer::from_file_on_tokenizers(path).unwrap();
+    for (name, tokenizer) in [("backend", &ours), ("pipeline", &on_tokenizers)] {
+        assert_eq!(tokenizer.token_to_id("<|extra|>"), Some(5), "{name}");
+        assert_eq!(
+            tokenizer.id_to_token(5).as_deref(),
+            Some("<|extra|>"),
+            "{name}"
+        );
+        assert_eq!(
+            tokenizer.encode("a<|extra|>b", false).unwrap().token_ids(),
+            &[0, 5, 1],
+            "{name}"
+        );
+        assert_eq!(tokenizer.decode(&[0, 5, 1], true).unwrap(), "ab", "{name}");
+        assert_eq!(
+            tokenizer.decode(&[0, 5, 1], false).unwrap(),
+            "a<|extra|>b",
+            "{name}"
+        );
+    }
+
+    // An id that does not follow the vocabulary's end: left out, and the
+    // backend declined.
+    fs::write(
+        &config,
+        r#"{"added_tokens_decoder": {"7": {"content": "<|extra|>", "special": true, "normalized": false}}}"#,
+    )
+    .unwrap();
+    let ours = HuggingFaceTokenizer::from_file(path).unwrap();
+    assert_eq!(ours.encode_path(), EncodePath::Tokenizers);
+    assert_eq!(ours.token_to_id("<|extra|>"), None);
+}
+
+/// A pre-tokenizer pattern anchored to the piece (a checkpoint grouping
+/// digits by threes, `\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)`) splits a run of seven
+/// or more digits otherwise on the backend than in `tokenizers`: the load
+/// keeps the pipeline for such a file.
+#[test]
+fn a_pre_tokenizer_pattern_anchored_to_the_piece_declines_the_backend() {
+    let mut definition: serde_json::Value =
+        serde_json::from_str(BYTE_LEVEL_TOKENIZER_JSON).unwrap();
+    definition["pre_tokenizer"] = json!({"type": "Sequence", "pretokenizers": [
+        {"type": "Digits", "individual_digits": false},
+        {"type": "Split", "pattern": {"Regex": "\\A\\p{Nd}{1,2}(?=\\p{Nd}{3}+\\z)"}, "behavior": "Isolated", "invert": false},
+        {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]});
+    let (_dir, ours) = checkpoint(&definition.to_string());
+    assert_eq!(ours.encode_path(), EncodePath::Tokenizers);
 }
 
 /// A plain ByteLevel file whose configuration prescribes the BOS on request:
