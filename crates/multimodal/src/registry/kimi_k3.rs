@@ -53,7 +53,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         id.contains("kimi") && id.contains("k3")
             || metadata
                 .config_model_type()
-                .is_some_and(|mt| mt == "kimi_k3")
+                .is_some_and(|mt| mt == "kimi_k3" || mt == "kimi_k31")
     }
 
     /// The reference renders content parts positionally, so a string
@@ -242,6 +242,24 @@ mod tests {
             registry.lookup(&metadata_by_type).expect("k3 spec").name(),
             "kimi_k3"
         );
+
+        // Kimi-K3.1 ships the K3 vision processor: by its id and by its model_type.
+        let k31_config = json!({
+            "model_type": "kimi_k31",
+            "media_placeholder_token_id": MEDIA_PAD_ID,
+        });
+        for model_id in ["moonshotai/Kimi-K3.1-Pro", "internal/checkpoint-final"] {
+            let metadata = ModelMetadata {
+                model_id,
+                tokenizer: &tokenizer,
+                config: &k31_config,
+            };
+            assert_eq!(
+                registry.lookup(&metadata).expect("k3.1 spec").name(),
+                "kimi_k3",
+                "{model_id}"
+            );
+        }
     }
 
     #[test]
