@@ -1929,7 +1929,6 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
     }
 
-    /// Record where a multimodal request's media is processed and why.
     /// Count a Responses stream whose terminal event was `response.failed`.
     ///
     /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
@@ -1955,6 +1954,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record where a multimodal request's media is processed and why.
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -2702,7 +2702,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Set running requests per worker
     /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
@@ -2946,7 +2945,6 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
-    /// Count a KV event batch by what the subscriber did with it.
     /// One load-monitor tick decision for a worker (see `PollMode`).
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
@@ -2957,6 +2955,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Count a KV event batch by what the subscriber did with it.
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
@@ -3426,11 +3425,15 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out `smg_engine_*` series for a removed worker.
-    ///
-    /// metrics-rs cannot delete series, so per the `remove_worker_metrics`
-    /// convention we set each to -1 (an impossible value for these gauges, whose
-    /// 0 is meaningful) until <https://github.com/metrics-rs/metrics/issues/653>.
+    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
+    /// ended while its URL stays registered: its status left `Ready`, or a
+    /// same-URL replacement has not yet published its own load (see
+    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
+    /// those series, so the last load would read as live. Each gauge is set
+    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// worker needs no sentinel: the store drops every `worker`-labelled
+    /// series with the registration ([`Self::remove_worker_metrics`]) and
+    /// no-ops the writes that follow, this one included.
     /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
     /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
     /// label set must exactly match `record_engine_load` (including `model` and
