@@ -387,7 +387,6 @@ impl CliArgs {
                 kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
                 default_throughput: self.routing.least_load_default_throughput,
-                max_waiting_requests: self.routing.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.routing.balance_abs_threshold,
