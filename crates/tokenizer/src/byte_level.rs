@@ -197,21 +197,36 @@ impl ByteLevelTable {
             return None;
         }
         let max_id = tokenizer.get_vocab(true).values().copied().max()?;
-        let count = max_id as usize + 1;
         let added = tokenizer.get_added_vocabulary();
+        Some(Self::from_vocabulary(
+            max_id,
+            |id| tokenizer.id_to_token(id),
+            |token| added.is_special_token(token),
+        ))
+    }
+
+    /// The table over a vocabulary whose decoder is a plain `ByteLevel` one:
+    /// `token_of` gives each id's token string up to `max_id`, `is_special`
+    /// says whether a token is one `skip_special_tokens` strips.
+    pub(crate) fn from_vocabulary(
+        max_id: TokenIdType,
+        token_of: impl Fn(TokenIdType) -> Option<String>,
+        is_special: impl Fn(&str) -> bool,
+    ) -> Arc<Self> {
+        let count = max_id as usize + 1;
         let mut table = ByteLevelTableBuilder::with_capacity(count);
         let mut bytes = Vec::new();
-        for id in 0..count {
-            match tokenizer.id_to_token(id as u32) {
+        for id in 0..=max_id {
+            match token_of(id) {
                 Some(token) => {
                     bytes.clear();
                     push_token_bytes(&token, &mut bytes);
-                    table.push(&bytes, added.is_special_token(&token));
+                    table.push(&bytes, is_special(&token));
                 }
                 None => table.push_absent(),
             }
         }
-        Some(table.finish())
+        table.finish()
     }
 
     /// Decode a complete HF sequence using the same bytes as incremental decode.

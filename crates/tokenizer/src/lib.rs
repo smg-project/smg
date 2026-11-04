@@ -10,6 +10,7 @@ pub mod encode_path;
 pub mod encoders;
 pub mod eos;
 pub mod factory;
+mod file;
 pub mod hub;
 pub(crate) mod json_dumps;
 pub mod mock;

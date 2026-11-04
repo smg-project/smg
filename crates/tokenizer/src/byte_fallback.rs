@@ -51,6 +51,26 @@ impl PieceTable {
     /// any other chain keeps the `tokenizers` decode.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
         let chain = serde_json::to_value(tokenizer.get_decoder()?).ok()?;
+        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let added = tokenizer.get_added_vocabulary();
+        Self::from_vocabulary(
+            &chain,
+            max_id,
+            |id| tokenizer.id_to_token(id),
+            |token| added.is_special_token(token),
+        )
+    }
+
+    /// The table over a vocabulary whose decoder `chain` (as `tokenizer.json`
+    /// writes it) is the one this module describes; `token_of` gives each
+    /// id's token up to `max_id`, `is_special` says whether a token is one
+    /// `skip_special_tokens` strips. `None` for any other chain.
+    pub(crate) fn from_vocabulary(
+        chain: &serde_json::Value,
+        max_id: TokenIdType,
+        token_of: impl Fn(TokenIdType) -> Option<String>,
+        is_special: impl Fn(&str) -> bool,
+    ) -> Option<Arc<Self>> {
         let decoders = chain.get("decoders")?.as_array()?;
         let replace = serde_json::json!(
             {"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "}
@@ -70,18 +90,16 @@ impl PieceTable {
             [b, c, d] if *b == byte_fallback && *c == fuse && *d == strip => true,
             _ => return None,
         };
-        // Each id through the lookups the decode uses: `id_to_token` (an added
-        // token before a model piece that shares its id) and the added
-        // vocabulary's own notion of special, as the byte-level table does.
-        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
-        let added = tokenizer.get_added_vocabulary();
+        // Each id through the lookups the decode uses: the token of the id
+        // (an added token before a model piece that shares its id) and the
+        // added vocabulary's own notion of special, as the byte-level table does.
         let ids = max_id as usize + 1;
         let mut offsets = Vec::with_capacity(ids + 1);
         offsets.push(0);
         let mut text = Vec::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
-            let kind = match tokenizer.id_to_token(id) {
+            let kind = match token_of(id) {
                 None => Piece::Absent,
                 Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),
@@ -95,7 +113,7 @@ impl PieceTable {
                             let mut buf = [0u8; 4];
                             text.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
-                        if added.is_special_token(&token) {
+                        if is_special(&token) {
                             Piece::Special
                         } else {
                             Piece::Text

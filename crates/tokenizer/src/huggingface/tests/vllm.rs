@@ -1,19 +1,19 @@
 //! The `vllm-tokenizer` backend: the files it takes, the loads it
 //! declines, and that its ids and text are the `tokenizers` pipeline's.
 
-use std::fs;
+use std::{fs, sync::Arc};
 
 use serde_json::json;
 use tempfile::TempDir;
 
 use super::{
-    llama_style_checkpoint, BYTE_LEVEL_TOKENIZER_JSON, NORMALIZED_TIE_TOKENIZER_JSON,
-    WORD_LEVEL_TOKENIZER_JSON,
+    llama_style_checkpoint, BYTE_FALLBACK_TOKENIZER_JSON, BYTE_LEVEL_TOKENIZER_JSON,
+    NORMALIZED_TIE_TOKENIZER_JSON, WORD_LEVEL_TOKENIZER_JSON,
 };
 use crate::{
     encode_path::EncodePath,
-    traits::{Decoder as _, Encoder as _},
-    HuggingFaceTokenizer,
+    traits::{Decoder as _, Encoder as _, Tokenizer as _},
+    HuggingFaceTokenizer, Sequence,
 };
 
 /// A checkpoint of `tokenizer.json` alone, loaded through the file's path.
@@ -127,4 +127,111 @@ fn the_configured_frame_the_file_lacks_goes_around_the_backend_s_ids() {
         &[5, 1]
     );
     assert_eq!(ours.decode(&[5, 0], true).unwrap(), "a");
+}
+
+/// A tokenizer the backend serves builds its vocabulary, its added tokens
+/// and its per-stream tables from the file; one built in memory builds
+/// them from the pipeline. Over every id, with and without special tokens,
+/// the two stream and decode the same text and answer the same lookups.
+#[test]
+fn the_file_built_tables_stream_what_the_pipeline_built_ones_stream() {
+    // `fastokens` reads a vocabulary whose ids are contiguous, as every
+    // checkpoint's are; the byte-fallback fixture's stand in for a 32k
+    // vocabulary's, so they are renumbered in rank order here.
+    let byte_fallback = contiguous_ids(BYTE_FALLBACK_TOKENIZER_JSON);
+    for (name, json) in [
+        ("byte-level", BYTE_LEVEL_TOKENIZER_JSON),
+        ("byte-fallback", byte_fallback.as_str()),
+    ] {
+        let (_dir, from_file) = checkpoint(json);
+        let from_pipeline =
+            HuggingFaceTokenizer::from_tokenizer(tokenizers::Tokenizer::from_bytes(json).unwrap());
+        assert_eq!(from_file.encode_path(), EncodePath::Vllm, "{name}");
+        assert_ne!(from_pipeline.encode_path(), EncodePath::Vllm, "{name}");
+        assert_eq!(
+            from_file.vocab, from_pipeline.vocab,
+            "{name}: the vocabulary"
+        );
+        assert_eq!(
+            from_file.added_token_strings(),
+            from_pipeline.added_token_strings(),
+            "{name}"
+        );
+        assert_eq!(
+            from_file.added_tokens_after_normalization(),
+            from_pipeline.added_tokens_after_normalization(),
+            "{name}"
+        );
+        assert_eq!(
+            from_file.get_special_tokens().eos_token,
+            from_pipeline.get_special_tokens().eos_token,
+            "{name}"
+        );
+        assert_eq!(
+            from_file.pieces.is_some(),
+            from_pipeline.pieces.is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            from_file.byte_level.is_some(),
+            from_pipeline.byte_level.is_some(),
+            "{name}"
+        );
+        let mut ids: Vec<u32> = from_file.reverse_vocab.keys().copied().collect();
+        ids.sort_unstable();
+        ids.push(ids.len() as u32 + 1_000); // an id the vocabulary lacks
+        let from_file: Arc<dyn crate::traits::Tokenizer> = Arc::new(from_file);
+        let from_pipeline: Arc<dyn crate::traits::Tokenizer> = Arc::new(from_pipeline);
+        for skip in [false, true] {
+            let stream = |tokenizer: &Arc<dyn crate::traits::Tokenizer>| {
+                let mut sequence = Sequence::new_with_options(Arc::clone(tokenizer), skip);
+                let mut text = String::new();
+                for &id in &ids {
+                    if let Ok(piece) = sequence.append_token(id) {
+                        text.push_str(&piece);
+                    }
+                }
+                text.push_str(&sequence.finish().unwrap_or_default());
+                text
+            };
+            assert_eq!(
+                stream(&from_file),
+                stream(&from_pipeline),
+                "{name}: stream, skip={skip}"
+            );
+        }
+    }
+}
+
+/// The tokenizer definition with its vocabulary renumbered to contiguous
+/// ids in the order of the original ones, the added tokens and the
+/// post-processor's special tokens following.
+fn contiguous_ids(tokenizer_json: &str) -> String {
+    let mut definition: serde_json::Value = serde_json::from_str(tokenizer_json).unwrap();
+    let vocab = definition["model"]["vocab"].as_object().unwrap().clone();
+    let mut by_id: Vec<(&str, u64)> = vocab
+        .iter()
+        .map(|(token, id)| (token.as_str(), id.as_u64().unwrap()))
+        .collect();
+    by_id.sort_unstable_by_key(|(_, id)| *id);
+    let renumbered: std::collections::HashMap<&str, u64> = by_id
+        .iter()
+        .enumerate()
+        .map(|(new_id, (token, _))| (*token, new_id as u64))
+        .collect();
+    definition["model"]["vocab"] = renumbered
+        .iter()
+        .map(|(token, id)| ((*token).to_string(), json!(id)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    for token in definition["added_tokens"].as_array_mut().unwrap() {
+        let content = token["content"].as_str().unwrap().to_string();
+        token["id"] = json!(renumbered[content.as_str()]);
+    }
+    if let Some(specials) = definition["post_processor"]["special_tokens"].as_object_mut() {
+        for (token, entry) in specials.iter_mut() {
+            entry["ids"] = json!([renumbered[token.as_str()]]);
+        }
+    }
+    definition.to_string()
 }
