@@ -160,9 +160,9 @@ impl Qwen3AudioProcessor {
         &self.params
     }
 
-    /// The log-mel features of a batch of decoded clips, read in place: a clip at the frontend's
-    /// sample rate is windowed straight from its samples, and only a clip at another rate is
-    /// resampled into a buffer of its own.
+    /// The log-mel features of a batch of decoded clips. The clips are borrowed: a clip at the
+    /// frontend's sample rate is copied once, into the batch's padded buffer, and only a clip at
+    /// another rate is resampled into a buffer of its own first.
     pub fn preprocess_decoded_clips(
         &self,
         clips: &[&DecodedAudio],
