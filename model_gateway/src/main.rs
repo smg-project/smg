@@ -5188,6 +5188,10 @@ mod tests {
             // until told to stop.
             std::thread::spawn(move || {
                 while let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(&fifo) {
+                    // The release open below is the reader that ends the wait.
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
                     served.fetch_add(1, Ordering::SeqCst);
                     writer.write_all(b"{}\n").unwrap();
                     drop(writer);
@@ -5197,10 +5201,10 @@ mod tests {
                         .open(&fifo)
                         .map_or_else(|e| e.raw_os_error() != Some(ENXIO), |_| true)
                     {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
                         std::thread::sleep(Duration::from_millis(1));
-                    }
-                    if stop.load(Ordering::SeqCst) {
-                        break;
                     }
                 }
             })
@@ -5214,9 +5218,17 @@ mod tests {
         cli.configure(vec![], vec![]).expect("configures");
         let reads = served.load(Ordering::SeqCst);
 
-        // Pair with the writer's pending open so the thread can see the stop flag and end.
+        // Release the writer, whatever it is doing: a read-write open of a FIFO
+        // never blocks on Linux and counts as a reader, so an `open` the writer
+        // is blocked in returns, a drain poll finds the reader, and either path
+        // reads the stop flag. A blocking read-only open could wait for a
+        // writer that read the flag in its drain loop and left.
         stop.store(true, Ordering::SeqCst);
-        std::fs::read_to_string(&fifo).unwrap();
+        let _release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         writer.join().unwrap();
         assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
     }
