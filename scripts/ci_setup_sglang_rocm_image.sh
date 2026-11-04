@@ -19,7 +19,43 @@ if [ "$#" -gt 0 ]; then
     fi
     verify_only=1
     [ "$#" -eq 1 ] || verify_output=("$2")
-    if [ "${SMG_SGLANG_ROCM_IMAGE:-}" != "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d" ]; then
+    if [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
+        echo "unsupported E2E SGLang image" >&2
+        exit 1
+    fi
+    # Read the verifier's one immutable IMAGE literal as data, without running
+    # Python or any external tool before rejecting an unsupported image. A pin
+    # format change must fail closed rather than use a second, stale digest.
+    case "${BASH_SOURCE[0]}" in
+        */*) verifier_source="${BASH_SOURCE[0]%/*}/ci_verify_sglang_rocm_cohort.py" ;;
+        *) verifier_source="./ci_verify_sglang_rocm_cohort.py" ;;
+    esac
+    image_declaration='^[[:space:]]*IMAGE([[:space:]:=]|$)'
+    image_double='^IMAGE[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
+    image_single="^IMAGE[[:space:]]*=[[:space:]]*'([^']+)'[[:space:]]*$"
+    image_reference='^[[:alnum:]][[:alnum:]_.:/-]*:[[:alnum:]_.-]+@sha256:[a-f0-9]{64}$'
+    image_count=0
+    image_pin=
+    if [ ! -f "$verifier_source" ] || [ ! -r "$verifier_source" ]; then
+        echo "invalid verifier IMAGE pin: missing or unreadable source" >&2
+        exit 1
+    fi
+    while IFS= read -r image_line || [ -n "$image_line" ]; do
+        if [[ "$image_line" =~ $image_declaration ]]; then
+            image_count=$((image_count + 1))
+            if [[ "$image_line" =~ $image_double ]] || [[ "$image_line" =~ $image_single ]]; then
+                image_pin="${BASH_REMATCH[1]}"
+            else
+                echo "invalid verifier IMAGE pin: expected one quoted immutable literal" >&2
+                exit 1
+            fi
+        fi
+    done < "$verifier_source"
+    if [ "$image_count" -ne 1 ] || [[ ! "$image_pin" =~ $image_reference ]]; then
+        echo "invalid verifier IMAGE pin: expected one quoted immutable literal" >&2
+        exit 1
+    fi
+    if [ "$SMG_SGLANG_ROCM_IMAGE" != "$image_pin" ]; then
         echo "unsupported E2E SGLang image" >&2
         exit 1
     fi
