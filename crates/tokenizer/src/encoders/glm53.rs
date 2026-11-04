@@ -8,6 +8,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    sync::LazyLock,
 };
 
 use anyhow::{bail, Result};
@@ -46,8 +47,38 @@ impl Template {
     }
 }
 
-const TOOLS_PREFIX: &str = "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
-const TOOLS_SUFFIX: &str = "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
+// GLM's markup, each tag spelled once: the tool instruction text and the
+// rendered history are built from these, and the cross-crate marker pin
+// reads this one place.
+const BOS: &str = "[gMASK]<sop>";
+const SYSTEM: &str = "<|system|>";
+const ASSISTANT: &str = "<|assistant|>";
+const OBSERVATION: &str = "<|observation|>";
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+const TOOLS_OPEN: &str = "<tools>";
+const TOOLS_CLOSE: &str = "</tools>";
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const ARG_KEY_OPEN: &str = "<arg_key>";
+const ARG_KEY_CLOSE: &str = "</arg_key>";
+const ARG_VALUE_OPEN: &str = "<arg_value>";
+const ARG_VALUE_CLOSE: &str = "</arg_value>";
+const TOOL_RESPONSE_OPEN: &str = "<tool_response>";
+const TOOL_RESPONSE_CLOSE: &str = "</tool_response>";
+
+/// The tool instruction text around the tool definitions, built once from the
+/// tags at first use.
+static TOOLS_PREFIX: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{SYSTEM}\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within {TOOLS_OPEN}{TOOLS_CLOSE} XML tags:\n{TOOLS_OPEN}\n"
+    )
+});
+static TOOLS_SUFFIX: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{TOOLS_CLOSE}\n\nFor each function call, output the function name and arguments within the following XML format:\n{TOOL_CALL_OPEN}{{function-name}}{ARG_KEY_OPEN}{{arg-key-1}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-1}}{ARG_VALUE_CLOSE}{ARG_KEY_OPEN}{{arg-key-2}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-2}}{ARG_VALUE_CLOSE}...{TOOL_CALL_CLOSE}"
+    )
+});
 
 pub(super) fn truthy(value: &Value) -> bool {
     match value {
@@ -146,7 +177,7 @@ fn reference_response(refs: &Value, tools: &[Value]) -> Result<String> {
     if tools.is_empty() {
         bail!("Rendering a tool_reference requires tools");
     }
-    let mut out = String::from("<tool_response><tools>\n");
+    let mut out = format!("{TOOL_RESPONSE_OPEN}{TOOLS_OPEN}\n");
     for reference in refs.as_array().into_iter().flatten() {
         for tool in tools.iter().map(unwrap_tool) {
             if tool.get("name") == reference.get("name") {
@@ -155,7 +186,8 @@ fn reference_response(refs: &Value, tools: &[Value]) -> Result<String> {
             }
         }
     }
-    out.push_str("</tools></tool_response>");
+    out.push_str(TOOLS_CLOSE);
+    out.push_str(TOOL_RESPONSE_CLOSE);
     Ok(out)
 }
 
@@ -164,7 +196,7 @@ fn response(value: &Value, tools: &[Value], media: &mut MediaContext) -> Result<
         reference_response(value, tools)
     } else {
         Ok(format!(
-            "<tool_response>{}</tool_response>",
+            "{TOOL_RESPONSE_OPEN}{}{TOOL_RESPONSE_CLOSE}",
             visible_text(value, media)
         ))
     }
@@ -269,17 +301,17 @@ fn tool_call(out: &mut String, call: &Value) -> Result<()> {
     let Some(arguments) = arguments.as_object() else {
         bail!("tool_call arguments must be a JSON object");
     };
-    let _ = write!(out, "<tool_call>{name}");
+    let _ = write!(out, "{TOOL_CALL_OPEN}{name}");
     for (key, value) in arguments {
-        let _ = write!(out, "<arg_key>{key}</arg_key><arg_value>");
+        let _ = write!(out, "{ARG_KEY_OPEN}{key}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}");
         if let Some(value) = value.as_str() {
             out.push_str(value);
         } else {
             out.push_str(&json(value)?);
         }
-        out.push_str("</arg_value>");
+        out.push_str(ARG_VALUE_CLOSE);
     }
-    out.push_str("</tool_call>");
+    out.push_str(TOOL_CALL_CLOSE);
     Ok(())
 }
 
@@ -331,16 +363,16 @@ fn render_inner(
     let clear_thinking = kwargs
         .and_then(|k| k.get("clear_thinking"))
         .is_some_and(truthy);
-    let mut out = format!("[gMASK]<sop><|system|>Reasoning Effort: {effort}");
+    let mut out = format!("{BOS}{SYSTEM}Reasoning Effort: {effort}");
     if !tools.is_empty() {
-        out.push_str(TOOLS_PREFIX);
+        out.push_str(&TOOLS_PREFIX);
         for tool in tools.iter().map(unwrap_tool) {
             if !truthy(&tool["defer_loading"]) {
                 out.push_str(&tool_definition(tool)?);
                 out.push('\n');
             }
         }
-        out.push_str(TOOLS_SUFFIX);
+        out.push_str(&TOOLS_SUFFIX);
     }
     let last_user = messages
         .iter()
@@ -358,22 +390,23 @@ fn render_inner(
                 );
             }
             "assistant" => {
-                out.push_str("<|assistant|><think>");
+                out.push_str(ASSISTANT);
+                out.push_str(THINK_OPEN);
                 let mut content = visible_text(&message["content"], media);
                 let mut reasoning = message["reasoning_content"].as_str().map(str::to_owned);
-                if reasoning.is_none() && content.contains("</think>") {
+                if reasoning.is_none() && content.contains(THINK_CLOSE) {
                     reasoning = Some(
                         content
-                            .split("</think>")
+                            .split(THINK_CLOSE)
                             .next()
                             .unwrap_or_default()
-                            .rsplit("<think>")
+                            .rsplit(THINK_OPEN)
                             .next()
                             .unwrap_or_default()
                             .to_owned(),
                     );
                     content = content
-                        .rsplit("</think>")
+                        .rsplit(THINK_CLOSE)
                         .next()
                         .unwrap_or_default()
                         .to_owned();
@@ -383,7 +416,7 @@ fn render_inner(
                         out.push_str(&reasoning);
                     }
                 }
-                out.push_str("</think>");
+                out.push_str(THINK_CLOSE);
                 // Match MiniJinja pycompat's str.strip (Rust whitespace); the
                 // shared continuation cut separately follows Python whitespace.
                 out.push_str(content.trim());
@@ -396,7 +429,7 @@ fn render_inner(
                 while index + 1 < messages.len() && messages[index + 1]["role"] == "tool" {
                     index += 1;
                 }
-                out.push_str("<|observation|>");
+                out.push_str(OBSERVATION);
                 out.push_str(&ordered_tool_block(
                     &messages[start..=index],
                     start.checked_sub(1).map(|i| &messages[i]),
@@ -409,7 +442,8 @@ fn render_inner(
         index += 1;
     }
     if params.add_generation_prompt {
-        out.push_str("<|assistant|><think>");
+        out.push_str(ASSISTANT);
+        out.push_str(THINK_OPEN);
     }
     Ok(out)
 }
