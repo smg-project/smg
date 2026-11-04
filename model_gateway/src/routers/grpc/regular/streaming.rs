@@ -307,6 +307,21 @@ struct GenerateStreamContext {
     expected_choices: u32,
 }
 
+/// The Messages stream's event buffer: every event is split off it to the
+/// connection, and its block is reused in place once those frames are dropped
+/// or replaced by a new block of this size while they are still held. A 16 KiB
+/// block holds about 150 delta frames, so an answer of a few hundred tokens
+/// runs through a handful of blocks.
+const MESSAGES_FIRST_BLOCK: usize = 16 * 1024;
+/// The room reserved once per `content_block_delta` frame beyond its string:
+/// the event line, the keys and the delta's tag (138 bytes for the longest,
+/// `input_json_delta` with a wide index) and a margin for the escapes a JSON
+/// delta's quotes take.
+const MESSAGES_DELTA_ROOM: usize = 192;
+/// The room reserved once per whole-event frame (the message start and delta,
+/// a block's start and stop, a ping, an error).
+const MESSAGES_EVENT_ROOM: usize = 512;
+
 impl StreamingProcessor {
     pub fn new(
         tool_parser_factory: ToolParserFactory,
@@ -1583,6 +1598,12 @@ impl StreamingProcessor {
             },
             _ => None,
         };
+        // One reserve per event, ahead of its writes: the frame's constant text
+        // and the delta's string (an escape grows the frame in place, as
+        // before), or a whole event's usual size.
+        buffer.reserve(string_delta.map_or(MESSAGES_EVENT_ROOM, |(_, _, text)| {
+            MESSAGES_DELTA_ROOM + text.len()
+        }));
         if let Some((index, delta_head, text)) = string_delta {
             buffer.extend_from_slice(
                 b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
@@ -1862,7 +1883,7 @@ impl StreamingProcessor {
                                 message: failure.to_string(),
                             },
                         };
-                        let mut buf = BytesMut::with_capacity(256);
+                        let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
@@ -1913,7 +1934,7 @@ impl StreamingProcessor {
                                 message: failure.to_string(),
                             },
                         };
-                        let mut buf = BytesMut::with_capacity(256);
+                        let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                 });
@@ -1925,7 +1946,7 @@ impl StreamingProcessor {
                         message: "Embeddings not supported for Messages API".to_string(),
                     },
                 };
-                let mut buf = BytesMut::with_capacity(256);
+                let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
             // Batch results exist only on the completions pipeline.
@@ -1936,7 +1957,7 @@ impl StreamingProcessor {
                         message: "Batched results not supported for Messages API".to_string(),
                     },
                 };
-                let mut buf = BytesMut::with_capacity(256);
+                let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
         }
@@ -4295,7 +4316,7 @@ impl<'a> MessagesStream<'a> {
             pd_timing,
             start_time,
             first_token_time: None,
-            sse_buffer: BytesMut::with_capacity(4096),
+            sse_buffer: BytesMut::with_capacity(MESSAGES_FIRST_BLOCK),
             blocks: ContentBlocks::default(),
             has_tool_calls: false,
             reasoning_parser: None,
