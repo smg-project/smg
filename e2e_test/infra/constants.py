@@ -491,6 +491,35 @@ _STARTUP_PROFILES = MappingProxyType(
             modes=frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC}),
             gpu_multiplier=1,
         ),
+        "vllm-mooncake-pd2": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "microsoft/Phi-3.5-vision-instruct": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "2"),
+                (ENV_CONNECTION_MODE, ""),
+                (ENV_ZMQ_ENGINE_COUNT, ""),
+                ("E2E_MIN_SELECTED", "15"),
+                ("E2E_VLLM_KV_BACKEND", "mooncake"),
+                ("E2E_KV_BACKEND", ""),
+                ("E2E_VLLM_EXTRA_KV_BACKENDS", ""),
+                ("E2E_MM_PROCESSING", ""),
+                ("E2E_VLLM_SERVICER_IMPL", ""),
+                ("E2E_PARSER", ""),
+            ),
+            max_floor=60,
+            modes=frozenset({ConnectionMode.GRPC}),
+            gpu_multiplier=1,
+            test_dir="e2e_test/router",
+        ),
     }
 )
 

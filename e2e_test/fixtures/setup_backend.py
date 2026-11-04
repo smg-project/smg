@@ -689,6 +689,24 @@ def _setup_pd(
     decode_tp = workers_config.get("decode_tp")
     prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
     decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
+    mooncake_pd2 = get_startup_profile() == "vllm-mooncake-pd2"
+    if mooncake_pd2:
+        for role, worker_type, tp, backends in (
+            ("prefill", WorkerType.PREFILL, prefill_tp, prefill_kv),
+            ("decode", WorkerType.DECODE, decode_tp, decode_kv),
+        ):
+            requested = workers_config.get(role)
+            if requested is not None and (type(requested) is not int or requested != 1):
+                raise ValueError("vllm-mooncake-pd2 requires one prefill and one decode worker")
+            validate_startup_profile_worker(
+                model_id=model_id,
+                engine=engine,
+                mode=connection_mode,
+                worker_type=worker_type,
+                tp=tp,
+                kv_backend=backends[0] if backends else None,
+            )
+        _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     moriio = _moriio_fleet(engine, prefill_kv, decode_kv)
     if moriio:
         # SMG speaks the MoRI-IO handoff only on its HTTP PD router (the gRPC
@@ -761,9 +779,12 @@ def _setup_pd(
             # the session's fail-fast budget as it does on the sequential path.
             # Evicting the previous pool and staggering new launches must not
             # consume the replacement fleet's readiness budget.
-            deadline = time.monotonic() + effective_startup_timeout(
-                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            readiness_bound = (
+                worker_startup_timeout(model_id)
+                if mooncake_pd2
+                else effective_startup_timeout(spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT))
             )
+            deadline = time.monotonic() + readiness_bound
             try:
                 for worker in all_workers:
                     remaining = deadline - time.monotonic()

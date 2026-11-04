@@ -1313,6 +1313,48 @@ def validate_startup_profile_worker(
     definition = startup_profile_definition()
     if definition is None:
         raise ValueError(f"{profile} has no startup profile definition")
+    if profile == "vllm-mooncake-pd2":
+        if (
+            (engine or get_runtime()) != "vllm"
+            or mode not in definition.modes
+            or worker_type not in (WorkerType.REGULAR, WorkerType.PREFILL, WorkerType.DECODE)
+        ):
+            raise ValueError(f"{profile} requires its original gRPC worker roles")
+        spec = get_model_spec(model_id)
+        actual_tp = spec.get("tp", 1) if tp is None else tp
+        profile_startup_timeout(model_id, actual_tp)
+        profile_startup_timeout(model_id, spec.get("tp", 1))
+        # The rank-pinning case uses TP1 and DP2 on two devices, not two prefills.
+        original_dp2 = (
+            model_id == "meta-llama/Llama-3.2-1B-Instruct"
+            and worker_type == WorkerType.REGULAR
+            and type(gpus) is int
+            and gpus == 2
+            and extra_engine_args == ["--data-parallel-size", "2"]
+        )
+        expected_gpus = 2 if original_dp2 else actual_tp
+        if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
+            raise ValueError(f"{profile} requires its original per-worker GPU count")
+        if _kwargs.get("kv_backend") not in (None, "mooncake"):
+            raise ValueError(f"{profile} forbids a per-worker KV backend override")
+        for arg in () if original_dp2 else extra_engine_args or ():
+            option = arg.split("=", 1)[0].replace("_", "-")
+            if option in (
+                "--tensor-parallel-size",
+                "--data-parallel-size",
+                "--data-parallel-size-local",
+                "--model",
+                "--tokenizer",
+                "--config",
+                "--kv-transfer-config",
+            ) or option.startswith(("-tp", "-dp")):
+                raise ValueError(f"{profile} forbids an appended model/TP/DP/KV override")
+        if extra_env and any(
+            key.startswith("E2E_") or key in ("SMG_VLLM_SERVICER_WARMUP", "SMG_VLLM_MM_PROCESSOR")
+            for key in extra_env
+        ):
+            raise ValueError(f"{profile} forbids a worker environment override")
+        return
     expected_mode = mode in definition.modes
     if (
         (engine or get_runtime()) != "vllm"

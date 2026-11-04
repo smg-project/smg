@@ -537,3 +537,294 @@ def test_absent_profile_definition_rejects_before_model_lookup(monkeypatch):
         worker_module.validate_startup_profile_worker(
             _ZMQ_DP2_MODELS[0], engine="vllm", mode=ConnectionMode.ZMQ
         )
+
+
+def _mooncake_pd2_profile(monkeypatch):
+    return set_profile_lane(monkeypatch, "vllm-mooncake-pd2")
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "Qwen/Qwen3-VL-8B-Instruct",
+        "microsoft/Phi-3.5-vision-instruct",
+    ],
+)
+def test_mooncake_pd2_worker_wait_cannot_inherit_model_or_warmup_headroom(monkeypatch, model):
+    _mooncake_pd2_profile(monkeypatch)
+    monkeypatch.setattr(
+        worker_module, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 9999}
+    )
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "60")
+    assert worker_startup_timeout(model, timeout=9999) == 300
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("E2E_VLLM_KV_BACKEND", "nixl"),
+        ("E2E_KV_BACKEND", "mooncake"),
+        ("E2E_VLLM_EXTRA_KV_BACKENDS", "nixl"),
+        ("E2E_MM_PROCESSING", "worker"),
+        ("E2E_GPU_TIER", "4"),
+        ("TEST_FILTER", "-k partial"),
+        (ENV_STARTUP_TIMEOUT, "61"),
+        (ENV_STARTUP_TIMEOUT, "600"),
+    ],
+)
+def test_mooncake_pd2_rejects_a_changed_contract_before_resolving_wait(monkeypatch, key, value):
+    _mooncake_pd2_profile(monkeypatch)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError):
+        worker_startup_timeout("meta-llama/Llama-3.1-8B-Instruct")
+
+
+def test_mooncake_pd2_backend_context_is_pinned_across_models(monkeypatch):
+    _mooncake_pd2_profile(monkeypatch)
+    assert worker_startup_timeout("meta-llama/Llama-3.1-8B-Instruct") == 300
+    monkeypatch.setenv("E2E_VLLM_KV_BACKEND", "nixl")
+    with pytest.raises(ValueError):
+        worker_startup_timeout("microsoft/Phi-3.5-vision-instruct")
+
+
+@pytest.mark.parametrize("role", ["regular", "prefill", "decode"])
+def test_mooncake_pd2_keeps_original_regular_and_pd_roles(monkeypatch, role):
+    _mooncake_pd2_profile(monkeypatch)
+    worker_module.validate_startup_profile_worker(
+        model_id="meta-llama/Llama-3.1-8B-Instruct",
+        engine="vllm",
+        mode=worker_module.ConnectionMode.GRPC,
+        worker_type=worker_module.WorkerType(role),
+        gpus=1,
+        tp=1,
+        kv_backend="mooncake",
+        extra_engine_args=["--max-model-len", "2048"],
+    )
+
+
+def test_mooncake_pd2_keeps_the_original_dp2_rank_pinning_case(monkeypatch):
+    _mooncake_pd2_profile(monkeypatch)
+    worker_module.validate_startup_profile_worker(
+        model_id="meta-llama/Llama-3.2-1B-Instruct",
+        engine="vllm",
+        mode=worker_module.ConnectionMode.GRPC,
+        worker_type=worker_module.WorkerType.REGULAR,
+        gpus=2,
+        tp=1,
+        extra_engine_args=["--data-parallel-size", "2"],
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"worker_type": worker_module.WorkerType.ENCODE},
+        {"mode": worker_module.ConnectionMode.HTTP},
+        {"tp": 2},
+        {"count": True},
+        {"gpus": 2, "extra_engine_args": ["--data-parallel-size", "2"]},
+        {"kv_backend": "nixl"},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "none"}},
+    ],
+)
+def test_mooncake_pd2_rejects_unowned_role_geometry_or_backend(monkeypatch, override):
+    _mooncake_pd2_profile(monkeypatch)
+    kwargs = {
+        "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+        "engine": "vllm",
+        "mode": worker_module.ConnectionMode.GRPC,
+        "worker_type": worker_module.WorkerType.PREFILL,
+        "tp": 1,
+        "gpus": 1,
+    }
+    with pytest.raises(ValueError):
+        worker_module.validate_startup_profile_worker(**(kwargs | override))
+
+
+@pytest.mark.parametrize("elapsed", [1.0, 301.0])
+def test_mooncake_pd2_real_pd_parallel_path_uses_shared300_deadline(monkeypatch, elapsed):
+    import importlib
+    from types import SimpleNamespace
+
+    setup = importlib.import_module("fixtures.setup_backend")
+    _mooncake_pd2_profile(monkeypatch)
+    model = "meta-llama/Llama-3.1-8B-Instruct"
+
+    def inflated_spec(_):
+        return {"tp": 1, "startup_timeout": 9999}
+
+    monkeypatch.setattr(setup, "get_model_spec", inflated_spec)
+    monkeypatch.setattr(worker_module, "get_model_spec", inflated_spec)
+    waits, pools, stopped, gateway_events = [], [], [], []
+    clock = iter((100.0, 100.0, 100.0 + elapsed))
+    monkeypatch.setattr(setup, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(setup, "_worker_start_failures", {})
+
+    def pool(**kwargs):
+        pools.append(kwargs)
+        return [SimpleNamespace(wait_ready=lambda bound: waits.append(bound))]
+
+    monkeypatch.setattr(setup, "_start_pd_pool", pool)
+    monkeypatch.setattr(setup, "stop_workers", lambda workers: stopped.extend(workers))
+    monkeypatch.setattr(
+        setup, "_start_gateway", lambda *args, **kwargs: gateway_events.append("start")
+    )
+    monkeypatch.setattr(setup, "_wait_for_serving", lambda *args: None)
+    monkeypatch.setattr(setup, "_make_openai_client", lambda _: "client")
+    gateway = SimpleNamespace(
+        base_url="http://127.0.0.1:30000",
+        shutdown=lambda: gateway_events.append("shutdown"),
+    )
+    profile = setup._setup_pd(
+        model,
+        model,
+        "vllm",
+        worker_module.ConnectionMode.GRPC,
+        {"parallel_start": True},
+        {"timeout": 60},
+        gateway,
+        None,
+    )
+    if elapsed > 300:
+        with pytest.raises(TimeoutError, match="startup bound"):
+            next(profile)
+        assert waits == [300]
+        assert gateway_events == ["shutdown"]
+    else:
+        assert next(profile)[0] == "pd_grpc"
+        assert waits == [300, 299]
+        profile.close()
+        assert gateway_events == ["start", "shutdown"]
+    assert len(pools) == len(stopped) == 2
+    assert all(kwargs["wait_ready"] is False for kwargs in pools)
+
+
+@pytest.mark.parametrize(
+    "workers,timeout",
+    [
+        ({"prefill": 2}, 60),
+        ({"prefill_kv": ["nixl"]}, 60),
+        ({"decode_tp": 2}, 60),
+        ({}, 61),
+    ],
+)
+def test_mooncake_pd2_pd_rejects_changed_fleet_before_any_pool(monkeypatch, workers, timeout):
+    import importlib
+    from types import SimpleNamespace
+
+    setup = importlib.import_module("fixtures.setup_backend")
+    _mooncake_pd2_profile(monkeypatch)
+    allocated = []
+    monkeypatch.setattr(setup, "_start_pd_pool", lambda **kwargs: allocated.append(kwargs))
+    gateway = SimpleNamespace(shutdown=lambda: None)
+    model = "meta-llama/Llama-3.1-8B-Instruct"
+    profile = setup._setup_pd(
+        model,
+        model,
+        "vllm",
+        worker_module.ConnectionMode.GRPC,
+        workers,
+        {"timeout": timeout},
+        gateway,
+        None,
+    )
+    with pytest.raises(ValueError):
+        next(profile)
+    assert allocated == []
+
+
+def _mooncake_pd2_workflows():
+    root = Path(__file__).resolve().parents[2]
+    caller = yaml.safe_load((root / ".github/workflows/pr-test-rust.yml").read_text())
+    callee = yaml.safe_load((root / ".github/workflows/e2e-gpu-job.yml").read_text())
+    return caller, callee
+
+
+def test_mooncake_pd2_caller_keeps_full_selection_and_closed_verdict():
+    caller, _callee = _mooncake_pd2_workflows()
+    name = "e2e-2gpu-pd-vllm-mooncake-amd"
+    job = caller["jobs"][name]
+    inputs = job["with"]
+    assert inputs["startup_profile"] == "vllm-mooncake-pd2"
+    assert (inputs["engine"], inputs["gpu_vendor"], inputs["gpu_tier"]) == ("vllm", "amd", "2")
+    assert (inputs["test_dirs"], inputs["test_filter"], inputs["min_selected"]) == (
+        "e2e_test/router",
+        "",
+        15,
+    )
+    assert (inputs["timeout"], inputs["test_timeout"], inputs["vllm_kv_backend"]) == (
+        50,
+        34,
+        "mooncake",
+    )
+    assert inputs["worker_log_filter"] == "info,engine_servicer::request=debug"
+    assert "--ulimit memlock=-1:-1" in inputs["container_options"]
+    assert inputs["runner"] == "${{ vars.SMG_RUNNER_AMD_GPU_2 }}"
+    assert set(job["needs"]) == {"build-wheel", "e2e-1gpu-gateway", "detect-changes"}
+    for guard in (
+        "!cancelled()",
+        "vars.SMG_RUN_AMD_LEGS == 'true'",
+        "vars.SMG_RUN_AMD_VLLM_PD2_MOONCAKE == 'true'",
+        "vars.SMG_RUNNER_AMD_GPU_2 != ''",
+        "needs.build-wheel.result == 'success'",
+        "needs.e2e-1gpu-gateway.result == 'success'",
+        "needs.detect-changes.result == 'success'",
+        "vars.SMG_RUN_AMD_ON_PRS == 'true'",
+        "needs.detect-changes.outputs.skip-chat-completions != 'true'",
+    ):
+        assert guard in job["if"]
+    finish = caller["jobs"]["finish"]
+    assert finish["needs"].count(name) == 1
+    verdict = next(step["run"] for step in finish["steps"] if step["name"] == "Check CI result")
+    assert verdict.count("needs." + name + ".result") == 2
+    assert "success|skipped) ;;" in verdict
+
+
+def _run_mooncake_pd2_contract(floor="", override=None):
+    import json
+    import subprocess
+    import sys
+
+    caller, callee = _mooncake_pd2_workflows()
+    inputs = dict(caller["jobs"]["e2e-2gpu-pd-vllm-mooncake-amd"]["with"])
+    for name in (
+        "kv_backend",
+        "vllm_extra_kv_backends",
+        "mm_processing",
+        "servicer_impl",
+        "parser",
+        "connection_mode",
+        "zmq_engine_count",
+    ):
+        inputs.setdefault(name, "")
+    inputs.update(override or {})
+    step = callee["jobs"]["run"]["steps"][0]
+    assert step["name"] == "Validate Mooncake PD startup contract"
+    assert step["if"] == "inputs.startup_profile == 'vllm-mooncake-pd2'"
+    code = step["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    env = dict(os.environ, PROFILE_INPUTS=json.dumps(inputs), E2E_STARTUP_TIMEOUT=floor)
+    return subprocess.run([sys.executable, "-I", "-S", "-c", code], env=env, capture_output=True)
+
+
+@pytest.mark.parametrize("floor", ["", "60", "61", "300", "600", "0", "NaN"])
+def test_mooncake_pd2_workflow_floor_keeps_gateway60_separate_from_worker300(floor):
+    assert (_run_mooncake_pd2_contract(floor).returncode == 0) == (floor in ("", "60"))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"test_dirs": "e2e_test/chat_completions"},
+        {"test_filter": "-k partial"},
+        {"test_timeout": 35},
+        {"timeout": 51},
+        {"vllm_kv_backend": "nixl"},
+        {"kv_backend": "mooncake"},
+        {"vllm_extra_kv_backends": "nixl"},
+        {"servicer_impl": "rust"},
+    ],
+)
+def test_mooncake_pd2_workflow_rejects_a_different_lane_before_checkout(override):
+    assert _run_mooncake_pd2_contract(override=override).returncode != 0

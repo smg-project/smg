@@ -181,6 +181,31 @@ jobs:
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
+      - name: Validate Mooncake PD startup contract
+        if: inputs.startup_profile == 'vllm-mooncake-pd2'
+        env:
+          PROFILE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          actual = json.loads(os.environ["PROFILE_INPUTS"])
+          expected = {
+              "engine": "vllm", "gpu_vendor": "amd", "gpu_tier": "2",
+              "test_dirs": "e2e_test/router", "test_filter": "", "min_selected": 15,
+              "timeout": 50, "test_timeout": 34, "vllm_kv_backend": "mooncake",
+              "kv_backend": "", "vllm_extra_kv_backends": "", "mm_processing": "",
+              "servicer_impl": "", "parser": "", "connection_mode": "", "zmq_engine_count": "",
+          }
+          mismatched = [key for key, value in expected.items() if actual.get(key) != value]
+          if mismatched:
+              raise SystemExit("Mooncake PD startup contract mismatch: " + ", ".join(mismatched))
+          floor = os.environ.get("E2E_STARTUP_TIMEOUT", "").strip()
+          if floor and not 0 < int(floor) <= 60:
+              raise SystemExit("Mooncake PD gateway startup floor must not exceed 60 seconds")
+          PY
+
       - name: Checkout code
         uses: actions/checkout@v7
 
