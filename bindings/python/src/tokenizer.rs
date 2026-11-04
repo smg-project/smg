@@ -16,7 +16,8 @@
 //!
 //! Short work runs on the calling thread with the GIL held. Work that can
 //! reach rayon (loading, batches, long texts) runs on a pool this module
-//! owns, one per process (see [`pool`]), with the GIL released.
+//! owns, one per process (see [`pool`]), with the GIL released, and
+//! `os.fork()` waits until no such call is running (see [`before_fork`]).
 
 use std::{
     cell::{Cell, RefCell},
@@ -24,16 +25,18 @@ use std::{
     fmt::{self, Write as _},
     fs,
     panic::{self, AssertUnwindSafe},
-    path::{self, Component, Path},
+    path::{self, Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, LazyLock, Mutex, PoisonError,
     },
+    thread,
+    time::Duration,
 };
 
 use llm_tokenizer::{
     factory::{create_tokenizer_with_chat_template_blocking, is_likely_openai_model},
-    hub::download_tokenizer_from_hf,
+    hub::{download_tokenizer_from_hf, is_tokenizer_file},
     traits::Tokenizer as TokenizerTrait,
     Encoding, HuggingFaceTokenizer, PromptEncoding, TiktokenTokenizer,
 };
@@ -130,29 +133,137 @@ fn caught<T>(work: impl FnOnce() -> Result<T, Failure>) -> Result<T, Failure> {
 }
 
 // ---------------------------------------------------------------------------
-// Forks: the hook that counts them
+// Fork safety: the calls in flight, and the hooks around `os.fork()`
 // ---------------------------------------------------------------------------
+
+/// The tokenizer calls running with the GIL released, and the process they
+/// run in: the process id in the high half, the count in the low one. A
+/// count another process left behind (copied into a child forked from C,
+/// past the hooks below) counts for nothing.
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// The `os.fork()`s between [`before_fork`] and the hook after the fork,
+/// kept as [`IN_FLIGHT`] keeps its count: while one is, a call keeps the GIL
+/// (see [`detached`]).
+static FORKING: AtomicU64 = AtomicU64::new(0);
+
+/// The count `state` keeps for process `pid`.
+fn count_for(state: u64, pid: u32) -> u64 {
+    if state >> 32 == u64::from(pid) {
+        state & u64::from(u32::MAX)
+    } else {
+        0
+    }
+}
+
+/// One more in the count `counter` keeps for process `pid`.
+fn count_up(counter: &AtomicU64, pid: u32) {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            Some(u64::from(pid) << 32 | (count_for(state, pid) + 1))
+        })
+        .ok();
+}
+
+/// One fewer in the count `counter` keeps for process `pid`, never below
+/// none.
+fn count_down(counter: &AtomicU64, pid: u32) {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            Some(u64::from(pid) << 32 | count_for(state, pid).saturating_sub(1))
+        })
+        .ok();
+}
+
+/// A tokenizer call running with the GIL released, counted from before the
+/// GIL is released to the end of its work (see [`before_fork`]).
+struct InFlight {
+    pid: u32,
+}
+
+impl InFlight {
+    /// Taken while the GIL is held.
+    fn start(_py: Python<'_>) -> Self {
+        let pid = std::process::id();
+        count_up(&IN_FLIGHT, pid);
+        Self { pid }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        count_down(&IN_FLIGHT, self.pid);
+    }
+}
+
+/// `work`, run with the GIL released and counted in flight until it ends,
+/// before the GIL is taken back; or, while an `os.fork()` runs its hooks (see
+/// [`before_fork`]), run with the GIL held, so that it ends before the fork,
+/// which the thread holding the GIL makes. `work` never calls into Python.
+fn detached<T: Send>(py: Python<'_>, work: impl FnOnce() -> T + Send) -> T {
+    if count_for(FORKING.load(Ordering::SeqCst), std::process::id()) != 0 {
+        return work();
+    }
+    let call = InFlight::start(py);
+    py.detach(move || {
+        let _call = call;
+        work()
+    })
+}
+
+/// Before `os.fork()`, with the GIL held: wait until no tokenizer call is
+/// running, and until the fork is made, keep the GIL in every call that
+/// starts. A call holds locks (the pool's slot, the gateway's tool cache, a
+/// lazily built table half initialized) that a child forked in its middle
+/// would inherit held, with no thread left to release them, and the child's
+/// next call would wait forever. A call starts only while holding the GIL
+/// and needs no GIL to finish, so the calls running drain. The `before`
+/// hooks registered ahead of this one (logging's and `concurrent.futures`',
+/// at their import) run after it, and one that releases the GIL lets another
+/// thread start a call before the fork: that call keeps the GIL (see
+/// [`detached`]), so it ends before the fork, which the thread holding the
+/// GIL makes. A fork made from C, past `os.fork()`, does not wait.
+#[pyfunction]
+fn before_fork() {
+    let pid = std::process::id();
+    count_up(&FORKING, pid);
+    while count_for(IN_FLIGHT.load(Ordering::SeqCst), pid) != 0 {
+        thread::sleep(Duration::from_micros(100));
+    }
+}
+
+/// In the parent after `os.fork()`, which calls it whether or not the fork
+/// was made: calls release the GIL again.
+#[pyfunction]
+fn after_fork_in_parent() {
+    count_down(&FORKING, std::process::id());
+}
 
 /// Forks this process went through by `os.fork()`, counted in the child: a
 /// pool built before one has no threads after it, even when the child's
 /// process id is a recycled one of its parent's line.
 static FORKS: AtomicU64 = AtomicU64::new(0);
 
-/// In the child of `os.fork()`.
+/// In the child of `os.fork()`, whose one thread, the one that forked, is
+/// in no call and in no other fork.
 #[pyfunction]
 fn after_fork_in_child() {
+    IN_FLIGHT.store(0, Ordering::SeqCst);
+    FORKING.store(0, Ordering::SeqCst);
     FORKS.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Whether this process registered [`after_fork_in_child`].
+/// Whether this process registered [`before_fork`],
+/// [`after_fork_in_parent`] and [`after_fork_in_child`].
 static FORK_HOOKS: AtomicBool = AtomicBool::new(false);
 
-/// Register [`after_fork_in_child`] with `os.register_at_fork`, once per
-/// process, when its first tokenizer loads. Checked and registered with the
-/// GIL held throughout, so that no fork falls in between: a once-cell would
-/// release the GIL while it initializes, and a child forked then would find
-/// the cell initializing forever. Two threads that race to the first load
-/// register at worst twice, which counts a fork twice.
+/// Register [`before_fork`], [`after_fork_in_parent`] and
+/// [`after_fork_in_child`] with `os.register_at_fork`, once per process, when
+/// its first tokenizer loads. Checked and registered with the GIL held
+/// throughout, so that no fork falls in between: a once-cell would release
+/// the GIL while it initializes, and a child forked then would find the cell
+/// initializing forever. Two threads that race to the first load register at
+/// worst twice, which waits twice and counts a fork twice.
 fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
     if FORK_HOOKS.load(Ordering::SeqCst) {
         return Ok(());
@@ -160,6 +271,11 @@ fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
     let os = py.import("os")?;
     if os.hasattr("register_at_fork")? {
         let hooks = PyDict::new(py);
+        hooks.set_item("before", wrap_pyfunction!(before_fork, py)?)?;
+        hooks.set_item(
+            "after_in_parent",
+            wrap_pyfunction!(after_fork_in_parent, py)?,
+        )?;
         hooks.set_item("after_in_child", wrap_pyfunction!(after_fork_in_child, py)?)?;
         os.call_method("register_at_fork", (), Some(&hooks))?;
     }
@@ -436,12 +552,13 @@ fn resolve_chat_template(path: &str) -> Result<String, Failure> {
     absolute(Path::new(path))
 }
 
-/// The Hub model id of a snapshot in the Hugging Face cache
-/// (`.../models--{org}--{name}/snapshots/{revision}`, or a path in one), as
-/// the cache spells it: a Hub name holds no `--`, so the first one is the
-/// `/` between the owner and the name. `..` counts by name, as
+/// Where a path is in a snapshot of the Hugging Face cache
+/// (`.../models--{org}--{name}/snapshots/{revision}`, or a path in one): the
+/// Hub model id, as the cache spells it (a Hub name holds no `--`, so the
+/// first one is the `/` between the owner and the name), and the path inside
+/// the snapshot, empty for the snapshot itself. `..` counts by name, as
 /// [`path::absolute`] leaves it: a snapshot is a real directory.
-fn hub_id_of_snapshot(path: &Path) -> Option<String> {
+fn hub_snapshot(path: &Path) -> Option<(String, String)> {
     let mut components: Vec<&str> = Vec::new();
     for component in path.components() {
         match component {
@@ -454,13 +571,17 @@ fn hub_id_of_snapshot(path: &Path) -> Option<String> {
             component => components.extend(component.as_os_str().to_str()),
         }
     }
-    components.windows(3).rev().find_map(|window| match window {
-        [repository, "snapshots", _] => repository
-            .strip_prefix("models--")
-            .filter(|id| !id.is_empty())
-            .map(|id| id.replacen("--", "/", 1)),
-        _ => None,
-    })
+    (0..components.len().saturating_sub(2))
+        .rev()
+        .find_map(|start| match &components[start..start + 3] {
+            [repository, "snapshots", _] => {
+                let id = repository
+                    .strip_prefix("models--")
+                    .filter(|id| !id.is_empty())?;
+                Some((id.replacen("--", "/", 1), components[start + 3..].join("/")))
+            }
+            _ => None,
+        })
 }
 
 /// A Hub model id's tokenizer files, downloaded as the gateway downloads
@@ -516,6 +637,77 @@ fn read_card(path: &Path) -> (Vec<String>, Option<String>) {
         .and_then(Value::as_str)
         .map(str::to_string);
     (architectures, model_type)
+}
+
+/// A digest of what a tokenizer's behaviour follows from: the smg build, the
+/// model id requests render under, the chat template file, the file a file
+/// source names, and, by name and content, the checkpoint's files the
+/// gateway's own Hub download fetches (its tokenizer files, `config.json`,
+/// `generation_config.json`) with `encoding/encoding.py`, which DeepSeek
+/// V4.1's renderer reads. Two tokenizers with one fingerprint render and
+/// encode alike; a file edited in place changes it.
+fn fingerprint(
+    location: &str,
+    chat_template: Option<&str>,
+    model: Option<&str>,
+) -> Result<String, Failure> {
+    let read = |path: &Path| {
+        fs::read(path)
+            .map_err(|error| Failure::Internal(format!("reading {}: {error}", path.display())))
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut field = |name: &str, bytes: &[u8]| {
+        for part in [name.as_bytes(), bytes] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    };
+    field("smg_build", PyTokenizer::smg_build().as_bytes());
+    if let Some(model) = model {
+        field("model", model.as_bytes());
+    }
+    if let Some(path) = chat_template {
+        field("chat_template", &read(Path::new(path))?);
+    }
+    let path = Path::new(location);
+    let (dir, source_file) = if path.is_dir() {
+        (path, None)
+    } else if let (true, Some(dir), Some(name)) = (
+        path.is_file(),
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) {
+        // The file loads whatever its name; and unlike a directory source, a
+        // file source discovers no chat template file beside it.
+        field("source_file", name.as_bytes());
+        (dir, Some(name))
+    } else {
+        // A model name tiktoken loads: no files.
+        field("source", location.as_bytes());
+        return Ok(hasher.finalize().to_hex().to_string());
+    };
+    let entries = fs::read_dir(dir)
+        .map_err(|error| Failure::Internal(format!("reading {}: {error}", dir.display())))?;
+    let mut files: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.path())))
+        .filter(|(name, path)| {
+            path.is_file()
+                && (is_tokenizer_file(name)
+                    || name == "config.json"
+                    || name == "generation_config.json"
+                    || source_file == Some(name.as_str()))
+        })
+        .collect();
+    let encoding = dir.join("encoding").join("encoding.py");
+    if encoding.is_file() {
+        files.push(("encoding/encoding.py".to_string(), encoding));
+    }
+    files.sort();
+    for (name, path) in files {
+        field(&name, &read(&path)?);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -751,8 +943,9 @@ fn openai_tokenizer(py: Python<'_>, name: &str) -> PyResult<Option<Arc<dyn Token
     if !is_likely_openai_model(name) {
         return Ok(None);
     }
-    let tokenizer =
-        py.detach(|| in_pool(|| caught(|| Ok(TiktokenTokenizer::from_model_name(name).ok()))))??;
+    let tokenizer = detached(py, || {
+        in_pool(|| caught(|| Ok(TiktokenTokenizer::from_model_name(name).ok())))
+    })??;
     Ok(tokenizer.map(|tokenizer| Arc::new(tokenizer) as Arc<dyn TokenizerTrait>))
 }
 
@@ -762,6 +955,8 @@ pub struct PyTokenizer {
     inner: Arc<dyn TokenizerTrait>,
     source: String,
     chat_template: Option<String>,
+    hub: Option<(String, String)>,
+    fingerprint: String,
     chat: Chat,
 }
 
@@ -788,14 +983,16 @@ impl PyTokenizer {
         // relative to `.` or `~`, or of more than two segments), refused when
         // it is not there, rather than read as a model name; an OpenAI model
         // name tiktoken knows, as given (see [`openai_tokenizer`]); any other
-        // name, a Hub id, downloaded here and loaded from its snapshot. The
-        // download releases the GIL, and stays off the pool, whose threads it
-        // must not hold.
-        let (location, hub_id, openai) = if path.exists() {
+        // name, a Hub id, downloaded here and loaded from its snapshot, which a
+        // pickle then names. The download releases the GIL but counts as no
+        // call in flight: it holds none of this module's locks, and a stalled
+        // one must not stall every fork; it stays off the pool, whose threads
+        // it must not hold.
+        let (location, hub, openai) = if path.exists() {
             // Read off the absolute path: `.` inside a snapshot is one too.
             let location = absolute(path)?;
-            let hub_id = hub_id_of_snapshot(Path::new(&location));
-            (location, hub_id, None)
+            let hub = hub_snapshot(Path::new(&location));
+            (location, hub, None)
         } else if path.is_absolute()
             || source.starts_with(['.', '~'])
             || source.matches('/').count() > 1
@@ -807,15 +1004,15 @@ impl PyTokenizer {
             (source.to_string(), None, Some(tokenizer))
         } else {
             let dir = py.detach(|| caught(|| download(source)))?;
-            (dir, Some(source.to_string()), None)
+            (dir, Some((source.to_string(), String::new())), None)
         };
         let model = model
-            .or(hub_id)
+            .or_else(|| hub.as_ref().map(|(id, _)| id.clone()))
             .or_else(|| (!Path::new(&location).exists()).then(|| location.clone()));
-        let inner = match openai {
-            Some(tokenizer) => tokenizer,
-            None => py.detach(|| {
-                in_pool(|| {
+        let (inner, fingerprint) = detached(py, || {
+            let inner = match openai {
+                Some(tokenizer) => tokenizer,
+                None => in_pool(|| {
                     caught(|| {
                         create_tokenizer_with_chat_template_blocking(
                             &location,
@@ -827,14 +1024,19 @@ impl PyTokenizer {
                             ))
                         })
                     })
-                })?
-            })?,
-        };
+                })??,
+            };
+            let fingerprint =
+                caught(|| fingerprint(&location, chat_template.as_deref(), model.as_deref()))?;
+            Ok::<_, Failure>((inner, fingerprint))
+        })?;
         let (architectures, model_type) = read_card(Path::new(&location));
         Ok(Self {
             inner,
             source: location,
             chat_template,
+            hub,
+            fingerprint,
             chat: Chat {
                 model,
                 architectures,
@@ -855,6 +1057,23 @@ impl PyTokenizer {
     #[getter]
     fn chat_template(&self) -> Option<&str> {
         self.chat_template.as_deref()
+    }
+
+    /// The Hub model id of the snapshot the source is in, and the source's
+    /// path inside it (empty for the snapshot itself), if it is in one.
+    #[getter]
+    fn hub_snapshot(&self) -> Option<(&str, &str)> {
+        self.hub
+            .as_ref()
+            .map(|(id, inside)| (id.as_str(), inside.as_str()))
+    }
+
+    /// A digest of the smg build, the model id, the chat template file, a
+    /// file source itself and the checkpoint's tokenizer files: tokenizers
+    /// with one fingerprint render and encode alike (see [`fingerprint`]).
+    #[getter]
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// The model id chat requests render under, if any.
@@ -935,7 +1154,9 @@ impl PyTokenizer {
         if text.len() < INLINE_ENCODE_MAX_BYTES {
             return Ok(encode_ids(tokenizer, text, add_special_tokens)?);
         }
-        let ids = py.detach(|| in_pool(|| encode_ids(tokenizer, text, add_special_tokens))?)?;
+        let ids = detached(py, || {
+            in_pool(|| encode_ids(tokenizer, text, add_special_tokens))?
+        })?;
         Ok(ids)
     }
 
@@ -946,7 +1167,7 @@ impl PyTokenizer {
         add_special_tokens: bool,
     ) -> PyResult<Vec<Vec<u32>>> {
         let tokenizer = &*self.inner;
-        let ids = py.detach(|| {
+        let ids = detached(py, || {
             in_pool(|| {
                 texts
                     .par_iter()
@@ -971,7 +1192,9 @@ impl PyTokenizer {
         if token_ids.len() < INLINE_DECODE_MAX_IDS {
             return Ok(decode_ids(tokenizer, &token_ids, skip_special_tokens)?);
         }
-        Ok(py.detach(|| decode_ids(tokenizer, &token_ids, skip_special_tokens))?)
+        Ok(detached(py, || {
+            decode_ids(tokenizer, &token_ids, skip_special_tokens)
+        })?)
     }
 
     fn decode_batch(
@@ -981,7 +1204,7 @@ impl PyTokenizer {
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
         let tokenizer = &*self.inner;
-        let texts = py.detach(|| {
+        let texts = detached(py, || {
             in_pool(|| {
                 sequences
                     .par_iter()
@@ -1007,7 +1230,7 @@ impl PyTokenizer {
         let (prepared, mut warnings) = if request.len() < INLINE_ENCODE_MAX_BYTES {
             render()
         } else {
-            py.detach(render)
+            detached(py, render)
         };
         let (processed, encoding) = prepared?;
         let from_text = matches!(encoding, PromptEncoding::FromText);
@@ -1019,7 +1242,7 @@ impl PyTokenizer {
             let (token_ids, more) = if text.len() < INLINE_ENCODE_MAX_BYTES {
                 encode()
             } else {
-                py.detach(|| in_pool(encode))?
+                detached(py, || in_pool(encode))?
             };
             warnings.extend(more);
             token_ids?
@@ -1031,7 +1254,7 @@ impl PyTokenizer {
     fn render_chat_batch(&self, py: Python<'_>, requests: Vec<String>) -> PyResult<Vec<Rendered>> {
         let tokenizer = &*self.inner;
         let chat = &self.chat;
-        let rendered = py.detach(|| {
+        let rendered = detached(py, || {
             in_pool(|| {
                 requests
                     .par_iter()
@@ -1054,28 +1277,34 @@ mod tests {
     #[test]
     fn a_hub_cache_snapshot_names_its_model_id() {
         let snapshot = Path::new("/home/u/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/0123abc");
-        let deepseek = Some("deepseek-ai/DeepSeek-V4-Flash");
-        assert_eq!(hub_id_of_snapshot(snapshot).as_deref(), deepseek);
+        let deepseek = |inside: &str| {
+            Some((
+                "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                inside.to_string(),
+            ))
+        };
+        assert_eq!(hub_snapshot(snapshot), deepseek(""));
         assert_eq!(
-            hub_id_of_snapshot(&snapshot.join("tokenizer.json")).as_deref(),
-            deepseek
+            hub_snapshot(&snapshot.join("tokenizer.json")),
+            deepseek("tokenizer.json")
         );
         assert_eq!(
-            hub_id_of_snapshot(Path::new("/cache/models--gpt2/snapshots/abc")).as_deref(),
-            Some("gpt2")
+            hub_snapshot(&snapshot.join("original/tokenizer.model")),
+            deepseek("original/tokenizer.model")
         );
-        assert_eq!(hub_id_of_snapshot(Path::new("/models/Qwen3-8B")), None);
-        assert_eq!(hub_id_of_snapshot(Path::new("/models/snapshots/abc")), None);
+        assert_eq!(
+            hub_snapshot(Path::new("/cache/models--gpt2/snapshots/abc")),
+            Some(("gpt2".to_string(), String::new()))
+        );
+        assert_eq!(hub_snapshot(Path::new("/models/Qwen3-8B")), None);
+        assert_eq!(hub_snapshot(Path::new("/models/snapshots/abc")), None);
         // `..` counts by name: out of the snapshot, no Hub id; into another
         // revision, that one's.
         assert_eq!(
-            hub_id_of_snapshot(&snapshot.join("../../../../models/my-ckpt")),
+            hub_snapshot(&snapshot.join("../../../../models/my-ckpt")),
             None
         );
-        assert_eq!(
-            hub_id_of_snapshot(&snapshot.join("../4567def")).as_deref(),
-            deepseek
-        );
+        assert_eq!(hub_snapshot(&snapshot.join("../4567def")), deepseek(""));
     }
 
     #[test]
@@ -1112,6 +1341,46 @@ mod tests {
         // the directory it would sit in.
         fs::write(&config, r#"{"architectures": ["GptOssForCausalLM"]}"#).expect("config");
         assert_eq!(read_card(&dir.path().join("gpt-4o")), (Vec::new(), None));
+    }
+
+    #[test]
+    fn the_fingerprint_follows_the_tokenizer_files_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().to_str().expect("utf-8");
+        fs::write(dir.path().join("tokenizer.json"), "{}").expect("tokenizer");
+        fs::write(dir.path().join("config.json"), "{}").expect("config");
+        let digest = |model: Option<&str>| fingerprint(source, None, model).ok().expect("digest");
+        let first = digest(Some("m"));
+        assert_eq!(digest(Some("m")), first);
+        assert_ne!(digest(Some("n")), first);
+        // Weights and other files are not the tokenizer's.
+        fs::write(dir.path().join("model.safetensors"), "weights").expect("weights");
+        fs::write(dir.path().join("README.md"), "readme").expect("readme");
+        assert_eq!(digest(Some("m")), first);
+        // A tokenizer file edited in place, or one added, is.
+        fs::write(dir.path().join("config.json"), r#"{"eos_token_id": 2}"#).expect("config");
+        let edited = digest(Some("m"));
+        assert_ne!(edited, first);
+        fs::create_dir(dir.path().join("encoding")).expect("encoding dir");
+        fs::write(dir.path().join("encoding").join("encoding.py"), "x").expect("encoding");
+        assert_ne!(digest(Some("m")), edited);
+        // A file source is fingerprinted by its directory's files and by
+        // itself, whatever its name: an in-place edit of `tok_v2.json` changes
+        // it, and a file source is not its directory.
+        let file = |name: &str| {
+            let path = dir.path().join(name);
+            fingerprint(path.to_str().expect("utf-8"), None, Some("m"))
+                .ok()
+                .expect("digest")
+        };
+        let tokenizer_json = file("tokenizer.json");
+        assert_ne!(tokenizer_json, digest(Some("m")));
+        fs::write(dir.path().join("tok_v2.json"), "{}").expect("tokenizer");
+        let tok_v2 = file("tok_v2.json");
+        assert_ne!(tok_v2, tokenizer_json);
+        fs::write(dir.path().join("tok_v2.json"), r#"{"edited": 1}"#).expect("tokenizer");
+        assert_ne!(file("tok_v2.json"), tok_v2);
+        assert_eq!(file("tokenizer.json"), tokenizer_json);
     }
 
     #[test]
@@ -1179,5 +1448,20 @@ mod tests {
         );
         let ((), outside) = captured(|| ());
         assert!(outside.is_empty());
+    }
+
+    #[test]
+    fn a_count_left_by_another_process_counts_for_nothing() {
+        let pid = std::process::id();
+        assert_eq!(count_for(u64::from(pid) << 32 | 2, pid), 2);
+        assert_eq!(count_for(u64::from(pid + 1) << 32 | 2, pid), 0);
+        // A count taken over from another process starts from none, and
+        // never goes below it.
+        let counter = AtomicU64::new(u64::from(pid + 1) << 32 | 2);
+        count_up(&counter, pid);
+        assert_eq!(count_for(counter.load(Ordering::SeqCst), pid), 1);
+        count_down(&counter, pid);
+        count_down(&counter, pid);
+        assert_eq!(counter.load(Ordering::SeqCst), u64::from(pid) << 32);
     }
 }

@@ -35,14 +35,21 @@ a chat whose request and prompt are shorter than 16 KiB) run on the calling
 thread with the GIL held, which costs less than releasing it; encode many
 texts with the batch methods. The batch methods and longer calls release the
 GIL. A decode of 4096 ids or more, the parse, checks and render of a chat
-request of 16 KiB or more, and a Hub download stay on the calling thread;
-what can reach rayon (the batch methods, building the tokenizer, and any
-encode of 16 KiB or more, a chat's prompt among them) runs on a Rust thread
-pool of ``SMG_TOKENIZER_THREADS`` threads (one when
-``TOKENIZERS_PARALLELISM`` is off, rayon's default otherwise:
-``RAYON_NUM_THREADS``, else the CPU count), one per process: a process
-forked after the parent used the tokenizer (torch ``DataLoader`` workers,
-``datasets.map(num_proc=...)``) starts its own.
+request of 16 KiB or more, a Hub download, and reading and hashing the
+loaded files for the fingerprint stay on the calling thread; what can reach
+rayon (the batch methods, building the tokenizer, and any encode of 16 KiB
+or more, a chat's prompt among them) runs on a Rust thread pool of
+``SMG_TOKENIZER_THREADS`` threads (one when ``TOKENIZERS_PARALLELISM`` is
+off, rayon's default otherwise: ``RAYON_NUM_THREADS``, else the CPU count),
+one per process: a process forked after the parent used the tokenizer (torch
+``DataLoader`` workers, ``datasets.map(num_proc=...)``) starts its own, and
+``os.fork()`` waits for the calls running in other threads (not for a Hub
+download, which holds none of their locks). A tokenizer pickles as the files
+it loaded, the smg build and their fingerprint, and reloads from those files
+in the receiving process (where the path it loaded is missing, from a
+download of the Hub snapshot it was in), refusing files that changed and
+another smg build. The fingerprint is also what makes ``datasets.map``
+recompute after a template or tokenizer file changes.
 
 Not reproduced: media content (SMG expands each image, video or audio item
 into model-specific tokens), gpt-oss models (SMG renders them with Harmony),
@@ -157,6 +164,66 @@ def _rendered(rendered: tuple[str, list[int], bool, bool, bool, list[str]]) -> R
     )
 
 
+def _restore(
+    cls: type[Tokenizer],
+    source: str,
+    chat_template: str | None,
+    model: str | None,
+    hub_snapshot: tuple[str, str] | None,
+    smg_build: str,
+    fingerprint: str,
+) -> Tokenizer:
+    """Unpickle a tokenizer: load it again from the files it was loaded
+    from, or, where the path it loaded is missing (another host), from a
+    download of the Hub snapshot it was in; and refuse it when what loaded is
+    not what was pickled."""
+    if smg_build != _Tokenizer.smg_build:
+        raise RuntimeError(
+            f"this tokenizer was pickled by smg {smg_build} and is unpickled by smg "
+            f"{_Tokenizer.smg_build}, whose token ids may differ; load it again: "
+            f"Tokenizer({source!r}, ...)"
+        )
+    if hub_snapshot is not None and not os.path.exists(source):
+        # Another host: the snapshot's files from the Hub, and the source's
+        # path in them.
+        hub_id, inside = hub_snapshot
+        downloaded = cls(hub_id, chat_template=chat_template, model=model)
+        missing = (
+            f"this tokenizer was pickled from {source}, which is not here; {hub_id} "
+            f"downloaded from the Hub (revision main) to {downloaded.source}"
+        )
+        if not inside:
+            tokenizer = downloaded
+        elif os.path.exists(os.path.join(downloaded.source, inside)):
+            location = os.path.join(downloaded.source, inside)
+            tokenizer = cls(location, chat_template=chat_template, model=model)
+        else:
+            raise RuntimeError(
+                f"{missing}, without {inside}: make the pickled snapshot available here"
+            )
+        if tokenizer.fingerprint != fingerprint:
+            raise RuntimeError(
+                f"{missing}, whose files differ: make the pickled snapshot available here"
+            )
+        return tokenizer
+    tokenizer = cls(source, chat_template=chat_template, model=model)
+    if tokenizer.fingerprint != fingerprint:
+        if hub_snapshot is not None:
+            raise RuntimeError(
+                f"the files of {source} (or its chat template) differ from those this "
+                "tokenizer was pickled with: changed since, or only partly in this host's "
+                f"Hugging Face cache, where Tokenizer({hub_snapshot[0]!r}) downloads the "
+                "missing tokenizer and config files (DeepSeek V4.1's encoding/encoding.py "
+                "comes from huggingface_hub.hf_hub_download); load it again: "
+                f"Tokenizer({source!r}, ...)"
+            )
+        raise RuntimeError(
+            f"the files of {source} (or its chat template) changed since this tokenizer "
+            "was pickled; load it again: Tokenizer(...)"
+        )
+    return tokenizer
+
+
 class Tokenizer:
     """A checkpoint's tokenizer, loaded, encoding and rendering as SMG serving does.
 
@@ -230,6 +297,18 @@ class Tokenizer:
         names, and one that names none is refused."""
         model: str | None = self._inner.model
         return model
+
+    @property
+    def fingerprint(self) -> str:
+        """A digest of the smg build, :attr:`model`, the chat template file,
+        a file source itself and the checkpoint's tokenizer files (those the
+        gateway's Hub download fetches, with ``config.json`` and
+        ``generation_config.json``, and DeepSeek V4.1's
+        ``encoding/encoding.py``, which that download does not fetch):
+        tokenizers with one fingerprint render and encode alike, and a file
+        edited in place changes it."""
+        fingerprint: str = self._inner.fingerprint
+        return fingerprint
 
     @property
     def provider_profile(self) -> str | None:
@@ -391,6 +470,27 @@ class Tokenizer:
             )
         rendered = self._inner.render_chat_batch([_request_json(r) for r in requests])
         return [_rendered(r) for r in rendered]
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (
+            _restore,
+            (
+                type(self),
+                self.source,
+                self.chat_template,
+                self.model,
+                self._inner.hub_snapshot,
+                self.smg_build,
+                self.fingerprint,
+            ),
+        )
+
+    def __copy__(self) -> Tokenizer:
+        # Immutable: a copy can share it.
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Tokenizer:
+        return self
 
     def __repr__(self) -> str:
         return (
