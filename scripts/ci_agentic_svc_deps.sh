@@ -150,9 +150,13 @@ cmd_cleanup_postgres_db() {
 cmd_setup_oracle_client() {
     set -e
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update
-    sudo apt-get install -y unzip wget
-    sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+    local sudo_cmd=()
+    if [ "$EUID" -ne 0 ]; then
+        sudo_cmd=(sudo)
+    fi
+    "${sudo_cmd[@]}" apt-get update
+    "${sudo_cmd[@]}" apt-get install -y unzip wget
+    "${sudo_cmd[@]}" apt-get install -y libaio1t64 || "${sudo_cmd[@]}" apt-get install -y libaio1
 
     LIBAIO_PATH=$(find /usr/lib -name "libaio.so*" -type f 2>/dev/null | head -1)
     INSTANT_CLIENT_DIR="$HOME/instant-client"
@@ -161,10 +165,23 @@ cmd_setup_oracle_client() {
     if [ ! -d "$INSTANT_CLIENT_DIR/instantclient_23_26" ]; then
         echo "Downloading Oracle Instant Client..."
         mkdir -p "$INSTANT_CLIENT_DIR"
-        (cd "$INSTANT_CLIENT_DIR" &&
-            wget "https://download.oracle.com/otn_software/linux/instantclient/2326100/$INSTANT_CLIENT_ZIP" &&
-            unzip "$INSTANT_CLIENT_ZIP" &&
-            rm "$INSTANT_CLIENT_ZIP")
+        (
+            # Keep failed downloads/extractions outside the reusable cache. Each
+            # retry overwrites the same private archive; TLS verification stays on.
+            staging="$(mktemp -d "$INSTANT_CLIENT_DIR/.oracle-client.XXXXXX")"
+            trap 'rm -rf -- "$staging"' EXIT
+            bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 5 \
+                timeout --kill-after=5s 120s wget --tries=1 --timeout=30 \
+                -O "$staging/$INSTANT_CLIENT_ZIP" \
+                "https://download.oracle.com/otn_software/linux/instantclient/2326100/$INSTANT_CLIENT_ZIP"
+            unzip -tq "$staging/$INSTANT_CLIENT_ZIP"
+            unzip -q "$staging/$INSTANT_CLIENT_ZIP" -d "$staging/unpacked"
+            test -d "$staging/unpacked/instantclient_23_26" || {
+                echo "Oracle archive $INSTANT_CLIENT_ZIP has no instantclient_23_26/ root" >&2
+                exit 1
+            }
+            mv -T "$staging/unpacked/instantclient_23_26" "$INSTANT_CLIENT_DIR/instantclient_23_26"
+        )
     else
         echo "Oracle Instant Client already exists, skipping download"
     fi

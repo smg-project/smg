@@ -53,6 +53,15 @@ from infra.mock_mcp import mock_mcp_server as mock_mcp_server  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+def pytest_ignore_collect(collection_path):
+    """Collect fixed-reference cap projections only for business evidence."""
+    if collection_path.name == "test_original_request_caps.py" and not os.environ.get(
+        "RESPONSES_EVIDENCE_DIR"
+    ):
+        return True
+    return None
+
+
 # =============================================================================
 # Mock MCP config
 # =============================================================================

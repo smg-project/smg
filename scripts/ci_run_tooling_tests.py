@@ -21,6 +21,9 @@ COMPONENTS = (
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
+    ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
+    ("scripts/ci_validate_amd_responses.sh", "scripts/tests/test_ci_amd_responses_adapter.py"),
+    ("scripts/ci_agentic_svc_deps.sh", "scripts/tests/test_ci_oracle_client_download.py"),
     (".github/workflows/pr-test-rust.yml", "scripts/tests/test_ci_amd_sglang_callers.py"),
     ("scripts/ci_run_sglang_rocm_units.sh", "scripts/tests/test_ci_sglang_rocm_units.py"),
     ("scripts/ci_verify_sglang_rocm_e2e.py", "scripts/tests/test_ci_sglang_rocm_e2e.py"),

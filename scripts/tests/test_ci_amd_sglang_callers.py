@@ -11,6 +11,16 @@ ROOT = Path(__file__).resolve().parents[2]
 CALLER = yaml.safe_load((ROOT / ".github/workflows/pr-test-rust.yml").read_text())
 CALLEE = yaml.safe_load((ROOT / ".github/workflows/e2e-gpu-job.yml").read_text())
 TARGETS = {
+    "e2e-1gpu-responses-amd": (
+        "SMG_RUN_AMD_RESPONSES",
+        {
+            "test_dirs": "e2e_test/responses",
+            "min_selected": 128,
+            "amd_responses": True,
+            "responses_evidence": True,
+            "setup_agentic_deps": True,
+        },
+    ),
     "e2e-1gpu-chat-zmq-amd": (
         "SMG_RUN_AMD_SGLANG_ZMQ",
         {"test_dirs": "e2e_test/chat_completions", "connection_mode": "zmq", "min_selected": 209},
@@ -32,6 +42,7 @@ def evaluate_gate(expression, flags, event, build, detect, cancelled, skip):
     expression = expression.replace(
         "needs.detect-changes.outputs.skip-chat-completions", repr(skip)
     )
+    expression = expression.replace("needs.detect-changes.outputs.skip-agentic", repr(skip))
     expression = re.sub(r"vars\.([A-Z0-9_]+)", lambda m: repr(flags.get(m[1], "")), expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
