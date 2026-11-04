@@ -166,6 +166,7 @@ def missing_lock_alias_cases(directory):
             }
             print("MISSING_LOCK_ALIAS_OBSERVATION " + json.dumps(observation), flush=True)
             assert result.returncode == 2, "missing-lock alias must reject before publishing status"
+            assert b"ready path aliases the lease lock" in result.stderr, result.stderr
             assert not lock.exists(), "owner-gone status created the lease lock"
             assert not list(case.glob("lock.tmp.*"))
             observations.append(observation)
@@ -222,6 +223,7 @@ def lifecycle_cases(directory):
             timeout=4,
         )
         assert collision.returncode == 2
+        assert b"ready path aliases the lease lock" in collision.stderr, collision.stderr
         assert (lock.stat().st_dev, lock.stat().st_ino) == identity
         assert alias.samefile(lock)
         # Keep /./ in the literal argument: Path joining would normalize it.
@@ -245,6 +247,9 @@ def lifecycle_cases(directory):
             timeout=4,
         )
         assert spelling_collision.returncode == 2
+        assert b"ready path aliases the lease lock" in spelling_collision.stderr, (
+            spelling_collision.stderr
+        )
         assert (lock.stat().st_dev, lock.stat().st_ino, lock.read_bytes()) == before_alias
         assert alias.samefile(lock) and alias.read_bytes() == before_alias[2]
     finally:
