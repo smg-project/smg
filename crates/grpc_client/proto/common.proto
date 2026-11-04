@@ -121,6 +121,8 @@ message EngineLoad {
   // silence allows for it at the prefill rate it has measured on the
   // worker, whatever it has in flight there itself.
   optional uint32 prefill_pending_tokens = 21;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 22;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field

@@ -529,6 +529,7 @@ impl VllmEngineClient {
 // ---------------------------------------------------------------------------
 
 impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+    /// Preserve the rank's measured input capacity separately from generation rate.
     fn from(load: proto::SchedulerLoad) -> Self {
         Self {
             dp_rank: load.dp_rank,
@@ -540,6 +541,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
             gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
