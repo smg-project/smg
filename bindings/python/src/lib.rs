@@ -31,6 +31,9 @@ use servicer::{
     PyVllmGrpcServer,
 };
 
+mod tokenizer;
+use tokenizer::PyTokenizer;
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
@@ -166,7 +169,7 @@ impl PyJwtConfig {
 }
 
 impl PyJwtConfig {
-    pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
+    pub fn to_auth_jwt_config(&self) -> config::ConfigResult<auth::JwtConfig> {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
         config.role_claim.clone_from(&self.role_claim);
 
@@ -175,16 +178,30 @@ impl PyJwtConfig {
             config = config.with_jwks_uri(uri);
         }
 
-        // Add role mappings
+        // A gateway role that is neither admin nor user is refused, as the
+        // CLI refuses it: mapped to user in silence, the operator who meant
+        // admin is locked out of the admin routes with nothing to read. An
+        // empty IdP role is refused with it, as the CLI refuses `=admin`: no
+        // claim ever matches it.
         for (idp_role, gateway_role) in &self.role_mapping {
-            let role = match gateway_role.to_lowercase().as_str() {
-                "admin" => auth::Role::Admin,
-                _ => auth::Role::User,
-            };
+            if idp_role.is_empty() {
+                return Err(config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("={gateway_role}"),
+                    "the IdP role must not be empty",
+                ));
+            }
+            let role: auth::Role = gateway_role.parse().map_err(|_: String| {
+                config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("{idp_role}={gateway_role}"),
+                    "the gateway role must be 'admin' or 'user'",
+                )
+            })?;
             config = config.with_role_mapping(idp_role, role);
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -217,16 +234,22 @@ impl PyControlPlaneAuthConfig {
 }
 
 impl PyControlPlaneAuthConfig {
-    pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
-        auth::ControlPlaneAuthConfig {
-            jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
+    pub fn to_auth_control_plane_config(
+        &self,
+    ) -> config::ConfigResult<auth::ControlPlaneAuthConfig> {
+        Ok(auth::ControlPlaneAuthConfig {
+            jwt: self
+                .jwt
+                .as_ref()
+                .map(|j| j.to_auth_jwt_config())
+                .transpose()?,
             api_keys: self
                 .api_keys
                 .iter()
                 .map(|k| k.to_auth_api_key_entry())
                 .collect(),
             audit_enabled: self.audit_enabled,
-        }
+        })
     }
 }
 
@@ -513,7 +536,6 @@ struct Router {
     kv_engine_id_annotation: String,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
-    least_load_max_waiting_requests: u32,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
     log_dir: Option<String>,
@@ -920,7 +942,6 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
-                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -1392,7 +1413,6 @@ impl Router {
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
-        least_load_max_waiting_requests = 0,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
         log_dir = None,
@@ -1614,7 +1634,6 @@ impl Router {
         kv_engine_id_annotation: String,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
-        least_load_max_waiting_requests: u32,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
         log_dir: Option<String>,
@@ -1872,7 +1891,6 @@ impl Router {
             kv_engine_id_annotation,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
-            least_load_max_waiting_requests,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
             log_dir,
@@ -2018,6 +2036,13 @@ impl Router {
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        if let Some(buckets) = &self.prometheus_duration_buckets {
+            PrometheusConfig::validate_duration_buckets(buckets).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        }
+
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
         })?;
@@ -2097,7 +2122,13 @@ impl Router {
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()
-                    .map(|c| c.to_auth_control_plane_config()),
+                    .map(|c| c.to_auth_control_plane_config())
+                    .transpose()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Configuration error: {e}"
+                        ))
+                    })?,
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
                         use rand::{distr::Alphanumeric, RngExt};
@@ -2258,6 +2289,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
+    m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;

@@ -67,20 +67,12 @@ def test_regular_tokenspeed_worker_has_no_disagg_flags():
     assert "--disaggregation-mode" not in cmd
 
 
-def test_regular_tokenspeed_worker_exposes_its_rl_control_app():
-    w = _ts_worker(WorkerType.REGULAR)
-    cmd = w._build_cmd()
-    # Port only: the control app binds the engine's ``--host``, which it advertises.
+def test_tokenspeed_worker_passes_no_rl_control_flags():
+    # The pinned engine has no in-engine control app; its parser, which gets
+    # every flag the servicer entrypoint does not own, rejects the flags.
+    cmd = _ts_worker(WorkerType.REGULAR)._build_cmd()
+    assert "--rl-control-port" not in cmd
     assert "--rl-control-host" not in cmd
-    port = int(cmd[cmd.index("--rl-control-port") + 1])
-    assert port == w.rl_control_port and port > 0 and port != w.port
-
-
-def test_pinned_rl_control_port_is_used_verbatim():
-    w = _ts_worker(WorkerType.REGULAR)
-    w.rl_control_port = 41234
-    cmd = w._build_cmd()
-    assert cmd[cmd.index("--rl-control-port") + 1] == "41234"
 
 
 def _w(port, worker_type, bootstrap_port=None):

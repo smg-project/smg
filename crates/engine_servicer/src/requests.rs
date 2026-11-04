@@ -41,7 +41,7 @@ pub(crate) const SHUTDOWN_MESSAGE: &str =
     "servicer shutting down: the engine went away before the request completed";
 
 /// The request-id prefix of the lifecycle owner's own requests: its planned
-/// warm-up names them `smg-warmup-<n>` (the Python servicer package's
+/// warm-up names them `smg-warmup-<nonce>-<n>` (the Python servicer package's
 /// `warmup.py` builds them; its tests pin the form) and sends them over the
 /// servicer's own port, from the process that holds readiness. While
 /// readiness is held, these are the only requests admitted; anything else
@@ -49,15 +49,28 @@ pub(crate) const SHUTDOWN_MESSAGE: &str =
 /// the warm-up's.
 pub(crate) const WARMUP_REQUEST_ID_PREFIX: &str = "smg-warmup-";
 
-/// Whether `request_id` has the exact form of a warm-up request, the prefix
-/// followed by the request's ordinal and nothing else. The gateway derives a
-/// request's id from a caller's `x-request-id` with a suffix of its own, so
-/// that path cannot take this form; a body `rid` outside PD is forwarded as
-/// sent and still can (a per-process nonce in the id would close that).
-pub(crate) fn is_warmup_request_id(request_id: &str) -> bool {
-    request_id
-        .strip_prefix(WARMUP_REQUEST_ID_PREFIX)
-        .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit()))
+/// Whether `request_id` has the exact form of a warm-up request: the prefix,
+/// the `nonce` the servicer was constructed with and a `-` when it has one,
+/// the request's ordinal and nothing else. The gateway derives a request's
+/// id from a caller's `x-request-id` with a suffix of its own, so that path
+/// cannot take this form; a body `rid` outside PD is forwarded as sent and
+/// can spell the bare form, which is why the lifecycle owner draws a nonce
+/// per process and hands it to the servicer and to its warm-up alone.
+pub(crate) fn is_warmup_request_id(request_id: &str, nonce: Option<&str>) -> bool {
+    let Some(rest) = request_id.strip_prefix(WARMUP_REQUEST_ID_PREFIX) else {
+        return false;
+    };
+    let ordinal = match nonce {
+        Some(nonce) => match rest
+            .strip_prefix(nonce)
+            .and_then(|rest| rest.strip_prefix('-'))
+        {
+            Some(ordinal) => ordinal,
+            None => return false,
+        },
+        None => rest,
+    };
+    !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Registered in-flight requests. The generation disambiguates an id reused
@@ -70,6 +83,9 @@ pub(crate) struct RequestRegistry {
     /// Readiness held for the planned warm-up: admission is the warm-up's
     /// own requests only.
     warming: AtomicBool,
+    /// The mark the warm-up's own request ids carry
+    /// (`ServicerConfig::warmup_nonce`); `None` admits the bare form.
+    warmup_nonce: Option<String>,
     active: AtomicUsize,
 }
 
@@ -98,6 +114,15 @@ impl Drop for Registration {
 }
 
 impl RequestRegistry {
+    /// An empty registry whose readiness hold admits the warm-up ids that
+    /// carry `warmup_nonce` (the bare `smg-warmup-<n>` under `None`).
+    pub(crate) fn with_warmup_nonce(warmup_nonce: Option<String>) -> Self {
+        Self {
+            warmup_nonce,
+            ..Self::default()
+        }
+    }
+
     /// Register `request_id` before its engine submit, so an `Abort` landing
     /// in the gap finds the entry. A live duplicate is refused: the id is the
     /// Router's cancellation handle, and the engine would refuse it too.
@@ -119,7 +144,9 @@ impl RequestRegistry {
         if self.draining.load(Ordering::Acquire) {
             return Err(Status::unavailable("servicer is draining"));
         }
-        if self.warming.load(Ordering::Acquire) && !is_warmup_request_id(request_id) {
+        if self.warming.load(Ordering::Acquire)
+            && !is_warmup_request_id(request_id, self.warmup_nonce.as_deref())
+        {
             return Err(Status::unavailable("servicer is warming up"));
         }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
@@ -316,6 +343,43 @@ mod tests {
             .expect("the release admits every request");
         drop(late);
         assert_eq!(registry.active(), 0);
+    }
+
+    /// A registry constructed with the lifecycle owner's nonce admits, while
+    /// readiness is held, the ids that carry it and nothing else: the bare
+    /// form a client's own `rid` can spell is refused, as are a wrong nonce,
+    /// a missing ordinal and a suffix after it; the release admits all.
+    #[test]
+    fn a_readiness_hold_admits_only_the_ids_that_carry_the_warm_ups_nonce() {
+        let registry = Arc::new(RequestRegistry::with_warmup_nonce(Some(
+            "c0ffee42".to_string(),
+        )));
+        registry.set_warming(true);
+        let (own, _cancel) = registry
+            .register("smg-warmup-c0ffee42-7")
+            .expect("the warm-up's own request carries the nonce");
+        drop(own);
+        for crafted in [
+            "smg-warmup-7",
+            "smg-warmup-c0ffee43-7",
+            "smg-warmup-c0ffee42-",
+            "smg-warmup-c0ffee42-7-8",
+            "smg-warmup-c0ffee427",
+            "smg-warmup--7",
+            "chatcmpl-smg-warmup-c0ffee42-7",
+        ] {
+            let refused = registry
+                .register(crafted)
+                .err()
+                .expect("an id without the exact nonce form is refused");
+            assert_eq!(refused.message(), "servicer is warming up", "{crafted}");
+        }
+        assert_eq!(registry.active(), 0);
+        registry.set_warming(false);
+        let (late, _cancel) = registry
+            .register("smg-warmup-7")
+            .expect("the release admits every request, the bare form too");
+        drop(late);
     }
 
     /// A choice as the shutdown sees it, in the shape of the servicers' own:

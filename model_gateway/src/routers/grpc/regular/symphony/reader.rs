@@ -28,7 +28,7 @@ use crate::routers::grpc::utils::isolation;
 use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
-/// ([`assign`]), and the part of the rendered prompt the engine replays.
+/// ([`assign_for`]), and the part of the rendered prompt the engine replays.
 #[derive(Clone, Debug)]
 pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
@@ -158,16 +158,8 @@ struct AskedVariant {
     variant: Arc<Format>,
 }
 
-/// Symphony's assignment to a request, if a table reads the response ([`reading`]) and the
-/// constraint is not a JSON schema: the older path's forced call, whose output has no markers for
-/// a table to read, which the older registry writes where the table has no tag. The table goes
-/// without its calls where the legacy path would run no tool parser, without its thought where it
-/// would run no reasoning parser ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call
-/// the conversation established without a tool inventory comes back as a call under either
-/// parser. `None` where the legacy parsers read the response, which the response's header then
-/// says; a request Symphony was configured for is counted once here, by the reason
-/// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
-/// decides the reader.
+/// [`assign_for`] with the table decision read here ([`reading`]) and the provider profile derived
+/// from the model, as the tests ask it.
 #[cfg(test)]
 pub(crate) fn assign(
     parser: ParserChoice,
@@ -186,10 +178,20 @@ pub(crate) fn assign(
     ))
 }
 
-/// [`assign`] with the table decision already read (`read`: preparation reads it once per
-/// request and request building passes it, `ProcessingState::reading`) and the model's provider
-/// profile already derived (the preparation stage derives it once per request; request building
-/// passes it).
+/// Symphony's assignment to a request, if a table reads the response (`read`, the table decision:
+/// preparation reads it once per request, [`reading`](super::names::reading), and request building
+/// passes it, `ProcessingState::reading`) and the constraint is not a JSON schema: the older
+/// path's forced call, whose output has no markers for a table to read, which the older registry
+/// writes where the table has no tag. The table goes without its calls where the legacy path would
+/// run no tool parser, without its thought where it would run no reasoning parser
+/// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
+/// established without a tool inventory comes back as a call under either parser. `None` where
+/// the legacy parsers read the response, which the response's header then says; a request
+/// Symphony was configured for is counted once here, by the reason
+/// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
+/// decides the reader. `provider` is the model's provider profile as the preparation stage derived
+/// it once per request; request building passes it. The tests ask through `assign`, which reads
+/// the decision and derives the profile first.
 pub(crate) fn assign_for(
     read: Reading,
     asks: Asks<'_>,

@@ -1,4 +1,9 @@
+mod alias_pipeline;
+mod build_parity;
+mod generate_body;
 mod glm53;
+mod model_label;
+mod rate_limit_reserve;
 
 use std::{
     path::{Path, PathBuf},
@@ -112,8 +117,8 @@ type TokenizerStream =
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
 /// for a stream that outlasts its dispatch. Every call's input token ids,
-/// prompt text and engine request id are recorded, as is every aborted
-/// request id.
+/// prompt text, stop sequences and engine request id are recorded, as is
+/// every aborted request id.
 #[derive(Clone, Default)]
 struct GatedScheduler {
     probe: Option<Weak<CompletionRequest>>,
@@ -138,6 +143,7 @@ struct GatedScheduler {
     seen_original_texts: Arc<Mutex<Vec<String>>>,
     seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
     seen_request_ids: Arc<Mutex<Vec<String>>>,
+    seen_stops: Arc<Mutex<Vec<Vec<String>>>>,
     aborted_request_ids: Arc<Mutex<Vec<String>>>,
 }
 
@@ -231,6 +237,16 @@ impl TokenSpeedScheduler for GatedScheduler {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.request_id.clone());
+        self.seen_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                request
+                    .sampling_params
+                    .as_ref()
+                    .map(|params| params.stop.clone())
+                    .unwrap_or_default(),
+            );
         if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
             return Err(Status::unavailable("release-test induced failure"));
         }
@@ -509,24 +525,17 @@ async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponent
     components_with_multimodal(worker_registry, false).await
 }
 
-/// Components over the mock tokenizer; `with_multimodal` adds the
-/// multimodal bundle (default settings, no model directory) so media
-/// reaches the multimodal path instead of the "not available" refusal.
-async fn components_with_multimodal(
+/// Components over `tokenizer_registry` and `worker_registry` with the
+/// legacy parser choice; `with_multimodal` adds the multimodal bundle
+/// (default settings) so media reaches the multimodal path instead of the
+/// "not available" refusal. The bundle's model config is read from the
+/// tokenizer's source, so the caller's tokenizer decides whether there is
+/// a model directory.
+fn shared_components(
+    tokenizer_registry: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     with_multimodal: bool,
 ) -> Arc<SharedComponents> {
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .expect("load mock tokenizer");
     let multimodal = with_multimodal.then(|| {
         Arc::new(
             MultimodalComponents::new(
@@ -550,6 +559,25 @@ async fn components_with_multimodal(
         tokenizer_load_failures: Arc::default(),
         parser: ParserChoice::Legacy,
     })
+}
+
+/// [`shared_components`] over the mock tokenizer (no model directory).
+async fn components_with_multimodal(
+    worker_registry: Arc<WorkerRegistry>,
+    with_multimodal: bool,
+) -> Arc<SharedComponents> {
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    tokenizer_registry
+        .load(
+            "tokenizer-id",
+            MODEL,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("load mock tokenizer");
+    shared_components(tokenizer_registry, worker_registry, with_multimodal)
 }
 
 /// A worker whose servicer left `supports_vision` unset (the SGLang and
@@ -1576,6 +1604,87 @@ async fn retry_replays_identical_token_ids_from_the_retained_plan() {
     }
 }
 
+/// A request whose first attempt fails retryably and whose retry succeeds
+/// is one routed request with no error, whose duration runs from the
+/// request's start (the backoff included), as the HTTP routers count a
+/// request: the attempts are the retry families' count, not this one's.
+#[test]
+fn a_retried_request_counts_once_with_its_whole_duration_and_no_error() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    let backoff = Duration::from_millis(50);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let port = spawn_stub(GatedScheduler {
+                fail_first: true,
+                ..Default::default()
+            })
+            .await;
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            register_worker(&worker_registry, port, WorkerType::Regular);
+            let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+            let components = components(worker_registry).await;
+            let retry = RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: backoff.as_millis() as u64,
+                max_backoff_ms: backoff.as_millis() as u64,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            };
+            let response = pipeline
+                .execute_completion(
+                    completion_request(false),
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    Some(&retry),
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+        });
+    });
+    let rendered = handle.render();
+    let value = |family: &str| -> Option<f64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{family}{{"))
+                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!(
+                        "endpoint=\"{}\"",
+                        metrics_labels::ENDPOINT_COMPLETIONS
+                    ))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+    };
+    assert_eq!(
+        value("smg_router_requests_total"),
+        Some(1.0),
+        "one request, not one per attempt:\n{rendered}"
+    );
+    assert_eq!(
+        value("smg_router_request_errors_total"),
+        None,
+        "the retried attempt's failure is not the request's answer:\n{rendered}"
+    );
+    assert_eq!(
+        value("smg_router_request_duration_seconds_count"),
+        Some(1.0),
+        "one duration sample:\n{rendered}"
+    );
+    assert!(
+        value("smg_router_request_duration_seconds_sum")
+            .is_some_and(|sum| sum >= backoff.as_secs_f64()),
+        "the duration runs from the request's start, the backoff included:\n{rendered}"
+    );
+}
+
 /// `x-smg-cache-trace: 1` on a request returns that request's decision
 /// record, with the chosen worker, whatever the process switches say.
 #[tokio::test]
@@ -2534,6 +2643,39 @@ async fn a_client_that_leaves_a_stalled_harmony_responses_stream_aborts_it_on_th
     );
 }
 
+/// Harmony Responses over the gRPC regular path: the request's `stop`
+/// sequences reach the engine on the request the Harmony pipeline built, as
+/// a chat request's do; the stub reads them off its sampling parameters.
+#[tokio::test]
+async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
+    let scheduler = GatedScheduler::default();
+    let port = spawn_stub(scheduler.clone()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+    let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "input": "hi",
+        "stream": true,
+        "stop": ["STOP", "\n\n"],
+    }))
+    .expect("responses request");
+
+    let response = serve_harmony_responses_stream(&ctx, request, anonymous(), None).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("the stream's body");
+    assert!(!body.is_empty(), "the stream answers");
+
+    let seen = scheduler
+        .seen_stops
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(seen, vec![vec!["STOP".to_string(), "\n\n".to_string()]]);
+}
+
 /// Harmony Responses over the gRPC PD path: the same client leaves while
 /// the decode side wedged after its first token. The decode engine receives
 /// the abort at once and both sides end with their load released.
@@ -2877,29 +3019,7 @@ async fn v41_components(
         )
         .await
         .expect("register the DeepSeek-V4.1 tokenizer");
-    let multimodal = with_multimodal.then(|| {
-        Arc::new(
-            MultimodalComponents::new(
-                Arc::new(MultimodalConfigRegistry::new()),
-                None,
-                None,
-                &MultimodalSettings::default(),
-            )
-            .expect("multimodal components"),
-        )
-    });
-    Arc::new(SharedComponents {
-        templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-        tokenizer_registry,
-        worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
-        parser_resolver: utils::ParserResolver::disabled(),
-        multimodal,
-        tokenizer_autoload: true,
-        tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Legacy,
-    })
+    shared_components(tokenizer_registry, worker_registry, with_multimodal)
 }
 
 /// Status, body, and the input ids and placeholders of every attempt a

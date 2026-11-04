@@ -170,10 +170,10 @@ class TestBackgroundResponsesLocal:
         assert stored.background is True
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
@@ -181,7 +181,8 @@ class TestBackgroundResponsesGptOss:
     """Background mode on the reasoning-model path, which serves the request
     through its own pipeline: the same lifecycle, under the same id."""
 
-    def test_background_response_is_queued_then_completes(self, model, api_client):
+    def test_background_response_is_queued_then_completes(self, model, api_client, mock_answers):
+        mock_answers.enqueue("Autumn turns the leaves. The evenings come early.")
         create_resp = api_client.responses.create(
             model=model,
             input="Write two sentences about autumn.",
@@ -200,7 +201,12 @@ class TestBackgroundResponsesGptOss:
         assert len(final.output) > 0, "the terminal object carries the generated items"
         assert final.completed_at is not None and final.completed_at > 0
 
-    def test_cancel_stops_a_running_background_response(self, model, api_client):
+    def test_cancel_stops_a_running_background_response(self, model, api_client, mock_answers):
+        # On the mock: an answer that takes seconds to stream, so the cancel
+        # finds the response running.
+        mock_answers.enqueue(
+            " ".join(["The keeper climbed the stairs at dusk."] * 60), chunk_tokens=4, delay_ms=100
+        )
         create_resp = api_client.responses.create(
             model=model,
             input="Write a long story about a lighthouse keeper, at least twenty paragraphs.",
@@ -209,12 +215,22 @@ class TestBackgroundResponsesGptOss:
         )
         assert create_resp.status in ("queued", "in_progress")
 
+        # On the mock, wait until the worker took the paced answer, so the
+        # cancel lands on a running generation (one that arrives first drops
+        # the work unsent and leaves the answer queued); a no-op on a real
+        # engine.
+        deadline = time.monotonic() + 10
+        while mock_answers.active and mock_answers.leftovers() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not mock_answers.leftovers(), "the mock worker did not take the paced answer"
+
         cancelled = api_client.responses.cancel(create_resp.id)
         assert cancelled.id == create_resp.id
         assert cancelled.status == "cancelled"
         assert api_client.responses.retrieve(response_id=create_resp.id).status == "cancelled"
 
-    def test_background_stream_starts_with_queued(self, model, api_client):
+    def test_background_stream_starts_with_queued(self, model, api_client, mock_answers):
+        mock_answers.enqueue("1, 2, 3, 4, 5.")
         stream = api_client.responses.create(
             model=model,
             input="Count from 1 to 5.",

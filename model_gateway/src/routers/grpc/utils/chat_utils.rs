@@ -27,6 +27,7 @@ use openai_protocol::{
         ToolChoiceValue,
     },
     generate::GenerateFinishReason,
+    profile::ProviderProfile,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -481,9 +482,13 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
 /// else the effective effort as the request's provider profile reads it
-/// (`ChatCompletionRequest::template_thinking`).
-fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.template_thinking()
+/// (`ChatCompletionRequest::template_thinking_for`, with the profile the
+/// preparation stage derived once for the request).
+fn resolve_template_thinking(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+) -> Option<bool> {
+    request.template_thinking_for(provider)
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -806,6 +811,7 @@ pub fn process_chat_messages_with_encoding(
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -817,6 +823,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
         // Get content format and transform messages accordingly: the format
@@ -878,7 +885,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             prepared_tools: prepared_tools.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
-            thinking: resolve_template_thinking(request),
+            thinking: resolve_template_thinking(request, provider),
             ..Default::default()
         };
 

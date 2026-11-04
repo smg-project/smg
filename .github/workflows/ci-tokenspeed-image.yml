@@ -12,6 +12,7 @@ on:
     paths:
       - '.github/versions/tokenspeed.ref'
       - '.github/versions/tokenspeed-nightly.txt'
+      - '.github/versions/tokenspeed-engine.txt'
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_apt_mirror.sh'
       - 'scripts/ci_ensure_python_headers.sh'

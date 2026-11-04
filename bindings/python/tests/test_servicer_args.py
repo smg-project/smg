@@ -55,6 +55,7 @@ SHARED_DEFAULTS = {
     "engine_silence_timeout_secs": None,
     "engine_prefill_tokens_per_sec": None,
     "metrics_bind_address": None,
+    "warmup_nonce": None,
 }
 # A call that passes the servicer's block and a model path only. The bad values
 # below are refused before anything is bound or dialled, so the endpoints need
@@ -102,6 +103,11 @@ REFUSED = [
         "metrics_bind_address",
         "nope",
         "invalid servicer config: metrics_bind_address must be host:port",
+    ),
+    (
+        "warmup_nonce",
+        "a-b",
+        "invalid servicer config: warmup_nonce must be ASCII letters and digits",
     ),
 ]
 

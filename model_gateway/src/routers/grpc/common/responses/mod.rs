@@ -18,7 +18,7 @@ pub(crate) use streaming::{
 };
 pub(crate) use utils::{
     ensure_mcp_connection, persist_response_if_needed, previous_response_chain, stored_foreground,
-    NotStored,
+    tool_call_limit, NotStored,
 };
 
 pub(crate) use crate::routers::common::mcp_utils::collect_user_function_names;

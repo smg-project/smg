@@ -1,8 +1,10 @@
 //! The arithmetic of a `GetLoads` answer every wire shares: one rank's
 //! figures from the engine's load snapshot and the report's capacity, the
-//! ranks of a zero-filled report, and the aggregate over the ranks reported.
-//! A wire builds its own proto types from these; what differs per wire (the
-//! fields it adds, how it names its version) stays in the wire's module.
+//! ranks of a zero-filled report, the aggregate over the ranks reported, and
+//! the per-rank entries in the order every wire lists them
+//! ([`rank_entries`]). A wire builds its own proto types from these; what
+//! differs per wire (the fields it adds, how it names its version) stays in
+//! the wire's module.
 
 use openai_protocol::worker::SchedulerLoadSnapshot;
 
@@ -33,10 +35,19 @@ impl RankFigures {
     }
 }
 
-/// The ranks of a zero-filled report (no snapshot carried yet): `0..count`
-/// as the proto's rank numbers.
+/// The proto's rank numbers of the `count` ranks a servicer serves: `0..count`.
 pub(crate) fn rank_ids(count: usize) -> impl Iterator<Item = i32> {
     (0..count).map(|rank| i32::try_from(rank).unwrap_or(i32::MAX))
+}
+
+/// The ranks of `0..count` with no entry in `reported`: a connected scheduler
+/// before its first output batch (an idle one, whether or not a sibling rank
+/// has reported). A report gives each a zero-filled entry, as the Python
+/// servicer reports an idle scheduler, so it lists every connected rank from
+/// boot on and a records-only stream reads an idle rank as idle, never as
+/// gone, through its siblings' first batches.
+pub(crate) fn unreported_ranks(count: usize, reported: &[i32]) -> impl Iterator<Item = i32> + '_ {
+    rank_ids(count).filter(move |rank| !reported.contains(rank))
 }
 
 /// One rank's share of the aggregate: the fields of a reported rank the
@@ -79,6 +90,49 @@ impl Aggregate {
             avg_usage,
         }
     }
+}
+
+/// The per-rank entries of a `GetLoads` answer, as every wire lists them:
+/// the snapshot's ranks (the one the request names, when it names one), each
+/// built by `reported` from its snapshot and its figures, then a zero-filled
+/// entry from `unreported` for every connected rank without one (see
+/// [`unreported_ranks`]; a rank past the connected ones gets none), sorted
+/// by rank; with the aggregate over all of them, the zero-filled ranks
+/// counted as idle.
+pub(crate) fn rank_entries<L>(
+    snapshot: Vec<SchedulerLoadSnapshot>,
+    kv_capacity_tokens: i32,
+    ranks: usize,
+    dp_rank: Option<i32>,
+    mut reported: impl FnMut(&SchedulerLoadSnapshot, &RankFigures) -> L,
+    mut unreported: impl FnMut(i32) -> L,
+) -> (Vec<L>, Aggregate) {
+    let asked = |rank: i32| dp_rank.is_none_or(|wanted| wanted == rank);
+    let mut entries: Vec<(i32, L)> = Vec::with_capacity(ranks);
+    let mut shares = Vec::with_capacity(ranks);
+    for load in snapshot.into_iter().filter(|load| asked(load.dp_rank)) {
+        let figures = RankFigures::of(&load, kv_capacity_tokens);
+        shares.push(RankLoad {
+            running: figures.running,
+            waiting: figures.waiting,
+            usage: figures.usage,
+        });
+        entries.push((figures.dp_rank, reported(&load, &figures)));
+    }
+    let seen: Vec<i32> = entries.iter().map(|(rank, _)| *rank).collect();
+    for rank in unreported_ranks(ranks, &seen).filter(|&rank| asked(rank)) {
+        shares.push(RankLoad {
+            running: 0,
+            waiting: 0,
+            usage: 0.0,
+        });
+        entries.push((rank, unreported(rank)));
+    }
+    entries.sort_by_key(|(rank, _)| *rank);
+    (
+        entries.into_iter().map(|(_, entry)| entry).collect(),
+        Aggregate::of(shares),
+    )
 }
 
 #[cfg(test)]
@@ -129,6 +183,57 @@ mod tests {
     fn rank_ids_count_from_zero() {
         assert_eq!(rank_ids(3).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(rank_ids(0).count(), 0);
+    }
+
+    /// The ranks a report zero-fills are the connected ones without an
+    /// entry, whichever reported first; none past the count.
+    #[test]
+    fn the_unreported_ranks_are_the_connected_ones_without_an_entry() {
+        assert_eq!(unreported_ranks(3, &[]).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(unreported_ranks(3, &[1]).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(unreported_ranks(1, &[0, 7]).count(), 0);
+    }
+
+    /// The entries are the asked ranks of the snapshot plus a zero-filled one
+    /// per silent connected rank, sorted by rank; the aggregate counts the
+    /// zero-filled ranks as idle.
+    #[test]
+    fn the_entries_list_the_asked_ranks_zero_fill_the_rest_in_order_and_aggregate_all() {
+        // Rank 2 reported before rank 0; rank 1 connected but silent.
+        let snapshot = vec![load(2, 3, 1, 0.5), load(0, 1, 0, 0.25)];
+        let (entries, aggregate) = rank_entries(
+            snapshot.clone(),
+            1000,
+            3,
+            None,
+            |load, figures| {
+                (
+                    figures.dp_rank,
+                    figures.running,
+                    load.num_waiting_reqs,
+                    false,
+                )
+            },
+            |rank| (rank, 0, 0, true),
+        );
+        assert_eq!(
+            entries,
+            vec![(0, 1, 0, false), (1, 0, 0, true), (2, 3, 1, false)]
+        );
+        assert_eq!(
+            (aggregate.running, aggregate.waiting, aggregate.total),
+            (4, 1, 5)
+        );
+        assert!(
+            (aggregate.avg_usage - 0.25).abs() < 1e-9,
+            "{}",
+            aggregate.avg_usage
+        );
+        // Asking for one rank keeps that rank's entry alone, reported or zero-filled.
+        let (one, _) = rank_entries(snapshot.clone(), 1000, 3, Some(2), |_, f| f.dp_rank, |r| -r);
+        assert_eq!(one, vec![2]);
+        let (silent, _) = rank_entries(snapshot, 1000, 3, Some(1), |_, f| f.dp_rank, |r| -r);
+        assert_eq!(silent, vec![-1]);
     }
 
     /// The aggregate sums the ranks (saturating) and averages their usage;

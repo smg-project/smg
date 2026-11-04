@@ -977,9 +977,9 @@ def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp
     planned = {}
     plan_for = rust_lifecycle.plan_for
 
-    def spying_plan_for(setting, inputs, *, knob):
+    def spying_plan_for(setting, inputs, *, knob, nonce=None):
         planned["inputs"] = inputs
-        return plan_for(setting, inputs, knob=knob)
+        return plan_for(setting, inputs, knob=knob, nonce=nonce)
 
     monkeypatch.setattr(rust_lifecycle, "plan_for", spying_plan_for)
     for mode in ("prefill", "decode"):

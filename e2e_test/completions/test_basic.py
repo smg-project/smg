@@ -27,8 +27,8 @@ _NO_TOKENS = ""
 class TestCompletionBasic:
     """Tests for OpenAI-compatible /v1/completions API (non-streaming).
 
-    On the mock engine each test states the answer first; the ``n=2`` case skips there
-    (the mock answers one choice per request).
+    On the mock engine each test states the answer first, one per choice the request
+    samples.
     """
 
     STOP_SEQUENCE_TRIMMED = True
@@ -127,21 +127,12 @@ class TestCompletionBasic:
 
         assert response.choices[0].text.endswith(suffix)
 
-    @pytest.mark.parametrize(
-        "n",
-        [
-            1,
-            pytest.param(
-                2,
-                marks=pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock answers one choice per request"
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("n", [1, 2])
     def test_non_streaming_parallel_sampling(self, model, api_client, n, mock_answers):
         """Test parallel sampling with n > 1."""
-        mock_answers.enqueue(" to be happy.")
+        # One answer per choice.
+        for _ in range(n):
+            mock_answers.enqueue(" to be happy.")
 
         temperature = 0.7 if n > 1 else 0
         response = api_client.completions.create(
@@ -329,8 +320,8 @@ class TestCompletionStreaming:
 class TestCompletionBatch:
     """Tests for batched prompt arrays on /v1/completions.
 
-    On the mock engine each test states one answer per prompt (the gateway sends the
-    prompts one by one, in its own order); the ``n > 1`` cases skip there.
+    On the mock engine each test states one answer per choice of each prompt (the
+    gateway sends the prompts one by one, in its own order).
     """
 
     PROMPTS = ["The capital of France is", "The capital of Germany is"]
@@ -386,11 +377,14 @@ class TestCompletionBatch:
             response.usage.prompt_tokens + response.usage.completion_tokens
         )
 
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
-    def test_batch_non_streaming_with_n(self, model, api_client):
+    def test_batch_non_streaming_with_n(self, model, api_client, mock_answers):
         """Test prompt-major global indices with n > 1: index = prompt_index * n + i."""
 
         n = 2
+        # One answer per choice of each prompt; the echo the gateway prepends
+        # names the prompt, so any answer serves any choice.
+        for answer in self.ANSWERS * n:
+            mock_answers.enqueue(answer)
         response = api_client.completions.create(
             model=model,
             prompt=self.PROMPTS,
@@ -439,12 +433,14 @@ class TestCompletionBatch:
         assert response.id == "batch-correlation-1"
         assert sorted(choice.index for choice in response.choices) == [0, 1]
 
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
-    def test_batch_streaming(self, model, api_client):
+    def test_batch_streaming(self, model, api_client, mock_answers):
         """Test streaming with a prompt array and n > 1: global per-choice deltas
         and exactly one aggregated usage chunk."""
 
         n = 2
+        # One answer per choice of each prompt.
+        for answer in self.ANSWERS * n:
+            mock_answers.enqueue(answer)
         stream = api_client.completions.create(
             model=model,
             prompt=self.PROMPTS,

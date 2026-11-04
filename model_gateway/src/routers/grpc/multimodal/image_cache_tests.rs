@@ -43,9 +43,13 @@ impl VisionPreProcessor for Processor {
     }
     fn preprocess(
         &self,
-        images: &[image::DynamicImage],
+        images: &[&image::DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let ids: Vec<_> = images.iter().map(image::DynamicImage::width).collect();
+        let ids: Vec<_> = images
+            .iter()
+            .copied()
+            .map(image::DynamicImage::width)
+            .collect();
         if self.reorder && ids == [1] {
             let (lock, ready) = &self.calls.second_done;
             let (_guard, timeout) = ready
@@ -379,7 +383,7 @@ impl VisionPreProcessor for PixelProbe {
     }
     fn preprocess(
         &self,
-        images: &[image::DynamicImage],
+        images: &[&image::DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let mut seen = self.seen.lock().unwrap();
         for image in images {

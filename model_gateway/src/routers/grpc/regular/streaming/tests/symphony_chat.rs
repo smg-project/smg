@@ -698,6 +698,7 @@ pub(super) fn assigned_message(
             forbids_calls: false,
             past_the_end: false,
         }),
+        parser_names: None,
     }
 }
 
@@ -908,10 +909,11 @@ async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() 
 }
 
 /// The Messages body a coding agent's client sends, as recorded: its environment notes as a
-/// system-role message after the user turn, rendered in place. The family's template writes the
-/// turn opener after a user message only, so the prompt opens no turn for the model, which starts
-/// inside its thought: the thought and its close are a thinking block (none when the thought is
-/// empty), never a text block, on the Messages API and on chat completions alike.
+/// system-role message after the user turn, rendered in place. The family's reference opens the
+/// assistant turn after a system message that ends the conversation, so the prompt ends with the
+/// turn opener and the open thought, and the model starts inside its thought: the thought and its
+/// close are a thinking block (none when the thought is empty), never a text block, on the
+/// Messages API and on chat completions alike.
 #[tokio::test]
 async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_the_text() {
     let messages = json!([
@@ -939,9 +941,12 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
         &EncodeParams::default(),
     )
     .expect("the rendered prompt");
-    // The template opened no turn: no assistant opener, no `<think>`.
-    assert!(!prompt.contains("<｜Assistant｜>"), "{prompt:?}");
-    assert!(!prompt.contains("<think>"), "{prompt:?}");
+    // The reference opens the turn after the trailing system message: the system text bare, then
+    // the opener and the open thought end the prompt.
+    assert!(
+        prompt.ends_with("Today's date is 2026-10-16.<｜Assistant｜><think>"),
+        "{prompt:?}"
+    );
     let call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"lookup\">\n\n</｜DSML｜invoke>\n\
                 </｜DSML｜tool_calls>";
     // The thought, its close, the template's spacing and the call, in an engine's pieces.

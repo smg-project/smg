@@ -422,12 +422,15 @@ async fn count_tokens_answers_load_failed_without_retry_after_for_a_worker_witho
 /// A one-token tokenizer (`hello`), enough for a count.
 const MINIMAL_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#;
 
-/// A tokenizer registered after a failed load clears the failure: here a
-/// worker re-registering with a usable path (an operator's
-/// `POST /v1/tokenizers` takes the same job), after which the model
-/// answers again.
-#[tokio::test]
-async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+/// A regular router over the worker of `m` under a context with a job queue
+/// and workflow engines, what a tokenizer job needs, and a tenant for its
+/// requests.
+async fn router_with_a_job_queue() -> (
+    Arc<AppContext>,
+    Arc<BasicWorker>,
+    GrpcRouter,
+    TenantRequestMeta,
+) {
     let ctx = grpc_ctx(regular_routing_mode()).await;
     ctx.worker_job_queue
         .set(JobQueue::new(
@@ -444,6 +447,33 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    (ctx, worker, router, tenant_meta)
+}
+
+/// A directory holding the one-token tokenizer and a chat template, as a
+/// worker's `tokenizer_path` would.
+fn hello_tokenizer_dir() -> tempfile::TempDir {
+    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        tokenizer_dir.path().join("tokenizer.json"),
+        MINIMAL_TOKENIZER_JSON,
+    )
+    .expect("tokenizer.json");
+    fs::write(
+        tokenizer_dir.path().join("tokenizer_config.json"),
+        r#"{"chat_template": "hello"}"#,
+    )
+    .expect("tokenizer_config.json");
+    tokenizer_dir
+}
+
+/// A tokenizer registered after a failed load clears the failure: here a
+/// worker re-registering with a usable path (an operator's
+/// `POST /v1/tokenizers` takes the same job), after which the model
+/// answers again.
+#[tokio::test]
+async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+    let (ctx, worker, router, tenant_meta) = router_with_a_job_queue().await;
     assert!(ctx.tokenizer_load_failures.record(
         "m",
         TokenizerLoadFailure::Failed("Workflow failed at step load_tokenizer: boom".to_string())
@@ -460,17 +490,7 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
     assert!(response.headers().get(RETRY_AFTER).is_none());
 
     // The worker registers again, this time with a tokenizer to load.
-    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer.json"),
-        MINIMAL_TOKENIZER_JSON,
-    )
-    .expect("tokenizer.json");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer_config.json"),
-        r#"{"chat_template": "hello"}"#,
-    )
-    .expect("tokenizer_config.json");
+    let tokenizer_dir = hello_tokenizer_dir();
     let path = tokenizer_dir.path().to_str().expect("utf-8 path");
     let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", path)]);
     SubmitTokenizerJobStep
@@ -499,33 +519,8 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
 /// answers once A's load ends.
 #[tokio::test]
 async fn a_registration_without_a_path_defers_to_the_models_load_in_flight() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    ctx.worker_job_queue
-        .set(JobQueue::new(
-            JobQueueConfig::default(),
-            Arc::downgrade(&ctx),
-        ))
-        .ok();
-    ctx.workflow_engines
-        .set(WorkflowEngines::new(&ctx.router_config))
-        .ok();
-    let worker = grpc_worker_for_m();
-    ctx.worker_registry
-        .register(worker.clone())
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
-    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer.json"),
-        MINIMAL_TOKENIZER_JSON,
-    )
-    .expect("tokenizer.json");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer_config.json"),
-        r#"{"chat_template": "hello"}"#,
-    )
-    .expect("tokenizer_config.json");
+    let (ctx, worker, router, tenant_meta) = router_with_a_job_queue().await;
+    let tokenizer_dir = hello_tokenizer_dir();
     let path = tokenizer_dir
         .path()
         .to_str()

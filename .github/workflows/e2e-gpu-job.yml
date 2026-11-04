@@ -115,7 +115,12 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default. For trtllm, rust starts this repository's launcher and anything else the engine's own gRPC server"
+        required: false
+        type: string
+        default: ""
+      worker_log_filter:
+        description: "A tracing filter for the Rust servicer in every worker the harness starts (the worker process's RUST_LOG; the gateway's logging is untouched); a row whose tests read the servicer's per-request line passes info,engine_servicer::request=debug; empty leaves the servicer's default"
         required: false
         type: string
         default: ""
@@ -181,6 +186,7 @@ jobs:
       E2E_SGLANG_SERVICER_IMPL: ${{ inputs.engine == 'sglang' && inputs.servicer_impl || '' }}
       E2E_VLLM_SERVICER_IMPL: ${{ inputs.engine == 'vllm' && inputs.servicer_impl || '' }}
       E2E_TOKENSPEED_SERVICER_IMPL: ${{ inputs.engine == 'tokenspeed' && inputs.servicer_impl || '' }}
+      E2E_TRTLLM_SERVICER_IMPL: ${{ inputs.engine == 'trtllm' && inputs.servicer_impl || '' }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
@@ -330,6 +336,7 @@ jobs:
           E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
           E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
           FINAL_ENVIRONMENT_CHECK: ${{ inputs.final_environment_check && '1' || '0' }}
+          E2E_WORKER_RUST_LOG: ${{ inputs.worker_log_filter }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -430,7 +437,11 @@ jobs:
           backend = inputs.get("kv_backend") or (
               inputs.get("vllm_kv_backend", "") if engine == "vllm" else ""
           )
-          mode = inputs.get("vllm_moriio_mode") or "auto" if engine == "vllm" and backend == "moriio" else ""
+          mode = (
+              (inputs.get("vllm_moriio_mode", "").strip().lower() or "read")
+              if engine == "vllm" and backend == "moriio"
+              else ""
+          )
           vendor = inputs.get("gpu_vendor") or "unknown"
           fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
                     vendor, inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
