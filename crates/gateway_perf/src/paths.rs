@@ -64,28 +64,6 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             finish: "length",
             label: "chat stream, 128 deltas of one token",
         },
-        // Not in `DEFAULT_PATHS` (`PERF_PATHS` names it): the stream with the
-        // sampled logprob and five candidates per token, the gateway reading,
-        // converting and decoding six token ids per delta.
-        PathSpec {
-            name: "stream_logprobs",
-            rate: 100.0,
-            client: &[
-                "--mode",
-                "chat",
-                "--stream",
-                "--max-tokens",
-                "128",
-                "--logprobs",
-                "5",
-                "--seed",
-                "109",
-            ],
-            answer: words(128),
-            finish: "length",
-            label:
-                "chat stream, 128 deltas of one token, the sampled logprob and 5 candidates each",
-        },
         PathSpec {
             name: "tools",
             rate: 500.0,
@@ -179,6 +157,33 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             answer: words(2000),
             finish: "length",
             label: "generate stream, 2,000 frames of one token, the whole text in every frame",
+        },
+        // The stream with the sampled logprob and five candidates per token,
+        // the gateway reading, converting and decoding six token ids per
+        // delta. Its rate is the gateway's load, not the frame rate: such an
+        // answer costs about 3.5 times the instructions and 13 times the
+        // allocation calls of the plain stream's, so at 100/s the cell runs
+        // about 1.4 times the `stream` cell's gateway instructions per second
+        // and about five times its allocation calls (3.5 and 13 times them at
+        // the `stream` rate).
+        PathSpec {
+            name: "stream_logprobs",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--logprobs",
+                "5",
+                "--seed",
+                "109",
+            ],
+            answer: words(128),
+            finish: "length",
+            label:
+                "chat stream, 128 deltas of one token, the sampled logprob and 5 candidates each",
         },
     ]
 });
