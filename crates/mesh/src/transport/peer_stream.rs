@@ -8,11 +8,12 @@
 //!   by [`plan_sender_tick`]) and then the CRDT ops the peer has not acked.
 //! - [`next_frame`]: the next inbound frame under [`STREAM_IDLE_TIMEOUT`];
 //!   `None` ends the stream (closed, failed or idle).
-//! - [`handle_frame`]: one inbound frame — a heartbeat is answered with one,
-//!   a stream batch and a CRDT batch are applied to the mesh KV (the CRDT one
-//!   acked back), a CRDT ack advances the send watermark, the retired v1
-//!   message types are ignored; an ack or a nack is handed back as a
-//!   [`Frame`] for the end to log or record.
+//! - [`handle_frame`]: one inbound frame — a heartbeat is handed back for the
+//!   end to answer (the acceptor) or not (the dialer), a stream batch and a
+//!   CRDT batch are applied to the mesh KV (the CRDT one acked back), a CRDT
+//!   ack advances the send watermark, the retired v1 message types are
+//!   ignored; an ack or a nack is handed back as a [`Frame`] for the end to
+//!   log or record.
 //! - [`StreamSink`]: the end's outbound channel; the dialer sends plain
 //!   messages, the acceptor sends `Result`s for tonic.
 //!
