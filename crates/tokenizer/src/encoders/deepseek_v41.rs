@@ -774,7 +774,7 @@ pub(crate) fn render_messages(
 mod tests {
     use serde_json::{json, Value};
 
-    use super::*;
+    use super::{super::deepseek_common::object_arguments_render_one_parameter_per_key_through, *};
 
     fn user(q: &str) -> Value {
         json!({ "role": "user", "content": q })
@@ -1334,6 +1334,37 @@ mod tests {
         assert_eq!(
             out,
             "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn object_form_tool_call_arguments_render_params() {
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &params(None)),
+            " parameter",
+        );
+    }
+
+    #[test]
+    fn a_kept_empty_content_blocks_list_drops_its_messages_content_through_a_merge() {
+        // The reference rebuilds a user message's blocks from its content only
+        // when the list is absent (`if content_blocks is None`), so an empty
+        // list a message carries is kept and a following user message's blocks
+        // extend it: the first message's content is not rendered.
+        let with_empty_list = [
+            json!({ "role": "user", "content": "A", "content_blocks": [] }),
+            user("B"),
+        ];
+        let out = encode_messages(&with_empty_list, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>B<｜Assistant｜></think>"
+        );
+        let without = [user("A"), user("B")];
+        let out = encode_messages(&without, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>A\n\nB<｜Assistant｜></think>"
         );
     }
 

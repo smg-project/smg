@@ -619,6 +619,39 @@ pub(super) fn push_tools_and_response_format(
     }
 }
 
+/// The renderer-level pin the three renderers share: a history tool call
+/// whose `arguments` are already an object (the gateway parses the OpenAI
+/// string before a renderer runs) renders one DSML parameter per key through
+/// `encode`, spelled with the dialect's `parameter` tag. Dropping them once
+/// erased every historical call's parameters in multi-turn prompts.
+#[cfg(test)]
+pub(super) fn object_arguments_render_one_parameter_per_key_through<F, E>(
+    encode: F,
+    parameter: &str,
+) where
+    F: FnOnce(&[Value]) -> Result<String, E>,
+    E: std::fmt::Debug,
+{
+    let msgs = [
+        json!({ "role": "user", "content": "call my tool" }),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "search", "arguments": { "query": "deepseek", "limit": 5 } }
+            }]
+        }),
+    ];
+    let out = encode(&msgs).unwrap();
+    for line in [
+        format!("<{DSML_TOKEN}{parameter} name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}{parameter}>"),
+        format!("<{DSML_TOKEN}{parameter} name=\"limit\" string=\"false\">5</{DSML_TOKEN}{parameter}>"),
+    ] {
+        assert!(out.contains(&line), "{line} is not in {out}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
