@@ -975,13 +975,13 @@ impl GrpcRouter {
         ];
         let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> =
             Vec::with_capacity(events.len());
-        let mut buffer = Vec::new();
+        let mut buffer = bytes::BytesMut::new();
         for event in &events {
             if let Err(e) = StreamingProcessor::format_messages_sse_into(&mut buffer, event) {
                 tracing::error!(model = %model_id, error = %e, "max_tokens 0: a stream event does not serialize");
                 return error::internal_error("messages_event_serialization_failed", e);
             }
-            frames.push(Ok(bytes::Bytes::from(std::mem::take(&mut buffer))));
+            frames.push(Ok(buffer.split().freeze()));
         }
         build_sse_response_from_stream(futures::stream::iter(frames))
     }

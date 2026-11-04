@@ -220,7 +220,7 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
 
 /// Compare (or, under `SMG_RECORD_SSE_FIXTURES`, record) the bytes of one
 /// scenario against `fixtures/<name>.sse`.
-fn assert_recorded_bytes(name: &str, must_contain: &str, actual: &[u8]) {
+pub(super) fn assert_recorded_bytes(name: &str, must_contain: &str, actual: &[u8]) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src/routers/grpc/regular/streaming/tests/fixtures");
     let record = std::env::var_os("SMG_RECORD_SSE_FIXTURES").is_some();
