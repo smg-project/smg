@@ -59,10 +59,45 @@ pub use vision::{
 /// Support for this crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::process::Command;
+
     use image::{DynamicImage, Rgb, RgbImage};
     use rustls::crypto::ring;
 
     use crate::vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs};
+
+    /// Set to a non-empty value where the video tools must be installed (CI
+    /// sets it on the shards that install ffmpeg): the tests that decode or
+    /// write a clip then fail, instead of skipping, when ffmpeg, ffprobe or
+    /// an encoder they use is missing.
+    pub(crate) const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
+
+    /// Reports that `missing` keeps a test or a case from running: a failure
+    /// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn skip_for(missing: &str) {
+        let required = std::env::var_os(REQUIRE_VIDEO_TOOLS).is_some_and(|value| !value.is_empty());
+        assert!(!required, "{missing}, and {REQUIRE_VIDEO_TOOLS} is set");
+        eprintln!("{missing}: skipping; the tests that need no clip still run");
+    }
+
+    /// Whether ffmpeg and ffprobe run on this host; says so when they do not.
+    pub(crate) fn video_tools_available() -> bool {
+        let runs = |tool: &str| {
+            Command::new(tool)
+                .arg("-version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        let available = runs("ffmpeg") && runs("ffprobe");
+        if !available {
+            skip_for("ffmpeg or ffprobe is not installed");
+        }
+        available
+    }
 
     /// The HTTP client builder for the tests' media connectors. The library
     /// takes its client's builder from the caller; the tests make it here,
