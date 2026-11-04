@@ -9,6 +9,30 @@ use llm_tokenizer::{
 };
 use tonic::Status;
 
+/// The refusal of a request with string stops on a servicer without the
+/// tokenizer that matches them.
+const NO_TOKENIZER_FOR_STOPS: &str = "string `stop` sequences need the model tokenizer, which \
+                                      this servicer could not load; start it with a local \
+                                      tokenizer directory";
+
+/// Whether a request's `stops` get a matcher per choice: `false` for no
+/// stops; the refusal a matcher would raise when the stops need the
+/// tokenizer this servicer lacks, read before the request is on the wire;
+/// `true` otherwise, with no matcher built here (each choice builds its
+/// own with [`stop_decoder`]).
+pub(crate) fn stops_need_matcher(
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+    stops: &[String],
+) -> Result<bool, Status> {
+    if stops.is_empty() {
+        return Ok(false);
+    }
+    if tokenizer.is_none() {
+        return Err(Status::failed_precondition(NO_TOKENIZER_FOR_STOPS));
+    }
+    Ok(true)
+}
+
 /// The string-stop matcher for a request, or `None` when it carries no
 /// string stops. Visible (included-in-output) stops only change the text
 /// the Router trims; the servicer only needs the match itself.
@@ -21,10 +45,7 @@ pub(crate) fn stop_decoder(
         return Ok(None);
     }
     let Some(tokenizer) = tokenizer else {
-        return Err(Status::failed_precondition(
-            "string `stop` sequences need the model tokenizer, which this servicer could not \
-             load; start it with a local tokenizer directory",
-        ));
+        return Err(Status::failed_precondition(NO_TOKENIZER_FOR_STOPS));
     };
     let mut config = StopSequenceConfig::default();
     for stop in stops {
@@ -112,6 +133,20 @@ mod tests {
         Arc::new(
             llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap(),
         )
+    }
+
+    #[test]
+    fn stops_need_a_matcher_only_when_there_are_some_and_a_tokenizer_decodes_them() {
+        let tokenizer: Arc<dyn Tokenizer> = byte_fallback_tokenizer();
+        assert!(!stops_need_matcher(Some(&tokenizer), &[]).unwrap());
+        assert!(!stops_need_matcher(None, &[]).unwrap());
+        assert!(stops_need_matcher(Some(&tokenizer), &["t".into()]).unwrap());
+        let refused = stops_need_matcher(None, &["t".into()]).unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        let decoder_refusal = stop_decoder(None, &["t".into()], true)
+            .err()
+            .map(|status| status.message().to_string());
+        assert_eq!(decoder_refusal.as_deref(), Some(refused.message()));
     }
 
     #[test]

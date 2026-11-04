@@ -206,22 +206,25 @@ pub(crate) async fn prepare_chat_like(
             preserve_reasoning_special_tokens,
         );
 
-        // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
-        let stop_decoder = utils::create_stop_decoder(
-            &tokenizer,
-            request.stop.as_ref(),
-            request.stop_token_ids.as_ref(),
-            skip_special_tokens,
-            request.no_stop_trim,
-            request.ignore_eos,
-        );
+        // Step 5: the stop sequence decoder of a collected answer. A stream
+        // builds one per choice as it reads, so none is built for it here.
+        let stop_decoder = (!ctx.input.streaming).then(|| {
+            utils::create_stop_decoder(
+                &tokenizer,
+                request.stop.as_ref(),
+                request.stop_token_ids.as_ref(),
+                skip_special_tokens,
+                request.no_stop_trim,
+                request.ignore_eos,
+            )
+        });
 
         // Store the intermediate + decoder + derived skip_special_tokens on
         // ctx (PreparationOutput is consumed by request_building before
         // response_processing runs); hand the rest to the caller.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
         ctx.state.multimodal_refs = multimodal_refs;
-        ctx.state.response.stop_decoder = Some(stop_decoder);
+        ctx.state.response.stop_decoder = stop_decoder;
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
         Ok((token_ids, processed_messages, tool_call_constraint))

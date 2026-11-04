@@ -199,16 +199,18 @@ impl MessagePreparationStage {
                 )
         };
 
-        // Step 5: the stop sequence decoder, over the stop sequences the spec
-        // carries on to the stream's decoder.
-        let stop_decoder = utils::create_stop_decoder(
-            &tokenizer,
-            spec.stop_sequences.as_ref(),
-            None, // no stop_token_ids in Messages API
-            skip_special_tokens,
-            false, // no_stop_trim default
-            false, // ignore_eos — not available in Messages API
-        );
+        // Step 5: the stop sequence decoder of a collected answer, over the
+        // stop sequences the spec carries; a stream builds its own.
+        let stop_decoder = (!ctx.input.streaming).then(|| {
+            utils::create_stop_decoder(
+                &tokenizer,
+                spec.stop_sequences.as_ref(),
+                None, // no stop_token_ids in Messages API
+                skip_special_tokens,
+                false, // no_stop_trim default
+                false, // ignore_eos — not available in Messages API
+            )
+        });
 
         // Store results in context.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
@@ -221,7 +223,7 @@ impl MessagePreparationStage {
         });
 
         // Store stop decoder and derived skip_special_tokens for response processing.
-        ctx.state.response.stop_decoder = Some(stop_decoder);
+        ctx.state.response.stop_decoder = stop_decoder;
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
         Ok(())

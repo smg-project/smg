@@ -68,21 +68,25 @@ impl PipelineStage for CompletionPreparationStage {
                 .join(" ")
         });
 
-        let stop_decoder = utils::create_stop_decoder(
-            &tokenizer,
-            request.stop.as_ref(),
-            request.stop_token_ids.as_ref(),
-            request.skip_special_tokens,
-            request.no_stop_trim,
-            request.ignore_eos,
-        );
+        // The stop sequence decoder of a collected answer; a stream builds
+        // one per choice as it reads.
+        let stop_decoder = (!ctx.input.streaming).then(|| {
+            utils::create_stop_decoder(
+                &tokenizer,
+                request.stop.as_ref(),
+                request.stop_token_ids.as_ref(),
+                request.skip_special_tokens,
+                request.no_stop_trim,
+                request.ignore_eos,
+            )
+        });
 
         ctx.state.preparation = Some(PreparationOutput::Completion {
             items,
             joined_routing_text,
         });
 
-        ctx.state.response.stop_decoder = Some(stop_decoder);
+        ctx.state.response.stop_decoder = stop_decoder;
 
         Ok(())
     }

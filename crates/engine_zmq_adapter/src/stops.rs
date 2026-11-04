@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 /// which detokenizes worker output and trims the stop text. Existing
 /// `stop_token_ids` are preserved and deduped.
 pub fn encode_single_token_stops(
-    stops: Vec<String>,
+    stops: &[String],
     stop_token_ids: &mut Vec<u32>,
     tokenizer: Option<&Arc<dyn Tokenizer>>,
 ) {
@@ -46,7 +46,7 @@ pub fn encode_single_token_stops(
         }
         // add_special_tokens=false: we want the literal token(s) for the stop
         // string, not a BOS/EOS-wrapped encoding.
-        match tokenizer.encode(&stop, false) {
+        match tokenizer.encode(stop, false) {
             Ok(encoding) => match encoding.token_ids() {
                 [id] => {
                     if !stop_token_ids.contains(id) {
@@ -75,7 +75,7 @@ pub fn take_tokenspeed_string_stops(
     tokenizer: Option<&Arc<dyn Tokenizer>>,
 ) -> Vec<String> {
     let stops = std::mem::take(&mut params.stop);
-    encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+    encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
     stops
 }
 
@@ -87,6 +87,6 @@ pub fn take_vllm_string_stops(
     tokenizer: Option<&Arc<dyn Tokenizer>>,
 ) -> Vec<String> {
     let stops = std::mem::take(&mut params.stop);
-    encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+    encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
     stops
 }

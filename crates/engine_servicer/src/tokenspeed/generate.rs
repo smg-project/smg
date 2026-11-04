@@ -23,7 +23,7 @@ use super::State;
 use crate::{
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
-    stop_match::{stop_decoder, StopMatcher},
+    stop_match::{stop_decoder, stops_need_matcher, StopMatcher},
     stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
@@ -57,7 +57,7 @@ pub(super) async fn generate(
         .as_mut()
         .map(|params| take_tokenspeed_string_stops(params, tokenizer))
         .unwrap_or_default();
-    let decoder = stop_decoder(tokenizer, &stops, skip_special_tokens)?;
+    let string_stops = stops_need_matcher(tokenizer, &stops)?;
     let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
         u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
     });
@@ -79,9 +79,10 @@ pub(super) async fn generate(
     let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
-        let decoder = match &decoder {
-            Some(_) => stop_decoder(tokenizer, &stops, skip_special_tokens)?,
-            None => None,
+        let decoder = if string_stops {
+            stop_decoder(tokenizer, &stops, skip_special_tokens)?
+        } else {
+            None
         };
         choices.push(ChoiceStream::new(
             Arc::clone(&request_id),

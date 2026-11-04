@@ -5,6 +5,7 @@ mod generate_pretokenized;
 mod glm53;
 mod model_label;
 mod rate_limit_reserve;
+mod stop_decoder;
 
 use std::{
     path::{Path, PathBuf},

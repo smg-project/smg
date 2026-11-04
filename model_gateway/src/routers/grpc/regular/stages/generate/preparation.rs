@@ -53,24 +53,26 @@ impl GeneratePreparationStage {
             }
         };
 
-        // Create stop sequence decoder for generate requests
+        // The stop sequence decoder of a collected answer; a stream reads
+        // without one.
         let params = request.sampling_params.as_ref();
-        let stop_decoder = utils::create_stop_decoder(
-            &tokenizer,
-            params.and_then(|p| p.stop.as_ref()),
-            params.and_then(|p| p.stop_token_ids.as_ref()),
-            params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
-            params.and_then(|p| p.no_stop_trim).unwrap_or(false),
-            params.and_then(|p| p.ignore_eos).unwrap_or(false),
-        );
+        let stop_decoder = (!ctx.input.streaming).then(|| {
+            utils::create_stop_decoder(
+                &tokenizer,
+                params.and_then(|p| p.stop.as_ref()),
+                params.and_then(|p| p.stop_token_ids.as_ref()),
+                params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+                params.and_then(|p| p.no_stop_trim).unwrap_or(false),
+                params.and_then(|p| p.ignore_eos).unwrap_or(false),
+            )
+        });
 
         ctx.state.preparation = Some(PreparationOutput::Generate {
             original_text,
             token_ids,
         });
 
-        // Store stop decoder
-        ctx.state.response.stop_decoder = Some(stop_decoder);
+        ctx.state.response.stop_decoder = stop_decoder;
 
         Ok(())
     }

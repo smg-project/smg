@@ -25,7 +25,7 @@ use super::{media::process_media_refs, State};
 use crate::{
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
-    stop_match::{stop_decoder, StopMatcher},
+    stop_match::{stop_decoder, stops_need_matcher, StopMatcher},
     stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
@@ -280,7 +280,7 @@ async fn submit(
         .unwrap_or_default();
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
-    let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
+    let string_stops = stops_need_matcher(state.tokenizer(), &stops)?;
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
     // returns, and an `n > 1` fan-out has live subs while later ones are
@@ -334,9 +334,10 @@ async fn submit(
     let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
-        let decoder = match &decoder {
-            Some(_) => stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?,
-            None => None,
+        let decoder = if string_stops {
+            stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?
+        } else {
+            None
         };
         choices.push(ChoiceStream::new(
             Arc::clone(state),
