@@ -22,6 +22,7 @@ python3 scripts/bench/multimodal/mm_baseline.py \
 | `../../../crates/multimodal/examples/mm_baseline.rs` | the crate arm: decode, the gateway's frame clone, the one-pass preprocess into the wire's dtype and the move of the wire bytes, per class, on one or many threads, with digests |
 | `reference.py` | the reference arm: the engine's image loader rules and the pinned `transformers` processors on the same files, one process or many with one compute thread each |
 | `requirements.txt` | the reference arm's pins (the engine image's own) |
+| `gateway_seam.py` | the gateway seam on the CPU mock bed (`scripts/bench/grpc_stress/bed.sh`): the per-class rows under a single rate and under load, the two-hundred-request burst, the twenty-turn screenshot replay |
 
 The corpus directory follows the fixture repository's layout (`images/<set>/<name>`,
 `videos/<set>/<name>`, `audios/<set>/<name>`); the manifest names every file by set and
@@ -38,3 +39,34 @@ the table says `same` or `DIFF` per class for the decoded RGB bytes and the floa
 The reference's video arm picks frames the way the engine's loader does for the Qwen3-VL
 family and decodes them with OpenCV; its audio arm decodes with `soundfile` and runs the
 checkpoint's feature extractor with the engine processor's own arguments.
+
+## The gateway seam
+
+`gateway_seam.py` runs the same classes through the gateway on the CPU mock bed, where the
+crate's stages run on the router placement with the request path around them (the HTTP
+body, the plan, the fetch, the pool, the wire bytes to the worker). It needs the bed's
+three binaries (`smg`, `mock-worker`, `stress_load` from a release build) and the
+tokenizer files beside the checkpoint configs:
+
+```
+python3 scripts/bench/multimodal/gateway_seam.py --manifest <run dir>/resolved.json \
+    --config-dir <Qwen3-VL checkpoint with tokenizer files> \
+    --smg target/release/smg --mock target/release/mock-worker --load target/release/stress_load \
+    --out <run dir> --mode classes|burst|replay
+```
+
+- `classes`: per image and batch class, a single-rate cell and a load cell; per cell the
+  client's latencies, the gateway's CPU per request and RSS, and the stage times the
+  gateway logs under `--log-mm-timing` (fetch and decode, preprocess, token expansion).
+  The script waits for the gateway to go idle between cells, so an overloaded cell does
+  not hand its backlog to the next one.
+- `burst`: two hundred requests of one class offered within one second, with an idle cell
+  before and after: the queue's p99, the RSS peak, the error count and the drain time.
+- `replay`: twenty turns of a screenshot session; turn k carries the last `--window`
+  screenshots (the model's limit of image items per request bounds a turn, as an agent's
+  context pruning would), once with the pixel cache off and once with it on; per turn the
+  latency, the gateway's CPU, the stage times and the RSS, and the cache's hit and miss
+  counters per run.
+
+Every multimodal change runs all three before it claims a number: the rows are the
+before/after of its PR body.
