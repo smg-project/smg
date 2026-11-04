@@ -1,10 +1,9 @@
 """Exercise the actual opt-in scope Bash without a container or backend."""
 
 import json
-import os
 import re
-import sys
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -152,13 +151,27 @@ def test_scope_stays_opt_in_with_typed_inputs():
 
 
 def _evidence_step():
-    steps = [step for step in _document()["jobs"]["run"]["steps"]
-             if step.get("id") == "evidence-identity"]
+    steps = [
+        step
+        for step in _document()["jobs"]["run"]["steps"]
+        if step.get("id") == "evidence-identity"
+    ]
     assert len(steps) == 1
     return steps[0]
 
 
+def _effective_evidence_inputs(inputs):
+    document = _document()
+    trigger = document.get("on", document.get(True))["workflow_call"]
+    defaults = {
+        name: spec.get("default", {"boolean": False, "number": 0}.get(spec["type"], ""))
+        for name, spec in trigger["inputs"].items()
+    }
+    return {**defaults, **inputs}
+
+
 def _evidence_identity(tmp_path, inputs, attempt="1"):
+    inputs = _effective_evidence_inputs(inputs)
     work = tmp_path / str(len(list(tmp_path.iterdir())))
     work.mkdir()
     binary = work / "bin"
@@ -169,10 +182,17 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
     script.write_text(_evidence_step()["run"])
     result = subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
-        env={"PATH": str(binary), "EVIDENCE_INPUTS": json.dumps(inputs),
-             "GITHUB_RUN_ATTEMPT": attempt, "GITHUB_OUTPUT": str(output),
-             "PYTHONDONTWRITEBYTECODE": "1"},
-        cwd=work, capture_output=True, text=True, timeout=3,
+        env={
+            "PATH": str(binary),
+            "EVIDENCE_INPUTS": json.dumps(inputs),
+            "GITHUB_RUN_ATTEMPT": attempt,
+            "GITHUB_OUTPUT": str(output),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        cwd=work,
+        capture_output=True,
+        text=True,
+        timeout=3,
     )
     assert result.returncode == 0, result.stderr
     fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
@@ -191,12 +211,26 @@ def test_evidence_exposes_exact_artifact_outputs():
     document = _document()
     trigger = document.get("on", document.get(True))["workflow_call"]
     job = document["jobs"]["run"]
-    for public, internal in [("complete_evidence_artifact", "complete_artifact"),
-                             ("worker_log_artifact", "worker_artifact")]:
+    for public, internal in [
+        ("complete_evidence_artifact", "complete_artifact"),
+        ("worker_log_artifact", "worker_artifact"),
+    ]:
         assert trigger["outputs"][public]["value"] == "${{ jobs.run.outputs." + public + " }}"
-        assert job["outputs"][public] == "${{ steps.evidence-identity.outputs." + internal + " }}"
-    uploads = [step["with"]["name"] for step in job["steps"]
-               if step.get("uses", "").startswith("actions/upload-artifact@")]
+        output = job["outputs"][public]
+        upload = (
+            "upload-complete-evidence"
+            if public == "complete_evidence_artifact"
+            else "upload-worker-logs"
+        )
+        assert output == (
+            "${{ steps." + upload + ".outputs.artifact-id != '' && "
+            "steps.evidence-identity.outputs." + internal + " || '' }}"
+        )
+    uploads = [
+        step["with"]["name"]
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
     assert "${{ steps.evidence-identity.outputs.complete_artifact }}" in uploads
     assert "${{ steps.evidence-identity.outputs.worker_artifact }}" in uploads
     assert _evidence_step()["env"] == {"EVIDENCE_INPUTS": "${{ toJSON(inputs) }}"}
@@ -214,13 +248,16 @@ def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
 
 def test_evidence_contract_ignores_json_key_order(tmp_path):
     inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/router"}
-    assert _evidence_identity(tmp_path, inputs)[0] == _evidence_identity(
-        tmp_path, dict(reversed(list(inputs.items())))
-    )[0]
+    assert (
+        _evidence_identity(tmp_path, inputs)[0]
+        == _evidence_identity(tmp_path, dict(reversed(list(inputs.items()))))[0]
+    )
 
 
-@pytest.mark.parametrize("field", ["test_dirs", "test_filter", "kv_backend", "connection_mode",
-                                   "servicer_impl", "mm_processing"])
+@pytest.mark.parametrize(
+    "field",
+    ["test_dirs", "test_filter", "kv_backend", "connection_mode", "servicer_impl", "mm_processing"],
+)
 def test_evidence_contract_distinguishes_effective_rows(tmp_path, field):
     inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/chat_completions"}
     changed = {**inputs, field: "changed"}
@@ -229,8 +266,12 @@ def test_evidence_contract_distinguishes_effective_rows(tmp_path, field):
 
 def test_evidence_attempt_and_source_looking_json_remain_data(tmp_path):
     marker = tmp_path / "must-not-execute"
-    inputs = {"engine": "sglang", "gpu_tier": "2", "test_dirs": "e2e_test/chat: weird/paths",
-              "test_filter": "$(touch " + str(marker) + "); `false`\n'\""}
+    inputs = {
+        "engine": "sglang",
+        "gpu_tier": "2",
+        "test_dirs": "e2e_test/chat: weird/paths",
+        "test_filter": "$(touch " + str(marker) + "); `false`\n'\"",
+    }
     first = _evidence_identity(tmp_path, inputs, "1")
     second = _evidence_identity(tmp_path, inputs, "2")
     assert first[0] == second[0]
@@ -249,3 +290,78 @@ def test_evidence_identity_retains_opt_in_or_failure_boundary():
     assert names.index("Check final AMD SGLang environment") < names.index(
         "Stop every process this job started"
     )
+
+
+def _artifact_output_value(public, artifact_id, outcome="success"):
+    job = _document()["jobs"]["run"]
+    expression = job["outputs"][public]
+    planned = {"complete_artifact": "planned-complete", "worker_artifact": "planned-worker"}
+    direct = re.fullmatch(r"\$\{\{ steps\.evidence-identity\.outputs\.([a-z_]+) \}\}", expression)
+    if direct:
+        return planned[direct[1]]
+    gated = re.fullmatch(
+        r"\$\{\{ steps\.([a-z-]+)\.outputs\.artifact-id != '' && "
+        r"steps\.evidence-identity\.outputs\.([a-z_]+) \|\| '' \}\}",
+        expression,
+    )
+    assert gated, "Only the actual direct or artifact-ID-gated expression is supported"
+    upload = next(step for step in job["steps"] if step.get("id") == gated[1])
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert upload["with"]["name"] == "${{ steps.evidence-identity.outputs." + gated[2] + " }}"
+    # Outcome is deliberately NOT evidence of an upload: warn/ignore-no-files can succeed.
+    return planned[gated[2]] if artifact_id != "" else ""
+
+
+@pytest.mark.parametrize("engine", ["sglang", "tokenspeed", "trtllm"])
+def test_evidence_non_vllm_defaults_do_not_claim_nixl(tmp_path, engine):
+    inputs = {"engine": engine, "gpu_tier": "1", "test_dirs": "e2e_test/chat_completions"}
+    assert _effective_evidence_inputs(inputs)["vllm_kv_backend"] == "nixl"
+    contract = _evidence_identity(tmp_path, inputs)[0]
+    assert "-auto-" in contract
+    assert "-nixl-" not in contract
+
+
+def test_evidence_vllm_keeps_its_configured_default_backend(tmp_path):
+    contract = _evidence_identity(tmp_path, {"engine": "vllm", "gpu_tier": "1"})[0]
+    assert "-nixl-" in contract
+
+
+@pytest.mark.parametrize("engine", ["sglang", "vllm"])
+def test_evidence_explicit_common_backend_wins_over_vllm_default(tmp_path, engine):
+    contract = _evidence_identity(
+        tmp_path, {"engine": engine, "gpu_tier": "2", "kv_backend": "mooncake"}
+    )[0]
+    assert "-mooncake-" in contract and "-nixl-" not in contract
+
+
+@pytest.mark.parametrize(
+    "mode,vendor", [("read", "amd"), ("write", "amd"), ("read", "nvidia"), ("write", "nvidia")]
+)
+def test_evidence_readable_label_keeps_moriio_mode_and_vendor(tmp_path, mode, vendor):
+    contract = _evidence_identity(
+        tmp_path,
+        {
+            "engine": "vllm",
+            "gpu_tier": "2",
+            "test_dirs": "e2e_test/router",
+            "vllm_kv_backend": "moriio",
+            "vllm_moriio_mode": mode,
+            "gpu_vendor": vendor,
+        },
+    )[0]
+    assert "-moriio-" + mode + "-" + vendor + "-" in contract
+
+
+@pytest.mark.parametrize("public", ["complete_evidence_artifact", "worker_log_artifact"])
+@pytest.mark.parametrize(
+    "outcome,artifact_id", [("success", ""), ("skipped", ""), ("failure", ""), ("success", "12345")]
+)
+def test_evidence_output_requires_real_uploaded_artifact_id(public, outcome, artifact_id):
+    actual = _artifact_output_value(public, artifact_id, outcome)
+    expected = "planned-complete" if public == "complete_evidence_artifact" else "planned-worker"
+    assert actual == (expected if artifact_id else "")
+
+
+def test_evidence_success_without_artifact_id_has_empty_output():
+    assert _artifact_output_value("complete_evidence_artifact", "", "success") == ""
+    assert _artifact_output_value("worker_log_artifact", "", "success") == ""

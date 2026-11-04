@@ -146,10 +146,10 @@ on:
         default: true
     outputs:
       complete_evidence_artifact:
-        description: "Exact artifact name for the opted-in complete test evidence"
+        description: "Successful per-invocation complete upload; matrix calls return one nonempty leg, not all rows"
         value: ${{ jobs.run.outputs.complete_evidence_artifact }}
       worker_log_artifact:
-        description: "Exact artifact name for failure diagnostics, when uploaded"
+        description: "Successful per-invocation worker-log upload; matrix calls do not aggregate rows"
         value: ${{ jobs.run.outputs.worker_log_artifact }}
 
 jobs:
@@ -159,8 +159,8 @@ jobs:
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     outputs:
-      complete_evidence_artifact: ${{ steps.evidence-identity.outputs.complete_artifact }}
-      worker_log_artifact: ${{ steps.evidence-identity.outputs.worker_artifact }}
+      complete_evidence_artifact: ${{ steps.upload-complete-evidence.outputs.artifact-id != '' && steps.evidence-identity.outputs.complete_artifact || '' }}
+      worker_log_artifact: ${{ steps.upload-worker-logs.outputs.artifact-id != '' && steps.evidence-identity.outputs.worker_artifact || '' }}
     permissions:
       contents: read
     env:
@@ -426,9 +426,14 @@ jobs:
           inputs = json.loads(os.environ["EVIDENCE_INPUTS"])
           canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
           digest = hashlib.sha256(canonical.encode()).hexdigest()[:12]
-          backend = inputs.get("kv_backend") or inputs.get("vllm_kv_backend", "")
-          fields = [inputs.get("engine", ""), inputs.get("test_dirs", ""), backend,
-                    inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
+          engine = inputs.get("engine", "")
+          backend = inputs.get("kv_backend") or (
+              inputs.get("vllm_kv_backend", "") if engine == "vllm" else ""
+          )
+          mode = inputs.get("vllm_moriio_mode") or "auto" if engine == "vllm" and backend == "moriio" else ""
+          vendor = inputs.get("gpu_vendor") or "unknown"
+          fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
+                    vendor, inputs.get("connection_mode", ""), inputs.get("servicer_impl", ""),
                     inputs.get("mm_processing", "")]
           label = re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(fields)).strip("-.")[:96]
           tier = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(inputs.get("gpu_tier", "")))
@@ -461,6 +466,7 @@ jobs:
           test "$cohort_status" -eq 0
 
       - name: Upload AMD SGLang complete test and final-environment evidence
+        id: upload-complete-evidence
         if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         uses: actions/upload-artifact@v7
         with:
@@ -479,6 +485,7 @@ jobs:
         id: log-snapshot
 
       - name: Upload worker logs
+        id: upload-worker-logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
