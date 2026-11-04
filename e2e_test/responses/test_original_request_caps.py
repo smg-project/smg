@@ -1,8 +1,10 @@
-"""Original e915 request caps alongside the complete current Responses suite.
+"""Opt-in original e915 caps alongside the complete current Responses suite.
 
 Only three original methods are projected: two streaming methods with the
 original OpenAI/SMG parametrization and one two-request sampling method with
 its original single default-client grpc identity. No original class is inherited.
+The Responses collection hook selects these five cases when the complete
+business-evidence route sets RESPONSES_EVIDENCE_DIR.
 """
 
 import pytest

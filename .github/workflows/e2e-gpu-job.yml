@@ -503,12 +503,17 @@ jobs:
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
+          pytest_reruns=2
+          if [ "$RESPONSES_EVIDENCE_ENABLED" = 1 ]; then
+            # Complete business evidence requires a passing first attempt.
+            pytest_reruns=0
+          fi
           pytest_args=(
             ${{ inputs.test_dirs }}
             --ignore=e2e_test/benchmarks
             --ignore=e2e_test/bindings_go
             ${{ inputs.test_filter }}
-            --reruns 2 --reruns-delay 5
+            --reruns "$pytest_reruns" --reruns-delay 5
             -s -vv
           )
           pytest_command=(pytest)

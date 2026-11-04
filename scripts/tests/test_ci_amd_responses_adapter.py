@@ -1,5 +1,6 @@
 """Execute the actual AMD Responses shell routes without services or GPUs."""
 
+import ast
 import json
 import os
 import re
@@ -27,6 +28,50 @@ PROFILE = {
     "CHECK_WIRE": "",
     "CHECK_MIN_SELECTED": "128",
 }
+
+
+@pytest.mark.parametrize("evidence", [False, True])
+def test_original_caps_are_collected_only_for_business_evidence(tmp_path, evidence):
+    source = (ROOT / "e2e_test/responses/conftest.py").read_text()
+    hook = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "pytest_ignore_collect"
+    )
+    # Run the production collection hook and exact cap module through pytest,
+    # without importing the GPU/service fixtures from the surrounding conftest.
+    (tmp_path / "conftest.py").write_text(
+        "import os\nimport pytest\n\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def setup_backend():\n"
+        "    raise AssertionError('collection must not start a backend')\n\n"
+        + ast.get_source_segment(source, hook)
+        + "\n"
+    )
+    (tmp_path / "test_original_request_caps.py").write_bytes(
+        (ROOT / "e2e_test/responses/test_original_request_caps.py").read_bytes()
+    )
+    (tmp_path / "test_control.py").write_text("def test_control(): pass\n")
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    env.pop("RESPONSES_EVIDENCE_DIR", None)
+    if evidence:
+        env["RESPONSES_EVIDENCE_DIR"] = "e2e-logs/responses-fixture"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-o", "addopts="],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    identities = [line for line in result.stdout.splitlines() if "::test_" in line]
+    caps = [line for line in identities if line.startswith("test_original_request_caps.py::")]
+    assert "test_control.py::test_control" in identities
+    assert len(caps) == (5 if evidence else 0)
+    if evidence:
+        expected = json.loads((ROOT / "scripts/ci_responses_required_cap5.json").read_text())
+        assert {"e2e_test/responses/" + item for item in caps} == set(expected)
 
 
 @pytest.mark.parametrize(
@@ -132,7 +177,8 @@ def test_actual_run_shell_routes_observer_before_final_capture_exit(
     observed = json.loads((tmp_path / "observed.json").read_text())
     args = observed["argv"]
     assert args[0] == directory
-    assert args.count("--reruns") == 1 and args[args.index("--reruns") + 1] == "2"
+    assert args.count("--reruns") == 1
+    assert args[args.index("--reruns") + 1] == ("0" if evidence else "2")
     junit = [value for value in args if value.startswith("--junitxml=")]
     if evidence:
         assert args[args.index("-p") + 1] == "scripts.ci_responses_evidence"
