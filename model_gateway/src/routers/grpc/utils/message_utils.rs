@@ -18,6 +18,7 @@ use openai_protocol::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         InputMessage, SystemContent, ToolResultContent,
     },
+    profile::ProviderProfile,
 };
 use serde_json::{json, Value};
 use tracing::error;
@@ -57,15 +58,27 @@ pub(crate) struct MessagesPrompt<'a> {
     pub tool_choice: Option<&'a messages::ToolChoice>,
 }
 
-impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
-    fn from(request: &'a CreateMessageRequest) -> Self {
+impl<'a> MessagesPrompt<'a> {
+    /// The prompt parts of `request`, with the model's provider profile the
+    /// caller derived already (the preparation stage derives it once per
+    /// request); `From` derives it for a caller without one.
+    pub(crate) fn for_request(
+        request: &'a CreateMessageRequest,
+        provider: ProviderProfile,
+    ) -> Self {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.template_thinking(),
+            thinking: request.template_thinking_for(provider),
             reasoning_effort: request.reasoning_effort(),
             tool_choice: request.tool_choice.as_ref(),
         }
+    }
+}
+
+impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
+    fn from(request: &'a CreateMessageRequest) -> Self {
+        Self::for_request(request, ProviderProfile::for_model(&request.model))
     }
 }
 
@@ -94,9 +107,10 @@ pub fn process_messages(
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     process_messages_prompt(
-        MessagesPrompt::from(request),
+        MessagesPrompt::for_request(request, provider),
         tokenizer,
         chat_tools,
         placeholder_tokens,
@@ -118,6 +132,7 @@ pub fn process_messages_with_encoding(
         chat_tools,
         None,
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -1134,11 +1149,17 @@ mod tests {
             ]
         }))
         .unwrap();
-        let rendered =
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text;
+        let rendered = process_messages(
+            &request,
+            &tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text;
         assert_eq!(
             rendered,
             "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
@@ -1262,10 +1283,17 @@ mod tests {
                 "messages": [{"role": "user", "content": blocks}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         let turn =
             |body: &str| format!("<|turn|>user<|body|>{body}<|end|><|turn|>assistant<|body|>");
@@ -1855,6 +1883,7 @@ mod tests {
             Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("render");
         let text = &processed.text;
@@ -1991,10 +2020,17 @@ mod tests {
     }
 
     fn render(request: &CreateMessageRequest, tokenizer: &dyn Tokenizer) -> String {
-        process_messages(request, tokenizer, None, None, MediaPartOrder::MediaFirst)
-            .unwrap()
-            .0
-            .text
+        process_messages(
+            request,
+            tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text
     }
 
     /// A trailing assistant message with text is a prefill: a Jinja template
@@ -2324,12 +2360,14 @@ mod tests {
             )
             .unwrap();
         let rendered = |output_config| {
+            let request = request(output_config);
             process_messages(
-                &request(output_config),
+                &request,
                 &tokenizer,
                 None,
                 None,
                 MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
             )
             .unwrap()
             .0
@@ -2378,11 +2416,17 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            let rendered =
-                process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                    .unwrap()
-                    .0
-                    .text;
+            let rendered = process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text;
             assert_eq!(rendered, format!("user: Hello\nassistant: {prompt_end}"));
             assert_eq!(
                 messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
@@ -2415,10 +2459,17 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         assert_eq!(rendered("none"), "user: Hello thinking=False");
         assert_eq!(rendered("high"), "user: Hello thinking=unset");

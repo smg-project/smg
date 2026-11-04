@@ -1587,6 +1587,7 @@ mod tests {
                 None,
                 None,
                 MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
             )
             .expect("rendered");
             messages_reasoning_starts_in_prefill(
@@ -1665,6 +1666,7 @@ mod tests {
             None,
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("rendered");
         assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
@@ -1698,6 +1700,7 @@ mod tests {
             &tokenizer,
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("rendered");
         assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
