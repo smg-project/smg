@@ -2291,9 +2291,10 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-// Built and run without the extension-module feature, which leaves the Python
-// symbols to the interpreter that loads the extension and so cannot link a
-// test binary: `cargo test -p smg-python --no-default-features --lib`.
+// `cargo test -p smg-python --lib` runs these without an interpreter: the
+// tests reach pure-Rust code only, so the linker drops the module's Python
+// references with the code nothing here calls (the crate's features change
+// nothing about that: pyo3's `extension-module` is on either way).
 #[cfg(test)]
 mod tests {
     use config::RoutingMode;
