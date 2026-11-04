@@ -90,13 +90,14 @@ impl Shared {
         kv_relay: Option<Arc<KvEventRelay>>,
         metrics: Arc<ServicerMetrics>,
         tokenizer_dir: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> Self {
         Self {
             kv_relay,
             tokenizer_dir,
             engine: EngineLink::default(),
             metrics,
-            registry: Arc::new(RequestRegistry::default()),
+            registry: Arc::new(RequestRegistry::with_warmup_nonce(warmup_nonce)),
             serving: AtomicBool::new(true),
             started: Instant::now(),
             started_at: SystemTime::now(),
@@ -241,7 +242,8 @@ impl Shared {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.
@@ -515,7 +517,7 @@ mod tests {
             false,
         )
         .expect("metrics without a listener");
-        Shared::new(None, metrics, None)
+        Shared::new(None, metrics, None, None)
     }
 
     /// Before the engine is up every reader answers from the launcher's

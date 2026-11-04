@@ -72,6 +72,7 @@ import contextlib
 import dataclasses
 import logging
 import random
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any, Protocol
@@ -403,12 +404,27 @@ def token_ids(count: int, seed: int, vocab_size: int) -> tuple[int, ...]:
     return tuple(floor + draw.randrange(span) for _ in range(count))
 
 
-class _Requests:
-    """The requests of one plan, numbered: the ordinal seeds the token ids."""
+def draw_nonce() -> str:
+    """A fresh nonce for one process's warm-up request ids
+    (:func:`plan_warmup`), drawn once per launcher process: the Rust servicer
+    constructed with it admits only ids that carry it while readiness is
+    held, so a client's own ``rid`` cannot spell its way into the pass."""
+    return secrets.token_hex(4)
 
-    def __init__(self, vocab_size: int, lone_leg_bootstrap: str | None = None) -> None:
+
+class _Requests:
+    """The requests of one plan, numbered: the ordinal seeds the token ids,
+    and ``nonce`` marks the ids as this process's own."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        lone_leg_bootstrap: str | None = None,
+        nonce: str | None = None,
+    ) -> None:
         self._vocab_size = vocab_size
         self._lone_leg_bootstrap = lone_leg_bootstrap
+        self._nonce = nonce
         self._next = 0
 
     def one(
@@ -422,9 +438,12 @@ class _Requests:
         self._next += 1
         # The exact form the Rust servicers admit while readiness is held
         # (`is_warmup_request_id` in the engine servicer crate's request
-        # registry): the prefix, the ordinal, nothing else.
+        # registry): the prefix, the nonce the server was constructed with,
+        # the ordinal, nothing else; without a nonce the prefix and the
+        # ordinal alone.
+        mark = f"{self._nonce}-" if self._nonce else ""
         return WarmupRequest(
-            request_id=f"smg-warmup-{ordinal}",
+            request_id=f"smg-warmup-{mark}{ordinal}",
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
             seed=ordinal,
@@ -447,7 +466,9 @@ def _media_step(requests: _Requests, ranks: tuple[int | None, ...]) -> WarmupSte
     )
 
 
-def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
+def plan_warmup(
+    inputs: WarmupInputs, level: str = DEFAULT_LEVEL, nonce: str | None = None
+) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
     prefill shapes by length, the odd variants, the second pass, the media
@@ -464,13 +485,15 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     pinned to its rank. An engine that runs prefill alone
     (``inputs.prefill_only``) gets neither the staircase nor the ladder: its
     plan is one request of the smallest shape per rank, and the media step
-    when the inputs ask for one."""
+    when the inputs ask for one. ``nonce`` (:func:`draw_nonce`) marks every
+    request id as this process's own, the mark the servicer constructed with
+    it admits while it holds readiness."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
     if inputs.max_num_batched_tokens <= 0 or inputs.vocab_size <= 0:
         return WarmupPlan(level, inputs, ())
-    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap)
+    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap, nonce)
     window = inputs.max_num_seqs if inputs.max_num_seqs > 0 else DEFAULT_WINDOW
     # The longest prompt a one-token request may carry: the context less the
     # token and the positions the engine keeps back (the step alone when the
@@ -951,17 +974,19 @@ def plan_for(
     *,
     knob: str,
     log: logging.Logger = logger,
+    nonce: str | None = None,
 ) -> WarmupPlan | None:
     """The plan a launcher runs for ``setting`` and ``inputs``, or ``None``
     with the reason logged: the knob is off, the engine or model takes no
-    warm-up (no inputs), or the configuration leaves nothing to plan."""
+    warm-up (no inputs), or the configuration leaves nothing to plan.
+    ``nonce`` marks the plan's request ids (:func:`plan_warmup`)."""
     if not setting.enabled:
         log.info("Planned warm-up off (%s=off)", knob)
         return None
     if inputs is None:
         log.info("Planned warm-up: none for this engine or model")
         return None
-    plan = plan_warmup(inputs, setting.level)
+    plan = plan_warmup(inputs, setting.level, nonce)
     if inputs.every_prefill_length and setting.level != LEVEL_FULL:
         log.warning(
             "Planned warm-up at the %s level plans the length classes alone and leaves out the "
