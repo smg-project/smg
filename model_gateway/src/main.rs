@@ -5153,7 +5153,9 @@ mod tests {
     /// of the validators (the scheduler YAML, the log-directory probe) for no
     /// second opinion. An inotify watch on the scheduler file counts the
     /// read-only opens `configure` closes; the count does not depend on
-    /// timing, since the events queue until they are read.
+    /// timing, since the events queue until they are read. The watch takes
+    /// the opens as well: the kernel folds two identical queued events into
+    /// one, and the open between two closes keeps them apart.
     #[cfg(target_os = "linux")]
     #[test]
     fn configure_reads_the_scheduler_file_once() {
@@ -5165,7 +5167,12 @@ mod tests {
         let scheduler = dir.path().join("scheduler.yaml");
         std::fs::write(&scheduler, "{}\n").unwrap();
         let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
-        inotify::add_watch(&watch, &scheduler, WatchFlags::CLOSE_NOWRITE).unwrap();
+        inotify::add_watch(
+            &watch,
+            &scheduler,
+            WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
+        )
+        .unwrap();
 
         let cli = cli_args_from(&[
             "--priority-scheduler-enabled",
