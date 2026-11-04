@@ -18,6 +18,9 @@ so the suite needs no network. What it pins:
 - a request renders under the tokenizer's model id, which selects the
   provider profile (a Hub cache snapshot names its own), and a local path
   without one renders no chat;
+- ``apply_chat_template`` refuses what SMG would not do (a template variable
+  the render fills itself, a generation prompt or continuation the renderer
+  does not honour) and issues the rewrites SMG logs as ``RenderWarning``;
 - the tokenizer pickles with its smg build, encodes from several threads at
   once, and works in a child forked after the parent used it, or while
   another thread is in a call (rayon's global pool, or a lock held at the
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import copy
 import http.server
+import inspect
 import json
 import multiprocessing
 import os
@@ -39,6 +43,7 @@ import sys
 import threading
 import time
 import types
+import warnings
 from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -49,7 +54,7 @@ from packaging.version import Version
 
 pytest.importorskip("smg.smg_rs")
 
-from smg.tokenizer import Tokenizer
+from smg.tokenizer import RenderWarning, Tokenizer
 
 MODEL = "test-org/test-model"
 
@@ -221,11 +226,11 @@ def symbols(text: str) -> list[int]:
     return [VOCAB[byte_symbols()[byte]] for byte in text.encode()]
 
 
-def chat_text(tokenizer: Tokenizer, conversation: list[Any], **fields: Any) -> str:
-    """The prompt of a request for one conversation, with the request fields
-    ``fields``; without the generation header unless they ask for it."""
-    request = {"messages": conversation, "add_generation_prompt": False, **fields}
-    return tokenizer.render_chat(request)["text"]
+def chat_text(tokenizer: Tokenizer, conversation: list[Any], **kwargs: Any) -> str:
+    """``apply_chat_template(..., tokenize=False)`` of one conversation."""
+    text = tokenizer.apply_chat_template(conversation, tokenize=False, **kwargs)
+    assert isinstance(text, str)
+    return text
 
 
 # --- encode and decode ---------------------------------------------------------
@@ -367,7 +372,7 @@ def test_from_pretrained_and_path_objects(checkpoint: Path, tmp_path: Path) -> N
     assert tokenizer.chat_template == str(template)
     assert tokenizer.model == "my-model"
     messages = [{"role": "user", "content": "hello"}]
-    assert chat_text(tokenizer, messages) == "[hello]"
+    assert tokenizer.apply_chat_template(messages, tokenize=False) == "[hello]"
 
 
 def test_a_name_tiktoken_does_not_know_downloads_as_a_hub_id(
@@ -460,7 +465,7 @@ def test_a_local_path_has_no_model_id_and_renders_no_chat_without_one(checkpoint
     assert (tokenizer.model, tokenizer.provider_profile) == (None, None)
     assert tokenizer.encode("hello world") == [HELLO, WORLD]
     with pytest.raises(ValueError, match="the request names no model, and this tokenizer has no"):
-        tokenizer.render_chat({"messages": CONVERSATION})
+        tokenizer.apply_chat_template(CONVERSATION)
     # A request that names its model renders under it.
     rendered = tokenizer.render_chat({"model": "any", "messages": CONVERSATION})
     assert rendered["text"].startswith(CONVERSATION_TEXT)
@@ -528,8 +533,7 @@ def test_a_conversation_renders_to_the_template_text_and_its_flat_encode(
     tokenizer: Tokenizer,
 ) -> None:
     assert chat_text(tokenizer, CONVERSATION) == CONVERSATION_TEXT
-    rendered = tokenizer.render_chat({"messages": CONVERSATION, "add_generation_prompt": False})
-    ids = rendered["token_ids"]
+    ids = tokenizer.apply_chat_template(CONVERSATION)
     assert ids == tokenizer.encode(CONVERSATION_TEXT, add_special_tokens=False)
     assert ids[:2] == [IM_START, *symbols("user")[:1]]
     assert chat_text(tokenizer, CONVERSATION[:1], add_generation_prompt=True) == (
@@ -541,7 +545,10 @@ def test_continue_final_message_leaves_the_last_message_open(tokenizer: Tokenize
     text = chat_text(tokenizer, CONVERSATION, continue_final_message=True)
     assert text == "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\nworld"
     # SMG continues a final assistant message only: asked of a user message,
-    # serving renders it closed.
+    # serving renders it closed, which apply_chat_template refuses to pass
+    # off as a continuation.
+    with pytest.raises(ValueError, match="SMG did not continue the final message"):
+        tokenizer.apply_chat_template(CONVERSATION[:1], continue_final_message=True)
     rendered = tokenizer.render_chat(
         {
             "messages": CONVERSATION[:1],
@@ -573,6 +580,19 @@ def test_a_renderer_that_cannot_continue_appends_the_text_after_the_header(
     )
     assert rendered["text"].endswith("The answer")
     assert (rendered["generation_prompt"], rendered["continued_final_message"]) == (True, False)
+    assert chat_text(tokenizer, messages, continue_final_message=True) == rendered["text"]
+
+
+def test_a_list_of_conversations_renders_each(tokenizer: Tokenizer) -> None:
+    batch = [CONVERSATION, CONVERSATION[:1]]
+    assert tokenizer.apply_chat_template(batch, tokenize=False) == [
+        CONVERSATION_TEXT,
+        "<|im_start|>user\nhello<|im_end|>\n",
+    ]
+    assert tokenizer.apply_chat_template(batch) == [
+        tokenizer.apply_chat_template(CONVERSATION),
+        tokenizer.apply_chat_template(CONVERSATION[:1]),
+    ]
 
 
 def test_tool_call_arguments_reach_the_template_as_the_gateway_hands_them(
@@ -619,7 +639,7 @@ def test_request_fields_and_template_kwargs_reach_the_template(probe: Tokenizer)
         tools=[WEATHER_TOOL],
         add_generation_prompt=True,
         reasoning_effort="low",
-        chat_template_kwargs={"greeting": "hey"},
+        greeting="hey",
     )
     assert text == (
         "tools_none=False tool_choice=auto reasoning_effort=low thinking= greeting=hey "
@@ -628,7 +648,8 @@ def test_request_fields_and_template_kwargs_reach_the_template(probe: Tokenizer)
 
 
 def test_template_kwargs_cannot_replace_what_the_render_sets(probe: Tokenizer) -> None:
-    # Serving's render context wins over chat_template_kwargs.
+    # Serving's render context wins over chat_template_kwargs: render_chat
+    # renders the request as serving does ...
     rendered = probe.render_chat(
         {
             "messages": [{"role": "user", "content": "hi"}],
@@ -637,6 +658,27 @@ def test_template_kwargs_cannot_replace_what_the_render_sets(probe: Tokenizer) -
         }
     )
     assert rendered["text"].endswith("messages=1 generation=False")
+    # ... and apply_chat_template refuses those SMG would not pass
+    # (transformers lets strftime_now be replaced; given messages, its call
+    # to Jinja's render() fails).
+    messages = [{"role": "user", "content": "hi"}]
+    with pytest.raises(TypeError, match="does not pass 'messages' to the template"):
+        probe.apply_chat_template(messages, messages=[])
+    with pytest.raises(TypeError, match="does not pass 'strftime_now' to the template"):
+        probe.apply_chat_template(messages, strftime_now=lambda _: "2026-01-01")
+
+
+def test_a_special_token_the_checkpoint_defines_is_not_replaced(tmp_path: Path) -> None:
+    tokenizer = Tokenizer(
+        write_checkpoint(tmp_path, chat_template="bos={{ bos_token }} eos={{ eos_token }}"),
+        model=MODEL,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    assert chat_text(tokenizer, messages) == "bos= eos=<|im_end|>"
+    with pytest.raises(TypeError, match=r"does not pass 'eos_token' .* \('<\|im_end\|>'\)"):
+        tokenizer.apply_chat_template(messages, eos_token="</s>")
+    # One it does not define, the keyword argument fills, as in serving.
+    assert chat_text(tokenizer, messages, bos_token="<s>") == "bos=<s> eos=<|im_end|>"
 
 
 RENDER_A_CHAT = """
@@ -787,13 +829,13 @@ def test_a_gpt_oss_checkpoint_is_refused_whatever_the_model_id(tmp_path: Path) -
         model="my-model",
     )
     with pytest.raises(ValueError, match="SMG renders gpt-oss models with Harmony"):
-        tokenizer.render_chat({"messages": CONVERSATION})
+        tokenizer.apply_chat_template(CONVERSATION)
     assert tokenizer.encode("hello") == [HELLO]
 
 
 def test_a_gpt_oss_model_id_is_refused(checkpoint: Path) -> None:
     with pytest.raises(ValueError, match=r"Harmony.*\(model openai/gpt-oss-20b\)"):
-        Tokenizer(checkpoint, model="openai/gpt-oss-20b").render_chat({"messages": CONVERSATION})
+        Tokenizer(checkpoint, model="openai/gpt-oss-20b").apply_chat_template(CONVERSATION)
     with pytest.raises(ValueError, match=r"Harmony.*\(model GPT-OSS-120B\)"):
         Tokenizer(checkpoint).render_chat({"model": "GPT-OSS-120B", "messages": CONVERSATION})
 
@@ -817,6 +859,14 @@ def test_rewrites_smg_logs_come_back_as_warnings(tokenizer: Tokenizer) -> None:
         "tool call arguments in history are not valid JSON; rendered as an empty object "
         "(tool=get_weather, bytes=9, error="
     )
+    with pytest.warns(RenderWarning, match="rendered as an empty object") as issued:
+        tokenizer.apply_chat_template(messages)
+        tokenizer.apply_chat_template([messages, messages])
+    assert [warning.filename for warning in issued] == [__file__] * 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RenderWarning)
+        with pytest.raises(RenderWarning):
+            tokenizer.apply_chat_template([messages, messages])
     assert tokenizer.render_chat({"messages": CONVERSATION})["warnings"] == []
 
 
@@ -850,6 +900,31 @@ def test_a_small_request_with_a_long_prompt_encodes_on_the_pool(tmp_path: Path) 
     assert rendered["token_ids"] == tokenizer.encode(rendered["text"], add_special_tokens=False)
 
 
+def test_transformers_arguments_without_an_smg_equivalent_are_refused(
+    tokenizer: Tokenizer,
+) -> None:
+    with pytest.raises(TypeError, match="does not take 'documents'"):
+        tokenizer.apply_chat_template(CONVERSATION, documents=[{"text": "x"}])
+    with pytest.raises(TypeError, match="does not take 'return_assistant_tokens_mask'"):
+        tokenizer.apply_chat_template(CONVERSATION, return_assistant_tokens_mask=True)
+    with pytest.raises(TypeError, match="does not take 'sanitize_control_tokens'"):
+        tokenizer.apply_chat_template(CONVERSATION, sanitize_control_tokens=True)
+    with pytest.raises(TypeError, match="continue_final_message='reasoning_content'"):
+        tokenizer.apply_chat_template(CONVERSATION, continue_final_message="reasoning_content")
+    # Their no-op values are accepted, and transformers 5's name for the content.
+    text = tokenizer.apply_chat_template(
+        CONVERSATION,
+        tokenize=False,
+        documents=None,
+        padding=False,
+        return_dict=False,
+        sanitize_control_tokens=False,
+    )
+    assert text == CONVERSATION_TEXT
+    continued = chat_text(tokenizer, CONVERSATION, continue_final_message="content")
+    assert continued == chat_text(tokenizer, CONVERSATION, continue_final_message=True)
+
+
 def test_a_segment_aware_renderer_returns_its_own_encode(tmp_path: Path) -> None:
     # DeepSeek V3.2's renderer encodes control tokens and message text
     # separately: control-token text typed in a message stays text, which a
@@ -867,10 +942,16 @@ def test_a_segment_aware_renderer_returns_its_own_encode(tmp_path: Path) -> None
     flat = tokenizer.encode(rendered["text"], add_special_tokens=False)
     assert IM_END in flat
     assert IM_END not in rendered["token_ids"]
+    assert (
+        tokenizer.apply_chat_template(messages, add_generation_prompt=True) == rendered["token_ids"]
+    )
     # Its encoder writes the generation header after a final user message
-    # whatever the request asks, as the engines' encoders do.
+    # whatever the request asks, as the engines' encoders do: render_chat
+    # reports it, apply_chat_template refuses to call it no header.
     unasked = tokenizer.render_chat({"messages": messages, "add_generation_prompt": False})
     assert unasked["generation_prompt"] is True
+    with pytest.raises(ValueError, match="SMG wrote the generation prompt although"):
+        tokenizer.apply_chat_template(messages)
 
 
 # --- processes and threads -----------------------------------------------------
@@ -1235,3 +1316,22 @@ def test_a_pool_size_that_is_no_number_is_refused(checkpoint: Path) -> None:
     )
     assert child.returncode != 0
     assert 'SMG_TOKENIZER_THREADS must be a positive number of threads, not "many"' in child.stderr
+
+
+def test_the_api_signature() -> None:
+    parameters = inspect.signature(Tokenizer.apply_chat_template).parameters
+    assert list(parameters) == [
+        "self",
+        "conversation",
+        "tools",
+        "add_generation_prompt",
+        "continue_final_message",
+        "tokenize",
+        "tool_choice",
+        "reasoning_effort",
+        "template_kwargs",
+    ]
+    assert parameters["add_generation_prompt"].default is False
+    assert parameters["tokenize"].default is True
+    assert inspect.signature(Tokenizer.encode).parameters["add_special_tokens"].default is True
+    assert inspect.signature(Tokenizer.decode).parameters["skip_special_tokens"].default is False

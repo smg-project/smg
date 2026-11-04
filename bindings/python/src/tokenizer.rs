@@ -836,7 +836,7 @@ fn prepare(
     tokenizer: &dyn TokenizerTrait,
     chat: &Chat,
     text: &str,
-) -> Result<(ProcessedMessages, PromptEncoding), Failure> {
+) -> Result<(ProcessedMessages, PromptEncoding, bool), Failure> {
     let mut request = parse_request(text, chat.model.as_deref())?;
     request.normalize();
     request
@@ -859,8 +859,11 @@ fn prepare(
         )));
     }
     refuse_media(&request.messages)?;
+    let continues_final_assistant = request.continues_final_assistant();
     let request = request_as_rendered(&request);
-    process_chat_messages_with_encoding(&request, tokenizer, None).map_err(Failure::Input)
+    let (processed, encoding) =
+        process_chat_messages_with_encoding(&request, tokenizer, None).map_err(Failure::Input)?;
+    Ok((processed, encoding, continues_final_assistant))
 }
 
 /// The gateway's tokenize step: the text without special tokens (the
@@ -881,16 +884,27 @@ fn encode_prompt(
 }
 
 /// A rendered chat, as `render_chat` hands it to Python: the prompt text,
-/// its token ids, whether those are the text's flat encode, whether the
-/// renderer wrote its generation header, whether it kept the final message
-/// open (a native continuation), and the warnings the gateway logged.
-type Rendered = (String, Vec<u32>, bool, bool, bool, Vec<String>);
+/// its token ids (`None` when not asked for), whether those are the text's
+/// flat encode, whether the renderer wrote its generation header, whether
+/// it kept the final message open (a native continuation), the warnings the
+/// gateway logged, and whether the request continues a final assistant
+/// message (`continue_final_message` with the assistant's message last).
+type Rendered = (
+    String,
+    Option<Vec<u32>>,
+    bool,
+    bool,
+    bool,
+    Vec<String>,
+    bool,
+);
 
 fn rendered(
     processed: ProcessedMessages,
-    token_ids: Vec<u32>,
+    token_ids: Option<Vec<u32>>,
     from_text: bool,
     warnings: Vec<String>,
+    continues_final_assistant: bool,
 ) -> Rendered {
     (
         processed.text,
@@ -899,6 +913,7 @@ fn rendered(
         processed.generation_prompt,
         processed.continued_final_message,
         warnings,
+        continues_final_assistant,
     )
 }
 
@@ -908,17 +923,22 @@ fn render_one(
     tokenizer: &dyn TokenizerTrait,
     chat: &Chat,
     text: &str,
+    tokenize: bool,
 ) -> Result<Rendered, Failure> {
     let (result, warnings) = captured(|| {
         caught(|| {
-            let (processed, encoding) = prepare(tokenizer, chat, text)?;
+            let (processed, encoding, continues) = prepare(tokenizer, chat, text)?;
             let from_text = matches!(encoding, PromptEncoding::FromText);
-            let token_ids = encode_prompt(tokenizer, &processed.text, encoding)?;
-            Ok((processed, token_ids, from_text))
+            let token_ids = tokenize
+                .then(|| encode_prompt(tokenizer, &processed.text, encoding))
+                .transpose()?;
+            Ok((processed, token_ids, from_text, continues))
         })
     });
-    let (processed, token_ids, from_text) = result?;
-    Ok(rendered(processed, token_ids, from_text, warnings))
+    let (processed, token_ids, from_text, continues) = result?;
+    Ok(rendered(
+        processed, token_ids, from_text, warnings, continues,
+    ))
 }
 
 /// The name of the provider profile a model id selects.
@@ -1221,7 +1241,8 @@ impl PyTokenizer {
 
     /// Render a chat completion request, given as JSON text, as the gateway
     /// does; see `smg.tokenizer.Tokenizer.render_chat`.
-    fn render_chat(&self, py: Python<'_>, request: &str) -> PyResult<Rendered> {
+    #[pyo3(signature = (request, tokenize=true))]
+    fn render_chat(&self, py: Python<'_>, request: &str, tokenize: bool) -> PyResult<Rendered> {
         let tokenizer = &*self.inner;
         let chat = &self.chat;
         // The rendering reaches no rayon: a short request renders here with
@@ -1232,9 +1253,9 @@ impl PyTokenizer {
         } else {
             detached(py, render)
         };
-        let (processed, encoding) = prepared?;
+        let (processed, encoding, continues) = prepared?;
         let from_text = matches!(encoding, PromptEncoding::FromText);
-        let token_ids = {
+        let token_ids = if tokenize {
             // The prompt's encode can reach rayon by the prompt's length,
             // which a template can make many times the request's.
             let text = processed.text.as_str();
@@ -1245,13 +1266,25 @@ impl PyTokenizer {
                 detached(py, || in_pool(encode))?
             };
             warnings.extend(more);
-            token_ids?
+            Some(token_ids?)
+        } else {
+            // The renderer's encode is not needed: dropped unrun.
+            drop(encoding);
+            None
         };
-        Ok(rendered(processed, token_ids, from_text, warnings))
+        Ok(rendered(
+            processed, token_ids, from_text, warnings, continues,
+        ))
     }
 
     /// Render chat completion requests, given as JSON texts, in parallel.
-    fn render_chat_batch(&self, py: Python<'_>, requests: Vec<String>) -> PyResult<Vec<Rendered>> {
+    #[pyo3(signature = (requests, tokenize=true))]
+    fn render_chat_batch(
+        &self,
+        py: Python<'_>,
+        requests: Vec<String>,
+        tokenize: bool,
+    ) -> PyResult<Vec<Rendered>> {
         let tokenizer = &*self.inner;
         let chat = &self.chat;
         let rendered = detached(py, || {
@@ -1260,7 +1293,7 @@ impl PyTokenizer {
                     .par_iter()
                     .enumerate()
                     .map(|(index, request)| {
-                        render_one(tokenizer, chat, request)
+                        render_one(tokenizer, chat, request, tokenize)
                             .map_err(|failure| failure.of_item("requests", index))
                     })
                     .collect::<Result<Vec<_>, _>>()
