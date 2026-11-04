@@ -34,6 +34,31 @@ fn mel_to_hz(mel: f64) -> f64 {
     }
 }
 
+/// Per filter of `filters` (`n_mels` rows of `fft_bins` weights), the half-open
+/// bin range `[first, last)` outside which its weight is zero. A filter is a
+/// triangle over the bins, so its weight is one contiguous band and a bin
+/// carries weight in at most two filters; the band is read off the weights
+/// rather than assumed, and an all-zero filter gets an empty one. A product
+/// over the band is the product over the row, bit for bit, when every power
+/// is finite: a zero weight adds nothing to a finite value.
+pub(super) fn mel_bands(filters: &[f32], n_mels: usize, fft_bins: usize) -> Vec<(usize, usize)> {
+    (0..n_mels)
+        .map(|mel| {
+            let row = &filters[mel * fft_bins..(mel + 1) * fft_bins];
+            match row.iter().position(|weight| *weight != 0.0) {
+                Some(first) => {
+                    let last = row
+                        .iter()
+                        .rposition(|weight| *weight != 0.0)
+                        .map_or(first, |index| index + 1);
+                    (first, last)
+                }
+                None => (0, 0),
+            }
+        })
+        .collect()
+}
+
 /// Build a Slaney-normalized mel filter bank.
 pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     let fft_bins = n_fft / 2 + 1;
