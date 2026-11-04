@@ -10,9 +10,7 @@ import yaml
 
 
 def score_script():
-    workflow = (
-        Path(__file__).resolve().parents[2] / ".github/workflows/nightly-bfcl.yml"
-    )
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-bfcl.yml"
     jobs = yaml.safe_load(workflow.read_text())["jobs"].values()
     marker = 'BFCL="$(command -v bfcl)"'
     scripts = [
@@ -117,9 +115,7 @@ def test_launch_failure_retains_status_and_partial_report(tmp_path, mode, arm, s
         assert not any(event.startswith("python:") for event in trace)
 
 
-@pytest.mark.parametrize(
-    "score_rc,phase,status", [(11, "score-a", 11), (0, "stop-a", 17)]
-)
+@pytest.mark.parametrize("score_rc,phase,status", [(11, "score-a", 11), (0, "stop-a", 17)])
 def test_first_score_or_stop_failure_remains_hard(tmp_path, score_rc, phase, status):
     result, trace, report = run_score(tmp_path, SCORE_A_RC=score_rc, STOP_RC=17)
     assert_incomplete(tmp_path, result, trace, report, phase, status)
