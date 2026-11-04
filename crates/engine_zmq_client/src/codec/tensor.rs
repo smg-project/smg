@@ -3,6 +3,10 @@
 //
 // Mirrors Python `vllm/v1/serial_utils.py` `encode_ndarray`/`encode_tensor`.
 
+//! Numpy arrays and tensors on the wire, laid out as the engine's `encode_ndarray` and
+//! `encode_tensor` write them: `WireNdArray`, its data inline or in an auxiliary frame once it
+//! reaches `TENSOR_AUX_MIN_BYTES`.
+
 use std::{collections::BTreeMap, fmt};
 
 use bytemuck::{cast_slice, Pod};

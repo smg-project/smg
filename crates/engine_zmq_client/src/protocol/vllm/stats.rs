@@ -1,6 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/stats.rs.
 
+//! The scheduler statistics an engine piggybacks on every output batch, as far as this client
+//! reads them: the per-rank load signal and the prefill counters.
+
 use serde::{Deserialize, Serialize};
 
 /// Breakdown of a scheduled prefill computation.

@@ -6,6 +6,9 @@
 // HELLO/INIT/READY handshake, a DEALER registers on the input socket and
 // receives requests, and a PUSH sends outputs back.
 
+//! A test-only mock engine: it plays the engine process's role over ZMQ so the transport and the
+//! connector are loopback-tested.
+
 use std::time::Duration;
 
 use bytes::Bytes;

@@ -6,6 +6,9 @@
 // reference's `expect`/`panic`/`hex`/`thiserror-ext`/`enum-as-inner` are
 // replaced with std/error-handled equivalents to satisfy `clippy -D warnings`.
 
+//! The ZMQ transport: the sockets the frontend binds, the handshake that admits each engine, the
+//! sends to one engine and the output loop that reads them all.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
