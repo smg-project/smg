@@ -100,3 +100,7 @@ harness = false
 [[bench]]
 name = "audio_clip"
 harness = false
+
+[[bench]]
+name = "audio_preprocess"
+harness = false
