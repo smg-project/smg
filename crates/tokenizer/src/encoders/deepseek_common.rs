@@ -18,7 +18,10 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use super::marks::{self, control};
+use super::{
+    marks::{self, control},
+    truthy,
+};
 
 // ---------------------------------------------------------------------------
 // The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
@@ -195,7 +198,16 @@ pub(super) fn task_sp_token(task: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Preprocessing: merge tool messages and sort tool results.
 // ---------------------------------------------------------------------------
-pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
+/// What a user message's own `content_blocks` list means to a dialect's
+/// merge: V4's reference rebuilds every user message from its `content` (a
+/// list the message carries is dropped), V4.1's keeps the list it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IncomingBlocks {
+    Rebuilt,
+    Kept,
+}
+
+pub(super) fn merge_tool_messages(messages: &[Value], incoming: IncomingBlocks) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let msg = msg.clone();
@@ -232,9 +244,17 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 }));
             }
         } else if role == "user" {
-            let text_block = json!({
-                "type": "text",
-                "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+            let own = match incoming {
+                IncomingBlocks::Kept => {
+                    msg.get("content_blocks").and_then(Value::as_array).cloned()
+                }
+                IncomingBlocks::Rebuilt => None,
+            }
+            .unwrap_or_else(|| {
+                vec![json!({
+                    "type": "text",
+                    "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                })]
             });
             let merged_into_prev = if let Some(prev) = merged.last_mut() {
                 let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -245,7 +265,7 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                         .get_mut("content_blocks")
                         .and_then(|v| v.as_array_mut())
                     {
-                        blocks.push(text_block.clone());
+                        blocks.extend(own.iter().cloned());
                         true
                     } else {
                         false
@@ -257,13 +277,17 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 false
             };
             if !merged_into_prev {
-                let mut new_msg = json!({
-                    "role": "user",
-                    "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-                    "content_blocks": [text_block],
-                });
-                // Preserve extra fields (task, wo_eos, mask, etc.).
+                let mut new_msg = match incoming {
+                    // The reference keeps the message as written, its blocks set.
+                    IncomingBlocks::Kept => msg.clone(),
+                    IncomingBlocks::Rebuilt => json!({
+                        "role": "user",
+                        "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    }),
+                };
                 if let Some(obj) = new_msg.as_object_mut() {
+                    obj.insert("content_blocks".to_string(), Value::Array(own));
+                    // Preserve extra fields (task, wo_eos, mask, etc.).
                     for key in ["task", "wo_eos", "mask"] {
                         if let Some(v) = msg.get(key) {
                             obj.insert(key.to_string(), v.clone());
@@ -456,16 +480,18 @@ pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> 
 /// One message as the family's renderers read it: the fields of the
 /// OpenAI-shape value every renderer reads, read once, with the tools and
 /// tool calls in the encoders' shape and empty lists dropped the way Python's
-/// truthiness drops them (`if tools:`); `response_format` is the field as
-/// written, read by each renderer under its reference's rule. A field only
-/// some arms read is read on demand ([`Turn::wo_eos`]), so a renderer that
-/// never asks pays no lookup.
+/// truthiness drops them (`if tools:`), and `response_format` dropped the
+/// same way (`if response_format:`), so a renderer reads it only when its
+/// reference would render it. A field only some arms read is read on demand
+/// ([`Turn::wo_eos`]), so a renderer that never asks pays no lookup.
 pub(super) struct Turn<'m> {
     pub(super) index: usize,
     pub(super) msg: &'m Value,
     pub(super) role: &'m str,
     pub(super) content: &'m str,
     pub(super) tools: Option<Vec<Value>>,
+    /// The turn's response format when the reference would render one: its
+    /// encoders test the field with Python's truthiness (see [`truthy`]).
     pub(super) response_format: Option<&'m Value>,
     pub(super) tool_calls: Option<Vec<Value>>,
     /// The gateway's protocol takes the `reasoning` spelling as an alias of
@@ -495,7 +521,7 @@ impl<'m> Turn<'m> {
             role: text(msg, "role"),
             content: text(msg, "content"),
             tools,
-            response_format: msg.get("response_format"),
+            response_format: msg.get("response_format").filter(|v| truthy(v)),
             tool_calls,
             reasoning_content: text(msg, "reasoning_content"),
         }
@@ -784,6 +810,58 @@ mod tests {
         assert_eq!(
             dsml(&json!("{oops"), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"true\">{oops</｜DSML｜ parameter>"
+        );
+    }
+
+    /// The reference encoders test an optional section with Python's
+    /// truthiness, so a turn's response format is nothing for every falsy
+    /// value and the value itself otherwise.
+    #[test]
+    fn a_turns_response_format_is_the_references_truthy_value_or_nothing() {
+        for falsy in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!(""),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(!truthy(&falsy), "{falsy}");
+            let msg = json!({ "role": "system", "content": "x", "response_format": falsy });
+            assert!(Turn::read(0, &msg).response_format.is_none(), "{msg}");
+        }
+        let schema = json!({ "type": "json_object" });
+        let msg = json!({ "role": "system", "content": "x", "response_format": schema });
+        assert_eq!(Turn::read(0, &msg).response_format, Some(&schema));
+        let bare = json!({ "role": "system", "content": "x" });
+        assert!(Turn::read(0, &bare).response_format.is_none());
+    }
+
+    /// V4's reference rebuilds every user message from its content; V4.1's
+    /// keeps a `content_blocks` list the message carries (and builds one from
+    /// the content when it carries none).
+    #[test]
+    fn a_user_messages_own_content_blocks_are_rebuilt_or_kept_by_dialect() {
+        let with_block = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "from the block" }],
+        })];
+        let rebuilt = merge_tool_messages(&with_block, IncomingBlocks::Rebuilt);
+        assert_eq!(
+            rebuilt[0]["content_blocks"],
+            json!([{ "type": "text", "text": "ignored" }])
+        );
+        let kept = merge_tool_messages(&with_block, IncomingBlocks::Kept);
+        assert_eq!(
+            kept[0]["content_blocks"],
+            json!([{ "type": "text", "text": "from the block" }])
+        );
+        assert_eq!(kept[0]["content"], json!("ignored"));
+        let without = [json!({ "role": "user", "content": "hello" })];
+        assert_eq!(
+            merge_tool_messages(&without, IncomingBlocks::Kept)[0]["content_blocks"],
+            json!([{ "type": "text", "text": "hello" }])
         );
     }
 }
