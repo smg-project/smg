@@ -657,3 +657,449 @@ def test_result_diagnostics_missing_result_key_is_not_a_null_model_reply(tmp_pat
     )
     assert diagnostic["status"] == "unknown"
     assert diagnostic["counts"] is None
+
+
+# Absolute lifecycle budgets are optional controller inputs, not resource admission.
+class FakeLifecycleClock:
+    def __init__(self):
+        self.wall = 1000.0
+        self.now = 100.0
+        self.wall_reads = 0
+
+    def epoch(self):
+        self.wall_reads += 1
+        return self.wall
+
+    def monotonic(self):
+        return self.now
+
+
+@pytest.fixture
+def lifecycle_clock(monkeypatch):
+    clock = FakeLifecycleClock()
+    monkeypatch.setattr(run_ab.time, "time", clock.epoch)
+    monkeypatch.setattr(run_ab.time, "monotonic", clock.monotonic)
+    return clock
+
+
+def lifecycle_args(**overrides):
+    from argparse import Namespace
+
+    return Namespace(out=None, json_out=None, tolerance=0.02, allow_incomplete=True, **overrides)
+
+
+def test_lifecycle_failure_cannot_be_waived_with_complete_scores():
+    arms = [
+        run_ab.Arm(
+            name=name,
+            base_url="unused",
+            scores={"simple_python": 0.9},
+            counts={"simple_python": 4441},
+        )
+        for name in ("direct", "smg")
+    ]
+    arms[1].timed_out.append("absolute_deadline")
+    assert run_ab.write_report_and_gate(*arms, ["simple_python"], lifecycle_args()) == 2
+
+
+def test_lifecycle_legacy_cleanup_has_finite_owned_wait(monkeypatch):
+    calls = []
+
+    class Owned:
+        pid = 987654
+
+        def wait(self, timeout=None):
+            calls.append(timeout)
+            return 0
+
+    monkeypatch.setattr(run_ab.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(run_ab.os, "killpg", lambda pid, sig: None)
+    run_ab._killpg(Owned())
+    assert calls and calls[0] is not None and 0 <= calls[0] <= 5
+
+
+@pytest.mark.parametrize(
+    "work,cleanup",
+    [
+        (None, 1010),
+        (1005, None),
+        (float("nan"), 1010),
+        (1005, float("inf")),
+        (1010, 1005),
+        (1005, 1005),
+        (0, 1),
+        (True, 1010),
+    ],
+)
+def test_lifecycle_epoch_pair_rejects_invalid_data(work, cleanup, lifecycle_clock):
+    with pytest.raises(ValueError):
+        run_ab.LifecycleDeadline.from_epochs(work, cleanup)
+    assert lifecycle_clock.wall_reads == 0
+
+
+def test_lifecycle_shared_anchor_ignores_later_wall_clock_jump(lifecycle_clock):
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    lifecycle_clock.wall = 999999
+    lifecycle_clock.now += 4
+    assert deadline.remaining() == 6
+    assert deadline.cleanup == 115
+    assert lifecycle_clock.wall_reads == 1
+    assert run_ab.LifecycleDeadline.from_epochs(None, None) is None
+
+
+def test_lifecycle_expired_before_spawn_does_not_start_process(monkeypatch, lifecycle_clock):
+    def forbidden(*args, **kwargs):
+        pytest.fail("expired budget launched a process")
+
+    monkeypatch.setattr(run_ab.subprocess, "Popen", forbidden)
+    deadline = run_ab.LifecycleDeadline.from_epochs(999, 1005)
+    with pytest.raises(run_ab.WorkDeadlineExpired):
+        run_ab._run(["bfcl"], {}, "expired", deadline=deadline)
+
+
+@pytest.mark.parametrize("stage_cap,expected", [(0, 7), (20, 7), (2, 2)])
+def test_lifecycle_stage_timeout_uses_remaining_budget(
+    monkeypatch, lifecycle_clock, stage_cap, expected
+):
+    waits = []
+
+    class Owned:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+    monkeypatch.setattr(run_ab.subprocess, "Popen", lambda *a, **kw: Owned())
+    deadline = run_ab.LifecycleDeadline.from_epochs(1007, 1010)
+    assert run_ab._run(["bfcl"], {}, "stage", timeout=stage_cap, deadline=deadline)
+    assert waits == [expected]
+
+
+def test_lifecycle_cleanup_budget_is_absolute_and_owned_group(monkeypatch, lifecycle_clock):
+    calls = []
+
+    class Owned:
+        pid = 123456
+
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            return 0
+
+    def foreign_lookup(pid):
+        pytest.fail("must not resolve a potentially different process group")
+
+    monkeypatch.setattr(run_ab.os, "getpgid", foreign_lookup)
+    monkeypatch.setattr(run_ab.os, "killpg", lambda pid, sig: calls.append(("signal", pid)))
+    lifecycle_clock.now = 112
+    run_ab._killpg(Owned(), 115)
+    assert calls == [("signal", 123456), ("wait", 3)]
+
+
+@pytest.mark.parametrize("failure", ["wait", "permission"])
+def test_lifecycle_cleanup_failure_is_explicit(monkeypatch, lifecycle_clock, failure):
+    class Owned:
+        pid = 123456
+
+        def wait(self, timeout=None):
+            assert timeout is not None
+            raise run_ab.subprocess.TimeoutExpired("owned", timeout)
+
+    def kill(pid, sig):
+        if failure == "permission":
+            raise PermissionError("owned signal denied")
+
+    monkeypatch.setattr(run_ab.os, "killpg", kill)
+    with pytest.raises(run_ab.OwnedCleanupFailed):
+        run_ab._killpg(Owned(), 115)
+
+
+def lifecycle_run(arm, deadline):
+    run_ab.run_bfcl(
+        arm,
+        bfcl="bfcl",
+        model=MODEL,
+        categories=["simple_python"],
+        num_threads=16,
+        temperature=0.001,
+        skip_generate=False,
+        run_timeout=14400,
+        deadline=deadline,
+    )
+
+
+def test_lifecycle_stage_timeout_can_still_evaluate_partial(monkeypatch, tmp_path, lifecycle_clock):
+    calls = []
+
+    def stage(cmd, env, label, timeout=0, deadline=None):
+        calls.append((cmd[1], timeout, deadline))
+        lifecycle_clock.now += 1
+        return cmd[1] != "generate"
+
+    monkeypatch.setattr(run_ab, "_run", stage)
+    arm = run_ab.parse_arm("smg=http://127.0.0.1:30000", tmp_path)
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    lifecycle_run(arm, deadline)
+    assert [x[0] for x in calls] == ["generate", "evaluate"]
+    assert all(x[1:] == (14400, deadline) for x in calls)
+    assert arm.timed_out == ["generate"]
+
+
+def test_lifecycle_aggregate_expiry_prevents_evaluate_and_other_arm(
+    monkeypatch, tmp_path, lifecycle_clock
+):
+    calls = []
+
+    def stage(cmd, env, label, **kwargs):
+        calls.append(cmd[1])
+        lifecycle_clock.now = 111
+        return False
+
+    monkeypatch.setattr(run_ab, "_run", stage)
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    arms = [
+        run_ab.parse_arm(f"{name}=http://127.0.0.1:30000", tmp_path) for name in ("direct", "smg")
+    ]
+    for arm in arms:
+        lifecycle_run(arm, deadline)
+    assert calls == ["generate"]
+    assert all("absolute_deadline" in a.timed_out for a in arms)
+
+
+def test_lifecycle_wait_crossing_work_deadline_remains_incomplete(monkeypatch, lifecycle_clock):
+    calls = []
+
+    class Owned:
+        pid = 123456
+
+        def wait(self, timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                lifecycle_clock.now = 110
+                raise run_ab.subprocess.TimeoutExpired("owned", timeout)
+            return 0
+
+    monkeypatch.setattr(run_ab.subprocess, "Popen", lambda *a, **kw: Owned())
+    monkeypatch.setattr(run_ab.os, "killpg", lambda *a: None)
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    with pytest.raises(run_ab.WorkDeadlineExpired):
+        run_ab._run(["bfcl"], {}, "generate", timeout=14400, deadline=deadline)
+    assert calls == [10, 5]
+
+
+def test_lifecycle_cleanup_failure_survives_save_load_diff(tmp_path):
+    arm = run_ab.Arm(
+        name="smg",
+        base_url="unused",
+        scores={"simple_python": 0.9},
+        counts={"simple_python": 4441},
+        timed_out=["cleanup_failed"],
+    )
+    saved = tmp_path / "scores.json"
+    run_ab.save_scores(arm, saved)
+    loaded = run_ab.load_scores(saved)
+    baseline = run_ab.Arm(name="direct", base_url="unused", scores=arm.scores, counts=arm.counts)
+    assert loaded.timed_out == ["cleanup_failed"]
+    assert run_ab.write_report_and_gate(baseline, loaded, ["simple_python"], lifecycle_args()) == 2
+
+
+def test_lifecycle_main_shares_one_deadline_between_arms(monkeypatch, tmp_path, lifecycle_clock):
+    seen = []
+
+    def score(arm, **kwargs):
+        seen.append(kwargs["deadline"])
+        arm.scores = {"simple_python": 0.9}
+        arm.counts = {"simple_python": 4441}
+
+    monkeypatch.setattr(run_ab, "run_bfcl", score)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ab.py",
+            "--baseline",
+            "a=http://localhost:1",
+            "--candidate",
+            "b=http://localhost:2",
+            "--bfcl-model",
+            MODEL,
+            "--work-deadline-epoch",
+            "1010",
+            "--cleanup-deadline-epoch",
+            "1015",
+        ],
+    )
+    assert run_ab.main() == 0
+    assert len(seen) == 2 and seen[0] is seen[1]
+    assert lifecycle_clock.wall_reads == 1
+
+
+def test_lifecycle_expired_score_arm_is_not_legacy_success(monkeypatch, tmp_path, lifecycle_clock):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ab.py",
+            "--score-arm",
+            "smg=http://localhost:1",
+            "--bfcl-model",
+            MODEL,
+            "--project-root",
+            str(tmp_path / "arm"),
+            "--scores-out",
+            str(tmp_path / "saved.json"),
+            "--work-deadline-epoch",
+            "999",
+            "--cleanup-deadline-epoch",
+            "1005",
+        ],
+    )
+    assert run_ab.main() == 2
+    assert "absolute_deadline" in json.loads((tmp_path / "saved.json").read_text())["timed_out"]
+
+
+def test_lifecycle_cleanup_exception_stops_before_evaluate(monkeypatch, tmp_path, lifecycle_clock):
+    calls = []
+
+    def stage(cmd, *args, **kwargs):
+        calls.append(cmd[1])
+        raise run_ab.OwnedCleanupFailed("unsettled owned child")
+
+    monkeypatch.setattr(run_ab, "_run", stage)
+    arm = run_ab.parse_arm("smg=http://localhost:1", tmp_path)
+    lifecycle_run(arm, run_ab.LifecycleDeadline.from_epochs(1010, 1015))
+    assert calls == ["generate"]
+    assert arm.timed_out == ["cleanup_failed"]
+
+
+def test_lifecycle_late_report_work_cannot_return_success(monkeypatch, lifecycle_clock):
+    original = run_ab.build_report
+
+    def slow_report(*args):
+        value = original(*args)
+        lifecycle_clock.now = 111
+        return value
+
+    monkeypatch.setattr(run_ab, "build_report", slow_report)
+    arms = [
+        run_ab.Arm(
+            name=n,
+            base_url="unused",
+            scores={"simple_python": 0.9},
+            counts={"simple_python": 4441},
+        )
+        for n in ("direct", "smg")
+    ]
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    assert run_ab.write_report_and_gate(*arms, ["simple_python"], lifecycle_args(), deadline) == 2
+    assert all("absolute_deadline" in arm.timed_out for arm in arms)
+
+
+def test_lifecycle_save_crossing_deadline_persists_hard_failure(
+    monkeypatch, tmp_path, lifecycle_clock
+):
+    real_save = run_ab.save_scores
+    seen = []
+
+    def save(arm, path):
+        seen.append(list(arm.timed_out))
+        real_save(arm, path)
+        lifecycle_clock.now = 111
+
+    def score(arm, **kwargs):
+        arm.scores = {"simple_python": 0.9}
+        arm.counts = {"simple_python": 4441}
+
+    monkeypatch.setattr(run_ab, "save_scores", save)
+    monkeypatch.setattr(run_ab, "run_bfcl", score)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ab.py",
+            "--score-arm",
+            "smg=http://localhost:1",
+            "--bfcl-model",
+            MODEL,
+            "--scores-out",
+            str(tmp_path / "saved.json"),
+            "--work-deadline-epoch",
+            "1010",
+            "--cleanup-deadline-epoch",
+            "1015",
+        ],
+    )
+    assert run_ab.main() == 2
+    assert seen == [[], ["absolute_deadline"]]
+    assert run_ab.load_scores(tmp_path / "saved.json").timed_out == ["absolute_deadline"]
+
+
+def test_lifecycle_second_stage_gets_only_remaining_budget(monkeypatch, lifecycle_clock):
+    waits = []
+
+    class Owned:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            lifecycle_clock.now += 4
+            return 0
+
+    monkeypatch.setattr(run_ab.subprocess, "Popen", lambda *a, **kw: Owned())
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    for stage in ("generate", "evaluate"):
+        assert run_ab._run(["bfcl", stage], {}, stage, timeout=14400, deadline=deadline)
+    assert waits == [10, 6]
+
+
+def test_lifecycle_clock_sampling_cannot_extend_cutoff(monkeypatch):
+    order = []
+
+    def monotonic():
+        order.append("monotonic")
+        return 100.0
+
+    def wall():
+        order.append("wall")
+        return 1002.0  # A delay between samples must shorten, never extend.
+
+    monkeypatch.setattr(run_ab.time, "monotonic", monotonic)
+    monkeypatch.setattr(run_ab.time, "time", wall)
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    assert order == ["monotonic", "wall"]
+    assert (deadline.work, deadline.cleanup) == (108.0, 113.0)
+
+
+@pytest.mark.parametrize(
+    "spawn_seconds,stage_cap,outcome,expected_wait",
+    [
+        (3, 0, "complete", 7),
+        (3, 5, "complete", 2),
+        (11, 0, "work_expired", 4),
+        (6, 5, "stage_expired", 9),
+    ],
+)
+def test_lifecycle_popen_latency_consumes_original_budget(
+    monkeypatch, lifecycle_clock, spawn_seconds, stage_cap, outcome, expected_wait
+):
+    waits, signals = [], []
+
+    class Owned:
+        pid = 123456
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+    def spawn(*args, **kwargs):
+        assert kwargs["start_new_session"] is True
+        lifecycle_clock.now += spawn_seconds
+        return Owned()
+
+    monkeypatch.setattr(run_ab.subprocess, "Popen", spawn)
+    monkeypatch.setattr(run_ab.os, "killpg", lambda pid, sig: signals.append(pid))
+    deadline = run_ab.LifecycleDeadline.from_epochs(1010, 1015)
+    if outcome == "work_expired":
+        with pytest.raises(run_ab.WorkDeadlineExpired):
+            run_ab._run(["bfcl"], {}, "spawn", timeout=stage_cap, deadline=deadline)
+    else:
+        result = run_ab._run(["bfcl"], {}, "spawn", timeout=stage_cap, deadline=deadline)
+        assert result is (outcome == "complete")
+    assert waits == [expected_wait]
+    assert signals == ([123456] if outcome.endswith("expired") else [])
