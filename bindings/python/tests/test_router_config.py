@@ -684,3 +684,10 @@ class TestTheRouterRefusesWhatTheCliRefuses:
         jwt = PyJwtConfig("https://issuer.example", "aud", None, {"Gateway.Admin": "administrator"})
         with pytest.raises(ValueError, match="the gateway role must be 'admin' or 'user'"):
             self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    def test_a_role_mapping_from_an_empty_idp_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"": "admin"})
+        with pytest.raises(ValueError, match="the IdP role must not be empty"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()

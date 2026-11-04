@@ -177,8 +177,17 @@ impl PyJwtConfig {
 
         // A gateway role that is neither admin nor user is refused, as the
         // CLI refuses it: mapped to user in silence, the operator who meant
-        // admin is locked out of the admin routes with nothing to read.
+        // admin is locked out of the admin routes with nothing to read. An
+        // empty IdP role is refused with it, as the CLI refuses `=admin`: no
+        // claim ever matches it.
         for (idp_role, gateway_role) in &self.role_mapping {
+            if idp_role.is_empty() {
+                return Err(config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("={gateway_role}"),
+                    "the IdP role must not be empty",
+                ));
+            }
             let role: auth::Role = gateway_role.parse().map_err(|_: String| {
                 config::ConfigError::invalid_value(
                     "role_mapping",
