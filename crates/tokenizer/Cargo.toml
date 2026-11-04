@@ -46,9 +46,6 @@ rayon = "1.12"
 thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
-# The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
-# the same text (a newer crate's tables know marks and compositions the library's do not).
-unicode-normalization-alignments = "0.1"
 # The vLLM Rust frontend's tokenizer backends: the engine of every file they read (see `src/vllm.rs`).
 vllm-tokenizer.workspace = true
 

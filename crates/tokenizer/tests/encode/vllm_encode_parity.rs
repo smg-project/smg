@@ -1,21 +1,26 @@
-//! The native encode path against `tokenizers` on real vocabularies.
+//! The backend against `tokenizers` on real vocabularies.
 //!
-//! Opt-in: `SMG_NATIVE_ENCODE_TOKENIZER_DIRS` lists tokenizer directories
-//! (comma-separated, each with a `tokenizer.json`). For each, the crate's
-//! tokenizer must take the native path and give the same ids as the
-//! `tokenizers` pipeline the crate configures from the same files (the file
-//! with the special-token rule of `tokenizer_config.json`, see
+//! Opt-in: `SMG_VLLM_ENCODE_TOKENIZER_DIRS` lists tokenizer directories
+//! (comma-separated, each with a `tokenizer.json`). For each the backend
+//! takes, the crate's tokenizer must give the same ids as the `tokenizers`
+//! pipeline the crate configures from the same files (the file with the
+//! special-token rule of `tokenizer_config.json`, see
 //! [`HuggingFaceTokenizer::tokenizers_pipeline`]; the file read alone would
 //! show a configured BOS as a difference with special tokens on), over
 //! mixed-script random text, texts with the tokenizer's own special tokens,
-//! and long prompts. Without the variable the test prints a notice and
-//! passes; the in-repo unit tests cover the same comparison on synthetic
-//! vocabularies, and the bellwether fixture test covers recorded prompts.
+//! and long prompts, with and without special tokens. Without the variable
+//! the test prints a notice and passes; the in-repo unit tests cover the
+//! same comparison on synthetic vocabularies, and the bellwether fixture
+//! test covers recorded prompts.
 #![expect(clippy::print_stdout, reason = "the test reports what it compared")]
 
-use llm_tokenizer::{create_tokenizer, traits::Encoding, HuggingFaceTokenizer};
+use llm_tokenizer::{
+    create_tokenizer,
+    traits::{Encoder, Encoding},
+    EncodePath, HuggingFaceTokenizer,
+};
 
-const DIRS_ENV: &str = "SMG_NATIVE_ENCODE_TOKENIZER_DIRS";
+const DIRS_ENV: &str = "SMG_VLLM_ENCODE_TOKENIZER_DIRS";
 
 const POOL: &[char] = &[
     'a',
@@ -165,7 +170,7 @@ fn random_text(state: &mut u64, len: usize, specials: &[String]) -> String {
 }
 
 #[test]
-fn native_encode_matches_tokenizers_on_real_vocabularies() {
+fn the_backend_matches_tokenizers_on_real_vocabularies() {
     let Ok(dirs) = std::env::var(DIRS_ENV) else {
         println!("{DIRS_ENV} is not set: skipping the real-vocabulary comparison");
         return;
@@ -173,59 +178,41 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
     let mut state = 0x6A09_E667_F3BC_C908u64;
     for dir in dirs.split(',').map(str::trim).filter(|d| !d.is_empty()) {
         let ours = create_tokenizer(dir).expect("the crate loads the tokenizer");
-        if !std::path::Path::new(&format!("{dir}/tokenizer.json")).exists() {
-            // A tiktoken vocabulary: the crate has no `tokenizers` pipeline
-            // for it, so there is nothing to compare and no native path.
-            for text in TEXTS {
-                let encoding = ours.encode(text, false).expect("encode");
-                assert!(
-                    !matches!(encoding, Encoding::Plain(_)),
-                    "{dir}: {text:?} took the native path"
-                );
-            }
+        let Some(ours) = ours.as_any().downcast_ref::<HuggingFaceTokenizer>() else {
             println!(
-                "{dir}: no tokenizer.json, the native path does not apply ({} texts checked)",
-                TEXTS.len()
+                "{dir}: no Hugging Face tokenizer (a tiktoken vocabulary), nothing to compare"
             );
             continue;
+        };
+        if ours.encode_path() != EncodePath::Vllm {
+            println!("{dir}: the backend declined the tokenizer, nothing to compare");
+            continue;
         }
-        let reference = ours
-            .as_any()
-            .downcast_ref::<HuggingFaceTokenizer>()
-            .expect("a tokenizer.json loads as the Hugging Face backend")
-            .tokenizers_pipeline();
+        let reference = ours.tokenizers_pipeline();
         let specials: Vec<String> = reference
             .get_added_vocabulary()
             .get_added_tokens_decoder()
             .values()
             .map(|token| token.content.clone())
             .collect();
-        let mut native = 0usize;
         let mut compared = 0usize;
         let mut check = |text: &str| {
-            let encoding = ours.encode(text, false).expect("encode");
-            let expected = reference.encode(text, false).expect("reference encode");
-            assert_eq!(encoding.token_ids(), expected.get_ids(), "{dir}: {text:?}");
-            compared += 1;
-            if matches!(encoding, Encoding::Plain(_)) {
-                native += 1;
-                // A tokenizer on the native path has no post-processor that
-                // adds tokens, so the path serves a request for special
-                // tokens too, with the ids `tokenizers` gives for it.
-                let with = ours.encode(text, true).expect("encode with special tokens");
+            for add_special_tokens in [false, true] {
+                let encoding = ours.encode(text, add_special_tokens).expect("encode");
                 let expected = reference
-                    .encode(text, true)
-                    .expect("reference encode with special tokens");
+                    .encode(text, add_special_tokens)
+                    .expect("reference encode");
                 assert_eq!(
-                    with.token_ids(),
+                    encoding.token_ids(),
                     expected.get_ids(),
-                    "{dir}: {text:?} (special)"
+                    "{dir}: {text:?} (special tokens {add_special_tokens})"
                 );
                 assert!(
-                    matches!(with, Encoding::Plain(_)),
-                    "{dir}: {text:?} with special tokens requested left the native path"
+                    matches!(encoding, Encoding::Plain(_)),
+                    "{dir}: {text:?} (special tokens {add_special_tokens}) left the backend"
                 );
             }
+            compared += 1;
         };
         for text in TEXTS {
             check(text);
@@ -248,18 +235,14 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             })
             .collect();
         check(&long);
-        // A long document without special tokens: the direct encoder cuts it
-        // at stable piece boundaries for the thread pool; the ids must be the
-        // ids of the one piece.
+        // A long document without special tokens: one text the pre-tokenizer
+        // cuts into many pieces, past the size of any pretoken cache.
         let document: String = (0..60)
             .map(|_| random_text(&mut state, 2000, &[]))
             .collect::<Vec<_>>()
             .join(" ");
         check(&document);
-        println!("{dir}: {compared} texts compared, {native} through the native path");
-        assert!(
-            native > compared / 2,
-            "{dir}: the native path handled only {native} of {compared} texts"
-        );
+        println!("{dir}: {compared} texts compared through the backend");
+        assert!(compared > 0, "{dir}: nothing compared");
     }
 }

@@ -26,12 +26,12 @@ fn tokenizer_activity_registers_both_layers_on_scrape() {
 }
 
 #[test]
-fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
+fn encode_path_activity_registers_every_path_on_scrape() {
     let rendered = render_with_recorder(|| {
         init_metrics();
         record_tokenizer_encode_activity();
     });
-    for path in ["vllm", "native", "tokenizers"] {
+    for path in ["vllm", "tokenizers"] {
         assert!(
             rendered.lines().any(|line| {
                 line.starts_with("smg_tokenizer_encode_path_loads_total{")
@@ -40,13 +40,6 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
             "missing path {path}: {rendered}"
         );
     }
-    assert!(
-        rendered.lines().any(|line| {
-            line.starts_with("smg_tokenizer_encode_fallbacks_total{")
-                && line.contains("reason=\"piece_declined\"")
-        }),
-        "missing reason piece_declined: {rendered}"
-    );
 }
 
 #[test]

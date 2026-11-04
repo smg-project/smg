@@ -4020,7 +4020,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "unicode-normalization-alignments",
  "uuid",
  "vllm-tokenizer",
 ]

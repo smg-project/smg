@@ -227,8 +227,7 @@ The gateway exports process-lifetime totals across tokenizer instances on `/metr
 | `smg_tokenizer_cache_lookups_total` | `layer=l0` or `l1`, `result=hit` or `miss` | One outcome per lookup, including L1 misses without special-token boundaries |
 | `smg_tokenizer_cache_evictions_total` | `layer=l0` or `l1` | Entries actually removed for capacity, excluding clear, drop and replacement |
 | `smg_tokenizer_cache_reused_bytes_total` | `layer=l0` or `l1` | UTF-8 input bytes served by hits: whole input for L0, matched prefix for L1 |
-| `smg_tokenizer_encode_path_loads_total` | `path=v1`, `native` or `tokenizers` | Hugging Face tokenizers loaded, by the encode path chosen at load (see `encode_path.rs`); a tokenizer loaded twice counts twice |
-| `smg_tokenizer_encode_fallbacks_total` | `reason=piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
+| `smg_tokenizer_encode_path_loads_total` | `path=vllm` or `tokenizers` | Hugging Face tokenizers loaded, by the encode path chosen at load (see `encode_path.rs`); a tokenizer loaded twice counts twice |
 
 Labels are fixed; no model IDs or prompt text are retained. L0 hits bypass L1,
 so each layer's hit ratio uses its own lookup count. Disabled layers have no
@@ -251,16 +250,14 @@ small prefix hits from reuse of large prompts.
 
 `smg_tokenizer_encode_path_loads_total` says which encoder each loaded
 tokenizer's encodes go through (the load also logs the path once, with the
-reasons the faster paths declined); a non-zero `tokenizers` series names the
-tokenizers neither the backend nor the direct encoder takes.
+reason the backend declined); a non-zero `tokenizers` series names the
+tokenizers the backend does not take.
 The series `vllm` counts the tokenizers the vLLM Rust frontend's backend
 (`vllm-tokenizer`, read from the vLLM repository) serves flat encodes and batch
 decodes for; it takes a checkpoint's `tokenizer.json`
 where the wrapper's pipeline is the file's and `fastokens` reads it, and the
 load logs why it declined the rest (a tokenizer built in memory or from
-`vocab.json`, the Llama class's pipeline, a configured post-processor, settled
-added tokens, a file `fastokens` does not read). A tiktoken tokenizer read from a
+`vocab.json`, the Llama class's pipeline, settled added tokens, a file
+`fastokens` does not read). A tiktoken tokenizer read from a
 file takes the frontend's `riptoken` backend the same way, where the frontend
 reads the file as the wrapper does (the Kimi family's pattern, the ids' end).
-`smg_tokenizer_encode_fallbacks_total` counts the inputs that still left the
-direct encoder afterwards, each encoded a second time by `tokenizers`.

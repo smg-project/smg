@@ -3,24 +3,22 @@
 //!
 //! The BPE model of the `tokenizers` crate remembers the words it merged in
 //! a cache per thread, up to a capacity the model carries; the wrapper sets
-//! that capacity ([`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`], or
-//! none behind the direct encode path). A built tokenizer hands out its
-//! model by shared reference only, so a bound set on one means a copy of
-//! the model (vocabulary, reverse vocabulary and merge table, a few hundred
-//! thousand entries for a large vocabulary) installed in place of the
-//! original. That is how the bound was first applied, and it cost the
-//! decode path: under the system allocator a full decode of a byte-level
-//! vocabulary measured almost twice as slow with the copy as without it,
-//! and an encode on the `tokenizers` path a quarter slower (the gateway's
-//! own allocator hid it). The loaders read a file into a tokenizer whose
-//! model is a [`LateBoundModel`] instead: the file's model as it is, with
-//! the capacity beside it, decided once the encode path is known and
-//! applied as the model moves into the built tokenizer. One model, no copy.
+//! that capacity ([`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`]). A
+//! built tokenizer hands out its model by shared reference only, so a bound
+//! set on one means a copy of the model (vocabulary, reverse vocabulary and
+//! merge table, a few hundred thousand entries for a large vocabulary)
+//! installed in place of the original. That is how the bound was first
+//! applied, and it cost the decode path: under the system allocator a full
+//! decode of a byte-level vocabulary measured almost twice as slow with the
+//! copy as without it, and an encode on the `tokenizers` path a quarter
+//! slower (the gateway's own allocator hid it). The loaders read a file into
+//! a tokenizer whose model is a [`LateBoundModel`] instead: the file's model
+//! as it is, the bound applied as the model moves into the built tokenizer.
+//! One model, no copy.
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -47,58 +45,27 @@ pub(crate) type TokenizerOf<M> =
 /// model moving in with the bound applied.
 pub(crate) type LoadingTokenizer = TokenizerOf<LateBoundModel>;
 
-/// The `tokenizers` model behind a tokenizer's model type, built or loading.
-pub(crate) trait ModelView {
-    fn wrapper(&self) -> &ModelWrapper;
-}
-
-impl ModelView for ModelWrapper {
-    fn wrapper(&self) -> &ModelWrapper {
-        self
-    }
-}
-
 /// A model read from a file, with the words its BPE may cache per thread
-/// decided later: the load reads the tokenizer, chooses its encode path and
-/// sets the bound through a shared reference (the only kind a tokenizer
-/// hands out of its model); the conversion into the built tokenizer applies
-/// it to the model as it moves, in place.
+/// still unbounded: the conversion into the built tokenizer applies the
+/// bound to the model as it moves, in place (a tokenizer hands out its
+/// model by shared reference only).
 pub(crate) struct LateBoundModel {
     model: ModelWrapper,
-    /// Words the BPE model caches per thread once built: the general bound
-    /// until the load decides otherwise.
-    words: AtomicUsize,
-}
-
-impl LateBoundModel {
-    /// Sets the words the BPE model caches per thread once built (other
-    /// model kinds have no such cache).
-    pub(crate) fn bound(&self, words: usize) {
-        self.words.store(words, Ordering::Relaxed);
-    }
-}
-
-impl ModelView for LateBoundModel {
-    fn wrapper(&self) -> &ModelWrapper {
-        &self.model
-    }
 }
 
 impl From<ModelWrapper> for LateBoundModel {
     fn from(model: ModelWrapper) -> Self {
-        Self {
-            model,
-            words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
-        }
+        Self { model }
     }
 }
 
 impl From<LateBoundModel> for ModelWrapper {
-    /// The model moves into the built tokenizer with its bound applied.
+    /// The model moves into the built tokenizer with its bound applied
+    /// (other model kinds have no such cache).
     fn from(late: LateBoundModel) -> Self {
-        let LateBoundModel { mut model, words } = late;
+        let LateBoundModel { mut model } = late;
         if let ModelWrapper::BPE(bpe) = &mut model {
-            bpe.resize_cache(words.into_inner());
+            bpe.resize_cache(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD);
         }
         model
     }
@@ -199,7 +166,6 @@ mod tests {
         let json = built.to_string(false).expect("the tokenizer serializes");
         let loading: LoadingTokenizer =
             serde_json::from_str(&json).expect("the loading tokenizer reads the same file");
-        loading.get_model().bound(2);
         let rebuilt = Tokenizer::from(loading);
         assert_eq!(rebuilt.get_vocab(true), built.get_vocab(true));
         let encode = |tokenizer: &Tokenizer| {

@@ -6,7 +6,7 @@
 //! (comma-separated; each dir what the gateway's `--tokenizer-path` takes,
 //! the recorded revision of the model). Every slug given must be a row of
 //! [`EXPECTED`], the fixture models (the bellwether recorded set) with the
-//! path each takes in either feature state; the test loads each through the
+//! path each takes; the test loads each through the
 //! crate's factory, reads the path and compares. Without the variable the
 //! test prints a notice and passes; the in-repo unit tests cover the choice
 //! on synthetic vocabularies.
@@ -28,8 +28,8 @@ enum Expected {
 
 use Expected::{Hf, Tiktoken};
 
-/// Slug and the path it takes: the backend reads every byte-level BPE file
-/// the direct encoder read, and declines what it declined.
+/// Slug and the path it takes: the backend reads the byte-level BPE files
+/// of the common shape and declines the rest to `tokenizers`.
 const EXPECTED: &[(&str, Expected)] = &[
     ("ai21-jamba2-3b", Hf(EncodePath::Tokenizers)),
     ("apertus-8b-instruct-2509", Hf(EncodePath::Vllm)),

@@ -301,9 +301,8 @@ static POOL: Mutex<Option<(Owner, &'static ThreadPool)>> = Mutex::new(None);
 
 /// The rayon pool for every call that can reach rayon, one per process.
 ///
-/// llm-tokenizer runs rayon work when a native-path tokenizer loads (its
-/// vocabulary seed), when the native encoder meets a text of 64 KiB or more,
-/// and in the `tokenizers` pipeline's batch encode. Started from a thread
+/// llm-tokenizer runs rayon work in the `tokenizers` pipeline's batch encode
+/// and in the cache's batch fan-out. Started from a thread
 /// outside any pool, that work creates rayon's global pool, and a child
 /// forked afterwards (a torch DataLoader or `datasets.map` worker) does not
 /// inherit its threads: the child's next rayon call waits forever. Run here,

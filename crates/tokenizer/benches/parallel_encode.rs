@@ -1,6 +1,4 @@
-//! Wall time of one encode of a long prompt, at the thread count of the
-//! process's pool: `RAYON_NUM_THREADS` sizes the pool the direct encoder
-//! splits a long input over. `PARALLEL_BENCH_TOKENIZERS`
+//! Wall time of one encode of a long prompt. `PARALLEL_BENCH_TOKENIZERS`
 //! = `name=dir,...` (without it the bench says so on one line and exits
 //! without measuring, so a plain `cargo bench` of the crate passes it by),
 //! `PARALLEL_BENCH_TOKENS` = the prompt sizes (default 131072,262144,1048576),
@@ -52,9 +50,8 @@ fn prose(seed: u64, bytes: usize) -> String {
 }
 
 /// Pseudo-words, digits and short CJK runs: a vocabulary wider than a
-/// thread's piece-cache share, no special tokens (the cuts come from the
-/// pre-tokenizer's pieces alone). `PARALLEL_BENCH_CORPUS=prose` selects
-/// [`prose`] instead.
+/// thread's piece cache, no special tokens. `PARALLEL_BENCH_CORPUS=prose`
+/// selects [`prose`] instead.
 fn body(seed: u64, bytes: usize) -> String {
     if std::env::var("PARALLEL_BENCH_CORPUS").is_ok_and(|v| v == "prose") {
         return prose(seed, bytes);
@@ -111,8 +108,6 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    let pool_threads = rayon::current_num_threads();
-    let internal = 1usize;
     for spec in specs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (name, dir) = spec.split_once('=').expect("name=dir");
         let tokenizer = create_tokenizer(dir).expect("tokenizer loads");
@@ -138,7 +133,6 @@ fn main() {
                 "{}",
                 json!({"kind":"row","model":name,"tokens":measured,"bytes":text.len(),
                     "corpus":std::env::var("PARALLEL_BENCH_CORPUS").unwrap_or_else(|_| "varied".into()),
-                    "pool_threads":pool_threads,"internal_threads":internal,
                     "median_ms":samples[samples.len()/2],"min_ms":samples[0],"rounds":rounds,
                     "us_per_token":samples[samples.len()/2]*1e3/measured as f64})
             );

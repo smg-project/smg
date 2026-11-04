@@ -5,7 +5,7 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 use dashmap::DashMap;
 use llm_tokenizer::{
     cache::{cache_activity_stats, CacheActivityStats},
-    decode_activity_stats, encode_fallbacks, encode_path_loads,
+    decode_activity_stats, encode_path_loads,
 };
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
@@ -606,8 +606,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
     describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
-    describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: vllm (the vllm-tokenizer backend), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
-    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: piece_declined (the model declined a piece)");
+    describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: vllm (the vllm-tokenizer backend) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -1371,16 +1370,12 @@ pub(super) fn record_detokenize_activity() {
     }
 }
 
-/// Publish the encode path chosen per tokenizer load and the inputs that left
-/// the direct encoder, process-lifetime totals like the cache activity.
+/// Publish the encode path chosen per tokenizer load, a process-lifetime
+/// total like the cache activity.
 pub(super) fn record_tokenizer_encode_activity() {
     for stats in encode_path_loads() {
         counter!("smg_tokenizer_encode_path_loads_total", "path" => stats.path.as_str())
             .absolute(stats.loads);
-    }
-    for stats in encode_fallbacks() {
-        counter!("smg_tokenizer_encode_fallbacks_total", "reason" => stats.reason)
-            .absolute(stats.encodes);
     }
 }
 

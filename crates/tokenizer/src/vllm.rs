@@ -1,6 +1,6 @@
 //! The `vllm-tokenizer` backends: the vLLM Rust frontend's Hugging Face
 //! tokenizer serves a tokenizer's flat encodes and batch decodes in place of
-//! `tokenizers` and the direct encoders. Model
+//! `tokenizers`. Model
 //! loading and configuration, the vocabulary maps, chat templates, the
 //! renderers with encoders of their own and the streaming step stay in the
 //! wrapper, so there is one source of semantics.
@@ -105,8 +105,8 @@ impl VllmBackend {
         }))
     }
 
-    /// Input by input on the calling thread, as the direct encoders' batches
-    /// run: the gateway fans a batch out over `encode` itself.
+    /// Input by input on the calling thread: the gateway fans a batch out
+    /// over `encode` itself.
     pub(crate) fn encode_batch(
         &self,
         inputs: &[&str],

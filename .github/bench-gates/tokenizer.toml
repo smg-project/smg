@@ -1,7 +1,7 @@
 # Regression gate for `cargo bench -p smg --bench tokenizer_benchmark`,
 # run by .github/workflows/benchmark-tokenizer.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs the single-threaded gateway-path groups: the native encoder (encode_throughput,
+# The gate runs the single-threaded gateway-path groups: the encode path (encode_throughput,
 # latency/encode_*), DecodeStream::step (latency/decode_token, decode_performance/decode_stream),
 # the one-shot decode and Sequence::append_token (decode_performance/direct_decode,
 # sequence_decode) and the stop-sequence decoder (stop_sequences). batch_encode runs on a thread

@@ -1,10 +1,8 @@
 //! A prompt made of long pieces (clauses in a script without word spaces, a
-//! long identifier, a run of digits) was merged again on every encode: the
-//! encoder's piece cache held pieces of up to 64 bytes only, and the model's
-//! own word cache, which used to hold the rest, stays empty behind the direct
-//! path because it outlived the tokenizer. The encoder caches long pieces too
-//! now, within a byte budget, so re-encoding such a prompt merges none of its
-//! pieces again: the second encode allocates the ids and nothing else.
+//! long identifier, a run of digits) is merged on its first encode and read
+//! from the backend's per-thread cache of pretokens after that, whatever
+//! the pieces' length: re-encoding such a prompt merges none of its pieces
+//! again, so the second encode allocates the ids and little else.
 
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 #![expect(
@@ -17,7 +15,7 @@ mod common;
 use std::sync::atomic::Ordering;
 
 use common::counting_alloc::{Counting, ALLOCATED};
-use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
+use llm_tokenizer::{traits::Encoder, EncodePath, HuggingFaceTokenizer};
 use tokenizers::Tokenizer;
 
 #[global_allocator]
@@ -53,12 +51,20 @@ fn prompt() -> String {
 }
 
 #[test]
-fn a_prompt_of_long_pieces_is_encoded_again_without_the_model() {
+fn a_prompt_of_long_pieces_is_encoded_again_without_a_merge() {
     let prompt = prompt();
     let reference = byte_level_bpe()
         .encode(prompt.as_str(), false)
         .expect("the reference encode");
-    let tokenizer = HuggingFaceTokenizer::from_tokenizer(byte_level_bpe());
+    // Written out and read back: the backend takes the file.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    byte_level_bpe()
+        .save(&path, false)
+        .expect("the file is written");
+    let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().expect("a utf-8 path"))
+        .expect("the loader reads the file");
+    assert_eq!(tokenizer.encode_path(), EncodePath::Vllm);
 
     let before = ALLOCATED.load(Ordering::Relaxed);
     let first = tokenizer.encode(&prompt, false).expect("the first encode");

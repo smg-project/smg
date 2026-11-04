@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokenizers::{
     decoders::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
@@ -28,6 +28,7 @@ use tokenizers::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    added_tokens::AddedTokens,
     byte_fallback::PieceTable,
     byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
@@ -40,13 +41,12 @@ use crate::{
         PromptSegment, RendererProfile, TemplateAnswers,
     },
     file::{self, AddedToken as FileAddedToken, TokenizerFile},
-    native::{AddedTokens, NativeEncoder},
     traits::{
         ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
         PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
     vllm::Frame,
-    word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
+    word_cache::{LateBoundModel, LoadingTokenizer, TokenizerOf},
 };
 
 mod deepseek_v31;
@@ -77,8 +77,8 @@ impl Renderer {
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
-    /// The `tokenizers` pipeline and the direct encode path, shared with the
-    /// deferred encode of a prompt rendered by segments.
+    /// The `tokenizers` pipeline, shared with the deferred encode of a
+    /// prompt rendered by segments.
     core: Arc<EncoderCore>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
@@ -110,8 +110,8 @@ pub struct HuggingFaceTokenizer {
     /// byte fallback (see `byte_fallback`): the streaming step's window
     /// decodes read it instead of running the `tokenizers` decode.
     pieces: Option<Arc<PieceTable>>,
-    /// The `vllm-tokenizer` backend, when the choice took it (then
-    /// `v1` and the core's `native` are `None`).
+    /// The `vllm-tokenizer` backend, when it took the file (see
+    /// [`choose_backend`]); `None` keeps every encode in `tokenizers`.
     vllm: Option<crate::vllm::VllmBackend>,
     has_byte_fallback: bool,
     /// The byte each `<0xHH>` token stands for, indexed by id (see
@@ -203,79 +203,22 @@ struct AddedTokenConfig {
     special: bool,
 }
 
-/// The encoders a tokenizer may serve an encode with before `tokenizers`
-/// itself, chosen once per load by [`DirectEncoders::choose`].
-struct DirectEncoders {
-    vllm: Option<crate::vllm::VllmBackend>,
-    native: Option<NativeEncoder>,
-}
-
-impl DirectEncoders {
-    /// The first path, in order of preference, that takes `tokenizer`: the
-    /// `vllm-tokenizer` backend (over the file `vllm` names), the direct
-    /// byte-level encoder, else none and `tokenizers` encodes. The
-    /// choice is logged once, with the reasons the paths before it declined,
-    /// and counted per path ([`encode_path::encode_path_loads`]).
-    fn choose<M: Model + ModelView + Serialize>(
-        tokenizer: &TokenizerOf<M>,
-        vllm: VllmSource<'_>,
-        frame: Option<Frame>,
-    ) -> Self {
-        match crate::vllm::VllmBackend::load(vllm, frame) {
-            Ok(vllm) => {
-                encode_path::note_load(EncodePath::Vllm);
-                tracing::info!(path = %EncodePath::Vllm, "tokenizer encode path");
-                return Self {
-                    vllm: Some(vllm),
-                    native: None,
-                };
-            }
-            Err(declined) => tracing::info!(
-                vllm_declined = %declined,
-                "the vllm-tokenizer backend declined this tokenizer; its encodes take the next path"
-            ),
-        }
-        let (native, path, native_declined) = match NativeEncoder::from_tokenizer(tokenizer) {
-            Ok(native) => (Some(native), EncodePath::Native, None),
-            Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
-        };
-        encode_path::note_load(path);
-        tracing::info!(
-            path = %path,
-            native_declined = native_declined.as_deref(),
-            "tokenizer encode path"
-        );
-        Self { vllm: None, native }
-    }
-
-    /// Words the `tokenizers` model may cache per thread: none behind the
-    /// direct encode path (`native`), whose own piece cache, owned by the
-    /// encoder and freed with it, answers in front of the model for every
-    /// piece of up to 256 bytes (the short ones by count, the long ones, a
-    /// clause in a script without word spaces say, within a byte budget; a
-    /// longer piece is rare and merged on every encode), else
-    /// [`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`]. The model's
-    /// cache outlives the model: it is a thread-local the crate never
-    /// clears, so every thread that encoded with a tokenizer the gateway
-    /// dropped (an unload, a re-registration, a reload) kept the words it
-    /// had cached for it, half a MB per thread per dropped tokenizer. The
-    /// piece cache is owned by the encoder and freed with it.
-    fn bpe_words_cached(&self) -> usize {
-        if self.native.is_some() {
-            0
-        } else {
-            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD
-        }
-    }
-
-    /// Reads the vocabulary into the direct encoder's seed, through the model
-    /// once its word cache is bounded: the words the seed merges then leave
-    /// nothing in the model's per-thread caches.
-    fn seed_native(&mut self, model: &ModelWrapper) {
-        if let Some(native) = &mut self.native {
-            native.seed_vocabulary(model);
-        }
-    }
+/// The `vllm-tokenizer` backend over the file `vllm` names, when it takes
+/// the file, else `None` and `tokenizers` encodes; chosen once per load. The
+/// choice is logged once, with the reason the backend declined, and counted
+/// per path ([`encode_path::encode_path_loads`]).
+fn choose_backend(vllm: VllmSource<'_>, frame: Option<Frame>) -> Option<crate::vllm::VllmBackend> {
+    let (backend, path, declined) = match crate::vllm::VllmBackend::load(vllm, frame) {
+        Ok(backend) => (Some(backend), EncodePath::Vllm, None),
+        Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
+    };
+    encode_path::note_load(path);
+    info!(
+        path = %path,
+        vllm_declined = declined.as_deref(),
+        "tokenizer encode path"
+    );
+    backend
 }
 
 /// What an encode runs on, shared between the wrapper and the deferred
@@ -283,10 +226,6 @@ impl DirectEncoders {
 /// borrow of the wrapper that prepared it).
 struct EncoderCore {
     tokenizer: HfTokenizer,
-    /// The direct encode path for byte-level BPE tokenizers of the common
-    /// shape (see `native`), when [`DirectEncoders::choose`] took it;
-    /// `None` keeps every encode in `tokenizers`.
-    native: Option<NativeEncoder>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
     /// encoder of its own asks; a vocabulary can carry tens of thousands of
@@ -296,8 +235,8 @@ struct EncoderCore {
     /// renderer's control tokens.
     added: OnceLock<Option<AddedTokens>>,
     /// `tokenizer` without its added vocabulary, built on first use: the
-    /// plain segments the direct path declines are encoded by it, every
-    /// spelling in them as text.
+    /// plain segments of a prompt rendered by segments are encoded by it,
+    /// every spelling in them as text.
     plain: OnceLock<HfTokenizer>,
     /// [`Self::plain`] for a plain segment after a control, under a
     /// `Metaspace` pre-tokenizer that prepends the word marker at the start
@@ -307,10 +246,9 @@ struct EncoderCore {
 }
 
 impl EncoderCore {
-    fn new(tokenizer: HfTokenizer, native: Option<NativeEncoder>) -> Self {
+    fn new(tokenizer: HfTokenizer) -> Self {
         Self {
             tokenizer,
-            native,
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
@@ -321,12 +259,12 @@ impl EncoderCore {
     fn added(&self) -> Option<&AddedTokens> {
         self.added
             .get_or_init(|| {
-                let added: Vec<(String, u32)> = self
+                let added: Vec<&str> = self
                     .tokenizer
                     .get_added_vocabulary()
                     .get_vocab()
-                    .iter()
-                    .map(|(content, &id)| (content.clone(), id))
+                    .keys()
+                    .map(String::as_str)
                     .collect();
                 AddedTokens::build(&added).unwrap_or_else(|declined| {
                     debug!(%declined, "no matcher over the added tokens; prompts rendered by segments are encoded by segments");
@@ -387,21 +325,9 @@ impl EncoderCore {
     }
 
     /// Appends the ids of `text` with every spelling in it encoded as text:
-    /// the direct path without its added-token cut, else (an input it
-    /// declines, or no direct path) `tokenizers` without the added
-    /// vocabulary, as the region at the start of the prompt (`at_start`) or
-    /// after a control. The opt-in v1 pipeline has no such mode and is
-    /// passed by.
+    /// `tokenizers` without the added vocabulary, as the region at the start
+    /// of the prompt (`at_start`) or after a control.
     fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
-        if let Some(native) = &self.native {
-            match native.encode_plain(self.tokenizer.get_model(), text) {
-                Ok(plain) => {
-                    ids.extend(plain);
-                    return Ok(());
-                }
-                Err(fallback) => encode_path::note_fallback(fallback),
-            }
-        }
         let encoding = self
             .plain_tokenizer(at_start)
             .encode(text, false)
@@ -450,10 +376,7 @@ impl HuggingFaceTokenizer {
     /// [`EncodePath`]).
     pub fn encode_path(&self) -> EncodePath {
         if self.vllm.is_some() {
-            return EncodePath::Vllm;
-        }
-        if self.core.native.is_some() {
-            EncodePath::Native
+            EncodePath::Vllm
         } else {
             EncodePath::Tokenizers
         }
@@ -732,10 +655,9 @@ impl HuggingFaceTokenizer {
     ) -> Result<Self> {
         // The file's `truncation` and `padding` blocks are the defaults the
         // engine's tokenizer keeps for a call that asks to truncate or pad; a
-        // plain encode runs with both off (the rule is on `from_file`).
-        // Cleared before the encode path is chosen, so the direct encoders
-        // decline nothing for a block that no longer applies. `None` passes
-        // the stride check `with_truncation` runs on a block.
+        // plain encode runs with both off (the rule is on `from_file`), as
+        // the backend's does: it reads the file's model and stages alone.
+        // `None` passes the stride check `with_truncation` runs on a block.
         tokenizer.with_truncation(None).map_err(|error| {
             Error::msg(format!(
                 "Failed to load tokenizer: the truncation block did not clear: {error}"
@@ -908,18 +830,16 @@ impl HuggingFaceTokenizer {
         } else {
             Ok(tokenizer_path)
         };
-        let mut encoders = DirectEncoders::choose(&tokenizer, vllm_source, configured_frame);
-        // The bound rides on the file's model into the built tokenizer: no
-        // copy of the model (see `word_cache`).
-        tokenizer.get_model().bound(encoders.bpe_words_cached());
+        let vllm = choose_backend(vllm_source, configured_frame);
+        // The file's model moves into the built tokenizer with its word cache
+        // bounded, no copy of the model (see `word_cache`).
         let tokenizer = HfTokenizer::from(tokenizer);
-        encoders.seed_native(tokenizer.get_model());
         // The backend took the file, so the file describes the pipeline: the
         // added tokens, the decoder's shape and the tables come from it and
         // the vocabulary. A file the load changed beyond itself, or none,
         // leaves them to the pipeline.
         let (added_tokens, has_byte_fallback, byte_level, pieces) =
-            match file.filter(|_| encoders.vllm.is_some()) {
+            match file.filter(|_| vllm.is_some()) {
                 Some(file) => {
                     let special: HashSet<&str> = file
                         .added_tokens
@@ -971,8 +891,8 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
-            vllm: encoders.vllm,
-            core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
+            vllm,
+            core: Arc::new(EncoderCore::new(tokenizer)),
             special_tokens,
             vocab,
             reverse_vocab,
@@ -1187,8 +1107,10 @@ impl HuggingFaceTokenizer {
             .ok()
     }
 
-    /// Words the `tokenizers` BPE model keeps in its per-thread cache when
-    /// every encode runs in `tokenizers`. The crate's default is 10,000 for
+    /// Words the `tokenizers` BPE model keeps in its per-thread cache (the
+    /// pipeline encodes what the backend does not: a file the backend
+    /// declined, the plain regions of a prompt rendered by segments). The
+    /// crate's default is 10,000 for
     /// every thread that ever encodes, and the gateway encodes on each of its
     /// runtime and blocking threads, so the caches of one model grew with the
     /// thread count (a few MB per thread) instead of settling. The cache
@@ -1198,7 +1120,7 @@ impl HuggingFaceTokenizer {
     pub(crate) const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
     /// Sizes the per-thread word cache of a built tokenizer's BPE model to
-    /// `words` ([`DirectEncoders::bpe_words_cached`]); other model kinds have
+    /// `words` ([`Self::BPE_WORDS_CACHED_PER_THREAD`]); other model kinds have
     /// none. A built tokenizer hands out its model by shared reference only,
     /// so this installs a copy of the model with the bound: the price of a
     /// tokenizer handed over built ([`Self::from_tokenizer`]). The loaders
@@ -1220,15 +1142,13 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        let mut encoders = DirectEncoders::choose(
-            &tokenizer,
+        let vllm = choose_backend(
             Err(Declined::from(
                 "the tokenizer was built in memory, with no tokenizer.json to read",
             )),
             None,
         );
-        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
-        encoders.seed_native(tokenizer.get_model());
+        Self::bound_bpe_cache(&mut tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
         let special_tokens = Self::extract_special_tokens(
             pipeline_special_tokens(&tokenizer),
             &ConfigTokens::default(),
@@ -1245,8 +1165,8 @@ impl HuggingFaceTokenizer {
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
-            vllm: encoders.vllm,
-            core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
+            vllm,
+            core: Arc::new(EncoderCore::new(tokenizer)),
             special_tokens,
             vocab,
             reverse_vocab,
@@ -1627,15 +1547,6 @@ impl Encoder for HuggingFaceTokenizer {
         if let Some(vllm) = &self.vllm {
             return vllm.encode(input, add_special_tokens);
         }
-        // The direct path frames the ids itself on a request for special
-        // tokens (what the post-processor it read at load adds). An input it
-        // gives up is counted and encoded by `tokenizers`.
-        if let Some(native) = &self.core.native {
-            match native.encode(self.core.tokenizer.get_model(), input, add_special_tokens) {
-                Ok(ids) => return Ok(Encoding::Plain(ids)),
-                Err(fallback) => encode_path::note_fallback(fallback),
-            }
-        }
         self.core
             .tokenizer
             .encode(input, add_special_tokens)
@@ -1646,19 +1557,6 @@ impl Encoder for HuggingFaceTokenizer {
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
         if let Some(vllm) = &self.vllm {
             return vllm.encode_batch(inputs, add_special_tokens);
-        }
-        // A batch takes the path a single input takes: the direct encoder when
-        // the vocabulary has one (an input it declines goes through the
-        // `tokenizers` path on its own), so a batch never runs on the model
-        // whose word cache the direct encoder replaced. The loop is serial on
-        // the calling thread (the `tokenizers` batch fanned out with rayon):
-        // the gateway reaches a batch through `CachedTokenizer::encode_batch`,
-        // which fans out over `encode` itself.
-        if self.core.native.is_some() {
-            return inputs
-                .iter()
-                .map(|input| self.encode(input, add_special_tokens))
-                .collect();
         }
         self.core
             .tokenizer

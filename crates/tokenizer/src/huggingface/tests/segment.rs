@@ -375,11 +375,11 @@ fn segment_ids(tok: &HuggingFaceTokenizer, messages: &[Value]) -> Vec<u32> {
         .expect("the segment encode")
 }
 
-/// The small vocabulary, built in memory, takes the direct encode path, so
-/// the tests below exercise its plain encode.
+/// The small vocabulary, built in memory, has no file for the backend to
+/// read, so the tests below exercise the segment encode on `tokenizers`.
 #[test]
-fn the_small_vocabulary_takes_the_direct_path() {
-    assert_eq!(v41_like(&ADDED).encode_path(), EncodePath::Native);
+fn the_small_vocabulary_built_in_memory_encodes_in_tokenizers() {
+    assert_eq!(v41_like(&ADDED).encode_path(), EncodePath::Tokenizers);
 }
 
 #[test]

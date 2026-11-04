@@ -1,18 +1,14 @@
 //! Which encoder serves a Hugging Face tokenizer's encodes.
 //!
-//! The choice is made once per load, in order of preference: the
-//! `vllm-tokenizer` backend, the crate's direct byte-level encoder
-//! (`native`), and `tokenizers` 0.23 itself. Each of the first two takes
-//! the tokenizers whose configuration it reproduces and declines the rest
-//! with a reason (`Declined`); the load logs the path it ended on and those
-//! reasons, once. After the choice an input can still
-//! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
-//! work done up to that point.
+//! The choice is made once per load: the `vllm-tokenizer` backend takes the
+//! tokenizers whose `tokenizer.json` it reads as the wrapper's pipeline
+//! reads it, and declines the rest with a reason (`Declined`), which
+//! `tokenizers` 0.23 itself encodes. The load logs the path it ended on
+//! and the reason, once.
 //!
 //! The process-lifetime totals here have the shape of `cache::activity`:
 //! fixed-size snapshots, no locks, never reset, read through
-//! [`encode_path_loads`] and [`encode_fallbacks`] whether or not a metrics
-//! recorder exists.
+//! [`encode_path_loads`] whether or not a metrics recorder exists.
 
 use std::{
     borrow::Cow,
@@ -26,21 +22,18 @@ use std::{
 pub enum EncodePath {
     /// The `vllm-tokenizer` backend, the vLLM Rust frontend's.
     Vllm,
-    /// The crate's direct byte-level encoder.
-    Native,
     /// `tokenizers` 0.23, the reference implementation.
     Tokenizers,
 }
 
 impl EncodePath {
     /// Every path, in order of preference.
-    pub const ALL: [Self; 3] = [Self::Vllm, Self::Native, Self::Tokenizers];
+    pub const ALL: [Self; 2] = [Self::Vllm, Self::Tokenizers];
 
     /// The path's name as the metrics and the log write it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Vllm => "vllm",
-            Self::Native => "native",
             Self::Tokenizers => "tokenizers",
         }
     }
@@ -48,8 +41,7 @@ impl EncodePath {
     fn index(self) -> usize {
         match self {
             Self::Vllm => 0,
-            Self::Native => 1,
-            Self::Tokenizers => 2,
+            Self::Tokenizers => 1,
         }
     }
 }
@@ -60,8 +52,9 @@ impl fmt::Display for EncodePath {
     }
 }
 
-/// Why a path did not take a tokenizer at load: the configuration it found
-/// outside what it reproduces, in the words the load's log line carries.
+/// Why the backend did not take a tokenizer at load: the configuration it
+/// found outside what it reproduces, in the words the load's log line
+/// carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Declined(Cow<'static, str>);
 
@@ -88,42 +81,11 @@ impl fmt::Display for Declined {
 /// else why the backend declines (see `vllm`).
 pub(crate) type VllmSource<'a> = Result<&'a Path, Declined>;
 
-/// Why one input left the direct encoder for `tokenizers` after the load's
-/// choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fallback {
-    /// The model declined a piece (a vocabulary whose `unk_token` is not in
-    /// it, in `tokenizers` 0.23); found after the pieces before it were
-    /// tokenized, so that the error surfaces from the `tokenizers` encode.
-    PieceDeclined,
-}
-
-impl Fallback {
-    /// The reason's name as the metrics write it.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::PieceDeclined => "piece_declined",
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::PieceDeclined => 0,
-        }
-    }
-}
-
-static LOADS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static FALLBACKS: [AtomicU64; 1] = [AtomicU64::new(0)];
+static LOADS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Count one load that ended on `path`.
 pub(crate) fn note_load(path: EncodePath) {
     LOADS[path.index()].fetch_add(1, Ordering::Relaxed);
-}
-
-/// Count one input that left the direct encoder.
-pub(crate) fn note_fallback(fallback: Fallback) {
-    FALLBACKS[fallback.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Cumulative loads of one path across all tokenizer instances.
@@ -135,29 +97,10 @@ pub struct EncodePathLoads {
     pub loads: u64,
 }
 
-/// Cumulative inputs that left the direct encoder for one reason across all
-/// tokenizer instances.
-#[derive(Debug, Clone, Copy)]
-pub struct EncodeFallbacks {
-    /// `piece_declined`, see `Fallback`.
-    pub reason: &'static str,
-    /// Inputs encoded by `tokenizers` after the direct encoder gave them
-    /// up; one per input, a batch counting each of its inputs.
-    pub encodes: u64,
-}
-
 /// Read process-lifetime totals, including activity before a metrics recorder exists.
-pub fn encode_path_loads() -> [EncodePathLoads; 3] {
+pub fn encode_path_loads() -> [EncodePathLoads; 2] {
     EncodePath::ALL.map(|path| EncodePathLoads {
         path,
         loads: LOADS[path.index()].load(Ordering::Relaxed),
-    })
-}
-
-/// Read process-lifetime totals, including activity before a metrics recorder exists.
-pub fn encode_fallbacks() -> [EncodeFallbacks; 1] {
-    [Fallback::PieceDeclined].map(|fallback| EncodeFallbacks {
-        reason: fallback.as_str(),
-        encodes: FALLBACKS[fallback.index()].load(Ordering::Relaxed),
     })
 }

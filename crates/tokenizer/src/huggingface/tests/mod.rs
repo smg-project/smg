@@ -31,8 +31,8 @@ const MIN_TOKENIZER_JSON: &str = r#"{
     }
 }"#;
 
-/// A byte-level BPE of the shape the direct encode path takes: two
-/// letters, the space mark and the merges that join it to a letter.
+/// A byte-level BPE of the shape the backend takes: two letters, the
+/// space mark and the merges that join it to a letter.
 const BYTE_LEVEL_TOKENIZER_JSON: &str = r#"{
     "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
     "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
@@ -44,8 +44,8 @@ const BYTE_LEVEL_TOKENIZER_JSON: &str = r#"{
         "merges": [["Ġ", "a"], ["Ġ", "b"]]}
 }"#;
 
-/// A word-level vocabulary: no direct encode path takes it, so its
-/// encodes run in `tokenizers`.
+/// A word-level vocabulary: the backend does not take it, so its encodes
+/// run in `tokenizers`.
 const WORD_LEVEL_TOKENIZER_JSON: &str = r#"{
     "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
     "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
@@ -660,9 +660,8 @@ fn tokenizer_without_response_template_reports_none() {
 /// `tokenizer.json`'s `truncation` and `padding` blocks are the defaults
 /// the engine's tokenizer keeps for a call that asks; a plain encode runs
 /// with both off. The loader clears them: a prompt longer than
-/// `max_length` encodes whole on the direct path and on the `tokenizers`
-/// path alike, and the direct path takes a file whose only obstacle was
-/// the block.
+/// `max_length` encodes whole on the backend and on the `tokenizers` path
+/// alike, and the backend takes a file whose only obstacle was the block.
 #[test]
 fn the_files_truncation_and_padding_blocks_do_not_apply_to_an_encode() {
     let twelve_words = "a b a b a b a b a b a b";
@@ -676,7 +675,7 @@ fn the_files_truncation_and_padding_blocks_do_not_apply_to_an_encode() {
         "pad_id": 1, "pad_type_id": 0, "pad_token": "b"
     });
     for (block, params) in [("truncation", &truncation), ("padding", &padding)] {
-        for (file, expected, direct) in [
+        for (file, expected, backend) in [
             (BYTE_LEVEL_TOKENIZER_JSON, &byte_level_ids[..], true),
             (WORD_LEVEL_TOKENIZER_JSON, &word_level_ids[..], false),
         ] {
@@ -689,15 +688,15 @@ fn the_files_truncation_and_padding_blocks_do_not_apply_to_an_encode() {
             let tokenizer =
                 HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
             assert_eq!(
-                tokenizer.encode_path() == EncodePath::Tokenizers,
-                !direct,
+                tokenizer.encode_path() == EncodePath::Vllm,
+                backend,
                 "a {block} block: the encode path"
             );
             let ids = tokenizer.encode(twelve_words, false).unwrap();
             assert_eq!(
                 ids.token_ids(),
                 expected,
-                "a {block} block, direct path {direct}"
+                "a {block} block, backend {backend}"
             );
         }
     }

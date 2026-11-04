@@ -3,7 +3,7 @@
 //! (`repeat`: every piece it holds was seen once already) and a document of N
 //! tokens no pass has seen, after documents of the same size (`fresh`). The
 //! corpus is cache-hostile by default: pseudo-words from a vocabulary wider
-//! than a thread's piece-cache share, digits and short CJK runs, no special
+//! than a thread's piece cache, digits and short CJK runs, no special
 //! tokens; `VOLUME_BENCH_CORPUS=prose` uses repeated paragraphs instead.
 //!
 //! `VOLUME_BENCH_TOKENIZERS=name=dir,...` selects the tokenizers (without it
