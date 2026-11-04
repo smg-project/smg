@@ -35,6 +35,11 @@ use crate::common;
 
 const MODEL: &str = "responses-route-series-model";
 const UNSERVED_MODEL: &str = "responses-route-series-nobody-serves";
+const ALIASED_MODEL: &str = "responses-route-series-aliased-model";
+const ALIAS: &str = "responses-route-series-alias";
+const REFUSING_MODEL: &str = "responses-route-series-refusing-model";
+const TOOL_CALL: &str =
+    "<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>\n";
 const ROUTE_LABELS: [&str; 4] = [
     "router_type=\"grpc\"",
     "backend_type=\"regular\"",
@@ -55,17 +60,21 @@ fn series(rendered: &str, family: &str, labels: &[&str]) -> Option<f64> {
         .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
 }
 
-/// A gRPC router in front of a scripted worker whose every answer is one MCP
-/// tool call, under a tokenizer that decodes it as such.
+/// A gRPC router in front of a scripted worker serving `card`, whose every
+/// answer is one MCP tool call under the generations' `finish_reasons`
+/// (`"unavailable"` in a generation's place refuses it), under a tokenizer
+/// that decodes the answer as such.
 async fn router_with_tool_calling_worker(
-    output: &str,
+    card: ModelCard,
+    finish_reasons: Vec<&'static str>,
 ) -> (Box<dyn RouterTrait>, tokio::task::JoinHandle<()>) {
+    let model = card.id.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(
         scripted_worker::ScriptedWorker {
             output_tokens: 2,
-            finish_reasons: vec!["stop"],
+            finish_reasons,
             generation: Default::default(),
             requests: Default::default(),
         }
@@ -76,7 +85,7 @@ async fn router_with_tool_calling_worker(
             .worker_type(WorkerType::Regular)
             .connection_mode(ConnectionMode::Grpc)
             .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
+            .model(card)
             .health_config(HealthCheckConfig {
                 disable_health_check: true,
                 ..Default::default()
@@ -97,11 +106,11 @@ async fn router_with_tool_calling_worker(
     config.tool_call_parser = Some("qwen".into());
     let tokenizers = Arc::new(TokenizerRegistry::new());
     let tokenizer: Arc<dyn Tokenizer> =
-        Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+        Arc::new(scripted_tokenizer::ScriptedTokenizer::new(TOOL_CALL));
     tokenizers
         .load(
             "tokenizer-id",
-            MODEL,
+            &model,
             "test",
             || async move { Ok(tokenizer) },
         )
@@ -157,10 +166,8 @@ async fn a_responses_turn_counts_once_at_the_route_whatever_its_tool_loop_ran() 
         "type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
         "require_approval": "never"
     }]);
-    let (router, server) = router_with_tool_calling_worker(
-        "<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>\n",
-    )
-    .await;
+    let (router, server) =
+        router_with_tool_calling_worker(ModelCard::new(MODEL), vec!["stop"]).await;
     let model = format!("model=\"{MODEL}\"");
 
     for (stream, turns) in [(false, 1.0), (true, 2.0)] {
@@ -231,6 +238,88 @@ async fn a_responses_turn_counts_once_at_the_route_whatever_its_tool_loop_ran() 
         ),
         Some(1.0),
         "the refusal counts once under its class and reason: {rendered}"
+    );
+
+    mcp.stop().await;
+    server.abort();
+}
+
+/// A request under a served alias counts under the served id, the label the
+/// run's own samples carry, so the request and whatever its run records sit
+/// on one series.
+#[tokio::test]
+async fn a_request_under_an_alias_counts_under_the_served_id() {
+    let handle = crate::metrics::recorder();
+    let (router, server) = router_with_tool_calling_worker(
+        ModelCard::new(ALIASED_MODEL).with_alias(ALIAS),
+        vec!["stop"],
+    )
+    .await;
+
+    let (status, object) = responses_turn(router.as_ref(), ALIAS, false, json!([])).await;
+    assert_eq!(status, StatusCode::OK, "{object}");
+    let rendered = handle.render();
+    assert_eq!(
+        series(
+            &rendered,
+            "smg_router_requests_total",
+            &[&format!("model=\"{ALIASED_MODEL}\""), "streaming=\"false\""]
+        ),
+        Some(1.0),
+        "the request counts under the served id: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!("model=\"{ALIAS}\"")),
+        "nothing counts under the alias: {rendered}"
+    );
+
+    server.abort();
+}
+
+/// A tool loop whose later iteration the worker refuses fails inside the
+/// answered stream, where the route's own answer cannot count it: the turn
+/// counts once as a request and once as an error under the route, and not
+/// under the iterations' chat endpoint.
+#[tokio::test]
+async fn a_later_iteration_refused_inside_the_stream_counts_one_error_under_the_route() {
+    let handle = crate::metrics::recorder();
+    let mut mcp = MockMCPServer::start().await.unwrap();
+    let tools = json!([{
+        "type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
+        "require_approval": "never"
+    }]);
+    let (router, server) = router_with_tool_calling_worker(
+        ModelCard::new(REFUSING_MODEL),
+        vec!["stop", "unavailable"],
+    )
+    .await;
+    let model = format!("model=\"{REFUSING_MODEL}\"");
+
+    // The first generation's tool call runs; the second generation is refused.
+    let (status, _) = responses_turn(router.as_ref(), REFUSING_MODEL, true, tools).await;
+    assert_eq!(status, StatusCode::OK, "the stream's head is answered");
+    let rendered = handle.render();
+    assert_eq!(
+        series(
+            &rendered,
+            "smg_router_requests_total",
+            &[&model, "streaming=\"true\""]
+        ),
+        Some(1.0),
+        "one request for the turn: {rendered}"
+    );
+    assert_eq!(
+        series(&rendered, "smg_router_request_errors_total", &[&model]),
+        Some(1.0),
+        "the refused iteration counts once under the route: {rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|line| {
+            line.starts_with("smg_router_request_errors_total{")
+                && line.contains(&model)
+                && line.contains("endpoint=\"chat\"")
+        }),
+        "the iteration's failure counts under no endpoint of its own: {rendered}"
     );
 
     mcp.stop().await;

@@ -1190,16 +1190,21 @@ impl RouterTrait for GrpcRouter {
         // counts under its class and reason instead.
         const ENDPOINT: &str = metrics_labels::ENDPOINT_RESPONSES;
         let start = Instant::now();
+        // The request's label is the served id, as the run's own samples
+        // name it (the pipeline canonicalizes an alias before it records):
+        // one series for the request and for whatever its run counts.
+        let served = self.worker_registry.resolve_model_alias(model_id);
+        let model_label = served.as_deref().unwrap_or(model_id);
         self.pipeline
-            .record_request(ENDPOINT, model_id, body.stream.unwrap_or(false));
+            .record_request(ENDPOINT, model_label, body.stream.unwrap_or(false));
         let response = self
             .route_responses_impl(headers, tenant_meta, body, model_id)
             .await;
         if response.status().is_success() {
-            self.pipeline.record_duration(ENDPOINT, model_id, start);
+            self.pipeline.record_duration(ENDPOINT, model_label, start);
         } else {
             self.pipeline
-                .record_error(Some(ENDPOINT), model_id, &response);
+                .record_error(Some(ENDPOINT), model_label, &response);
         }
         response
     }

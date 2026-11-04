@@ -987,7 +987,8 @@ async fn execute_tool_loop_streaming_internal(
                 // The route has answered by the time a run here can fail
                 // (the first iteration's barrier opens before its answer
                 // is read; the later ones run inside the stream), so a
-                // fault is counted here, with the request the route counted.
+                // fault, or a later iteration's failed run, is counted
+                // here, with the request the route counted.
                 Some(metrics_labels::ENDPOINT_RESPONSES),
             )
             .await;

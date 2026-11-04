@@ -1163,7 +1163,8 @@ impl RequestPipeline {
     /// [`Self::execute_chat_for_responses`] runs a collected iteration, so
     /// the turn counts once at the Responses route and not once per
     /// iteration under `chat`. `fault_endpoint` is where an internal fault
-    /// of the run (the wrong answer shape, or none) is counted: the route's
+    /// of the run (the wrong answer shape, or none) is counted, and a failed
+    /// run when no startup barrier hands its failure back: the route's
     /// endpoint when the route has answered already, so that nothing else
     /// would count it; `None` when the failure goes back through the route,
     /// which counts it. Tool-loop iterations are not retried.
@@ -1196,8 +1197,9 @@ impl RequestPipeline {
 
     /// The chat pipeline under `metrics_endpoint` (`None` for a Responses
     /// iteration, whose route records the request); `fault_endpoint` is
-    /// where an internal fault of a run under no metrics endpoint is
-    /// counted, if anywhere (see [`Self::execute_chat_for_responses_streaming`]).
+    /// where an internal fault of a run under no metrics endpoint, or the
+    /// failure no startup barrier hands back, is counted, if anywhere (see
+    /// [`Self::execute_chat_for_responses_streaming`]).
     #[expect(clippy::too_many_arguments)]
     async fn execute_chat_under(
         &self,
@@ -1214,8 +1216,14 @@ impl RequestPipeline {
     ) -> Response {
         // A run that answered with the wrong shape, or none, is an internal
         // fault, counted under the request's endpoint, or where the caller
-        // of a run under no endpoint says.
+        // of a run under no endpoint says. A run under no endpoint whose
+        // failure no startup barrier hands back fails inside an answered
+        // stream, so its failure counts there too, as a run under an
+        // endpoint counts its own.
         let fault_endpoint = metrics_endpoint.or(fault_endpoint);
+        let unseen_failure_label =
+            (metrics_endpoint.is_none() && fault_endpoint.is_some() && stream_start.is_none())
+                .then(|| model_id.clone());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
@@ -1247,7 +1255,12 @@ impl RequestPipeline {
                 ),
                 None => self.no_response_produced("execute_chat", &dctx.model_id, fault_endpoint),
             },
-            Err(response) => response,
+            Err(response) => {
+                if let (Some(model), Some(endpoint)) = (unseen_failure_label, fault_endpoint) {
+                    self.record_error(Some(endpoint), &model, &response);
+                }
+                response
+            }
         }
     }
 
