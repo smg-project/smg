@@ -1003,14 +1003,38 @@ async fn collect_http_body_with_limit(
     }
 
     // A declared length is within the cap (checked above), so the body fits
-    // one allocation; without it the buffer grows as chunks arrive.
-    let mut body = match response.content_length() {
-        Some(length) => BytesMut::with_capacity(length as usize),
-        None => BytesMut::new(),
+    // one allocation the chunks are copied into as they arrive. Without one
+    // the chunks are kept as they came and joined once the last has arrived,
+    // into a buffer of the body's exact size: a body of a few megabytes is
+    // copied once, not once per doubling of a buffer that grew from the
+    // first chunk.
+    let Some(length) = response.content_length() else {
+        return collect_unsized_http_body(response, limit, media).await;
     };
+    let mut body = BytesMut::with_capacity(length as usize);
     while let Some(chunk) = response.chunk().await? {
         checked_payload_length(body.len(), chunk.len(), limit, media)?;
         body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+/// The body of a response that declares no length: its chunks as they
+/// arrive, held to `limit` as they add up, joined once at the end.
+async fn collect_unsized_http_body(
+    mut response: reqwest::Response,
+    limit: usize,
+    media: &'static str,
+) -> Result<Bytes, MediaConnectorError> {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut total = 0;
+    while let Some(chunk) = response.chunk().await? {
+        total = checked_payload_length(total, chunk.len(), limit, media)?;
+        chunks.push(chunk);
+    }
+    let mut body = BytesMut::with_capacity(total);
+    for chunk in &chunks {
+        body.extend_from_slice(chunk);
     }
     Ok(body.freeze())
 }
