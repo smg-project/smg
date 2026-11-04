@@ -38,13 +38,13 @@ LIST_MARKER = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
 # The spellings of a release note that declares none, one set read in two places: the renderer drops the section
 # on it, the check reports a candidate line that still reads as one. Accepted: none, n/a, nothing, no release note,
 # no (user-visible | user-facing | visible | behaviour | functional) change(s), not user-visible, internal (only);
-# alone, or followed by a reason after a separator (: ; , . ( ) or a dash of any width) or a word that opens one
-# (because, as, since). A sentence that goes on in its own words ("None of the defaults change", "Nothing breaks
-# when") is a release note.
+# alone, or followed by a reason after a separator (: ; , . ( ) or a dash of any width) or "because". A sentence
+# that goes on in its own words ("None of the defaults change", "Nothing breaks when", "No change as long as") is a
+# release note; one that reads as none still declares for Upgrade notes through its text (Pull.take).
 NONE_NOTE = re.compile(
     r"^\W*(none|n/?a|nothing|no release note|no (user[- ](?:visible|facing) |visible |behaviour |behavior "
     r"|functional )?changes?|not user[- ](?:visible|facing)|internal( only)?)\b"
-    r"\s*(?:(?:[:;,.)(\-\u2013\u2014]|because\b|as\b|since\b).*)?$",
+    r"\s*(?:(?:[:;,.)(\-\u2013\u2014]|because\b).*)?$",
     re.IGNORECASE,
 )
 NONE_LINE = re.compile(
@@ -192,6 +192,7 @@ class Pull:
     read: bool = False  # the body was read (a pull request the repository has)
     body: str = ""
     section: bool = False  # the body has a release-note section, with a sentence or left empty
+    text: str | None = None  # the section's sentence as written, kept when it reads as none
     # the release-note sentence; "" when the section declares none; None without a section
     note: str | None = None
     kinds: list[str] = field(default_factory=list)
@@ -226,9 +227,17 @@ class Pull:
         """Whether the pull request is a candidate line: a subject with an area, no note declaring none."""
         return self.area is not None and self.note != ""
 
+    def take(self, body: str) -> None:
+        """The body as read: its release-note section, the sentence as written, and the note it is ("" when
+        the sentence reads as none; what such a sentence goes on to declare still reaches Upgrade notes)."""
+        self.body = body
+        self.section, self.text = section_text(body)
+        self.note = "" if self.text is not None and NONE_NOTE.match(self.text) else self.text
+
     def declarations(self) -> str:
-        """The text read for Upgrade notes: the subject, the sentence, the declaring sections, the footers."""
-        parts = [self.subject, self.note or ""]
+        """The text read for Upgrade notes: the subject, the sentence as written, the declaring sections, the
+        footers."""
+        parts = [self.subject, self.text or ""]
         declaring = False
         for line in without_comments(self.body).split("\n"):
             heading = HEADING.match(line)
@@ -264,7 +273,7 @@ class Pull:
 
     @property
     def upgrade_line(self) -> str:
-        text = f"{self.note} (#{self.number})" if self.note else self.subject
+        text = f"{self.text} (#{self.number})" if self.text else self.subject
         return f"- {text} <!-- AUTHOR: declared: {', '.join(self.kinds)}; keep it here, move it or drop it -->"
 
     def upgrade_slot(self) -> str:
@@ -289,9 +298,9 @@ class Pull:
 # --- the pull request bodies ------------------------------------------------------------------------
 
 
-def note_section(body: str) -> tuple[bool, str | None]:
-    """Whether the body has a release-note section, and its sentence: None when the section is absent or was left
-    empty (nothing, or a template's placeholder comment alone), "" when it declares none.
+def section_text(body: str) -> tuple[bool, str | None]:
+    """Whether the body has a release-note section, and its sentence as written: None when the section is absent
+    or was left empty (nothing, or a template's placeholder comment alone).
 
     The section is a heading (any level) that starts with "Release note", read until the next heading, or a
     "Release note:" line, read until the blank line after it; list markers go, the lines join into one. Comments
@@ -328,11 +337,16 @@ def note_section(body: str) -> tuple[bool, str | None]:
     text = re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()
     if not text:
         return True, None
-    if NONE_NOTE.match(text):
-        return True, ""
     return True, outside_code(
         text, lambda part: part.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
     )
+
+
+def note_section(body: str) -> tuple[bool, str | None]:
+    """Whether the body has a release-note section, and the note it carries: the sentence, "" when it reads as
+    none (NONE_NOTE), None when the section is absent or was left empty."""
+    section, text = section_text(body)
+    return section, ("" if text is not None and NONE_NOTE.match(text) else text)
 
 
 def release_note(body: str) -> str | None:
@@ -614,7 +628,7 @@ def render(args: argparse.Namespace) -> int:
     read_bodies(pulls, args.gh, args.repo, Path(args.cache), args.refresh)
     for pull in pulls:
         if pull.read:
-            pull.section, pull.note = note_section(pull.body)
+            pull.take(pull.body)
         pull.declare()
     with_note = sum(1 for pull in pulls if pull.note)
     none = sum(1 for pull in pulls if pull.note == "")

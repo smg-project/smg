@@ -1597,10 +1597,13 @@ SKELETON = (
 )
 
 
-def noted_release(repo: Sandbox, pulls: Path) -> None:
-    """The sixteen pull requests merged on main, their bodies where GH_STUB_PULLS serves them, v1.14.0 tagged."""
+def noted_release(
+    repo: Sandbox, pulls: Path, extra: tuple[tuple[str, str | None], ...] = ()
+) -> None:
+    """The sixteen pull requests merged on main (and extra ones after them), their bodies where GH_STUB_PULLS
+    serves them, v1.14.0 tagged."""
     pulls.mkdir()
-    for index, (subject, body) in enumerate(NOTED_PULLS):
+    for index, (subject, body) in enumerate(NOTED_PULLS + extra):
         repo.commit_main(subject, f"model_gateway/src/change_{index}.rs", f"// {index}\n")
         if body is not None:
             (pulls / f"{subject.rsplit('#', 1)[1].rstrip(')')}.md").write_text(body)
@@ -1766,6 +1769,39 @@ def test_notes_name_the_packages_and_engines_at_the_tag(repo: Sandbox, tmp_path:
     assert "[Full changelog](https://github.com/example/repo/compare/v1.13.0...v1.14.0)" in out
 
 
+def test_notes_keep_what_a_sentence_that_reads_as_none_declares(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    """A conditional sentence ("as long as") is a release note with its declaration; one that reads as none and
+    goes on ("No behavior change, but the default moves") seeds no candidate line, and what it declares reaches
+    Upgrade notes in its own words."""
+    pulls = tmp_path / "pulls"
+    conditional = "No user-visible change as long as `--foo` is unset; with it set, the gateway now refuses to start."
+    none_but = "No behavior change, but the default of `--x` moves to 5."
+    noted_release(
+        repo,
+        pulls,
+        (
+            (
+                "fix(gateway): a set `--foo` needs its peer (#217)",
+                f"## Release note\n\n{conditional}\n",
+            ),
+            ("feat(gateway): the `--x` default moves (#218)", f"## Release note\n\n{none_but}\n"),
+        ),
+    )
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    declared = "<!-- AUTHOR: declared: {}; keep it here, move it or drop it -->"
+    assert f"- {conditional} (#217)" in section(out, "## Notable fixes", "## Upgrade notes")
+    assert "(#218)" not in section(out, "## Highlights", "## Upgrade notes"), "it reads as none"
+    upgrade = section(out, "## Upgrade notes", "## Packages")
+    assert f"- {conditional} (#217) " + declared.format(
+        "a configuration that now refuses to start"
+    ) in subsection(upgrade, "### Configuration that now refuses to start")
+    assert f"- {none_but} (#218) " + declared.format("a changed default") in subsection(
+        upgrade, "### Changed defaults"
+    )
+
+
 def test_notes_read_each_pull_request_body_once(repo: Sandbox, tmp_path: Path) -> None:
     pulls = tmp_path / "pulls"
     noted_release(repo, pulls)
@@ -1918,16 +1954,41 @@ def test_the_release_note_of_a_pull_request_body() -> None:
         "none because it is a test-only change",
         "None \u2014 tests only",
         "none \u2013 CI only",
-        "none as the change is internal",
+        "none, a refactor",
         "N/A \u2014 refactor",
         "No user-facing change.",
     ):
         assert notes.release_note(f"## Release note\n\n{declared}\n") == "", declared
+    # a sentence that goes on in its own words is a release note: "as" and "since" open no reason ("as long as",
+    # "as of", "since 1.13" are conditions and times)
     for sentence in (
         "None of the defaults change in this release.",
         "Nothing breaks when the flag is unset.",
+        "No user-visible change as long as `--foo` is unset; with it set, the gateway now refuses to start.",
+        "No behaviour change as long as the default of `--max-batch` is kept; it now defaults to 64.",
+        "No visible change since 1.13 for callers; the flag now defaults to on.",
+        "Nothing as of this release; the flag is removed in the next.",
     ):
         assert notes.release_note(f"## Release note\n\n{sentence}\n") == sentence, sentence
+    # what a sentence that reads as none goes on to declare still reaches Upgrade notes, in its own words,
+    # while it seeds no candidate line
+    pull = notes.Pull.of("feat(gateway): the `--x` default moves (#7)")
+    pull.read = True
+    pull.take("## Release note\n\nNo behavior change, but the default of `--x` moves to 5.\n")
+    pull.declare()
+    assert pull.note == "" and not pull.seeds and pull.kinds == ["a changed default"]
+    assert pull.upgrade_line.startswith(
+        "- No behavior change, but the default of `--x` moves to 5. (#7) <!-- AUTHOR: declared: a changed"
+        " default;"
+    )
+    pull = notes.Pull.of("fix(gateway): a set `--foo` needs its peer (#8)")
+    pull.read = True
+    pull.take(
+        "## Release note\n\nNo user-visible change as long as `--foo` is unset; with it set, the gateway"
+        " now refuses to start.\n"
+    )
+    pull.declare()
+    assert pull.seeds and pull.kinds == ["a configuration that now refuses to start"]
     assert notes.placeholders("- none because tests only (#5)\n- A real sentence. (#6)\n") == [
         (1, "- none because tests only (#5)")
     ]
