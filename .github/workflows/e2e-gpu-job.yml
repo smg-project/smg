@@ -350,40 +350,53 @@ jobs:
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
+          pytest_args=(
+            ${{ inputs.test_dirs }}
+            --ignore=e2e_test/benchmarks
+            --ignore=e2e_test/bindings_go
+            ${{ inputs.test_filter }}
+            --reruns 2 --reruns-delay 5
+            -s -vv
+          )
           if [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then
             mkdir -p e2e-logs
-            # Both streams remain live and retain their own complete evidence.
-            # Keep the stderr tee PID so its file is drained before this step exits.
-            exec {stderr_copy}> >(tee e2e-logs/pytest.stderr >&2)
-            stderr_tee_pid=$!
+            # Descendants may keep writing after pytest exits. They inherit
+            # regular spool files, never the live pumps' pipes.
+            : >e2e-logs/pytest.stdout.source
+            : >e2e-logs/pytest.stderr.source
             set +e
-            pytest ${{ inputs.test_dirs }} \
-              --ignore=e2e_test/benchmarks \
-              --ignore=e2e_test/bindings_go \
-              ${{ inputs.test_filter }} \
-              --reruns 2 --reruns-delay 5 \
-              -s -vv --junitxml=e2e-logs/sglang-pd.xml \
-              2>&"$stderr_copy" | tee e2e-logs/pytest.stdout
-            pipeline_status=("${PIPESTATUS[@]}")
-            exec {stderr_copy}>&-
-            wait "$stderr_tee_pid"
-            stderr_tee_status=$?
+            pytest "${pytest_args[@]}" --junitxml=e2e-logs/sglang-pd.xml \
+              >e2e-logs/pytest.stdout.source 2>e2e-logs/pytest.stderr.source &
+            pytest_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stdout.source \
+                | tee e2e-logs/pytest.stdout
+            ) &
+            stdout_pump_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stderr.source \
+                | tee e2e-logs/pytest.stderr >&2
+            ) &
+            stderr_pump_pid=$!
+            wait "$pytest_pid"
+            pytest_status=$?
+            wait "$stdout_pump_pid"
+            stdout_status=$?
+            wait "$stderr_pump_pid"
+            stderr_status=$?
             set -e
-            # A successful tee must never mask pytest's original failure.
-            if [ "${pipeline_status[0]}" -ne 0 ]; then
-              exit "${pipeline_status[0]}"
+            # Preserve pytest's failure; either live-copy failure also rejects green.
+            if [ "$pytest_status" -ne 0 ]; then
+              exit "$pytest_status"
             fi
-            if [ "${pipeline_status[1]}" -ne 0 ]; then
-              exit "${pipeline_status[1]}"
+            if [ "$stdout_status" -ne 0 ]; then
+              exit "$stdout_status"
             fi
-            exit "$stderr_tee_status"
+            exit "$stderr_status"
           fi
-          pytest ${{ inputs.test_dirs }} \
-            --ignore=e2e_test/benchmarks \
-            --ignore=e2e_test/bindings_go \
-            ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
-            -s -vv
+          pytest "${pytest_args[@]}"
 
       # This is deliberately after pytest and before marker-based process cleanup.
       # Keep both return codes and streams even when pytest or either check fails.
