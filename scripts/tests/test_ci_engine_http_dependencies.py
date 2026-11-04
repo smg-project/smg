@@ -753,9 +753,7 @@ def _nightly_sglang_postinstall_contract(job):
 def _nightly_sglang_benchmark_job(job_id):
     import yaml
 
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/nightly-benchmark-amd.yml").read_text()
-    )
+    workflow = yaml.safe_load((ROOT / ".github/workflows/nightly-benchmark-amd.yml").read_text())
     return workflow["jobs"][job_id]
 
 
@@ -838,15 +836,17 @@ def _pin_rejects_before_tools(tmp_path, monkeypatch):
     # If the guard reaches Python or the old dirname subprocess, fail visibly.
     marker = tmp_path / "unexpected-tool"
     monkeypatch.setattr(
-        sys.modules[__name__], "FAKE",
-        "from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n"
-        "raise SystemExit(99)\n",
+        sys.modules[__name__],
+        "FAKE",
+        "from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\nraise SystemExit(99)\n",
     )
     binary = tmp_path / "bin"
     binary.mkdir()
     for name in ("dirname", "pin_payload"):
         command = binary / name
-        command.write_text("#!/bin/sh\nprintf unexpected > " + shlex.quote(str(marker)) + "\nexit 99\n")
+        command.write_text(
+            "#!/bin/sh\nprintf unexpected > " + shlex.quote(str(marker)) + "\nexit 99\n"
+        )
         command.chmod(0o755)
     return marker
 
@@ -859,10 +859,14 @@ def test_verify_only_follows_the_verifier_image_pin(tmp_path, monkeypatch, reque
         marker = _pin_rejects_before_tools(tmp_path, monkeypatch)
     report = tmp_path / "native.json"
     result, calls = run_installer(
-        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
         arguments=("--verify-only", str(report)),
-        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0",
-                   "SMG_SGLANG_ROCM_IMAGE": new_image if requested == "new-pin" else FIXED_IMAGE},
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": new_image if requested == "new-pin" else FIXED_IMAGE,
+        },
     )
     if requested == "new-pin":
         assert result.returncode == 0, result.stderr
@@ -879,8 +883,17 @@ def test_verify_only_follows_the_verifier_image_pin(tmp_path, monkeypatch, reque
 
 @pytest.mark.parametrize(
     "state",
-    ["missing-file", "missing-pin", "duplicate", "unclosed", "short-digest",
-     "computed", "multiline", "annotated", "source-looking"],
+    [
+        "missing-file",
+        "missing-pin",
+        "duplicate",
+        "unclosed",
+        "short-digest",
+        "computed",
+        "multiline",
+        "annotated",
+        "source-looking",
+    ],
 )
 def test_verify_only_rejects_invalid_authoritative_pin_before_tools(tmp_path, monkeypatch, state):
     literal = 'IMAGE = "' + FIXED_IMAGE + '"'
@@ -898,7 +911,9 @@ def test_verify_only_rejects_invalid_authoritative_pin_before_tools(tmp_path, mo
     _pin_source_fixture(tmp_path, monkeypatch, declaration, missing_file=state == "missing-file")
     marker = _pin_rejects_before_tools(tmp_path, monkeypatch)
     result, calls = run_installer(
-        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
         arguments=("--verify-only",),
         extra_env={"SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
     )
@@ -912,7 +927,10 @@ def test_verify_only_rejects_invalid_authoritative_pin_before_tools(tmp_path, mo
 def test_verify_only_accepts_a_single_quoted_authoritative_pin(tmp_path, monkeypatch):
     _pin_source_fixture(tmp_path, monkeypatch, "IMAGE = '" + FIXED_IMAGE + "'")
     result, calls = run_installer(
-        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh", arguments=("--verify-only",),
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only",),
         extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
     )
     assert result.returncode == 0, result.stderr
