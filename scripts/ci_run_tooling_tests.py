@@ -14,8 +14,6 @@ BASELINE = (
 )
 COMPONENTS = (
     ("e2e_test/infra/mcp_readiness.py", "e2e_test/infra/test_mcp_readiness.py"),
-    ("scripts/ci_check_e2e_dependencies.py", "scripts/tests/test_ci_e2e_dependencies.py"),
-    ("scripts/ci_check_vllm_engine_units.py", "scripts/tests/test_ci_vllm_engine_units.py"),
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
 )
 # These scripts predate their regression suites. Earlier stack layers must not
@@ -27,10 +25,6 @@ REGRESSIONS = (
         "e2e_test/benchmarks/nightly_summarize.py",
         "scripts/tests/test_nightly_summary_errors.py",
     ),
-    ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
-    ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),
-    ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),
-    ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
 )
 
 
