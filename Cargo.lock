@@ -7908,12 +7908,14 @@ dependencies = [
  "llm-multimodal",
  "llm-tokenizer",
  "once_cell",
+ "openai-protocol",
  "prost",
  "pyo3",
  "rand 0.10.2",
  "rayon",
  "reasoning-parser",
  "serde_json",
+ "serde_path_to_error",
  "serde_yaml",
  "smg",
  "smg-auth",
@@ -7921,11 +7923,13 @@ dependencies = [
  "smg-mesh",
  "smg-rl",
  "smg-symphony",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tonic",
  "tool-parser",
  "tracing",
+ "validator",
 ]
 
 [[package]]
