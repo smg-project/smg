@@ -143,6 +143,13 @@ def test_scope_stays_opt_in_with_typed_inputs():
     assert flag["type"] == "boolean" and flag["default"] is False
     scope = _scope()
     assert scope["if"] == "inputs.final_environment_check"
+    setups = {step["name"]: step for step in document["jobs"]["run"]["steps"] if "name" in step}
+    assert setups["Setup SGLang backend"]["if"] == (
+        "inputs.engine == 'sglang' && !inputs.final_environment_check"
+    )
+    assert (
+        setups["Setup AMD SGLang in its fixed ROCm image"]["if"] == "inputs.final_environment_check"
+    )
     assert scope["env"] == {
         "CHECK_ENGINE": "${{ inputs.engine }}",
         "CHECK_VENDOR": "${{ inputs.gpu_vendor }}",
@@ -226,6 +233,13 @@ def test_evidence_exposes_exact_artifact_outputs():
             "${{ steps." + upload + ".outputs.artifact-id != '' && "
             "steps.evidence-identity.outputs." + internal + " || '' }}"
         )
+    complete_upload = [
+        step for step in job["steps"] if step.get("id") == "upload-complete-evidence"
+    ]
+    assert len(complete_upload) == 1
+    assert complete_upload[0]["if"] == (
+        "always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'"
+    )
     uploads = [
         step["with"]["name"]
         for step in job["steps"]
@@ -244,6 +258,24 @@ def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
     assert "sglang-e2e_test-chat_completions" in first[0]
     assert first[1] != second[1]
     assert first[2] != second[2]
+
+
+@pytest.mark.parametrize("count", ["", "1", "2"])
+def test_evidence_readable_contract_identifies_grouped_zmq(tmp_path, count):
+    contract, _, artifacts = _evidence_identity(
+        tmp_path,
+        {
+            "engine": "vllm",
+            "gpu_tier": "1",
+            "gpu_vendor": "nvidia",
+            "test_dirs": "e2e_test/chat_completions",
+            "connection_mode": "zmq",
+            "zmq_engine_count": count,
+        },
+    )
+    assert ("-dp2-" in contract) is (count == "2")
+    assert "-dp1-" not in contract
+    assert all(contract in name for name in artifacts.values())
 
 
 def test_evidence_contract_ignores_json_key_order(tmp_path):
