@@ -206,6 +206,16 @@ def versioned(name: str, version: str) -> str:
     return f'[package]\nname = "{name}"\nversion = "{version}"\n'
 
 
+def interpreter_library_path() -> dict[str, str]:
+    """The LD_LIBRARY_PATH of this process, when it has one. The sandboxes below put this
+    interpreter's directory on PATH so the tools under test run the same python; on a
+    runner whose python is a relocatable tool-cache build, that interpreter finds its
+    shared library through LD_LIBRARY_PATH, which an environment built from scratch
+    would drop."""
+    library_path = os.environ.get("LD_LIBRARY_PATH")
+    return {"LD_LIBRARY_PATH": library_path} if library_path else {}
+
+
 class Sandbox:
     """An origin, a clone with the tooling, the stubs, and the helpers the tests share."""
 
@@ -253,10 +263,7 @@ class Sandbox:
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base),
         }
-        # The interpreter put on PATH above may be a relocatable build that finds
-        # its shared library through LD_LIBRARY_PATH (a runner's tool cache).
-        if library_path := os.environ.get("LD_LIBRARY_PATH"):
-            env["LD_LIBRARY_PATH"] = library_path
+        env.update(interpreter_library_path())
         env.update(extra)
         return env
 
@@ -2592,6 +2599,7 @@ def grpc_detect(
             "PATH": os.pathsep.join(
                 [str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"]
             ),
+            **interpreter_library_path(),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_REF_TYPE": ref_type,
             "GITHUB_REF_NAME": "v1.14.0" if ref_type == "tag" else "release/1.14",
