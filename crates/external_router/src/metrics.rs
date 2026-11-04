@@ -29,19 +29,19 @@ static MODEL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_M
 static TOOL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_TOOL_LABELS));
 static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
 
-/// Intern a client-controlled label with a hard cardinality cap.
-///
-/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
-/// (client-supplied model names, model-generated tool names) cannot grow the
-/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
-/// admitted values are never evicted and re-admitted, which would keep minting new
-/// series in the recorder even as the map churned.
 /// A label set that admits at most `cap` distinct values; everything past
-/// the cap maps to the sentinel. Admission reserves a slot before touching
-/// the map, so a burst of distinct labels cannot overshoot the cap. The
-/// model and tool labels are two process-wide sets; a label another part of
-/// the gateway bounds by a setting of its own (the scheduler's tenant label)
-/// gets a set of its own.
+/// the cap maps to the sentinel `other`.
+///
+/// Distinct values beyond `cap` collapse to the shared sentinel, so untrusted
+/// input (client-supplied model names, model-generated tool names, tenant
+/// keys) cannot grow the interner, or the metric's Prometheus series set,
+/// without bound. Unlike an LRU, admitted values are never evicted and
+/// re-admitted, which would keep minting new series in the recorder even as
+/// the map churned. Admission reserves a slot before touching the map, so a
+/// burst of distinct labels cannot overshoot the cap. The model and tool
+/// labels are two process-wide sets; a label another part of the gateway
+/// bounds by a setting of its own (the scheduler's tenant label) gets a set
+/// of its own.
 pub struct BoundedLabels {
     map: DashMap<String, Arc<str>>,
     admitted: AtomicUsize,

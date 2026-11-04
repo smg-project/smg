@@ -189,7 +189,7 @@ mod tests {
         // Other tests of the process intern labels of their own meanwhile;
         // forty tenant keys through the never-freed interner would be forty.
         assert!(
-            interner_size() - interned_before < 40,
+            interner_size().saturating_sub(interned_before) < 40,
             "the tenant keys never reach the process-wide interner"
         );
     }
