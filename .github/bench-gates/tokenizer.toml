@@ -1,4 +1,4 @@
-# Regression gate for `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`,
+# Regression gate for `cargo bench -p smg --bench tokenizer_benchmark`,
 # run by .github/workflows/benchmark-tokenizer.yml on pull requests through scripts/bench_gate.py.
 #
 # The gate runs the single-threaded gateway-path groups: the native encoder (encode_throughput,

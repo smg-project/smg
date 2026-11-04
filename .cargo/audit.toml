@@ -46,10 +46,6 @@ ignore = [
     # 2's API or to another codec in the three crates that write the bytes: they are exchanged
     # between peers, so it is a format decision, not a lockfile bump. Review by 2027-01-15.
     "RUSTSEC-2025-0141",
-    # RUSTSEC-2025-0057: fxhash 0.2, through ptr_hash 2.1 under the optional tokenizers 1.0
-    # release candidate of crates/tokenizer (feature tokenizers-v1); no ptr_hash release is
-    # without it. Review by 2027-01-15.
-    "RUSTSEC-2025-0057",
     # RUSTSEC-2024-0436: paste 1.0, a complete proc macro under malachite-bigint (rustpython-parser,
     # used by crates/tool_parser), oracle 0.6 (crates/data_connector), tokenizers, rav1e, pulp,
     # tikv-jemalloc-ctl and tk-encode; it leaves the graph only when every one of them has a

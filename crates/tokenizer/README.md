@@ -251,8 +251,8 @@ small prefix hits from reuse of large prompts.
 
 `smg_tokenizer_encode_path_loads_total` says which encoder each loaded
 tokenizer's encodes go through (the load also logs the path once, with the
-reasons the faster paths declined); a non-zero `tokenizers` series under the
-`tokenizers-v1` feature names the tokenizers the opt-in pipeline does not take.
+reasons the faster paths declined); a non-zero `tokenizers` series names the
+tokenizers neither the backend nor the direct encoder takes.
 The series `vllm` counts the tokenizers the vLLM Rust frontend's backend
 (`vllm-tokenizer`, read from the vLLM repository) serves flat encodes and batch
 decodes for; it takes a checkpoint's `tokenizer.json`

@@ -162,8 +162,7 @@ commands_of() {
         bindings)
             echo "-p smg-python -p smg-golang" ;;
         tokenizer)
-            echo "-p llm-tokenizer"
-            echo "-p llm-tokenizer --features tokenizers-v1" ;;
+            echo "-p llm-tokenizer" ;;
         multimodal)
             echo "-p llm-multimodal" ;;
         symphony)

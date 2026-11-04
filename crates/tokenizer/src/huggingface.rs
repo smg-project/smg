@@ -110,10 +110,6 @@ pub struct HuggingFaceTokenizer {
     /// byte fallback (see `byte_fallback`): the streaming step's window
     /// decodes read it instead of running the `tokenizers` decode.
     pieces: Option<Arc<PieceTable>>,
-    /// The opt-in v1 pipeline, when the choice took it (then the core's
-    /// `native` is `None`).
-    #[cfg(feature = "tokenizers-v1")]
-    v1: Option<crate::v1::V1Encoder>,
     /// The `vllm-tokenizer` backend, when the choice took it (then
     /// `v1` and the core's `native` are `None`).
     vllm: Option<crate::vllm::VllmBackend>,
@@ -211,16 +207,13 @@ struct AddedTokenConfig {
 /// itself, chosen once per load by [`DirectEncoders::choose`].
 struct DirectEncoders {
     vllm: Option<crate::vllm::VllmBackend>,
-    #[cfg(feature = "tokenizers-v1")]
-    v1: Option<crate::v1::V1Encoder>,
     native: Option<NativeEncoder>,
 }
 
 impl DirectEncoders {
     /// The first path, in order of preference, that takes `tokenizer`: the
-    /// `vllm-tokenizer` backend (over the file `vllm` names), the opt-in v1
-    /// pipeline (behind its feature), the
-    /// direct byte-level encoder, else none and `tokenizers` encodes. The
+    /// `vllm-tokenizer` backend (over the file `vllm` names), the direct
+    /// byte-level encoder, else none and `tokenizers` encodes. The
     /// choice is logged once, with the reasons the paths before it declined,
     /// and counted per path ([`encode_path::encode_path_loads`]).
     fn choose<M: Model + ModelView + Serialize>(
@@ -234,8 +227,6 @@ impl DirectEncoders {
                 tracing::info!(path = %EncodePath::Vllm, "tokenizer encode path");
                 return Self {
                     vllm: Some(vllm),
-                    #[cfg(feature = "tokenizers-v1")]
-                    v1: None,
                     native: None,
                 };
             }
@@ -244,58 +235,17 @@ impl DirectEncoders {
                 "the vllm-tokenizer backend declined this tokenizer; its encodes take the next path"
             ),
         }
-        #[cfg(feature = "tokenizers-v1")]
-        let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
-            tokenizer,
-            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD,
-        ) {
-            Ok(v1) => {
-                encode_path::note_load(EncodePath::V1);
-                tracing::info!(path = %EncodePath::V1, "tokenizer encode path");
-                return Self {
-                    vllm: None,
-                    v1: Some(v1),
-                    native: None,
-                };
-            }
-            Err(declined) => declined,
-        };
         let (native, path, native_declined) = match NativeEncoder::from_tokenizer(tokenizer) {
             Ok(native) => (Some(native), EncodePath::Native, None),
             Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
         };
         encode_path::note_load(path);
-        // The opt-in pipeline is for BPE tokenizers: one of those it declines
-        // is worth a warning (the opt-in did not take where it could have);
-        // any other model kind was never its business.
-        #[cfg(feature = "tokenizers-v1")]
-        if matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
-            tracing::warn!(
-                path = %path,
-                v1_declined = %v1_declined,
-                native_declined = native_declined.as_deref(),
-                "the opt-in tokenizers v1 pipeline declined this BPE tokenizer; its encodes take the next path"
-            );
-        } else {
-            tracing::info!(
-                path = %path,
-                v1_declined = %v1_declined,
-                native_declined = native_declined.as_deref(),
-                "tokenizer encode path (the opt-in v1 pipeline takes BPE models only)"
-            );
-        }
-        #[cfg(not(feature = "tokenizers-v1"))]
         tracing::info!(
             path = %path,
             native_declined = native_declined.as_deref(),
             "tokenizer encode path"
         );
-        Self {
-            vllm: None,
-            #[cfg(feature = "tokenizers-v1")]
-            v1: None,
-            native,
-        }
+        Self { vllm: None, native }
     }
 
     /// Words the `tokenizers` model may cache per thread: none behind the
@@ -502,21 +452,11 @@ impl HuggingFaceTokenizer {
         if self.vllm.is_some() {
             return EncodePath::Vllm;
         }
-        #[cfg(feature = "tokenizers-v1")]
-        if self.v1.is_some() {
-            return EncodePath::V1;
-        }
         if self.core.native.is_some() {
             EncodePath::Native
         } else {
             EncodePath::Tokenizers
         }
-    }
-
-    /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
-    /// Unsupported configurations retain the existing encode path.
-    pub fn uses_v1_encoder(&self) -> bool {
-        self.encode_path() == EncodePath::V1
     }
 
     /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
@@ -1031,8 +971,6 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
-            #[cfg(feature = "tokenizers-v1")]
-            v1: encoders.v1,
             vllm: encoders.vllm,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
             special_tokens,
@@ -1307,8 +1245,6 @@ impl HuggingFaceTokenizer {
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
-            #[cfg(feature = "tokenizers-v1")]
-            v1: encoders.v1,
             vllm: encoders.vllm,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
             special_tokens,
@@ -1691,10 +1627,6 @@ impl Encoder for HuggingFaceTokenizer {
         if let Some(vllm) = &self.vllm {
             return vllm.encode(input, add_special_tokens);
         }
-        #[cfg(feature = "tokenizers-v1")]
-        if let Some(v1) = &self.v1 {
-            return v1.encode(input, add_special_tokens);
-        }
         // The direct path frames the ids itself on a request for special
         // tokens (what the post-processor it read at load adds). An input it
         // gives up is counted and encoded by `tokenizers`.
@@ -1714,10 +1646,6 @@ impl Encoder for HuggingFaceTokenizer {
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
         if let Some(vllm) = &self.vllm {
             return vllm.encode_batch(inputs, add_special_tokens);
-        }
-        #[cfg(feature = "tokenizers-v1")]
-        if let Some(v1) = &self.v1 {
-            return v1.encode_batch(inputs, add_special_tokens);
         }
         // A batch takes the path a single input takes: the direct encoder when
         // the vocabulary has one (an input it declines goes through the
@@ -2061,10 +1989,6 @@ impl Decoder for HuggingFaceTokenizer {
         // keep the piece table (see `window_decode`).
         if let Some(vllm) = &self.vllm {
             return vllm.decode(token_ids, skip_special_tokens);
-        }
-        #[cfg(feature = "tokenizers-v1")]
-        if let Some(table) = &self.byte_level {
-            return Ok(table.decode(token_ids, skip_special_tokens));
         }
         // A sentencepiece-style vocabulary with byte fallback decodes through
         // its piece table, as its streaming windows do: one pass over the ids

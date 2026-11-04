@@ -17,8 +17,6 @@ categories = ["text-processing", "parsing"]
 name = "llm_tokenizer"
 
 [features]
-# Opt-in encoding and full ByteLevel decode acceleration; streaming stays unchanged.
-tokenizers-v1 = ["dep:tokenizers-v1"]
 
 [dependencies]
 anyhow.workspace = true
@@ -48,20 +46,6 @@ rayon = "1.12"
 thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
-# rc.3 splits what rc.2 compiled unconditionally into features: the pipeline's normalizers, the model types the
-# replayed vocabularies use, the serialized form `from_json` reads, the parallelism switches the adapter sets, and the
-# Unicode-scripts pre-tokenizer; the training progress bar and the hub client stay out.
-tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = true, default-features = false, features = [
-    "regex",
-    "serialize",
-    "normalizers",
-    "parallelism",
-    "bpe",
-    "unigram",
-    "wordpiece",
-    "wordlevel",
-    "unicode-scripts",
-] }
 # The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
 # the same text (a newer crate's tables know marks and compositions the library's do not).
 unicode-normalization-alignments = "0.1"
@@ -101,14 +85,6 @@ harness = false
 
 [[bench]]
 name = "byte_fallback_invalid_run"
-harness = false
-
-[[bench]]
-name = "v1_compare"
-harness = false
-
-[[bench]]
-name = "decode_compare"
 harness = false
 
 [[bench]]

@@ -53,7 +53,7 @@ jobs:
         with:
           # Bench-profile artifacts; kept apart from the debug-profile cache
           # every other job saves under the default key.
-          cache-key: rust-cache-bench-tokenizer-v1
+          cache-key: rust-cache-bench-tokenizer
 
       # A pull request is gated: its bench binary and the base branch's (the merge
       # commit's first parent) are built in this checkout, run interleaved on this
@@ -68,7 +68,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bench-gate"
           cp scripts/bench_gate.py "$RUNNER_TEMP/bench-gate/"
           python3 scripts/bench_gate.py build --out "$RUNNER_TEMP/bench-gate/pr" -- \
-            cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark --no-run
+            cargo bench -p smg --bench tokenizer_benchmark --no-run
 
       - name: Build the base branch's benchmark
         if: github.event_name == 'pull_request'
@@ -78,7 +78,7 @@ jobs:
           head=$(git rev-parse HEAD)
           git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
           python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
-            cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark --no-run
+            cargo bench -p smg --bench tokenizer_benchmark --no-run
           git checkout --quiet "$head"
 
       - name: Run the benchmark gate
@@ -95,7 +95,7 @@ jobs:
         timeout-minutes: 60
         run: |
           source "$HOME/.cargo/env"
-          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
+          cargo bench -p smg --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -115,7 +115,7 @@ jobs:
       - name: Summary
         if: always() && github.event_name != 'pull_request'
         run: |
-          echo "## Tokenizer Benchmark (tokenizers-v1 enabled)" >> $GITHUB_STEP_SUMMARY
+          echo "## Tokenizer Benchmark" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_output.txt ]; then
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -100 benchmark_output.txt >> $GITHUB_STEP_SUMMARY

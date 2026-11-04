@@ -1,7 +1,6 @@
 //! Wall time of one encode of a long prompt, at the thread count of the
 //! process's pool: `RAYON_NUM_THREADS` sizes the pool the direct encoder
-//! splits a long input over; with `tokenizers-v1`, `SMG_BENCH_THREADS` sets
-//! that encoder's internal thread count instead. `PARALLEL_BENCH_TOKENIZERS`
+//! splits a long input over. `PARALLEL_BENCH_TOKENIZERS`
 //! = `name=dir,...` (without it the bench says so on one line and exits
 //! without measuring, so a plain `cargo bench` of the crate passes it by),
 //! `PARALLEL_BENCH_TOKENS` = the prompt sizes (default 131072,262144,1048576),
@@ -113,17 +112,6 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
     let pool_threads = rayon::current_num_threads();
-    #[cfg(feature = "tokenizers-v1")]
-    let internal: usize = std::env::var("SMG_BENCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    #[cfg(feature = "tokenizers-v1")]
-    {
-        tokenizers_v1::parallelism::set_num_threads(internal);
-        tokenizers_v1::parallelism::set_parallelism(internal > 1);
-    }
-    #[cfg(not(feature = "tokenizers-v1"))]
     let internal = 1usize;
     for spec in specs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (name, dir) = spec.split_once('=').expect("name=dir");

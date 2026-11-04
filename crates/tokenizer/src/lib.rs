@@ -20,8 +20,6 @@ pub mod sequence;
 pub mod stop;
 pub mod stream;
 pub mod traits;
-#[cfg(feature = "tokenizers-v1")]
-mod v1;
 mod vllm;
 mod word_cache;
 

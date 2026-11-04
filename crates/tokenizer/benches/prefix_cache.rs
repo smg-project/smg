@@ -26,7 +26,7 @@ use std::{
 use aho_corasick::{AhoCorasick, MatchKind};
 use llm_tokenizer::{
     create_tokenizer,
-    traits::{Encoder, Encoding, Tokenizer},
+    traits::{Encoder, Tokenizer},
     CacheConfig, CachedTokenizer, HuggingFaceTokenizer,
 };
 use serde_json::json;
@@ -365,17 +365,10 @@ fn main() {
         let specials = cache_specials(inner.as_ref());
         let probe = body(7, 40_000);
         let sample = inner.encode(&probe, false).expect("probe encode");
-        let path = match (
-            inner
-                .as_any()
-                .downcast_ref::<HuggingFaceTokenizer>()
-                .is_some_and(HuggingFaceTokenizer::uses_v1_encoder),
-            &sample,
-        ) {
-            (true, _) => "v1",
-            (false, Encoding::Plain(_)) => "native",
-            (false, _) => "hf-0.23",
-        };
+        let path = inner
+            .as_any()
+            .downcast_ref::<HuggingFaceTokenizer>()
+            .map_or("tiktoken", |hf| hf.encode_path().as_str());
         let bytes_per_token = probe.len() as f64 / sample.token_ids().len() as f64;
         let mut distinct = specials.clone();
         distinct.sort();
