@@ -1,6 +1,6 @@
 //! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
-//! surface (vLLM and TokenSpeed today), plus the connect entry points and
-//! metadata reads.
+//! surface, one connection for any of the four dialects of [`ZmqDialect`],
+//! plus the connect entry points and metadata reads.
 
 use std::{
     collections::{BTreeMap, HashMap},

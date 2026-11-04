@@ -15,8 +15,12 @@ only. The Router cannot tell the two implementations apart.
 
 What the wire does not carry, the Rust path refuses by name rather than
 drops: beam search, the logits-returning flags, KV-cache retention, prompt
-tuning and lookahead configs. ``Embed`` and ``SubscribeKvEvents`` answer
-UNIMPLEMENTED, as the engine's Python servicer answers them.
+tuning and lookahead configs. ``Embed`` answers UNIMPLEMENTED, as the engine's
+Python servicer answers it. A ``loads_only`` ``SubscribeKvEvents`` streams the
+servicer's own load records; a full one answers UNIMPLEMENTED with the reason,
+since the server relays KV events only when handed a publisher endpoint (the
+``kv_events_endpoint`` fact) and this launcher hands none: the wire has no
+publisher yet.
 """
 
 from __future__ import annotations

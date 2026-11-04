@@ -14,9 +14,11 @@
 //!
 //! Engines plug in via the `AbortOnDropClient` trait — they describe how
 //! to translate `(client, request_id)` into the abort future. This keeps
-//! the (large) Drop / Stream impl in one place instead of replicated
-//! across `mlx_engine`, `sglang_scheduler`, `vllm_engine`, and
-//! `trtllm_service`.
+//! the (large) Drop / Stream impl in one place instead of replicated per
+//! engine client: `mlx_engine`, `sglang_scheduler`, `tokenspeed_scheduler`
+//! and `vllm_engine` take the trait through the crate root's
+//! `impl_abort_for_drop_with_reason` macro (their `abort_request` takes a
+//! reason), `trtllm_service` implements it by hand.
 
 use std::{
     future::Future,
