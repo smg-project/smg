@@ -50,9 +50,11 @@ process_matches() {
 
 write_status() {
   local status=$1
-  local temporary_directory
+  local temporary_directory normalized_ready normalized_lock
 
-  if [[ ${READY_PATH} == "${lock_path}" || ${READY_PATH} -ef ${lock_path} ]]; then
+  normalized_ready=$(/usr/bin/realpath -m -- "${READY_PATH}" 9>&-) || return 2
+  normalized_lock=$(/usr/bin/realpath -m -- "${lock_path}" 9>&-) || return 2
+  if [[ ${READY_PATH} == "${lock_path}" || ${READY_PATH} -ef ${lock_path} || ${normalized_ready} == "${normalized_lock}" ]]; then
     printf '%s\n' "ERROR: ready path aliases the lease lock" >&2 || true
     return 2
   fi

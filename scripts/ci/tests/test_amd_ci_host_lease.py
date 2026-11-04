@@ -132,6 +132,48 @@ def run_case(directory, logger_body, closed_stderr=False, blocked=False, require
             holder.communicate(timeout=2)
 
 
+def missing_lock_alias_cases(directory):
+    directory.mkdir()
+    owner = subprocess.Popen(["true"])
+    try:
+        procstat = Path(f"/proc/{owner.pid}/stat")
+        until(lambda: procstat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+        birth = procstat.read_text().rsplit(")", 1)[1].split()[19]
+        owner.wait(timeout=2)
+        observations = []
+        for spelling in ["literal", "dot", "parent", "relative"]:
+            case = directory / spelling
+            case.mkdir()
+            (case / "subdirectory").mkdir()
+            lock = case / "lock"
+            ready = {
+                "literal": str(lock),
+                "dot": str(case) + "/./lock",
+                "parent": str(case) + "/subdirectory/../lock",
+                "relative": "./lock",
+            }[spelling]
+            assert not lock.exists()
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "--lock-path", str(lock), str(owner.pid), birth, ready, "0"],
+                cwd=case,
+                capture_output=True,
+                timeout=4,
+            )
+            observation = {
+                "spelling": spelling,
+                "returncode": result.returncode,
+                "lock_created": lock.exists(),
+            }
+            print("MISSING_LOCK_ALIAS_OBSERVATION " + json.dumps(observation), flush=True)
+            assert result.returncode == 2, "missing-lock alias must reject before publishing status"
+            assert not lock.exists(), "owner-gone status created the lease lock"
+            assert not list(case.glob("lock.tmp.*"))
+            observations.append(observation)
+        return observations
+    finally:
+        owner.wait(timeout=2)
+
+
 def lifecycle_cases(directory):
     directory.mkdir()
     bindir = directory / "bin"
@@ -240,6 +282,7 @@ def lifecycle_cases(directory):
         "ready_alias_rejected_without_inode_change": True,
         "zombie_owner_rejected": True,
         "literal_same_dentry_alias_rejected_content_preserved": True,
+        "missing_lock_aliases_rejected": missing_lock_alias_cases(directory / "missing-lock"),
     }
 
 
@@ -404,7 +447,9 @@ exec bash "$1" --lock-path "$2" "$3" "$4" "$5" 0
 
 with tempfile.TemporaryDirectory(prefix="lease-audit-tests-") as scratch:
     root = Path(scratch)
-    if sys.argv[1:] == ["--partial-write-only"]:
+    if sys.argv[1:] == ["--missing-lock-only"]:
+        results = {"missing_lock_aliases": missing_lock_alias_cases(root / "missing-lock")}
+    elif sys.argv[1:] == ["--partial-write-only"]:
         results = {"partial_write_cleanup": partial_write_failure_case(root / "partial-write")}
     elif sys.argv[1:] == ["--ready-tempfile-only"]:
         results = {"ready_tempfiles": ready_tempfile_cases(root / "ready-tempfiles")}
