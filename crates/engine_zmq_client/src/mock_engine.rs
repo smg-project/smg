@@ -6,6 +6,9 @@
 // HELLO/INIT/READY handshake, a DEALER registers on the input socket and
 // receives requests, and a PUSH sends outputs back.
 
+//! A mock engine for tests and test tooling: it plays the engine process's role over ZMQ, for the
+//! crate's loopback tests and, behind `mock-engine`, for `mock-worker` and other crates' tests.
+
 use std::time::Duration;
 
 use bytes::Bytes;

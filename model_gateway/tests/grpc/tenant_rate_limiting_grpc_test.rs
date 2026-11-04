@@ -406,8 +406,8 @@ async fn feature_disabled_is_a_no_op() {
 /// routes into it, and PD needs a distinct prefill+decode worker pair --
 /// both larger harness investments than this suite carries for its other
 /// cases, and the underlying reserve/settle mechanics they'd exercise are
-/// identical to what's already proven above and in `pipeline.rs`'s own
-/// `rate_limit_reserve_tests` (which drives `RateLimitReserveStage` directly
+/// identical to what's already proven above and in the pipeline's own
+/// `tests/rate_limit_reserve.rs` (which drives `RateLimitReserveStage` directly
 /// rather than through a real backend).
 #[tokio::test]
 async fn completion_denial_reaches_the_client() {

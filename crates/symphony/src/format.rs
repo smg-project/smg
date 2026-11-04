@@ -290,6 +290,38 @@ pub enum CallId {
     Header,
 }
 
+/// The text that opens the model's turn, with its reverse finder built once with the table:
+/// the prompt's replay starts at the opener's last occurrence, and a request searches for it two
+/// or three times (the replay, the turn, an unopened turn), so the searcher's preprocessing of
+/// the needle is paid here, not on every search.
+#[derive(Clone, Debug)]
+struct TurnOpener {
+    text: String,
+    finder: memchr::memmem::FinderRev<'static>,
+}
+
+impl TurnOpener {
+    fn new(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            finder: memchr::memmem::FinderRev::new(text).into_owned(),
+        }
+    }
+
+    /// The byte offset where the opener last occurs in `prompt`, as `str::rfind` finds it.
+    fn rfind(&self, prompt: &str) -> Option<usize> {
+        self.finder.rfind(prompt.as_bytes())
+    }
+}
+
+impl PartialEq for TurnOpener {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for TurnOpener {}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -304,7 +336,7 @@ pub struct Format {
     calls: Option<CallSyntax>,
     /// Where a call's id comes from.
     call_id: CallId,
-    turn_opener: Option<String>,
+    turn_opener: Option<TurnOpener>,
     /// The turn anchors, in the order a match at one place prefers them.
     anchors: Vec<Anchor>,
     /// The state a turn starts in when it does not start with a terminal.
@@ -621,7 +653,7 @@ impl Format {
     /// prompt's replay starts at its last occurrence.
     #[must_use]
     pub fn opens_turn(mut self, text: &str) -> Self {
-        self.turn_opener = Some(text.to_string());
+        self.turn_opener = Some(TurnOpener::new(text));
         self
     }
 
@@ -970,7 +1002,7 @@ impl Format {
     /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
     /// turn's start on it ([`Self::unopened_turn_starts_in`]).
     pub fn turn_opener(&self) -> Option<&str> {
-        self.turn_opener.as_deref()
+        self.turn_opener.as_ref().map(|opener| opener.text.as_str())
     }
 
     /// The texts that start the model's turn: the turn opener, or the turn anchors in the table's
@@ -990,9 +1022,9 @@ impl Format {
             let (at, anchor) = self.last_anchor(prompt)?;
             return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
         }
-        let opener = self.turn_opener()?;
-        let at = prompt.rfind(opener)?;
-        Some((at, &prompt[at + opener.len()..], 0))
+        let opener = self.turn_opener.as_ref()?;
+        let at = opener.rfind(prompt)?;
+        Some((at, &prompt[at + opener.text.len()..], 0))
     }
 
     /// The part of `prompt` the engine replays to find the state the generation starts in: from
@@ -1005,7 +1037,11 @@ impl Format {
             let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
             return &prompt[from..];
         }
-        match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
+        match self
+            .turn_opener
+            .as_ref()
+            .and_then(|opener| opener.rfind(prompt))
+        {
             Some(at) => &prompt[at..],
             None => prompt,
         }
@@ -1162,10 +1198,10 @@ impl Format {
         if prompt.is_empty() {
             return None;
         }
-        let opener = self.turn_opener()?;
-        let opened = prompt
-            .rfind(opener)
-            .is_some_and(|at| !prompt[at + opener.len()..].contains(unopened.end.as_str()));
+        let opener = self.turn_opener.as_ref()?;
+        let opened = opener
+            .rfind(prompt)
+            .is_some_and(|at| !prompt[at + opener.text.len()..].contains(unopened.end.as_str()));
         (!opened).then_some(unopened.state)
     }
 
@@ -1390,7 +1426,7 @@ impl Format {
                 self.name, terminal.name
             ));
         }
-        if self.turn_opener.as_deref() == Some("") {
+        if self.turn_opener() == Some("") {
             return Err(format!("format {}: an empty turn opener", self.name));
         }
         if self.anchors.iter().any(|anchor| anchor.text.is_empty()) {

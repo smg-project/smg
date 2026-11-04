@@ -7,10 +7,24 @@
       "properties": {
         "policy": {
           "type": "string",
-          "enum": ["cache_aware", "round_robin", "power_of_two", "manual", "random", "prefix_hash"]
+          "enum": [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash"
+          ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "maxConcurrentRequests": {
+          "type": "integer",
+          "description": "In-flight requests the gateway admits before shedding with 429 or 503 (--max-concurrent-requests), each permit held for the whole response. -1 derives the bound from the host (1024 per available core, at least 4096); 0 lifts the bound; a positive value is the bound."
+        },
         "replicas": { "type": "integer", "minimum": 1 },
         "progressDeadlineSeconds": { "type": "integer", "minimum": 1 },
         "discovery": {

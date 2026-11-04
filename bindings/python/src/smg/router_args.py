@@ -424,7 +424,6 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
-    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
@@ -989,16 +988,6 @@ class RouterArgs:
             help=(
                 "Mean prefill tokens for least_load's in-flight estimate when a"
                 " request's token count is unknown at routing"
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}least-load-max-waiting-requests",
-            type=int,
-            default=RouterArgs.least_load_max_waiting_requests,
-            help=(
-                "Per-worker waiting-queue cap for least_load: skip workers whose"
-                " reported waiting requests (plus dispatches since their last"
-                " poll) have reached this count; 0 disables"
             ),
         )
         routing_group.add_argument(

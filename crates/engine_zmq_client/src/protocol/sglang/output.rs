@@ -1,8 +1,8 @@
-// SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
-// declared by the SMG plugin that runs inside the scheduler
-// (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
-// of parallel per-request columns. **Field order is the wire contract** — do
-// not reorder; the plugin appends only.
+//! SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
+//! declared by the SMG plugin that runs inside the scheduler
+//! (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
+//! of parallel per-request columns. **Field order is the wire contract** — do
+//! not reorder; the plugin appends only.
 
 use bytes::Bytes;
 use serde::{
