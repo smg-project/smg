@@ -67,9 +67,25 @@ use crate::{
     },
 };
 
-/// The name the configured join peer (`--mesh-peer-urls`) goes by until
-/// its answer names it: in the dial's log lines and in the retry table.
+/// The name the first configured join peer (`--mesh-peer-urls`) goes by
+/// until its answer names it: in the dial's log lines and in the retry
+/// table. The entries after it carry their position: `init_peer_1`,
+/// `init_peer_2`, so each has a retry state of its own.
 const INIT_PEER_NAME: &str = "init_peer";
+
+/// The placeholder name of the join peer at `index` of the configured list.
+fn join_peer_name(index: usize) -> String {
+    if index == 0 {
+        INIT_PEER_NAME.to_string()
+    } else {
+        format!("{INIT_PEER_NAME}_{index}")
+    }
+}
+
+/// Whether `name` is a join peer's placeholder, not a member's name.
+fn is_join_peer(name: &str) -> bool {
+    name == INIT_PEER_NAME || name.starts_with(&format!("{INIT_PEER_NAME}_"))
+}
 
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
@@ -81,7 +97,9 @@ pub struct GossipController {
     state: ClusterState,
     self_name: String,
     self_addr: SocketAddr,
-    init_peer: Option<SocketAddr>,
+    /// The configured join peers, dialed in turn while the table holds
+    /// nobody else.
+    init_peers: Vec<SocketAddr>,
     /// The node's dials: the probes, the relayed probes and the status
     /// broadcasts go through it, one channel per peer address.
     dialer: Arc<Dialer>,
@@ -102,14 +120,14 @@ impl GossipController {
         state: ClusterState,
         self_addr: SocketAddr,
         self_name: &str,
-        init_peer: Option<SocketAddr>,
+        init_peers: Vec<SocketAddr>,
         dialer: Arc<Dialer>,
     ) -> Self {
         Self {
             state,
             self_name: self_name.to_string(),
             self_addr,
-            init_peer,
+            init_peers,
             dialer,
             sync_connections: Arc::new(Mutex::new(HashMap::new())),
             current_stream_batch: Arc::new(RwLock::new(Arc::new(crate::kv::RoundBatch::default()))),
@@ -142,7 +160,7 @@ impl GossipController {
             log::info!("Round {} Status:{:?}", round, self.state.read());
             self.reap_finished_streams().await;
             let targets = self.probe_targets();
-            let peer = self.peer_to_dial(&targets);
+            let peer = self.peer_to_dial(&targets, round);
             round += 1;
             self.periodic_gc(round, &targets, &mut retry_managers);
             self.collect_stream_batch();
@@ -230,14 +248,18 @@ impl GossipController {
     }
 
     /// The peer this round dials: a random probe target, or, while the table
-    /// holds nobody else, the configured join peer as a Suspected placeholder
-    /// named `init_peer`: at the start, and again should every other member
-    /// be gone, under its backoff like any peer. Members a service discovery
-    /// wrote into the table take precedence.
-    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>) -> Option<NodeState> {
+    /// holds nobody else, one of the configured join peers as a Suspected
+    /// placeholder named by its position (`init_peer`, `init_peer_1`, ...),
+    /// the entries taken in turn round by round: at the start, and again
+    /// should every other member be gone, each under its own backoff like
+    /// any peer. Members a service discovery wrote into the table take
+    /// precedence.
+    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>, round: u64) -> Option<NodeState> {
         if targets.is_empty() {
-            return self.init_peer.map(|init_peer| NodeState {
-                name: INIT_PEER_NAME.to_string(),
+            let count = u64::try_from(self.init_peers.len()).ok()?;
+            let index = usize::try_from(round.checked_rem(count)?).ok()?;
+            return self.init_peers.get(index).map(|init_peer| NodeState {
+                name: join_peer_name(index),
                 address: init_peer.to_string(),
                 status: NodeStatus::Suspected as i32,
                 version: 1,
@@ -253,10 +275,11 @@ impl GossipController {
     /// the receiver has held for a full assembly timeout are assumed lost,
     /// and the sender re-publishes on its own retry cycle with a fresh
     /// generation. Every sixtieth round (~60 s) the retry managers of peers
-    /// no longer in the table go; the join peer's entry stays, as it is never
-    /// in the table under its placeholder name and its backoff must not
-    /// restart every minute. The dialer's channels to addresses the table no
-    /// longer names go with them (the join peer's address stays too).
+    /// no longer in the table go; the join peers' entries stay, as they are
+    /// never in the table under their placeholder names and their backoff
+    /// must not restart every minute. The dialer's channels to addresses the
+    /// table no longer names go with them (the join peers' addresses stay
+    /// too).
     fn periodic_gc(
         &self,
         round: u64,
@@ -269,15 +292,14 @@ impl GossipController {
             }
         }
         if round.is_multiple_of(60) {
-            retry_managers.retain(|peer_name, _| {
-                targets.contains_key(peer_name) || peer_name == INIT_PEER_NAME
-            });
+            retry_managers
+                .retain(|peer_name, _| targets.contains_key(peer_name) || is_join_peer(peer_name));
             let members: Vec<SocketAddr> = self
                 .state
                 .read()
                 .values()
                 .filter_map(|node| node.address.parse().ok())
-                .chain(self.init_peer)
+                .chain(self.init_peers.iter().copied())
                 .collect();
             self.dialer.retain(|addr| members.contains(addr));
         }
@@ -298,7 +320,7 @@ impl GossipController {
     /// One dial of `peer` under its retry manager's backoff: nothing is
     /// dialled while the manager still backs off from an earlier failure;
     /// otherwise `connect` runs. Its success resets the manager, unless the
-    /// peer is the join peer and `has_another_member` finds the table still
+    /// peer is a join peer and `has_another_member` finds the table still
     /// without a member to probe (the join peer is this node itself, or it
     /// is leaving): that counts as an attempt, so the next dial waits out
     /// the backoff instead of coming every round. A failure records the
@@ -321,7 +343,7 @@ impl GossipController {
             };
         }
         match connect(peer.clone()).await {
-            Ok(()) if peer.name == INIT_PEER_NAME && !has_another_member() => {
+            Ok(()) if is_join_peer(&peer.name) && !has_another_member() => {
                 retry_manager.record_attempt();
                 DialOutcome::JoinPeerAlone {
                     next_delay: retry_manager.next_delay(),
@@ -923,7 +945,8 @@ mod retry_manager_tests {
 #[cfg(test)]
 mod dial_tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
+        net::SocketAddr,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -931,8 +954,11 @@ mod dial_tests {
         time::{Duration, Instant},
     };
 
+    use parking_lot::RwLock;
+
     use super::{
-        DialOutcome, GossipController, NodeState, NodeStatus, RetryManager, INIT_PEER_NAME,
+        is_join_peer, join_peer_name, DialOutcome, Dialer, GossipController, NodeState, NodeStatus,
+        RetryManager, INIT_PEER_NAME,
     };
 
     fn node(name: &str) -> NodeState {
@@ -1070,6 +1096,95 @@ mod dial_tests {
         assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
         assert_eq!(retry_managers[INIT_PEER_NAME].attempt_count(), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Every configured join peer is a join peer: the second entry's
+    /// placeholder answering alone records an attempt as the first's does,
+    /// under a retry state of its own.
+    #[tokio::test]
+    async fn every_join_peer_is_dialed_under_its_own_retry_state() {
+        assert_eq!(join_peer_name(0), INIT_PEER_NAME);
+        assert_eq!(join_peer_name(2), "init_peer_2");
+        assert!(is_join_peer(INIT_PEER_NAME) && is_join_peer("init_peer_1"));
+        assert!(!is_join_peer("init_peerless") && !is_join_peer("peer-a"));
+
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = node(&join_peer_name(1));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &second,
+            connect(&calls, true),
+            || false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::JoinPeerAlone { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(retry_managers["init_peer_1"].attempt_count(), 1);
+        assert!(
+            !retry_managers.contains_key(INIT_PEER_NAME),
+            "the first join peer's retry state is untouched"
+        );
+    }
+
+    /// While the table holds nobody to probe, the rounds dial the configured
+    /// join peers in turn, each under its placeholder; a member in the table
+    /// takes precedence over all of them.
+    #[test]
+    fn the_rounds_dial_the_join_peers_in_turn_while_the_table_is_empty() {
+        let seeds: Vec<SocketAddr> = vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            "127.0.0.1:3".parse().unwrap(),
+        ];
+        let state = Arc::new(RwLock::new(BTreeMap::new()));
+        let controller = GossipController::new(
+            state,
+            "127.0.0.1:9".parse().unwrap(),
+            "self",
+            seeds.clone(),
+            Dialer::new(None),
+        );
+        let nobody = BTreeMap::new();
+
+        let dialed: Vec<(String, String)> = (0..6)
+            .map(|round| {
+                let peer = controller
+                    .peer_to_dial(&nobody, round)
+                    .expect("a join peer to dial");
+                (peer.name, peer.address)
+            })
+            .collect();
+        assert_eq!(
+            dialed,
+            vec![
+                ("init_peer".to_string(), seeds[0].to_string()),
+                ("init_peer_1".to_string(), seeds[1].to_string()),
+                ("init_peer_2".to_string(), seeds[2].to_string()),
+                ("init_peer".to_string(), seeds[0].to_string()),
+                ("init_peer_1".to_string(), seeds[1].to_string()),
+                ("init_peer_2".to_string(), seeds[2].to_string()),
+            ],
+            "the entries are dialed in turn, round by round"
+        );
+
+        let members = BTreeMap::from([("peer-a".to_string(), node("peer-a"))]);
+        let peer = controller.peer_to_dial(&members, 0).expect("a member");
+        assert_eq!(peer.name, "peer-a", "a member in the table comes first");
+
+        let alone = GossipController::new(
+            Arc::new(RwLock::new(BTreeMap::new())),
+            "127.0.0.1:9".parse().unwrap(),
+            "self",
+            Vec::new(),
+            Dialer::new(None),
+        );
+        assert!(
+            alone.peer_to_dial(&nobody, 0).is_none(),
+            "no join peer configured, nobody to dial"
+        );
     }
 
     /// Two failures in a row double the wait, and each peer keeps its own

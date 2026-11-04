@@ -2154,9 +2154,9 @@ impl Router {
                             .collect();
                         format!("Mesh_{random_string}")
                     });
-                    let peer = self
+                    let init_peers = self
                         .mesh_peer_urls
-                        .first()
+                        .iter()
                         .map(|url| {
                             url.parse::<std::net::SocketAddr>().map_err(|e| {
                                 pyo3::exceptions::PyValueError::new_err(format!(
@@ -2164,7 +2164,7 @@ impl Router {
                                 ))
                             })
                         })
-                        .transpose()?;
+                        .collect::<PyResult<Vec<_>>>()?;
                     // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
@@ -2197,7 +2197,7 @@ impl Router {
                         self_name,
                         bind_addr,
                         advertise_addr,
-                        init_peer: peer,
+                        init_peers,
                         mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {

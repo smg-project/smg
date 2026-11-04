@@ -136,16 +136,16 @@ impl Drop for Gateway {
 }
 
 /// A gateway with the mesh on, with this node's identity under mTLS, on
-/// `ports` (HTTP, mesh, metrics), dialing `peer_mesh_port` when given and
-/// registering `worker_urls` at its start; its output goes to `<name>.log`
-/// next to the certificates. A worker removed through its API goes at once
-/// (no drain settle), so a peer's view of the removal is read within the
-/// mesh timeout.
+/// `ports` (HTTP, mesh, metrics), naming `peers` (mesh ports, in that order)
+/// in its peer URLs when given and registering `worker_urls` at its start;
+/// its output goes to `<name>.log` next to the certificates. A worker removed
+/// through its API goes at once (no drain settle), so a peer's view of the
+/// removal is read within the mesh timeout.
 fn spawn_gateway(
     name: &'static str,
     certs: &TestCertificates,
     ports: [u16; 3],
-    peer_mesh_port: Option<u16>,
+    peers: &[u16],
     mesh: Mesh,
     worker_urls: &[&str],
 ) -> Gateway {
@@ -174,8 +174,10 @@ fn spawn_gateway(
             .arg("--mesh-tls-key")
             .arg(&key);
     }
-    if let Some(port) = peer_mesh_port {
-        command.args(["--mesh-peer-urls", &format!("{IP}:{port}")]);
+    if !peers.is_empty() {
+        command
+            .arg("--mesh-peer-urls")
+            .args(peers.iter().map(|port| format!("{IP}:{port}")));
     }
     if !worker_urls.is_empty() {
         command.arg("--worker-urls").args(worker_urls);
@@ -191,14 +193,17 @@ fn spawn_gateway(
     }
 }
 
-/// Both gateways healthy with their mesh listeners' verdict in, B dialing
-/// A's mesh port, A registering `worker_urls` at its start. The pair is
-/// respawned on fresh ports when a gateway lost one of its ports between the
-/// pick and its bind, at most `SPAWN_ATTEMPTS` times.
+/// Both gateways healthy with their mesh listeners' verdict in, B naming
+/// A's mesh port in its peer URLs after `peers_before_a` (ports nobody
+/// listens on, for the join through a later entry), A registering
+/// `worker_urls` at its start. The pair is respawned on fresh ports when a
+/// gateway lost one of its ports between the pick and its bind, at most
+/// `SPAWN_ATTEMPTS` times.
 fn spawn_pair(
     certs: &TestCertificates,
     probe: &(PathBuf, PathBuf),
     mesh: Mesh,
+    peers_before_a: &[u16],
     worker_urls: &[&str],
 ) -> (Gateway, Gateway) {
     // One launch at a time in this binary: the six ports are released for the
@@ -212,15 +217,16 @@ fn spawn_pair(
             "nodea",
             certs,
             [http_a, mesh_a, metrics_a],
-            None,
+            &[],
             mesh,
             worker_urls,
         );
+        let peers: Vec<u16> = peers_before_a.iter().copied().chain([mesh_a]).collect();
         let mut b = spawn_gateway(
             "nodeb",
             certs,
             [http_b, mesh_b, metrics_b],
-            Some(mesh_a),
+            &peers,
             mesh,
             &[],
         );
@@ -548,7 +554,7 @@ fn logs(gateways: &[&Gateway]) -> String {
 fn mesh_with_mtls_forms_between_two_gateway_processes() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls, &[]);
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls, &[], &[]);
 
     // The mesh listener serves TLS to a peer that presents a certificate
     // from the CA.
@@ -633,7 +639,7 @@ fn mesh_with_mtls_forms_between_two_gateway_processes() {
 fn a_stopping_gateway_leaves_the_mesh() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain, &[]);
+    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[]);
     assert!(
         wait_until(MESH_TIMEOUT, || peer_connected(&a, "nodeb")
             || peer_connected(&b, "nodea")),
@@ -684,7 +690,7 @@ fn a_worker_registered_on_one_gateway_is_served_through_the_other() {
         let _serial = serial();
         MockHttpWorker::start()
     };
-    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[&engine.url]);
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[&engine.url]);
 
     let mut id_on_a = None;
     assert!(
@@ -834,4 +840,69 @@ fn unusable_mesh_tls_material_refuses_the_start() {
             "{name}: the mesh server served\n{log}"
         );
     }
+}
+
+/// A member whose first peer URL answers nobody joins through its second:
+/// every entry of `--mesh-peer-urls` is dialed in turn, each under its own
+/// retry state, and one live entry is enough.
+#[test]
+fn a_gateway_joins_through_its_second_peer_url_when_the_first_is_dead() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    // A port nobody listens on, picked and released like the gateways' own.
+    let [dead] = free_ports();
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[dead], &[]);
+    assert!(
+        wait_until(MESH_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Alive")),
+        "{} did not join through its second peer URL while the first is dead; its status on {}: {:?}\n{}",
+        b.name,
+        a.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+}
+
+/// Every entry of `--mesh-peer-urls` is read as a socket address, so a bad
+/// one refuses the start by name in whichever position it stands; before,
+/// only the first entry was read and the rest were taken for nothing.
+#[test]
+fn a_bad_entry_of_the_peer_urls_refuses_the_start_in_any_position() {
+    let _serial = serial();
+    let certs = TestCertificates::generate().expect("test certificates");
+    let [http_port, mesh_port, metrics_port, peer_port] = free_ports();
+    let ip = IP.to_string();
+    let mut args = base_args(http_port, metrics_port);
+    args.extend(
+        [
+            "--enable-mesh",
+            "--mesh-host",
+            &ip,
+            "--mesh-port",
+            &mesh_port.to_string(),
+            "--mesh-peer-urls",
+            &format!("{IP}:{peer_port}"),
+            "nowhere:x",
+        ]
+        .map(str::to_string),
+    );
+    let launch = launch_with(
+        &args,
+        &[http_port],
+        Until::Bound,
+        &certs.temp_dir.path().join("peer-urls.log"),
+    );
+    let log = &launch.log;
+    assert!(
+        launch.bound.is_none(),
+        "the HTTP port answered although the second peer URL is no socket address\n{log}"
+    );
+    assert!(
+        launch.status.is_some(),
+        "the gateway neither exited nor served within {EXIT_TIMEOUT:?}\n{log}"
+    );
+    assert!(
+        log.contains("nowhere:x"),
+        "the refusal names the entry\n{log}"
+    );
 }

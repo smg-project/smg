@@ -31,7 +31,10 @@ pub struct MeshServerConfig {
     pub self_name: String,
     pub bind_addr: SocketAddr,
     pub advertise_addr: SocketAddr,
-    pub init_peer: Option<SocketAddr>,
+    /// The join peers (`--mesh-peer-urls`): while the membership table holds
+    /// nobody else, they are dialed in turn, one per round, each under its
+    /// own retry backoff, until one answers.
+    pub init_peers: Vec<SocketAddr>,
     pub mtls_config: Option<MTLSConfig>,
 }
 
@@ -154,7 +157,7 @@ pub struct MeshServerBuilder {
     self_name: String,
     bind_addr: SocketAddr,
     advertise_addr: SocketAddr,
-    init_peer: Option<SocketAddr>,
+    init_peers: Vec<SocketAddr>,
     mtls_manager: Option<Arc<MTLSManager>>,
 }
 
@@ -163,7 +166,7 @@ impl MeshServerBuilder {
         self_name: String,
         bind_addr: SocketAddr,
         advertise_addr: SocketAddr,
-        init_peer: Option<SocketAddr>,
+        init_peers: Vec<SocketAddr>,
     ) -> Self {
         let state = Arc::new(RwLock::new(BTreeMap::from([(
             self_name.clone(),
@@ -180,7 +183,7 @@ impl MeshServerBuilder {
             self_name,
             bind_addr,
             advertise_addr,
-            init_peer,
+            init_peers,
             mtls_manager: None,
         }
     }
@@ -203,7 +206,7 @@ impl MeshServerBuilder {
                 self_name: self.self_name.clone(),
                 bind_addr: self.bind_addr,
                 advertise_addr: self.advertise_addr,
-                init_peer: self.init_peer,
+                init_peers: self.init_peers.clone(),
                 signal_rx,
                 partition_detector: Some(partition_detector.clone()),
                 dialer: Arc::clone(&dialer),
@@ -227,7 +230,7 @@ impl From<&MeshServerConfig> for MeshServerBuilder {
             value.self_name.clone(),
             value.bind_addr,
             value.advertise_addr,
-            value.init_peer,
+            value.init_peers.clone(),
         );
         if let Some(mtls_config) = &value.mtls_config {
             builder = builder.with_mtls(mtls_config.clone());
@@ -241,7 +244,7 @@ pub struct MeshServer {
     self_name: String,
     bind_addr: SocketAddr,
     advertise_addr: SocketAddr,
-    init_peer: Option<SocketAddr>,
+    init_peers: Vec<SocketAddr>,
     signal_rx: watch::Receiver<bool>,
     partition_detector: Option<Arc<PartitionDetector>>,
     /// The node's dials, shared by the gossip controller, the service and
@@ -267,7 +270,7 @@ impl MeshServer {
             self.state.clone(),
             self.advertise_addr,
             &self.self_name,
-            self.init_peer,
+            self.init_peers.clone(),
             Arc::clone(&self.dialer),
         )
         .with_mesh_kv(self.mesh_kv.clone())
@@ -476,15 +479,15 @@ pub(crate) async fn broadcast_node_states(
 
 #[macro_export]
 macro_rules! mesh_run {
-    ($addr:expr, $init_peer:expr) => {{
-        mesh_run!($addr.to_string(), $addr, $init_peer)
+    ($addr:expr, $init_peers:expr) => {{
+        mesh_run!($addr.to_string(), $addr, $init_peers)
     }};
 
-    ($name:expr, $addr:expr, $init_peer:expr) => {{
+    ($name:expr, $addr:expr, $init_peers:expr) => {{
         tracing::info!("Starting mesh server : {}", $addr);
         use $crate::MeshServerBuilder;
         let (server, handler) =
-            MeshServerBuilder::new($name.to_string(), $addr, $addr, $init_peer).build();
+            MeshServerBuilder::new($name.to_string(), $addr, $addr, $init_peers).build();
         #[expect(clippy::disallowed_methods, reason = "test macro: spawned server runs for the test lifetime and handler is returned for assertions")]
         tokio::spawn(async move {
             if let Err(e) = server.start().await {
@@ -494,11 +497,11 @@ macro_rules! mesh_run {
         handler
     }};
 
-    ($name:expr, $listener:expr, $addr:expr, $init_peer:expr) => {{
+    ($name:expr, $listener:expr, $addr:expr, $init_peers:expr) => {{
         tracing::info!("Starting mesh server : {}", $addr);
         use $crate::MeshServerBuilder;
         let (server, handler) =
-            MeshServerBuilder::new($name.to_string(), $addr, $addr, $init_peer).build();
+            MeshServerBuilder::new($name.to_string(), $addr, $addr, $init_peers).build();
         #[expect(clippy::disallowed_methods, reason = "test macro: spawned server runs for the test lifetime and handler is returned for assertions")]
         tokio::spawn(async move {
             if let Err(e) = server.start_with_listener($listener).await {
@@ -563,7 +566,7 @@ mod tests {
         let (listener, bind_addr) = bind_node().await;
         let advertise_addr = SocketAddr::from(([10, 20, 30, 40], bind_addr.port()));
         let (server, handler) =
-            MeshServerBuilder::new("A".to_string(), bind_addr, advertise_addr, None).build();
+            MeshServerBuilder::new("A".to_string(), bind_addr, advertise_addr, Vec::new()).build();
 
         #[expect(
             clippy::disallowed_methods,
@@ -610,9 +613,9 @@ mod tests {
 
         // 1. Setup A-B cluster
         let (listener_a, addr_a) = bind_node().await;
-        let handler_a = mesh_run!("A", listener_a, addr_a, None);
+        let handler_a = mesh_run!("A", listener_a, addr_a, Vec::new());
         let (listener_b, addr_b) = bind_node().await;
-        let handler_b = mesh_run!("B", listener_b, addr_b, Some(addr_a));
+        let handler_b = mesh_run!("B", listener_b, addr_b, vec![addr_a]);
 
         wait_for(
             || handler_a.state.read().len() == 2,
@@ -623,9 +626,9 @@ mod tests {
 
         // 2. Add C and D
         let (listener_c, addr_c) = bind_node().await;
-        let handler_c = mesh_run!("C", listener_c, addr_c, Some(addr_a));
+        let handler_c = mesh_run!("C", listener_c, addr_c, vec![addr_a]);
         let (listener_d, addr_d) = bind_node().await;
-        let handler_d = mesh_run!("D", listener_d, addr_d, Some(addr_c));
+        let handler_d = mesh_run!("D", listener_d, addr_d, vec![addr_c]);
 
         wait_for(
             || handler_a.state.read().len() == 4,
@@ -637,7 +640,7 @@ mod tests {
         // 3. Add E, let it join, then kill it
         {
             let (listener_e, addr_e) = bind_node().await;
-            let handler_e = mesh_run!("E", listener_e, addr_e, Some(addr_d));
+            let handler_e = mesh_run!("E", listener_e, addr_e, vec![addr_d]);
 
             wait_for(
                 || handler_a.state.read().len() == 5,
@@ -687,7 +690,7 @@ mod tests {
         let (listener_a, addr_a) = bind_node().await;
         drop(listener_a);
         let (listener_b, addr_b) = bind_node().await;
-        let handler_b = mesh_run!("B", listener_b, addr_b, Some(addr_a));
+        let handler_b = mesh_run!("B", listener_b, addr_b, vec![addr_a]);
 
         // B's first round and its dial pass before A binds its address.
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -699,7 +702,7 @@ mod tests {
         let listener_a = TcpListener::bind(addr_a)
             .await
             .expect("A's address is free again");
-        let handler_a = mesh_run!("A", listener_a, addr_a, None);
+        let handler_a = mesh_run!("A", listener_a, addr_a, Vec::new());
 
         wait_for(
             || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
@@ -831,16 +834,16 @@ mod tests {
     }
 
     /// A mesh node with mTLS on (client certificates required), bound to an
-    /// ephemeral port of `ip`, joining `init_peer` when given.
+    /// ephemeral port of `ip`, joining `init_peers`.
     async fn mtls_node(
         name: &str,
         ip: IpAddr,
-        init_peer: Option<SocketAddr>,
+        init_peers: Vec<SocketAddr>,
         certs: &MtlsTestCerts,
     ) -> (SocketAddr, MeshServerHandler) {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, init_peer)
+        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, init_peers)
             .with_mtls(mtls_config(certs))
             .build();
         let name = name.to_string();
@@ -868,8 +871,8 @@ mod tests {
         init();
         let _ = ring::default_provider().install_default();
         let certs = MtlsTestCerts::generate();
-        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
-        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+        let (addr_a, handler_a) = mtls_node("A", ip, Vec::new(), &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, vec![addr_a], &certs).await;
 
         wait_for(
             || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
@@ -916,8 +919,8 @@ mod tests {
         let _ = ring::default_provider().install_default();
         let certs = MtlsTestCerts::generate();
         let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
-        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
-        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+        let (addr_a, handler_a) = mtls_node("A", ip, Vec::new(), &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, vec![addr_a], &certs).await;
         wait_for(
             || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
             Duration::from_secs(20),
@@ -953,7 +956,8 @@ mod tests {
         init();
         let _ = ring::default_provider().install_default();
         let certs = MtlsTestCerts::generate();
-        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+        let (addr_a, handler_a) =
+            mtls_node("A", Ipv4Addr::LOCALHOST.into(), Vec::new(), &certs).await;
         let mut leaving_b = node_state("B", SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
         leaving_b.status = NodeStatus::Leaving as i32;
         let timeout = Some(Duration::from_secs(3));
@@ -1002,7 +1006,8 @@ mod tests {
         init();
         let _ = ring::default_provider().install_default();
         let certs = MtlsTestCerts::generate();
-        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+        let (addr_a, handler_a) =
+            mtls_node("A", Ipv4Addr::LOCALHOST.into(), Vec::new(), &certs).await;
 
         let trusting_only = ClientTlsConfig::new()
             .domain_name(addr_a.ip().to_string())
@@ -1038,7 +1043,8 @@ mod tests {
         let _ = ring::default_provider().install_default();
         let certs = MtlsTestCerts::generate();
         let foreign = MtlsTestCerts::generate();
-        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+        let (addr_a, handler_a) =
+            mtls_node("A", Ipv4Addr::LOCALHOST.into(), Vec::new(), &certs).await;
 
         let result = Dialer::new(Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))))
             .ping(
@@ -1054,7 +1060,7 @@ mod tests {
     /// A plain mesh node on an ephemeral loopback port, listening.
     async fn plain_node(name: &str) -> (SocketAddr, MeshServerHandler) {
         let (listener, addr) = bind_node().await;
-        let handler = mesh_run!(name, listener, addr, None);
+        let handler = mesh_run!(name, listener, addr, Vec::new());
         wait_for(
             || std::net::TcpStream::connect(addr).is_ok(),
             Duration::from_secs(5),
@@ -1113,6 +1119,32 @@ mod tests {
         handler_b.shutdown();
     }
 
+    /// A node whose first join peer is dead joins through its second: the
+    /// entries are dialed in turn, so a dead seed costs a round, not the
+    /// mesh.
+    #[tokio::test]
+    async fn a_node_joins_through_its_second_join_peer_when_the_first_is_dead() {
+        init();
+        let dead = {
+            let (listener, addr) = bind_node().await;
+            drop(listener);
+            addr
+        };
+        let (listener_a, addr_a) = bind_node().await;
+        let handler_a = mesh_run!("A", listener_a, addr_a, Vec::new());
+        let (listener_b, addr_b) = bind_node().await;
+        let handler_b = mesh_run!("B", listener_b, addr_b, vec![dead, addr_a]);
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "B joins A through its second join peer",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
     /// A member that goes away and comes back on its address answers a later
     /// dial through the channel kept for it: a dial into the gap fails
     /// instead of hanging, the channel reconnects by itself, and no second
@@ -1148,7 +1180,7 @@ mod tests {
             "a dial into the gap answered: {in_the_gap:?}"
         );
 
-        let handler = mesh_run!("A", listener, addr, None);
+        let handler = mesh_run!("A", listener, addr, Vec::new());
         let mut answer = None;
         for _ in 0..50 {
             match dialer.ping(&node_state("A", addr), Some(probe())).await {
@@ -1184,7 +1216,7 @@ mod tests {
         std::fs::write(&certs.node_cert_path, "not a certificate\n").unwrap();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (server, _handler) = MeshServerBuilder::new("node".to_string(), addr, addr, None)
+        let (server, _handler) = MeshServerBuilder::new("node".to_string(), addr, addr, Vec::new())
             .with_mtls(mtls_config(&certs))
             .build();
 
@@ -1212,7 +1244,7 @@ mod tests {
         let other = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let configured = other.local_addr().unwrap();
         let (server, _handler) =
-            MeshServerBuilder::new("node".to_string(), configured, configured, None).build();
+            MeshServerBuilder::new("node".to_string(), configured, configured, Vec::new()).build();
 
         let error = match server.prepare_with_listener(listener).await {
             Ok(_) => panic!("a mesh server was prepared on a listener bound elsewhere"),
