@@ -175,6 +175,18 @@ message GenerateRequest {
   // Additional modality batches, matching vLLM's mm_inputs + extra_mm_inputs.
   // Each batch owns its tensors, token ID and placeholders.
   repeated MultimodalInputs extra_mm_inputs = 21;
+
+  // Router-selected IMAGE encoders for one n == 1 prefill attempt. Not a decode hint.
+  EncodeHandoff encode_handoff = 22;
+}
+
+message EncodeHandoff {
+  // The final scheduler-side request ID; must match GenerateRequest.request_id.
+  // Multiple samples need per-choice handoffs and are not supported by this contract.
+  string request_id = 1;
+  // Ordered IMAGE-only snapshot: keep each URL aligned with its image count.
+  repeated string encoder_urls = 2;
+  repeated uint32 num_items_assigned = 3;
 }
 
 message TokenizedInput {

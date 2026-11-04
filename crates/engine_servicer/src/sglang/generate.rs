@@ -35,6 +35,11 @@ pub(super) async fn generate(
     mut req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
+    if req.encode_handoff.is_some() {
+        return Err(Status::unimplemented(
+            "router-selected SGLang encode handoff is not connected on this servicer",
+        ));
+    }
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
     let client = state.shared.engine()?;
