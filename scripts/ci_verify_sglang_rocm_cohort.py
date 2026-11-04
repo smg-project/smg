@@ -101,14 +101,19 @@ def verify(report):
     require(not CONSTRAINT.is_symlink() and digest(CONSTRAINT) == CONSTRAINT_SHA, "Torch constraint changed")
     versions = {name: md.version(name) for name in (
         "sglang", "torch", "apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext")}
-    expected = {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
+    expected_versions = {"sglang": "0.5.21", "torch": "2.11.0+rocm10.0.0",
         "apache-tvm-ffi": "0.1.12", "tilelang": "0.1.15", "torch-c-dlpack-ext": "0.1.5"}
+    differences = {name: (versions[name], expected_versions[name])
+                   for name in expected_versions if versions[name] != expected_versions[name]}
     native_names = ("apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext")
-    require(versions == expected,
-            "ERROR: native dependency versions (TVM, TileLang, DLPack): observed=%r expected=%r; "
-            "full cohort observed=%r expected=%r" % (
-                tuple(versions[name] for name in native_names),
-                tuple(expected[name] for name in native_names), versions, expected))
+    observed_native = tuple(versions[name] for name in native_names)
+    expected_native = tuple(expected_versions[name] for name in native_names)
+    native_diagnostic = (
+        "ERROR: native dependency versions (TVM, TileLang, DLPack): observed=%r expected=%r; "
+        % (observed_native, expected_native) if observed_native != expected_native else "")
+    require(versions == expected_versions,
+            "ERROR: SGLang ROCm cohort versions differ: %r; %sfull cohort observed=%r expected=%r"
+            % (differences, native_diagnostic, versions, expected_versions))
     root = Path(sysconfig.get_path("purelib")).resolve()
     require(root.is_relative_to(Path("/opt/venv")), "Unexpected site-packages")
     installed, record_names = {}, set()
@@ -140,10 +145,10 @@ def verify(report):
                     require(str(child.relative_to(root)) in names, "Unrecorded installed payload")
         installed[name] = {"RECORD_files": len(names), "distribution": str(folder)}
     require(set(ANCHORS) <= record_names, "Official anchor missing from installed RECORD")
-    for name, expected in ANCHORS.items():
+    for name, anchor_sha in ANCHORS.items():
         path = root / name
         require(not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(root), "Invalid anchor path")
-        require(digest(path) == expected, "Official payload anchor differs: " + name)
+        require(digest(path) == anchor_sha, "Official payload anchor differs: " + name)
     folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
     direct = json.loads((folder / "direct_url.json").read_text())
     require(direct.get("url") == SDIST_URL and direct.get("archive_info", {}).get("hashes", {}).get("sha256") == SDIST_SHA
