@@ -792,7 +792,10 @@ async fn a_connected_ranks_record_is_zero_filled_before_its_first_load_tail() {
 
 /// Two connected shims, one of which has reported a load tail: the record
 /// of the other stays zero-filled (an idle scheduler, not a gone one), never
-/// the sibling's figures; a rank past the connected ones has none.
+/// the sibling's figures; a rank past the connected ones has none. `GetLoads`
+/// answers the same figures for every connected rank, the named rank alone
+/// when the request names one, and the record pushed for a rank is that
+/// rank's poll entry.
 #[tokio::test]
 async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     let dir = tempfile::tempdir().unwrap();
@@ -802,8 +805,11 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.engine_count = 2;
     let server = TrtllmServicerServer::start(config).expect("servicer starts");
+    // A KV capacity on the handshake, so the token figures below are real
+    // counts (the shim's batch reports 10 of 100 KV tokens), not zeros.
     let ready = |rank: u32| EngineCoreReadyResponse {
         data_parallel_rank: rank,
+        kv_cache_size_tokens: Some(100),
         ..ready_response()
     };
     let (first, second) = tokio::join!(
@@ -859,6 +865,83 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
         "{idle:?}"
     );
     assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    let loads = client
+        .get_loads(smg_grpc_client::trtllm_proto::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2, "{loads:?}");
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_total_reqs))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, i32::from(served == 0), i32::from(served == 0)),
+            (1, i32::from(served == 1), i32::from(served == 1))
+        ]
+    );
+    assert!(loads
+        .loads
+        .iter()
+        .all(|load| load.prefill_throughput.is_none()));
+    // The served rank's entry carries the shim's real counts over the
+    // handshake's capacity; the idle rank reads the capacity and no use.
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (
+                load.dp_rank,
+                load.num_used_tokens,
+                load.max_total_num_tokens
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, if served == 0 { 10 } else { 0 }, 100),
+            (1, if served == 1 { 10 } else { 0 }, 100)
+        ]
+    );
+    // The record the relay pushes for a rank is the poll's entry for it: one
+    // field set on both wires, the token counts and the KV capacity included,
+    // so a gateway's DP-rank token cache reads the same from a push as from
+    // a poll.
+    for load in &loads.loads {
+        let pushed = kv_events::LoadSource::load(&source, Some(load.dp_rank))
+            .expect("the rank's pushed record");
+        assert_eq!(
+            (pushed.num_used_tokens, pushed.max_total_num_tokens),
+            (Some(load.num_used_tokens), Some(load.max_total_num_tokens)),
+            "{pushed:?}"
+        );
+        let mut from_push = openai_protocol::worker::SchedulerLoadSnapshot::from(&pushed);
+        from_push.dp_rank = load.dp_rank;
+        assert_eq!(
+            format!(
+                "{:?}",
+                openai_protocol::worker::SchedulerLoadSnapshot::from(*load)
+            ),
+            format!("{from_push:?}")
+        );
+    }
+    let named = client
+        .get_loads(smg_grpc_client::trtllm_proto::GetLoadsRequest {
+            dp_rank: Some(served_rank),
+            include: vec![],
+        })
+        .await
+        .expect("get_loads of one rank")
+        .into_inner();
+    assert_eq!(
+        (
+            named.dp_rank_count,
+            named.loads.len(),
+            named.loads[0].dp_rank
+        ),
+        (1, 1, served_rank)
+    );
 
     drop(stream);
     server.stop(Duration::from_secs(5)).expect("clean stop");

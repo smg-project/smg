@@ -125,48 +125,18 @@ pub struct TrtllmServicerConfig {
     pub model: TrtllmModelInfo,
 }
 
-/// The per-rank load the relay attaches to every batch it streams: the
-/// engine's proto has no `GetLoads`, so the record is built from the load
-/// tail of the shim's batches directly.
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams: the same entry the poll answers with
+/// for the rank, so both wires carry one field set (the token counts and
+/// the KV capacity included). A connected rank reads its own entry,
+/// zero-filled before its first load tail; a rank past the connected ones
+/// gets no record (`rank_entries`).
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
-        let client = self.shared.engine.client.get()?;
-        let loads = client.get_loads().loads;
-        let reported = match dp_rank {
-            Some(rank) => loads.iter().find(|load| load.dp_rank == rank),
-            None => loads
-                .iter()
-                .find(|load| load.dp_rank == 0)
-                .or_else(|| loads.first()),
-        };
-        let (running_requests, waiting_requests, token_usage) = match reported {
-            Some(load) => (
-                u32::try_from(load.num_running_reqs).unwrap_or(0),
-                u32::try_from(load.num_waiting_reqs).unwrap_or(0),
-                load.token_usage,
-            ),
-            // A connected rank no batch has carried a load tail for yet (an
-            // idle scheduler, whether or not a sibling rank has reported)
-            // reads as zero, as on the other wires (`unreported_ranks`); a
-            // rank past the connected ones gets no record.
-            None => {
-                let rank = usize::try_from(dp_rank.unwrap_or(0)).ok()?;
-                if rank >= self.rank_count() {
-                    return None;
-                }
-                (0, 0, 0.0)
-            }
-        };
-        Some(common::EngineLoad {
-            running_requests,
-            waiting_requests,
-            token_usage,
-            max_running_requests: u32::try_from(
-                self.shared.running_window(self.model.max_running_requests),
-            )
-            .unwrap_or(0),
-            ..Default::default()
-        })
+        let response = info::loads(self, dp_rank).ok()?;
+        // The engine reports no queued token-work on this wire yet: the
+        // record's `waiting_uncached_tokens` stays unset.
+        Some(common::EngineLoad::from(response.loads.first()?))
     }
 
     fn engine_link(&self) -> &EngineLink {

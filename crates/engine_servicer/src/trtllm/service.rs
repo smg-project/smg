@@ -95,6 +95,16 @@ impl TrtllmService for TrtllmServicer {
         Ok(Response::new(info::server_info(&self.state)))
     }
 
+    async fn get_loads(
+        &self,
+        request: Request<trt::GetLoadsRequest>,
+    ) -> Result<Response<trt::GetLoadsResponse>, Status> {
+        Ok(Response::new(info::loads(
+            &self.state,
+            request.into_inner().dp_rank,
+        )?))
+    }
+
     async fn get_tokenizer(
         &self,
         _request: Request<common::GetTokenizerRequest>,
