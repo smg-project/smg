@@ -250,7 +250,9 @@ def test_launch_failure_preserves_existing_reports_and_saved_scores(tmp_path):
     assert not any(event.startswith("python:") for event in trace)
 
 
-def run_actual_diff(tmp_path, candidate_score, report_error=None):
+def run_actual_diff(
+    tmp_path, candidate_score, report_error=None, *, diagnostic_write_failure=False
+):
     for name, score in [("vllm", 1.0), ("smg", candidate_score)]:
         (tmp_path / f"{name}.json").write_text(
             json.dumps({"name": name, "scores": {"mock": score}, "counts": {"mock": 1}})
@@ -262,21 +264,51 @@ def run_actual_diff(tmp_path, candidate_score, report_error=None):
     elif report_error == "json":
         report.mkdir()
     driver = Path(__file__).resolve().parents[1] / "bfcl/run_ab.py"
+    command = [
+        sys.executable,
+        str(driver),
+        "--diff-baseline",
+        str(tmp_path / "vllm.json"),
+        "--diff-candidate",
+        str(tmp_path / "smg.json"),
+        "--categories",
+        "mock",
+        "--out",
+        str(markdown),
+        "--json-out",
+        str(report),
+    ]
+    if diagnostic_write_failure:
+        wrapper = tmp_path / "broken_stderr.py"
+        wrapper.write_text(
+            textwrap.dedent(
+                """\
+                import runpy
+                import sys
+                from pathlib import Path
+
+                class BrokenStderr:
+                    def write(self, _text):
+                        Path(__file__).with_suffix(".attempted").write_text("attempted")
+                        raise OSError("diagnostic writer unavailable")
+
+                    def flush(self):
+                        pass
+
+                driver = sys.argv[1]
+                sys.argv = sys.argv[1:]
+                original_stderr = sys.stderr
+                sys.stderr = BrokenStderr()
+                try:
+                    runpy.run_path(driver, run_name="__main__")
+                finally:
+                    sys.stderr = original_stderr
+                """
+            )
+        )
+        command.insert(1, str(wrapper))
     return subprocess.run(
-        [
-            sys.executable,
-            str(driver),
-            "--diff-baseline",
-            str(tmp_path / "vllm.json"),
-            "--diff-candidate",
-            str(tmp_path / "smg.json"),
-            "--categories",
-            "mock",
-            "--out",
-            str(markdown),
-            "--json-out",
-            str(report),
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=10,
@@ -297,3 +329,10 @@ def test_actual_driver_preserves_clean_and_regression_exit_codes(tmp_path, candi
     assert (tmp_path / "comparison.md").is_file()
     report = json.loads((tmp_path / "comparison.json").read_text())
     assert not report["incomplete"]
+
+
+def test_actual_driver_diagnostic_write_failure_remains_hard_incomplete(tmp_path):
+    result = run_actual_diff(tmp_path, 1.0, "markdown", diagnostic_write_failure=True)
+    assert result.returncode == 2
+    assert (tmp_path / "broken_stderr.attempted").read_text() == "attempted"
+    assert not (tmp_path / "comparison.json").exists()

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import math
@@ -1005,6 +1006,7 @@ if __name__ == "__main__":
         exit_code = main()
     except Exception:
         # Exit 1 is reserved for a completed comparison's score regression.
-        traceback.print_exc()
         exit_code = EXIT_INCOMPLETE
+        with contextlib.suppress(Exception):
+            traceback.print_exc()
     raise SystemExit(exit_code)
