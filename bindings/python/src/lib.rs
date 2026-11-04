@@ -67,6 +67,30 @@ pub enum BackendType {
     Gemini,
 }
 
+impl BackendType {
+    /// The routing mode of a provider backend, with the URLs it is given: a
+    /// provider backend is a mode of its own and wins over the disaggregation
+    /// flags, as the CLI's `--backend` does. `None` for an engine backend,
+    /// whose mode those flags select.
+    fn provider_mode(&self, worker_urls: &[String]) -> Option<config::RoutingMode> {
+        use config::RoutingMode;
+
+        let mode = match self {
+            Self::Openai => RoutingMode::OpenAI {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Anthropic => RoutingMode::Anthropic {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Gemini => RoutingMode::Gemini {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Sglang | Self::Vllm | Self::Tokenspeed | Self::Trtllm => return None,
+        };
+        Some(mode)
+    }
+}
+
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum HistoryBackendType {
@@ -951,18 +975,8 @@ impl Router {
 
         // IGW does not override backend or disaggregated modes; IGW-only keeps
         // the Python binding's existing empty startup-worker behavior.
-        let mode = if matches!(self.backend, BackendType::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, BackendType::Anthropic) {
-            RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, BackendType::Gemini) {
-            RoutingMode::Gemini {
-                worker_urls: self.worker_urls.clone(),
-            }
+        let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
+            provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
                 encode_urls: self.encode_urls.clone().unwrap_or_default(),
@@ -2275,4 +2289,44 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
+}
+
+// Built and run without the extension-module feature, which leaves the Python
+// symbols to the interpreter that loads the extension and so cannot link a
+// test binary: `cargo test -p smg-python --no-default-features --lib`.
+#[cfg(test)]
+mod tests {
+    use config::RoutingMode;
+
+    use super::*;
+
+    #[test]
+    fn a_provider_backend_is_its_routing_mode_and_an_engine_backend_is_none() {
+        let urls = vec!["https://provider.example".to_string()];
+        let provider = |backend: BackendType| backend.provider_mode(&urls);
+
+        assert!(matches!(
+            provider(BackendType::Openai),
+            Some(RoutingMode::OpenAI { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Anthropic),
+            Some(RoutingMode::Anthropic { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Gemini),
+            Some(RoutingMode::Gemini { worker_urls }) if worker_urls == urls
+        ));
+        for engine in [
+            BackendType::Sglang,
+            BackendType::Vllm,
+            BackendType::Tokenspeed,
+            BackendType::Trtllm,
+        ] {
+            assert!(
+                engine.provider_mode(&urls).is_none(),
+                "{engine:?} is an engine backend: the disaggregation flags select its mode"
+            );
+        }
+    }
 }
