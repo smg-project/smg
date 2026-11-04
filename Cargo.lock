@@ -1510,6 +1510,12 @@ dependencies = [
 
 [[package]]
 name = "daachorse"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
+
+[[package]]
+name = "daachorse"
 version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
@@ -2219,6 +2225,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "env_filter",
+ "jiff",
+ "log",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2336,6 +2365,17 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fancy-regex"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
@@ -2357,6 +2397,29 @@ dependencies = [
  "image",
  "num-traits",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fastokens"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84024abb104481ef6b9c55df497f941f92f49515c428afd78b990efc906f1aa6"
+dependencies = [
+ "aho-corasick",
+ "daachorse 1.0.1",
+ "fancy-regex 0.17.0",
+ "fastrand",
+ "icu_normalizer",
+ "libc",
+ "memchr",
+ "pcre2",
+ "rayon",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.21",
+ "unicode-normalization-alignments",
 ]
 
 [[package]]
@@ -3156,6 +3219,9 @@ dependencies = [
  "icu_properties",
  "icu_provider",
  "smallvec",
+ "utf16_iter",
+ "utf8_iter",
+ "write16",
  "zerovec",
 ]
 
@@ -4012,7 +4078,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
- "tiktoken-rs",
+ "tiktoken-rs 0.12.1",
  "tokenizers 0.23.2",
  "tokenizers 1.0.0-rc.3",
  "tokio",
@@ -4020,6 +4086,7 @@ dependencies = [
  "tracing",
  "unicode-normalization-alignments",
  "uuid",
+ "vllm-tokenizer",
 ]
 
 [[package]]
@@ -5416,6 +5483,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcre2"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
+dependencies = [
+ "libc",
+ "log",
+ "pcre2-sys",
+]
+
+[[package]]
+name = "pcre2-sys"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18b9073c1a2549bd409bf4a32c94d903bb1a09bf845bc306ae148897fa0760a4"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6695,6 +6784,19 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "riptoken"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "196b37c4dd48f99b51e8aeaa3d0c343df62c7bb5b66cd6735aa072524fbe8665"
+dependencies = [
+ "fancy-regex 0.17.0",
+ "rayon",
+ "regex",
+ "regex-automata",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]
@@ -8187,6 +8289,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8482,6 +8605,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
+name = "tekken"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1481e6bbb98c7e1b04124420b6e7c367c87fc897aae340edcdeb4e91b639d2"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "env_logger",
+ "log",
+ "regex",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tiktoken-rs 0.9.1",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8519,6 +8660,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl 2.0.21",
+]
+
+[[package]]
+name = "thiserror-ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fb7e61141f4141832ca9aad63c3c90023843f944a1975460abdacc64d03f534"
+dependencies = [
+ "thiserror 2.0.21",
+ "thiserror-ext-derive",
+]
+
+[[package]]
+name = "thiserror-ext-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b5042dd3b562d1d57711be902006a0003fa2781b81d5b2bec07416be31586ff"
+dependencies = [
+ "either",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -8564,6 +8727,21 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a19830747d9034cd9da43a60eaa8e552dfda7712424aebf187b7a60126bae0d"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex 0.13.0",
+ "lazy_static",
+ "regex",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -8755,13 +8933,47 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
+dependencies = [
+ "ahash",
+ "aho-corasick",
+ "compact_str",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.3.4",
+ "indicatif",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand 0.9.5",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.21",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokenizers"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
 dependencies = [
  "ahash",
  "compact_str",
- "daachorse",
+ "daachorse 3.0.3",
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
@@ -9538,6 +9750,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "utf16_iter"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c7de35d9d8757dbc1f5125dc8b51438c68b4430546a735c3a9b91aaaaf9a18a"
+dependencies = [
+ "utf_types",
+]
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9548,6 +9769,12 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "utf_types"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "uuid"
@@ -9619,6 +9846,26 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vllm-tokenizer"
+version = "0.1.0"
+source = "git+https://github.com/vllm-project/vllm?rev=da0b6ac2216e93d33aa0650d89f7be51bb53ca43#da0b6ac2216e93d33aa0650d89f7be51bb53ca43"
+dependencies = [
+ "base64 0.22.1",
+ "fastokens",
+ "riptoken",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tekken",
+ "thiserror 2.0.21",
+ "thiserror-ext",
+ "tiktoken-rs 0.9.1",
+ "tokenizers 0.22.2",
+ "tracing",
+]
 
 [[package]]
 name = "walkdir"
@@ -10629,6 +10876,12 @@ dependencies = [
  "thiserror 1.0.69",
  "wast 35.0.2",
 ]
+
+[[package]]
+name = "write16"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1890f4022759daae28ed4fe62859b1236caebfc61ede2f63ed4e695f3f6d936"
 
 [[package]]
 name = "writeable"

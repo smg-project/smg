@@ -1,11 +1,12 @@
 //! Which encoder serves a Hugging Face tokenizer's encodes.
 //!
 //! The choice is made once per load, in order of preference: the opt-in
-//! `tokenizers` v1 pipeline (feature `tokenizers-v1`), the crate's direct
-//! byte-level encoder (`native`), and `tokenizers` 0.23 itself. Each of the
-//! first two takes the tokenizers whose configuration it reproduces and
-//! declines the rest with a reason (`Declined`); the load logs the path it
-//! ended on and those reasons, once. After the choice an input can still
+//! `vllm-tokenizer` backend (feature `vllm`), the opt-in `tokenizers` v1
+//! pipeline (feature `tokenizers-v1`), the crate's direct byte-level encoder
+//! (`native`), and `tokenizers` 0.23 itself. Each of the first three takes
+//! the tokenizers whose configuration it reproduces and declines the rest
+//! with a reason (`Declined`); the load logs the path it ended on and those
+//! reasons, once. After the choice an input can still
 //! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
 //! work done up to that point.
 //!
@@ -17,12 +18,15 @@
 use std::{
     borrow::Cow,
     fmt,
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 /// The path a Hugging Face tokenizer's encodes take, chosen at load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodePath {
+    /// The opt-in `vllm-tokenizer` backend, the vLLM Rust frontend's.
+    Vllm,
     /// The opt-in `tokenizers` v1 pipeline.
     V1,
     /// The crate's direct byte-level encoder.
@@ -33,11 +37,12 @@ pub enum EncodePath {
 
 impl EncodePath {
     /// Every path, in order of preference.
-    pub const ALL: [Self; 3] = [Self::V1, Self::Native, Self::Tokenizers];
+    pub const ALL: [Self; 4] = [Self::Vllm, Self::V1, Self::Native, Self::Tokenizers];
 
     /// The path's name as the metrics and the log write it.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Vllm => "vllm",
             Self::V1 => "v1",
             Self::Native => "native",
             Self::Tokenizers => "tokenizers",
@@ -46,9 +51,10 @@ impl EncodePath {
 
     fn index(self) -> usize {
         match self {
-            Self::V1 => 0,
-            Self::Native => 1,
-            Self::Tokenizers => 2,
+            Self::Vllm => 0,
+            Self::V1 => 1,
+            Self::Native => 2,
+            Self::Tokenizers => 3,
         }
     }
 }
@@ -82,6 +88,11 @@ impl fmt::Display for Declined {
     }
 }
 
+/// What the load hands the opt-in `vllm-tokenizer` backend (feature `vllm`):
+/// the `tokenizer.json` to read, where the wrapper's pipeline is the file's,
+/// else why the backend declines (see `vllm`).
+pub(crate) type VllmSource<'a> = Result<&'a Path, Declined>;
+
 /// Why one input left the direct encoder for `tokenizers` after the load's
 /// choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +118,12 @@ impl Fallback {
     }
 }
 
-static LOADS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static LOADS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 static FALLBACKS: [AtomicU64; 1] = [AtomicU64::new(0)];
 
 /// Count one load that ended on `path`.
@@ -141,7 +157,7 @@ pub struct EncodeFallbacks {
 }
 
 /// Read process-lifetime totals, including activity before a metrics recorder exists.
-pub fn encode_path_loads() -> [EncodePathLoads; 3] {
+pub fn encode_path_loads() -> [EncodePathLoads; 4] {
     EncodePath::ALL.map(|path| EncodePathLoads {
         path,
         loads: LOADS[path.index()].load(Ordering::Relaxed),

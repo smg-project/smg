@@ -575,10 +575,13 @@ mod tests {
     /// added tokens with the family's normalizer and pre-tokenizer.
     #[test]
     fn a_downloaded_vocab_and_merges_pair_loads_like_its_tokenizer_json() {
+        // The newline byte has a token too: a checkpoint's byte-level
+        // vocabulary holds every byte, and the opt-in `vllm` backend rejects
+        // a byte without one where `tokenizers` drops it.
         let vocab = json!({
             "H": 0, "e": 1, "l": 2, "o": 3, "Ġ": 4, "w": 5, "r": 6, "d": 7, "!": 8,
             "ll": 9, "He": 10, "Hell": 11, "Hello": 12,
-            "Ġw": 13, "Ġwo": 14, "Ġwor": 15, "Ġworl": 16, "Ġworld": 17
+            "Ġw": 13, "Ġwo": 14, "Ġwor": 15, "Ġworl": 16, "Ġworld": 17, "Ċ": 18
         });
         let merges = [
             ["l", "l"],
@@ -613,8 +616,8 @@ mod tests {
                 "tokenizer_class": "Qwen2Tokenizer",
                 "add_prefix_space": false,
                 "added_tokens_decoder": {
-                    "18": added(18, "<|im_start|>", true),
-                    "19": added(19, "<tool_call>", false)
+                    "19": added(19, "<|im_start|>", true),
+                    "20": added(20, "<tool_call>", false)
                 }
             }))
             .unwrap(),
@@ -626,7 +629,7 @@ mod tests {
             as_json.path().join("tokenizer.json"),
             serde_json::to_vec(&json!({
                 "version": "1.0",
-                "added_tokens": [added(18, "<|im_start|>", true), added(19, "<tool_call>", false)],
+                "added_tokens": [added(19, "<|im_start|>", true), added(20, "<tool_call>", false)],
                 "normalizer": {"type": "NFC"},
                 "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                     {"type": "Split",

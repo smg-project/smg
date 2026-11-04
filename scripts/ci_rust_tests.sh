@@ -163,7 +163,8 @@ commands_of() {
             echo "-p smg-python -p smg-golang" ;;
         tokenizer)
             echo "-p llm-tokenizer"
-            echo "-p llm-tokenizer --features tokenizers-v1" ;;
+            echo "-p llm-tokenizer --features tokenizers-v1"
+            echo "-p llm-tokenizer --features vllm" ;;
         multimodal)
             echo "-p llm-multimodal" ;;
         symphony)

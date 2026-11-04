@@ -1,4 +1,6 @@
 mod segment;
+#[cfg(feature = "vllm")]
+mod vllm;
 
 use std::{collections::HashMap, fs};
 

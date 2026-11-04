@@ -34,7 +34,7 @@ use crate::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
     },
-    encode_path::{self, EncodePath},
+    encode_path::{self, Declined, EncodePath, VllmSource},
     encoders::{
         deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
         PromptSegment, RendererProfile, TemplateAnswers,
@@ -112,6 +112,10 @@ pub struct HuggingFaceTokenizer {
     /// `native` is `None`).
     #[cfg(feature = "tokenizers-v1")]
     v1: Option<crate::v1::V1Encoder>,
+    /// The opt-in `vllm-tokenizer` backend, when the choice took it (then
+    /// `v1` and the core's `native` are `None`).
+    #[cfg(feature = "vllm")]
+    vllm: Option<crate::vllm::VllmBackend>,
     has_byte_fallback: bool,
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
@@ -174,6 +178,8 @@ struct AddedTokenConfig {
 /// The encoders a tokenizer may serve an encode with before `tokenizers`
 /// itself, chosen once per load by [`DirectEncoders::choose`].
 struct DirectEncoders {
+    #[cfg(feature = "vllm")]
+    vllm: Option<crate::vllm::VllmBackend>,
     #[cfg(feature = "tokenizers-v1")]
     v1: Option<crate::v1::V1Encoder>,
     native: Option<NativeEncoder>,
@@ -181,11 +187,34 @@ struct DirectEncoders {
 
 impl DirectEncoders {
     /// The first path, in order of preference, that takes `tokenizer`: the
-    /// opt-in v1 pipeline (behind its feature), the direct byte-level
-    /// encoder, else none and `tokenizers` encodes. The choice is logged
-    /// once, with the reasons the paths before it declined, and counted per
-    /// path ([`encode_path::encode_path_loads`]).
-    fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
+    /// opt-in `vllm-tokenizer` backend (behind its feature, over the file
+    /// `vllm` names), the opt-in v1 pipeline (behind its feature), the
+    /// direct byte-level encoder, else none and `tokenizers` encodes. The
+    /// choice is logged once, with the reasons the paths before it declined,
+    /// and counted per path ([`encode_path::encode_path_loads`]).
+    fn choose<M: Model + ModelView + Serialize>(
+        tokenizer: &TokenizerOf<M>,
+        vllm: VllmSource<'_>,
+    ) -> Self {
+        #[cfg(feature = "vllm")]
+        match crate::vllm::VllmBackend::load(vllm) {
+            Ok(vllm) => {
+                encode_path::note_load(EncodePath::Vllm);
+                tracing::info!(path = %EncodePath::Vllm, "tokenizer encode path");
+                return Self {
+                    vllm: Some(vllm),
+                    #[cfg(feature = "tokenizers-v1")]
+                    v1: None,
+                    native: None,
+                };
+            }
+            Err(declined) => tracing::info!(
+                vllm_declined = %declined,
+                "the opt-in vllm-tokenizer backend declined this tokenizer; its encodes take the next path"
+            ),
+        }
+        #[cfg(not(feature = "vllm"))]
+        let _ = vllm;
         #[cfg(feature = "tokenizers-v1")]
         let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
             tokenizer,
@@ -195,6 +224,8 @@ impl DirectEncoders {
                 encode_path::note_load(EncodePath::V1);
                 tracing::info!(path = %EncodePath::V1, "tokenizer encode path");
                 return Self {
+                    #[cfg(feature = "vllm")]
+                    vllm: None,
                     v1: Some(v1),
                     native: None,
                 };
@@ -232,6 +263,8 @@ impl DirectEncoders {
             "tokenizer encode path"
         );
         Self {
+            #[cfg(feature = "vllm")]
+            vllm: None,
             #[cfg(feature = "tokenizers-v1")]
             v1: None,
             native,
@@ -439,6 +472,10 @@ impl HuggingFaceTokenizer {
     /// The path this tokenizer's encodes take, chosen at load (see
     /// [`EncodePath`]).
     pub fn encode_path(&self) -> EncodePath {
+        #[cfg(feature = "vllm")]
+        if self.vllm.is_some() {
+            return EncodePath::Vllm;
+        }
         #[cfg(feature = "tokenizers-v1")]
         if self.v1.is_some() {
             return EncodePath::V1;
@@ -750,12 +787,13 @@ impl HuggingFaceTokenizer {
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
-        Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
+        let class_pipeline =
+            Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
         // Two added tokens matched after normalization can share one
         // normalized spelling, and which of them `tokenizers` matches changes
         // from process to process. Settled before the encode path is chosen
         // (the rule is on `settle_normalized_added_token_ties`).
-        Self::settle_normalized_added_token_ties(&mut tokenizer).map_err(|error| {
+        let settled = Self::settle_normalized_added_token_ties(&mut tokenizer).map_err(|error| {
             Error::msg(format!(
                 "Failed to load tokenizer: the added tokens with one normalized spelling did not settle: {error}"
             ))
@@ -815,12 +853,18 @@ impl HuggingFaceTokenizer {
             None => needs_eos && Self::tokenizer_adds_special_tokens(&tokenizer),
         };
 
+        // Whether the configured template frames an encode differently from
+        // the file's own post-processor (a file read alone then gives other
+        // ids on request, which the opt-in backend reading it alone would).
+        let mut post_processor_replaced = false;
         if needs_bos || needs_eos {
             if let Some(post_processor) =
                 Self::build_post_processor(needs_bos, needs_eos, &special_tokens, &vocab)
             {
                 debug!(needs_bos, needs_eos, "Configured post_processor");
+                let file_frame = Self::special_token_frame(&tokenizer);
                 tokenizer.with_post_processor(Some(post_processor));
+                post_processor_replaced = Self::special_token_frame(&tokenizer) != file_frame;
             }
         }
 
@@ -843,7 +887,30 @@ impl HuggingFaceTokenizer {
             .map(|dir| detect_renderer_from_config(dir, chat_template_str.is_some()))
             .unwrap_or(Renderer::Jinja);
 
-        let mut encoders = DirectEncoders::choose(&tokenizer);
+        // The opt-in `vllm-tokenizer` backend reads `tokenizer.json` alone:
+        // it takes the file where the pipeline is the file's, and declines
+        // where the load built the pipeline from other files or changed it
+        // beyond the file, so that its ids are the wrapper's (see `vllm`).
+        let vllm_source: VllmSource<'_> = if !tokenizer_path.is_file() {
+            Err(Declined::from(
+                "no tokenizer.json (the vocabulary was read from vocab.json and merges.txt)",
+            ))
+        } else if class_pipeline {
+            Err(Declined::from(
+                "the Llama class's pipeline was installed over the file's",
+            ))
+        } else if settled > 0 {
+            Err(Declined::from(
+                "added tokens with one normalized spelling were settled beyond the file",
+            ))
+        } else if post_processor_replaced {
+            Err(Declined::from(
+                "the configured special tokens frame an encode differently from the file's post-processor",
+            ))
+        } else {
+            Ok(tokenizer_path)
+        };
+        let mut encoders = DirectEncoders::choose(&tokenizer, vllm_source);
         // The bound rides on the file's model into the built tokenizer: no
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
@@ -877,6 +944,8 @@ impl HuggingFaceTokenizer {
             pieces: PieceTable::build(&tokenizer),
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
+            #[cfg(feature = "vllm")]
+            vllm: encoders.vllm,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
             special_tokens,
             vocab,
@@ -960,7 +1029,8 @@ impl HuggingFaceTokenizer {
     /// pipeline (no normalizer, the `Metaspace` pre-tokenizer, and the
     /// class's decoder, which strips the one leading space of the decoded
     /// text only where the marker is prepended) over the file's vocabulary,
-    /// added tokens and post-processor; any other file stays as it is.
+    /// added tokens and post-processor; any other file stays as it is. Says
+    /// whether the class's pipeline was installed.
     ///
     /// The class is read from `tokenizer_config.json`, as the reference reads
     /// it, before any `config.json`: a checkpoint shipped as the tokenizer's
@@ -975,23 +1045,23 @@ impl HuggingFaceTokenizer {
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
         config: &TokenizerConfigResult,
-    ) {
+    ) -> bool {
         if !matches!(
             config.tokenizer_class.as_deref(),
             Some("LlamaTokenizer" | "LlamaTokenizerFast")
         ) {
-            return;
+            return false;
         }
         if dir
             .and_then(model_type_from_config)
             .is_some_and(|model_type| reference_reads_as_file(&model_type))
         {
-            return;
+            return false;
         }
         if tokenizer.get_pre_tokenizer().is_some()
             || !is_legacy_prepend_normalizer(tokenizer.get_normalizer())
         {
-            return;
+            return false;
         }
         let add_prefix_space = config.add_prefix_space.unwrap_or(true);
         let scheme = match (add_prefix_space, config.legacy.unwrap_or(false)) {
@@ -1009,7 +1079,7 @@ impl HuggingFaceTokenizer {
             Ok(marker) => marker,
             Err(error) => {
                 warn!(class, %error, "the file's pipeline stays: the class's decoder did not build");
-                return;
+                return false;
             }
         };
         let mut decoder: Vec<DecoderWrapper> = vec![
@@ -1024,7 +1094,7 @@ impl HuggingFaceTokenizer {
         // which this function exists to replace: said at `warn!`.
         if let Err(error) = tokenizer.with_normalizer(None::<NormalizerWrapper>) {
             warn!(class, %error, "the file's pipeline stays: the added vocabulary did not refresh without the normalizer");
-            return;
+            return false;
         }
         tokenizer.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
         tokenizer.with_decoder(Some(DecoderSequence::new(decoder)));
@@ -1033,14 +1103,21 @@ impl HuggingFaceTokenizer {
             add_prefix_space,
             "Llama-class pipeline: no normalizer, a Metaspace pre-tokenizer, the class's decoder"
         );
+        true
     }
 
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
     fn tokenizer_adds_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> bool {
+        !Self::special_token_frame(tokenizer).is_empty()
+    }
+
+    /// The ids the post-processor adds around an empty text on request: the
+    /// frame of every encode with special tokens.
+    fn special_token_frame<M: Model>(tokenizer: &TokenizerOf<M>) -> Vec<TokenIdType> {
         tokenizer
             .encode("", true)
-            .map(|enc| !enc.get_ids().is_empty())
-            .unwrap_or(false)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .unwrap_or_default()
     }
 
     /// Build a TemplateProcessing post_processor (matches Python transformers' update_post_processor)
@@ -1116,7 +1193,12 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        let mut encoders = DirectEncoders::choose(&tokenizer);
+        let mut encoders = DirectEncoders::choose(
+            &tokenizer,
+            Err(Declined::from(
+                "the tokenizer was built in memory, with no tokenizer.json to read",
+            )),
+        );
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         encoders.seed_native(tokenizer.get_model());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
@@ -1133,6 +1215,8 @@ impl HuggingFaceTokenizer {
             pieces: PieceTable::build(&tokenizer),
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
+            #[cfg(feature = "vllm")]
+            vllm: encoders.vllm,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
             special_tokens,
             vocab,
@@ -1517,6 +1601,10 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        #[cfg(feature = "vllm")]
+        if let Some(vllm) = &self.vllm {
+            return vllm.encode(input, add_special_tokens);
+        }
         #[cfg(feature = "tokenizers-v1")]
         if let Some(v1) = &self.v1 {
             return v1.encode(input, add_special_tokens);
@@ -1538,6 +1626,10 @@ impl Encoder for HuggingFaceTokenizer {
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        #[cfg(feature = "vllm")]
+        if let Some(vllm) = &self.vllm {
+            return vllm.encode_batch(inputs, add_special_tokens);
+        }
         #[cfg(feature = "tokenizers-v1")]
         if let Some(v1) = &self.v1 {
             return v1.encode_batch(inputs, add_special_tokens);
@@ -1879,6 +1971,13 @@ impl Decoder for HuggingFaceTokenizer {
     }
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        // The opt-in backend decodes every batch, in front of the wrapper's
+        // own tables; the streaming windows of a byte-fallback vocabulary
+        // keep the piece table (see `window_decode`).
+        #[cfg(feature = "vllm")]
+        if let Some(vllm) = &self.vllm {
+            return vllm.decode(token_ids, skip_special_tokens);
+        }
         #[cfg(feature = "tokenizers-v1")]
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
