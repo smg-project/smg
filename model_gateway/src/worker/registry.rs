@@ -387,6 +387,13 @@ pub struct WorkerRegistry {
     /// removed in `remove()` teardown.
     worker_origins: Arc<DashMap<WorkerId, WorkerOrigin>>,
 
+    /// The publisher's `version` a mesh import was last built from, written
+    /// with the import and removed with it. A state on the import's own key
+    /// with a higher version is its owner's in-place replacement and
+    /// rebuilds the import (`on_remote_worker_state`); the same version
+    /// replayed by the reconcile pass is a health hint only.
+    import_versions: Arc<DashMap<WorkerId, u64>>,
+
     /// Broadcast channel for worker state change events.
     event_tx: broadcast::Sender<WorkerEvent>,
 
@@ -442,6 +449,7 @@ impl WorkerRegistry {
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
+            import_versions: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
             // storms): a lagged subscriber forces a full state resync, so
             // the capacity should comfortably exceed realistic worker
@@ -1552,6 +1560,9 @@ impl WorkerRegistry {
 
         if let Some(origin) = promote_origin {
             self.worker_origins.insert(worker_id.clone(), origin);
+            // A claimed import is this node's worker from here on; the
+            // publication it was built from no longer matters.
+            self.import_versions.remove(worker_id);
         }
 
         let _ = self.event_tx.send(WorkerEvent::Replaced {
@@ -1832,6 +1843,7 @@ impl WorkerRegistry {
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
             self.worker_origins.remove(worker_id);
+            self.import_versions.remove(worker_id);
 
             for model_id in Self::worker_model_ids(&worker) {
                 self.remove_worker_from_model_index(&model_id, worker.url());
@@ -2581,14 +2593,15 @@ impl Default for WorkerRegistry {
 impl WorkerRegistry {
     /// Sink for inbound mesh worker-state updates. The v2
     /// `WorkerSyncAdapter` calls this for each entry it pulls from
-    /// the `worker:` CRDT namespace. Behaviour matches the prior
-    /// `WorkerStateSubscriber` impl: URL-dedupe a remote update
-    /// against an existing local worker (refresh health only), or
-    /// register a new worker from the embedded `WorkerSpec` (falling
-    /// back to a minimal builder if the spec is absent or invalid).
+    /// the `worker:` CRDT namespace. A state for a URL this registry
+    /// holds refreshes the worker's health, unless it is a newer
+    /// publication of a mesh import's own key: then its owner replaced
+    /// the worker in place, and the import is rebuilt from the embedded
+    /// `WorkerSpec` under its id before the health is read. A state for
+    /// a URL this registry does not hold registers a new worker from the
+    /// spec (falling back to a minimal builder if the spec is absent or
+    /// invalid).
     pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
-        use openai_protocol::model_card::ModelCard;
-
         // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
         // on the publisher's machine, so importing it here would advertise a
         // route that can never reach the engine. Publishers filter these out;
@@ -2603,7 +2616,8 @@ impl WorkerRegistry {
 
         // If worker already exists at this URL, update its health
         // status from the mesh state. Don't re-register — the existing
-        // worker has full config from its creation workflow.
+        // worker has full config from its creation workflow (an import
+        // whose owner replaced the worker is the exception, below).
         // `true` promotes `Pending`/`NotReady` to `Ready`; `false` only
         // demotes from `Ready` to `NotReady`. `Failed` and `Draining`
         // are owned by the local state machine, never by mesh hints — a
@@ -2620,6 +2634,35 @@ impl WorkerRegistry {
                     "Ignoring mesh state for locally-owned worker"
                 );
                 return;
+            }
+            // An owner that replaces a worker in place (a new model, role,
+            // bootstrap port or labels under the same address) publishes
+            // the replacement under the same key with a higher version.
+            // An import built from the earlier state would otherwise keep
+            // that specification for as long as it lives and route what
+            // the worker no longer serves. The rebuild goes through the
+            // replacement path, so the id, the origin and the shared
+            // runtime state (status, breaker, counters) stay; the health
+            // hint below then applies to the rebuilt import.
+            if self.is_newer_publication_of_import(&existing_id, state) {
+                let Some(spec) = Self::importable_spec(state) else {
+                    return;
+                };
+                let replacement: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
+                if !self.replace_inner(&existing_id, replacement, None, None) {
+                    // Removed between the read and the lock: the key's
+                    // next event or pass imports it anew.
+                    return;
+                }
+                self.import_versions
+                    .insert(existing_id.clone(), state.version);
+                tracing::info!(
+                    worker_id = %existing_id.as_str(),
+                    url = %state.url,
+                    model = %state.model_id,
+                    version = state.version,
+                    "Rebuilt mesh-synced worker from its owner's replacement"
+                );
             }
             // The status is read and the write decided under the worker's
             // mutation lock, in one step with the write: decided outside
@@ -2661,31 +2704,8 @@ impl WorkerRegistry {
         // id reservation below would outlive it and a legitimate worker
         // later arriving at this URL would silently inherit the rejected
         // publisher's id — breaking tombstone routing for it.
-        let spec = if state.spec.is_empty() {
-            None
-        } else {
-            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
-                Ok(spec) => {
-                    // Same-host transport declared by the spec rather than by
-                    // the URL scheme — not routable from this node.
-                    if spec.connection_mode == ConnectionMode::Zmq {
-                        tracing::debug!(
-                            url = %state.url,
-                            "Ignoring mesh state for host-local ZMQ worker"
-                        );
-                        return;
-                    }
-                    Some(spec)
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        url = %state.url,
-                        %err,
-                        "undecodable WorkerSpec in mesh state; importing minimal worker"
-                    );
-                    None
-                }
-            }
+        let Some(spec) = Self::importable_spec(state) else {
+            return;
         };
 
         // Adopt the publisher's worker id for the import so a later
@@ -2704,21 +2724,7 @@ impl WorkerRegistry {
         // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
         let spec_applied = spec.is_some();
-        let worker = match spec {
-            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
-            None => super::builder::BasicWorkerBuilder::new(&state.url)
-                .model(ModelCard::new(&state.model_id))
-                .build(),
-        };
-
-        // An explicitly-unhealthy import must not be routable: the builder
-        // defaults `disable_health_check` workers to `Ready`, so the
-        // `false` case needs a forced demotion, not just no promotion.
-        if state.health {
-            worker.set_status(WorkerStatus::Ready);
-        } else {
-            worker.set_status(WorkerStatus::NotReady);
-        }
+        let worker: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
 
         // A `Mesh` origin keeps the outbound sync from re-publishing the
         // imported state (which would version-bump the CRDT in a loop),
@@ -2726,8 +2732,8 @@ impl WorkerRegistry {
         // per-worker mutation lock so in-process subscribers
         // (WorkerManager's health scheduler, etc.) pick up mesh-imported
         // workers via the same event path as any other registration.
-        let worker: Arc<dyn Worker> = Arc::new(worker);
         if let Some(id) = self.register_inner(worker, WorkerOrigin::Mesh) {
+            self.import_versions.insert(id.clone(), state.version);
             tracing::info!(
                 worker_id = %id.as_str(),
                 url = %state.url,
@@ -2737,6 +2743,85 @@ impl WorkerRegistry {
                 "Registered mesh-synced worker into local registry"
             );
         }
+    }
+
+    /// Whether `state` is the owner's newer publication of the key a mesh
+    /// import was built from: the import's own key (the import adopted the
+    /// publisher's id) carrying a higher version than the one recorded with
+    /// the import. A state from another key for the same address (a second
+    /// publisher, an orphan key of the owner's earlier life) is not, and
+    /// neither is a replay of the version the import already has.
+    fn is_newer_publication_of_import(
+        &self,
+        import_id: &WorkerId,
+        state: &smg_mesh::WorkerState,
+    ) -> bool {
+        state.worker_id == import_id.as_str()
+            && self
+                .import_versions
+                .get(import_id)
+                .is_some_and(|built_from| state.version > *built_from)
+    }
+
+    /// The `WorkerSpec` a published state carries, decoded, under the
+    /// transport gate it declares: `None` when the worker is host-local to
+    /// its publisher (a `Zmq` connection mode declared by the spec rather
+    /// than by the URL scheme) and must not be imported here; `Some(None)`
+    /// when the spec is absent or undecodable, for the minimal builder.
+    fn importable_spec(
+        state: &smg_mesh::WorkerState,
+    ) -> Option<Option<openai_protocol::worker::WorkerSpec>> {
+        if state.spec.is_empty() {
+            return Some(None);
+        }
+        match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+            Ok(spec) => {
+                // Same-host transport declared by the spec rather than by
+                // the URL scheme — not routable from this node.
+                if spec.connection_mode == ConnectionMode::Zmq {
+                    tracing::debug!(
+                        url = %state.url,
+                        "Ignoring mesh state for host-local ZMQ worker"
+                    );
+                    return None;
+                }
+                Some(Some(spec))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    url = %state.url,
+                    %err,
+                    "undecodable WorkerSpec in mesh state; importing minimal worker"
+                );
+                Some(None)
+            }
+        }
+    }
+
+    /// The worker a published state imports as: built from its spec when it
+    /// has one, from the minimal builder otherwise, with the status the
+    /// state's health says. An explicitly-unhealthy import must not be
+    /// routable: the builder defaults `disable_health_check` workers to
+    /// `Ready`, so the `false` case needs a forced demotion, not just no
+    /// promotion.
+    fn import_from(
+        state: &smg_mesh::WorkerState,
+        spec: Option<openai_protocol::worker::WorkerSpec>,
+    ) -> super::basic::BasicWorker {
+        use openai_protocol::model_card::ModelCard;
+
+        let worker = match spec {
+            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            None => super::builder::BasicWorkerBuilder::new(&state.url)
+                .model(ModelCard::new(&state.model_id))
+                .build(),
+        };
+        worker.set_status(if state.health {
+            WorkerStatus::Ready
+        } else {
+            WorkerStatus::NotReady
+        });
+        worker
     }
 }
 

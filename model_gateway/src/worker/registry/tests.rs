@@ -750,6 +750,127 @@ fn register_or_replace_promotes_mesh_origin_to_local() {
     );
 }
 
+/// The spec a publisher's state carries, as the outbound sync encodes it.
+fn spec_bytes(url: &str, model: &str, worker_type: WorkerType) -> Vec<u8> {
+    let worker = BasicWorkerBuilder::new(url)
+        .model(ModelCard::new(model))
+        .worker_type(worker_type)
+        .build();
+    serde_json::to_vec(&worker.metadata().spec).unwrap()
+}
+
+#[test]
+fn a_newer_state_on_the_imports_own_key_rebuilds_the_import_from_its_spec() {
+    // The owner replaced the worker in place (a new model and role under the
+    // same address) and published the replacement under the same key with a
+    // higher version. Before, such a state refreshed the import's health
+    // only, and the import kept the specification it was first built from.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Regular),
+    );
+    state.version = 3;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let import = registry.get(&id).unwrap();
+    assert_eq!(import.model_id(), "m1");
+    let built = import.revision();
+
+    let mut replaced = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m2", WorkerType::Decode),
+    );
+    replaced.version = 4;
+    registry.on_remote_worker_state(&replaced);
+    let rebuilt = registry.get(&id).expect("the import keeps its id");
+    assert_eq!(
+        rebuilt.model_id(),
+        "m2",
+        "the import follows the owner's new model"
+    );
+    assert_eq!(
+        *rebuilt.worker_type(),
+        WorkerType::Decode,
+        "and its new role"
+    );
+    assert_eq!(
+        registry.origin_of(&id),
+        Some(WorkerOrigin::Mesh),
+        "a rebuilt import is still an import"
+    );
+    assert!(
+        rebuilt.revision() > built,
+        "the rebuild went through the replacement path"
+    );
+    assert_eq!(
+        registry.get_id_by_url(url),
+        Some(id.clone()),
+        "under the same id, so the owner's tombstone still resolves"
+    );
+
+    // The reconcile pass replays the key's current state every interval:
+    // the same version is a health hint, not another rebuild.
+    let rebuilt_at = rebuilt.revision();
+    registry.on_remote_worker_state(&replaced);
+    assert_eq!(
+        registry.get(&id).unwrap().revision(),
+        rebuilt_at,
+        "a replay of the version the import has rebuilds nothing"
+    );
+
+    // The health hint still reaches the rebuilt import.
+    replaced.health = false;
+    registry.on_remote_worker_state(&replaced);
+    assert_eq!(
+        registry.get(&id).unwrap().status(),
+        WorkerStatus::NotReady,
+        "an unhealthy state demotes the rebuilt import"
+    );
+}
+
+#[test]
+fn a_state_from_another_key_for_an_imports_address_stays_a_health_hint() {
+    // Only the import's own key rebuilds it: a state under another id for
+    // the same address (a second publisher of the endpoint, or an orphan
+    // key of the owner's earlier life) carries a version from another
+    // sequence, and is read as it always was, for its health alone.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Regular),
+    );
+    state.version = 1;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let built = registry.get(&id).unwrap().revision();
+
+    let mut other = remote_state(
+        "peer-w2",
+        url,
+        false,
+        spec_bytes(url, "m2", WorkerType::Decode),
+    );
+    other.version = 9;
+    registry.on_remote_worker_state(&other);
+    let import = registry.get(&id).expect("the import stays");
+    assert_eq!(import.model_id(), "m1", "another key's spec is not applied");
+    assert_eq!(import.revision(), built, "and nothing was rebuilt");
+    assert_eq!(
+        import.status(),
+        WorkerStatus::NotReady,
+        "its health hint applied, as before"
+    );
+}
+
 #[test]
 fn remove_inner_aborts_when_origin_changed_before_lock() {
     // The TOCTOU guard: remove_remote's pre-check can observe Mesh,
