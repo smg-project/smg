@@ -849,29 +849,213 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata(
-            &crate::clients::http_client(),
-            "http://0.0.0.0:30000",
-            None,
-        )
-        .await;
-        dump_labels("SGLang HTTP combined", &labels);
-        assert!(labels.contains_key("model_path"));
-        assert!(labels.contains_key("tokenizer_path"));
+    fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+        labels.get(key).map(String::as_str)
     }
 
+    /// The SGLang HTTP read asks `/server_info`, `/model_info` and
+    /// `/v1/models` and combines them: the engine's own labels first, the
+    /// model list filling in what they left out.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_vllm_http_metadata() {
-        let labels =
-            fetch_vllm_http_metadata(&crate::clients::http_client(), "http://0.0.0.0:20000", None)
-                .await;
-        dump_labels("vLLM HTTP", &labels);
-        assert!(labels.contains_key("model_path"));
-        assert!(labels.contains_key("version"));
+    async fn the_sglang_http_read_combines_the_three_endpoints_with_the_engines_own_labels_first() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::OK,
+                serde_json::json!({
+                    "model_path": "org/model-a", "tp_size": 4, "dp_size": 1,
+                    "max_running_requests": 256, "version": "0.5.0",
+                }),
+            ),
+            (
+                "/model_info",
+                StatusCode::OK,
+                serde_json::json!({
+                    "model_path": "org/model-a", "tokenizer_path": "org/model-a-tokenizer",
+                    "is_generation": true,
+                }),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [
+                    {"id": "served-a", "root": "org/model-a-root", "max_model_len": 32768}
+                ]}),
+            ),
+        ])
+        .await;
+
+        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        assert_eq!(
+            label(&labels, "model_path"),
+            Some("org/model-a"),
+            "the engine's own model path, not the model list's root: {labels:?}"
+        );
+        assert_eq!(
+            label(&labels, "tokenizer_path"),
+            Some("org/model-a-tokenizer")
+        );
+        assert_eq!(label(&labels, "tp_size"), Some("4"));
+        assert_eq!(label(&labels, "max_running_requests"), Some("256"));
+        assert_eq!(label(&labels, "version"), Some("0.5.0"));
+        assert_eq!(label(&labels, "is_generation"), Some("true"));
+        assert_eq!(
+            label(&labels, "served_model_name"),
+            Some("served-a"),
+            "the model list fills in the served name the engine's info left out"
+        );
+        assert_eq!(label(&labels, "max_model_len"), Some("32768"));
+    }
+
+    /// An endpoint gone to 404 is read at its older `/get_` spelling; one
+    /// that answers 404 under both spellings is one the engine does not
+    /// offer, tolerated by the strict read as by registration.
+    #[tokio::test]
+    async fn the_sglang_http_read_takes_the_older_spelling_and_tolerates_an_endpoint_not_offered() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/get_server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-b", "tp_size": 2}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "served-b"}]}),
+            ),
+        ])
+        .await;
+        let client = crate::clients::http_client();
+
+        let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
+        assert_eq!(label(&tolerant, "tp_size"), Some("2"));
+        assert_eq!(label(&tolerant, "served_model_name"), Some("served-b"));
+        assert_eq!(
+            label(&tolerant, "tokenizer_path"),
+            None,
+            "an endpoint not offered leaves no label: {tolerant:?}"
+        );
+
+        let strict = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect("an endpoint the engine does not offer fails no read");
+        assert_eq!(strict, tolerant);
+    }
+
+    /// An endpoint that fails leaves a gap in the registration read and
+    /// fails a strict read, named.
+    #[tokio::test]
+    async fn an_endpoint_that_fails_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name()
+    {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-c"}),
+            ),
+            (
+                "/model_info",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": "down"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": []}),
+            ),
+        ])
+        .await;
+        let client = crate::clients::http_client();
+
+        let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
+        assert_eq!(label(&tolerant, "tokenizer_path"), None, "{tolerant:?}");
+
+        let error = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on a failing endpoint");
+        assert!(
+            error.starts_with("model_info: status 500"),
+            "the error names the endpoint and its answer: {error}"
+        );
+    }
+
+    /// The vLLM HTTP read takes the model's identity and window from
+    /// `/v1/models` and the build from `/version`; a `/version` the engine
+    /// does not offer leaves no label and fails no read.
+    #[tokio::test]
+    async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let models = serde_json::json!({"data": [
+            {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
+        ]});
+        let client = crate::clients::http_client();
+
+        let base = serve_json_routes(vec![
+            ("/v1/models", StatusCode::OK, models.clone()),
+            (
+                "/version",
+                StatusCode::OK,
+                serde_json::json!({"version": "0.31.0"}),
+            ),
+        ])
+        .await;
+        let labels = fetch_vllm_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
+        assert_eq!(label(&labels, "served_model_name"), Some("served-d"));
+        assert_eq!(label(&labels, "max_model_len"), Some("8192"));
+        assert_eq!(label(&labels, "version"), Some("0.31.0"));
+
+        let without_version = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+        let labels = fetch_vllm_http_metadata_checked(&client, &without_version, None, true)
+            .await
+            .expect("a version endpoint the engine does not offer fails no read");
+        assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
+        assert_eq!(label(&labels, "version"), None, "{labels:?}");
+    }
+
+    /// An engine that refuses the connection leaves registration with no
+    /// labels and fails a strict read on the first endpoint, named.
+    #[tokio::test]
+    async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
+    ) {
+        use crate::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let base = refused.http_url();
+        let client = crate::clients::http_client();
+
+        assert!(fetch_vllm_http_metadata(&client, &base, None)
+            .await
+            .is_empty());
+        assert!(fetch_sglang_http_metadata(&client, &base, None)
+            .await
+            .is_empty());
+
+        let error = fetch_vllm_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on an engine it cannot reach");
+        assert!(error.starts_with("/v1/models: "), "{error}");
+        let error = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on an engine it cannot reach");
+        assert!(error.starts_with("server_info: "), "{error}");
     }
 
     #[tokio::test]
