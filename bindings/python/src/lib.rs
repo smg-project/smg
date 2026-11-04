@@ -2154,9 +2154,14 @@ impl Router {
                             .collect();
                         format!("Mesh_{random_string}")
                     });
+                    // The binary's flag takes the entries space- or comma-separated
+                    // (clap splits the list); the Python launcher hands each argument
+                    // through as typed, so the comma list is split here for both.
                     let init_peers = self
                         .mesh_peer_urls
                         .iter()
+                        .flat_map(|entry| entry.split(','))
+                        .filter(|url| !url.is_empty())
                         .map(|url| {
                             url.parse::<std::net::SocketAddr>().map_err(|e| {
                                 pyo3::exceptions::PyValueError::new_err(format!(

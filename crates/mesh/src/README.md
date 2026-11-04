@@ -86,7 +86,7 @@ The gateway configures the mesh from its flags (`model_gateway/src/main.rs`,
 | `--mesh-host <ip>` | Bind address of the mesh listener; an IP literal, IPv6 with or without brackets. Default `0.0.0.0`. |
 | `--mesh-port <port>` | The listener's port, default `39527`; must differ from `--port`, `--prometheus-port`, `--health-check-port` and `--admin-port`, and cannot be `0`. |
 | `--mesh-advertise-host <ip>` | The address peers dial for this node; required when `--mesh-host` is unspecified (`0.0.0.0`, `::`). Advertised with `--mesh-port`. |
-| `--mesh-peer-urls <ip:port> ...` | Where to join: while the node's membership table holds nobody else, the entries are dialed in turn, one per round, each under the retry backoff (1 s doubling to 60 s), until one answers; the rest of the mesh is learned from that member. A peer that is not up yet is dialed again, so the members may start in any order. |
+| `--mesh-peer-urls <ip:port> ...` | Where to join, as separate values or one comma-separated list: while the node's membership table holds nobody else, the entries are dialed in turn, one per round, each under the retry backoff (1 s doubling to 60 s), until one answers; the rest of the mesh is learned from that member. A peer that is not up yet is dialed again, so the members may start in any order. |
 | `--mesh-tls-ca-cert`, `--mesh-tls-cert`, `--mesh-tls-key` | Mutual TLS between members: all three or none. The listener then serves TLS with the node certificate and requires a peer certificate from the CA; every dial presents this node's certificate. The node certificate carries the node's IP as a SAN. |
 
 A member whose mesh port is held by another process, or whose TLS material

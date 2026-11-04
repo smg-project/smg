@@ -42,7 +42,7 @@ router:
   mesh:
     enabled: false
     port: 39527               # mesh gossip port
-    # peerUrls: []            # auto-generated from StatefulSet pod DNS
+    # peerUrls: []            # ip:port entries, one flag each; a hostname is refused
     # Without peerUrls the routers find each other among the release's router
     # pods through the Kubernetes API, which the gateway runs only inside
     # Kubernetes discovery; with the file, slurm or consul discovery

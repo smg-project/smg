@@ -1812,12 +1812,12 @@ struct IntegrationArgs {
     #[arg(long, default_value_t = 39527)]
     mesh_port: u16,
 
-    /// Where to join, as `ip:port` of other members' mesh listeners: while
-    /// the membership table holds nobody else, the entries are dialed in
-    /// turn under the retry backoff until one answers, and the rest of the
-    /// mesh is learned from that member. On Kubernetes `--router-selector`
-    /// finds the members instead.
-    #[arg(long, num_args = 0..)]
+    /// Where to join, as `ip:port` of other members' mesh listeners,
+    /// space- or comma-separated: while the membership table holds nobody
+    /// else, the entries are dialed in turn under the retry backoff until
+    /// one answers, and the rest of the mesh is learned from that member. On
+    /// Kubernetes `--router-selector` finds the members instead.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
     mesh_peer_urls: Vec<String>,
 
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
@@ -2496,8 +2496,6 @@ mod tests {
         }
     }
 
-    /// Mesh bind and advertise hosts go through the shared bind-host rule, so
-    /// IPv6 works with or without brackets, as it does for `--host`.
     /// Every `--mesh-peer-urls` entry is a join peer, in the order given; an
     /// entry that is no socket address is refused by name, whatever its
     /// position.
@@ -2538,6 +2536,42 @@ mod tests {
         );
     }
 
+    /// The peer URLs may stand as separate values or as one comma-separated
+    /// list; both read as the same join peers, in the order given.
+    #[test]
+    fn mesh_peer_urls_parse_the_same_comma_separated_and_as_separate_values() {
+        let init_peers = |peer_args: &[&str]| {
+            let mut args = vec![
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-peer-urls",
+            ];
+            args.extend_from_slice(peer_args);
+            cli_args_from(&args)
+                .build_mesh_server_config()
+                .expect("a valid mesh configuration")
+                .expect("the mesh is on")
+                .init_peers
+        };
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527", "10.0.0.3:39527"]),
+            expected,
+            "separate values, in order"
+        );
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527,10.0.0.3:39527"]),
+            expected,
+            "one comma-separated list reads as the same join peers"
+        );
+    }
+
+    /// Mesh bind and advertise hosts go through the shared bind-host rule, so
+    /// IPv6 works with or without brackets, as it does for `--host`.
     #[test]
     fn mesh_hosts_accept_both_ipv6_spellings() {
         for (host, advertise, expected_bind, expected_advertise) in [
