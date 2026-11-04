@@ -75,7 +75,11 @@ per second near the `stream` path's):
 |---|---|---|---|
 | `messages_stream` | `POST /v1/messages`, `stream: true`, `max_tokens` 300 | 300 tokens, one per event, `length` | 100/s |
 | `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
-| `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 15/s |
+| `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 16/s |
+
+The long path's cells are long at the Makefile's default `PERF_REQUESTS` (10,000 requests at
+16/s is 625 s per cell, and the alloc cells run at half the rate): pass a smaller count when
+naming it, for example `PERF_REQUESTS=3000`; its rate stays a whole number at the alloc scale.
 
 The gateway runs with `--parser symphony --tool-call-parser json` (`--gw-args` changes it),
 `cache_aware` routing, 8 runtime threads and log level `warn`, as `grpc_stress/bed.sh` sets

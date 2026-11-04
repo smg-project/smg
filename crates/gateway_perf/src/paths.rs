@@ -144,7 +144,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
         },
         PathSpec {
             name: "generate_stream_long",
-            rate: 15.0,
+            rate: 16.0,
             client: &[
                 "--mode",
                 "generate",
