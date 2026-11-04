@@ -7911,6 +7911,7 @@ dependencies = [
  "prost",
  "pyo3",
  "rand 0.10.2",
+ "rayon",
  "reasoning-parser",
  "serde_json",
  "serde_yaml",

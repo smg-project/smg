@@ -31,6 +31,9 @@ use servicer::{
     PyVllmGrpcServer,
 };
 
+mod tokenizer;
+use tokenizer::PyTokenizer;
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
@@ -2286,6 +2289,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
+    m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
