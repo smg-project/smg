@@ -4,44 +4,20 @@
 //! the count is this test's own; the pushes run on a current-thread runtime.
 //!
 //! `cargo test -p llm-multimodal --test tracker_alloc_pins -- --nocapture` prints the count.
-#![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 mod common;
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
+use common::counting_alloc::{Counting, CALLS};
 use llm_multimodal::{
     types::{MediaContentPart, Modality},
     AsyncMultiModalTracker, MediaConnector, MediaConnectorConfig,
 };
-
-struct Counting;
-
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
