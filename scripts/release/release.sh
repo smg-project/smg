@@ -1369,9 +1369,17 @@ ship_tag() { # the tag at the branch head, pushed; a tag that exists elsewhere s
 }
 
 notes_unfilled() { # <file>: what keeps a notes file from publication, one line each (nothing when it is ready): an empty file, a
-  # heading that is not the release's; the notes template's unfilled placeholders join here once the notes render it
+  # first line that is not the template's for this release, a placeholder the template's check still finds (a fresh render
+  # carries the author's, so the ship stops here until the notes are written; the check's lines go to stderr for them)
+  local first left
   [ -s "$1" ] || { say "the file is empty"; return 0; }
-  head -n 1 "$1" | grep -qx "## SMG $ship_tag" || say "the first line is not '## SMG $ship_tag'"
+  first=$(head -n 1 "$root/scripts/release/NOTES-TEMPLATE.md" | sed "s/{{version}}/$ship_version/g")
+  head -n 1 "$1" | grep -qxF -- "$first" || say "the first line is not '$first'"
+  if ! left=$("$PYTHON" "$root/scripts/release/notes.py" check "$1" 2>&1 >/dev/null); then
+    printf '%s\n' "$left" >&2
+    left=${left%%$'\n'*} left=${left#notes: }
+    say "${left#"$1" } (listed above)"
+  fi
 }
 
 ship_notes() { # the notes file the GitHub release carries: NOTES when given, else rendered once (an existing render is kept: it may be edited)
@@ -1395,7 +1403,7 @@ ship_notes() { # the notes file the GitHub release carries: NOTES when given, el
     ship_say "notes: rendered into $ship_notes_file ($(grep -c . "$ship_notes_file") lines)"
   fi
   unfilled=$(notes_unfilled "$ship_notes_file")
-  [ -z "$unfilled" ] || die "the notes at $ship_notes_file are not ready for publication: $(tr '\n' ';' <<< "$unfilled") (fill them, then rerun the ship: --from notes)"
+  [ -z "$unfilled" ] || die "the notes at $ship_notes_file are not ready for publication: ${unfilled//$'\n'/; } (fill them, then rerun the ship: --from notes)"
 }
 
 ship_release() { # the GitHub release on the tag: a prerelease for a candidate, latest for a final; one that exists is kept
@@ -1406,8 +1414,8 @@ ship_release() { # the GitHub release on the tag: a prerelease for a candidate, 
     ship_say "release: done, $existing"
     return 0
   fi
-  if [ "$ship_dry" -eq 1 ]; then ship_would "create the GitHub release: gh release create $ship_tag --verify-tag ${flags[*]} --title 'SMG $ship_tag' --notes-file $ship_notes_file"; return 0; fi
-  url=$("$GH" release create "$ship_tag" --verify-tag "${flags[@]}" --title "SMG $ship_tag" --notes-file "$ship_notes_file") \
+  if [ "$ship_dry" -eq 1 ]; then ship_would "create the GitHub release: gh release create $ship_tag --verify-tag ${flags[*]} --title '$ship_tag' --notes-file $ship_notes_file"; return 0; fi
+  url=$("$GH" release create "$ship_tag" --verify-tag "${flags[@]}" --title "$ship_tag" --notes-file "$ship_notes_file") \
     || die "gh release create $ship_tag failed (its message is above): rerun the ship once the cause is fixed (--from release)"
   ship_say "release: created $url (${flags[*]#--})"
 }

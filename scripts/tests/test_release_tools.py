@@ -2482,6 +2482,19 @@ CANDIDATE_DISPATCHES = [
     "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=tokenspeed",
     "gh workflow run release-go.yml --ref v1.14.0-rc.2 -f version=1.14.0-rc.2",
 ]
+TITLE = "# Shepherd Model Gateway v1.14.0-rc.2"  # the template's first line for the candidate
+
+
+def written_notes(repo: Sandbox) -> Path:
+    """Notes the author wrote for v1.14.0-rc.2: the template's title and a sentence, no placeholder."""
+    path = repo.base / "notes.md"
+    path.write_text(f"{TITLE}\n\nWhat changed, in the author's words.\n")
+    return path
+
+
+def written(notes: Path) -> None:
+    """The author's pass over a rendered draft: every placeholder comment becomes a sentence."""
+    notes.write_text(re.sub(r"<!--.*?-->", "Written.", notes.read_text(), flags=re.S))
 
 
 def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None:
@@ -2504,7 +2517,7 @@ def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None
         "would tag v1.14.0-rc.2 at release/1.14's head once it reads 1.14.0-rc.2",
         "would render the notes (release.sh notes 1.14.0-rc.2) into ",
         "would create the GitHub release: gh release create v1.14.0-rc.2 --verify-tag --prerelease"
-        " --title 'SMG v1.14.0-rc.2' --notes-file ",
+        " --title 'v1.14.0-rc.2' --notes-file ",
         "publish: the plan is read at ",
         "would dispatch: gh workflow run release-docker.yml --ref v1.14.0-rc.2",
         "dry run of v1.14.0-rc.2 done: nothing was committed, pushed, tagged, created or dispatched",
@@ -2567,7 +2580,8 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
     repo.cut()
     parent = repo.origin_ref("refs/heads/release/1.14")
     cut_calls = len(repo.gh_calls())
-    out = repo.tool("ship", "1.14.0-rc.2").stdout
+    first = repo.tool("ship", "1.14.0-rc.2", check=False)
+    out = first.stdout
     head = repo.origin_ref("refs/heads/release/1.14")
     assert head != parent and repo.git("rev-parse", f"{head}^") == parent, (
         "the bump commit was pushed onto the branch"
@@ -2585,13 +2599,29 @@ def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_chan
         "the topic is on the branch now"
     )
     notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
-    assert notes.read_text().startswith("## SMG v1.14.0-rc.2\n")
+    assert notes.read_text().startswith(f"{TITLE}\n")
+    # the fresh render carries the template's author placeholders: the ship stops at the notes with the
+    # check's lines for the author, and nothing is published
+    assert first.returncode == 1 and f"notes: rendered into {notes}" in out
+    assert "not ready for publication: still carries " in first.stderr
+    assert " author comment(s), 0 template token(s), 0 line(s) that say none (listed above)" in (
+        first.stderr
+    )
+    assert "(fill them, then rerun the ship: --from notes)" in first.stderr
+    assert "  line " in first.stderr and "<!-- AUTHOR:" in first.stderr
     calls = repo.gh_calls()[cut_calls:]
     assert not [call for call in calls if call.startswith("gh pr create")], (
         "no pull request: the push was allowed (the cut's own, moving main, came before)"
     )
+    assert not [
+        call for call in calls if call.split()[1:3] in (["release", "create"], ["workflow", "run"])
+    ], "nothing is published on unwritten notes"
+    written(notes)
+    out = repo.tool("ship", "1.14.0-rc.2").stdout
+    assert f"notes: {notes}, rendered by an earlier run" in out
+    calls = repo.gh_calls()[cut_calls:]
     assert (
-        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title SMG v1.14.0-rc.2"
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title v1.14.0-rc.2"
         f" --notes-file {notes}" in calls
     )
     assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
@@ -2677,7 +2707,9 @@ def test_ship_opens_the_bump_pull_request_when_the_remote_refuses_the_push_and_w
         "exit 0\n"
     )
     hook.chmod(0o755)
-    out = repo.tool("ship", "1.14.0-rc.2", GH_STUB_MERGE="1", MERGE_POLL="0").stdout
+    out = repo.tool(
+        "ship", "1.14.0-rc.2", GH_STUB_MERGE="1", MERGE_POLL="0", NOTES=str(written_notes(repo))
+    ).stdout
     assert (
         "bump: origin refused the push (" in out and "opening the bump pull request instead" in out
     )
@@ -2727,6 +2759,7 @@ def test_ship_stops_when_the_bump_pull_request_is_not_merged_in_time_and_resumes
         GH_STUB_OPEN_HEADS="chore/release-1.14.0-rc.2",
         GH_STUB_MERGE="1",
         MERGE_POLL="0",
+        NOTES=str(written_notes(repo)),
     ).stdout
     assert (
         "bump: the pull request #8 of chore/release-1.14.0-rc.2 is open (an earlier run):"
@@ -2803,8 +2836,7 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
     repo.land_on_release()
     repo.git("switch", "--quiet", "main")
     repo.tool("tag", "1.14.0-rc.2", PUSH="1")
-    authored = repo.base / "notes.md"
-    authored.write_text("## SMG v1.14.0-rc.2\n\nWhat changed, in the author's words.\n")
+    authored = written_notes(repo)
     lines = ship_lines(
         repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(authored)).stdout
     )
@@ -2815,7 +2847,7 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
     ]
     assert f"notes: {authored} (NOTES)" in lines
     assert (
-        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title SMG v1.14.0-rc.2"
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title v1.14.0-rc.2"
         f" --notes-file {authored}" in repo.gh_calls()
     )
     assert "publish: 7 dispatched, 0 there already, 0 failed" in lines
@@ -2823,9 +2855,21 @@ def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sand
     wrong.write_text("# notes\n")
     stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(wrong), check=False)
     assert stopped.returncode == 1
+    assert f"not ready for publication: the first line is not '{TITLE}'" in stopped.stderr
+    half = repo.base / "half.md"
+    half.write_text(f"{TITLE}\n\n<!-- AUTHOR: the opening paragraph -->\n\nA sentence.\n")
+    creates = len([call for call in repo.gh_calls() if call.startswith("gh release create")])
+    stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(half), check=False)
+    assert stopped.returncode == 1
     assert (
-        "not ready for publication: the first line is not '## SMG v1.14.0-rc.2'" in stopped.stderr
+        "not ready for publication: still carries 1 placeholder(s): 1 author comment(s),"
+        " 0 template token(s), 0 line(s) that say none (listed above) (fill them, then rerun the"
+        " ship: --from notes)" in stopped.stderr
     )
+    assert "  line 3: <!-- AUTHOR: the opening paragraph -->" in stopped.stderr
+    assert len([call for call in repo.gh_calls() if call.startswith("gh release create")]) == (
+        creates
+    ), "the template's check holds the release"
     # from the release step the notes of the earlier run are read, not rendered again
     later = repo.tool("ship", "1.14.0-rc.2", "--from", "release", NOTES=str(authored)).stdout
     assert f"notes: {authored} (NOTES)" in later and "release: created" in later
@@ -2907,9 +2951,12 @@ def test_ship_leaves_no_notes_file_behind_when_the_render_fails(repo: Sandbox) -
     assert not notes.exists()
     repo.git("tag", "v1.13.0", first_final)
     repo.git("push", "--quiet", "origin", "refs/tags/v1.13.0")
-    again = repo.tool("ship", "1.14.0-rc.2", "--from", "notes").stdout
-    assert f"notes: rendered into {notes}" in again
-    assert notes.read_text().startswith("## SMG v1.14.0-rc.2\n")
+    again = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", check=False)
+    assert f"notes: rendered into {notes}" in again.stdout
+    assert again.returncode == 1 and "not ready for publication: still carries " in again.stderr, (
+        "the fresh render carries the author's placeholders: the ship stops at the notes"
+    )
+    assert notes.read_text().startswith(f"{TITLE}\n")
     assert not notes.with_name(notes.name + ".partial").exists()
 
 

@@ -175,7 +175,10 @@ skips what is there, so the same command is run again after an interruption, and
    repository at the head is kept; one anywhere else stops the ship (tags never move).
 4. `notes`: `release-notes` rendered once into `.git/release/notes-v<version>.md` (kept across
    reruns, so it can be edited), or the file `NOTES=<path>` names. Notes that are not ready (an
-   empty file, a heading that is not the release's) stop the ship before anything is published.
+   empty file, a first line that is not the template's for the release, a placeholder
+   `release.sh notes --check` still finds) stop the ship before anything is published. A fresh
+   render carries the template's author placeholders, so the first run stops here: write the
+   notes (see [Writing the notes](#writing-the-notes)), then rerun the ship (`--from notes`).
    The engine-image list fills in once those images exist: `scripts/release_docker_notes.sh
    v<version>` and `gh release edit` after the dispatches.
 5. `release`: `gh release create --verify-tag` with the notes, `--prerelease` for a candidate and
@@ -233,7 +236,8 @@ its candidate lists and What's Changed against the draft for what landed since. 
 manager reviews the draft before the tag. `scripts/release/release.sh notes --check notes.md`
 refuses a file that still carries an author comment or a template token, line by line, so neither
 a raw list nor a half-written draft reaches `gh release create`: run it before the release, and in
-any step that publishes the notes.
+any step that publishes the notes; `release.sh ship` runs it at its `notes` step and stops on what
+it finds.
 
 ## Branch protection a maintainer sets
 
