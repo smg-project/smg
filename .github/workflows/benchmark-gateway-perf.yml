@@ -69,9 +69,7 @@ jobs:
           # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
           # environment of THAT step, so these live on the build steps alone, as the nightly
           # has them: a release profile with frame pointers and line tables, the same on both
-          # sides of the comparison, and sccache in front of rustc.
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
+          # sides of the comparison.
           RUSTFLAGS: -C force-frame-pointers=yes
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
           CFLAGS: -fno-omit-frame-pointer
@@ -95,9 +93,7 @@ jobs:
           # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
           # environment of THAT step, so these live on the build steps alone, as the nightly
           # has them: a release profile with frame pointers and line tables, the same on both
-          # sides of the comparison, and sccache in front of rustc.
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
+          # sides of the comparison.
           RUSTFLAGS: -C force-frame-pointers=yes
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
           CFLAGS: -fno-omit-frame-pointer
@@ -147,7 +143,7 @@ jobs:
       - name: Comment the tables on the pull request
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('gateway-perf/numbers.md') != ''
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

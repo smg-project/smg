@@ -172,7 +172,7 @@ fn inkling_vision_preprocess_matches_checked_in_golden() {
         let processor =
             InklingImageProcessor::from_preprocessor_config(&config).expect("valid config");
         let result = processor
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .expect("Inkling vision preprocessing failed");
 
         assert_eq!(

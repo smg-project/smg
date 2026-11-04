@@ -67,7 +67,6 @@ fn least_load_policy() -> PolicyConfig {
         kv_pressure_weight: 0.15,
         mean_prefill_tokens: 1024,
         default_throughput: 2000.0,
-        max_waiting_requests: 0,
     }
 }
 

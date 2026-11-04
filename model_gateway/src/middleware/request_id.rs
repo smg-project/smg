@@ -43,7 +43,7 @@ pub(super) const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
 /// [`MAX_INBOUND_REQUEST_ID_LEN`] visible-ASCII characters, no space among
 /// them. The HTTP parser lets a horizontal tab through, so a header value
 /// that parses as a string is not enough.
-pub(super) fn is_acceptable_inbound_id(value: &str) -> bool {
+fn is_acceptable_inbound_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_INBOUND_REQUEST_ID_LEN
         && value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))

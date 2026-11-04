@@ -4,9 +4,11 @@
 //! machines write through. Moved out of `streaming.rs` as is; the streams
 //! keep writing through them by name.
 
-use bytes::{BufMut, BytesMut};
+use std::io;
+
+use bytes::BytesMut;
 use openai_protocol::{
-    chat::{ChatMessageDelta, ChatStreamChoice},
+    chat::{ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef},
     common::{ToolCallDelta, ToolChoice, Usage},
     completion::CompletionStreamChoice,
 };
@@ -15,6 +17,32 @@ use serde_json::json;
 use tracing::error;
 
 use crate::routers::grpc::spec::ChatResponseSpec;
+
+/// The frame buffer as serde's sink: every write is one `extend_from_slice`,
+/// the shape a `Vec<u8>` gives serde. The `bytes` writer adapter instead slices
+/// each write to the buffer's remaining room before it appends, which costs the
+/// length bookkeeping on every JSON token and turns the one-byte constant tokens
+/// into libc calls: about 7 % of a 128-delta stream request's user instructions.
+pub(super) struct FrameSink<'a>(pub(super) &'a mut BytesMut);
+
+impl io::Write for FrameSink<'_> {
+    #[inline]
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(src);
+        Ok(src.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, src: &[u8]) -> io::Result<()> {
+        self.0.extend_from_slice(src);
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Buffered chat chunks are flushed to the response channel at this size even
 /// while the engine keeps more ready, so one frame stays a bounded burst.
@@ -65,12 +93,50 @@ impl ChatChunkFrame {
     ) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        let mut serialized = serde_json::to_writer((&mut *buffer).writer(), choice);
+        let serialized = serde_json::to_writer(FrameSink(buffer), choice);
+        Self::close_chunk(buffer, start, serialized, usage, emit_usage_null);
+    }
+
+    /// [`Self::write_chunk`] for a bare text delta ([`text_delta`]): the
+    /// choice is `{"index":N,"delta":{"<field>":"<text>"},"logprobs":null,"finish_reason":null}`,
+    /// so its constant text is written as literals and serde writes the index
+    /// and the text alone, instead of walking the five keys and the two nulls
+    /// of the struct on every token. The bytes are those [`Self::write_chunk`]
+    /// writes for the same choice (pinned by test).
+    pub(super) fn write_text_delta(
+        &self,
+        buffer: &mut BytesMut,
+        index: u32,
+        field: TextDelta,
+        text: &str,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        buffer.extend_from_slice(b"{\"index\":");
+        push_json(FrameSink(buffer), &index);
+        buffer.extend_from_slice(field.opener());
+        push_json(FrameSink(buffer), text);
+        buffer.extend_from_slice(b"},\"logprobs\":null,\"finish_reason\":null}");
+        Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// The chunk's end after its choice: `]`, the usage or its `null`
+    /// placeholder, `}` and the event's blank line; a choice that failed to
+    /// serialize leaves an error event in its place.
+    fn close_chunk(
+        buffer: &mut BytesMut,
+        start: usize,
+        mut serialized: serde_json::Result<()>,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
         if serialized.is_ok() {
             buffer.extend_from_slice(b"]");
             if let Some(usage) = usage {
                 buffer.extend_from_slice(b",\"usage\":");
-                serialized = serde_json::to_writer((&mut *buffer).writer(), usage);
+                serialized = serde_json::to_writer(FrameSink(buffer), usage);
             } else if emit_usage_null {
                 buffer.extend_from_slice(b",\"usage\":null");
             }
@@ -87,9 +153,61 @@ impl ChatChunkFrame {
     }
 }
 
+/// The one text field a bare per-token chat delta carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TextDelta {
+    Content,
+    Reasoning,
+}
+
+impl TextDelta {
+    /// The bytes between a choice's index and its text: the delta's opening
+    /// and the field's key, as serde writes them for the struct.
+    fn opener(self) -> &'static [u8] {
+        match self {
+            TextDelta::Content => b",\"delta\":{\"content\":",
+            TextDelta::Reasoning => b",\"delta\":{\"reasoning_content\":",
+        }
+    }
+}
+
+/// The field and the text of `choice` when it is a bare per-token delta: one
+/// text field and nothing else (no role, no tool calls, no logprobs, not
+/// finished, no matched stop), the shape [`ChatChunkFrame::write_text_delta`]
+/// writes; `None` for every other choice, which stays serde's. Both structs
+/// are matched field by field with no rest pattern, so a field added to
+/// either is a compile error here until this read says what it does.
+pub(super) fn text_delta<'a>(choice: &'a ChatStreamChoiceRef<'_>) -> Option<(TextDelta, &'a str)> {
+    let ChatStreamChoiceRef {
+        index: _,
+        delta,
+        logprobs: None,
+        finish_reason: None,
+        matched_stop: None,
+    } = choice
+    else {
+        return None;
+    };
+    match delta {
+        ChatMessageDeltaRef {
+            role: None,
+            content: Some(text),
+            tool_calls: None,
+            reasoning_content: None,
+        } => Some((TextDelta::Content, text.as_ref())),
+        ChatMessageDeltaRef {
+            role: None,
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some(text),
+        } => Some((TextDelta::Reasoning, text.as_ref())),
+        _ => None,
+    }
+}
+
 /// Serializing a string or an integer into memory cannot fail.
-fn push_json<T: Serialize + ?Sized>(buffer: &mut Vec<u8>, value: &T) {
-    let _ = serde_json::to_writer(buffer, value);
+fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
+    let _ = serde_json::to_writer(writer, value);
 }
 
 /// The SSE frame of the per-token chunks of one completion stream.
@@ -135,7 +253,7 @@ impl CompletionChunkFrame {
     pub(super) fn write_chunk(&self, buffer: &mut BytesMut, choice: &CompletionStreamChoice) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        match serde_json::to_writer((&mut *buffer).writer(), choice) {
+        match serde_json::to_writer(FrameSink(buffer), choice) {
             Ok(()) => buffer.extend_from_slice(&self.tail),
             Err(e) => {
                 error!("Failed to serialize completion SSE chunk: {}", e);

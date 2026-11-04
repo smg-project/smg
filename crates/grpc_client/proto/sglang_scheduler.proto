@@ -171,6 +171,10 @@ message GenerateRequest {
   bool return_media_identity = 19;
   // Decode-only hint. Original tokenized input and references remain for fallback.
   MediaIdentity media_identity = 20;
+
+  // Additional modality batches, matching vLLM's mm_inputs + extra_mm_inputs.
+  // Each batch owns its tensors, token ID and placeholders.
+  repeated MultimodalInputs extra_mm_inputs = 21;
 }
 
 message TokenizedInput {

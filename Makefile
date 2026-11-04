@@ -34,7 +34,7 @@ endif
         python-dev python-build python-build-release python-install python-clean python-test python-check \
         generate-openapi generate-python-types generate-java-types generate-clients \
         show-version bump-version check-versions \
-        release-plan release-cut release-bump release-pick release-pick-pr release-status release-tag release-notes release-bump-main release-publish-plan release-check
+        release-plan release-cut release-bump release-pick release-pick-pr release-status release-tag release-notes release-bump-main release-publish-plan release-check release-ship
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -273,6 +273,9 @@ release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatc
 
 release-check: ## The release gate for vVERSION: what the repository can read (versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) (usage: make release-check VERSION=1.14.0-rc.1)
 	@$(RELEASE_TOOL) check "$(VERSION)"
+
+release-ship: ## vVERSION on its existing release branch in one run: the preflight, the bump (pushed when the rules allow the caller one, else its pull request, waited for), the tag, the notes, the GitHub release and the publish dispatches; a rerun skips what is there (usage: make release-ship VERSION=1.14.1 [DRY_RUN=1] [FROM=tag])
+	@$(RELEASE_TOOL) ship "$(VERSION)" $(if $(DRY_RUN),--dry-run) $(if $(FROM),--from $(FROM))
 
 # Gateway perf bed (crates/gateway_perf, the `gateway-perf` binary): the gateway's cost per
 # request on a CPU mock bed, base against head. PERF_OUT is the run root (one stamp per make

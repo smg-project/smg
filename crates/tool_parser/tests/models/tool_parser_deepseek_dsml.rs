@@ -454,7 +454,11 @@ async fn test_deepseek_v4_factory_registration() {
         "</｜DSML｜invoke>\n",
         "</｜DSML｜tool_calls>",
     );
-    for model in ["deepseek-v4", "deepseek-ai/DeepSeek-V4-Flash"] {
+    for model in [
+        "deepseek-v4",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Pro",
+    ] {
         let parser = factory
             .registry()
             .create_for_model(model)

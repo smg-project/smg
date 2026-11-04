@@ -165,7 +165,7 @@ fn images_match_the_reference_tiler() {
                 .expect("fixture image decodes"),
             ),
         };
-        let out = processor.preprocess(&[image]).expect("image preprocesses");
+        let out = processor.preprocess(&[&image]).expect("image preprocesses");
         assert_eq!(
             out.feature_token_counts,
             vec![case.tokens],

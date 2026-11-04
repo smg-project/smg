@@ -25,7 +25,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client,
+            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -60,9 +60,26 @@ pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str)
     }
 }
 
+/// Whether a turn's calls hold one that was cut: a call whose status under the finish reason
+/// reads `incomplete` (`function_call_status`), read on the function-shaped arguments of every
+/// call before a custom tool's call becomes its `custom_tool_call` item, which carries no
+/// status on the wire.
+pub(crate) fn cut_call<'a>(
+    finish_reason: Option<&str>,
+    arguments: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    arguments
+        .into_iter()
+        .any(|arguments| function_call_status(finish_reason, arguments) == "incomplete")
+}
+
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
-/// finish is the token limit; a call cut by anything else (`cut_call`) leaves the response
-/// incomplete with no stated reason, as the item says.
+/// finish is the token limit; a call cut by anything else (`cut_call`, read on the calls'
+/// function-shaped arguments) leaves the response incomplete with no stated reason. Every
+/// builder of a Responses object reads its status here: the non-streaming conversions,
+/// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
+/// terminal event and stored object under the finish it holds, whether chat chunks or a
+/// Harmony stream gave it.
 pub(crate) fn response_status(
     finish_reason: Option<&str>,
     cut_call: bool,
@@ -78,6 +95,14 @@ pub(crate) fn response_status(
         _ if cut_call => (ResponseStatus::Incomplete, None),
         _ => (ResponseStatus::Completed, None),
     }
+}
+
+/// The MCP tool calls a request may make in all: its `max_tool_calls`
+/// capped by the loop's safety limit, the safety limit when it names none.
+pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
+    max_tool_calls.map_or(DEFAULT_MAX_ITERATIONS, |user_max| {
+        user_max.min(DEFAULT_MAX_ITERATIONS)
+    })
 }
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
@@ -1233,6 +1258,17 @@ mod tests {
         assert_eq!(
             response_status(Some("error"), true),
             (ResponseStatus::Failed, None)
+        );
+    }
+
+    #[test]
+    fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
+        assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
+        assert_eq!(tool_call_limit(Some(3)), 3);
+        assert_eq!(tool_call_limit(Some(0)), 0);
+        assert_eq!(
+            tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
+            DEFAULT_MAX_ITERATIONS
         );
     }
 }

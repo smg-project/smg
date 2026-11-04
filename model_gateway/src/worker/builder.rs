@@ -646,6 +646,27 @@ mod tests {
         assert!(!worker.is_healthy());
     }
 
+    /// The built worker's health check reads back `health_config`'s timeout,
+    /// interval and thresholds.
+    fn assert_health_config(worker: &BasicWorker, health_config: &HealthCheckConfig) {
+        assert_eq!(
+            worker.metadata().health_config.timeout_secs,
+            health_config.timeout_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.check_interval_secs,
+            health_config.check_interval_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.failure_threshold,
+            health_config.failure_threshold
+        );
+        assert_eq!(
+            worker.metadata().health_config.success_threshold,
+            health_config.success_threshold
+        );
+    }
+
     #[test]
     fn test_basic_worker_builder_full() {
         let mut labels = HashMap::new();
@@ -682,22 +703,7 @@ mod tests {
         assert_eq!(worker.connection_mode(), &ConnectionMode::Grpc);
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/health");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]
@@ -760,22 +766,7 @@ mod tests {
         assert_eq!(worker.dp_size(), Some(16));
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/status");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]

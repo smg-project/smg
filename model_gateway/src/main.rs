@@ -66,16 +66,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Backend::Sglang => "sglang",
-            Backend::Vllm => "vllm",
-            Backend::Trtllm => "trtllm",
-            Backend::Tokenspeed => "tokenspeed",
-            Backend::Openai => "openai",
-            Backend::Anthropic => "anthropic",
-            Backend::Gemini => "gemini",
-        };
-        write!(f, "{s}")
+        write_flag_value(self, f)
     }
 }
 
@@ -92,15 +83,23 @@ pub enum DiscoveryProvider {
     Consul,
 }
 
-impl DiscoveryProvider {
-    /// The spelling `--discovery-provider` takes for this provider.
-    fn flag_value(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::File => "file",
-            Self::Slurm => "slurm",
-            Self::Consul => "consul",
-        }
+impl std::fmt::Display for DiscoveryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_flag_value(self, f)
+    }
+}
+
+/// A value's spelling on the command line is its one spelling: `Display` writes
+/// the name clap parses, so a message that names a flag's value prints what the
+/// flag takes. A variant clap skips has no command-line name and prints as its
+/// `Debug` form, so a formatter that has not failed never reports an error.
+fn write_flag_value<V: ValueEnum + std::fmt::Debug>(
+    value: &V,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match value.to_possible_value() {
+        Some(name) => f.write_str(name.get_name()),
+        None => write!(f, "{value:?}"),
     }
 }
 
@@ -308,6 +307,18 @@ struct RoutingArgs {
     /// `http_pool.http2` on a worker spec pins the version instead.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
+
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "Worker Configuration")]
+    worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "Worker Configuration")]
+    worker_startup_delay: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "Worker Configuration")]
+    worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -557,12 +568,6 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
-    /// waiting requests (plus dispatches since their last poll) have reached
-    /// this count; 0 disables. Set below the engine's max batch size
-    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
-    least_load_max_waiting_requests: u32,
-
     /// What power_of_two compares: expected_wait (default), requests or least_requests
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
@@ -709,18 +714,6 @@ struct WorkerArgs {
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
-
-    /// Timeout in seconds for worker startup and registration
-    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
-    worker_startup_timeout_secs: u64,
-
-    /// Grace period in seconds before the first worker startup check
-    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
-    worker_startup_delay: u64,
-
-    /// Interval in seconds between worker startup checks
-    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
-    worker_startup_check_interval: u64,
 
     // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
@@ -1306,7 +1299,9 @@ struct ServingArgs {
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
-    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
@@ -2229,6 +2224,34 @@ mod tests {
         cli_args_from(&["--cors-allowed-origins", "*"])
             .to_router_config(vec![], vec![])
             .expect("a lone '*' is the open policy");
+    }
+
+    /// The names `--backend` and `--discovery-provider` accept are the ones
+    /// their values print, so a message that names a value spells it as the
+    /// flag takes it.
+    #[test]
+    fn a_backend_and_a_discovery_provider_print_the_names_their_flags_accept() {
+        let backends: Vec<String> = Backend::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            backends,
+            [
+                "sglang",
+                "vllm",
+                "trtllm",
+                "tokenspeed",
+                "openai",
+                "anthropic",
+                "gemini"
+            ]
+        );
+        let providers: Vec<String> = DiscoveryProvider::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(providers, ["kubernetes", "file", "slurm", "consul"]);
     }
 
     /// A flag that only acts with a companion is named when the companion is
@@ -5071,5 +5094,30 @@ mod tests {
             assert!(help.contains(named), "{named} missing from the help");
         }
         assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
+    }
+
+    /// The three start-up bounds hold for every worker the gateway starts
+    /// with, so the help lists them with the worker settings and not under
+    /// the disaggregation heading.
+    #[test]
+    fn the_worker_start_up_bounds_are_listed_under_worker_configuration() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for id in [
+            "worker_startup_timeout_secs",
+            "worker_startup_delay",
+            "worker_startup_check_interval",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert_eq!(
+                arg.get_help_heading(),
+                Some("Worker Configuration"),
+                "{id} is listed under another heading"
+            );
+        }
     }
 }

@@ -12,11 +12,12 @@
 
 use bytes::Bytes;
 
-use self::handshake::EngineCoreReadyResponse;
+use self::{handshake::EngineCoreReadyResponse, kv_transfer::KvTransferStats};
 use crate::{codec::OpaqueValue, Result};
 
 pub mod control;
 pub mod handshake;
+pub mod kv_transfer;
 pub(crate) mod positional;
 pub mod sglang;
 pub mod tokenspeed;
@@ -88,6 +89,10 @@ pub struct EngineBatch<O> {
     pub finished_request_ids: Vec<String>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,
+    /// The KV-transfer samples the rank's connector reported with this tick,
+    /// when the protocol carries them and the connector recorded any (`None`
+    /// on every other tick, which is most of them: hence boxed).
+    pub kv_transfer: Option<Box<KvTransferStats>>,
     /// Wave-control notification from a lockstep engine group (`None` on every
     /// ordinary tick).
     pub wave: Option<WaveEvent>,
@@ -102,6 +107,7 @@ impl<O> Default for EngineBatch<O> {
             outputs: Vec::new(),
             finished_request_ids: Vec::new(),
             load: None,
+            kv_transfer: None,
             wave: None,
             utility: None,
         }

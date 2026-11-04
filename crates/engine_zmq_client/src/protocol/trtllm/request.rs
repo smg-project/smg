@@ -1,10 +1,10 @@
-// The TensorRT-LLM dialect's request: a tagged positional array (the shape of
-// a `msgspec.Struct(tag=True, array_like=True)` on the engine side) that the
-// engine-side shim decodes into its own struct and turns into one LLM API
-// `SamplingParams`. **Field order is the wire contract**: append only, never
-// reorder. The shim declares both layouts at the handshake
-// (`positional_layouts`) and the protocol compares the prefixes encoded here
-// against them once per connection.
+//! The TensorRT-LLM dialect's request: a tagged positional array (the shape of
+//! a `msgspec.Struct(tag=True, array_like=True)` on the engine side) that the
+//! engine-side shim decodes into its own struct and turns into one LLM API
+//! `SamplingParams`. **Field order is the wire contract**: append only, never
+//! reorder. The shim declares both layouts at the handshake
+//! (`positional_layouts`) and the protocol compares the prefixes encoded here
+//! against them once per connection.
 
 use std::collections::BTreeMap;
 

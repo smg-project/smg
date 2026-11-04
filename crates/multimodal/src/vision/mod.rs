@@ -27,9 +27,10 @@
 //! // Load config from HuggingFace
 //! let config = PreProcessorConfig::from_json(config_json)?;
 //!
-//! // Create a processor that resolves the config once, then preprocess images
+//! // Create a processor that resolves the config once, then preprocess the
+//! // batch's images, borrowed one by one.
 //! let processor = LlavaProcessor::from_configs(&model_config, &config);
-//! let result = processor.preprocess(&images)?;
+//! let result = processor.preprocess(&images.iter().collect::<Vec<_>>())?;
 //! ```
 
 pub mod execution;

@@ -1,8 +1,8 @@
-// SGLang's tokenized generate request — the scheduler's own
-// `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
-// `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
-// with the class-name tag string as element 0. **Field order is the wire
-// contract** — do not reorder.
+//! SGLang's tokenized generate request — the scheduler's own
+//! `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
+//! `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
+//! with the class-name tag string as element 0. **Field order is the wire
+//! contract** — do not reorder.
 
 use std::collections::BTreeMap;
 

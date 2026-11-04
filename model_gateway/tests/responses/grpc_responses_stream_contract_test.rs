@@ -177,13 +177,21 @@ async fn responses_result_with_finishes(
     // JSON answer and the SSE answer, with and without MCP tools (the MCP
     // stream's header comes from the startup barrier, the non-stream tool
     // loop's from its last completion). Which reader it is follows the
-    // parser rule the route test pins (here `legacy` for the plain cases,
-    // `symphony` for the scripted tool-call cases); the contract is that the
-    // header is there and names a reader.
+    // parser rule the route test pins, and this helper's own setup decides
+    // it: the `qwen` tool parser is configured exactly when an output is
+    // scripted, and under a configured tool parser the Symphony reader is
+    // chosen, so every scripted-output case names `symphony` (the scripted
+    // plain answer included) and the two unscripted cases `legacy`.
     let parser = parser.as_ref().and_then(|value| value.to_str().ok());
-    assert!(
-        matches!(parser, Some("symphony" | "legacy")),
-        "x-smg-parser on the {} answer: {parser:?}",
+    let expected = if output.is_some() {
+        "symphony"
+    } else {
+        "legacy"
+    };
+    assert_eq!(
+        parser,
+        Some(expected),
+        "x-smg-parser on the {} answer",
         if stream { "SSE" } else { "JSON" }
     );
     if !stream {

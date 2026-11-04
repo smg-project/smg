@@ -39,14 +39,15 @@ pub(crate) struct ContextRequirements {
 }
 
 impl ContextRequirements {
-    /// Capture exact preparation counts and the provider's output-budget rule.
+    /// [`Self::new_for`] with the provider profile derived here, as the tests ask it.
     #[cfg(test)]
     pub(crate) fn new(prep: &PreparationOutput, request: &RequestType) -> Self {
         Self::new_for(prep, request, None)
     }
 
-    /// [`ContextRequirements::new`] with the chat model's provider profile as
-    /// the request's preparation derived it (`None` derives it here).
+    /// Capture exact preparation counts and the provider's output-budget rule,
+    /// with the chat model's provider profile as the request's preparation
+    /// derived it (`None` derives it here).
     pub(crate) fn new_for(
         prep: &PreparationOutput,
         request: &RequestType,

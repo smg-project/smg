@@ -296,8 +296,7 @@ def _topology_mode(param) -> str | None:
 
 def _is_epd_topology(param) -> bool:
     """True when a ``setup_backend`` param asks for an encode-prefill-decode
-    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode), whose
-    encode role runs the Python servicer only."""
+    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode)."""
     return (_topology_mode(param) or "").startswith("epd")
 
 
@@ -320,14 +319,12 @@ def _filter_tokenspeed_rust_items(
     workers run the Rust servicer (by the lane's setting or by the servicer
     package's default: ``infra.constants.get_servicer_impl``).
 
-    The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries generate and abort only: no control messages, so the admin
-    operations (flush cache, profiling) stay with the Python servicer. The
-    prefill/decode topologies run on it (the request's bootstrap fields ride
-    the wire; the launcher starts the prefill side's bootstrap server); the
-    encode-prefill-decode topologies need the encode role, which stays with
-    the Python servicer, so their cases are dropped here rather than failing
-    on a known gap, as are the multi-worker fleets of plain workers.
+    The Rust servicer reaches the scheduler over the engine's msgpack wire,
+    whose handshake declares the control messages (flush cache, profiling),
+    the encode role and the logprob columns, so the admin operations, the
+    prefill/decode topologies and the encode-prefill-decode topologies all run
+    on it. Dropped here rather than failing on a known gap: the wires this
+    lane does not serve, and the multi-worker fleets of plain workers.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
@@ -335,15 +332,17 @@ def _filter_tokenspeed_rust_items(
         param = _setup_backend_param(item)
         workers = _workers_marker_kwargs(item)
         # A wire this lane does not serve: anything but the local wires and
-        # the prefill/decode topologies (an EPD topology is one of those).
+        # the prefill/decode and encode-prefill-decode topologies. The wire is
+        # the param's mode: a topology tuple may carry per-pool dicts, which
+        # no set membership can hash.
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_topology(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not (_is_pd_topology(param) or _is_epd_topology(param))
         )
-        admin_ops = "test_admin_ops.py" in item.nodeid
-        encode_workers = bool(workers.get("encode"))
         pd_workers = bool(workers.get("prefill") or workers.get("decode"))
         plain_fleet = (workers.get("count") or 1) > 1 and not pd_workers
-        if unserved_wire or _is_epd_topology(param) or encode_workers or plain_fleet or admin_ops:
+        if unserved_wire or plain_fleet:
             deselected.append(item)
         else:
             kept.append(item)
@@ -369,8 +368,12 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         # The wires this servicer serves: the local ones and the
         # prefill/decode topologies; EPD and anything else stay with Python.
+        # The wire is the param's mode (a topology tuple may carry per-pool
+        # dicts, which no set membership can hash).
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not _is_pd_param(param)
         )
         if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)

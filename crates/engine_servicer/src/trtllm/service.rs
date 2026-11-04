@@ -1,6 +1,11 @@
 //! `trtllm.TrtllmService` over the shared state: each RPC delegates to its
-//! handler module. What the engine's Python servicer does not serve either
-//! (`Embed`, `SubscribeKvEvents`) answers UNIMPLEMENTED here, with the reason.
+//! handler module. `Embed`, which the engine's Python servicer does not serve
+//! either, answers UNIMPLEMENTED here with the reason. `SubscribeKvEvents`
+//! streams the servicer's own load records for a `loads_only` request; any
+//! other is served by the KV-event relay when the launcher configured the
+//! engine's publisher endpoint, and answers UNIMPLEMENTED with the reason
+//! otherwise (the TensorRT-LLM launcher configures none: the wire has no
+//! publisher yet).
 
 use std::sync::Arc;
 
@@ -11,7 +16,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, tokenizer_bundle, BoxStream};
+use crate::{kv_events, rpc, BoxStream};
 
 /// What neither servicer serves: the engine's Python servicer does not
 /// implement `Embed`, and the wire carries no embedding request.
@@ -35,10 +40,8 @@ impl TrtllmService for TrtllmServicer {
         request: Request<trt::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
-        generate::generate(&self.state, request.into_inner(), trace_headers)
-            .await
-            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
-            .map(Response::new)
+        let stream = generate::generate(&self.state, request.into_inner(), trace_headers).await;
+        rpc::generated(&self.state, stream)
     }
 
     async fn embed(
@@ -96,18 +99,13 @@ impl TrtllmService for TrtllmServicer {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
-            .await
-            .map(Response::new)
+        rpc::get_tokenizer(&self.state).await
     }
 
     async fn subscribe_kv_events(
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.shared.kv_relay else {
-            return Err(Status::unimplemented(kv_events::TRTLLM_DISABLED_MESSAGE));
-        };
-        relay.subscribe(request.into_inner()).map(Response::new)
+        rpc::subscribe_kv_events(&self.state, request, kv_events::TRTLLM_DISABLED_MESSAGE)
     }
 }

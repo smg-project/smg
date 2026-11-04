@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, tokenizer_bundle, BoxStream};
+use crate::{kv_events, rpc, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -56,10 +56,8 @@ impl TokenSpeedScheduler for TokenSpeedService {
                 "Generate is unavailable on TokenSpeed encode workers",
             ));
         }
-        generate::generate(&self.state, request.into_inner())
-            .await
-            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
-            .map(Response::new)
+        let stream = generate::generate(&self.state, request.into_inner()).await;
+        rpc::generated(&self.state, stream)
     }
 
     async fn health_check(
@@ -141,20 +139,13 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
-            .await
-            .map(Response::new)
+        rpc::get_tokenizer(&self.state).await
     }
 
     async fn subscribe_kv_events(
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.shared.kv_relay else {
-            return Err(Status::unimplemented(
-                kv_events::TOKENSPEED_DISABLED_MESSAGE,
-            ));
-        };
-        relay.subscribe(request.into_inner()).map(Response::new)
+        rpc::subscribe_kv_events(&self.state, request, kv_events::TOKENSPEED_DISABLED_MESSAGE)
     }
 }

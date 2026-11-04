@@ -305,8 +305,8 @@ enum RunOutcome {
     /// Early response (streaming SSE) already produced by response processing.
     Early(Response),
     /// Buffered completion: the final response (or responses-iteration state)
-    /// sits on the dispatch context; the Instant is the successful attempt's
-    /// start, for duration metrics.
+    /// sits on the dispatch context; the Instant is the request's start, for
+    /// the duration record.
     Final(Box<DispatchContext>, Instant),
 }
 
@@ -647,10 +647,12 @@ impl RequestPipeline {
             })
     }
 
-    /// Full two-phase run. `metrics_endpoint` enables per-attempt
-    /// router-request/error/duration recording (the responses-internal entry
-    /// points pass `None`, matching their historical behavior); `retry_config`
-    /// enables the dispatch-phase retry loop.
+    /// Full two-phase run. `metrics_endpoint` enables the request's
+    /// router-request, error and duration records, one each per request as
+    /// the HTTP routers record a route (the responses-internal entry points
+    /// pass `None`: a Responses turn runs the pipeline once per tool-loop
+    /// iteration, so the pipeline is not where that turn is counted);
+    /// `retry_config` enables the dispatch-phase retry loop.
     ///
     /// The run is boxed once, here, and the context moves straight into that
     /// box: it holds ingress + per-attempt state across awaits, and an
@@ -692,7 +694,7 @@ impl RequestPipeline {
         retry_config: Option<&'a RetryConfig>,
     ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
         async move {
-            let mut attempt_start = Instant::now();
+            let start = Instant::now();
             if let Some(endpoint) = metrics_endpoint {
                 self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
@@ -724,13 +726,6 @@ impl RequestPipeline {
             let mut spec = Some(spec);
             let mut attempt: u32 = 0;
             loop {
-                if attempt > 0 {
-                    attempt_start = Instant::now();
-                    if let Some(endpoint) = metrics_endpoint {
-                        self.record_request(endpoint, &dctx.model_id, dctx.streaming);
-                    }
-                }
-
                 let last_attempt = attempt + 1 >= max_attempts;
                 let mut failure = match self
                     .run_attempt(
@@ -745,15 +740,14 @@ impl RequestPipeline {
                 {
                     Ok(Some(response)) => {
                         if let Some(endpoint) = metrics_endpoint {
-                            self.record_duration(endpoint, &dctx.model_id, attempt_start);
+                            self.record_duration(endpoint, &dctx.model_id, start);
                         }
                         return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                     }
-                    Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                    Ok(None) => return Ok(RunOutcome::Final(dctx, start)),
                     Err(response) => response,
                 };
 
-                self.record_error(metrics_endpoint, &dctx.model_id, &failure);
                 if failure.extensions().get::<ReportedRefusal>().is_some() {
                     // The re-selection wrote this refusal's line (rate-limited,
                     // with the pool's state), as for the first selection.
@@ -800,18 +794,20 @@ impl RequestPipeline {
                     );
                 }
 
-                let Some(config) = retry_config else {
-                    return Err(failure);
-                };
-                if !is_retryable_response(&failure) {
-                    return Err(failure);
-                }
-                if last_attempt {
-                    if let Some(endpoint) = metrics_endpoint {
-                        self.record_retries_exhausted(endpoint);
+                // The attempt's failure is the request's answer unless a retry
+                // follows: counted once, here, under its class and reason, as
+                // the HTTP routers count the answer of a route; the attempts
+                // are the retry families' count.
+                let retryable = retry_config.filter(|_| is_retryable_response(&failure));
+                let Some(config) = retryable.filter(|_| !last_attempt) else {
+                    self.record_error(metrics_endpoint, &dctx.model_id, &failure);
+                    if retryable.is_some() {
+                        if let Some(endpoint) = metrics_endpoint {
+                            self.record_retries_exhausted(endpoint);
+                        }
                     }
                     return Err(failure);
-                }
+                };
 
                 // The retry re-selects away from the engines this attempt used,
                 // while another available worker is left to take the request.
@@ -879,7 +875,8 @@ impl RequestPipeline {
     }
 
     /// One router request under this pipeline's labels, the count the
-    /// dashboards read: recorded per attempt here, and by the router for an
+    /// dashboards read: recorded once per request here, at its entry (the
+    /// attempts are the retry families' count), and by the router for an
     /// answer it gives without the pipeline, so that traffic stays visible.
     /// The `model` label is the served model's id, or `other` for a model no
     /// worker serves ([`WorkerRegistry::metric_model_label`]), here and in
@@ -1657,7 +1654,8 @@ impl RequestPipeline {
     /// Runs through dispatch and returns the raw ExecutionResult (with
     /// stream) and LoadGuards for token-level streaming processing, with the
     /// iteration's tenant rate-limit reservation (taken under a charge id of
-    /// its own). The caller keeps
+    /// its own) and the router's stop obligations (the string `stop`s the
+    /// engine cannot match, for the reader to scan for). The caller keeps
     /// load_guards alive until stream processing completes, then settles the
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
@@ -1669,7 +1667,15 @@ impl RequestPipeline {
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>, Arc<RateLimitCell>), Response> {
+    ) -> Result<
+        (
+            ExecutionResult,
+            Option<LoadGuards>,
+            Arc<RateLimitCell>,
+            Vec<String>,
+        ),
+        Response,
+    > {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
@@ -1693,7 +1699,16 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
                 Some(execution_result) => {
                     let load_guards = dctx.load_guards.take();
-                    Ok((execution_result, load_guards, rate_limit_cell.clone()))
+                    // The string stops the engine will never match, for the
+                    // Harmony reader to scan the channel text for, as the
+                    // response stage hands them to a non-streamed iteration.
+                    let router_stops = std::mem::take(&mut dctx.response.router_stop_obligations);
+                    Ok((
+                        execution_result,
+                        load_guards,
+                        rate_limit_cell.clone(),
+                        router_stops,
+                    ))
                 }
                 None => {
                     error!(
@@ -1747,874 +1762,4 @@ fn generate_response_body(
 }
 
 #[cfg(test)]
-mod generate_response_body_tests {
-    use openai_protocol::generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo};
-
-    use super::*;
-
-    fn response(weight_version: &str) -> GenerateResponse {
-        GenerateResponse {
-            text: "hi".to_string(),
-            output_ids: vec![1, 2, 3],
-            meta_info: GenerateMetaInfo {
-                id: "req-1".to_string(),
-                finish_reason: GenerateFinishReason::Stop {
-                    finish_type: GenerateFinishType::Stop,
-                },
-                prompt_tokens: 3,
-                weight_version: weight_version.to_string(),
-                input_token_logprobs: None,
-                output_token_logprobs: None,
-                completion_tokens: 3,
-                cached_tokens: 0,
-                reasoning_tokens: None,
-                e2e_latency: 0.1,
-                matched_stop: None,
-            },
-        }
-    }
-
-    fn to_value(body: GenerateBody) -> serde_json::Value {
-        serde_json::to_value(body).expect("GenerateBody always serializes")
-    }
-
-    #[test]
-    fn single_prompt_with_one_response_is_an_object() {
-        let value = to_value(generate_response_body(true, 1, vec![response("v1")]));
-        assert!(value.is_object(), "expected an object, got {value}");
-        assert_eq!(value["meta_info"]["weight_version"], "v1");
-    }
-
-    #[test]
-    fn n_greater_than_one_stays_a_list_even_for_a_single_prompt() {
-        let value = to_value(generate_response_body(
-            true,
-            2,
-            vec![response("v1"), response("v1")],
-        ));
-        assert!(value.is_array(), "expected a list, got {value}");
-        assert_eq!(value.as_array().map(Vec::len), Some(2));
-    }
-
-    #[test]
-    fn a_batch_request_stays_a_list() {
-        // `single_prompt = false` here stands in for a batch `input_ids`
-        // request. That shape is unreachable over gRPC today --
-        // `GeneratePreparationStage::resolve_generate_input` rejects
-        // `InputIds::Batch` with 400 before any response exists -- but the
-        // helper still needs to answer it correctly if that ever changes.
-        let value = to_value(generate_response_body(
-            false,
-            1,
-            vec![response("v1"), response("v1")],
-        ));
-        assert!(value.is_array(), "expected a list, got {value}");
-    }
-
-    #[test]
-    fn single_prompt_with_more_than_one_response_stays_a_list() {
-        // Shouldn't happen in practice (a single prompt dispatches once),
-        // but the helper must not silently drop a response if it did.
-        let value = to_value(generate_response_body(
-            true,
-            1,
-            vec![response("v1"), response("v2")],
-        ));
-        assert!(value.is_array(), "expected a list, got {value}");
-        assert_eq!(value.as_array().map(Vec::len), Some(2));
-    }
-}
-
-#[cfg(test)]
-impl RequestPipeline {
-    /// Mode-bearing construction descriptor for the parity test. Stage
-    /// ordering itself is structural (see `PipelineStages`), so only the
-    /// per-mode args and optional stages need freezing.
-    fn signature(&self) -> String {
-        format!(
-            "{}|encode={}|{}",
-            self.stages.worker_selection.signature(),
-            self.stages.encode.is_some(),
-            self.stages.request_building.signature(),
-        )
-    }
-}
-
-#[cfg(test)]
-mod build_parity_tests {
-    use super::*;
-    use crate::routers::grpc::mode::Mode;
-
-    /// Hand-transcribed expected construction descriptor + metrics backend
-    /// label per endpoint/mode. Do not regenerate from `build()` output, or
-    /// this stops guarding anything: it exists to catch a wrong
-    /// `build`/`mode.rs` mapping (a flipped `inject_pd_metadata`, wrong
-    /// `plan_kind`, or swapped `WorkerSelectionMode`). Stage ordering is
-    /// structural in `PipelineStages` and needs no golden.
-    fn golden(endpoint: Endpoint, mode: Mode) -> (String, &'static str) {
-        const REGULAR: &str = metrics_labels::BACKEND_REGULAR;
-        const PD: &str = metrics_labels::BACKEND_PD;
-        let (selection, inject, plan, backend) = match mode {
-            Mode::Regular => ("Regular", "false", "Single", REGULAR),
-            Mode::PrefillDecode => ("PrefillDecode", "true", "PrefillDecode", PD),
-            Mode::EncodePrefillDecode => {
-                ("EncodePrefillDecode", "false", "EncodePrefillDecode", PD)
-            }
-        };
-        let encode = matches!(mode, Mode::EncodePrefillDecode);
-        let build = match endpoint {
-            Endpoint::Chat => format!(
-                "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata={inject}, {plan}), GenerateRequestBuildingStage(inject_pd_metadata={inject}, {plan}))"
-            ),
-            Endpoint::Messages => {
-                format!("MessageRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Completion => {
-                format!("CompletionRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Harmony => {
-                format!("HarmonyRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Embeddings | Endpoint::Classify => {
-                "EmbeddingRequestBuildingStage".to_string()
-            }
-            Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
-            Endpoint::Decisions => "DecisionsRequestBuildingStage".to_string(),
-        };
-        // Harmony never carries the encode stage.
-        let encode = encode && !matches!(endpoint, Endpoint::Harmony);
-        (
-            format!("WorkerSelectionStage({selection})|encode={encode}|{build}"),
-            backend,
-        )
-    }
-
-    fn assert_parity(endpoint: Endpoint, mode: Mode, deps: &PipelineDeps) {
-        let (expected_sig, expected_backend) = golden(endpoint, mode);
-        let built = RequestPipeline::build(endpoint, mode, deps)
-            .unwrap_or_else(|| panic!("build({endpoint:?}, {mode:?}) should be valid"));
-        assert_eq!(
-            built.signature(),
-            expected_sig,
-            "construction parity for {endpoint:?}/{mode:?}"
-        );
-        assert_eq!(
-            built.backend_type, expected_backend,
-            "backend_type parity for {endpoint:?}/{mode:?}"
-        );
-        assert_eq!(built.mode, mode, "mode parity for {endpoint:?}/{mode:?}");
-    }
-
-    #[test]
-    fn build_matches_frozen_goldens() {
-        let deps = PipelineDeps::test_default();
-
-        for endpoint in [Endpoint::Chat, Endpoint::Messages, Endpoint::Completion] {
-            for mode in [
-                Mode::Regular,
-                Mode::PrefillDecode,
-                Mode::EncodePrefillDecode,
-            ] {
-                assert_parity(endpoint, mode, &deps);
-            }
-        }
-
-        assert!(
-            RequestPipeline::build(Endpoint::Harmony, Mode::EncodePrefillDecode, &deps).is_none(),
-            "Harmony EPD must be invalid"
-        );
-        assert_parity(Endpoint::Harmony, Mode::Regular, &deps);
-        assert_parity(Endpoint::Harmony, Mode::PrefillDecode, &deps);
-
-        for endpoint in [
-            Endpoint::Embeddings,
-            Endpoint::Classify,
-            Endpoint::Transcription,
-            Endpoint::Decisions,
-        ] {
-            assert!(
-                RequestPipeline::build(endpoint, Mode::PrefillDecode, &deps).is_none(),
-                "{endpoint:?} PD must be invalid"
-            );
-            assert!(
-                RequestPipeline::build(endpoint, Mode::EncodePrefillDecode, &deps).is_none(),
-                "{endpoint:?} EPD must be invalid"
-            );
-            assert_parity(endpoint, Mode::Regular, &deps);
-        }
-    }
-}
-
-#[cfg(test)]
-mod alias_pipeline_tests {
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::{
-        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
-    };
-    use serde_json::json;
-
-    use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        routers::grpc::regular::symphony::template::Templates,
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
-    };
-
-    const CANONICAL_MODEL: &str = "canonical-model";
-    const MODEL_ALIAS: &str = "model-alias";
-
-    fn register_pd_worker(registry: &WorkerRegistry, url: &str, worker_type: WorkerType) {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Sglang)
-            .model(ModelCard::new(CANONICAL_MODEL).with_alias(MODEL_ALIAS))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        registry.register(Arc::new(worker)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn pd_generate_alias_is_canonical_before_preparation() {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_pd_worker(
-            &worker_registry,
-            "grpc://prefill:30000",
-            WorkerType::Prefill,
-        );
-        register_pd_worker(&worker_registry, "grpc://decode:30000", WorkerType::Decode);
-
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load("tokenizer-id", CANONICAL_MODEL, "test", || async move {
-                Ok(tokenizer)
-            })
-            .await
-            .unwrap();
-
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            policy_registry,
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-            tokenizer_registry,
-            worker_registry,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: ParserChoice::Legacy,
-        });
-        let request: GenerateRequest = serde_json::from_value(json!({
-            "model": MODEL_ALIAS,
-            "text": "Hello"
-        }))
-        .unwrap();
-        let mut ctx = RequestContext::for_generate(
-            Arc::new(request),
-            None,
-            MODEL_ALIAS.to_string(),
-            components,
-        );
-
-        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
-
-        // Ingress up to worker selection: the canonical id must already be in
-        // place when selection runs.
-        pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
-        pipeline
-            .stages
-            .worker_selection
-            .execute(&mut ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
-        assert!(ctx.state.tokenizer.is_some());
-        match ctx.state.workers.as_ref().unwrap() {
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => {
-                assert_eq!(prefill.url(), "grpc://prefill:30000");
-                assert_eq!(decode.url(), "grpc://decode:30000");
-            }
-            WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod rate_limit_reserve_tests {
-    use bytes::Bytes;
-    use llm_multimodal::registry::transcription::FAMILIES;
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::{
-        decisions::{DecisionInputTokensDetails, DecisionOutputTokensDetails},
-        generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo, GenerateRequest},
-        transcription::{AudioFile, TranscriptionRequest},
-    };
-    use serde_json::json;
-
-    use super::*;
-    use crate::{
-        config::types::RouterConfig,
-        rate_limit::{RateLimitManager, Reservation, ReserveRequest},
-        routers::grpc::{
-            regular::symphony::template::Templates, spec::TranscriptionResponseFormat,
-            ProcessedMessages,
-        },
-        tenant::TenantKey,
-    };
-
-    const MODEL: &str = "reserve-test-model";
-
-    async fn test_components() -> Arc<SharedComponents> {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load(
-                "tokenizer-id",
-                MODEL,
-                "test",
-                || async move { Ok(tokenizer) },
-            )
-            .await
-            .unwrap();
-        Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-            tokenizer_registry,
-            worker_registry,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: ParserChoice::Legacy,
-        })
-    }
-
-    /// Real `RateLimitManager` backed by a tiny in-memory budget --
-    /// `RateLimitManager::new` is private to the `rate_limit` module, so
-    /// `from_config` (with a temp YAML) is the only way to build one from
-    /// here. The YAML is read synchronously inside `from_config`, before the
-    /// tempdir is dropped at the end of this function, so no leak is needed.
-    fn manager_with_tokens_per_minute(tpm: u32) -> Arc<RateLimitManager> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            format!("default_policy:\n  tokens_per_minute: {tpm}\n  requests_per_minute: 1000\n"),
-        )
-        .unwrap();
-        let rc = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .tenant_rate_limit_enabled(true)
-            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
-            .build_unchecked();
-        RateLimitManager::from_config(&rc).unwrap().unwrap()
-    }
-
-    fn ctx_with_tokens(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
-        let request: GenerateRequest = serde_json::from_value(json!({
-            "model": MODEL,
-            "text": "Hello"
-        }))
-        .unwrap();
-        let mut ctx =
-            RequestContext::for_generate(Arc::new(request), None, MODEL.to_string(), components);
-        ctx.state.preparation = Some(PreparationOutput::Generate {
-            original_text: None,
-            token_ids: vec![0; num_tokens],
-        });
-        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
-        ctx
-    }
-
-    #[tokio::test]
-    async fn reserve_is_admitted_once_and_cached_on_the_cell() {
-        // Admits one 5-token reservation but not two (5 + 5 > 6).
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-
-        assert!(stage.execute(&mut ctx).await.is_ok());
-        // A second pass (defensive; ingress runs once) sees the cached
-        // Admitted outcome and does not reserve again.
-        assert!(stage.execute(&mut ctx).await.is_ok());
-
-        assert!(matches!(
-            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
-            Some(RateLimitOutcome::Admitted(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn denial_is_cached_on_the_cell() {
-        // Too small for even one 5-token reservation.
-        let manager = manager_with_tokens_per_minute(3);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-
-        let response = stage.execute(&mut ctx).await.expect_err("should be denied");
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        assert!(matches!(
-            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
-            Some(RateLimitOutcome::Denied)
-        ));
-    }
-
-    #[tokio::test]
-    async fn disabled_manager_is_a_no_op() {
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(None);
-        assert!(stage.execute(&mut ctx).await.is_ok());
-        assert!(ctx.input.rate_limit_cell.as_ref().unwrap().peek().is_none());
-    }
-
-    #[tokio::test]
-    async fn endpoint_without_a_cell_is_a_no_op() {
-        // The Responses iterations set no rate_limit_cell.
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-        assert!(stage.execute(&mut ctx).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
-        // Budget 6; reserve 5 leaves 1. A response without usage settles
-        // with all zeros (see `recorded_settlement`, `completion_settlement`
-        // and `generate_settlement`) -- that must refund the full 5-token
-        // debit back to the tenant, not silently keep it (nothing was
-        // actually consumed) and not leave the reservation stuck open
-        // (which would leak budget forever).
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager.clone()));
-        assert!(stage.execute(&mut ctx).await.is_ok());
-
-        RequestPipeline::settle_reservation(
-            ctx.input.rate_limit_cell.as_deref(),
-            UsageSettlement::default(),
-        )
-        .await;
-
-        // The full 6-token budget must be available again -- would be
-        // denied if settle had kept the original 5-token debit instead of
-        // truing it up to the real (zero) usage.
-        let check = ReserveRequest {
-            request_charge_id: uuid::Uuid::now_v7(),
-            tenant_key: TenantKey::new("test-tenant"),
-            model_id: Some(MODEL.to_string()),
-            estimated_input_tokens: 6,
-        };
-        assert!(matches!(
-            manager.reserve(check).await,
-            Reservation::Admitted(_)
-        ));
-    }
-
-    /// The cached and reasoning split of a settlement is carried for the
-    /// consumers that price or report it; the true-up charges the counts.
-    #[tokio::test]
-    async fn settle_reservation_charges_the_counts_and_not_their_split() {
-        let manager = manager_with_tokens_per_minute(100);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager.clone()));
-        assert!(stage.execute(&mut ctx).await.is_ok());
-
-        RequestPipeline::settle_reservation(
-            ctx.input.rate_limit_cell.as_deref(),
-            UsageSettlement {
-                actual_input_tokens: 5,
-                completion_tokens: 10,
-                cached_input_tokens: 4,
-                reasoning_tokens: 3,
-            },
-        )
-        .await;
-
-        // 100 - 15 = 85 remain: the split neither charges twice nor refunds.
-        let check = |tokens: u32| ReserveRequest {
-            request_charge_id: uuid::Uuid::now_v7(),
-            tenant_key: TenantKey::new("test-tenant"),
-            model_id: Some(MODEL.to_string()),
-            estimated_input_tokens: tokens,
-        };
-        assert!(matches!(
-            manager.reserve(check(85)).await,
-            Reservation::Admitted(_)
-        ));
-        assert!(matches!(
-            manager.reserve(check(1)).await,
-            Reservation::Denied { .. }
-        ));
-    }
-
-    /// The non-streamed completion settles from its usage object: the
-    /// engine's counters, their details included; zeros without one.
-    #[test]
-    fn completion_settlement_carries_the_usage_details() {
-        let usage = Usage::from_counts(7, 5)
-            .with_cached_tokens(3)
-            .with_reasoning_tokens(2);
-        assert_eq!(
-            RequestPipeline::completion_settlement(Some(&usage)),
-            UsageSettlement {
-                actual_input_tokens: 7,
-                completion_tokens: 5,
-                cached_input_tokens: 3,
-                reasoning_tokens: 2,
-            }
-        );
-        assert_eq!(
-            RequestPipeline::completion_settlement(Some(&Usage::from_counts(7, 5))),
-            UsageSettlement {
-                actual_input_tokens: 7,
-                completion_tokens: 5,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            }
-        );
-        assert_eq!(
-            RequestPipeline::completion_settlement(None),
-            UsageSettlement::default()
-        );
-    }
-
-    /// The non-streamed generate answer settles its shared prompt and cache
-    /// hit once, the greatest any choice reports, and sums each choice's
-    /// completion and reasoning counts; an empty answer settles zeros.
-    #[test]
-    fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
-        let choice = |completion_tokens: u32, reasoning_tokens: Option<u32>, cached_tokens: u32| {
-            GenerateResponse {
-                text: String::new(),
-                output_ids: Vec::new(),
-                meta_info: GenerateMetaInfo {
-                    id: "gen".to_string(),
-                    finish_reason: GenerateFinishReason::Stop {
-                        finish_type: GenerateFinishType::Stop,
-                    },
-                    prompt_tokens: 9,
-                    weight_version: "default".to_string(),
-                    input_token_logprobs: None,
-                    output_token_logprobs: None,
-                    completion_tokens,
-                    cached_tokens,
-                    reasoning_tokens,
-                    e2e_latency: 0.0,
-                    matched_stop: None,
-                },
-            }
-        };
-        assert_eq!(
-            RequestPipeline::generate_settlement(&[choice(3, Some(1), 4), choice(5, None, 4)]),
-            UsageSettlement {
-                actual_input_tokens: 9,
-                completion_tokens: 8,
-                cached_input_tokens: 4,
-                reasoning_tokens: 1,
-            }
-        );
-        // The choices report different cache hits: the settlement takes the
-        // greatest, as the streamed answer settles.
-        assert_eq!(
-            RequestPipeline::generate_settlement(&[choice(3, Some(1), 2), choice(5, None, 6)])
-                .cached_input_tokens,
-            6
-        );
-        assert_eq!(
-            RequestPipeline::generate_settlement(&[]),
-            UsageSettlement::default()
-        );
-    }
-
-    /// A decision batch settles its input tokens and the cache and reasoning
-    /// counters its usage carries, no completion; a count past `u32` saturates.
-    #[test]
-    fn decisions_settlement_carries_the_usage_counters() {
-        let usage = DecisionUsage {
-            input_tokens: 11,
-            output_tokens: 0,
-            total_tokens: 11,
-            input_tokens_details: DecisionInputTokensDetails {
-                cached_tokens: 2,
-                cache_write_tokens: 0,
-            },
-            output_tokens_details: DecisionOutputTokensDetails {
-                reasoning_tokens: 1,
-            },
-        };
-        assert_eq!(
-            RequestPipeline::decisions_settlement(&usage),
-            UsageSettlement {
-                actual_input_tokens: 11,
-                completion_tokens: 0,
-                cached_input_tokens: 2,
-                reasoning_tokens: 1,
-            }
-        );
-        let beyond = DecisionUsage {
-            input_tokens: u64::from(u32::MAX) + 1,
-            ..usage
-        };
-        assert_eq!(
-            RequestPipeline::decisions_settlement(&beyond).actual_input_tokens,
-            u32::MAX
-        );
-    }
-
-    fn with_tenant_and_cell(mut ctx: RequestContext) -> RequestContext {
-        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-        ctx
-    }
-
-    /// An embeddings request after its preparation: `num_tokens` input tokens.
-    fn embedding_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
-        let request: EmbeddingRequest =
-            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
-        let mut ctx =
-            RequestContext::for_embedding(Arc::new(request), None, MODEL.to_string(), components);
-        ctx.state.preparation = Some(PreparationOutput::Embedding {
-            original_text: "Hello".to_string(),
-            token_ids: vec![0; num_tokens],
-        });
-        with_tenant_and_cell(ctx)
-    }
-
-    /// A classification request after its preparation, which it shares with
-    /// embeddings: `num_tokens` input tokens.
-    fn classify_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
-        let request: ClassifyRequest =
-            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
-        let mut ctx =
-            RequestContext::for_classify(Arc::new(request), None, MODEL.to_string(), components);
-        ctx.state.preparation = Some(PreparationOutput::Embedding {
-            original_text: "Hello".to_string(),
-            token_ids: vec![0; num_tokens],
-        });
-        with_tenant_and_cell(ctx)
-    }
-
-    /// A transcription request after its preparation: the chat-shaped
-    /// request the family's convention made, rendered to `num_tokens` tokens.
-    fn transcription_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
-        let request = TranscriptionRequest {
-            model: MODEL.to_string(),
-            ..Default::default()
-        };
-        let audio = AudioFile {
-            bytes: Bytes::from_static(b"not audio"),
-            file_name: "clip.wav".to_string(),
-            content_type: None,
-        };
-        let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .unwrap();
-        let mut ctx = RequestContext::for_transcription(
-            Arc::new(request),
-            Arc::new(audio),
-            None,
-            MODEL.to_string(),
-            components,
-        );
-        ctx.state.preparation = Some(PreparationOutput::Transcription {
-            token_ids: vec![0; num_tokens],
-            processed_messages: ProcessedMessages {
-                text: String::new(),
-                unbilled_prompt_tokens: 0,
-                continued_final_message: false,
-                generation_prompt: true,
-            },
-            chat_request: Arc::new(chat_request),
-            format: TranscriptionResponseFormat::Json,
-            family: FAMILIES[0],
-        });
-        with_tenant_and_cell(ctx)
-    }
-
-    /// The reservation of `endpoint`, as the chat endpoint takes it: the
-    /// estimate is the preparation's input token count; a budget that cannot
-    /// hold it refuses with the chat endpoint's 429, a budget that holds it
-    /// once admits the first request and refuses the second.
-    async fn assert_reserves_like_chat(
-        endpoint: &str,
-        make: fn(Arc<SharedComponents>, usize) -> RequestContext,
-    ) {
-        let components = test_components().await;
-
-        // Too small for one 5-token reservation.
-        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(3)));
-        let mut ctx = make(components.clone(), 5);
-        let response = stage.execute(&mut ctx).await.expect_err(endpoint);
-        assert_eq!(
-            response.status(),
-            http::StatusCode::TOO_MANY_REQUESTS,
-            "{endpoint}"
-        );
-        assert!(
-            matches!(
-                ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
-                Some(RateLimitOutcome::Denied)
-            ),
-            "{endpoint}: the denial is cached on the cell"
-        );
-
-        // Room for one 5-token reservation, not two (5 + 5 > 6).
-        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(6)));
-        let mut first = make(components.clone(), 5);
-        assert!(stage.execute(&mut first).await.is_ok(), "{endpoint}");
-        assert!(
-            matches!(
-                first.input.rate_limit_cell.as_ref().unwrap().peek(),
-                Some(RateLimitOutcome::Admitted(_))
-            ),
-            "{endpoint}: the admission is cached on the cell"
-        );
-        let mut second = make(components, 5);
-        let response = stage.execute(&mut second).await.expect_err(endpoint);
-        assert_eq!(
-            response.status(),
-            http::StatusCode::TOO_MANY_REQUESTS,
-            "{endpoint}: the first request's tokens are debited"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_embeddings_request_reserves_its_input_tokens_like_a_chat_request() {
-        assert_reserves_like_chat("embeddings", embedding_ctx).await;
-    }
-
-    #[tokio::test]
-    async fn a_classify_request_reserves_its_input_tokens_like_a_chat_request() {
-        assert_reserves_like_chat("classify", classify_ctx).await;
-    }
-
-    #[tokio::test]
-    async fn a_transcription_request_reserves_its_prompt_tokens_like_a_chat_request() {
-        assert_reserves_like_chat("transcription", transcription_ctx).await;
-    }
-
-    /// Embeddings and classification settle the prompt tokens the engine
-    /// counted and nothing else.
-    #[test]
-    fn prompt_only_settlement_charges_the_prompt_alone() {
-        assert_eq!(
-            RequestPipeline::prompt_only_settlement(7),
-            UsageSettlement {
-                actual_input_tokens: 7,
-                completion_tokens: 0,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-mod model_label_tests {
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
-
-    use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        observability::metrics::test_support::render_with_recorder,
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
-    };
-
-    /// smg-lab #288: the pipeline's request and error records carry the
-    /// served model's id, or `other` for a model no worker serves, so a
-    /// client cannot mint series with unknown names.
-    #[test]
-    fn the_pipeline_counts_an_unserved_model_under_other() {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Sglang)
-            .model(ModelCard::new("m1"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        worker_registry.register(Arc::new(worker)).unwrap();
-        let deps = PipelineDeps::pair(
-            worker_registry,
-            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let rendered = render_with_recorder(|| {
-            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "ghost-1", false);
-            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "m1", false);
-            pipeline.record_error(
-                Some(metrics_labels::ENDPOINT_CHAT),
-                "ghost-1",
-                &error::model_not_found("ghost-1"),
-            );
-        });
-        assert!(!rendered.contains("ghost-"), "{rendered}");
-        let has = |family: &str, label: &str| {
-            rendered
-                .lines()
-                .any(|line| line.starts_with(&format!("{family}{{")) && line.contains(label))
-        };
-        assert!(
-            has("smg_router_requests_total", r#"model="other""#),
-            "{rendered}"
-        );
-        assert!(
-            has("smg_router_requests_total", r#"model="m1""#),
-            "{rendered}"
-        );
-        assert!(
-            has("smg_router_request_errors_total", r#"model="other""#),
-            "{rendered}"
-        );
-    }
-}

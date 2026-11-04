@@ -1,6 +1,10 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
 
@@ -34,6 +38,12 @@ pub struct Config {
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
     pub tokenizer_path: String,
+    /// The model's sampling defaults as a gRPC worker's model info reports
+    /// them: the compact JSON of the `generation_config.json` keys an engine
+    /// servicer advertises (`temperature`, `top_p`, `top_k`, `min_p`,
+    /// `repetition_penalty`), read from the model directory at startup; empty
+    /// when the model is not a directory or its config declares none.
+    pub default_sampling_params_json: String,
     /// Simulated per-request generation latency (canned mode only).
     pub gen_delay: Duration,
     /// Number of canned output tokens per generation; also the default output
@@ -84,6 +94,24 @@ pub struct Config {
     /// batches), `false` (the default) a wire that carries token batches
     /// only, whose silence the gateway judges against its prefill bound.
     pub step_reports: bool,
+    /// The gRPC workers' role in a disaggregated fleet (`--worker-type`): a
+    /// prefill worker answers every request with the prompt side's
+    /// completion alone and binds its bootstrap port, a decode worker
+    /// generates as a regular one; both advertise the role in their server
+    /// args as the engines do (`disaggregation_mode`). `None` is a regular
+    /// worker.
+    pub role: Option<Role>,
+    /// First bootstrap port of the prefill workers (`--bootstrap-base-port`):
+    /// worker `i` binds `base + i`, where a decode partner's engine would
+    /// rendezvous for the KV handoff, and advertises it
+    /// (`disaggregation_bootstrap_port`); the gateway probes it. `None` binds
+    /// and advertises nothing.
+    pub bootstrap_base_port: Option<u16>,
+    /// The pairing protocol the process environment names
+    /// (`SMG_PAIRING_PROTOCOL`), advertised in the gRPC workers' server args
+    /// as the engine servicers advertise theirs (`pairing_protocol`): the
+    /// gateway pairs a prefill and a decode worker on it alone when set.
+    pub pairing_protocol: Option<String>,
     /// Settings for replay testing (gRPC workers only).
     pub replay: ReplayConfig,
 }
@@ -100,6 +128,40 @@ pub struct ReplayConfig {
     /// token ids, served on every wire ahead of the engine
     /// ([`crate::script`]).
     pub script: Option<PathBuf>,
+}
+
+/// A gRPC worker's role in a disaggregated fleet (`--worker-type`; the
+/// gateway's worker API spells it `worker_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Answers every request with the prompt side's completion alone and
+    /// binds its bootstrap port: the side a gateway in PD mode sends the
+    /// prompt to first.
+    Prefill,
+    /// Generates as a regular worker: the side whose output the client reads.
+    Decode,
+}
+
+impl Role {
+    /// The role as the engines' server args spell it (`disaggregation_mode`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "prefill" => Ok(Self::Prefill),
+            "decode" => Ok(Self::Decode),
+            other => Err(format!("--worker-type must be prefill|decode, got {other}")),
+        }
+    }
 }
 
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
@@ -178,6 +240,7 @@ impl Default for Config {
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
+            default_sampling_params_json: String::new(),
             gen_delay: Duration::from_millis(0),
             output_tokens: 8,
             realistic: false,
@@ -195,15 +258,24 @@ impl Default for Config {
             kv_events_wire: crate::kv_zmq::Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
+            role: None,
+            bootstrap_base_port: None,
+            pairing_protocol: None,
             replay: ReplayConfig::default(),
         }
     }
 }
 
 impl Config {
-    /// Parse the configuration from `std::env::args`, falling back to defaults.
+    /// Parse the configuration from `std::env::args`, falling back to
+    /// defaults, with what the environment names (`SMG_PAIRING_PROTOCOL`).
     pub fn from_args() -> Result<Self, String> {
-        Self::parse(std::env::args().skip(1))
+        let mut cfg = Self::parse(std::env::args().skip(1))?;
+        cfg.pairing_protocol = std::env::var("SMG_PAIRING_PROTOCOL")
+            .ok()
+            .map(|protocol| protocol.trim().to_string())
+            .filter(|protocol| !protocol.is_empty());
+        Ok(cfg)
     }
 
     /// Parse the configuration from command-line flags, without the program
@@ -318,6 +390,10 @@ impl Config {
                     block_size_given = true;
                 }
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--worker-type" => cfg.role = Some(value(&mut args, &flag)?.parse()?),
+                "--bootstrap-base-port" => {
+                    cfg.bootstrap_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
                 "--drain-timeout-secs" => {
                     let secs: f64 = parse(value(&mut args, &flag)?, &flag)?;
                     cfg.drain_timeout =
@@ -334,6 +410,7 @@ impl Config {
         if cfg.tokenizer_path.is_empty() {
             cfg.tokenizer_path = cfg.model_id.clone();
         }
+        cfg.default_sampling_params_json = sampling_defaults_json(Path::new(&cfg.model_id));
         let (model, calibration) = timing.resolve()?;
         cfg.engine.timing = model;
         if let Some(c) = calibration {
@@ -386,11 +463,42 @@ impl Config {
         if cfg.zmq_count > 0 && cfg.zmq_handshake.is_none() {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
         }
+        if cfg.role.is_some() {
+            if cfg.grpc_count == 0 {
+                return Err(
+                    "--worker-type is the gRPC workers' role: pass --grpc-count".to_string()
+                );
+            }
+            if cfg.http_count > 0 || cfg.zmq_count > 0 {
+                return Err(
+                    "--worker-type is the gRPC workers' role: the HTTP and ZMQ workers of this \
+                     mock take none"
+                        .to_string(),
+                );
+            }
+        }
+        if cfg.bootstrap_base_port.is_some() && cfg.role != Some(Role::Prefill) {
+            return Err(
+                "--bootstrap-base-port needs --worker-type prefill: only a prefill worker binds \
+                 a bootstrap port"
+                    .to_string(),
+            );
+        }
         Ok(cfg)
     }
 }
 
 impl Config {
+    /// The bootstrap port of gRPC worker number `index` (its offset from
+    /// `--grpc-base-port`): `--bootstrap-base-port` plus the offset for a
+    /// prefill worker given one, `None` for every other worker.
+    pub fn bootstrap_port_for(&self, index: u16) -> Option<u16> {
+        if self.role != Some(Role::Prefill) {
+            return None;
+        }
+        self.bootstrap_base_port?.checked_add(index)
+    }
+
     /// The KV-event publisher of worker number `index` (gRPC workers first,
     /// then ZMQ ranks), when publishing is on and the engine is realistic.
     /// `dp_rank` is the rank the publisher stamps on the vLLM wire: 0 for a
@@ -457,7 +565,9 @@ pub fn usage() -> String {
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
-       --model <id>             advertised model id (default mock-model)\n\
+       --model <id|dir>         advertised model id, or a model directory whose\n\
+                                generation_config.json gives the sampling defaults gRPC\n\
+                                workers report (default mock-model)\n\
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
@@ -507,9 +617,86 @@ pub fn usage() -> String {
                                 engine's silence against\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
+       --worker-type <prefill|decode>  the gRPC workers' role in a disaggregated fleet (default\n\
+                                none): a prefill worker answers every request with the prompt\n\
+                                side's completion alone (no output, no script) and a decode\n\
+                                worker generates as a regular one; both advertise the role in\n\
+                                their server args (disaggregation_mode)\n\
+       --bootstrap-base-port <port>  first bootstrap port of the prefill workers: worker i binds\n\
+                                base+i, accepts and closes each connection (the gateway's probe)\n\
+                                and advertises it (disaggregation_bootstrap_port) (default none)\n\
        --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
-                                finish before the process exits regardless (default 5)"
+                                finish before the process exits regardless (default 5)\n\
+     \n\
+     Environment:\n\
+       SMG_PAIRING_PROTOCOL=<name>  advertised by every gRPC worker as pairing_protocol, as the engine\n\
+                                servicers do: the gateway pairs a prefill and a decode that name the\n\
+                                same one (default none advertised)\n"
         .to_string()
+}
+
+/// The `generation_config.json` keys an engine servicer reports as the
+/// model's sampling defaults, in the order they are written.
+const SAMPLING_DEFAULT_KEYS: [&str; 5] = [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+];
+
+/// The sampling defaults of the model at `model_dir`, as an engine servicer
+/// reports them: the compact JSON of `SAMPLING_DEFAULT_KEYS` present and
+/// non-null in `generation_config.json`. Empty when `model_dir` is not a
+/// directory (a model id, a file), has no such config, the file does not
+/// parse, or it declares none of the keys.
+pub fn sampling_defaults_json(model_dir: &Path) -> String {
+    if !model_dir.is_dir() {
+        return String::new();
+    }
+    let path = model_dir.join("generation_config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // A model without the file declares no defaults; anything else that
+        // keeps the file from being read is said, so a bed with a broken
+        // fixture does not read like such a model.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(e) => {
+            tracing::warn!("{}: not read, no sampling defaults: {e}", path.display());
+            return String::new();
+        }
+    };
+    let config = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(config)) => config,
+        Ok(_) => {
+            tracing::warn!(
+                "{}: not a JSON object, no sampling defaults",
+                path.display()
+            );
+            return String::new();
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{}: does not parse, no sampling defaults: {e}",
+                path.display()
+            );
+            return String::new();
+        }
+    };
+    let defaults: serde_json::Map<String, serde_json::Value> = SAMPLING_DEFAULT_KEYS
+        .iter()
+        .filter_map(|&key| {
+            config
+                .get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
+    if defaults.is_empty() {
+        String::new()
+    } else {
+        serde_json::Value::Object(defaults).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +705,56 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn sampling_defaults_are_the_generation_configs_advertised_keys() {
+        let dir = tempfile::tempdir().expect("a model directory");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"bos_token_id": 1, "do_sample": true, "temperature": 0.7, "top_p": 0.8,
+                "top_k": 20, "min_p": null, "repetition_penalty": 1.05, "max_new_tokens": 32}"#,
+        )
+        .expect("write the config");
+        assert_eq!(
+            sampling_defaults_json(dir.path()),
+            r#"{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05}"#
+        );
+        // The parsed configuration reads the directory it was given as the model.
+        let flags = ["--grpc-base-port", "19000", "--grpc-count", "1", "--model"];
+        let cfg = parse(&[&flags[..], &[dir.path().to_str().expect("utf-8 path")]].concat())
+            .expect("a model directory");
+        assert_eq!(
+            cfg.default_sampling_params_json,
+            r#"{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05}"#
+        );
+    }
+
+    #[test]
+    fn sampling_defaults_are_empty_without_a_directory_a_config_or_the_keys() {
+        assert_eq!(sampling_defaults_json(Path::new("owner/model-id")), "");
+        let dir = tempfile::tempdir().expect("a model directory");
+        assert_eq!(sampling_defaults_json(dir.path()), "", "no config file");
+        let config = dir.path().join("generation_config.json");
+        std::fs::write(
+            &config,
+            r#"{"bos_token_id": 1, "max_new_tokens": 32, "top_k": null}"#,
+        )
+        .expect("write the config");
+        assert_eq!(sampling_defaults_json(dir.path()), "", "none of the keys");
+        std::fs::write(&config, "not json").expect("write the config");
+        assert_eq!(
+            sampling_defaults_json(dir.path()),
+            "",
+            "a config that does not parse"
+        );
+        assert_eq!(
+            parse(&["--grpc-base-port", "19000", "--grpc-count", "1"])
+                .expect("defaults")
+                .default_sampling_params_json,
+            "",
+            "the default model id is no directory"
+        );
     }
 
     #[test]
@@ -646,6 +883,62 @@ mod tests {
         let cfg = parse(&[&grpc[..], &["--script", "/tmp/answers.jsonl"]].concat())
             .expect("--script parses");
         assert_eq!(cfg.replay.script, Some(PathBuf::from("/tmp/answers.jsonl")));
+    }
+
+    #[test]
+    fn a_role_is_prefill_or_decode_on_the_grpc_workers_alone() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
+        assert_eq!(cfg.bootstrap_port_for(0), None, "a regular worker");
+
+        let prefill = parse(
+            &[
+                &grpc[..],
+                &["--worker-type", "prefill", "--bootstrap-base-port", "8998"],
+            ]
+            .concat(),
+        )
+        .expect("prefill workers with bootstrap ports");
+        assert_eq!(prefill.role, Some(Role::Prefill));
+        assert_eq!(
+            (prefill.bootstrap_port_for(0), prefill.bootstrap_port_for(1)),
+            (Some(8998), Some(8999)),
+            "worker i binds base + i"
+        );
+        let unbound = parse(&[&grpc[..], &["--worker-type", "prefill"]].concat())
+            .expect("a prefill worker without a bootstrap port");
+        assert_eq!(unbound.bootstrap_port_for(0), None);
+
+        let decode =
+            parse(&[&grpc[..], &["--worker-type", "decode"]].concat()).expect("decode workers");
+        assert_eq!(decode.role, Some(Role::Decode));
+        assert_eq!(decode.bootstrap_port_for(0), None, "a decode binds no port");
+
+        assert!(parse(&[&grpc[..], &["--worker-type", "encode"]].concat())
+            .expect_err("no encode role")
+            .contains("--worker-type must be prefill|decode"));
+        assert!(parse(&["--http-count", "1", "--worker-type", "prefill"])
+            .expect_err("a role needs gRPC workers")
+            .contains("pass --grpc-count"));
+        assert!(
+            parse(&[&grpc[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
+                .expect_err("the HTTP workers take no role")
+                .contains("HTTP and ZMQ workers")
+        );
+        assert!(parse(
+            &[
+                &grpc[..],
+                &["--worker-type", "decode", "--bootstrap-base-port", "8998"],
+            ]
+            .concat()
+        )
+        .expect_err("a decode binds no bootstrap port")
+        .contains("needs --worker-type prefill"));
+        assert!(
+            parse(&[&grpc[..], &["--bootstrap-base-port", "8998"]].concat()).is_err(),
+            "a regular worker binds no bootstrap port"
+        );
     }
 
     #[test]

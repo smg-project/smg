@@ -393,8 +393,32 @@ mod tests {
 
     #[test]
     fn port_block_is_free_and_laid_out_as_the_bed_expects() {
+        // A block's ports, the gateway first (the refusal below reads it at the head of
+        // the busy list).
+        assert_eq!(
+            Ports::block(29800, 2),
+            (
+                Ports {
+                    gateway: 29800,
+                    metrics: 29801,
+                    admin: 29809,
+                    mock_base: 29810
+                },
+                vec![29800, 29801, 29809, 29810, 29811]
+            )
+        );
+        // The test holds a port of its own, the first of the bed's range it can bind: the
+        // bind both finds and holds it, so no other user of the range (another instance of
+        // this test included) can take what the test asserts on.
+        let holder = (29700..=29999)
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .unwrap();
+        let held = holder.local_addr().unwrap().port();
+        // The scan passes the held block by and lays the first free one out as the bed
+        // expects.
         let ports = pick_ports(0, 4, 29700, 29999).unwrap();
         let base = ports.gateway;
+        assert_ne!(base, held);
         assert_eq!(
             ports,
             Ports {
@@ -404,14 +428,13 @@ mod tests {
                 mock_base: base + 10
             }
         );
-        assert_eq!(pick_ports(29800, 2, 29700, 29999).unwrap().admin, 29809);
         let err = pick_ports(0, 4, 29700, 29705).unwrap_err().to_string();
         assert!(err.contains("no free port block"), "{err}");
-        // A block whose gateway port is taken is refused by name.
-        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
-        let taken = holder.local_addr().unwrap().port();
-        let err = pick_ports(taken, 1, 29700, 29999).unwrap_err().to_string();
-        assert!(err.contains(&format!("[{taken}]")), "{err}");
+        // A block whose gateway port is taken is refused by that port's name: the held port
+        // heads the error's list whatever else is busy in its block (an ephemeral port
+        // would head a block the host's other connections share).
+        let err = pick_ports(held, 4, 29700, 29999).unwrap_err().to_string();
+        assert!(err.contains(&format!("port(s) [{held}")), "{err}");
     }
 
     struct FakeScript {

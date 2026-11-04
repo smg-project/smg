@@ -1,5 +1,6 @@
 //! The `Embed` RPC: one pooling request, answered when the engine's single
-//! finished output arrives, and registered so the `Abort` RPC can end it.
+//! finished output arrives, under the frame every wire shares
+//! ([`crate::embed::guarded`]: registered so the `Abort` RPC can end it).
 
 use std::sync::Arc;
 
@@ -15,27 +16,18 @@ pub(super) async fn embed(
     req: vllm::EmbedRequest,
 ) -> Result<vllm::EmbedResponse, Status> {
     let client = state.shared.engine()?;
-    if req.request_id.is_empty() {
-        return Err(Status::invalid_argument("request_id is required"));
-    }
-    // A generation runner serves no pooling task; vLLM's frontend refuses
-    // this before the engine sees it, in these words.
-    if state.model.is_generation {
-        return Err(Status::invalid_argument(
-            "This model does not support pooling",
-        ));
-    }
     let pooler = PoolerDefaults {
         use_activation: state.model.pooler_use_activation,
         dimensions: state.model.pooler_dimensions,
     };
-    // Registered like a generate stream, so an `Abort` (or the drain on
-    // shutdown) ends the wait: dropping the in-flight call drops its engine
-    // stream, which aborts the engine-side request.
-    let (_registration, cancel) = state.shared.registry.register(&req.request_id)?;
-    let request_id = req.request_id.clone();
-    tokio::select! {
-        result = client.embed(req, pooler) => result,
-        _ = cancel => Err(Status::aborted(format!("embed request {request_id} was aborted"))),
-    }
+    // A generation runner serves no pooling task; vLLM's frontend refuses
+    // this before the engine sees it, in these words.
+    crate::embed::guarded(
+        state,
+        req.request_id.clone(),
+        state.model.is_generation,
+        "This model does not support pooling",
+        || client.embed(req, pooler),
+    )
+    .await
 }

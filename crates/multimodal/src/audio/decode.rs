@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use symphonia::{
     core::{
         codecs::audio::AudioDecoderOptions,
@@ -40,18 +41,20 @@ pub struct DecodedAudio {
 }
 
 /// The clip as mono `f32` samples, by the in-process decoder first and the
-/// external one when it fails. What a decoder says about the clip is the
+/// external one when it fails. The clip's buffer is handed over, never
+/// copied: the in-process decoder's cursor reads it as it is, and the
+/// external decoder's scratch file is written from it. What a decoder says about the clip is the
 /// media's fault ([`MediaConnectorError::AudioDecode`]); this process's own
 /// scratch file, pipe or task, and a decoder it cannot start, are its own
 /// (see [`MediaConnectorError::fault`]).
-pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, MediaConnectorError> {
+pub async fn decode_audio_mono_f32(bytes: Bytes) -> Result<DecodedAudio, MediaConnectorError> {
     match audio_decode_backend_override() {
         Some("symphonia") => decode_audio_with_symphonia_blocking(bytes).await,
         Some("ffmpeg") => decode_audio_with_ffmpeg(bytes).await,
         Some(backend) => Err(MediaConnectorError::decoder_unavailable(format!(
             "unsupported SMG_AUDIO_DECODE_BACKEND={backend}; expected auto, symphonia, or ffmpeg"
         ))),
-        None => match decode_audio_with_symphonia_blocking(bytes).await {
+        None => match decode_audio_with_symphonia_blocking(bytes.clone()).await {
             Ok(decoded) => Ok(decoded),
             Err(symphonia_error) => {
                 debug!(
@@ -75,10 +78,9 @@ pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, MediaCo
 }
 
 async fn decode_audio_with_symphonia_blocking(
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<DecodedAudio, MediaConnectorError> {
-    let bytes = bytes.to_vec();
-    task::spawn_blocking(move || decode_audio_mono_f32_symphonia(&bytes))
+    task::spawn_blocking(move || decode_audio_mono_f32_symphonia(bytes))
         .await
         .map_err(MediaConnectorError::Blocking)?
         .map_err(audio_decode)
@@ -101,7 +103,7 @@ fn audio_decode(error: TransformError) -> MediaConnectorError {
 }
 
 pub(crate) fn decode_audio_mono_f32_symphonia(
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<DecodedAudio, TransformError> {
     decode_audio_mono_f32_symphonia_with_limits(
         bytes,
@@ -111,17 +113,18 @@ pub(crate) fn decode_audio_mono_f32_symphonia(
 }
 
 fn decode_audio_mono_f32_symphonia_with_limits(
-    bytes: &[u8],
+    bytes: Bytes,
     max_decoded_bytes: usize,
     timeout: Duration,
 ) -> Result<DecodedAudio, TransformError> {
     let started = Instant::now();
     let mut hint = Hint::new();
-    if let Some(ext) = audio_extension_hint(bytes) {
+    if let Some(ext) = audio_extension_hint(&bytes) {
         hint.with_extension(ext);
     }
 
-    let cursor = Cursor::new(bytes.to_vec());
+    // The clip's own buffer is the media source; nothing is copied before the first packet.
+    let cursor = Cursor::new(bytes);
     let media_source = MediaSourceStream::new(Box::new(cursor), Default::default());
     let mut format = get_probe()
         .probe(
@@ -211,7 +214,7 @@ fn decode_audio_mono_f32_symphonia_with_limits(
     finish_decoded_audio(mono, sample_rate)
 }
 
-async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, MediaConnectorError> {
+async fn decode_audio_with_ffmpeg(bytes: Bytes) -> Result<DecodedAudio, MediaConnectorError> {
     let input_file = write_temp_audio_file_async(bytes).await?;
     let sample_rate = probe_audio_sample_rate(input_file.path()).await?;
     // Ask FFmpeg for one sample beyond our limit so a longer stream is
@@ -353,9 +356,8 @@ async fn probe_audio_sample_rate(input_path: &Path) -> Result<usize, MediaConnec
 }
 
 async fn write_temp_audio_file_async(
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
-    let bytes = bytes.to_vec();
     task::spawn_blocking(move || write_temp_audio_file(&std::env::temp_dir(), &bytes))
         .await
         .map_err(MediaConnectorError::Blocking)?
@@ -527,7 +529,7 @@ mod tests {
     #[test]
     fn symphonia_decodes_wav_to_mono_f32() {
         let wav = wav_i16_mono(16_000, &[0, 16_384, -16_384]);
-        let decoded = decode_audio_mono_f32_symphonia(&wav).unwrap();
+        let decoded = decode_audio_mono_f32_symphonia(Bytes::from(wav)).unwrap();
         assert_eq!(decoded.sample_rate, 16_000);
         assert_eq!(decoded.samples.len(), 3);
         assert!(decoded.samples[0].abs() < 1e-6);
@@ -539,7 +541,7 @@ mod tests {
     fn symphonia_enforces_decoded_byte_limit() {
         let wav = wav_i16_mono(16_000, &[0, 1, 2]);
         let error = decode_audio_mono_f32_symphonia_with_limits(
-            &wav,
+            Bytes::from(wav),
             2 * size_of::<f32>(),
             Duration::from_secs(1),
         )
@@ -570,8 +572,12 @@ mod tests {
     #[test]
     fn symphonia_enforces_decode_deadline() {
         let wav = wav_i16_mono(16_000, &[0]);
-        let error = decode_audio_mono_f32_symphonia_with_limits(&wav, usize::MAX, Duration::ZERO)
-            .unwrap_err();
+        let error = decode_audio_mono_f32_symphonia_with_limits(
+            Bytes::from(wav),
+            usize::MAX,
+            Duration::ZERO,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("Symphonia timed out"));
     }
@@ -653,7 +659,7 @@ mod tests {
     /// in-process decoder's verdict stands when the fallback judged nothing.
     #[tokio::test]
     async fn a_clip_no_decoder_can_read_is_the_requests() {
-        let error = decode_audio_mono_f32(b"not audio at all")
+        let error = decode_audio_mono_f32(Bytes::from_static(b"not audio at all"))
             .await
             .expect_err("not audio");
         assert!(

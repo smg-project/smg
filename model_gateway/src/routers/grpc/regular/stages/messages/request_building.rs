@@ -201,6 +201,7 @@ impl BuildStage for MessageRequestBuildingStage {
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
             plan,
             spec: ResponseSpec::Messages(spec),

@@ -33,6 +33,7 @@ pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
         "/v1/decisions" => metrics_labels::ENDPOINT_DECISIONS,
         "/v1/systemone" => metrics_labels::ENDPOINT_SYSTEMONE,
         "/v1/messages" => metrics_labels::ENDPOINT_MESSAGES,
+        "/v1/interactions" => metrics_labels::ENDPOINT_INTERACTIONS,
         "/v1/audio/transcriptions" => metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS,
         _ => "other",
     }
