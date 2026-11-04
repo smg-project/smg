@@ -39,9 +39,16 @@ def _run(tmp_path, *, requested=None, declaration=None, vendor="amd", engine="sg
     scripts.mkdir(parents=True)
     marker = tmp_path / "unexpected-helper"
     if helper:
-        (scripts / "ci_setup_sglang_rocm_image.sh").write_text(
-            '#!/bin/sh\nprintf called > "$PROBE_MARKER"\nexit 97\n'
-        )
+        # Later stack layers add an execution wrapper to the same scope guard.
+        # Supply every helper present at this layer, with a marker that still
+        # rejects execution: this test exercises the guard, never the helpers.
+        for name in (
+            "ci_setup_sglang_rocm_image.sh",
+            "ci_setup_sglang_rocm_e2e.sh",
+            "ci_verify_sglang_rocm_e2e.py",
+        ):
+            if (ROOT / "scripts" / name).is_file():
+                (scripts / name).write_text('#!/bin/sh\nprintf called > "$PROBE_MARKER"\nexit 97\n')
     if declaration != "MISSING_FILE":
         if declaration is not None:
             source = source.replace('IMAGE = "' + pin + '"', declaration, 1)
