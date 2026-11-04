@@ -7974,6 +7974,7 @@ name = "smg-symphony"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "memchr",
  "openai-protocol",
  "rand 0.10.2",
  "regex",
