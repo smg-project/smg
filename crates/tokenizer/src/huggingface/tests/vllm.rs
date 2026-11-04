@@ -83,8 +83,7 @@ fn a_file_fastokens_does_not_read_keeps_the_established_paths() {
 }
 
 /// The file alone would give other ids than the wrapper: the Llama class's
-/// pipeline over a legacy file, a tie among normalized added tokens
-/// settled, a post-processor the configuration prescribes.
+/// pipeline over a legacy file, a tie among normalized added tokens settled.
 #[test]
 fn a_pipeline_the_load_changed_beyond_the_file_declines_the_backend() {
     let dir = TempDir::new().unwrap();
@@ -98,8 +97,13 @@ fn a_pipeline_the_load_changed_beyond_the_file_declines_the_backend() {
 
     let (_dir, ours) = checkpoint(NORMALIZED_TIE_TOKENIZER_JSON);
     assert_ne!(ours.encode_path(), EncodePath::Vllm, "a settled tie");
+}
 
-    // A plain ByteLevel file whose configuration prescribes the BOS on request.
+/// A plain ByteLevel file whose configuration prescribes the BOS on request:
+/// the backend takes the file and puts the configured frame around its ids,
+/// where the file's post-processor adds nothing.
+#[test]
+fn the_configured_frame_the_file_lacks_goes_around_the_backend_s_ids() {
     let dir = TempDir::new().unwrap();
     let mut definition: serde_json::Value =
         serde_json::from_str(BYTE_LEVEL_TOKENIZER_JSON).unwrap();
@@ -115,10 +119,12 @@ fn a_pipeline_the_load_changed_beyond_the_file_declines_the_backend() {
     )
     .unwrap();
     let ours = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
-    assert_ne!(
-        ours.encode_path(),
-        EncodePath::Vllm,
-        "a configured post-processor"
-    );
+    assert_eq!(ours.encode_path(), EncodePath::Vllm);
     assert_eq!(ours.encode("a", true).unwrap().token_ids(), &[5, 0]);
+    assert_eq!(ours.encode("a", false).unwrap().token_ids(), &[0]);
+    assert_eq!(
+        ours.encode_batch(&["a", "b"], true).unwrap()[1].token_ids(),
+        &[5, 1]
+    );
+    assert_eq!(ours.decode(&[5, 0], true).unwrap(), "a");
 }

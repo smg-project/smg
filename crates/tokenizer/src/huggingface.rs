@@ -44,6 +44,7 @@ use crate::{
         ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
         PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
+    vllm::Frame,
     word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
 
@@ -193,8 +194,9 @@ impl DirectEncoders {
     fn choose<M: Model + ModelView + Serialize>(
         tokenizer: &TokenizerOf<M>,
         vllm: VllmSource<'_>,
+        frame: Option<Frame>,
     ) -> Self {
-        match crate::vllm::VllmBackend::load(vllm) {
+        match crate::vllm::VllmBackend::load(vllm, frame) {
             Ok(vllm) => {
                 encode_path::note_load(EncodePath::Vllm);
                 tracing::info!(path = %EncodePath::Vllm, "tokenizer encode path");
@@ -845,10 +847,10 @@ impl HuggingFaceTokenizer {
             None => needs_eos && Self::tokenizer_adds_special_tokens(&tokenizer),
         };
 
-        // Whether the configured template frames an encode differently from
-        // the file's own post-processor (a file read alone then gives other
-        // ids on request, which the opt-in backend reading it alone would).
-        let mut post_processor_replaced = false;
+        // Where the configured template frames an encode differently from
+        // the file's own post-processor, the backend, which reads the file
+        // alone, gets the configured frame as ids to put around its own.
+        let mut configured_frame = None;
         if needs_bos || needs_eos {
             if let Some(post_processor) =
                 Self::build_post_processor(needs_bos, needs_eos, &special_tokens, &vocab)
@@ -856,7 +858,23 @@ impl HuggingFaceTokenizer {
                 debug!(needs_bos, needs_eos, "Configured post_processor");
                 let file_frame = Self::special_token_frame(&tokenizer);
                 tokenizer.with_post_processor(Some(post_processor));
-                post_processor_replaced = Self::special_token_frame(&tokenizer) != file_frame;
+                if Self::special_token_frame(&tokenizer) != file_frame {
+                    let id_of = |token: &Option<String>| {
+                        token.as_deref().and_then(|token| vocab.get(token).copied())
+                    };
+                    configured_frame = Some(Frame {
+                        prefix: needs_bos
+                            .then(|| id_of(&special_tokens.bos_token))
+                            .flatten()
+                            .into_iter()
+                            .collect(),
+                        suffix: needs_eos
+                            .then(|| id_of(&special_tokens.eos_token))
+                            .flatten()
+                            .into_iter()
+                            .collect(),
+                    });
+                }
             }
         }
 
@@ -895,14 +913,10 @@ impl HuggingFaceTokenizer {
             Err(Declined::from(
                 "added tokens with one normalized spelling were settled beyond the file",
             ))
-        } else if post_processor_replaced {
-            Err(Declined::from(
-                "the configured special tokens frame an encode differently from the file's post-processor",
-            ))
         } else {
             Ok(tokenizer_path)
         };
-        let mut encoders = DirectEncoders::choose(&tokenizer, vllm_source);
+        let mut encoders = DirectEncoders::choose(&tokenizer, vllm_source, configured_frame);
         // The bound rides on the file's model into the built tokenizer: no
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
@@ -1189,6 +1203,7 @@ impl HuggingFaceTokenizer {
             Err(Declined::from(
                 "the tokenizer was built in memory, with no tokenizer.json to read",
             )),
+            None,
         );
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         encoders.seed_native(tokenizer.get_model());

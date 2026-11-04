@@ -14,9 +14,11 @@
 //! The backend reads `tokenizer.json` alone, so the load hands it the file
 //! only where the wrapper's pipeline is the file's: a tokenizer built in
 //! memory, a vocabulary read from `vocab.json` and `merges.txt`, the Llama
-//! class's pipeline installed over a legacy file, a post-processor the
-//! configuration prescribes, or added tokens settled beyond the file keep
-//! the established paths, with the reason logged once at load. So does a
+//! class's pipeline installed over a legacy file, or added tokens settled
+//! beyond the file keep the established paths, with the reason logged once
+//! at load. The BOS and EOS the configuration prescribes on request, where
+//! the file's post-processor does not frame an encode the same way, reach
+//! the backend as a [`Frame`] of ids it puts around its bare encode. So does a
 //! file `fastokens` does not read: the frontend's own fallback for those is
 //! the `tokenizers` crate with its default per-thread word cache, which the
 //! wrapper bounds on its own pipeline and could not on the frontend's.
@@ -34,15 +36,43 @@ use crate::{
     traits::{Encoding, TokenIdType},
 };
 
+/// The ids a request for special tokens gets around a bare encode: the BOS
+/// the configuration prescribes before it, the EOS after it, where the
+/// file's own post-processor frames an encode otherwise (the rule is on
+/// `HuggingFaceTokenizer::from_file`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Frame {
+    pub(crate) prefix: Vec<TokenIdType>,
+    pub(crate) suffix: Vec<TokenIdType>,
+}
+
+impl Frame {
+    /// `ids` with the frame around it.
+    fn around(&self, ids: Vec<TokenIdType>) -> Vec<TokenIdType> {
+        if self.prefix.is_empty() && self.suffix.is_empty() {
+            return ids;
+        }
+        let mut framed = Vec::with_capacity(self.prefix.len() + ids.len() + self.suffix.len());
+        framed.extend_from_slice(&self.prefix);
+        framed.extend(ids);
+        framed.extend_from_slice(&self.suffix);
+        framed
+    }
+}
+
 /// The backend over one `tokenizer.json`, read by `fastokens`.
 pub(crate) struct VllmBackend {
     tokenizer: VllmHuggingFaceTokenizer,
+    /// The configured frame, when the file's post-processor is not it; `None`
+    /// leaves a request for special tokens to the file's post-processor.
+    frame: Option<Frame>,
 }
 
 impl VllmBackend {
-    /// The backend over the file `source` names, or why it declines: the
-    /// load's reason for naming no file, or a file `fastokens` does not read.
-    pub(crate) fn load(source: VllmSource<'_>) -> Result<Self, Declined> {
+    /// The backend over the file `source` names, with `frame` around the ids
+    /// of a request for special tokens, or why it declines: the load's
+    /// reason for naming no file, or a file `fastokens` does not read.
+    pub(crate) fn load(source: VllmSource<'_>, frame: Option<Frame>) -> Result<Self, Declined> {
         let path = source?;
         let tokenizer = VllmHuggingFaceTokenizer::new_fastokens(path).map_err(|error| {
             Declined::from(format!(
@@ -57,14 +87,22 @@ impl VllmBackend {
                 "vllm-tokenizer's fastokens backend did not encode a space: {error}"
             ))
         })?;
-        Ok(Self { tokenizer })
+        Ok(Self { tokenizer, frame })
     }
 
+    /// The ids of `input`; on a request for special tokens the file's
+    /// post-processor frames them, or the configured [`Frame`] where the
+    /// load handed one over.
     pub(crate) fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-        self.tokenizer
-            .encode(input, add_special_tokens)
-            .map(Encoding::Plain)
-            .map_err(|error| Error::msg(format!("Encoding failed: {error}")))
+        let framed_by_file = add_special_tokens && self.frame.is_none();
+        let ids = self
+            .tokenizer
+            .encode(input, framed_by_file)
+            .map_err(|error| Error::msg(format!("Encoding failed: {error}")))?;
+        Ok(Encoding::Plain(match &self.frame {
+            Some(frame) if add_special_tokens => frame.around(ids),
+            _ => ids,
+        }))
     }
 
     /// Input by input on the calling thread, as the direct encoders' batches
