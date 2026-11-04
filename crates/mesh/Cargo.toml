@@ -31,8 +31,6 @@ bytes = "1"
 futures.workspace = true
 metrics = "0.24.6"
 prost.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2.2"
 tokio-stream = "0.1"
 tonic = { workspace = true, features = ["tls-ring"] }
 # The generated gossip service decodes with its codec.
@@ -45,6 +43,8 @@ tonic-prost-build = "0.14.6"
 [dev-dependencies]
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 openssl = "0.10.81"
+# The mTLS tests install the process crypto provider the gateway installs at start-up.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
