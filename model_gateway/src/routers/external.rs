@@ -25,7 +25,7 @@ use smg_external_router::{
 use super::{
     common::worker_selection::WorkerSelector,
     grpc::utils::{error_reason_for_response, error_type_for_response, route_to_endpoint},
-    http::tenant_rate_limit::{self, TenantCharge},
+    http::tenant_rate_limit::{self, Estimate, TenantCharge},
     RouterTrait,
 };
 use crate::{
@@ -235,7 +235,7 @@ impl ExternalRouterAdapter {
             Some(tenant_meta),
             &request,
             model_id,
-            None,
+            Estimate::Text(None),
         )
         .await;
         let response = match denial {

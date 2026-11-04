@@ -48,6 +48,13 @@ pub(crate) const PREFILL_SILENCE_MESSAGE: &str = "prefill side produced nothing 
 /// stalled decode partner (see [`decode_partner_silent`]).
 pub(crate) const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
 
+/// Whether the rule is on: a prefill side gets a bound unless the wedge
+/// threshold is zero ([`liveness::prefill_side_bound`]). For what a router
+/// spends only because a bound reads it (the HTTP router's prompt estimate).
+pub(crate) fn applies() -> bool {
+    !liveness::budgets().wedge.is_zero()
+}
+
 /// The bound on one prefill side's silence, counted from its dispatch (see
 /// [`liveness::prefill_side_bound`]); the dispatch instant stays with it,
 /// as a reprieve past the deadline may count from there, and so does the
@@ -331,7 +338,9 @@ pub(crate) fn silent_side_answer(side: PdSide, message: &str, worker: &dyn Worke
 }
 
 /// Await a prefill side's `dispatch` (its call, up to the point the
-/// transport counts as the side's answer) within `bound`. Past the deadline
+/// transport counts as the side's answer, or the first item of the stream
+/// the call returned; `phase` names which in the verdict, `dispatch` or
+/// `first_response`) within `bound`. Past the deadline
 /// the side waits on while its worker keeps answering other sides, or while
 /// the worker's current run of prompts has not answered yet and has not
 /// gone unanswered for the time its backlog takes ([`judge_prefill_side`]);
@@ -340,6 +349,10 @@ pub(crate) fn silent_side_answer(side: PdSide, message: &str, worker: &dyn Worke
 /// request path, the HTTP router drops it, which closes the connection. A
 /// stalled decode `partner` takes the verdict where the shape has one.
 /// Without a bound the call is awaited as it is.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a side's identity and its bound: plumbing the two transports share, not state"
+)]
 pub(crate) async fn await_prefill_within<T, F>(
     bound: Option<&PrefillBound>,
     mut dispatch: Pin<&mut F>,
@@ -348,6 +361,7 @@ pub(crate) async fn await_prefill_within<T, F>(
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
+    phase: &'static str,
 ) -> Result<T, SilenceVerdict>
 where
     F: Future<Output = T> + ?Sized,
@@ -367,7 +381,7 @@ where
             connection,
             request_id,
             prompt_tokens,
-            "dispatch",
+            phase,
         )?;
         deadline = Instant::now() + more;
     }

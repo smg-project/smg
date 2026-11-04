@@ -1738,6 +1738,7 @@ async fn dispatch_prefill_within(
         connection,
         &request_id,
         prompt_tokens,
+        "dispatch",
     )
     .await
     {

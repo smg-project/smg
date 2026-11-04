@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -39,7 +39,7 @@ use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
     stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
-    tenant_rate_limit::{self, TenantCharge},
+    tenant_rate_limit::{self, Estimate, TenantCharge},
 };
 use crate::{
     config::types::RetryConfig,
@@ -66,7 +66,7 @@ use crate::{
             },
             overload,
             pd_failure::{PdSide, SidePhase},
-            pd_silence::{await_prefill_within, PrefillBound, SilenceVerdict},
+            pd_silence::{self, await_prefill_within, PrefillBound, SilenceVerdict},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
@@ -225,8 +225,13 @@ struct PDRequestContext<'a> {
     /// The prompt's length the prefill side's silence bound is sized by: the
     /// request's token ids when it carries them, else the rate limiter's
     /// estimate of its input tokens (the gRPC pipeline reads its tokenized
-    /// prompt).
+    /// prompt); zero when nothing reads it (see `route_pd`).
     prompt_tokens: u64,
+    /// That estimate when it is the body's own, for the tenant reservation
+    /// to take instead of counting the words again; `None`: the reservation
+    /// counts its own (the request carries ids, or the estimate read
+    /// routing's text, a batch's first prompt alone).
+    estimate: Option<u32>,
     /// The middleware's request id, for the lines a side's verdict writes.
     request_id: Option<&'a str>,
 }
@@ -351,6 +356,28 @@ struct BootstrapFields {
     host: Box<RawValue>,
     port: Box<RawValue>,
     room: Box<RawValue>,
+}
+
+/// A prefill side's streamed answer with the side's booking riding on it
+/// (see [`PrefillTicket`]): the first chunk is the side's answer (the head
+/// of a streamed answer leaves the engine's server before its handler
+/// produced anything), so the booking is released there, as answered; a
+/// body that ends, fails or is dropped before any chunk gives it back
+/// unanswered.
+fn answered_at_first_chunk<S>(
+    body: S,
+    mut booking: Option<PrefillTicket>,
+) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    body.inspect(move |chunk| {
+        if chunk.is_ok() {
+            if let Some(mut ticket) = booking.take() {
+                ticket.first_response(0);
+            }
+        }
+    })
 }
 
 impl PDRouter {
@@ -622,9 +649,22 @@ impl PDRouter {
         } else {
             (None, None)
         };
-        let prompt_tokens = match &tokens {
-            Some(ids) => ids.len() as u64,
-            None => u64::from(body.estimated_input_tokens(text.as_deref())),
+        // The prompt's length, which sizes the prefill side's silence bound,
+        // counted once: the request's token ids when it carries them, else
+        // the rate limiter's estimate of its input, which the tenant
+        // reservation takes as well when it is the body's own, so a charged
+        // request counts its words once; not counted when nothing reads it
+        // (the rule off and no tenant to charge).
+        let reserves = self.rate_limit_manager.is_some() && tenant_meta.is_some();
+        let (prompt_tokens, estimate) = match &tokens {
+            Some(ids) => (ids.len() as u64, None),
+            None if reserves || pd_silence::applies() => {
+                let estimate = body.estimated_input_tokens(text.as_deref());
+                // Routing's text is a batch's first prompt alone; the
+                // reservation charges every prompt and counts the body itself.
+                (u64::from(estimate), text.is_none().then_some(estimate))
+            }
+            None => (0, None),
         };
         let routing = RoutingDerivatives {
             tokens,
@@ -643,6 +683,7 @@ impl PDRouter {
             model_id,
             headers: headers.cloned(),
             prompt_tokens,
+            estimate,
             request_id: middleware_request_id(tenant_meta),
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
@@ -694,12 +735,16 @@ impl PDRouter {
         // The estimate reads the body, not the routing text: a text-reading
         // policy routes a completions batch on its first prompt alone
         // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
+        // `route_pd` counted the body's own for the silence bound where it
+        // could, and hands it on.
         let (reservation, denial) = tenant_rate_limit::reserve(
             self.rate_limit_manager.as_deref(),
             tenant_meta,
             &original_request,
             model,
-            None,
+            context
+                .estimate
+                .map_or(Estimate::Text(None), Estimate::Counted),
         )
         .await;
 
@@ -1419,14 +1464,16 @@ impl PDRouter {
         let prefill_fut = async {
             let send = send_with_stale_conn_retry(prefill_request);
             tokio::pin!(send);
+            let request_id = context.request_id.unwrap_or_default();
             let resp = match await_prefill_within(
                 bound.as_ref(),
                 send,
                 &prefill,
                 None,
                 metrics_labels::CONNECTION_HTTP,
-                context.request_id.unwrap_or_default(),
+                request_id,
                 context.prompt_tokens,
+                "dispatch",
             )
             .await
             {
@@ -1437,52 +1484,114 @@ impl PDRouter {
                     return Err(DispatchError::Prefill(verdict.answer(prefill.as_ref())))
                 }
             };
-            // The head is the side's answer on this wire; the booking is
-            // released as answered (the wire reports no cached count).
-            if let Some(ticket) = prefill_ticket.as_mut() {
-                ticket.first_response(0);
-            }
-            if context.is_stream && !context.return_logprob && resp.status().is_success() {
-                let prefill = Arc::clone(&prefill);
-                let model_id = context.model_id.to_string();
-                // The drain owns both the permit and the outcome. It may finish
-                // before Decode sends headers; neither waits for the other.
-                *prefill_outcome = PrefillOutcome::Drained;
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
-                )]
-                let drain = tokio::spawn(async move {
-                    let _prefill_guard = prefill_guard;
-                    let mut chunks = resp.bytes_stream();
-                    let mut drained = StatusCode::OK;
-                    while let Some(chunk) = chunks.next().await {
-                        if let Err(e) = chunk {
-                            warn!("Error consuming prefill response: {e}");
-                            drained = StatusCode::BAD_GATEWAY;
+            if context.is_stream && resp.status().is_success() {
+                // This shape sends the prefill side the request as the
+                // client streams it, so the side answers with a stream, and
+                // its head is the engine's server starting the response
+                // before its handler produced anything: the side's answer is
+                // the first body chunk, awaited under the bound (the gRPC
+                // pipeline's `first_response` phase); the booking rides on
+                // the body and is released there.
+                let mut chunks = resp.bytes_stream();
+                let first = {
+                    let next = chunks.next();
+                    tokio::pin!(next);
+                    match await_prefill_within(
+                        bound.as_ref(),
+                        next,
+                        &prefill,
+                        None,
+                        metrics_labels::CONNECTION_HTTP,
+                        request_id,
+                        context.prompt_tokens,
+                        "first_response",
+                    )
+                    .await
+                    {
+                        Ok(first) => first,
+                        // The body is dropped with this future, which closes
+                        // its connection; the decode side is cancelled with it.
+                        Err(verdict) => {
+                            return Err(DispatchError::Prefill(verdict.answer(prefill.as_ref())))
+                        }
+                    }
+                };
+                let body = answered_at_first_chunk(
+                    futures_util::stream::iter(first).chain(chunks),
+                    prefill_ticket.take(),
+                );
+                if !context.return_logprob {
+                    let prefill = Arc::clone(&prefill);
+                    let model_id = context.model_id.to_string();
+                    // The drain owns both the permit and the outcome. It may finish
+                    // before Decode sends headers; neither waits for the other.
+                    *prefill_outcome = PrefillOutcome::Drained;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
+                    )]
+                    let drain = tokio::spawn(async move {
+                        let _prefill_guard = prefill_guard;
+                        let mut chunks = body;
+                        let mut drained = StatusCode::OK;
+                        while let Some(chunk) = chunks.next().await {
+                            if let Err(e) = chunk {
+                                warn!("Error consuming prefill response: {e}");
+                                drained = StatusCode::BAD_GATEWAY;
+                                break;
+                            }
+                        }
+                        prefill.record_outcome(drained.as_u16());
+                        if drained.is_server_error() {
+                            Metrics::record_worker_error(
+                                metrics_labels::WORKER_PREFILL,
+                                metrics_labels::CONNECTION_HTTP,
+                                error_type_from_status(drained),
+                            );
+                        }
+                        Metrics::record_pd_prefill_duration(
+                            metrics_labels::BACKEND_PD,
+                            &model_id,
+                            runtime,
+                            dispatch_start.elapsed(),
+                        );
+                    });
+                    // A Decode error or cancellation before both heads arrive
+                    // cancels the drain too, releasing its admission permit.
+                    return Ok(PrefillResult::Draining(
+                        tokio_util::task::AbortOnDropHandle::new(drain),
+                    ));
+                }
+                // The logprob merge reads the side's whole answer.
+                let mut chunks = body;
+                let mut answer = Vec::new();
+                let mut failed = false;
+                while let Some(chunk) = chunks.next().await {
+                    match chunk {
+                        Ok(chunk) => answer.extend_from_slice(&chunk),
+                        Err(e) => {
+                            warn!("Failed to read prefill response body for logprobs: {e}");
+                            failed = true;
                             break;
                         }
                     }
-                    prefill.record_outcome(drained.as_u16());
-                    if drained.is_server_error() {
-                        Metrics::record_worker_error(
-                            metrics_labels::WORKER_PREFILL,
-                            metrics_labels::CONNECTION_HTTP,
-                            error_type_from_status(drained),
-                        );
-                    }
-                    Metrics::record_pd_prefill_duration(
-                        metrics_labels::BACKEND_PD,
-                        &model_id,
-                        runtime,
-                        dispatch_start.elapsed(),
-                    );
-                });
-                // A Decode error or cancellation before both heads arrive
-                // cancels the drain too, releasing its admission permit.
-                return Ok(PrefillResult::Draining(
-                    tokio_util::task::AbortOnDropHandle::new(drain),
+                }
+                drop(prefill_guard);
+                Metrics::record_pd_prefill_duration(
+                    metrics_labels::BACKEND_PD,
+                    context.model_id,
+                    runtime,
+                    dispatch_start.elapsed(),
+                );
+                return Ok(PrefillResult::Buffered(
+                    (!failed).then(|| Bytes::from(answer)),
                 ));
+            }
+            // An unstreamed answer, or a refusal, comes whole with its head:
+            // the booking is released as answered (the wire reports no
+            // cached count).
+            if let Some(ticket) = prefill_ticket.as_mut() {
+                ticket.first_response(0);
             }
             let result = self
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)
@@ -1504,11 +1613,15 @@ impl PDRouter {
             if !resp.status().is_success() {
                 return Err(DispatchError::Decode(resp));
             }
-            // On this shape the decode's head follows the handoff the prefill
-            // worker made: the sign of life the prefill side's silence rule
+            // On this shape an unstreamed decode answer's head follows the
+            // handoff the prefill worker made (the engine's server sends it
+            // with the body, once the decode engine produced from the KV it
+            // was handed): the sign of life the prefill side's silence rule
             // reads while the side's own answer waits (as the gRPC pipeline's
-            // `dispatch_pd_sides` reads the decode's first output).
-            if bound.is_some() {
+            // `dispatch_pd_sides` reads the decode's first output). A
+            // streamed answer's head is the server starting its response
+            // before its handler produced anything, and says nothing.
+            if bound.is_some() && !context.is_stream {
                 prefill.note_prefill_handoff();
             }
             Ok((dispatch_start.elapsed(), resp))
@@ -1795,6 +1908,7 @@ impl PDRouter {
                 metrics_labels::CONNECTION_HTTP,
                 context.request_id.unwrap_or_default(),
                 context.prompt_tokens,
+                "dispatch",
             )
             .await
             {
@@ -2020,6 +2134,7 @@ impl PDRouter {
                 metrics_labels::CONNECTION_HTTP,
                 context.request_id.unwrap_or_default(),
                 context.prompt_tokens,
+                "dispatch",
             )
             .await
             {
@@ -2356,7 +2471,7 @@ impl PDRouter {
     )]
     fn create_streaming_response(
         &self,
-        stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
@@ -6058,6 +6173,7 @@ mod tests {
             headers: None,
             prompt_tokens: 0,
             request_id: None,
+            estimate: None,
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -6152,6 +6268,7 @@ mod tests {
                     headers: None,
                     prompt_tokens: 0,
                     request_id: None,
+                    estimate: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -6250,6 +6367,7 @@ mod tests {
                             headers: None,
                             prompt_tokens: 0,
                             request_id: None,
+                            estimate: None,
                         },
                         prefill,
                         decode,
@@ -6333,6 +6451,7 @@ mod tests {
                     headers: None,
                     prompt_tokens: 0,
                     request_id: None,
+                    estimate: None,
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -7712,6 +7831,95 @@ mod tests {
                 decode.circuit_breaker_state(),
                 CircuitState::Closed,
                 "{case}"
+            );
+        }
+    }
+
+    /// An engine's server whose streamed answer's head leaves `head_after`
+    /// its request, as a framework's streaming response starts before its
+    /// handler produced anything, and whose body then never comes: a wedged
+    /// engine behind a live server.
+    async fn spawn_held_body_stub(head_after: std::time::Duration) -> String {
+        let app = axum::Router::new().fallback(axum::routing::any(move || async move {
+            tokio::time::sleep(head_after).await;
+            (
+                [(CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>()),
+            )
+        }));
+        spawn_stub(app).await
+    }
+
+    /// On the concurrent shape a streamed request's prefill side answers
+    /// with a stream, whose head is the engine's server starting its
+    /// response before its handler produced anything: a prefill side silent
+    /// behind such a head is given up on at its bound all the same, its
+    /// answer being the first body chunk, and the decode side's early head,
+    /// the same kind of start, is no handoff of the prefill worker's (on a
+    /// worker that has answered before, a handoff inside the bound would
+    /// reprieve the side past it). With and without logprobs, whose prefill
+    /// body the router reads whole.
+    #[tokio::test]
+    async fn a_streamed_prefill_side_silent_behind_its_early_head_is_given_up_on_at_its_bound() {
+        for return_logprob in [false, true] {
+            let prefill_url = spawn_held_body_stub(std::time::Duration::ZERO).await;
+            // The decode's head inside the bound: were it a handoff, it would
+            // reprieve the prefill side for another bound and a half.
+            let decode_url = spawn_held_body_stub(std::time::Duration::from_millis(1_500)).await;
+            let router = single_attempt_router();
+            let (prefill, decode) =
+                silence_pair(&router, prefill_url, decode_url, RuntimeType::Sglang);
+            // A handoff counts on a worker that has answered before.
+            prefill.note_prefill_started(8, false);
+            prefill.note_prefill_ended(8, false, Some(0));
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let request: GenerateRequest = serde_json::from_value(
+                json!({"text": "hi", "stream": true, "return_logprob": return_logprob}),
+            )
+            .expect("valid generate request");
+            let case = format!("logprobs {return_logprob}");
+
+            let started = Instant::now();
+            // The answer is read to its end: a 200 whose body never ends is
+            // the hang this row refuses.
+            let (status, code, body) = tokio::time::timeout(HANG_GUARD, async {
+                let response = router
+                    .route_generate(None, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await;
+                let status = response.status();
+                let code = error::extract_error_code_from_response(&response).to_string();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+                (status, code, body)
+            })
+            .await
+            .expect("given up on at the bound, not held to the request timeout");
+            let elapsed = started.elapsed();
+
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{case}: {code}");
+            assert_eq!(code, PdSide::Prefill.code(SidePhase::Silent), "{case}");
+            assert!(body.is_ok(), "{case}: {body:?}");
+            assert!(
+                elapsed >= SILENCE_BOUND - std::time::Duration::from_millis(100),
+                "{case}: cut at the bound, not before: {elapsed:?}"
+            );
+            assert!(
+                prefill.prefill_handed_off_ago().is_none(),
+                "{case}: a streamed decode head is no handoff"
+            );
+            assert_eq!(
+                (prefill.load(), decode.load()),
+                (0, 0),
+                "{case}: both sides' load released with the verdict"
+            );
+            assert_eq!(
+                prefill.circuit_breaker_state(),
+                CircuitState::Open,
+                "{case}: the verdict is the prefill worker's one failure"
+            );
+            assert_eq!(
+                decode.circuit_breaker_state(),
+                CircuitState::Closed,
+                "{case}: the decode worker, which waited on the prefill, is not charged"
             );
         }
     }
