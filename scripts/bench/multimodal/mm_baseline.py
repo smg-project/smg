@@ -201,7 +201,10 @@ def build_example(cargo_target: str | None) -> Path:
         env=env,
         check=True,
     )
+    # cargo resolves a relative target directory against its working directory, ROOT
     target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if not target.is_absolute():
+        target = ROOT / target
     return target / "release" / "examples" / "mm_baseline"
 
 
