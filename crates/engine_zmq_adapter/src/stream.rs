@@ -476,22 +476,27 @@ pub(crate) fn map_slim_output(
             token_ids: token_ids.clone(),
         })
         .collect();
+    // The tick's columns go into the chunk as they are (the ids moved, the
+    // ranked rows built once); the history the terminal `Complete` drains is
+    // extended from them.
     let chunk_logprobs = (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
         token_logprobs: output
             .output_logprobs_val
             .iter()
             .map(|&lp| lp as f32)
             .collect(),
-        token_ids: output.output_logprobs_idx.clone(),
-        top_logprobs: tick_top_logprobs.clone(),
+        token_ids: output.output_logprobs_idx,
+        top_logprobs: tick_top_logprobs,
     });
-    state
-        .output_logprobs_val
-        .extend(output.output_logprobs_val.iter().map(|&lp| lp as f32));
-    state
-        .output_logprobs_idx
-        .extend(output.output_logprobs_idx.iter().copied());
-    state.output_top_logprobs.extend(tick_top_logprobs);
+    if let Some(tick) = &chunk_logprobs {
+        state
+            .output_logprobs_val
+            .extend_from_slice(&tick.token_logprobs);
+        state.output_logprobs_idx.extend_from_slice(&tick.token_ids);
+        state
+            .output_top_logprobs
+            .extend(tick.top_logprobs.iter().cloned());
+    }
     let mut response = state.emit_tick(index, output.output_ids, chunk_logprobs, finish, pending);
     state.attach_input_logprobs(pending, input_logprobs_emitted, &mut response);
     response

@@ -7,46 +7,39 @@ use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
 
 use crate::routers::grpc::proto_wrapper::{ProtoInputLogProbs, ProtoOutputLogProbs};
 
-/// Convert OutputLogProbs to OpenAI ChatLogProbs format
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format.
 ///
 /// Generic over the token decoding strategy. The `decode_token` closure maps a
 /// single token ID to its text representation.
 pub(crate) fn convert_proto_logprobs(
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
     decode_token: impl Fn(u32) -> String,
 ) -> ChatLogProbs {
-    let mut content_items = Vec::with_capacity(proto_logprobs.token_logprobs.len());
+    let mut content_items = Vec::with_capacity(proto_logprobs.len());
 
-    for (i, &logprob) in proto_logprobs.token_logprobs.iter().enumerate() {
-        let token_id = proto_logprobs.token_ids.get(i).copied().unwrap_or(0);
-        let token_text = decode_token(token_id);
+    for position in proto_logprobs.positions() {
+        let token_text = decode_token(position.token_id);
         let bytes = Some(token_text.as_bytes().to_vec());
 
-        // Build top_logprobs for this position
-        let top_logprobs = if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
-            top_logprobs_entry
-                .values
-                .iter()
-                .enumerate()
-                .filter_map(|(j, &top_logprob)| {
-                    top_logprobs_entry.token_ids.get(j).map(|&tid| {
-                        let text = decode_token(tid);
-                        let bytes = Some(text.as_bytes().to_vec());
-                        TopLogProb {
-                            token: text,
-                            logprob: top_logprob,
-                            bytes,
-                        }
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // The position's candidates, in the engine's order.
+        let top_logprobs = position
+            .top_logprobs
+            .iter()
+            .map(|(token_id, logprob)| {
+                let text = decode_token(token_id);
+                let bytes = Some(text.as_bytes().to_vec());
+                TopLogProb {
+                    token: text,
+                    logprob,
+                    bytes,
+                }
+            })
+            .collect();
 
         content_items.push(ChatLogProbsContent {
             token: token_text,
-            logprob,
+            logprob: position.logprob,
             bytes,
             top_logprobs,
         });
@@ -65,7 +58,7 @@ pub(crate) fn convert_proto_logprobs(
 /// the chosen token when only its own logprob was requested; the OpenAI API
 /// returns exactly the requested alternatives, an empty list when none were.
 pub(crate) fn convert_proto_to_openai_logprobs(
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
     tokenizer: &Arc<dyn Tokenizer>,
     top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
@@ -107,13 +100,16 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (u32), ...]
 pub(crate) fn convert_generate_output_logprobs(
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
-        .token_logprobs
-        .iter()
-        .zip(proto_logprobs.token_ids.iter())
-        .map(|(&logprob, &token_id)| vec![Some(logprob as f64), Some(token_id as f64)])
+        .positions()
+        .map(|position| {
+            vec![
+                Some(f64::from(position.logprob)),
+                Some(f64::from(position.token_id)),
+            ]
+        })
         .collect()
 }
 
@@ -138,21 +134,22 @@ pub(crate) fn convert_generate_input_logprobs(
 
 #[cfg(test)]
 mod tests {
+    use smg_grpc_client::{trtllm_proto as trtllm, vllm_proto as vllm};
+
     use super::*;
-    use crate::routers::grpc::proto_wrapper::ProtoTopLogProbs;
 
     /// Two tokens; the engine reports the chosen token and one runner-up as
     /// alternatives for each, whether or not alternatives were requested.
-    fn proto() -> ProtoOutputLogProbs {
-        ProtoOutputLogProbs {
+    fn proto() -> vllm::OutputLogProbs {
+        vllm::OutputLogProbs {
             token_logprobs: vec![-0.1, -0.2],
             token_ids: vec![1, 2],
             top_logprobs: vec![
-                ProtoTopLogProbs {
+                vllm::TopLogProbs {
                     values: vec![-0.1, -1.5],
                     token_ids: vec![1, 3],
                 },
-                ProtoTopLogProbs {
+                vllm::TopLogProbs {
                     values: vec![-0.2, -1.6],
                     token_ids: vec![2, 4],
                 },
@@ -160,8 +157,52 @@ mod tests {
         }
     }
 
+    /// The same two tokens on the wire that keeps one record per position.
+    fn records() -> Vec<trtllm::TokenLogprob> {
+        let candidate = |token_id, logprob| trtllm::TopLogprob { token_id, logprob };
+        vec![
+            trtllm::TokenLogprob {
+                token_id: 1,
+                logprob: -0.1,
+                top_logprobs: vec![candidate(1, -0.1), candidate(3, -1.5)],
+            },
+            trtllm::TokenLogprob {
+                token_id: 2,
+                logprob: -0.2,
+                top_logprobs: vec![candidate(2, -0.2), candidate(4, -1.6)],
+            },
+        ]
+    }
+
+    #[test]
+    fn the_record_layout_reads_as_the_columns_do() {
+        let proto = proto();
+        let records = records();
+        let columns =
+            convert_proto_logprobs(ProtoOutputLogProbs::Vllm(&proto), |id| format!("t{id}"));
+        let per_position =
+            convert_proto_logprobs(ProtoOutputLogProbs::Trtllm(&records), |id| format!("t{id}"));
+        assert_eq!(
+            serde_json::to_value(&columns).unwrap(),
+            serde_json::to_value(&per_position).unwrap()
+        );
+        assert_eq!(
+            convert_generate_output_logprobs(ProtoOutputLogProbs::Vllm(&proto)),
+            convert_generate_output_logprobs(ProtoOutputLogProbs::Trtllm(&records))
+        );
+        assert_eq!(
+            convert_generate_output_logprobs(ProtoOutputLogProbs::Vllm(&proto)),
+            vec![
+                vec![Some(f64::from(-0.1_f32)), Some(1.0)],
+                vec![Some(f64::from(-0.2_f32)), Some(2.0)]
+            ]
+        );
+    }
+
     fn alternatives(top_logprobs: Option<u32>) -> Vec<Vec<String>> {
-        let mut logprobs = convert_proto_logprobs(&proto(), |id| format!("t{id}"));
+        let proto = proto();
+        let mut logprobs =
+            convert_proto_logprobs(ProtoOutputLogProbs::Vllm(&proto), |id| format!("t{id}"));
         truncate_top_logprobs(&mut logprobs, top_logprobs.unwrap_or(0) as usize);
         let ChatLogProbs::Detailed {
             content: Some(items),
@@ -180,8 +221,12 @@ mod tests {
 
     #[test]
     fn the_logprobs_object_carries_content_and_refusal() {
-        let value = serde_json::to_value(convert_proto_logprobs(&proto(), |id| format!("t{id}")))
-            .expect("serialize");
+        let proto = proto();
+        let value = serde_json::to_value(convert_proto_logprobs(
+            ProtoOutputLogProbs::Vllm(&proto),
+            |id| format!("t{id}"),
+        ))
+        .expect("serialize");
         assert_eq!(value["content"][0]["token"], "t1", "{value}");
         assert_eq!(
             value.get("refusal"),
