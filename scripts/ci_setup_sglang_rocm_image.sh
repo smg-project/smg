@@ -115,14 +115,15 @@ if [ "$verify_only" -eq 0 ]; then
 
 fi
 
+# Check selected NIXL in both setup and verify-only mode before publishing
+# either a verified cohort report or the next-step companion handoff.
+if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
+    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
+fi
+
 python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
 
 # Carry the observed image version into the next Actions step.
 if [ "$verify_only" -eq 0 ] && [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
-fi
-
-# Check the image's existing NIXL only on explicitly selected NIXL lanes.
-if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
-    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
 fi
