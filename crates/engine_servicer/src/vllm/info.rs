@@ -193,7 +193,10 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         ranks,
         None,
         |load, figures| {
-            let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
+            let estimate = state
+                .shared
+                .loads
+                .estimate(load.dp_rank, load.num_waiting_reqs);
             vllm::SchedulerLoad {
                 dp_rank: figures.dp_rank,
                 num_running_reqs: figures.running,
@@ -211,7 +214,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
             }
         },
         |dp_rank| {
-            let estimate = state.loads.estimate(dp_rank, i32::MAX);
+            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
             vllm::SchedulerLoad {
                 dp_rank,
                 max_running_requests,
