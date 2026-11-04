@@ -2021,7 +2021,7 @@ jobs:
       min_selected: 14 # Full original17-ID coverage is separate from this floor.
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      container_options: ${{ format('{0} --ulimit memlock=-1:-1', vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') }}
     secrets: inherit
 
   # --- CPU E2E: the classes on the scripted mock worker ---

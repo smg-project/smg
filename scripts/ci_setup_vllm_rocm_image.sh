@@ -24,6 +24,23 @@ $RETRY 3 10 pip install --ignore-installed pytest
 
 python3 -c "import torch, vllm, smg_grpc_servicer; assert torch.version.hip; print('vllm', vllm.__version__)"
 
+# Only an explicitly requested extra transport needs this dependency canary.
+# Importability does not qualify HIP transfers, devices or the native cohort.
+python3 - <<'PY_CANARY'
+import os
+
+extras = {
+    name.strip().lower()
+    for name in os.environ.get("E2E_VLLM_EXTRA_KV_BACKENDS", "").split(",")
+}
+if "mooncake" in extras:
+    print("Checking requested Mooncake extra backend", flush=True)
+    import torch
+    from mooncake.engine import TransferEngine
+
+    print("mooncake extra import canary OK")
+PY_CANARY
+
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 fi
