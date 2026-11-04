@@ -1306,7 +1306,9 @@ struct ServingArgs {
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
-    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 

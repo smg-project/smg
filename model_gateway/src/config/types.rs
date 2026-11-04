@@ -499,8 +499,9 @@ pub struct RouterConfig {
     /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
-    /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
-    /// by inflight; the remainder bucket under `tenant="other"`).
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
     pub priority_scheduler_tenant_metric_top_n: u32,
     /// Enable per-tenant LLM token/request rate limiting. When false
