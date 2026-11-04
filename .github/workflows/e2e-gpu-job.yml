@@ -155,23 +155,12 @@ on:
         type: boolean
         default: true
 
-    outputs:
-      complete_evidence_artifact:
-        description: "Successful per-invocation complete upload; matrix calls return one nonempty leg, not all rows"
-        value: ${{ jobs.run.outputs.complete_evidence_artifact }}
-      worker_log_artifact:
-        description: "Successful per-invocation worker-log upload; matrix calls do not aggregate rows"
-        value: ${{ jobs.run.outputs.worker_log_artifact }}
-
 jobs:
   run:
     if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
-    outputs:
-      complete_evidence_artifact: ${{ steps.upload-complete-evidence.outputs.artifact-id != '' && steps.evidence-identity.outputs.complete_artifact || '' }}
-      worker_log_artifact: ${{ inputs.final_environment_check && steps.upload-worker-logs.outputs.artifact-id != '' && steps.log-snapshot.outputs.artifact || '' }}
     permissions:
       contents: read
     env:
@@ -458,7 +447,7 @@ jobs:
 
       - name: Identify row evidence
         id: evidence-identity
-        if: always() && ((inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd') || failure() || cancelled())
+        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         env:
           EVIDENCE_INPUTS: ${{ toJSON(inputs) }}
         run: |
@@ -532,7 +521,7 @@ jobs:
         if: failure() || cancelled()
         env:
           WORKER_LOG_ARTIFACT: ${{ steps.evidence-identity.outputs.worker_artifact }}
-          FINAL_ENVIRONMENT_CHECK: ${{ inputs.final_environment_check && '1' || '0' }}
+          FINAL_ENVIRONMENT_CHECK: ${{ inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && '1' || '0' }}
         run: |
           if [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then
             bash scripts/ci_dump_worker_logs.sh e2e-logs "$WORKER_LOG_ARTIFACT"

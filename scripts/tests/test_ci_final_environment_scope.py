@@ -214,38 +214,25 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
     return contract, unique, fields
 
 
-def test_evidence_exposes_exact_artifact_outputs():
+def test_evidence_exposes_exact_artifact_outputs(tmp_path):
     document = _document()
     trigger = document.get("on", document.get(True))["workflow_call"]
     job = document["jobs"]["run"]
-    for public, internal in [
-        ("complete_evidence_artifact", "complete_artifact"),
-        ("worker_log_artifact", "worker_artifact"),
-    ]:
-        assert trigger["outputs"][public]["value"] == "${{ jobs.run.outputs." + public + " }}"
-        output = job["outputs"][public]
-        upload = (
-            "upload-complete-evidence"
-            if public == "complete_evidence_artifact"
-            else "upload-worker-logs"
-        )
-        if public == "worker_log_artifact":
-            assert output == (
-                "${{ inputs.final_environment_check && "
-                "steps.upload-worker-logs.outputs.artifact-id != '' && "
-                "steps.log-snapshot.outputs.artifact || '' }}"
-            )
-        else:
-            assert output == (
-                "${{ steps." + upload + ".outputs.artifact-id != '' && "
-                "steps.evidence-identity.outputs." + internal + " || '' }}"
-            )
+    # The names feed actual artifact consumers, not an unused public API.
+    for unused in ("complete_evidence_artifact", "worker_log_artifact"):
+        assert unused not in trigger.get("outputs", {})
+        assert unused not in job.get("outputs", {})
     complete_upload = [
         step for step in job["steps"] if step.get("id") == "upload-complete-evidence"
     ]
     assert len(complete_upload) == 1
     assert complete_upload[0]["if"] == (
         "always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'"
+    )
+    assert complete_upload[0].get("continue-on-error", False) is False
+    assert complete_upload[0]["with"]["if-no-files-found"] == "error"
+    assert complete_upload[0]["with"]["name"] == (
+        "${{ steps.evidence-identity.outputs.complete_artifact }}"
     )
     uploads = [
         step["with"]["name"]
@@ -255,19 +242,110 @@ def test_evidence_exposes_exact_artifact_outputs():
     assert "${{ steps.evidence-identity.outputs.complete_artifact }}" in uploads
     assert "${{ steps.log-snapshot.outputs.artifact }}" in uploads
     snapshots = [step for step in job["steps"] if step.get("id") == "log-snapshot"]
-    worker_uploads = [step for step in job["steps"] if step.get("id") == "upload-worker-logs"]
+    worker_uploads = [
+        step for step in job["steps"] if step.get("id") == "upload-worker-logs"
+    ]
     assert len(snapshots) == len(worker_uploads) == 1
     assert snapshots[0]["if"] == worker_uploads[0]["if"] == "failure() || cancelled()"
+    assert worker_uploads[0]["with"]["name"] == "${{ steps.log-snapshot.outputs.artifact }}"
     assert snapshots[0]["env"] == {
         "WORKER_LOG_ARTIFACT": "${{ steps.evidence-identity.outputs.worker_artifact }}",
-        "FINAL_ENVIRONMENT_CHECK": "${{ inputs.final_environment_check && '1' || '0' }}",
+        "FINAL_ENVIRONMENT_CHECK": (
+            "${{ inputs.final_environment_check && inputs.engine == 'sglang' "
+            "&& inputs.gpu_vendor == 'amd' && '1' || '0' }}"
+        ),
     }
     assert 'if [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then' in snapshots[0]["run"]
-    assert 'bash scripts/ci_dump_worker_logs.sh e2e-logs "$WORKER_LOG_ARTIFACT"' in snapshots[0]["run"]
+    assert (
+        'bash scripts/ci_dump_worker_logs.sh e2e-logs "$WORKER_LOG_ARTIFACT"' in snapshots[0]["run"]
+    )
     assert 'echo "artifact=${WORKER_LOG_ARTIFACT}" >> "$GITHUB_OUTPUT"' in snapshots[0]["run"]
     assert 'bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"' in snapshots[0]["run"]
     assert 'echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"' in snapshots[0]["run"]
     assert _evidence_step()["env"] == {"EVIDENCE_INPUTS": "${{ toJSON(inputs) }}"}
+    final_checks = [step for step in job["steps"] if step.get("id") == "final-environment"]
+    assert len(final_checks) == 1
+    assert final_checks[0]["if"] == complete_upload[0]["if"]
+    assert 'test "$pip_status" -eq 0' in final_checks[0]["run"]
+    assert 'test "$cohort_status" -eq 0' in final_checks[0]["run"]
+
+    # Exercise the actual diagnostic shell: the valid opt-in uses its generated
+    # identity; wrong engine/vendor and false opt-in keep nonempty legacy logs.
+    for index, (enabled, engine, vendor) in enumerate(
+        [
+            (True, "sglang", "amd"),
+            (True, "vllm", "amd"),
+            (True, "sglang", "nvidia"),
+            (False, "sglang", "amd"),
+        ]
+    ):
+        work = tmp_path / str(index)
+        work.mkdir()
+        binary = work / "bin"
+        binary.mkdir()
+        dump_log = work / "dump.json"
+        fake_bash = binary / "bash"
+        fake_bash.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "assert len(sys.argv) == 4\n"
+            "assert sys.argv[1:3] == ['scripts/ci_dump_worker_logs.sh', 'e2e-logs']\n"
+            "Path(os.environ['DUMP_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+        )
+        fake_bash.chmod(0o700)
+        (binary / "tr").symlink_to("/usr/bin/tr")
+        inputs = _effective_evidence_inputs(
+            {
+                "final_environment_check": enabled,
+                "engine": engine,
+                "gpu_vendor": vendor,
+                "gpu_tier": "1",
+                "test_dirs": "e2e_test/chat_completions",
+                "kv_backend": "",
+                "vllm_kv_backend": "",
+                "vllm_moriio_mode": "",
+                "connection_mode": "",
+                "zmq_engine_count": "",
+                "mm_processing": "",
+                "servicer_impl": "",
+            }
+        )
+        scoped = enabled and engine == "sglang" and vendor == "amd"
+        identity = _evidence_identity(work, inputs)[2]["worker_artifact"] if scoped else ""
+        body = re.sub(
+            r"\$\{\{\s*inputs\.([a-z_]+)\s*\}\}",
+            lambda match: str(inputs[match.group(1)]),
+            snapshots[0]["run"],
+        )
+        script = work / "diagnostics.bash"
+        script.write_text(body)
+        output = work / "output"
+        result = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
+            cwd=work,
+            env={
+                "PATH": str(binary),
+                "WORKER_LOG_ARTIFACT": identity,
+                "FINAL_ENVIRONMENT_CHECK": "1" if scoped else "0",
+                "GITHUB_OUTPUT": str(output),
+                "DUMP_LOG": str(dump_log),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        assert result.returncode == 0, result.stderr
+        legacy = f"e2e-worker-logs-{engine}-gpu1-e2e_test-chat_completions"
+        if vendor == "amd":
+            legacy += "-amd"
+        expected = identity if scoped else legacy
+        assert expected
+        assert json.loads(dump_log.read_text()) == [
+            "scripts/ci_dump_worker_logs.sh", "e2e-logs", expected
+        ]
+        assert output.read_text() == "artifact=" + expected + "\n"
 
 
 def test_evidence_readable_contract_preserves_invocation_uniqueness(tmp_path):
@@ -334,8 +412,8 @@ def test_evidence_attempt_and_source_looking_json_remain_data(tmp_path):
 def test_evidence_identity_retains_opt_in_or_failure_boundary():
     step = _evidence_step()
     assert step["if"] == (
-        "always() && ((inputs.final_environment_check && inputs.engine == 'sglang' "
-        "&& inputs.gpu_vendor == 'amd') || failure() || cancelled())"
+        "always() && inputs.final_environment_check && inputs.engine == 'sglang' "
+        "&& inputs.gpu_vendor == 'amd'"
     )
     names = [step.get("name") for step in _document()["jobs"]["run"]["steps"]]
     assert names.index("Identify row evidence") < names.index("Check final AMD SGLang environment")

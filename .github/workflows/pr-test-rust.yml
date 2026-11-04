@@ -1258,6 +1258,8 @@ jobs:
       enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
+  # Retain the NVIDIA SGLang row's original 36/28-minute budgets.
+  # Full cold-image preparation, execution and cleanup fit on MI300X is unverified.
   e2e-1gpu-chat-sglang-amd:
     name: e2e-1gpu-chat-sglang-amd (sglang)
     needs: [build-wheel, detect-changes]
