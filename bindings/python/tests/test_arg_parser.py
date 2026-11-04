@@ -1929,6 +1929,21 @@ class TestPrometheusHostDefault:
         assert args.prometheus_host is None
 
 
+class TestPrometheusBucketsReachNativeValidation:
+    """The launcher passes the bucket list through; the native router refuses
+    the shapes the binary refuses at parse time, before anything binds."""
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "1", "0.5"])
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            Router.from_args(args).start()
+
+    def test_a_bucket_bound_of_zero_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "0", "1"])
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            Router.from_args(args).start()
+
+
 class TestControlPlaneApiKeyEntryErrors:
     """A malformed entry is refused without the entry in the message: it carries the credential."""
 

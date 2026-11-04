@@ -643,21 +643,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.serving.prometheus_duration_buckets;
-        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &bad.to_string(),
-                "every bucket bound must be a finite number above 0",
-            ));
-        }
-        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &format!("{} {}", pair[0], pair[1]),
-                "bucket bounds must ascend strictly",
-            ));
-        }
+        PrometheusConfig::validate_duration_buckets(&self.serving.prometheus_duration_buckets)?;
         for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
