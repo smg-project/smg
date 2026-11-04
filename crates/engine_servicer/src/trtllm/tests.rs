@@ -360,7 +360,7 @@ async fn images_ride_as_frames_behind_the_request() {
     let mut h = harness(model_info()).await;
     let mut req = generate_request("img", true);
     req.multimodal_input = Some(trt::MultimodalInput {
-        image_data: vec![b"first".to_vec(), b"second".to_vec()],
+        image_data: vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")],
     });
     let _stream = h.client.generate(req).await.expect("generate").into_inner();
     let (request, aux) = recv_add(&mut h.engine_in).await;

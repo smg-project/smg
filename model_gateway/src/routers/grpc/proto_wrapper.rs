@@ -2593,11 +2593,36 @@ mod tests {
         assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
     }
 
+    /// The raw-file request's wire bytes are the files, length-delimited in
+    /// order, whether the generated field holds them as shared or as owned
+    /// bytes: what the TRT-LLM servicer reads does not change with the type.
+    #[test]
+    fn trtllm_raw_images_encode_as_the_files_length_delimited_in_order() {
+        let files: [&[u8]; 2] = [b"abc", b"de"];
+        let data = TrtllmMultimodalData {
+            image_data: files
+                .iter()
+                .map(|file| bytes::Bytes::from_static(file))
+                .collect(),
+        };
+        let mut expected = Vec::new();
+        for file in files {
+            // field 1, wire type 2 (length-delimited): the tag, the length, the bytes
+            expected.push(0x0a);
+            expected.push(u8::try_from(file.len()).unwrap());
+            expected.extend_from_slice(file);
+        }
+        assert_eq!(data.into_proto().encode_to_vec(), expected);
+    }
+
     #[test]
     /// Account for all inline pixels and raw media across supported engine payloads.
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
         let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
-            image_data: vec![vec![0; 3], vec![0; 5]],
+            image_data: vec![
+                bytes::Bytes::from(vec![0; 3]),
+                bytes::Bytes::from(vec![0; 5]),
+            ],
         });
         assert_eq!(trtllm.inline_bytes(), 8);
 
