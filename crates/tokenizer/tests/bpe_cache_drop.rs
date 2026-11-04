@@ -132,15 +132,12 @@ fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
 /// The file loader bounds the model it reads in place (no copy of it): the
 /// same holds for the tokenizer read from its `tokenizer.json`.
 ///
-/// Not under the `vllm` feature: `fastokens`, the opt-in backend that takes a
-/// file of this shape, seeds a pretoken cache per thread for the model it
+/// Ignored: `fastokens`, the `vllm-tokenizer` backend that takes a file of
+/// this shape, seeds a pretoken cache per thread for the model it
 /// encodes with and parks up to three of them for the models the thread used
 /// before, dropped or not, so each thread keeps megabytes of a dropped
 /// tokenizer by that crate's design (see `vllm`).
-#[cfg_attr(
-    feature = "vllm",
-    ignore = "the opt-in vllm backend keeps a seeded per-thread cache of a dropped tokenizer by design"
-)]
+#[ignore = "the vllm backend keeps a seeded per-thread cache of a dropped tokenizer by design"]
 #[test]
 fn a_dropped_tokenizer_read_from_a_file_leaves_nothing_on_the_threads_either() {
     let dir = tempfile::tempdir().expect("a temp dir");

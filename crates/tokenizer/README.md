@@ -25,7 +25,7 @@ as of `tokenizer/src/*`.
 - `factory.rs` – backend discovery, file/model heuristics, and tokio-aware creation helpers
 - `hub.rs` – Hugging Face Hub downloads via `hf_hub`
 - `huggingface.rs` – wrapper over `tokenizers::Tokenizer`, chat template loading, vocab access
-- `vllm.rs` – the opt-in `vllm-tokenizer` backend (feature `vllm`): the vLLM Rust frontend's Hugging Face tokenizer (`fastokens`) and tiktoken tokenizer (`riptoken`) serving a tokenizer's flat encodes and batch decodes
+- `vllm.rs` – the `vllm-tokenizer` backends: the vLLM Rust frontend's Hugging Face tokenizer (`fastokens`) and tiktoken tokenizer (`riptoken`) serving a tokenizer's flat encodes and batch decodes
 - `tiktoken.rs` – wrapper over `tiktoken-rs` encoders for OpenAI model families and hub-loaded tiktoken models (includes `tokenizer_config.json` parsing for the tiktoken path)
 - `chat_template.rs` – AST-driven Jinja template inspection, rendering utilities, shared `ChatTemplateState`, and template file loading
 - `registry.rs` – thread-safe tokenizer registry with deduplication for IGW mode, supporting lookup by UUID or name
@@ -253,9 +253,9 @@ small prefix hits from reuse of large prompts.
 tokenizer's encodes go through (the load also logs the path once, with the
 reasons the faster paths declined); a non-zero `tokenizers` series under the
 `tokenizers-v1` feature names the tokenizers the opt-in pipeline does not take.
-Under the `vllm` feature the series `vllm` counts the tokenizers the vLLM Rust
-frontend's backend (`vllm-tokenizer`, read from the vLLM repository) serves
-flat encodes and batch decodes for; it takes a checkpoint's `tokenizer.json`
+The series `vllm` counts the tokenizers the vLLM Rust frontend's backend
+(`vllm-tokenizer`, read from the vLLM repository) serves flat encodes and batch
+decodes for; it takes a checkpoint's `tokenizer.json`
 where the wrapper's pipeline is the file's and `fastokens` reads it, and the
 load logs why it declined the rest (a tokenizer built in memory or from
 `vocab.json`, the Llama class's pipeline, a configured post-processor, settled

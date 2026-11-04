@@ -1,4 +1,4 @@
-//! The opt-in `vllm-tokenizer` backend: the files it takes, the loads it
+//! The `vllm-tokenizer` backend: the files it takes, the loads it
 //! declines, and that its ids and text are the `tokenizers` pipeline's.
 
 use std::fs;

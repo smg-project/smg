@@ -1,10 +1,9 @@
-//! The opt-in `vllm-tokenizer` backend (feature `vllm`): the vLLM Rust
-//! frontend's Hugging Face tokenizer serves a tokenizer's flat encodes and
-//! batch decodes in place of `tokenizers` and the direct encoders. Model
+//! The `vllm-tokenizer` backends: the vLLM Rust frontend's Hugging Face
+//! tokenizer serves a tokenizer's flat encodes and batch decodes in place of
+//! `tokenizers` and the direct encoders. Model
 //! loading and configuration, the vocabulary maps, chat templates, the
 //! renderers with encoders of their own and the streaming step stay in the
-//! wrapper, so there is one source of semantics (the shape of the v1
-//! opt-in, see `v1`).
+//! wrapper, so there is one source of semantics.
 //!
 //! The frontend's tiktoken backend (`riptoken`) serves the tiktoken wrapper
 //! the same way ([`VllmTiktokenBackend`]): the wrapper keeps the Kimi

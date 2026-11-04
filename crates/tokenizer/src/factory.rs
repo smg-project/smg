@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn a_downloaded_vocab_and_merges_pair_loads_like_its_tokenizer_json() {
         // The newline byte has a token too: a checkpoint's byte-level
-        // vocabulary holds every byte, and the opt-in `vllm` backend rejects
+        // vocabulary holds every byte, and the `vllm-tokenizer` backend rejects
         // a byte without one where `tokenizers` drops it.
         let vocab = json!({
             "H": 0, "e": 1, "l": 2, "o": 3, "Ġ": 4, "w": 5, "r": 6, "d": 7, "!": 8,

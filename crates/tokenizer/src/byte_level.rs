@@ -247,7 +247,6 @@ impl ByteLevelTable {
     }
 
     /// Whether the vocabulary lacks `id`.
-    #[cfg(feature = "vllm")]
     #[inline]
     pub(crate) fn is_absent(&self, id: TokenIdType) -> bool {
         self.locate(id).is_none()

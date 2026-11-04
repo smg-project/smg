@@ -1,8 +1,8 @@
 //! Which encoder serves a Hugging Face tokenizer's encodes.
 //!
-//! The choice is made once per load, in order of preference: the opt-in
-//! `vllm-tokenizer` backend (feature `vllm`), the opt-in `tokenizers` v1
-//! pipeline (feature `tokenizers-v1`), the crate's direct byte-level encoder
+//! The choice is made once per load, in order of preference: the
+//! `vllm-tokenizer` backend, the opt-in `tokenizers` v1 pipeline (feature
+//! `tokenizers-v1`), the crate's direct byte-level encoder
 //! (`native`), and `tokenizers` 0.23 itself. Each of the first three takes
 //! the tokenizers whose configuration it reproduces and declines the rest
 //! with a reason (`Declined`); the load logs the path it ended on and those
@@ -25,7 +25,7 @@ use std::{
 /// The path a Hugging Face tokenizer's encodes take, chosen at load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodePath {
-    /// The opt-in `vllm-tokenizer` backend, the vLLM Rust frontend's.
+    /// The `vllm-tokenizer` backend, the vLLM Rust frontend's.
     Vllm,
     /// The opt-in `tokenizers` v1 pipeline.
     V1,
@@ -88,7 +88,7 @@ impl fmt::Display for Declined {
     }
 }
 
-/// What the load hands the opt-in `vllm-tokenizer` backend (feature `vllm`):
+/// What the load hands the `vllm-tokenizer` backend:
 /// the `tokenizer.json` to read, where the wrapper's pipeline is the file's,
 /// else why the backend declines (see `vllm`).
 pub(crate) type VllmSource<'a> = Result<&'a Path, Declined>;

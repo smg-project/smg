@@ -19,9 +19,6 @@ name = "llm_tokenizer"
 [features]
 # Opt-in encoding and full ByteLevel decode acceleration; streaming stays unchanged.
 tokenizers-v1 = ["dep:tokenizers-v1"]
-# Opt-in: the vLLM Rust frontend's tokenizer backend serves a Hugging Face
-# tokenizer's flat encodes and batch decodes (see `src/vllm.rs`).
-vllm = ["dep:vllm-tokenizer"]
 
 [dependencies]
 anyhow.workspace = true
@@ -68,8 +65,8 @@ tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = tr
 # The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
 # the same text (a newer crate's tables know marks and compositions the library's do not).
 unicode-normalization-alignments = "0.1"
-# The vLLM Rust frontend's tokenizer backend, behind the `vllm` feature (see `src/vllm.rs`).
-vllm-tokenizer = { workspace = true, optional = true }
+# The vLLM Rust frontend's tokenizer backends: the engine of every file they read (see `src/vllm.rs`).
+vllm-tokenizer.workspace = true
 
 [dev-dependencies]
 criterion = "0.8"

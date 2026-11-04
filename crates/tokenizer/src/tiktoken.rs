@@ -219,9 +219,8 @@ pub struct TiktokenTokenizer {
     /// `tokenization_kimi.py` sorts them in its `apply_chat_template`
     /// (Kimi K3's class, which renders its own format, does not).
     tools_key_sorted: bool,
-    /// The opt-in `vllm-tokenizer` backend, when the load took it: the flat
+    /// The `vllm-tokenizer` backend, when the load took it: the flat
     /// encodes and batch decodes run on it (see `vllm`).
-    #[cfg(feature = "vllm")]
     vllm: Option<crate::vllm::VllmTiktokenBackend>,
 }
 
@@ -291,7 +290,6 @@ impl TiktokenTokenizer {
             byte_level,
             checkpoint_pieces: false,
             tools_key_sorted: false,
-            #[cfg(feature = "vllm")]
             vllm: None,
         })
     }
@@ -405,7 +403,6 @@ impl TiktokenTokenizer {
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
         let byte_level = byte_level_table(&tokenizer, vocab_size, &config.skip_token_ids);
-        #[cfg(feature = "vllm")]
         let vllm =
             Self::choose_vllm_backend(tiktoken_path, dir, vocab_size, kimi, byte_level.is_some());
 
@@ -428,16 +425,14 @@ impl TiktokenTokenizer {
                 Renderer::KimiK3Xtml => false,
                 Renderer::Jinja => kimi,
             },
-            #[cfg(feature = "vllm")]
             vllm,
         })
     }
 
-    /// The opt-in `vllm-tokenizer` backend over the same file, where it
+    /// The `vllm-tokenizer` backend over the same file, where it
     /// reads it as the wrapper does and the wrapper has the per-id byte
     /// table its decode checks unknown ids against; else the reason is
     /// logged once and the wrapper's own engine serves (see `vllm`).
-    #[cfg(feature = "vllm")]
     fn choose_vllm_backend(
         tiktoken_path: &Path,
         dir: &Path,
@@ -465,24 +460,17 @@ impl TiktokenTokenizer {
             Err(declined) => {
                 tracing::info!(
                     vllm_declined = %declined,
-                    "the opt-in vllm-tokenizer backend declined this tiktoken tokenizer; the wrapper's engine serves it"
+                    "the vllm-tokenizer backend declined this tiktoken tokenizer; the wrapper's engine serves it"
                 );
                 None
             }
         }
     }
 
-    /// Whether the opt-in `vllm-tokenizer` backend serves this tokenizer's
-    /// flat encodes and batch decodes (feature `vllm`).
+    /// Whether the `vllm-tokenizer` backend serves this tokenizer's flat
+    /// encodes and batch decodes.
     pub fn uses_vllm_backend(&self) -> bool {
-        #[cfg(feature = "vllm")]
-        let uses = self.vllm.is_some();
-        #[cfg(not(feature = "vllm"))]
-        let uses = {
-            let _ = self;
-            false
-        };
-        uses
+        self.vllm.is_some()
     }
 
     /// Create a tokenizer from a model string (e.g., "gpt-4", "gpt-3.5-turbo")
@@ -825,7 +813,6 @@ impl Encoder for TiktokenTokenizer {
         // backends, which tiktoken has no concept of) and always recognizes
         // special-token patterns, so chat-template tokens like <|media_pad|> stay
         // atomic instead of splitting into BPE sub-tokens.
-        #[cfg(feature = "vllm")]
         if let Some(vllm) = &self.vllm {
             let tokens = if self.checkpoint_pieces {
                 let mut tokens = Vec::new();
@@ -870,7 +857,6 @@ impl Decoder for TiktokenTokenizer {
         } else {
             token_ids
         };
-        #[cfg(feature = "vllm")]
         if let Some(vllm) = &self.vllm {
             // An id the vocabulary lacks fails the decode, as the wrapper's
             // engine fails it below; the backend would skip it.
@@ -2129,9 +2115,8 @@ mod tests {
             "Special token <|endoftext|> should be recognized as single token, got: {ids:?}"
         );
     }
-    /// The opt-in `vllm-tokenizer` backend over a Kimi-style file: the
+    /// The `vllm-tokenizer` backend over a Kimi-style file: the
     /// ids and text are those of the wrapper's own engine.
-    #[cfg(feature = "vllm")]
     mod vllm_backend {
         use tiktoken_rs::CoreBPE;
 

@@ -21,7 +21,6 @@ pub mod stream;
 pub mod traits;
 #[cfg(feature = "tokenizers-v1")]
 mod v1;
-#[cfg(feature = "vllm")]
 mod vllm;
 mod word_cache;
 
