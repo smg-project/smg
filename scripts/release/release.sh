@@ -1039,11 +1039,30 @@ registry_rows() { # <ref> <branch>: the gate's registry rows for the crates and 
   return "$failed"
 }
 
+inherited_run() { # <repository slug> <head>: the run that stands for <head>'s card tier when <head> changes nothing but version
+  # strings on its parent (scripts/ci_version_only.py, the rule the PR Test workflow applies): the parent's successful PR Test (SMG)
+  # run on a push or a dispatch (a pull request's run can pass with the card lanes skipped, the docs-only shortcut; those two
+  # kinds keep every lane, or inherit it by this very rule), as "<parent short sha> <run url>". The head's own checks come from
+  # every workflow on its push, so the parent must be green on every check of its own (none red, none pending), not on that
+  # run alone: fails otherwise, as it does when the head is more than such a change or the parent has no such run
+  local parent checks runs url
+  parent=$(git rev-parse --verify --quiet "$2^") || return 1
+  "$PYTHON" scripts/ci_version_only.py "$parent" "$2" >/dev/null 2>&1 || return 1
+  checks=$("$GH" api --paginate "repos/$1/commits/$parent/check-runs?per_page=100" --jq '.check_runs[] | "\(.conclusion // .status) \(.name)"' 2>/dev/null) || return 1
+  [ -n "$checks" ] || return 1
+  ! grep -qvE '^(success|skipped|neutral) ' <<< "$checks" || return 1
+  runs=$("$GH" api "repos/$1/actions/workflows/pr-test-rust.yml/runs?head_sha=$parent&per_page=20" --jq '.workflow_runs[] | select(.event != "pull_request") | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null) || return 1
+  url=$(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2)
+  [ -n "$url" ] && printf '%s %s\n' "$(git rev-parse --short "$parent")" "$url"
+}
+
 ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, and the test matrix on this very commit (a
   # documentation-only merge runs none, the push trigger's paths-ignore, and the pull request's run was for the merge ref,
   # not the branch head, so a run is required by head sha). 0 when green; 1 when a row is red (a failed or cancelled run,
   # no run of the matrix at all, a read that failed); 2 when a row is pending or the head is not on the repository gh reads.
-  local head=$1 branch=$2 slug checks runs ok=0 bad=0 pending=0 line read_rc=0 error state=0
+  # inherited: "<parent> <run url>" once read (inherited_run), for a head that changes nothing but version strings and whose
+  # parent is green on every check and whose run passed; read only where a pending or missing run of the head would otherwise fail the row.
+  local head=$1 branch=$2 slug checks runs ok=0 bad=0 pending=0 line read_rc=0 error state=0 inherited=""
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
     # On an API error gh leaves the error body on stdout ({"message": ...}) and exits non-zero: the read is reported
     # as the failure it is, never counted as a check run (a head the remote does not have yet answers 422).
@@ -1072,6 +1091,8 @@ ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, an
       done <<< "$checks"
       if [ "$bad" -eq 0 ] && [ "$pending" -eq 0 ]; then
         say "[ok]   CI: $ok check(s) green on $(git rev-parse --short "$head")"
+      elif [ "$bad" -eq 0 ] && inherited=$(inherited_run "$slug" "$head"); then
+        say "[ok]   CI: $ok green, $pending pending on $(git rev-parse --short "$head"): the head changes nothing but version strings on ${inherited%% *}, green on every check, whose PR Test (SMG) run passed (${inherited#* }); the card tier is that run's, the head's own pending checks are expected to end as the parent's did"
       else
         say "[FAIL] CI: $ok green, $bad red, $pending pending on $(git rev-parse --short "$head") (https://github.com/$slug/commits/$head)"
         if [ "$bad" -gt 0 ]; then state=1; else state=2; fi
@@ -1084,12 +1105,14 @@ ci_rows() { # <head> <branch>: the gate's CI rows for <head>: its check runs, an
         error=$(api_message "$runs")
         say "[FAIL] PR Test (SMG): the workflow-runs read failed (${error:-gh exited $read_rc}); the runs of $(git rev-parse --short "$head") are at https://github.com/$slug/actions/workflows/pr-test-rust.yml"
         state=1
-      elif [ -z "$runs" ]; then
+      elif [ -z "$runs" ] && ! { [ -n "$inherited" ] || inherited=$(inherited_run "$slug" "$head"); }; then
         # an absent matrix is not a queued one: nothing arrives by waiting
         say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
         state=1
       elif grep -q '^success ' <<< "$runs"; then
         say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
+      elif ! grep -qE '^(failure|cancelled|timed_out|action_required|stale|startup_failure) ' <<< "$runs" && { [ -n "$inherited" ] || inherited=$(inherited_run "$slug" "$head"); }; then
+        say "[ok]   PR Test (SMG): the card tier of $(git rev-parse --short "$head") is ${inherited%% *}'s successful run (${inherited#* }): the head changes nothing but version strings on it; the head's own run ($(paste -sd ';' <<< "${runs:-not started yet}")) is expected to end as the parent's did"
       else
         say "[FAIL] PR Test (SMG): no successful run on $(git rev-parse --short "$head") yet: $(tr '\n' ';' <<< "$runs")"
         # a run still going is waited for; runs that all ended without a success are red

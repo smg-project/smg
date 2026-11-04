@@ -106,7 +106,13 @@ A candidate or a final is tagged when, on the branch head:
 1. CI is green on the head commit itself: a successful run of the `PR Test (SMG)` matrix for
    that commit (it runs on every push to `release/**` and every pull request against it, as for
    `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
-   `gh workflow run pr-test-rust.yml --ref release/<x.y>`);
+   `gh workflow run pr-test-rust.yml --ref release/<x.y>`). A bump commit changes nothing but
+   version strings (`scripts/ci_version_only.py` is the judge), so the workflow lets it inherit
+   the GPU lanes, the card tier, from the commit it was made on when that commit's push or
+   dispatch run passed (a pull request's run can pass with the card lanes skipped, so it stands
+   for nothing), and its own run covers the host rows alone; `make release-check` then reads the
+   parent's run for the card tier while the head's own checks are pending, provided the parent is
+   green on every check of its own (none red, none pending) besides that run, and says so;
 2. the versions are consistent (`make release-check` reads them; `make release-tag` refuses
    otherwise), and no crate or package sits at a version crates.io or PyPI hold already with
    changes after it (`make release-check` reads the registries; such a version is skipped by
