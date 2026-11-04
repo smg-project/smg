@@ -1,6 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/sampling.rs.
 
+//! The sampling parameters a generate request carries to the engine, repetition detection
+//! included.
+
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};

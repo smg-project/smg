@@ -44,6 +44,7 @@ MAKE_TARGETS = {
     "release-bump-main": "bump-main",
     "release-publish-plan": "publish-plan",
     "release-check": "check",
+    "release-ship": "ship",
 }
 
 GH_STUB = r"""#!/usr/bin/env bash
@@ -56,19 +57,57 @@ api_error() { # <message> <status>: an API error as gh reports it: the body on s
 case "$1 $2" in
   "pr create")
     for ((i = 1; i <= $#; i++)); do
-      if [ "${!i}" = "--body-file" ]; then j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body"; fi
+      case "${!i}" in
+        --body-file) j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body" ;;
+        --head) j=$((i + 1)); head=${!j} ;;
+        --base) j=$((i + 1)); base=${!j} ;;
+      esac
     done
+    printf '%s %s\n' "${head-}" "${base-}" > "$GH_STUB_LOG.pr"
     echo "https://example.invalid/pull/1" ;;
   "pr list")
     [ -z "${GH_STUB_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_LIST_ERROR" >&2; exit 1; }
     case " $* " in
-      *" --head "*) # the cut's precondition: the open pull requests on a head (--json number --jq .[].number)
+      *" --head "*) # the open pull requests on a head (--json number --jq .[].number): the cut's and the ship's reads
         for ((i = 1; i <= $#; i++)); do
           if [ "${!i}" = "--head" ]; then j=$((i + 1)); head=${!j}; fi
+          if [ "${!i}" = "--base" ]; then j=$((i + 1)); base=${!j}; fi
         done
+        [ -z "${base-}" ] || printf '%s %s\n' "$head" "$base" > "$GH_STUB_LOG.pr"
         case " ${GH_STUB_OPEN_HEADS-} " in *" $head "*) echo 8 ;; esac ;;
       *) echo "#7  fix(router): y  pick/1.14-0000000" ;;
     esac ;;
+  "pr view") # the bump pull request the ship waits for; GH_STUB_MERGE=1 merges it (origin's base moves to its head)
+    if [ "${GH_STUB_MERGE-}" = 1 ] && [ -s "$GH_STUB_LOG.pr" ]; then
+      read -r head base < "$GH_STUB_LOG.pr"
+      git -C "$GH_STUB_ORIGIN" update-ref "refs/heads/$base" "refs/heads/$head"
+      echo MERGED
+    else
+      echo "${GH_STUB_PR_STATE:-OPEN}"
+    fi ;;
+  "api user") [ -z "${GH_STUB_AUTH_ERROR-}" ] || { echo "gh: HTTP 401: Bad credentials" >&2; exit 1; }; echo 1 ;;
+  "api repos/example/repo/branches/"*) echo "${GH_STUB_PROTECTED:-false}" ;;
+  "api repos/example/repo/rules/branches/"*) [ -z "${GH_STUB_RULES-}" ] || printf '%b\n' "$GH_STUB_RULES" ;;
+  "api repos/example/repo/rulesets/"*) [ -z "${GH_STUB_BYPASS-}" ] || printf '%b\n' "$GH_STUB_BYPASS" ;;
+  "release view")
+    case " ${GH_STUB_RELEASES-} " in
+      *" $3 "*) echo "https://example.invalid/releases/$3 (prerelease: ${GH_STUB_RELEASE_PRE:-false})" ;;
+      *) echo "release not found" >&2; exit 1 ;;
+    esac ;;
+  "release create") echo "https://example.invalid/releases/$3" ;;
+  "workflow run") ;;
+  "run list") # the runs on a tag: GH_STUB_TAG_RUNS holds "file;id;title;status;conclusion" lines, --workflow narrows
+    [ -z "${GH_STUB_RUN_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_RUN_LIST_ERROR" >&2; exit 1; }
+    workflow=""
+    for ((i = 1; i <= $#; i++)); do
+      if [ "${!i}" = "--workflow" ]; then j=$((i + 1)); workflow=${!j}; fi
+    done
+    while IFS=';' read -r file id title status conclusion; do
+      [ -n "$file" ] || continue
+      [ -z "$workflow" ] || [ "$file" = "$workflow" ] || continue
+      if [ -n "$workflow" ]; then printf '%s\t%s\t%s\t%s\n' "$id" "$title" "$status" "$conclusion"
+      else printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$file" "$status" "$conclusion" "$title"; fi
+    done <<< "${GH_STUB_TAG_RUNS-}" ;;
   "repo view") echo "example/repo" ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
@@ -208,6 +247,7 @@ class Sandbox:
             "GIT_COMMITTER_EMAIL": "owner@example.invalid",
             "GIT_EDITOR": "true",
             "GH_STUB_LOG": str(self.gh_log),
+            "GH_STUB_ORIGIN": str(self.origin),
             "CARGO_STUB_LOG": str(self.cargo_log),
             "CURL_STUB_LOG": str(self.curl_log),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -1810,6 +1850,456 @@ def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
     (repo.bin / "gh").unlink()
     out = repo.tool("check", "1.14.0-rc.1").stdout
     assert "[....] CI: not readable here" in out
+
+
+# --- ship -------------------------------------------------------------------------------------
+
+
+def ship_lines(out: str) -> list[str]:
+    return [line[len("ship: ") :] for line in out.splitlines() if line.startswith("ship: ")]
+
+
+ENGINE_RUN = "SMG+{engine} | base={base} | engine=latest | smg=release tag |  by @owner"
+# a candidate's plan: the Python package, the crates and the gRPC packages wait for the final
+CANDIDATE_DISPATCHES = [
+    "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+    "gh workflow run release-helm.yml --ref v1.14.0-rc.2",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm"
+    " -f base_image_ref=vllm/vllm-openai:v0.27.1",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=sglang",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=tokenspeed",
+    "gh workflow run release-go.yml --ref v1.14.0-rc.2 -f version=1.14.0-rc.2",
+]
+
+
+def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None:
+    """A dry run reads the branch, the rules and the plan, prints each step with what it would do, and
+    changes nothing; a candidate's release is a prerelease, a final's is latest."""
+    repo.cut()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    calls = len(repo.gh_calls())
+    done = repo.tool("ship", "1.14.0-rc.2", "--dry-run")
+    lines = ship_lines(done.stdout)
+    assert lines[0].startswith("v1.14.0-rc.2, a candidate on release/1.14 at ")
+    assert lines[1] == (
+        "dry run: each step prints what it would do with what it reads now; nothing is written"
+    )
+    assert "[ok]   CI: 2 check(s) green" in done.stdout and "[ok]   PR Test (SMG)" in done.stdout
+    assert "DeepSeek provider verifier: <record link>" in done.stdout
+    steps = [
+        "preflight: the CI of release/1.14's head",
+        "would commit 'chore(release): bump versions for v1.14.0-rc.2' on chore/release-1.14.0-rc.2",
+        "would tag v1.14.0-rc.2 at release/1.14's head once it reads 1.14.0-rc.2",
+        "would render the notes (release.sh notes 1.14.0-rc.2) into ",
+        "would create the GitHub release: gh release create v1.14.0-rc.2 --verify-tag --prerelease"
+        " --title 'SMG v1.14.0-rc.2' --notes-file ",
+        "publish: the plan is read at ",
+        "would dispatch: gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+        "dry run of v1.14.0-rc.2 done: nothing was committed, pushed, tagged, created or dispatched",
+    ]
+    found = [next(i for i, line in enumerate(lines) if line.startswith(step)) for step in steps]
+    assert found == sorted(found), "the steps print in their order"
+    bump = lines[found[1]]
+    assert bump.endswith(
+        "and move release/1.14 to it directly: no rule the caller cannot bypass requires"
+        " a pull request on release/1.14"
+    )
+    assert [
+        line[len("would dispatch: ") :] for line in lines if line.startswith("would dispatch: ")
+    ] == (CANDIDATE_DISPATCHES)
+    assert repo.origin_ref("refs/heads/release/1.14") == head
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2") is None
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == ""
+    assert repo.git("branch", "--show-current") == "main"
+    writes = [
+        call
+        for call in repo.gh_calls()[calls:]
+        if call.split()[1:3] in (["pr", "create"], ["release", "create"], ["workflow", "run"])
+    ]
+    assert writes == [], "a dry run reads"
+    final = ship_lines(repo.tool("ship", "1.14.0", "--dry-run").stdout)
+    assert final[0].startswith("v1.14.0, the final on release/1.14 at ")
+    release = [line for line in final if line.startswith("would create the GitHub release: ")]
+    assert len(release) == 1 and " --latest " in release[0] and "--prerelease" not in release[0]
+    assert "would dispatch: gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in final
+    assert "would dispatch: gh workflow run release-pypi.yml --ref v1.14.0" in final, (
+        "the final's plan carries the registry dispatches a candidate's leaves out"
+    )
+
+
+def test_ship_plans_the_bump_by_a_pull_request_when_a_rule_the_caller_cannot_bypass_applies(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+
+    def plan(**env: str) -> str:
+        return repo.tool("ship", "1.14.0-rc.2", "--dry-run", **env).stdout
+
+    assert (
+        "by a pull request: the rule 'pull_request' of ruleset 11 applies to release/1.14 and the"
+        " caller is not on its bypass list" in plan(GH_STUB_RULES="pull_request 11")
+    )
+    assert "directly: no rule the caller cannot bypass" in plan(
+        GH_STUB_RULES="pull_request 11", GH_STUB_BYPASS="7\\n1"
+    ), "the caller (user 1) is on the ruleset's always-bypass list"
+    assert "by a pull request: release/1.14 carries branch protection (the classic kind)" in plan(
+        GH_STUB_PROTECTED="true"
+    )
+    assert "directly (BUMP_PUSH=1)" in plan(GH_STUB_RULES="pull_request 11", BUMP_PUSH="1")
+    assert "by a pull request (BUMP_PUSH=0)" in plan(BUMP_PUSH="0")
+
+
+def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_changes_nothing(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    parent = repo.origin_ref("refs/heads/release/1.14")
+    cut_calls = len(repo.gh_calls())
+    out = repo.tool("ship", "1.14.0-rc.2").stdout
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert head != parent and repo.git("rev-parse", f"{head}^") == parent, (
+        "the bump commit was pushed onto the branch"
+    )
+    for path in VERSION_FILES:
+        assert repo.version_of(path, head) == "1.14.0-rc.2", path
+    assert repo.git("log", "-1", "--format=%s", head) == (
+        "chore(release): bump versions for v1.14.0-rc.2"
+    )
+    assert "bump: pushing chore/release-1.14.0-rc.2 to release/1.14 directly" in out
+    assert "[ok]   versions: the branch reads 1.14.0-rc.2" in out and "[ok]   registry:" in out
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert repo.git("branch", "--show-current") == "main"
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == "", (
+        "the topic is on the branch now"
+    )
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    assert notes.read_text().startswith("## SMG v1.14.0-rc.2\n")
+    calls = repo.gh_calls()[cut_calls:]
+    assert not [call for call in calls if call.startswith("gh pr create")], (
+        "no pull request: the push was allowed (the cut's own, moving main, came before)"
+    )
+    assert (
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title SMG v1.14.0-rc.2"
+        f" --notes-file {notes}" in calls
+    )
+    assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in out
+    assert "the runs on v1.14.0-rc.2 (gh run list --branch v1.14.0-rc.2):" in out
+    assert out.rstrip().endswith(
+        "7 new dispatch(es) (0 were there already); a run that fails is dispatched again by"
+        " 'release.sh ship 1.14.0-rc.2 --from publish'"
+    )
+    # the rerun: the branch, the tag, the release and the runs are there; a failed or cancelled run is
+    # dispatched again, nothing else is
+    runs = "\n".join(
+        [
+            "release-docker.yml;3;Release Docker Image;completed;failure",
+            "release-helm.yml;4;Release Helm Chart;completed;success",
+            "release-engine-docker.yml;5;"
+            + ENGINE_RUN.format(engine="vllm", base="engine default")
+            + ";queued;",
+            "release-engine-docker.yml;6;"
+            + ENGINE_RUN.format(engine="vllm", base="vllm/vllm-openai:v0.27.1")
+            + ";queued;",
+            "release-engine-docker.yml;7;"
+            + ENGINE_RUN.format(engine="sglang", base="engine default")
+            + ";completed;cancelled",
+            "release-engine-docker.yml;8;"
+            + ENGINE_RUN.format(engine="tokenspeed", base="engine default")
+            + ";queued;",
+            "release-go.yml;10;Release gRPC goLang packages;completed;success",
+        ]
+    )
+    before = len(repo.gh_calls())
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        GH_STUB_RELEASES="v1.14.0-rc.2",
+        GH_STUB_RELEASE_PRE="true",
+        GH_STUB_TAG_RUNS=runs,
+    ).stdout
+    assert "preflight: release/1.14 reads 1.14.0-rc.2 already; the CI of the bump's parent" in again
+    assert "bump: done, release/1.14 reads 1.14.0-rc.2 at" in again
+    assert "tag: done, v1.14.0-rc.2 is on origin at" in again
+    assert f"notes: {notes}, rendered by an earlier run" in again
+    assert (
+        "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in again
+    )
+    assert (
+        "publish: done, gh workflow run release-helm.yml --ref v1.14.0-rc.2: run 4 (success)"
+        in again
+    )
+    assert (
+        "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm:"
+        " run 5 (queued)" in again
+    )
+    assert (
+        "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm"
+        " -f base_image_ref=vllm/vllm-openai:v0.27.1: run 6 (queued)" in again
+    )
+    new_calls = repo.gh_calls()[before:]
+    assert [call for call in new_calls if call.startswith("gh workflow run ")] == [
+        "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+        "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=sglang",
+    ]
+    assert not [
+        call for call in new_calls if call.split()[1:3] in (["release", "create"], ["pr", "create"])
+    ]
+    assert "publish: 2 dispatched, 5 there already, 0 failed" in again
+    assert repo.origin_ref("refs/heads/release/1.14") == head
+    assert "  4            release-helm.yml                     completed success" in again
+
+
+def test_ship_opens_the_bump_pull_request_when_the_remote_refuses_the_push_and_waits_for_its_merge(
+    repo: Sandbox,
+) -> None:
+    """The rules read as pushable and the remote says otherwise (a hook here, a rule there): the bump goes
+    by its pull request, the ship waits for the merge, then tags the merged head."""
+    repo.cut()
+    hook = repo.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/usr/bin/env bash\n"
+        "while read -r old new ref; do\n"
+        '  case "$ref" in refs/heads/release/*) echo "a pull request is required" >&2; exit 1 ;; esac\n'
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+    out = repo.tool("ship", "1.14.0-rc.2", GH_STUB_MERGE="1", MERGE_POLL="0").stdout
+    assert (
+        "bump: origin refused the push (" in out and "opening the bump pull request instead" in out
+    )
+    assert (
+        "bump: pull request #1 opened (https://example.invalid/pull/1): waiting for its merge"
+        " (120 min at most, read every 0 s)" in out
+    )
+    calls = repo.gh_calls()
+    assert any(
+        call.startswith(
+            "gh pr create --base release/1.14 --head chore/release-1.14.0-rc.2"
+            " --title chore(release): bump versions for v1.14.0-rc.2 --body-file "
+        )
+        for call in calls
+    )
+    assert "gh pr view 1 --json state --jq .state" in calls
+    assert "## Release gate" in repo.pr_body()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert repo.version_of("model_gateway/Cargo.toml", head) == "1.14.0-rc.2"
+    assert "bump: release/1.14 reads 1.14.0-rc.2 at" in out
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
+
+
+def test_ship_stops_when_the_bump_pull_request_is_not_merged_in_time_and_resumes_on_it(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    done = repo.tool("ship", "1.14.0-rc.2", BUMP_PUSH="0", MERGE_WAIT="0", check=False)
+    assert done.returncode == 1
+    assert (
+        "the bump pull request #1 is not merged after 0 min: merge it, then rerun the ship"
+        in done.stderr
+    )
+    assert (
+        "bump: opening the pull request of chore/release-1.14.0-rc.2 against release/1.14"
+        " (by a pull request (BUMP_PUSH=0))" in done.stdout
+    )
+    assert repo.origin_ref("refs/heads/chore/release-1.14.0-rc.2") is not None, (
+        "the topic is pushed and its pull request open"
+    )
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2") is None
+    assert not [call for call in repo.gh_calls() if call.startswith("gh release create")]
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        GH_STUB_OPEN_HEADS="chore/release-1.14.0-rc.2",
+        GH_STUB_MERGE="1",
+        MERGE_POLL="0",
+    ).stdout
+    assert (
+        "bump: the pull request #8 of chore/release-1.14.0-rc.2 is open (an earlier run):"
+        " waiting for its merge" in again
+    )
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert repo.version_of("model_gateway/Cargo.toml", head) == "1.14.0-rc.2"
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == ""
+    closed = repo.tool("ship", "1.14.0", BUMP_PUSH="0", GH_STUB_PR_STATE="CLOSED", check=False)
+    assert closed.returncode == 1 and "was closed without a merge" in closed.stderr
+
+
+def test_ship_stops_on_a_red_ci_row_and_goes_on_past_a_pending_one(repo: Sandbox) -> None:
+    repo.cut()
+    red = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        check=False,
+        GH_STUB_CHECKS="failure unit tests\\nsuccess lint",
+    )
+    assert red.returncode == 1 and "a CI row of " in red.stderr and " is red (above)" in red.stderr
+    assert "       red: unit tests" in red.stdout and "would commit" not in red.stdout
+    pending = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        GH_STUB_CHECKS="in_progress e2e (card)\\nsuccess lint",
+        GH_STUB_RUNS="in_progress https://example.invalid/runs/2",
+    ).stdout
+    assert "       pending: e2e (card) (in_progress)" in pending
+    assert "preflight: the pending rows above do not hold the ship" in pending
+    assert any(line.startswith("would commit") for line in ship_lines(pending))
+    ended = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        check=False,
+        GH_STUB_RUNS="cancelled https://example.invalid/runs/3",
+    )
+    assert ended.returncode == 1, "a matrix that ended without a success is red, not pending"
+    absent = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_RUNS="none")
+    assert absent.returncode == 1 and "[FAIL] PR Test (SMG): no run on" in absent.stdout, (
+        "a matrix that never ran is red, not pending: nothing arrives by waiting"
+    )
+    logged_out = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_AUTH_ERROR="1")
+    assert logged_out.returncode == 1 and "is not logged in" in logged_out.stderr
+    assert "preflight" not in logged_out.stdout, "nothing is read before gh is known to answer"
+
+
+def test_ship_refuses_a_tag_elsewhere_and_a_topic_of_a_bump_that_did_not_land(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    repo.git("tag", "v1.14.0-rc.2", "origin/main")
+    repo.git("push", "--quiet", "origin", "refs/tags/v1.14.0-rc.2")
+    done = repo.tool("ship", "1.14.0-rc.2", "--dry-run", "--from", "tag", check=False)
+    assert done.returncode == 1 and "tags never move; the ship stops" in done.stderr
+    repo.git("push", "--quiet", "origin", ":refs/tags/v1.14.0-rc.2")
+    repo.git("tag", "-d", "v1.14.0-rc.2")
+    repo.git("branch", "chore/release-1.14.0-rc.2", "origin/release/1.14")
+    stale = repo.tool("ship", "1.14.0-rc.2", check=False)
+    assert stale.returncode == 1
+    assert "the branch chore/release-1.14.0-rc.2 exists (a bump that did not land)" in stale.stderr
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git(
+        "rev-parse", "origin/release/1.14"
+    )
+
+
+def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sandbox) -> None:
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    authored = repo.base / "notes.md"
+    authored.write_text("## SMG v1.14.0-rc.2\n\nWhat changed, in the author's words.\n")
+    lines = ship_lines(
+        repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(authored)).stdout
+    )
+    assert lines[1:4] == [
+        "preflight: skipped (--from notes)",
+        "bump: skipped (--from notes)",
+        "tag: skipped (--from notes)",
+    ]
+    assert f"notes: {authored} (NOTES)" in lines
+    assert (
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title SMG v1.14.0-rc.2"
+        f" --notes-file {authored}" in repo.gh_calls()
+    )
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in lines
+    wrong = repo.base / "wrong.md"
+    wrong.write_text("# notes\n")
+    stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(wrong), check=False)
+    assert stopped.returncode == 1
+    assert (
+        "not ready for publication: the first line is not '## SMG v1.14.0-rc.2'" in stopped.stderr
+    )
+    # from the release step the notes of the earlier run are read, not rendered again
+    later = repo.tool("ship", "1.14.0-rc.2", "--from", "release", NOTES=str(authored)).stdout
+    assert f"notes: {authored} (NOTES)" in later and "release: created" in later
+    assert (
+        "unknown step 'frobnicate'"
+        in repo.tool("ship", "1.14.0-rc.2", "--from", "frobnicate", check=False).stderr
+    )
+    assert (
+        "no release/1.15 on origin: cut it first"
+        in repo.tool("ship", "1.15.0-rc.1", "--dry-run", check=False).stderr
+    )
+
+
+def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo: Sandbox) -> None:
+    """The plan is read whole, with its status, before the first dispatch, and a failed read of a workflow's runs is
+    not an empty list: either failure stops the ship with nothing dispatched (a rerun would double a run otherwise)."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    unread = repo.tool(
+        "ship", "1.14.0-rc.2", "--from", "publish", check=False, GH_STUB_RUN_LIST_ERROR="no answer"
+    )
+    assert unread.returncode == 1
+    assert "the runs of release-docker.yml on v1.14.0-rc.2 could not be read" in unread.stderr
+    assert "gh: no answer" in unread.stderr, "gh's own message is shown"
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    broken = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False, PYTHON="false")
+    assert broken.returncode == 1
+    assert "the publish plan of v1.14.0-rc.2 could not be read" in broken.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+
+
+def test_ship_dispatches_nothing_when_the_engine_table_cannot_be_read(repo: Sandbox) -> None:
+    """The engine table is read inside the plan, whose failures `set -e` does not see under `if`: a table the
+    Python cannot parse stops the plan by name, so the ship dispatches nothing (not the registry workflows
+    alone, with the engine images missing)."""
+    repo.commit_main(
+        "ci: a trailing comma in the engine table",
+        ".github/workflows/release-engine-docker.yml",
+        ENGINE_WORKFLOW.replace(
+            '"tokenspeed": {"release_bases": [""]}', '"tokenspeed": {"release_bases": [""]},'
+        ),
+    )
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    done = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False)
+    assert done.returncode == 1
+    assert (
+        "the engine table of .github/workflows/release-engine-docker.yml at v1.14.0-rc.2 could not be read"
+        in done.stderr
+    )
+    assert "the publish plan of v1.14.0-rc.2 could not be read" in done.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    plan = repo.tool("publish-plan", "1.14.0-rc.2", check=False)
+    assert plan.returncode == 1 and "no engine dispatch listed" in plan.stderr
+
+
+def test_ship_leaves_no_notes_file_behind_when_the_render_fails(repo: Sandbox) -> None:
+    """The notes are rendered beside their place and moved there once whole: a render that stops halfway
+    leaves no file a rerun would keep as "rendered by an earlier run"."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    first_final = repo.git("rev-parse", "v1.13.0^{commit}")
+    repo.git("push", "--quiet", "origin", ":refs/tags/v1.13.0")
+    repo.git("tag", "-d", "v1.13.0")
+    failed = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", check=False)
+    assert failed.returncode == 1 and "no final release tag below v1.14.0-rc.2" in failed.stderr
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    assert not notes.exists()
+    repo.git("tag", "v1.13.0", first_final)
+    repo.git("push", "--quiet", "origin", "refs/tags/v1.13.0")
+    again = repo.tool("ship", "1.14.0-rc.2", "--from", "notes").stdout
+    assert f"notes: rendered into {notes}" in again
+    assert notes.read_text().startswith("## SMG v1.14.0-rc.2\n")
+    assert not notes.with_name(notes.name + ".partial").exists()
 
 
 # --- a rehearsal: the cut before its push ------------------------------------------------------------

@@ -21,6 +21,7 @@ COMPONENTS = (
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.
 REGRESSIONS = (
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
     ("scripts/ci_reap_job_processes.py", "scripts/tests/test_ci_reap_job_processes.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
     (

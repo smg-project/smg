@@ -5,6 +5,9 @@
 // preserved; `utility_output` is typed (`UtilityOutput`) so replies route to
 // their callers.
 
+//! The engine's per-step outputs: request batches with each request's tokens, events and finish
+//! reason, utility replies routed to their callers, and data-parallel control messages.
+
 use std::collections::BTreeSet;
 
 use bytes::Bytes;

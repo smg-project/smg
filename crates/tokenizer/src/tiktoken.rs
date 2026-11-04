@@ -26,7 +26,7 @@ use crate::{
         kimi_k3_xtml::{
             self, apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, RenderedXtml,
         },
-        PromptSegment, RendererProfile,
+        PromptSegment, RendererProfile, TemplateAnswers,
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
@@ -845,6 +845,16 @@ fn is_unknown_tiktoken_decode_error(err: &Error) -> bool {
     err.downcast_ref::<DecodeKeyError>().is_some()
 }
 
+impl TiktokenTokenizer {
+    /// The template questions, answered by the profile or by the template.
+    fn template_answers(&self) -> TemplateAnswers<'_> {
+        TemplateAnswers {
+            profile: self.profile.as_ref(),
+            template: &self.chat_template,
+        }
+    }
+}
+
 impl TokenizerTrait for TiktokenTokenizer {
     fn vocab_size(&self) -> usize {
         self.vocab_size
@@ -924,37 +934,23 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        self.profile
-            .and_then(|profile| profile.content_format)
-            .unwrap_or_else(|| self.chat_template.content_format())
+        self.template_answers().content_format()
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        self.profile.map_or_else(
-            || self.chat_template.thinking_toggle(),
-            |profile| profile.thinking_toggle,
-        )
+        self.template_answers().thinking_toggle()
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        self.profile.map_or_else(
-            || self.chat_template.thinking_key_name(),
-            |profile| Some(profile.thinking_key_name),
-        )
+        self.template_answers().thinking_key_name()
     }
 
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-        self.profile.map_or_else(
-            || self.chat_template.native_reasoning_effort_values(),
-            |profile| profile.native_effort_values,
-        )
+        self.template_answers().native_reasoning_effort_values()
     }
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
-        self.profile.map_or_else(
-            || self.chat_template.native_reasoning_effort_off_values(),
-            |profile| profile.native_effort_off_values,
-        )
+        self.template_answers().native_reasoning_effort_off_values()
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
@@ -962,32 +958,18 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn think_in_prefill(&self) -> bool {
-        self.profile.map_or_else(
-            || self.chat_template.think_in_prefill(),
-            |profile| profile.think_in_prefill,
-        )
+        self.template_answers().think_in_prefill()
     }
 
     fn prefill_opens_think_block(&self) -> bool {
-        self.profile.map_or_else(
-            || self.chat_template.prefill_opens_think_block(),
-            |profile| profile.think_in_prefill,
-        )
+        self.template_answers().prefill_opens_think_block()
     }
 
+    /// The profile's, or the Jinja template's; this tokenizer resolves no
+    /// media handling of its own.
     fn renderer_capabilities(&self) -> RendererCapabilities {
-        // A renderer with an encoder of its own answers from its profile; the
-        // others render through the Jinja template, which continues a
-        // trailing assistant message the way transformers does and takes a
-        // history call's arguments as the text the request sent when it
-        // writes them that way.
-        self.profile.map_or_else(
-            || RendererCapabilities {
-                raw_tool_call_arguments: self.chat_template.raw_tool_call_arguments(),
-                ..RendererProfile::TEMPLATE_CAPABILITIES
-            },
-            |profile| profile.capabilities,
-        )
+        self.template_answers()
+            .renderer_capabilities(RendererProfile::TEMPLATE_CAPABILITIES.media_handling)
     }
 
     fn native_thinking_mode(
@@ -995,9 +977,8 @@ impl TokenizerTrait for TiktokenTokenizer {
         template_kwargs: Option<&HashMap<String, serde_json::Value>>,
         thinking: Option<bool>,
     ) -> Option<bool> {
-        self.profile
-            .and_then(|profile| profile.thinking_mode)
-            .map(|resolve| resolve(template_kwargs, thinking))
+        self.template_answers()
+            .native_thinking_mode(template_kwargs, thinking)
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {

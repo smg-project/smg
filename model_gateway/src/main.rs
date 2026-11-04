@@ -66,16 +66,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Backend::Sglang => "sglang",
-            Backend::Vllm => "vllm",
-            Backend::Trtllm => "trtllm",
-            Backend::Tokenspeed => "tokenspeed",
-            Backend::Openai => "openai",
-            Backend::Anthropic => "anthropic",
-            Backend::Gemini => "gemini",
-        };
-        write!(f, "{s}")
+        write_flag_value(self, f)
     }
 }
 
@@ -92,15 +83,23 @@ pub enum DiscoveryProvider {
     Consul,
 }
 
-impl DiscoveryProvider {
-    /// The spelling `--discovery-provider` takes for this provider.
-    fn flag_value(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::File => "file",
-            Self::Slurm => "slurm",
-            Self::Consul => "consul",
-        }
+impl std::fmt::Display for DiscoveryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_flag_value(self, f)
+    }
+}
+
+/// A value's spelling on the command line is its one spelling: `Display` writes
+/// the name clap parses, so a message that names a flag's value prints what the
+/// flag takes. A variant clap skips has no command-line name and prints as its
+/// `Debug` form, so a formatter that has not failed never reports an error.
+fn write_flag_value<V: ValueEnum + std::fmt::Debug>(
+    value: &V,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match value.to_possible_value() {
+        Some(name) => f.write_str(name.get_name()),
+        None => write!(f, "{value:?}"),
     }
 }
 
@@ -556,12 +555,6 @@ struct RoutingArgs {
     /// token count is unknown at routing
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
-
-    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
-    /// waiting requests (plus dispatches since their last poll) have reached
-    /// this count; 0 disables. Set below the engine's max batch size
-    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
-    least_load_max_waiting_requests: u32,
 
     /// What power_of_two compares: expected_wait (default), requests or least_requests
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
@@ -2229,6 +2222,34 @@ mod tests {
         cli_args_from(&["--cors-allowed-origins", "*"])
             .to_router_config(vec![], vec![])
             .expect("a lone '*' is the open policy");
+    }
+
+    /// The names `--backend` and `--discovery-provider` accept are the ones
+    /// their values print, so a message that names a value spells it as the
+    /// flag takes it.
+    #[test]
+    fn a_backend_and_a_discovery_provider_print_the_names_their_flags_accept() {
+        let backends: Vec<String> = Backend::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            backends,
+            [
+                "sglang",
+                "vllm",
+                "trtllm",
+                "tokenspeed",
+                "openai",
+                "anthropic",
+                "gemini"
+            ]
+        );
+        let providers: Vec<String> = DiscoveryProvider::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(providers, ["kubernetes", "file", "slurm", "consul"]);
     }
 
     /// A flag that only acts with a companion is named when the companion is

@@ -1,4 +1,9 @@
+mod alias_pipeline;
+mod build_parity;
+mod generate_body;
 mod glm53;
+mod model_label;
+mod rate_limit_reserve;
 
 use std::{
     path::{Path, PathBuf},

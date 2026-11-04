@@ -2,6 +2,9 @@
 // (vllm-project/vllm): protocol/logprobs.rs + protocol/logprobs/wire.rs.
 // The numpy-array decoders live in `crate::codec::tensor`.
 
+//! Log probabilities on the engine's wire: the per-token and per-position records a request's
+//! output carries, decoded from the engine's packed arrays.
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};

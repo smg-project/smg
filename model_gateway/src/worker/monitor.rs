@@ -636,6 +636,21 @@ impl WorkerMonitor {
         self.pushed_notify.notify_one();
     }
 
+    /// Whether `workers`, the members of one group, are to have live load
+    /// state: always by default; under `--disable-load-monitoring` only when
+    /// a load-aware or dp-rank policy, the engine-metrics export or overload
+    /// protection on a member needs it. The poll tick and the decision to
+    /// open a worker's load stream read the same answer.
+    pub(crate) fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
+        if !self.conditional_polling {
+            return true;
+        }
+        let routing_needs_load = self.policy_registry.needs_backend_loads()
+            || self.policy_registry.get_dp_rank_policy().is_some();
+        let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
+        routing_needs_load || self.engine_metrics || overload_needs_load
+    }
+
     /// The poll decision for `url` at `now` from the receipt times of its
     /// pushed records: none on file polls, a record within `interval` on
     /// every pushing rank suppresses the poll, an older one on any rank
@@ -1675,14 +1690,9 @@ async fn poll_group_once(
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    if monitor.conditional_polling {
-        let routing_needs_load = monitor.policy_registry.needs_backend_loads()
-            || monitor.policy_registry.get_dp_rank_policy().is_some();
-        let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
-        if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
-            debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
-            return;
-        }
+    if !monitor.loads_wanted(&workers) {
+        debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
+        return;
     }
 
     // A worker whose stream pushed a load record on every pushing rank
@@ -2578,6 +2588,33 @@ mod native_loads_tests {
         })
         .await
         .expect("cache_aware with overlap_decay must trigger load polling");
+    }
+
+    /// The one predicate behind the poll tick and the load stream: wanted
+    /// by default; under `--disable-load-monitoring` only for a reason.
+    #[tokio::test]
+    async fn loads_wanted_follows_the_conditional_gate() {
+        let (_registry, by_default) = monitor_with(PolicyConfig::Random, false);
+        assert!(by_default.loads_wanted(&[vllm_worker("http://a:8000")]));
+        let (_registry, conditional) = monitor_with(PolicyConfig::Random, true);
+        assert!(!conditional.loads_wanted(&[vllm_worker("http://a:8000")]));
+        assert!(
+            conditional.loads_wanted(&[vllm_worker_with_overload(
+                "http://a:8000",
+                OverloadUpdate {
+                    waiting_requests: Some(1),
+                    ..Default::default()
+                }
+            )]),
+            "overload protection on a member wants the loads"
+        );
+        let (_registry, load_aware) = monitor_with(
+            PolicyConfig::PowerOfTwo {
+                load_metric: Default::default(),
+            },
+            true,
+        );
+        assert!(load_aware.loads_wanted(&[vllm_worker("http://a:8000")]));
     }
 
     /// Load monitoring is on by default: a load-blind policy with no flags and

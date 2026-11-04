@@ -1,19 +1,19 @@
-// The connector: the frontend-side request/response layer over a
-// [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
-// `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
-//
-// - DP load balancing for unpinned requests: the connector picks the
-//   least-loaded engine from the piggybacked per-rank `scheduler_stats`
-//   (mirroring vLLM's frontend DP client). An SMG-stamped
-//   `data_parallel_rank` remains authoritative.
-// - No DP coordinator process: for a lockstep engine group the connector plays
-//   the wake role itself, over the input socket each rank already listens on.
-// - Utility RPCs (`call_utility`, vLLM only): one call to one rank, correlated
-//   by a call id this client issues. Pending calls live in the request
-//   registry, so the one dispatcher resolves their replies and fails them with
-//   the requests when the engine dies. Upstream's management wrappers (LoRA
-//   add/remove, sleep/wake, profiling, weight updates) stay unported; the
-//   prefix-cache reset is built on it by the adapter.
+//! The connector: the frontend-side request/response layer over a
+//! [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
+//! `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
+//!
+//! - DP load balancing for unpinned requests: the connector picks the
+//!   least-loaded engine from the piggybacked per-rank `scheduler_stats`
+//!   (mirroring vLLM's frontend DP client). An SMG-stamped
+//!   `data_parallel_rank` remains authoritative.
+//! - No DP coordinator process: for a lockstep engine group the connector plays
+//!   the wake role itself, over the input socket each rank already listens on.
+//! - Utility RPCs (`call_utility`, vLLM only): one call to one rank, correlated
+//!   by a call id this client issues. Pending calls live in the request
+//!   registry, so the one dispatcher resolves their replies and fails them with
+//!   the requests when the engine dies. Upstream's management wrappers (LoRA
+//!   add/remove, sleep/wake, profiling, weight updates) stay unported; the
+//!   prefix-cache reset is built on it by the adapter.
 
 use std::{
     collections::{HashMap, HashSet},

@@ -619,7 +619,7 @@ impl AppContextBuilder {
             .with_mcp_orchestrator(&router_config)
             .await?
             .with_wasm_manager(&router_config)
-            .with_kv_event_monitor(&router_config)
+            .with_kv_event_monitor()
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -914,58 +914,34 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create KV event monitor for event-driven cache-aware routing.
+    /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// The monitor is created when ANY serving policy is cache_aware — the
-    /// global default or a PD/EPD role override (a non-cache-aware global with
-    /// a cache-aware decode policy still needs event-driven indexers) —
-    /// regardless of connection mode. The monitor itself is cheap (empty
-    /// DashMaps) and stays dormant until workers are added. The
-    /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so
-    /// HTTP workers are never subscribed.
-    fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
-        use crate::config::types::{PolicyConfig, RoutingMode};
+    /// Every gateway has one, whatever its policies: a worker under a
+    /// cache-aware policy streams its KV events into the model's index, every
+    /// other gRPC worker streams its load records alone, so load-aware
+    /// routing prices a worker by a record at the engine's cadence rather
+    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
+    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// is cheap (empty maps) and stays dormant until workers are added; a
+    /// model without an events subscription has no index and no index
+    /// gauges.
+    fn with_kv_event_monitor(mut self) -> Self {
+        let monitor = Arc::new(KvEventMonitor::new());
+        debug!("Created KV event monitor for the workers' KV-event and load streams");
+        // The load records on the streams are polls of the worker.
+        if let Some(worker_monitor) = &self.worker_monitor {
+            monitor.set_load_sink(worker_monitor);
+        }
+        monitor.start_stats_task();
 
-        let role_is_cache_aware =
-            |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
-            || match &config.mode {
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
-                RoutingMode::EncodePrefillDecode {
-                    encode_policy,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    role_is_cache_aware(encode_policy)
-                        || role_is_cache_aware(prefill_policy)
-                        || role_is_cache_aware(decode_policy)
-                }
-                _ => false,
-            };
-
-        if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::new());
-            debug!("Created KV event monitor for event-driven cache-aware routing");
-            // The load records on the event streams are polls of the worker.
-            if let Some(worker_monitor) = &self.worker_monitor {
-                monitor.set_load_sink(worker_monitor);
-            }
-            monitor.start_stats_task();
-
-            // Inject monitor into PolicyRegistry — propagates to default_policy
-            // and any other existing cache-aware policies.
-            if let Some(ref registry) = self.policy_registry {
-                registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-            }
-
-            self.kv_event_monitor = Some(monitor);
+        // Inject monitor into PolicyRegistry — propagates to default_policy
+        // and any cache-aware policy created later from a worker's policy
+        // label.
+        if let Some(ref registry) = self.policy_registry {
+            registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
         }
 
+        self.kv_event_monitor = Some(monitor);
         self
     }
 
@@ -1190,14 +1166,13 @@ mod tests {
         }
     }
 
-    /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
-    /// This run of the builder needs no storage or network, so it exercises the
-    /// real gating path rather than the predicate in isolation.
+    /// Whether `with_kv_event_monitor` creates the monitor under `policy`.
+    /// This run of the builder needs no storage or network.
     fn kv_monitor_created_for(policy: PolicyConfig) -> bool {
         let config = config_with_policy(policy);
         AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
+            .with_kv_event_monitor()
             .kv_event_monitor
             .is_some()
     }
@@ -1248,55 +1223,43 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
-    /// The #1794-relevant guarantee: passthrough never starts the KV-event
-    /// monitor, so single-backend gateways skip the `SubscribeKvEvents` overhead.
+    /// Every policy gets the monitor: a cache-aware one for its indexes, any
+    /// other for the load stream of its gRPC workers, which the policies'
+    /// load feed reads in place of the poll.
     #[test]
-    fn test_passthrough_does_not_create_kv_event_monitor() {
-        assert!(!kv_monitor_created_for(PolicyConfig::Passthrough));
-        // Other non-cache-aware policies are likewise skipped.
-        assert!(!kv_monitor_created_for(PolicyConfig::RoundRobin));
-        // Control: cache-aware still creates the monitor.
+    fn every_policy_creates_the_kv_event_monitor() {
+        assert!(kv_monitor_created_for(PolicyConfig::Passthrough));
+        assert!(kv_monitor_created_for(PolicyConfig::RoundRobin));
+        assert!(kv_monitor_created_for(PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        }));
         assert!(kv_monitor_created_for(PolicyConfig::cache_aware(
             0.5, 32, 1.1, 30, 1000
         )));
     }
 
-    /// A cache-aware PD/EPD role policy needs the monitor even when the
-    /// global policy is not cache-aware.
+    /// The monitor reaches a cache-aware policy created later from a
+    /// worker's policy label under a non-cache-aware default: its model's
+    /// workers get the event-driven index rather than the approximate tree.
     #[test]
-    fn test_cache_aware_role_policy_creates_kv_event_monitor() {
-        use crate::config::types::RoutingMode;
+    fn a_cache_aware_policy_from_a_worker_label_gets_the_kv_event_monitor() {
+        use crate::policies::CacheAwarePolicy;
 
-        let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000);
-
-        let mut config = config_with_policy(PolicyConfig::Random);
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: Some(cache_aware.clone()),
-        };
-        let created = AppContextBuilder::new()
+        let config = config_with_policy(PolicyConfig::Random);
+        let builder = AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
-            .kv_event_monitor
-            .is_some();
-        assert!(created, "cache-aware decode policy must create the monitor");
-
-        // Non-cache-aware role policies still skip it.
-        let mut config = config_with_policy(PolicyConfig::Random);
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: Some(PolicyConfig::RoundRobin),
-            decode_policy: None,
-        };
-        let created = AppContextBuilder::new()
-            .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
-            .kv_event_monitor
-            .is_some();
-        assert!(!created);
+            .with_kv_event_monitor();
+        assert!(builder.kv_event_monitor.is_some());
+        let registry = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set");
+        let policy = registry.on_worker_added("affine", Some("cache_aware"));
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .expect("the label's policy is cache-aware");
+        assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
     #[test]

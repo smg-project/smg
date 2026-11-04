@@ -151,13 +151,6 @@ impl SincePollDispatch {
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
 ///   the in-flight term when the request's token count is unknown at routing
 ///   (the HTTP path; ignored when tokens are known, i.e. gRPC).
-/// - `max_waiting_requests` (default `0` = disabled) — per-worker waiting-queue
-///   cap: a worker whose reported waiting requests, plus requests dispatched to
-///   it since its last poll and the requests the router holds on it beyond
-///   its report, have reached the cap is skipped. When every
-///   candidate is at the cap the selection returns none, so the request falls
-///   to the router's admission queue instead of deepening a backlog. Set it
-///   below the engine's max batch size.
 #[derive(Debug)]
 pub struct LeastLoadPolicy {
     /// The worker monitor's load feed: the shared snapshot of every worker's
@@ -180,8 +173,6 @@ pub struct LeastLoadPolicy {
     /// candidate reports a live `gen_throughput`; always used as input
     /// tokens/s for prefill.
     default_throughput: f64,
-    /// Per-worker waiting-queue cap; `0` disables the veto.
-    max_waiting_requests: u32,
     /// Seeded source for the tie draw when set (tests reproduce a selection
     /// sequence with it); the thread's generator otherwise.
     tie_rng: Option<Mutex<StdRng>>,
@@ -226,7 +217,6 @@ impl LeastLoadPolicy {
             DEFAULT_KV_PRESSURE_WEIGHT,
             DEFAULT_MEAN_PREFILL_TOKENS,
             DEFAULT_THROUGHPUT,
-            0,
         )
     }
 
@@ -235,7 +225,6 @@ impl LeastLoadPolicy {
             kv_pressure_weight,
             DEFAULT_MEAN_PREFILL_TOKENS,
             DEFAULT_THROUGHPUT,
-            0,
         )
     }
 
@@ -243,7 +232,6 @@ impl LeastLoadPolicy {
         kv_pressure_weight: f64,
         mean_prefill_tokens: u32,
         default_throughput: f64,
-        max_waiting_requests: u32,
     ) -> Self {
         Self {
             loads: RwLock::new(None),
@@ -259,7 +247,6 @@ impl LeastLoadPolicy {
             } else {
                 DEFAULT_THROUGHPUT
             },
-            max_waiting_requests,
             tie_rng: None,
         }
     }
@@ -284,12 +271,11 @@ impl LeastLoadPolicy {
     /// Test-only view of the tunables so registry tests can assert
     /// operator values propagated.
     #[cfg(test)]
-    pub(crate) fn params_for_test(&self) -> (f64, u32, f64, u32) {
+    pub(crate) fn params_for_test(&self) -> (f64, u32, f64) {
         (
             self.kv_pressure_weight,
             self.mean_prefill_tokens,
             self.default_throughput,
-            self.max_waiting_requests,
         )
     }
 
@@ -593,45 +579,6 @@ impl LeastLoadPolicy {
             Self::release_reported(snapshot, &mut inflight, workers[i].url());
         }
 
-        // Waiting-queue veto: drop candidates whose reported queue, plus
-        // requests dispatched since their last report and the requests the
-        // router holds on them beyond the report, has reached the cap.
-        // Workers without a report stay eligible — there is no queue
-        // evidence to veto on, and a dark fleet must keep routing.
-        let capped: Vec<usize>;
-        let candidates = if self.max_waiting_requests == 0 {
-            candidates
-        } else {
-            let cap = self.max_waiting_requests as u64;
-            capped = candidates
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    let url = workers[i].url();
-                    match Self::fresh_load(snapshot, url) {
-                        Some(load) => {
-                            let since_poll =
-                                inflight.get(url).map_or(0, |dispatch| dispatch.requests);
-                            let unaccounted =
-                                Self::unaccounted_requests(&workers[i], load, since_poll);
-                            let waiting = load.total_waiting_reqs().max(0) as u64;
-                            let eligible = waiting + since_poll + unaccounted < cap;
-                            if cache_trace::enabled() {
-                                cache_trace::gate(serde_json::json!({
-                                    "source": "waiting_queue_cap", "worker": url,
-                                    "waiting_requests": waiting, "since_poll_requests": since_poll,
-                                    "unaccounted_requests": unaccounted,
-                                    "cap": cap, "eligible": eligible,
-                                }));
-                            }
-                            eligible
-                        }
-                        None => true,
-                    }
-                })
-                .collect();
-            &capped
-        };
         let (&first, rest) = candidates.split_first()?;
 
         let inputs = self.score_inputs(workers, candidates, snapshot, &inflight);
@@ -710,8 +657,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         if healthy.is_empty() {
             return None;
         }
-        // The single-worker shortcut must not bypass the waiting-queue veto.
-        if healthy.len() == 1 && self.max_waiting_requests == 0 {
+        if healthy.len() == 1 {
             return Some(healthy[0]);
         }
         self.select_min_expected_wait(workers, &healthy, info, self.name())
@@ -774,7 +720,7 @@ mod tests {
     /// Prefill scores and missing-peer estimates must not track output-token rates.
     #[test]
     fn prefill_ignores_generation_rate() {
-        let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0, 0);
+        let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
         let feed = TestFeed::attached_to(&policy);
         let workers: Vec<Arc<dyn Worker>> = ["http://prefill:1", "http://missing:2"]
             .into_iter()
@@ -1040,74 +986,6 @@ mod tests {
     }
 
     #[test]
-    fn waiting_queue_veto_skips_capped_worker() {
-        // a would win the argmin (655s vs 10,000s) but reports 64 waiting
-        // (>= cap 48); the veto must exclude it before scoring.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48));
-        let mut loads = HashMap::new();
-        loads.insert(
-            "http://a:8000".to_string(),
-            one_rank_load_reqs_only(64, 0.0, 100.0),
-        );
-        loads.insert(
-            "http://b:8000".to_string(),
-            one_rank_load(1_000_000, 0.0, 100.0),
-        );
-        feed.publish(&loads);
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn waiting_queue_veto_all_capped_returns_none() {
-        // Every candidate at the cap: selection must fail so the request
-        // falls to the router's admission queue instead of piling on.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48));
-        let mut loads = HashMap::new();
-        loads.insert(
-            "http://a:8000".to_string(),
-            one_rank_load_reqs_only(48, 0.0, 100.0),
-        );
-        loads.insert(
-            "http://b:8000".to_string(),
-            one_rank_load_reqs_only(48, 0.0, 100.0),
-        );
-        feed.publish(&loads);
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            None
-        );
-    }
-
-    #[test]
-    fn waiting_queue_veto_counts_since_poll_dispatches() {
-        // Cap 2: a reports 1 waiting and wins the first pick; the dispatch
-        // counts one since-poll request, lifting a to the cap, so the second
-        // pick must go to b even though b scores far worse.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 2));
-        let mut loads = HashMap::new();
-        loads.insert(
-            "http://a:8000".to_string(),
-            one_rank_load_reqs_only(1, 0.0, 100.0),
-        );
-        loads.insert(
-            "http://b:8000".to_string(),
-            one_rank_load(400_000, 0.0, 100.0),
-        );
-        feed.publish(&loads);
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(0)
-        );
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(1)
-        );
-    }
-
-    #[test]
     fn unaccounted_requests_are_the_in_flight_beyond_the_report_and_the_credit() {
         let w = make_worker("http://a:8000");
         for _ in 0..12 {
@@ -1135,7 +1013,7 @@ mod tests {
         // yet seen by the engine, their credit released by the fresh sample).
         // `a` must read as 40 requests of work, not as an idle peer of `b`:
         // every pick goes to `b` until its own credit has grown to the same.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0).with_tie_break_seed(1);
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0).with_tie_break_seed(1);
         let feed = TestFeed::attached_to(&policy);
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
@@ -1167,7 +1045,7 @@ mod tests {
         // nothing to either, so the reports alone decide: `a`, whose work is
         // running rather than queued, ties with `b` on the estimate, and a
         // third worker that holds nothing wins outright.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
         let feed = TestFeed::attached_to(&policy);
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
@@ -1208,35 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn waiting_queue_veto_counts_the_requests_the_router_holds_beyond_the_report() {
-        // Cap 5: `a` reports 1 waiting and nothing running while the router
-        // holds 6 on it; the 5 the report does not show count toward the
-        // cap, so `a` is skipped and the pick goes to `b` although `b`
-        // scores far worse.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 5);
-        let feed = TestFeed::attached_to(&policy);
-        let a = make_worker("http://a:8000");
-        for _ in 0..6 {
-            a.increment_load();
-        }
-        let workers = vec![a, make_worker("http://b:8000")];
-        let mut loads = HashMap::new();
-        loads.insert(
-            "http://a:8000".to_string(),
-            one_rank_load_reqs_only(1, 0.0, 100.0),
-        );
-        loads.insert(
-            "http://b:8000".to_string(),
-            one_rank_load(400_000, 0.0, 100.0),
-        );
-        feed.publish(&loads);
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(1)
-        );
-    }
-
-    #[test]
     fn the_floor_excludes_hidden_backlogs_without_tilting_the_healthy_fleet() {
         // Two of eight workers hold 16 requests each that their fresh reports
         // do not show (admission throttled: the requests wait in front of the
@@ -1245,7 +1094,7 @@ mod tests {
         // router's would) with no report in between, the two take nothing
         // and the six water-fill evenly: the floor steers off the hidden
         // backlogs, not onto a favourite.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
         let feed = TestFeed::attached_to(&policy);
         let workers: Vec<Arc<dyn Worker>> = (0..8)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
@@ -1331,45 +1180,10 @@ mod tests {
     }
 
     #[test]
-    fn waiting_queue_veto_ignores_workers_without_snapshots() {
-        // A dark fleet with a cap configured has no queue evidence to veto
-        // on; routing must continue on join-shortest-queue.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 1);
-        let a = make_worker("http://a:8000");
-        let b = make_worker("http://b:8000");
-        for _ in 0..5 {
-            a.increment_load();
-        }
-        let workers = vec![a, b];
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn waiting_queue_veto_applies_to_single_worker() {
-        // The one-healthy-worker shortcut must not bypass the veto.
-        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![make_worker("http://a:8000")];
-        let mut loads = HashMap::new();
-        loads.insert(
-            "http://a:8000".to_string(),
-            one_rank_load_reqs_only(64, 0.0, 100.0),
-        );
-        feed.publish(&loads);
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            None
-        );
-    }
-
-    #[test]
     fn waiting_queue_cap_zero_disables_veto() {
         // Cap 0 keeps the historical behavior: arbitrarily deep queues stay
         // routable.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0, 0));
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1024, 100.0));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
