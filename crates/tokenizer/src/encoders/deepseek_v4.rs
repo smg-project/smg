@@ -496,7 +496,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN},
+        super::deepseek_common::{
+            object_arguments_render_one_parameter_per_key_through, ASSISTANT_SP_TOKEN,
+            LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN,
+        },
         *,
     };
 
@@ -633,34 +636,10 @@ mod tests {
     }
     #[test]
     fn object_form_tool_call_arguments_render_params() {
-        // `model_gateway`'s `process_tool_call_arguments` converts the OpenAI
-        // arguments *string* into a dict before the chat template runs, so the
-        // encoder receives object-form arguments. It must render them, not drop
-        // them — dropping erased every historical tool call's parameters in
-        // multi-turn prompts and made the model loop (re-calling tools forever).
-        let msgs = [
-            user("call my tool"),
-            json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": { "query": "deepseek", "limit": 5 }
-                        }
-                    }
-                ]
-            }),
-        ];
-        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}parameter>"
-        )));
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
-        )));
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &EncodeParams::default()),
+            "parameter",
+        );
     }
     /// A system message after the first renders as the serving engine's copy
     /// of the encoder renders it: bare text with no role marker, and the
