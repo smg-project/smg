@@ -1155,6 +1155,7 @@ impl RequestPipeline {
     /// [`Self::execute_chat_for_responses`] runs a collected iteration, so
     /// the turn counts once at the Responses route and not once per
     /// iteration under `chat`. Tool-loop iterations are not retried.
+    #[expect(clippy::too_many_arguments)]
     pub async fn execute_chat_for_responses_streaming(
         &self,
         request: Arc<ChatCompletionRequest>,
