@@ -48,7 +48,7 @@ use super::{
     conversions,
 };
 use crate::{
-    observability::metrics::Metrics,
+    observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::{
             mcp_utils::DEFAULT_MAX_ITERATIONS,
@@ -117,7 +117,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             Some(iteration_charge(&params.tenant_request_meta)),
             Some(reservation.clone()),
             // No startup barrier: the status is checked below before the
-            // stream is forwarded.
+            // stream is forwarded, so a failed run goes back through the
+            // route, which counts it.
+            None,
             None,
         )
         .await;
@@ -982,6 +984,11 @@ async fn execute_tool_loop_streaming_internal(
                 Some(iteration_charge(&params.tenant_request_meta)),
                 Some(reservation.clone()),
                 startup.take(),
+                // The route has answered by the time a run here can fail
+                // (the first iteration's barrier opens before its answer
+                // is read; the later ones run inside the stream), so a
+                // fault is counted here, with the request the route counted.
+                Some(metrics_labels::ENDPOINT_RESPONSES),
             )
             .await;
 
