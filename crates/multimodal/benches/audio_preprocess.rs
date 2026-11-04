@@ -63,20 +63,16 @@ fn bench_log_mel(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(3));
 
     for seconds in [1_usize, 10] {
-        let samples = waveform(rate, seconds);
-        group.throughput(Throughput::Elements(samples.len() as u64));
+        let clip = DecodedAudio {
+            samples: waveform(rate, seconds),
+            sample_rate: rate,
+        };
+        group.throughput(Throughput::Elements(clip.samples.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{seconds}s")),
-            &samples,
-            |b, samples| {
-                b.iter(|| {
-                    processor
-                        .preprocess_decoded_clips(vec![DecodedAudio {
-                            samples: samples.clone(),
-                            sample_rate: rate,
-                        }])
-                        .unwrap()
-                });
+            &clip,
+            |b, clip| {
+                b.iter(|| processor.preprocess_decoded_clips(&[clip]).unwrap());
             },
         );
     }
@@ -95,20 +91,16 @@ fn bench_resample_and_log_mel(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(5));
 
     for (rate, seconds) in [(44_100_usize, 1_usize), (44_100, 10), (48_000, 10)] {
-        let samples = waveform(rate, seconds);
-        group.throughput(Throughput::Elements(samples.len() as u64));
+        let clip = DecodedAudio {
+            samples: waveform(rate, seconds),
+            sample_rate: rate,
+        };
+        group.throughput(Throughput::Elements(clip.samples.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}khz_{seconds}s", rate / 1000)),
-            &samples,
-            |b, samples| {
-                b.iter(|| {
-                    processor
-                        .preprocess_decoded_clips(vec![DecodedAudio {
-                            samples: samples.clone(),
-                            sample_rate: rate,
-                        }])
-                        .unwrap()
-                });
+            &clip,
+            |b, clip| {
+                b.iter(|| processor.preprocess_decoded_clips(&[clip]).unwrap());
             },
         );
     }
@@ -134,8 +126,9 @@ fn bench_ragged_batch(c: &mut Criterion) {
         .sample_size(10)
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3));
+    let borrowed: Vec<&DecodedAudio> = clips.iter().collect();
     group.bench_function("5s_2s_1s", |b| {
-        b.iter(|| processor.preprocess_decoded_clips(clips.clone()).unwrap());
+        b.iter(|| processor.preprocess_decoded_clips(&borrowed).unwrap());
     });
     group.finish();
 }

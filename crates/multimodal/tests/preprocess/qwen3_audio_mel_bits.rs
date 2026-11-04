@@ -21,11 +21,12 @@
 //! tensor slicing and an off-by-one in either is a wrong answer rather than a drift.
 //!
 //! The portable form of the bit-identity claim is not here: it is in
-//! `audio::processors::qwen3_audio::tests`, where the optimized projection is
-//! compared against a dense reference computed in the same process. That is what
-//! actually proves a change altered nothing, on whatever target runs it. This file
-//! adds a second, stricter signal on one architecture -- it is not the load-bearing
-//! gate.
+//! `audio::processors::qwen3_audio::tests`
+//! (`the_batched_frontend_equals_the_frame_by_frame_computation_bit_for_bit`), where
+//! the batched frontend is compared against the frame-by-frame computation in the same
+//! process. That is what actually proves a change altered nothing, on whatever target
+//! runs it. This file adds a second, stricter signal on one architecture -- it is not
+//! the load-bearing gate.
 //!
 //! The fingerprints were generated from the unmodified frontend, so they cannot
 //! have been fitted to a later change. To regenerate after a deliberate
@@ -299,8 +300,8 @@ fn qwen3_audio_log_mel_is_bit_identical_to_the_recorded_fingerprints() {
         // unconditionally.
         //
         // The portable form of the bit-identity claim lives in
-        // `audio::processors::qwen3_audio::tests`, where the optimized projection is
-        // compared against a dense reference computed in the *same process*. That
+        // `audio::processors::qwen3_audio::tests`, where the batched frontend is
+        // compared against the frame-by-frame computation in the *same process*. That
         // proves "this change altered nothing" on whatever target runs it, which is
         // the property this fixture was added to defend.
         //
