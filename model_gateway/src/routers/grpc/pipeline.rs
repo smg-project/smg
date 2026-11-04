@@ -958,38 +958,46 @@ impl RequestPipeline {
         );
     }
 
+    /// The answer to a run that produced the wrong response shape, an
+    /// internal fault, counted in the router error family under `endpoint`
+    /// when there is one (`None`: the route counts the answer it gives).
     fn wrong_response_type(
         &self,
         function: &'static str,
         expected: &'static str,
         response_type: &FinalResponse,
         model: &str,
-        endpoint: &'static str,
+        endpoint: Option<&'static str>,
     ) -> Response {
         error!(
             function = function,
             response_type = %response_type,
             "Wrong response type: expected {expected}, got {response_type}"
         );
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            self.worker_registry.metric_model_label(model),
-            endpoint,
-            metrics_labels::ERROR_INTERNAL,
-            metrics_labels::REASON_INTERNAL,
-        );
+        if let Some(endpoint) = endpoint {
+            self.record_internal_fault(model, endpoint);
+        }
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
     }
 
+    /// The answer to a run that produced no response, an internal fault,
+    /// counted as [`Self::wrong_response_type`] counts one.
     fn no_response_produced(
         &self,
         function: &'static str,
         model: &str,
-        endpoint: &'static str,
+        endpoint: Option<&'static str>,
     ) -> Response {
         error!(function = function, "No response produced by pipeline");
+        if let Some(endpoint) = endpoint {
+            self.record_internal_fault(model, endpoint);
+        }
+        error::internal_error("no_response_produced", "No response produced")
+    }
+
+    /// One internal fault of a run in the router error family, under
+    /// `endpoint` and the bounded model label.
+    fn record_internal_fault(&self, model: &str, endpoint: &'static str) {
         Metrics::record_router_error(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
@@ -999,7 +1007,6 @@ impl RequestPipeline {
             metrics_labels::ERROR_INTERNAL,
             metrics_labels::REASON_INTERNAL,
         );
-        error::internal_error("no_response_produced", "No response produced")
     }
 
     /// Settle a non-streaming success's reservation with real usage, if this
@@ -1195,16 +1202,22 @@ impl RequestPipeline {
         retry_config: Option<&RetryConfig>,
         stream_start: Option<StreamStartupSender>,
     ) -> Response {
+        // A run that answered with the wrong shape, or none, is an internal
+        // fault, counted under the request's endpoint. A Responses iteration
+        // has none: without a startup barrier its failure goes back through
+        // the route, which counts it; with one the route has answered already
+        // (the barrier opened before this match), so the fault is counted
+        // here, under the route's endpoint, with the request the route
+        // counted.
+        let fault_endpoint = metrics_endpoint.or(stream_start
+            .is_some()
+            .then_some(metrics_labels::ENDPOINT_RESPONSES));
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run_signalling(ctx, metrics_endpoint, retry_config, stream_start)
         };
-        // A run that answered with the wrong shape, or none, is an internal
-        // fault: counted under the chat shape it ran as, whatever the
-        // endpoint, so it never goes unseen.
-        let fault_endpoint = metrics_endpoint.unwrap_or(metrics_labels::ENDPOINT_CHAT);
         match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
@@ -1287,9 +1300,11 @@ impl RequestPipeline {
                     "Generate",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_generate", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_generate", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
@@ -1331,9 +1346,11 @@ impl RequestPipeline {
                     "Completion",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_completion", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_completion", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
@@ -1378,9 +1395,11 @@ impl RequestPipeline {
                     "Messages",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_messages", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_messages", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
@@ -1425,9 +1444,11 @@ impl RequestPipeline {
                     "Decisions",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_decisions", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_decisions", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
@@ -1469,9 +1490,11 @@ impl RequestPipeline {
                     "Embedding",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_embeddings", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_embeddings", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
@@ -1524,11 +1547,13 @@ impl RequestPipeline {
                     "Transcription",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => {
-                    self.no_response_produced("execute_transcription", &dctx.model_id, ENDPOINT)
-                }
+                None => self.no_response_produced(
+                    "execute_transcription",
+                    &dctx.model_id,
+                    Some(ENDPOINT),
+                ),
             },
             Err(response) => response,
         }
@@ -1570,9 +1595,11 @@ impl RequestPipeline {
                     "Classify",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    Some(ENDPOINT),
                 ),
-                None => self.no_response_produced("execute_classify", &dctx.model_id, ENDPOINT),
+                None => {
+                    self.no_response_produced("execute_classify", &dctx.model_id, Some(ENDPOINT))
+                }
             },
             Err(response) => response,
         }
