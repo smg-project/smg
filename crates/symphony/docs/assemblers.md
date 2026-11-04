@@ -480,9 +480,12 @@ no deeper than the crate's own JSON reader allows a call's arguments (`PartialJs
 containers, the arguments object counted), because that is the prefix every syntax's fragments are
 held to. Text either refuses, a lone surrogate escape, nesting past the bound, is a string like any
 other text, so one odd value never costs a call its other arguments; a value the end of the stream
-cut stands as written only where both readers take it as a prefix, and opens a string holding it
-otherwise (a `\u` escape cut short that `serde_json` reads past the text's end is the one place
-the two differ besides the bound).
+cut stands as written only where `serde_json` and the crate's own judge of a JSON prefix
+(`json::Prefix`) both take it, and opens a string holding it otherwise. The two differ in two
+places: nesting past the bound, which `serde_json` follows, and a `\u` escape short of its four
+hex digits before the quote that ends its string (`"\u1"`), which `serde_json` reads four bytes of
+blindly and then asks for more bytes rather than refuse, and which the judge refuses from the
+escape's backslash, whatever follows the quote; no continuation makes such a text JSON.
 
 Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and from
 `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three things

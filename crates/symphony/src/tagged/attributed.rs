@@ -1208,7 +1208,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        json::PartialJson,
+        json::{PartialJson, Prefix},
         tagged::{dropped, nothing_empty, refused, shown},
         testing::{arguments, bytes, malformed},
     };
@@ -1272,7 +1272,12 @@ mod tests {
             arguments(&run_with(Tags::XTML, &[&closed], false)),
             format!("{{\"o\": \"{deep}\"}}")
         );
-        for cut in ["[".repeat(past), "{\"\\u1\"=".to_string()] {
+        for cut in [
+            "[".repeat(past),
+            "{\"\\u1\"=".to_string(),
+            "{\"\\u1\"".to_string(),
+            "[\"\\u1\"]".to_string(),
+        ] {
             let events = run_with(Tags::XTML, &[&argument(&cut)], true);
             let written = arguments(&events);
             assert!(
@@ -1280,11 +1285,8 @@ mod tests {
                 "{cut:?}: {written:?} does not open a string"
             );
             assert!(
-                matches!(
-                    PartialJson::default().parse(&written, true),
-                    Ok((_, read)) if read == written.len()
-                ),
-                "{cut:?}: {written:?} is no prefix the JSON reader takes"
+                Prefix::default().feed(&written).is_none(),
+                "{cut:?}: {written:?} is no prefix the crate's JSON judge takes"
             );
             assert_eq!(
                 malformed(&events),

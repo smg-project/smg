@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
-    json::PartialJson,
+    json::{PartialJson, Prefix},
     CallIds, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
     Input, MalformedReason, Parser,
 };
@@ -653,9 +653,30 @@ fn closed_structure(text: &str) -> bool {
     open.is_empty() && !inside
 }
 
-/// Whether `text` is a JSON prefix the prefix parser takes whole.
-fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+/// The breach in the arguments so far, when the crate's own judge of a JSON prefix ([`Prefix`])
+/// refuses them, which it does at the first byte a strict reader refuses and from the backslash
+/// of an escape no continuation completes: `json-prefix` when the partial parser refuses them too
+/// (nesting past the bound, bytes after the value, a word that is no literal, a surrogate without
+/// its other half), and `tolerated-json` when that parser takes them whole, the shapes JSON
+/// refuses and it tolerates (a value left out, a trailing comma, an escape JSON lacks, a `\u`
+/// escape short of its digits before its string's closing quote, which it reads as unfinished
+/// and the quote as the string's text, whitespace outside JSON's, a number or a word cut short
+/// before a delimiter), the name the call's end gives the same shapes, so that a run's allowance
+/// means one thing at a cut and at a close. The judge lets a raw control character inside a
+/// string through, as the fragment that carries one writes it as its escape; a number's range is
+/// the client's, as [`whole_json`] says.
+fn prefix_breach(so_far: &str) -> Option<&'static str> {
+    // Where the judge refused, if it did: where it did not, there is no breach.
+    Prefix::default().feed(so_far)?;
+    let tolerated = matches!(
+        PartialJson::default().parse(so_far, true),
+        Ok((_, consumed)) if consumed == so_far.len()
+    );
+    Some(if tolerated {
+        "tolerated-json"
+    } else {
+        "json-prefix"
+    })
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.
@@ -765,10 +786,10 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                                 place()
                             )
                         });
-                    } else {
-                        breach("json-prefix", valid_json_prefix(so_far), || {
+                    } else if let Some(name) = prefix_breach(so_far) {
+                        breach(name, false, || {
                             format!(
-                                "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                                "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
                                 place()
                             )
                         });
@@ -796,9 +817,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     // Three names for one promise, so that a run allows a class already
                     // reported and still catches the others: a call that ended with no fragment
                     // at all; a value whose shape closed but whose tokens JSON refuses (what the
-                    // prefix judge tolerates: a value left out, a trailing comma, an escape JSON
-                    // lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
-                    // short); and the rest, the committed prefix of a value that never closed.
+                    // partial parser tolerates: a value left out, a trailing comma, an escape
+                    // JSON lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
+                    // short, the shapes [`prefix_breach`] names the same way at the fragment
+                    // that brings them); and the rest, the committed prefix of a value that
+                    // never closed.
                     if so_far.is_empty() {
                         breach("empty-arguments", false, || {
                             format!(

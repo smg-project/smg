@@ -796,6 +796,12 @@ mod tests {
         let cut = run(&[&format!("f<arg_key>x</arg_key><arg_value>{open}")], true);
         assert_eq!(fragments(&cut), [format!("{{\"x\": \"{open}")]);
         assert_eq!(malformed(&cut), [("", MalformedReason::UnterminatedRegion)]);
+        // A value cut right after a `\u` escape short of its digits: a strict reader reads four
+        // bytes past the text's end rather than refuse the quote, the crate's own judge refuses
+        // the escape, and the value opens a string holding its text, which both take.
+        let short = "[\"\\u1\"]";
+        let cut = run(&[&format!("f<arg_key>x</arg_key><arg_value>{short}")], true);
+        assert_eq!(fragments(&cut), ["{\"x\": \"[\\\"\\\\u1\\\"]".to_string()]);
     }
 
     #[test]

@@ -1079,6 +1079,14 @@ mod tests {
             arguments(&Ending::Stream.run(&[&format!("f(a={open}")])),
             format!("{{\"a\": \"{open}")
         );
+        // A value cut right after a `\u` escape short of its digits: no JSON prefix the crate's
+        // own judge takes (a strict reader reads four bytes past the text's end rather than
+        // refuse the quote), so a string holding its text.
+        let short = "[\"\\u1\"]";
+        assert_eq!(
+            arguments(&Ending::Stream.run(&[&format!("f(a={short}")])),
+            "{\"a\": \"[\\\"\\\\u1\\\"]"
+        );
     }
 
     /// Content with a `[name(` of its own: a name no tool declares is given back as content at its

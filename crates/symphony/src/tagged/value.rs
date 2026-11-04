@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::{
-    json::{prefix::json_space, PartialJson},
+    json::{PartialJson, Prefix},
     tagged::assembler::push_escaped,
 };
 
@@ -673,27 +673,31 @@ impl Literal<'_> {
 /// prefix that reader takes, so a value a syntax passes through as JSON is held to it too.
 const DEEPEST_IN_THE_OBJECT: usize = PartialJson::DEFAULT_MAX_DEPTH - 1;
 
-/// Whether the crate's own JSON reader takes `text` from inside the arguments object: a value, or
-/// a prefix of one, nesting no deeper than [`DEEPEST_IN_THE_OBJECT`], read to its end (trailing
-/// whitespace aside). A strict reader agrees with it on everything but two things, which this is
-/// the judge of: nesting the strict reader still follows and this one refuses, and a `\u` escape
-/// cut short of its digits that the strict reader reads past the text's end rather than refuse
-/// (`{"\u1"=`), which this one stops before.
-fn the_json_reader_takes(text: &str) -> bool {
-    match PartialJson::new(DEEPEST_IN_THE_OBJECT, true).parse(text, true) {
-        Ok((_, read)) => text[read..].chars().all(json_space),
-        Err(_) => false,
-    }
+/// Whether the crate's own judge of a JSON prefix ([`Prefix`]) takes `text` from inside the
+/// arguments object: fed the open bracket of a container first, so that the value stands one
+/// level down, as it does in the object, it says whether the text is a value, or a prefix of one,
+/// a strict reader takes cut anywhere, nesting no deeper than [`DEEPEST_IN_THE_OBJECT`]. It is
+/// asked for the two things it refuses and `serde_json` reads on: nesting past the bound, which
+/// `serde_json` follows four times as deep, and a `\u` escape short of its four hex digits
+/// before the quote that ends the string (`"\u1"`), which `serde_json` reads four bytes of
+/// blindly and then asks for more bytes rather than refuse when the text ends under them, and
+/// which the judge refuses from the escape's backslash, whatever follows the quote. Whitespace or
+/// a comma after the value is the container's and passes the judge; it is `serde_json`'s to
+/// refuse, which both callers ask first.
+fn the_json_judge_takes(text: &str) -> bool {
+    let mut judge = Prefix::default();
+    judge.feed("[").is_none() && judge.feed(text).is_none()
 }
 
 /// Whether `text` is one JSON value a client takes as an argument: one `serde_json` reads whole,
-/// nesting no deeper than the arguments object can hold ([`the_json_reader_takes`]). Nesting
-/// takes a bracket per level, so a value with fewer brackets than the bound cannot pass it, and
-/// the common value costs the strict read and one scan of its bytes, never the second read.
+/// nesting no deeper than the arguments object can hold ([`the_json_judge_takes`]). A value read
+/// whole has every escape complete, so the judge is asked about the nesting alone, and nesting
+/// takes a bracket per level: a value with fewer brackets than the bound cannot pass it, and the
+/// common value costs the strict read and one scan of its bytes, never the judge.
 pub(crate) fn reads_back_as_an_argument(text: &str) -> bool {
     serde_json::from_str::<Value>(text).is_ok()
         && (text.bytes().filter(|b| matches!(b, b'[' | b'{')).count() <= DEEPEST_IN_THE_OBJECT
-            || the_json_reader_takes(text))
+            || the_json_judge_takes(text))
 }
 
 /// `text` as a JSON string.
@@ -739,15 +743,16 @@ pub(crate) fn cut_opens_a_string(text: &str) -> bool {
 }
 
 /// Whether `text` is a strict prefix of a JSON value an argument may hold: one `serde_json` reads
-/// whole, or one it stops reading only because the text ended, and one the crate's own reader
-/// takes too ([`the_json_reader_takes`]), which bounds the nesting and reads an escape cut short
-/// as the bytes say, not past the text's end.
+/// whole, or one it stops reading only because the text ended (it refuses a raw control character
+/// inside a string and a number out of its range, which the judge leaves to the client), and one
+/// the crate's own judge takes too ([`the_json_judge_takes`]), which bounds the nesting and
+/// refuses an escape cut short where `serde_json` reads past the text's end.
 pub(crate) fn json_prefix(text: &str) -> bool {
     let strict = match serde_json::from_str::<Value>(text) {
         Ok(_) => true,
         Err(error) => error.is_eof(),
     };
-    strict && the_json_reader_takes(text)
+    strict && the_json_judge_takes(text)
 }
 
 #[cfg(test)]
@@ -1057,37 +1062,47 @@ mod tests {
     }
 
     /// The fuzz campaign's `json-prefix` class: a value the end of the stream cut inside a list
-    /// nested past the bound, and an object cut right after a `\u` escape short of its digits,
-    /// which `serde_json` reads past the text's end. Neither stands as written, since the
-    /// arguments so far must stay a prefix the crate's own reader takes, as every syntax's
-    /// fragments do; each opens a string holding its text, as text that is no JSON prefix does.
+    /// nested past the bound, and a value cut right after a `\u` escape short of its digits,
+    /// whatever follows the quote that ends the escape's string, which `serde_json` reads past
+    /// the text's end. Neither stands as written, since the arguments so far must stay a prefix
+    /// the crate's own judge takes, as every syntax's fragments do; each opens a string holding
+    /// its text, as text that is no JSON prefix does. A value within the bound, and one cut
+    /// inside an escape still under way, stand as written: a strict reader asks more bytes of
+    /// either.
     #[test]
-    fn a_cut_value_stands_as_written_only_where_the_crates_own_reader_takes_it() {
-        let within = "[".repeat(DEEPEST_IN_THE_OBJECT);
-        assert_eq!(cut(&within), within);
+    fn a_cut_value_stands_as_written_only_where_the_crates_own_judge_takes_it() {
+        for text in [
+            "[".repeat(DEEPEST_IN_THE_OBJECT),
+            "\"\\u12".to_string(),
+            "[\"\\u1".to_string(),
+        ] {
+            assert_eq!(cut(&text), text);
+        }
         for text in [
             "[".repeat(DEEPEST_IN_THE_OBJECT + 1),
             format!("{{\"nested\": {}", "[".repeat(DEEPEST_IN_THE_OBJECT)),
             "{\"\\u1\"=".to_string(),
+            "{\"\\u1\"".to_string(),
+            "{\"\\u1\":".to_string(),
+            "[\"\\u1\"]".to_string(),
+            "\"\\u12\"".to_string(),
         ] {
             let written = cut(&text);
+            let mut judge = Prefix::default();
             assert!(
-                written.starts_with('"') && !written.ends_with('"'),
+                written.starts_with('"') && judge.feed(&written).is_none() && !judge.whole(),
                 "{text:?}: {written:?} is not the opening of a string"
             );
             // What a client holds at the cut, one member in: a prefix its strict reader asks
-            // more bytes of and the crate's own reader takes whole, the judge the fuzz harness
-            // applies to every fragment.
+            // more bytes of and the crate's own judge takes, the judge the fuzz harness applies
+            // to every fragment.
             let so_far = format!("{{\"k\": {written}");
             assert!(
                 serde_json::from_str::<Value>(&so_far).is_err_and(|error| error.is_eof()),
                 "{text:?}: {so_far:?}"
             );
             assert!(
-                matches!(
-                    PartialJson::default().parse(&so_far, true),
-                    Ok((_, read)) if read == so_far.len()
-                ),
+                Prefix::default().feed(&so_far).is_none(),
                 "{text:?}: {so_far:?}"
             );
         }

@@ -38,7 +38,7 @@ use serde_json::json as value;
 use symphony::{
     format::CallId,
     formats::{self, Table},
-    json::PartialJson,
+    json::Prefix,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
         ValueParser,
@@ -1404,6 +1404,14 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
      <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
      <|open|>call tool=\"f\" index=\"1\"<|sep|>\
      <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"\\u1\"=",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"\\u1\"",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[\"\\u1\"]",
 ];
 
 /// The plain table: prose of every shape, the other families' markers as prose, and nothing.
@@ -1461,6 +1469,9 @@ const LFM_OUTPUTS: &[&str] = &[
     // whole at the call's `)` and cut inside it: the fuzz campaign's `json-prefix` class.
     "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]])]<|tool_call_end|>",
     "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    // A value cut right after a `\u` escape short of its digits, which a strict reader reads
+    // past the text's end: the same class.
+    "<|tool_call_start|>[get_weather(days=[\"\\u1\"]",
     "<|tool_call_start|>[get_weather(city='Par",
     "<|tool_call_start|>[get_weather(",
     "<|tool_call_start|>[get_weather(ci",
@@ -1686,6 +1697,9 @@ const GLM_OUTPUTS: &[&str] = &[
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]</arg_value>\
      </tool_call>",
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    // A value cut right after a `\u` escape short of its digits, which a strict reader reads
+    // past the text's end: the same class.
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[\"\\u1\"]",
     "<think></think><tool_call>get_weather<arg_key>q</arg_key><arg_value>計画 🌍 \"q\" \\ \
      </arg_value></tool_call>",
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>three</arg_value>\
@@ -2288,19 +2302,21 @@ fn replay(
 }
 
 /// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader asks
-/// for more bytes rather than refusing one it saw. The crate's partial parser is no oracle for
-/// that: its prefix mode tolerates what JSON lacks (a trailing comma, a value left out, an escape
-/// JSON lacks), which is what a client's reader refuses once the call ends. It is the oracle for
-/// what it refuses and the strict reader does not, nesting past its bound and the bytes it stops
-/// before (a `\u` escape short of its digits, which the strict reader reads past the text's end),
-/// so the prefix is one both take whole: the judge the fuzz harness applies to every fragment.
+/// for more bytes rather than refusing one it saw, and one the crate's own judge of a JSON prefix
+/// takes too, the judge the fuzz harness applies to every fragment. The strict reader alone is no
+/// oracle: it follows nesting past the bound the crate puts on a call's arguments, and it reads
+/// four bytes of a `\u` escape blindly and asks for more when the text ends under them, so an
+/// escape short of its digits before its string's closing quote (`"\u1"`) passes it, which no
+/// continuation makes JSON. The judge refuses both, the escape from its backslash. The crate's
+/// partial parser is no oracle either: its prefix mode tolerates what JSON lacks (a trailing
+/// comma, a value left out, an escape JSON lacks, the short escape read as unfinished and the
+/// quote as the string's text), which is what a client's reader refuses once the call ends.
 fn strict_json_prefix(text: &str) -> bool {
     let strict = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(_) => true,
         Err(error) => error.is_eof(),
     };
-    strict
-        && matches!(PartialJson::default().parse(text, true), Ok((_, read)) if read == text.len())
+    strict && Prefix::default().feed(text).is_none()
 }
 
 /// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
