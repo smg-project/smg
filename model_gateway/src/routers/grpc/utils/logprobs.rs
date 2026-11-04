@@ -102,15 +102,16 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
 pub(crate) fn convert_generate_output_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> Vec<Vec<Option<f64>>> {
-    proto_logprobs
-        .positions()
-        .map(|position| {
-            vec![
-                Some(f64::from(position.logprob)),
-                Some(f64::from(position.token_id)),
-            ]
-        })
-        .collect()
+    // `positions()` filters, so its size hint is not exact: the outer list is
+    // sized from the position count, as `convert_proto_logprobs` sizes its own.
+    let mut rows = Vec::with_capacity(proto_logprobs.len());
+    rows.extend(proto_logprobs.positions().map(|position| {
+        vec![
+            Some(f64::from(position.logprob)),
+            Some(f64::from(position.token_id)),
+        ]
+    }));
+    rows
 }
 
 /// Convert InputLogProbs to Generate format `Vec<Vec<Option<f64>>>`
