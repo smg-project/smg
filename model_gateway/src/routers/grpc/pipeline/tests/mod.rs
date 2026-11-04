@@ -1599,6 +1599,87 @@ async fn retry_replays_identical_token_ids_from_the_retained_plan() {
     }
 }
 
+/// A request whose first attempt fails retryably and whose retry succeeds
+/// is one routed request with no error, whose duration runs from the
+/// request's start (the backoff included), as the HTTP routers count a
+/// request: the attempts are the retry families' count, not this one's.
+#[test]
+fn a_retried_request_counts_once_with_its_whole_duration_and_no_error() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    let backoff = Duration::from_millis(50);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let port = spawn_stub(GatedScheduler {
+                fail_first: true,
+                ..Default::default()
+            })
+            .await;
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            register_worker(&worker_registry, port, WorkerType::Regular);
+            let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+            let components = components(worker_registry).await;
+            let retry = RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: backoff.as_millis() as u64,
+                max_backoff_ms: backoff.as_millis() as u64,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            };
+            let response = pipeline
+                .execute_completion(
+                    completion_request(false),
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    Some(&retry),
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+        });
+    });
+    let rendered = handle.render();
+    let value = |family: &str| -> Option<f64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{family}{{"))
+                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!(
+                        "endpoint=\"{}\"",
+                        metrics_labels::ENDPOINT_COMPLETIONS
+                    ))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+    };
+    assert_eq!(
+        value("smg_router_requests_total"),
+        Some(1.0),
+        "one request, not one per attempt:\n{rendered}"
+    );
+    assert_eq!(
+        value("smg_router_request_errors_total"),
+        None,
+        "the retried attempt's failure is not the request's answer:\n{rendered}"
+    );
+    assert_eq!(
+        value("smg_router_request_duration_seconds_count"),
+        Some(1.0),
+        "one duration sample:\n{rendered}"
+    );
+    assert!(
+        value("smg_router_request_duration_seconds_sum")
+            .is_some_and(|sum| sum >= backoff.as_secs_f64()),
+        "the duration runs from the request's start, the backoff included:\n{rendered}"
+    );
+}
+
 /// `x-smg-cache-trace: 1` on a request returns that request's decision
 /// record, with the chosen worker, whatever the process switches say.
 #[tokio::test]

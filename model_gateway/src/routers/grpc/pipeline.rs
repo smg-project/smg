@@ -305,8 +305,8 @@ enum RunOutcome {
     /// Early response (streaming SSE) already produced by response processing.
     Early(Response),
     /// Buffered completion: the final response (or responses-iteration state)
-    /// sits on the dispatch context; the Instant is the successful attempt's
-    /// start, for duration metrics.
+    /// sits on the dispatch context; the Instant is the request's start, for
+    /// the duration record.
     Final(Box<DispatchContext>, Instant),
 }
 
@@ -647,9 +647,10 @@ impl RequestPipeline {
             })
     }
 
-    /// Full two-phase run. `metrics_endpoint` enables per-attempt
-    /// router-request/error/duration recording (the responses-internal entry
-    /// points pass `None`, matching their historical behavior); `retry_config`
+    /// Full two-phase run. `metrics_endpoint` enables the request's
+    /// router-request, error and duration records, one each per request as
+    /// the HTTP routers record a route (the responses-internal entry points
+    /// pass `None`: the Responses route records its own); `retry_config`
     /// enables the dispatch-phase retry loop.
     ///
     /// The run is boxed once, here, and the context moves straight into that
@@ -692,7 +693,7 @@ impl RequestPipeline {
         retry_config: Option<&'a RetryConfig>,
     ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
         async move {
-            let mut attempt_start = Instant::now();
+            let start = Instant::now();
             if let Some(endpoint) = metrics_endpoint {
                 self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
@@ -724,13 +725,6 @@ impl RequestPipeline {
             let mut spec = Some(spec);
             let mut attempt: u32 = 0;
             loop {
-                if attempt > 0 {
-                    attempt_start = Instant::now();
-                    if let Some(endpoint) = metrics_endpoint {
-                        self.record_request(endpoint, &dctx.model_id, dctx.streaming);
-                    }
-                }
-
                 let last_attempt = attempt + 1 >= max_attempts;
                 let mut failure = match self
                     .run_attempt(
@@ -745,15 +739,14 @@ impl RequestPipeline {
                 {
                     Ok(Some(response)) => {
                         if let Some(endpoint) = metrics_endpoint {
-                            self.record_duration(endpoint, &dctx.model_id, attempt_start);
+                            self.record_duration(endpoint, &dctx.model_id, start);
                         }
                         return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                     }
-                    Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                    Ok(None) => return Ok(RunOutcome::Final(dctx, start)),
                     Err(response) => response,
                 };
 
-                self.record_error(metrics_endpoint, &dctx.model_id, &failure);
                 if failure.extensions().get::<ReportedRefusal>().is_some() {
                     // The re-selection wrote this refusal's line (rate-limited,
                     // with the pool's state), as for the first selection.
@@ -800,18 +793,20 @@ impl RequestPipeline {
                     );
                 }
 
-                let Some(config) = retry_config else {
-                    return Err(failure);
-                };
-                if !is_retryable_response(&failure) {
-                    return Err(failure);
-                }
-                if last_attempt {
-                    if let Some(endpoint) = metrics_endpoint {
-                        self.record_retries_exhausted(endpoint);
+                // The attempt's failure is the request's answer unless a retry
+                // follows: counted once, here, under its class and reason, as
+                // the HTTP routers count the answer of a route; the attempts
+                // are the retry families' count.
+                let retryable = retry_config.filter(|_| is_retryable_response(&failure));
+                let Some(config) = retryable.filter(|_| !last_attempt) else {
+                    self.record_error(metrics_endpoint, &dctx.model_id, &failure);
+                    if retryable.is_some() {
+                        if let Some(endpoint) = metrics_endpoint {
+                            self.record_retries_exhausted(endpoint);
+                        }
                     }
                     return Err(failure);
-                }
+                };
 
                 // The retry re-selects away from the engines this attempt used,
                 // while another available worker is left to take the request.
@@ -879,7 +874,8 @@ impl RequestPipeline {
     }
 
     /// One router request under this pipeline's labels, the count the
-    /// dashboards read: recorded per attempt here, and by the router for an
+    /// dashboards read: recorded once per request here, at its entry (the
+    /// attempts are the retry families' count), and by the router for an
     /// answer it gives without the pipeline, so that traffic stays visible.
     /// The `model` label is the served model's id, or `other` for a model no
     /// worker serves ([`WorkerRegistry::metric_model_label`]), here and in
