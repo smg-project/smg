@@ -3,10 +3,11 @@
 //! only (`cfg(test)`, or the `test-util` feature the self dev-dependency
 //! turns on for them), never into a production build.
 
-/// A test's downloads from the model hub: the test harness's module, compiled
-/// here as well so the crate's unit tests fetch as its integration binaries
-/// do (the harness depends on this crate and is not linked into its unit
-/// tests).
+/// A test's downloads from the model hub. The file sits in the test harness's
+/// source tree but is compiled only here, so the crate's unit tests fetch as
+/// its integration binaries do (the harness depends on this crate and is not
+/// linked into its unit tests); the harness re-exports this module, so a
+/// binary linking both has one module and one download lock.
 #[path = "../test_harness/src/hub_fetch.rs"]
 pub mod hub_fetch;
 
