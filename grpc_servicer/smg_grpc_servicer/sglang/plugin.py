@@ -83,9 +83,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
         action=_ServicerImplAction,
         on_add=_state.forget_parse,
         help=(
-            "Which implementation serves the gRPC contract under --grpc-mode: the Python "
-            "servicer (default) or the Rust one (smg.servicer.SglangGrpcServer, with the "
-            f"scheduler headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            "Which implementation serves the gRPC contract under --grpc-mode: the Rust "
+            "servicer (default; smg.servicer.SglangGrpcServer, with the scheduler headless) "
+            f"or the deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust."
         ),
     )
 

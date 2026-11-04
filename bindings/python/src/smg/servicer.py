@@ -21,20 +21,23 @@ Python processors are chosen: a ``media_processor`` object
 runs smg's own media pipeline inside the server with no Python on the path.
 
 The launcher that does all of that is ``serve_rust`` in
-``smg_grpc_servicer.vllm.rust``, reached by setting
-``SMG_VLLM_SERVICER_IMPL=rust`` on upstream vLLM's gRPC entrypoint.
+``smg_grpc_servicer.vllm.rust``, the default of upstream vLLM's gRPC
+entrypoint once this package's plugin is installed
+(``SMG_VLLM_SERVICER_IMPL=python`` selects the deprecated Python servicer).
 
 :class:`TokenSpeedGrpcServer` serves ``tokenspeed.grpc.scheduler.TokenSpeedScheduler``
 over same-host headless TokenSpeed scheduler(s) on their msgpack ZMQ wire, with the
 same lifecycle shape; its launcher is ``serve_rust`` in
-``smg_grpc_servicer.tokenspeed.rust``, reached by setting
-``SMG_TOKENSPEED_SERVICER_IMPL=rust`` on ``python -m smg_grpc_servicer.tokenspeed``.
+``smg_grpc_servicer.tokenspeed.rust``, the default of
+``python -m smg_grpc_servicer.tokenspeed`` (``SMG_TOKENSPEED_SERVICER_IMPL=python``
+selects the deprecated Python servicer).
 
 :class:`TrtllmGrpcServer` serves ``trtllm.TrtllmService`` over a same-host
 TensorRT-LLM engine behind the shim beside its LLM API (the shim dials the
 msgpack ZMQ wire), with the same lifecycle shape; its launcher is ``serve_rust``
 in ``smg_grpc_servicer.trtllm``, reached by setting ``SMG_TRTLLM_SERVICER_IMPL=rust``
-on the engine's gRPC entrypoint.
+on the engine's gRPC entrypoint (the engine's Python servicer stays that
+entrypoint's default).
 """
 
 from smg.smg_rs import (
