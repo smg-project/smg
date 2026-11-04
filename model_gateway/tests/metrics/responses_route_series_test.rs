@@ -196,6 +196,14 @@ async fn a_responses_turn_counts_once_at_the_route_whatever_its_tool_loop_ran() 
             None,
             "an answered turn is no error (stream {stream})"
         );
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_router_requests_total{")
+                    && line.contains(&model)
+                    && line.contains("endpoint=\"chat\"")
+            }),
+            "the iterations count under no endpoint of their own (stream {stream}): {rendered}"
+        );
     }
 
     // A request the route refuses on its own, before any pipeline run.

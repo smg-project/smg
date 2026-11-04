@@ -1136,13 +1136,74 @@ impl RequestPipeline {
         retry_config: Option<&RetryConfig>,
         stream_start: Option<StreamStartupSender>,
     ) -> Response {
-        const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
+        self.execute_chat_under(
+            Some(metrics_labels::ENDPOINT_CHAT),
+            request,
+            headers,
+            model_id,
+            components,
+            tenant_request_meta,
+            rate_limit_cell,
+            retry_config,
+            stream_start,
+        )
+        .await
+    }
+
+    /// One streamed iteration of a `/v1/responses` turn through the chat
+    /// pipeline: [`Self::execute_chat`]'s run under no metrics endpoint, as
+    /// [`Self::execute_chat_for_responses`] runs a collected iteration, so
+    /// the turn counts once at the Responses route and not once per
+    /// iteration under `chat`. Tool-loop iterations are not retried.
+    pub async fn execute_chat_for_responses_streaming(
+        &self,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
+        stream_start: Option<StreamStartupSender>,
+    ) -> Response {
+        self.execute_chat_under(
+            None,
+            request,
+            headers,
+            model_id,
+            components,
+            tenant_request_meta,
+            rate_limit_cell,
+            None,
+            stream_start,
+        )
+        .await
+    }
+
+    /// The chat pipeline under `metrics_endpoint` (`None` for a Responses
+    /// iteration, whose route records the request).
+    #[expect(clippy::too_many_arguments)]
+    async fn execute_chat_under(
+        &self,
+        metrics_endpoint: Option<&'static str>,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
+        stream_start: Option<StreamStartupSender>,
+    ) -> Response {
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
-            self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
+            self.run_signalling(ctx, metrics_endpoint, retry_config, stream_start)
         };
+        // A run that answered with the wrong shape, or none, is an internal
+        // fault: counted under the chat shape it ran as, whatever the
+        // endpoint, so it never goes unseen.
+        let fault_endpoint = metrics_endpoint.unwrap_or(metrics_labels::ENDPOINT_CHAT);
         match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
@@ -1154,7 +1215,9 @@ impl RequestPipeline {
                         Self::recorded_settlement(&dctx.response),
                     )
                     .await;
-                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    if let Some(endpoint) = metrics_endpoint {
+                        self.record_duration(endpoint, &dctx.model_id, start);
+                    }
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
@@ -1162,9 +1225,9 @@ impl RequestPipeline {
                     "Chat",
                     &other,
                     &dctx.model_id,
-                    ENDPOINT,
+                    fault_endpoint,
                 ),
-                None => self.no_response_produced("execute_chat", &dctx.model_id, ENDPOINT),
+                None => self.no_response_produced("execute_chat", &dctx.model_id, fault_endpoint),
             },
             Err(response) => response,
         }

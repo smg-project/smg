@@ -109,15 +109,13 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let reservation = Arc::new(RateLimitCell::new());
     let chat_response = ctx
         .pipeline
-        .execute_chat(
+        .execute_chat_for_responses_streaming(
             chat_request,
             params.headers,
             params.model_id,
             ctx.components.clone(),
             Some(iteration_charge(&params.tenant_request_meta)),
             Some(reservation.clone()),
-            // Tool-loop iterations are not retried.
-            None,
             // No startup barrier: the status is checked below before the
             // stream is forwarded.
             None,
@@ -976,15 +974,13 @@ async fn execute_tool_loop_streaming_internal(
         let reservation = Arc::new(RateLimitCell::new());
         let response = ctx
             .pipeline
-            .execute_chat(
+            .execute_chat_for_responses_streaming(
                 Arc::new(chat_request),
                 params.headers.clone(),
                 params.model_id.clone(),
                 ctx.components.clone(),
                 Some(iteration_charge(&params.tenant_request_meta)),
                 Some(reservation.clone()),
-                // Tool-loop iterations are not retried.
-                None,
                 startup.take(),
             )
             .await;
