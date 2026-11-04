@@ -163,7 +163,8 @@ def selected_json(base, path, model, deadline=None):
                 {
                     key: row[key]
                     for key in ("ready", "healthy_workers", "total_workers")
-                    if key in row and isinstance(row[key], (bool, int))
+                    if key in row
+                    and (type(row[key]) is bool if key == "ready" else type(row[key]) is int)
                 }
                 for row in data.get("models", [])
                 if isinstance(row, dict) and row.get("model") == model
@@ -273,7 +274,9 @@ def ready(observation):
         observation.get("http_status") == 200
         and observation.get("ready") is True
         and any(
-            row.get("ready") is True and row.get("healthy_workers", 0) >= 1
+            row.get("ready") is True
+            and type(row.get("healthy_workers")) is int
+            and row["healthy_workers"] >= 1
             for row in observation.get("models", [])
         )
     )

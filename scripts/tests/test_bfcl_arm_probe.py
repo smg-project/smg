@@ -786,3 +786,95 @@ def test_launcher_rejects_invalid_timeout_before_any_process_start(tmp_path, arm
     assert b"RUN_TIMEOUT" in result.stderr
     assert events == []
     assert not run_dir.exists()
+
+
+def _readiness_with_fake_fetch(monkeypatch, data, status=200):
+    calls = []
+
+    def fake_fetch(base, path, deadline=None):
+        calls.append((base, path, deadline))
+        return {"http_status": status}, json.dumps(data).encode()
+
+    monkeypatch.setattr(probe, "fetch", fake_fetch)
+    selected = probe.selected_json("http://127.0.0.1:1234", "/readiness", MODEL)
+    assert calls == [("http://127.0.0.1:1234", "/readiness", None)]
+    return selected
+
+
+@pytest.mark.parametrize(
+    "shape,value,expected",
+    [
+        pytest.param("value", 1, True, id="int-one"),
+        pytest.param("value", True, False, id="bool-true"),
+        pytest.param("value", False, False, id="bool-false"),
+        pytest.param("missing", None, False, id="missing"),
+        pytest.param("value", None, False, id="none"),
+        pytest.param("value", "1", False, id="string"),
+        pytest.param("value", 1.5, False, id="float"),
+        pytest.param("value", 0, False, id="int-zero"),
+        pytest.param("value", -1, False, id="negative-int"),
+    ],
+)
+def test_readiness_counts_require_real_integers(monkeypatch, shape, value, expected):
+    data = readiness()
+    if shape == "missing":
+        del data["models"][0]["healthy_workers"]
+    else:
+        data["models"][0]["healthy_workers"] = value
+    selected = _readiness_with_fake_fetch(monkeypatch, data)
+    assert probe.ready(selected) is expected
+    if shape == "value" and type(value) is int:
+        assert selected["models"][0]["healthy_workers"] == value
+    else:
+        assert "healthy_workers" not in selected["models"][0]
+
+
+def test_ready_defends_against_direct_noninteger_counts():
+    for value in [True, False, None, "1", 1.5]:
+        selected = {
+            "http_status": 200,
+            "ready": True,
+            "models": [{"ready": True, "healthy_workers": value}],
+        }
+        assert not probe.ready(selected)
+    assert probe.ready(
+        {"http_status": 200, "ready": True, "models": [{"ready": True, "healthy_workers": 1}]}
+    )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        pytest.param(True, True, id="bool-true"),
+        pytest.param(False, False, id="bool-false"),
+        pytest.param(1, False, id="int-one"),
+        pytest.param("true", False, id="string"),
+        pytest.param(None, False, id="none"),
+    ],
+)
+def test_model_ready_marker_requires_a_real_boolean(monkeypatch, value, expected):
+    data = readiness()
+    data["models"][0]["ready"] = value
+    selected = _readiness_with_fake_fetch(monkeypatch, data)
+    assert probe.ready(selected) is expected
+    assert ("ready" in selected["models"][0]) is (type(value) is bool)
+
+
+def test_total_worker_count_retains_only_real_integers(monkeypatch):
+    for value in [True, False, None, "1", 1.5, 0, 1]:
+        data = readiness()
+        data["models"][0]["total_workers"] = value
+        row = _readiness_with_fake_fetch(monkeypatch, data)["models"][0]
+        assert ("total_workers" in row) is (type(value) is int)
+        if type(value) is int:
+            assert row["total_workers"] == value
+
+
+def test_fake_readiness_preserves_http_target_and_gateway_contract(monkeypatch):
+    for data, status, expected in [
+        (readiness(), 200, True),
+        (readiness("other/model"), 200, False),
+        (readiness(), 503, False),
+        ({**readiness(), "status": "not_ready"}, 200, False),
+    ]:
+        assert probe.ready(_readiness_with_fake_fetch(monkeypatch, data, status)) is expected
