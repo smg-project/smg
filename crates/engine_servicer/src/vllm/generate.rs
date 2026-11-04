@@ -16,7 +16,7 @@ use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
     VllmGenerateStream, ZmqEngineClient,
 };
-use futures::{stream::SelectAll, Stream};
+use futures::Stream;
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -26,7 +26,7 @@ use crate::{
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
-    stream::{poll_engine_item, Choice, RequestStream},
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
@@ -331,7 +331,7 @@ async fn submit(
         max_tokens,
         n,
     );
-    let mut choices = SelectAll::new();
+    let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
         let decoder = match &decoder {
