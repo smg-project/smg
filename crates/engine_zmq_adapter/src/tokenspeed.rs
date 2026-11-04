@@ -1103,6 +1103,12 @@ pub(crate) fn translate_sampling_tokenspeed(
         // Proto `0` means unspecified; TokenSpeed expects at least one sample.
         // n>1 is fanned out before translation, so this is always 1 on the wire.
         n: sp.n.max(1),
+        logit_bias: (!sp.logit_bias.is_empty()).then(|| {
+            sp.logit_bias
+                .into_iter()
+                .map(|(token, bias)| (token, f64::from(bias)))
+                .collect()
+        }),
         ..TokenSpeedSamplingParams::default()
     };
     apply_tokenspeed_constraint(&mut params, sp.constraint);
@@ -1297,6 +1303,22 @@ mod tests {
         assert_eq!(first.prompt_tokens, 3);
 
         engine_task.await.unwrap();
+    }
+
+    /// The proto's `logit_bias` map rides the wire as the engine's record
+    /// (token id text to a bias); an empty map rides as `None`.
+    #[test]
+    fn tokenspeed_sampling_forwards_logit_bias() {
+        let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams {
+            logit_bias: [("1".to_string(), -100.0f32), ("2".to_string(), 100.0)].into(),
+            ..Default::default()
+        });
+        let bias = mapped.logit_bias.expect("a bias map");
+        assert_eq!(bias["1"], -100.0);
+        assert_eq!(bias["2"], 100.0);
+        assert_eq!(bias.len(), 2);
+        let none = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams::default());
+        assert!(none.logit_bias.is_none());
     }
 
     #[test]

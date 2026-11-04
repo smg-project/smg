@@ -41,7 +41,9 @@ pub struct CompletionRequest {
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
-    /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
@@ -486,6 +488,25 @@ mod tests {
             "logprobs": logprobs,
             "max_tokens": 1
         })
+    }
+
+    /// `logit_bias` is keyed by token ids and bounded as on the chat route.
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (
+                serde_json::json!({"not-a-token": 1}),
+                "logit_bias_invalid_key",
+            ),
+            (serde_json::json!({"1": 101}), "integer_above_max_value"),
+            (serde_json::json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let request = req(serde_json::json!({"logit_bias": bias}));
+            let errors = request.validate().expect_err(&bias.to_string());
+            assert_eq!(errors.field_errors()["logit_bias"][0].code, code, "{bias}");
+        }
+        let good = req(serde_json::json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+        assert!(good.validate().is_ok());
     }
 
     /// `logprobs` takes up to 20 alternatives, the bound of chat's

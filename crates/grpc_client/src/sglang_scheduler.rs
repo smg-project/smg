@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
-        FormatSetAside, OutputConstraint, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
+        stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
@@ -366,6 +366,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
@@ -636,6 +637,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint,
             ..Default::default()
         })
@@ -799,6 +801,38 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.n, 1);
         assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    /// A chat or completion request's `logit_bias` reaches the proto keyed by
+    /// the token id's text; a request without one sends an empty map.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_logit_bias() {
+        let bias = json!({"1": -100, "2": 100});
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": bias
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias["2"], 100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "logit_bias": bias
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let plain: CompletionRequest =
+            serde_json::from_value(json!({"model": "m", "prompt": "hi"})).expect("a request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
+            .expect("build sampling params");
+        assert!(params.logit_bias.is_empty());
     }
 
     #[test]

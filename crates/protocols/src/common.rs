@@ -307,6 +307,37 @@ pub(crate) fn on_field(
     error
 }
 
+/// Validates `logit_bias` as the public API bounds it: every key a
+/// non-negative integer token id, every bias within -100..=100 (a bias of
+/// -100 bans the token, 100 forces it). Used by the chat and the completion
+/// request; the engines take the map as validated.
+pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    for (key, bias) in bias {
+        if !key.parse::<i32>().is_ok_and(|id| id >= 0) {
+            return Err(invalid(
+                "logit_bias_invalid_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                     ids"
+                ),
+            ));
+        }
+        let code = match *bias {
+            b if b > 100.0 => "integer_above_max_value",
+            b if b < -100.0 => "integer_below_min_value",
+            _ => continue,
+        };
+        return Err(invalid(
+            code,
+            format!(
+                "Invalid value for 'logit_bias': token '{key}' has bias {bias}; each bias must be \
+                 between -100 and 100."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {

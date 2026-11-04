@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
-        OutputConstraint, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint,
+        stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
@@ -218,6 +218,7 @@ impl VllmEngineClient {
             include_stop_str_in_output: request.no_stop_trim,
             n: request.n.unwrap_or(1),
             logprobs,
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             // Proto seed is i32 (line 48 of generated vllm.grpc.engine.rs);
             // OpenAI request seed is i64. Saturating cast keeps "set" vs
             // "unset" distinction (None stays None — vLLM will pick a random
@@ -472,6 +473,7 @@ impl VllmEngineClient {
             include_stop_str_in_output: request.no_stop_trim,
             n: request.n.unwrap_or(1),
             logprobs,
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request
                 .seed
                 .map(|s| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
@@ -851,6 +853,36 @@ mod tests {
         let huge_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&huge)
             .expect("build sampling params");
         assert_eq!(huge_params.seed, Some(i32::MAX));
+    }
+
+    /// A chat or completion request's `logit_bias` reaches the proto keyed by
+    /// token id; a request without one sends an empty map.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_logit_bias() {
+        let bias: std::collections::HashMap<String, f32> =
+            [("1".to_string(), -100.0), ("2".to_string(), 100.0)].into();
+        let chat = ChatCompletionRequest {
+            logit_bias: Some(bias.clone()),
+            ..Default::default()
+        };
+        let params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.logit_bias, [(1, -100.0), (2, 100.0)].into());
+        let completion = CompletionRequest {
+            logit_bias: Some(bias),
+            ..minimal_completion_request()
+        };
+        let params = VllmEngineClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.logit_bias, [(1, -100.0), (2, 100.0)].into());
+        let params = VllmEngineClient::build_grpc_sampling_params_from_completion(
+            &minimal_completion_request(),
+        )
+        .expect("build sampling params");
+        assert!(params.logit_bias.is_empty());
     }
 
     #[test]
