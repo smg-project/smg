@@ -624,6 +624,12 @@ jobs:
           test "$cohort_status" -eq 0
           test "$provenance_status" -eq 0
 
+      - name: Verify complete Responses business evidence
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success' && steps.e2e_tests.outcome != 'skipped'
+        env:
+          RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
+        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json scripts/ci_responses_required_cap5.json
+
       - name: Upload AMD SGLang complete test and final-environment evidence
         id: upload-complete-evidence
         if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
@@ -633,12 +639,6 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: error
-
-      - name: Verify complete Responses business evidence
-        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success' && steps.e2e_tests.outcome != 'skipped'
-        env:
-          RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
-        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json scripts/ci_responses_required_cap5.json
 
       - name: Upload Responses evidence
         if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'

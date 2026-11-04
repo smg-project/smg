@@ -231,3 +231,24 @@ def test_services_and_always_verifier_keep_unique_evidence_contract():
     assert names.index("Validate AMD Responses configuration") < names.index(
         "Setup AMD SGLang in its fixed ROCm image"
     )
+
+
+def test_complete_upload_includes_responses_verdict_even_when_verification_fails():
+    names = list(STEPS)
+    assert names.index("Run E2E tests") < names.index("Verify complete Responses business evidence")
+    assert names.index("Verify complete Responses business evidence") < names.index(
+        "Upload AMD SGLang complete test and final-environment evidence"
+    )
+    verify = STEPS["Verify complete Responses business evidence"]
+    upload = STEPS["Upload AMD SGLang complete test and final-environment evidence"]
+    assert verify["if"].startswith("always() && inputs.responses_evidence")
+    assert upload["if"] == (
+        "always() && inputs.final_environment_check && inputs.engine == 'sglang' "
+        "&& inputs.gpu_vendor == 'amd'"
+    )
+    assert upload["id"] == "upload-complete-evidence"
+    assert upload["with"]["path"] == "e2e-logs/"
+    assert (
+        "steps.upload-complete-evidence.outputs.artifact-id != ''"
+        in JOB["outputs"]["complete_evidence_artifact"]
+    )
