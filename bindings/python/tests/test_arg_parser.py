@@ -1849,6 +1849,36 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestHelpGroups:
+    """The launcher's --help lists an option under the heading of what it bounds."""
+
+    @staticmethod
+    def options_by_group() -> dict[str, set[str]]:
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return {
+            group.title: {
+                spelling for action in group._group_actions for spelling in action.option_strings
+            }
+            for group in parser._action_groups
+            if group.title is not None
+        }
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--worker-startup-timeout-secs",
+            "--worker-startup-delay",
+            "--worker-startup-check-interval",
+        ],
+    )
+    def test_the_worker_start_up_bounds_are_worker_configuration_options(self, flag):
+        """They bound every worker's start-up, not a disaggregated deployment's."""
+        groups = self.options_by_group()
+        assert flag in groups["Worker Configuration"], f"{flag} is listed under another heading"
+        assert flag not in groups["PD/EPD Disaggregation"]
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""
