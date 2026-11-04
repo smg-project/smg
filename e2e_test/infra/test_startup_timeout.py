@@ -574,9 +574,13 @@ def test_mooncake_pd2_worker_wait_cannot_inherit_model_or_warmup_headroom(monkey
     ],
 )
 def test_mooncake_pd2_rejects_a_changed_contract_before_resolving_wait(monkeypatch, key, value):
+    if key == ENV_STARTUP_TIMEOUT:
+        with pytest.raises(ValueError, match="would extend"):
+            _mooncake_pd2_profile(monkeypatch, floor=value)
+        return
     config = _mooncake_pd2_profile(monkeypatch)
     if key == "TEST_FILTER":
-        config.option.keyword = value
+        config.option.keyword = value.removeprefix("-k ")
     else:
         monkeypatch.setenv(key, value)
     with pytest.raises(ValueError):
