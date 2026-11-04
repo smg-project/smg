@@ -214,7 +214,7 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
     return contract, unique, fields
 
 
-def test_evidence_exposes_exact_artifact_outputs(tmp_path):
+def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
     document = _document()
     trigger = document.get("on", document.get(True))["workflow_call"]
     job = document["jobs"]["run"]
@@ -242,9 +242,7 @@ def test_evidence_exposes_exact_artifact_outputs(tmp_path):
     assert "${{ steps.evidence-identity.outputs.complete_artifact }}" in uploads
     assert "${{ steps.log-snapshot.outputs.artifact }}" in uploads
     snapshots = [step for step in job["steps"] if step.get("id") == "log-snapshot"]
-    worker_uploads = [
-        step for step in job["steps"] if step.get("id") == "upload-worker-logs"
-    ]
+    worker_uploads = [step for step in job["steps"] if step.get("id") == "upload-worker-logs"]
     assert len(snapshots) == len(worker_uploads) == 1
     assert snapshots[0]["if"] == worker_uploads[0]["if"] == "failure() || cancelled()"
     assert worker_uploads[0]["with"]["name"] == "${{ steps.log-snapshot.outputs.artifact }}"
@@ -338,12 +336,16 @@ def test_evidence_exposes_exact_artifact_outputs(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         legacy = f"e2e-worker-logs-{engine}-gpu1-e2e_test-chat_completions"
+        if engine == "vllm":
+            legacy += "-" + str(inputs["vllm_kv_backend"])
         if vendor == "amd":
             legacy += "-amd"
         expected = identity if scoped else legacy
         assert expected
         assert json.loads(dump_log.read_text()) == [
-            "scripts/ci_dump_worker_logs.sh", "e2e-logs", expected
+            "scripts/ci_dump_worker_logs.sh",
+            "e2e-logs",
+            expected,
         ]
         assert output.read_text() == "artifact=" + expected + "\n"
 
@@ -409,7 +411,7 @@ def test_evidence_attempt_and_source_looking_json_remain_data(tmp_path):
     assert not marker.exists()
 
 
-def test_evidence_identity_retains_opt_in_or_failure_boundary():
+def test_evidence_identity_stays_inside_the_opt_in():
     step = _evidence_step()
     assert step["if"] == (
         "always() && inputs.final_environment_check && inputs.engine == 'sglang' "
