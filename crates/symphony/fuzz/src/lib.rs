@@ -1606,12 +1606,17 @@ mod tests {
             breach_in(Table::Qwen3, events)
         };
         assert_eq!(ended_with("").as_deref(), Some("empty-arguments"));
+        // A shape that closed with a value left out, a trailing comma or an escape JSON lacks
+        // is named at the fragment that brings it, by the judge of every fragment
+        // ([`prefix_breach`]); a scalar cut short passes that judge at every fragment and is
+        // named at the call's end. One name for both, since an allowance is by shape.
         for tolerated in [
             "{\"city\": \"Paris\", \"days\": ,}",
             "{\"a\": 1,}",
+            "\"\\h\"",
             "0e",
             "n",
-            "\"\\h\"",
+            "1.",
         ] {
             assert_eq!(
                 ended_with(tolerated).as_deref(),
@@ -1636,6 +1641,47 @@ mod tests {
         }
         assert!(closed_structure("{\"a\": \"}\"}") && !closed_structure("{\"a\": \"}\""));
         assert!(!closed_structure("}") && !closed_structure("{]") && !closed_structure("  "));
+    }
+
+    /// The judge of every fragment names a refusal by what the partial parser makes of the text,
+    /// so that the scheduled run's allowance of `tolerated-json` hides no `json-prefix`: what
+    /// both refuse is `json-prefix`, what the judge refuses and the parser takes whole is
+    /// `tolerated-json`, at the fragment that brings it, and what the judge takes is no breach.
+    #[test]
+    fn a_fragments_breach_is_named_by_what_the_partial_parser_makes_of_it() {
+        let past_the_bound = format!("{{\"a\": {}", "[".repeat(33));
+        for (so_far, name) in [
+            // Nesting past the bound, and bytes after the closed object: both refuse.
+            (past_the_bound.as_str(), "json-prefix"),
+            ("{\"a\": 1}x", "json-prefix"),
+            // The short escape at a cut, and a trailing comma: the parser tolerates both.
+            ("{\"a\": [\"\\u1\"]", "tolerated-json"),
+            ("{\"a\": [1,]", "tolerated-json"),
+        ] {
+            assert_eq!(prefix_breach(so_far), Some(name), "{so_far:?}");
+            // The same text as the one fragment of a call, on the stream's own path.
+            let events = vec![
+                start(0),
+                arguments(0, so_far, so_far),
+                end(0, "</tool_call>"),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Qwen3, events).as_deref(),
+                Some(name),
+                "{so_far:?}"
+            );
+        }
+        for taken in [
+            "{\"a\": [1,",
+            "{\"a\": \"\\u1",
+            "{\"a\": 1.",
+            "{\"a\": -",
+            "",
+            "  ",
+        ] {
+            assert_eq!(prefix_breach(taken), None, "{taken:?}");
+        }
     }
 
     #[test]
