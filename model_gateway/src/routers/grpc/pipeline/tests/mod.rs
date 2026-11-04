@@ -1,6 +1,7 @@
 mod alias_pipeline;
 mod build_parity;
 mod generate_body;
+mod generate_pretokenized;
 mod glm53;
 mod model_label;
 mod rate_limit_reserve;
@@ -157,14 +158,19 @@ impl GatedScheduler {
     }
 }
 
-fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>> {
+/// The stub's two frames for `request_id`: one token, then the finish, both counting
+/// `prompt_tokens` as the prompt the request carried, as an engine reports it.
+fn generate_frames(
+    request_id: &str,
+    prompt_tokens: u32,
+) -> Vec<Result<ts::GenerateResponse, Status>> {
     use ts::generate_response::Response as GenResp;
     vec![
         Ok(ts::GenerateResponse {
             request_id: request_id.to_string(),
             response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
                 token_ids: vec![100],
-                prompt_tokens: 2,
+                prompt_tokens,
                 completion_tokens: 1,
                 cached_tokens: 0,
                 output_logprobs: None,
@@ -177,7 +183,7 @@ fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>
             response: Some(GenResp::Complete(ts::GenerateComplete {
                 output_ids: vec![100],
                 finish_reason: "stop".to_string(),
-                prompt_tokens: 2,
+                prompt_tokens,
                 completion_tokens: 1,
                 cached_tokens: 0,
                 output_logprobs: None,
@@ -229,10 +235,12 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .map(|t| t.original_text.clone())
                     .unwrap_or_default(),
             );
+        let input_ids = request.tokenized.map(|t| t.input_ids).unwrap_or_default();
+        let prompt_tokens = u32::try_from(input_ids.len()).unwrap_or(u32::MAX);
         self.seen_input_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(request.tokenized.map(|t| t.input_ids).unwrap_or_default());
+            .push(input_ids);
         self.seen_request_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -290,7 +298,10 @@ impl TokenSpeedScheduler for GatedScheduler {
             if let Some(probe) = probe {
                 Self::await_probe(&probe, &released).await;
             }
-            for (index, frame) in generate_frames(&request_id).into_iter().enumerate() {
+            for (index, frame) in generate_frames(&request_id, prompt_tokens)
+                .into_iter()
+                .enumerate()
+            {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
                 }
