@@ -1,0 +1,29 @@
+# Regression gate for `cargo bench -p smg --bench radix_tree_benchmark`, run by
+# .github/workflows/benchmark-radix-tree.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the single-threaded ids of the `benchmark_summary` group the push-to-main job
+# prints: insert and match of the string tree and the token tree, match and store of the chain
+# index, per worker count and size (72 ids, about four minutes a run on one core). The three
+# `*_concurrent_*` ids run on a thread pool and measure the runner's free cores; the kv-index
+# throughput sweeps and the Mooncake replays are not criterion groups and do not fit a pull
+# request's runner: a push to main keeps running all of them.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) /
+# median of the per-run criterion medians over ten pinned runs of one build of main (five "base"
+# and five "pull request" runs of the same binary through this gate), was measured twice on a shared
+# build host whose load ran from 15 to 480 on 192 cores during the runs: the 72 ids spread 11 - 235 %
+# the first time and 14 - 117 % the second (median 32 % and 36 %), numbers that say more about that
+# host than about the benchmark (the tokenizer's ids read 0.8 - 6.7 % on the same host at a lower
+# load). Both null cases at a 10 % threshold passed through the overlap rule (0 failed; 19 of 81 and
+# 3 of 72 suspect). 25 % is provisional: it fails the regressions that matter on this path (a 2 x
+# slower match or insert) and holds under the noise seen; every job uploads bench-gate/results.json
+# with the raw per-run medians of both sides, and the hosted runner's own spread, read from those,
+# is the number to tighten this to.
+
+repeats = 3
+filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
+
+[[gate]]
+pattern = "^benchmark_summary/"
+threshold = 0.25
+note = "provisional: identical build 11 - 235 % and 14 - 117 % on a loaded host; tighten from the runner's results.json"

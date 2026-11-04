@@ -1,0 +1,36 @@
+# Regression gate for `cargo bench -p smg-symphony --bench throughput`, run by
+# .github/workflows/benchmark-symphony.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the rows that need no fixtures: `parse/{whole,pieces8}/<table>` (one turn with a
+# thought, an answer and two calls, fed whole and in pieces of eight bytes), `prose/{whole,pieces8}/
+# <table>` (text with no marker in it, the common streaming case), `setup/{table,engine}/<table>`
+# and `setup/declared` (the parser's per-request construction): 57 ids. The `setup/validate` rows
+# are 17 - 24 ns each, where the spread is the timer's and not the code's, and the `slice` and
+# `adapt` groups read the bellwether tree and run where it is unpacked, not on this runner; a push
+# to main keeps running the whole file at criterion's default times.
+#
+# The gated run shortens criterion's warm-up and measurement time per id (bench_args below): at the
+# defaults (3 s and 5 s) the 57 ids took about nine minutes a run on the hosted runner and six runs
+# overran the 40-minute step; the radix bench sets 0.5 s and 2 s in code and runs its 72 ids there
+# in under four minutes a run.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) /
+# median of the per-run criterion medians over ten pinned runs of one build of main (five "base" and
+# five "pull request" runs of the same binary through this gate), was measured twice on a shared
+# build host whose load ran from 15 to 480 on 192 cores during the runs: the gated ids spread
+# 9 - 59 % the first time and 14 - 76 % the second (median 39 % and 44 %), numbers that say more
+# about that host than about the benchmark (the tokenizer's ids read 0.8 - 6.7 % on the same host
+# at a lower load). Both null cases at a 10 % threshold passed through the overlap rule (0 failed;
+# 12 of 66 and 3 of 57 suspect). 25 % is provisional: it fails the regressions that matter on this
+# path (a 2 x slower parse of a turn) and holds under the noise seen; every job uploads
+# bench-gate/results.json with the raw per-run medians of both sides, and the hosted runner's own
+# spread, read from those, is the number to tighten this to.
+
+repeats = 3
+filter = "^((parse|prose)/|setup/(table|engine)/|setup/declared$)"
+bench_args = ["--warm-up-time", "0.5", "--measurement-time", "2"]
+
+[[gate]]
+pattern = "^(parse|prose|setup)/"
+threshold = 0.25
+note = "provisional: identical build 9 - 59 % and 14 - 76 % on a loaded host; tighten from the runner's results.json"
