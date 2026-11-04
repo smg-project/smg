@@ -141,7 +141,7 @@ def test_actual_run_shell_routes_observer_before_final_capture_exit(
     else:
         assert "scripts.ci_responses_evidence" not in args
         assert observed["evidence"] is None
-        assert junit == (["--junitxml=e2e-logs/sglang-pd.xml"] if final else [])
+        assert junit == (["--junitxml=e2e-logs/sglang-results.xml"] if final else [])
     assert "fixture pytest stdout" in result.stdout
     assert "fixture pytest stderr" in result.stderr
     if final:
