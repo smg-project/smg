@@ -436,10 +436,10 @@ pub(crate) async fn resolve_media(
     };
 
     // The per-request media limits the model's workers advertise for their
-    // engine, which the plan is held to before any fetch.
-    // The limits live for the preparation only, not across the order lookup
-    // after it: this future is boxed once per request and its largest state
-    // is the one that holds the prepared placeholders.
+    // engine, which the plan is held to before any fetch. They live for the
+    // preparation only, not across the order lookup after it: this future is
+    // inlined into the route and stage futures boxed once per request, and its
+    // largest state is the one that holds the prepared placeholders.
     let placeholders = {
         let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
         multimodal::prepare_placeholder_tokens(
