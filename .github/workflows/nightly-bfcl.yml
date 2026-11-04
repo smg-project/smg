@@ -558,6 +558,14 @@ jobs:
               fi
             fi
           }
+          launch_arm() {
+            local arm="$1" gpu="$2" output_var="$3" url rc=0
+            url=$(BFCL_GPU="$gpu" bash scripts/bfcl/launch_arm.sh "$arm" 9>&-) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              return "$rc"
+            fi
+            printf -v "$output_var" '%s' "$url"
+          }
           partial_report() {
             local rc=0
             # Never replace a comparison report already emitted by run_ab.py.
@@ -586,21 +594,25 @@ jobs:
             # Whole node per arm (TP=8), one at a time: each model needs all 8 GPUs
             # for enough KV cache at the larger max_model_len. Score arm A, tear it
             # down to free the GPUs, score arm B, then diff the two saved results.
-            A_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh a 9>&-)
-            echo "arm A (vllm): $A_URL"
-            run_arm_step score-a python scripts/bfcl/run_ab.py --score-arm "vllm=$A_URL" \
-              --scores-out "$ROOT/scores_vllm.json" \
-              --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
-              --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+            run_arm_step launch-a launch_arm a "$GPU_A" A_URL
+            if [ "$AB_RC" -eq 0 ]; then
+              echo "arm A (vllm): $A_URL"
+              run_arm_step score-a python scripts/bfcl/run_ab.py --score-arm "vllm=$A_URL" \
+                --scores-out "$ROOT/scores_vllm.json" \
+                --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
+                --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+            fi
             run_arm_step stop-a bash scripts/bfcl/launch_arm.sh stop 9>&-
             # A hard scoring/stop failure must never fall through to native B.
             if [ "$AB_RC" -eq 0 ]; then
-              B_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh b 9>&-)
-              echo "arm B (smg): $B_URL"
-              run_arm_step score-b python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
-                --scores-out "$ROOT/scores_smg.json" \
-                --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
-                --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+              run_arm_step launch-b launch_arm b "$GPU_A" B_URL
+              if [ "$AB_RC" -eq 0 ]; then
+                echo "arm B (smg): $B_URL"
+                run_arm_step score-b python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
+                  --scores-out "$ROOT/scores_smg.json" \
+                  --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
+                  --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+              fi
               run_arm_step stop-b bash scripts/bfcl/launch_arm.sh stop 9>&-
             fi
             if [ "$AB_RC" -eq 0 ]; then
@@ -613,20 +625,24 @@ jobs:
           else
             # Concurrent: arm A (pure vLLM) on the first GPU half, arm B (SMG ->
             # vLLM gRPC) on the second; ports left unset so launch_arm.sh picks free.
-            A_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh a 9>&-)
-            B_URL=$(BFCL_GPU="$GPU_B" bash scripts/bfcl/launch_arm.sh b 9>&-)
-            echo "arm A: $A_URL   arm B: $B_URL"
-            gate python scripts/bfcl/run_ab.py \
-              --baseline  "vllm=$A_URL" \
-              --candidate "smg=$B_URL" \
-              --bfcl-model "$BFCL_MODEL_FC" \
-              --categories "$CATEGORIES" \
-              --bfcl "$BFCL" \
-              --project-root "$ROOT" \
-              --out "$RUNNER_TEMP/bfcl_ab.md" \
-              --json-out "$RUNNER_TEMP/bfcl_ab.json" \
-              --run-timeout "$RUN_TIMEOUT" \
-              --tolerance 0.02
+            run_arm_step launch-a launch_arm a "$GPU_A" A_URL
+            if [ "$AB_RC" -eq 0 ]; then
+              run_arm_step launch-b launch_arm b "$GPU_B" B_URL
+            fi
+            if [ "$AB_RC" -eq 0 ]; then
+              echo "arm A: $A_URL   arm B: $B_URL"
+              gate python scripts/bfcl/run_ab.py \
+                --baseline  "vllm=$A_URL" \
+                --candidate "smg=$B_URL" \
+                --bfcl-model "$BFCL_MODEL_FC" \
+                --categories "$CATEGORIES" \
+                --bfcl "$BFCL" \
+                --project-root "$ROOT" \
+                --out "$RUNNER_TEMP/bfcl_ab.md" \
+                --json-out "$RUNNER_TEMP/bfcl_ab.json" \
+                --run-timeout "$RUN_TIMEOUT" \
+                --tolerance 0.02
+            fi
           fi
           # Fail only after attempting a fixed-size partial report. Report-write
           # failure cannot erase the original hard arm/stop/comparison status.

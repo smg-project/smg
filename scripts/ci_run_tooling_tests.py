@@ -33,6 +33,7 @@ REGRESSIONS = (
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),
     ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
     ("scripts/bfcl/run_ab.py", "scripts/tests/test_bfcl_run_ab.py"),
+    (".github/workflows/nightly-bfcl.yml", "scripts/tests/test_bfcl_score_caller.py"),
 )
 
 
