@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -9,25 +8,20 @@ use std::{
 use anyhow::Result;
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tonic::{transport::Endpoint, Request};
 use tracing as log;
-
-use crate::transport::limits::MAX_MESSAGE_SIZE;
 
 pub mod gossip {
     #![allow(unused_qualifications, clippy::absolute_paths)]
     #![allow(clippy::trivially_copy_pass_by_ref, clippy::allow_attributes)]
     tonic::include_proto!("mesh.gossip");
 }
-use gossip::{
-    gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping,
-    StateSync,
-};
+use gossip::{gossip_message, NodeState, NodeStatus, Ping, StateSync};
 
 use crate::{
+    dialer::Dialer,
     gossip_controller::GossipController,
     gossip_service::{GossipService, PreparedGossipServer},
-    mtls::{tls_server_name, MTLSConfig, MTLSManager},
+    mtls::{MTLSConfig, MTLSManager},
     partition::PartitionDetector,
 };
 
@@ -54,9 +48,10 @@ pub struct MeshServerHandler {
     /// namespaces (broadcast/targeted) and publish values that reach
     /// peers via the gossip loop.
     mesh_kv: Arc<crate::kv::MeshKV>,
-    /// The node's TLS identity when the mesh has one: the `Leaving`
-    /// broadcast dials the members with it, as the probes do.
-    mtls_manager: Option<Arc<MTLSManager>>,
+    /// The node's dials, shared with the gossip loop: the `Leaving` broadcast
+    /// goes through the channels the probes keep, with the node's TLS
+    /// identity when the mesh has one.
+    dialer: Arc<Dialer>,
 }
 
 impl MeshServerHandler {
@@ -123,7 +118,7 @@ impl MeshServerHandler {
             vec![leaving_node],
             alive_nodes,
             Some(Duration::from_secs(3)),
-            self.mtls_manager.clone(),
+            Arc::clone(&self.dialer),
         )
         .await;
 
@@ -199,6 +194,9 @@ impl MeshServerBuilder {
         let (signal_tx, signal_rx) = watch::channel(false);
         let partition_detector = Arc::new(PartitionDetector::default());
         let mesh_kv = Arc::new(crate::kv::MeshKV::new(self.self_name.clone()));
+        // One dialer for the server, its gossip loop and the handler: every
+        // dial to a peer, from any of them, goes through the same channel.
+        let dialer = Dialer::new(self.mtls_manager.clone());
         (
             MeshServer {
                 state: self.state.clone(),
@@ -208,7 +206,7 @@ impl MeshServerBuilder {
                 init_peer: self.init_peer,
                 signal_rx,
                 partition_detector: Some(partition_detector.clone()),
-                mtls_manager: self.mtls_manager.clone(),
+                dialer: Arc::clone(&dialer),
                 mesh_kv: mesh_kv.clone(),
             },
             MeshServerHandler {
@@ -217,7 +215,7 @@ impl MeshServerBuilder {
                 signal_tx,
                 partition_detector: Some(partition_detector),
                 mesh_kv,
-                mtls_manager: self.mtls_manager.clone(),
+                dialer,
             },
         )
     }
@@ -246,7 +244,9 @@ pub struct MeshServer {
     init_peer: Option<SocketAddr>,
     signal_rx: watch::Receiver<bool>,
     partition_detector: Option<Arc<PartitionDetector>>,
-    mtls_manager: Option<Arc<MTLSManager>>,
+    /// The node's dials, shared by the gossip controller, the service and
+    /// the handler.
+    dialer: Arc<Dialer>,
     /// Node-wide MeshKV handle shared by the gossip controller and service.
     mesh_kv: Arc<crate::kv::MeshKV>,
 }
@@ -268,7 +268,7 @@ impl MeshServer {
             self.advertise_addr,
             &self.self_name,
             self.init_peer,
-            self.mtls_manager.clone(),
+            Arc::clone(&self.dialer),
         )
         .with_mesh_kv(self.mesh_kv.clone())
     }
@@ -332,10 +332,8 @@ impl MeshServer {
         // client-side.
         service = service.with_current_stream_batch(controller.current_stream_batch());
 
-        // Add mTLS support if configured
-        if let Some(mtls_manager) = self.mtls_manager.clone() {
-            service = service.with_mtls_manager(mtls_manager);
-        }
+        // The node's dials, and with them its TLS identity for the listener.
+        service = service.with_dialer(Arc::clone(&self.dialer));
 
         let server = service.prepare(listener).await?;
         Ok(PreparedMeshServer {
@@ -400,14 +398,15 @@ impl PreparedMeshServer {
     }
 }
 
-/// Broadcast node state updates to target nodes, each dialed with the node's
-/// TLS identity when the mesh has one (`mtls_manager`), as the probes are.
+/// Broadcast node state updates to target nodes, each dialed through
+/// `dialer` (the channel the probes keep to it, with the node's TLS identity
+/// when the mesh has one).
 /// Returns (success_count, total_count)
-pub async fn broadcast_node_states(
+pub(crate) async fn broadcast_node_states(
     nodes_to_broadcast: Vec<NodeState>,
     target_nodes: Vec<NodeState>,
     timeout: Option<Duration>,
-    mtls_manager: Option<Arc<MTLSManager>>,
+    dialer: Arc<Dialer>,
 ) -> (usize, usize) {
     if nodes_to_broadcast.is_empty() || target_nodes.is_empty() {
         log::debug!(
@@ -422,7 +421,7 @@ pub async fn broadcast_node_states(
     for target_node in &target_nodes {
         let target_node_clone = target_node.clone();
         let nodes_for_task = nodes_to_broadcast.clone();
-        let mtls_manager = mtls_manager.clone();
+        let dialer = Arc::clone(&dialer);
         #[expect(
             clippy::disallowed_methods,
             reason = "broadcast tasks are collected and awaited via join_all with a timeout immediately below"
@@ -434,7 +433,7 @@ pub async fn broadcast_node_states(
             let ping_payload = gossip_message::Payload::Ping(Ping {
                 state_sync: Some(state_sync),
             });
-            match try_ping(&target_node_clone, Some(ping_payload), mtls_manager).await {
+            match dialer.ping(&target_node_clone, Some(ping_payload)).await {
                 Ok(_) => {
                     log::debug!("Successfully broadcasted to {}", target_node_clone.name);
                     Ok(())
@@ -473,82 +472,6 @@ pub async fn broadcast_node_states(
             (0, target_nodes.len())
         }
     }
-}
-
-pub async fn try_ping(
-    peer_node: &NodeState,
-    payload: Option<gossip_message::Payload>,
-    mtls_manager: Option<Arc<MTLSManager>>,
-) -> Result<NodeUpdate, tonic::Status> {
-    let peer_name = peer_node.name.clone();
-
-    let peer_addr = SocketAddr::from_str(&peer_node.address).map_err(|e| {
-        tonic::Status::invalid_argument(format!(
-            "Invalid address for node {}: {}, {}",
-            peer_name, peer_node.address, e
-        ))
-    })?;
-
-    let connect_url = if mtls_manager.is_some() {
-        format!("https://{peer_addr}")
-    } else {
-        format!("http://{peer_addr}")
-    };
-
-    let mut endpoint = Endpoint::from_shared(connect_url.clone())
-        .map_err(|e| {
-            tonic::Status::invalid_argument(format!(
-                "Invalid endpoint for node {peer_name}: {connect_url}, {e}"
-            ))
-        })?
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10));
-
-    if let Some(mtls_manager) = mtls_manager {
-        mtls_manager.load_client_config().await.map_err(|e| {
-            tonic::Status::unavailable(format!(
-                "Failed to load mTLS client config for {peer_name}: {e}"
-            ))
-        })?;
-
-        let tls_domain = endpoint.uri().host().map_or_else(
-            || peer_name.clone(),
-            |host| tls_server_name(host).to_owned(),
-        );
-        let tls = mtls_manager
-            .client_tls_config(&tls_domain)
-            .await
-            .map_err(|e| {
-                tonic::Status::unavailable(format!(
-                    "Failed to load the mTLS identity for {peer_name}: {e}"
-                ))
-            })?;
-        endpoint = endpoint.tls_config(tls).map_err(|e| {
-            tonic::Status::unavailable(format!(
-                "Failed to configure TLS endpoint for {peer_name}: {e}"
-            ))
-        })?;
-    }
-
-    let channel = endpoint.connect().await.map_err(|e| {
-        log::warn!(
-            "Failed to connect to peer {} {}: {}.",
-            peer_name,
-            peer_addr,
-            e
-        );
-        tonic::Status::unavailable("Failed to connect to peer")
-    })?;
-    let mut client = gossip_client::GossipClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE)
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-
-    let ping_message = GossipMessage { payload };
-    let response = client.ping_server(Request::new(ping_message)).await?;
-
-    Ok(response.into_inner())
 }
 
 #[macro_export]
@@ -595,18 +518,28 @@ mod tests {
 
     use rustls::crypto::ring;
     use tokio::net::TcpListener;
-    use tonic::transport::{
-        server::TcpIncoming, Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
+    use tonic::{
+        transport::{
+            server::TcpIncoming, Certificate, ClientTlsConfig, Endpoint, Identity, Server,
+            ServerTlsConfig,
+        },
+        Request,
     };
     use tracing as log;
     use tracing_subscriber::{
         filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
     };
 
-    use super::{gossip::gossip_server::GossipServer, *};
-    use crate::tests::{
-        mtls_certs::MtlsTestCerts,
-        test_utils::{bind_node, wait_for},
+    use super::{
+        gossip::{gossip_client, gossip_server::GossipServer, GossipMessage, NodeUpdate},
+        *,
+    };
+    use crate::{
+        tests::{
+            mtls_certs::MtlsTestCerts,
+            test_utils::{bind_node, wait_for},
+        },
+        transport::limits::MAX_MESSAGE_SIZE,
     };
 
     static INIT: Once = Once::new();
@@ -649,21 +582,21 @@ mod tests {
         )
         .await;
 
-        let response = try_ping(
-            &NodeState {
-                name: "A".to_string(),
-                address: bind_addr.to_string(),
-                status: NodeStatus::Alive as i32,
-                version: 1,
-                metadata: HashMap::new(),
-            },
-            Some(gossip_message::Payload::Ping(Ping {
-                state_sync: Some(StateSync { nodes: vec![] }),
-            })),
-            None,
-        )
-        .await
-        .unwrap();
+        let response = Dialer::new(None)
+            .ping(
+                &NodeState {
+                    name: "A".to_string(),
+                    address: bind_addr.to_string(),
+                    status: NodeStatus::Alive as i32,
+                    version: 1,
+                    metadata: HashMap::new(),
+                },
+                Some(gossip_message::Payload::Ping(Ping {
+                    state_sync: Some(StateSync { nodes: vec![] }),
+                })),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.address, advertise_addr.to_string());
         handler.shutdown();
@@ -818,7 +751,7 @@ mod tests {
         let _ = ring::default_provider().install_default();
     }
 
-    /// `try_ping` with mTLS on, the way the gossip loop dials a peer.
+    /// A dial with mTLS on, the way the gossip loop dials a peer.
     async fn mtls_ping(
         peer: SocketAddr,
         certs: &MtlsTestCerts,
@@ -830,20 +763,20 @@ mod tests {
             server_key_path: certs.node_key_path.clone(),
             require_client_cert: false,
         });
-        try_ping(
-            &NodeState {
-                name: "peer".to_string(),
-                address: peer.to_string(),
-                status: NodeStatus::Alive as i32,
-                version: 1,
-                metadata: HashMap::new(),
-            },
-            Some(gossip_message::Payload::Ping(Ping {
-                state_sync: Some(StateSync { nodes: vec![] }),
-            })),
-            Some(Arc::new(mtls)),
-        )
-        .await
+        Dialer::new(Some(Arc::new(mtls)))
+            .ping(
+                &NodeState {
+                    name: "peer".to_string(),
+                    address: peer.to_string(),
+                    status: NodeStatus::Alive as i32,
+                    version: 1,
+                    metadata: HashMap::new(),
+                },
+                Some(gossip_message::Payload::Ping(Ping {
+                    state_sync: Some(StateSync { nodes: vec![] }),
+                })),
+            )
+            .await
     }
 
     #[tokio::test]
@@ -1029,7 +962,7 @@ mod tests {
             vec![leaving_b.clone()],
             vec![node_state("A", addr_a)],
             timeout,
-            None,
+            Dialer::new(None),
         )
         .await;
         assert_eq!(
@@ -1047,7 +980,7 @@ mod tests {
             vec![leaving_b],
             vec![node_state("A", addr_a)],
             timeout,
-            Some(Arc::new(MTLSManager::new(mtls_config(&certs)))),
+            Dialer::new(Some(Arc::new(MTLSManager::new(mtls_config(&certs))))),
         )
         .await;
         assert_eq!(
@@ -1107,15 +1040,136 @@ mod tests {
         let foreign = MtlsTestCerts::generate();
         let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
 
-        let result = try_ping(
-            &node_state("A", addr_a),
-            Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
-            Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))),
-        )
-        .await;
+        let result = Dialer::new(Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))))
+            .ping(
+                &node_state("A", addr_a),
+                Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+            )
+            .await;
 
         assert!(result.is_err(), "a foreign CA must be refused: {result:?}");
         handler_a.shutdown();
+    }
+
+    /// A plain mesh node on an ephemeral loopback port, listening.
+    async fn plain_node(name: &str) -> (SocketAddr, MeshServerHandler) {
+        let (listener, addr) = bind_node().await;
+        let handler = mesh_run!(name, listener, addr, None);
+        wait_for(
+            || std::net::TcpStream::connect(addr).is_ok(),
+            Duration::from_secs(5),
+            "mesh listener started",
+        )
+        .await;
+        (addr, handler)
+    }
+
+    fn probe() -> gossip_message::Payload {
+        gossip_message::Payload::Ping(Ping {
+            state_sync: Some(StateSync { nodes: vec![] }),
+        })
+    }
+
+    /// The dialer keeps one channel per peer address: two dials of one
+    /// member share it, another member gets its own, and `retain` drops the
+    /// channels of the addresses it refuses.
+    #[tokio::test]
+    async fn a_dialer_keeps_one_channel_per_peer_address() {
+        init();
+        let (addr_a, handler_a) = plain_node("A").await;
+        let (addr_b, handler_b) = plain_node("B").await;
+        let dialer = Dialer::new(None);
+
+        dialer
+            .ping(&node_state("A", addr_a), Some(probe()))
+            .await
+            .expect("A answers");
+        dialer
+            .ping(&node_state("A", addr_a), Some(probe()))
+            .await
+            .expect("A answers again");
+        assert_eq!(
+            dialer.channel_count(),
+            1,
+            "two dials of one address share one channel"
+        );
+        dialer
+            .ping(&node_state("B", addr_b), Some(probe()))
+            .await
+            .expect("B answers");
+        assert_eq!(
+            dialer.channel_count(),
+            2,
+            "another address gets a channel of its own"
+        );
+
+        dialer.retain(|addr| *addr == addr_a);
+        assert_eq!(
+            dialer.channel_count(),
+            1,
+            "retain drops the channels of the addresses it refuses"
+        );
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// A member that goes away and comes back on its address answers a later
+    /// dial through the channel kept for it: a dial into the gap fails
+    /// instead of hanging, the channel reconnects by itself, and no second
+    /// channel is made for the address.
+    #[tokio::test]
+    async fn a_peer_back_on_its_address_answers_through_the_kept_channel() {
+        init();
+        let (addr, handler) = plain_node("A").await;
+        let dialer = Dialer::new(None);
+        dialer
+            .ping(&node_state("A", addr), Some(probe()))
+            .await
+            .expect("the first life answers");
+
+        handler.shutdown();
+        let listener = {
+            // The address is free once the first life's listener is gone.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        log::debug!("the address is still held: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("the address was never released: {e}"),
+                }
+            }
+        };
+        let in_the_gap = dialer.ping(&node_state("A", addr), Some(probe())).await;
+        assert!(
+            in_the_gap.is_err(),
+            "a dial into the gap answered: {in_the_gap:?}"
+        );
+
+        let handler = mesh_run!("A", listener, addr, None);
+        let mut answer = None;
+        for _ in 0..50 {
+            match dialer.ping(&node_state("A", addr), Some(probe())).await {
+                Ok(update) => {
+                    answer = Some(update);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        assert_eq!(
+            answer.map(|update| update.name).as_deref(),
+            Some("A"),
+            "the second life never answered through the kept channel"
+        );
+        assert_eq!(
+            dialer.channel_count(),
+            1,
+            "no second channel was made for the address"
+        );
+        handler.shutdown();
     }
 
     /// Material the node can read but not use fails the preparation, before
