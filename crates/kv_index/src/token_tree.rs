@@ -189,7 +189,9 @@ struct Node {
     children: DashMap<TokenPageKey, NodeRef, TokenPageHasherBuilder>,
     /// Tenants that own this node with last access timestamps
     tenant_last_access_time: TenantMap<u64>,
-    /// Cached last tenant for fast access (probabilistic update)
+    /// Cached last tenant for fast access: written when a lookup misses it
+    /// (the next lookup of the node takes the fast path), refreshed on one
+    /// touch in sixteen (the write-contention bound).
     last_tenant: ParkingLotRwLock<Option<TenantId>>,
     /// Parent node (Weak to avoid reference cycles). None for root.
     parent: ParkingLotRwLock<Weak<Node>>,
@@ -261,11 +263,20 @@ impl Node {
         }
         drop(guard);
 
-        // Slow path: iterate to find any tenant
-        self.tenant_last_access_time
+        // Slow path: the first tenant in map order, written into the cache so
+        // the next lookup takes the fast path (the string tree populates its
+        // cache on the same miss). The shard walk behind `iter()` allocates
+        // once per shard it enters, so a node that never caches pays it on
+        // every match, and more the later its tenant's shard.
+        let tenant = self
+            .tenant_last_access_time
             .iter()
             .next()
-            .map(|entry| Arc::clone(entry.key()))
+            .map(|entry| Arc::clone(entry.key()))?;
+        if let Some(mut guard) = self.last_tenant.try_write() {
+            *guard = Some(Arc::clone(&tenant));
+        }
+        Some(tenant)
     }
 
     /// Up to [`MATCHED_TENANTS_CAP`] tenants of this node, in map order.
@@ -326,6 +337,7 @@ impl Node {
     /// owns the node. A match never re-attaches an evicted tenant.
     fn touch_any_tenant(&self, ts: u64, track_lfu: bool) -> Option<TenantId> {
         let cached = self.last_tenant.read().clone();
+        let mut missed = false;
         let tenant = cached
             .filter(|tenant| {
                 self.tenant_last_access_time
@@ -334,6 +346,7 @@ impl Node {
                     .is_some()
             })
             .or_else(|| {
+                missed = true;
                 self.tenant_last_access_time
                     .iter_mut()
                     .next()
@@ -345,7 +358,10 @@ impl Node {
         if track_lfu {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
         }
-        if ts & 0xF == 0 {
+        // A miss writes the cache (the next touch takes the fast path instead
+        // of the per-shard walk); a hit refreshes it on one timestamp in
+        // sixteen, the write-contention bound.
+        if missed || ts & 0xF == 0 {
             if let Some(mut guard) = self.last_tenant.try_write() {
                 *guard = Some(Arc::clone(&tenant));
             }
