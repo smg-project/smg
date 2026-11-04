@@ -847,12 +847,15 @@ jobs:
       # carriers (scripts/ci_version_only.py: the manifests' version lines and workspace
       # pins, the lock file's entries for the workspace crates, the Python packages'
       # version fields, the chart, the engine-image workflow's release tag) leaves every
-      # tested code path as the commit it was made on had it. When that commit's own run
-      # of this workflow passed, the lanes on GPU runners (the card tier) are inherited
-      # from it, on a push as on a pull request, and the host rows run as the tier table
-      # says. The commit is the pull request's base, or the tip a push replaced; a manual
-      # run, a new branch and a commit with no passed run keep every lane. release.sh
-      # check reads the same classifier when it takes the parent's run for such a head.
+      # tested code path as the commit it was made on had it. When that commit's own push
+      # or dispatch run of this workflow passed, the lanes on GPU runners (the card tier)
+      # are inherited from it, on a push as on a pull request, and the host rows run as
+      # the tier table says. A pull request's run stands for nothing: it can pass with the
+      # card lanes skipped (the docs-only shortcut); a push or dispatch run keeps every
+      # lane, or inherits it by this very rule one commit earlier. The commit is the pull
+      # request's base, or the tip a push replaced; a manual run, a new branch and a
+      # commit with no such run keep every lane. release.sh check reads the same
+      # classifier when it takes the parent's run for such a head.
       - name: Classify a version-only change
         id: version-only
         env:
@@ -871,13 +874,15 @@ jobs:
           elif ! git fetch --quiet --depth=1 origin "$BASE"; then
             echo "cannot fetch $BASE: every lane"
           elif python3 scripts/ci_version_only.py "$BASE" HEAD; then
+            # the newest passed run of the base outside a pull request: a pull request's run can
+            # pass with the card lanes skipped, a push or dispatch run never does
             run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-rust.yml/runs?head_sha=$BASE&per_page=20" \
-                    --jq '[.workflow_runs[] | select(.conclusion == "success")][0].html_url // empty' 2>/dev/null || true)
+                    --jq '[.workflow_runs[] | select(.conclusion == "success" and .event != "pull_request")][0].html_url // empty' 2>/dev/null || true)
             if [ -n "$run" ]; then
               from=$BASE
               echo "card tier inherited from $BASE ($run)" | tee -a "$GITHUB_STEP_SUMMARY"
             else
-              echo "version-only on $BASE, which has no passed run of this workflow: every lane"
+              echo "version-only on $BASE, which has no passed push or dispatch run of this workflow: every lane"
             fi
           fi
           echo "card-tier-from=$from" >> "$GITHUB_OUTPUT"

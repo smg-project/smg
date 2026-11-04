@@ -142,12 +142,16 @@ PY
     printf '%b\n' "${checks:-success a\nsuccess b}" ;;
   "api repos/example/repo/actions/workflows/pr-test-rust.yml/runs?head_sha="*)
     [ -z "${GH_STUB_RUNS_ERROR-}" ] || api_error "$GH_STUB_RUNS_ERROR" 401
-    # one commit's own runs when a test sets GH_STUB_RUNS_<sha> (a version-only head's parent); else GH_STUB_RUNS
+    # one commit's own runs when a test sets GH_STUB_RUNS_<sha> (a version-only head's parent); else GH_STUB_RUNS;
+    # a line is "<conclusion> <url>", with the run's event as a third word when a test gives one: a pull_request
+    # line is dropped when the read selects on the event, as the API would
     sha=${2#*head_sha=}; sha=${sha%%&*}; of_sha="GH_STUB_RUNS_$sha"; runs=${!of_sha-${GH_STUB_RUNS-}}
     case "$runs" in
       none) ;;
       "") echo "success https://example.invalid/runs/1" ;;
-      *) printf '%b\n' "$runs" ;;
+      *) printf '%b\n' "$runs" | while read -r conclusion url event; do
+           [[ "$event" == pull_request && "$4" == *'.event != "pull_request"'* ]] || echo "$conclusion $url"
+         done ;;
     esac ;;
 esac
 """
@@ -2290,8 +2294,8 @@ def test_check_takes_the_parents_run_for_a_head_that_changes_nothing_but_version
 ) -> None:
     """The cut's bump commit changes nothing but version strings on main's tip: the workflow lets it inherit the
     card tier from that commit when its run passed, and the gate reads that run while the head's own host rows are
-    pending or not started. A red on the head, a parent whose run did not pass, or code beside the bump: nothing
-    is inherited."""
+    pending or not started. A red on the head, a parent whose run did not pass or whose only passed run is a
+    pull request's, or code beside the bump: nothing is inherited."""
     repo.cut()
     head = repo.origin_ref("refs/heads/release/1.14")
     assert head is not None
@@ -2363,6 +2367,37 @@ def test_check_takes_the_parents_run_for_a_head_that_changes_nothing_but_version
     assert cancelled.returncode == 1
     assert "[FAIL] CI: 0 green, 0 red, 1 pending" in cancelled.stdout
     assert "[FAIL] PR Test (SMG): no successful run on" in cancelled.stdout
+    # a pull request's run can pass with the card lanes skipped (the docs-only shortcut): the parent's push run
+    # is the one read, whatever the order the API lists them in, and a pull request's run alone covers nothing
+    push = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request"
+            "\\nsuccess https://example.invalid/runs/2 push",
+        },
+    ).stdout
+    assert (
+        f"[ok]   PR Test (SMG): the card tier of {head[:7]} is {parent[:7]}'s successful run"
+        " (https://example.invalid/runs/2)" in push
+    )
+    pull_request = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request",
+        },
+    )
+    assert pull_request.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in pull_request.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in pull_request.stdout
     # code lands on the branch after the bump: that head inherits nothing, whatever the bump's run
     repo.git("switch", "--quiet", "--detach", "origin/release/1.14")
     repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("three");\n}\n')

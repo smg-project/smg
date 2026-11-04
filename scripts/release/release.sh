@@ -1041,16 +1041,17 @@ registry_rows() { # <ref> <branch>: the gate's registry rows for the crates and 
 
 inherited_run() { # <repository slug> <head>: the run that stands for <head>'s card tier when <head> changes nothing but version
   # strings on its parent (scripts/ci_version_only.py, the rule the PR Test workflow applies): the parent's successful PR Test (SMG)
-  # run, as "<parent short sha> <run url>". The head's own checks come from every workflow on its push, so the parent must be
-  # green on every check of its own (none red, none pending), not on that run alone: fails otherwise, as it does when the head
-  # is more than such a change or the parent's run did not pass
+  # run on a push or a dispatch (a pull request's run can pass with the card lanes skipped, the docs-only shortcut; those two
+  # kinds keep every lane, or inherit it by this very rule), as "<parent short sha> <run url>". The head's own checks come from
+  # every workflow on its push, so the parent must be green on every check of its own (none red, none pending), not on that
+  # run alone: fails otherwise, as it does when the head is more than such a change or the parent has no such run
   local parent checks runs url
   parent=$(git rev-parse --verify --quiet "$2^") || return 1
   "$PYTHON" scripts/ci_version_only.py "$parent" "$2" >/dev/null 2>&1 || return 1
   checks=$("$GH" api --paginate "repos/$1/commits/$parent/check-runs?per_page=100" --jq '.check_runs[] | "\(.conclusion // .status) \(.name)"' 2>/dev/null) || return 1
   [ -n "$checks" ] || return 1
   ! grep -qvE '^(success|skipped|neutral) ' <<< "$checks" || return 1
-  runs=$("$GH" api "repos/$1/actions/workflows/pr-test-rust.yml/runs?head_sha=$parent&per_page=20" --jq '.workflow_runs[] | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null) || return 1
+  runs=$("$GH" api "repos/$1/actions/workflows/pr-test-rust.yml/runs?head_sha=$parent&per_page=20" --jq '.workflow_runs[] | select(.event != "pull_request") | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null) || return 1
   url=$(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2)
   [ -n "$url" ] && printf '%s %s\n' "$(git rev-parse --short "$parent")" "$url"
 }

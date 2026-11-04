@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -443,6 +445,53 @@ def test_the_classify_step_keeps_every_lane_under_the_label_or_without_a_base(
     assert fetched.returncode == 0, fetched.stderr
     assert "git called" in fetched.stderr and "gh called" not in fetched.stderr
     assert "cannot fetch" in fetched.stdout and output == "card-tier-from=\n"
+
+
+def test_the_classify_step_takes_a_passed_run_outside_a_pull_request(workflow) -> None:
+    """The run read: the newest passed push or dispatch run of the base. A pull request's run can pass
+    with the card lanes skipped (the docs-only shortcut), so it stands for nothing, whatever its place."""
+    if shutil.which("jq") is None:
+        pytest.skip("the expression is evaluated by jq")
+    _, steps = workflow
+    expression = re.search(r"--jq '([^']+)'", steps["version-only"]["run"])
+    assert expression, "the classify step reads the base's runs with one --jq expression"
+
+    def selected(*runs: tuple[str, str]) -> str:
+        page = {
+            "workflow_runs": [
+                {
+                    "conclusion": conclusion,
+                    "event": event,
+                    "html_url": f"https://example.invalid/runs/{i}",
+                }
+                for i, (conclusion, event) in enumerate(runs, 1)
+            ]
+        }
+        done = subprocess.run(
+            ["jq", "-r", expression.group(1)],
+            input=json.dumps(page),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return done.stdout
+
+    assert selected() == ""
+    assert selected(("success", "pull_request")) == ""
+    assert selected(("failure", "push"), ("cancelled", "workflow_dispatch")) == ""
+    assert (
+        selected(
+            ("success", "pull_request"),
+            ("failure", "push"),
+            ("success", "push"),
+            ("success", "push"),
+        )
+        == "https://example.invalid/runs/3\n"
+    )
+    assert (
+        selected(("success", "pull_request"), ("success", "workflow_dispatch"))
+        == "https://example.invalid/runs/2\n"
+    )
 
 
 def run_lanes_step(script: str, tmp_path: Path, **env: str) -> dict[str, str]:

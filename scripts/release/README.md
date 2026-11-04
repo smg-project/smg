@@ -108,7 +108,8 @@ A candidate or a final is tagged when, on the branch head:
    `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
    `gh workflow run pr-test-rust.yml --ref release/<x.y>`). A bump commit changes nothing but
    version strings (`scripts/ci_version_only.py` is the judge), so the workflow lets it inherit
-   the GPU lanes, the card tier, from the commit it was made on when that commit's run passed,
+   the GPU lanes, the card tier, from the commit it was made on when that commit's push run
+   passed (a pull request's run can pass with the card lanes skipped, so it stands for nothing),
    and its own run covers the host rows alone; `make release-check` then reads the parent's
    run for the card tier while the head's own checks are pending, provided the parent is green
    on every check of its own (none red, none pending) besides that run, and says so;
