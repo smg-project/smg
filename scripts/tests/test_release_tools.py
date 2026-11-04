@@ -137,13 +137,21 @@ PY
     ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
-    printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
+    # one commit's own check runs when a test sets GH_STUB_CHECKS_<sha> (a bump's parent); else GH_STUB_CHECKS
+    sha=${3#*commits/}; sha=${sha%%/*}; of_sha="GH_STUB_CHECKS_$sha"; checks=${!of_sha-${GH_STUB_CHECKS-}}
+    printf '%b\n' "${checks:-success a\nsuccess b}" ;;
   "api repos/example/repo/actions/workflows/pr-test-rust.yml/runs?head_sha="*)
     [ -z "${GH_STUB_RUNS_ERROR-}" ] || api_error "$GH_STUB_RUNS_ERROR" 401
-    case "${GH_STUB_RUNS-}" in
+    # one commit's own runs when a test sets GH_STUB_RUNS_<sha> (a version-only head's parent); else GH_STUB_RUNS;
+    # a line is "<conclusion> <url>", with the run's event as a third word when a test gives one: a pull_request
+    # line is dropped when the read selects on the event, as the API would
+    sha=${2#*head_sha=}; sha=${sha%%&*}; of_sha="GH_STUB_RUNS_$sha"; runs=${!of_sha-${GH_STUB_RUNS-}}
+    case "$runs" in
       none) ;;
       "") echo "success https://example.invalid/runs/1" ;;
-      *) printf '%b\n' "$GH_STUB_RUNS" ;;
+      *) printf '%b\n' "$runs" | while read -r conclusion url event; do
+           [[ "$event" == pull_request && "$4" == *'.event != "pull_request"'* ]] || echo "$conclusion $url"
+         done ;;
     esac ;;
 esac
 """
@@ -374,7 +382,8 @@ class Sandbox:
         self.put(".github/workflows/release-engine-docker.yml", ENGINE_WORKFLOW)
         shutil.copy(ROOT / "Makefile", self.work / "Makefile")
         (self.work / "scripts" / "release").mkdir(parents=True)
-        shutil.copy(ROOT / "scripts" / "check_release_versions.py", self.work / "scripts")
+        for name in ("check_release_versions.py", "ci_version_only.py"):
+            shutil.copy(ROOT / "scripts" / name, self.work / "scripts")
         for name in ("release.sh", "sync_versions.py", "notes.py", "NOTES-TEMPLATE.md"):
             shutil.copy(ROOT / "scripts" / "release" / name, self.work / "scripts" / "release")
         self.put("scripts/release_docker_notes.sh", DOCKER_NOTES_STUB)
@@ -2251,7 +2260,14 @@ def test_check_fails_on_a_version_mismatch_or_red_ci(repo: Sandbox) -> None:
     assert red.returncode == 1
     assert "       red: unit tests" in red.stdout
     assert "[FAIL] CI: 1 green, 1 red, 0 pending" in red.stdout
-    pending = repo.tool("check", "1.14.0-rc.1", check=False, GH_STUB_CHECKS="in_progress build")
+    # the parent's run is pending too: the bump has no card tier to inherit
+    pending = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="in_progress https://example.invalid/runs/2",
+    )
     assert pending.returncode == 1 and "1 pending" in pending.stdout
 
 
@@ -2271,6 +2287,135 @@ def test_check_requires_a_run_of_the_test_matrix_on_the_head(repo: Sandbox) -> N
     )
     assert pending.returncode == 1
     assert "[FAIL] PR Test (SMG): no successful run on" in pending.stdout
+
+
+def test_check_takes_the_parents_run_for_a_head_that_changes_nothing_but_version_strings(
+    repo: Sandbox,
+) -> None:
+    """The cut's bump commit changes nothing but version strings on main's tip: the workflow lets it inherit the
+    card tier from that commit when its run passed, and the gate reads that run while the head's own host rows are
+    pending or not started. A red on the head, a parent whose run did not pass or whose only passed run is a
+    pull request's, or code beside the bump: nothing is inherited."""
+    repo.cut()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert head is not None
+    parent = repo.git("rev-parse", f"{head}^")
+    # the parent: green on every check of its own (the head's checks come from every workflow), its run passed
+    passed = {
+        f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/2",
+        f"GH_STUB_CHECKS_{parent}": "success build\\nsuccess pr-test-mlx\\nskipped e2e (mock)",
+    }
+    out = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        GH_STUB_CHECKS="in_progress build\\nsuccess lint",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **passed,
+    ).stdout
+    assert (
+        f"[ok]   CI: 1 green, 1 pending on {head[:7]}: the head changes nothing but version strings on"
+        f" {parent[:7]}, green on every check, whose PR Test (SMG) run passed (https://example.invalid/runs/2)"
+        in out
+    )
+    assert (
+        f"[ok]   PR Test (SMG): the card tier of {head[:7]} is {parent[:7]}'s successful run"
+        " (https://example.invalid/runs/2)" in out
+    )
+    assert "the head's own run (queued https://example.invalid/runs/3) is expected to end" in out
+    assert out.rstrip().endswith("the verifier lines are the release owner's.")
+    none = repo.tool(
+        "check", "1.14.0-rc.1", GH_STUB_CHECKS="queued build", GH_STUB_RUNS="none", **passed
+    )
+    assert "the head's own run (not started yet) is expected to end" in none.stdout
+    assert "[FAIL]" not in none.stdout
+    # a parent whose PR Test (SMG) run passed but whose other workflow is red, or still pending, covers nothing:
+    # the same red is queued on the head
+    for parent_checks in (
+        "success build\\nfailure pr-test-mlx",
+        "success build\\nin_progress pr-test-mlx",
+    ):
+        other = repo.tool(
+            "check",
+            "1.14.0-rc.1",
+            check=False,
+            GH_STUB_CHECKS="in_progress build\\nsuccess lint",
+            GH_STUB_RUNS="queued https://example.invalid/runs/3",
+            **{**passed, f"GH_STUB_CHECKS_{parent}": parent_checks},
+        )
+        assert other.returncode == 1, parent_checks
+        assert "[FAIL] CI: 1 green, 0 red, 1 pending" in other.stdout, parent_checks
+        assert "[FAIL] PR Test (SMG): no successful run on" in other.stdout, parent_checks
+    red = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="failure build",
+        GH_STUB_RUNS="failure https://example.invalid/runs/3",
+        **passed,
+    )
+    assert red.returncode == 1
+    assert "[FAIL] CI: 0 green, 1 red, 0 pending" in red.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in red.stdout
+    cancelled = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{**passed, f"GH_STUB_RUNS_{parent}": "cancelled https://example.invalid/runs/2"},
+    )
+    assert cancelled.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in cancelled.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in cancelled.stdout
+    # a pull request's run can pass with the card lanes skipped (the docs-only shortcut): the parent's push run
+    # is the one read, whatever the order the API lists them in, and a pull request's run alone covers nothing
+    push = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request"
+            "\\nsuccess https://example.invalid/runs/2 push",
+        },
+    ).stdout
+    assert (
+        f"[ok]   PR Test (SMG): the card tier of {head[:7]} is {parent[:7]}'s successful run"
+        " (https://example.invalid/runs/2)" in push
+    )
+    pull_request = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request",
+        },
+    )
+    assert pull_request.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in pull_request.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in pull_request.stdout
+    # code lands on the branch after the bump: that head inherits nothing, whatever the bump's run
+    repo.git("switch", "--quiet", "--detach", "origin/release/1.14")
+    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("three");\n}\n')
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "fix(router): three on the branch (#10)")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/release/1.14")
+    repo.git("switch", "--quiet", "main")
+    code = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/4",
+        **{f"GH_STUB_RUNS_{head}": "success https://example.invalid/runs/3"},
+    )
+    assert code.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in code.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in code.stdout
 
 
 def test_check_reads_an_api_error_as_an_error_not_as_a_pending_check(repo: Sandbox) -> None:

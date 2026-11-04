@@ -407,12 +407,6 @@ pub(crate) async fn resolve_media(
     // The tokenizer's registry entry (its id and source) is read for the
     // media paths alone, which need the multimodal components; a gateway
     // without them looks nothing up.
-    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
-        components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
-    });
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -423,7 +417,13 @@ pub(crate) async fn resolve_media(
             "Multimodal content detected but multimodal processing is not available",
         ));
     };
-    let Some(entry) = tokenizer_entry else {
+    // Bound straight from the lookup: a named `Option` moved from here would
+    // keep its slot in this future beside `entry` across both awaits below.
+    let Some(entry) = components
+        .tokenizer_registry
+        .get_by_name(model_id)
+        .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    else {
         error!(
             function = stage,
             model = %model_id,
@@ -436,19 +436,24 @@ pub(crate) async fn resolve_media(
     };
 
     // The per-request media limits the model's workers advertise for their
-    // engine, which the plan is held to before any fetch.
-    let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
-    let placeholders = multimodal::prepare_placeholder_tokens(
-        &plan,
-        model_id,
-        tokenizer,
-        mm_components,
-        &entry.id,
-        &entry.source,
-        &engine_limits,
-        |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
-    )
-    .await
+    // engine, which the plan is held to before any fetch. They live for the
+    // preparation only, not across the order lookup after it: this future is
+    // inlined into the route and stage futures boxed once per request, and its
+    // largest state is the one that holds the prepared placeholders.
+    let placeholders = {
+        let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
+        multimodal::prepare_placeholder_tokens(
+            &plan,
+            model_id,
+            tokenizer,
+            mm_components,
+            &entry.id,
+            &entry.source,
+            &engine_limits,
+            |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
+        )
+        .await
+    }
     .map_err(|e| {
         // The chain, not the outermost context alone: a hub failure's cause
         // (the file, the hub's answer, its address) is answered generically

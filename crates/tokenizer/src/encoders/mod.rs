@@ -58,6 +58,21 @@ pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
     segments.iter().map(|s| s.text.as_str()).collect()
 }
 
+/// Python's truthiness of a JSON value, the test the reference encoders and
+/// the Jinja templates put on an optional field (`if response_format:`):
+/// `null`, `false`, zero and an empty string, array or object are all
+/// nothing.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 /// A renderer's own rule for the thinking mode a request renders with, from
 /// the template kwargs and the request's `thinking` field.
 pub(crate) type ThinkingModeRule = fn(Option<&HashMap<String, Value>>, Option<bool>) -> bool;

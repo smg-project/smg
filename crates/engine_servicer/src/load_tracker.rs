@@ -1,5 +1,5 @@
 //! What a servicer can tell about its engine's load from the requests it
-//! forwards: queued token-work, generation throughput and the prefix-cache
+//! forwards: queued token-work, prefill/generation throughput and the prefix-cache
 //! hit rate, per data-parallel rank. The gateway's expected-wait score reads
 //! them from `GetLoads`; an engine whose stats do not carry them (vLLM
 //! reports running, waiting and KV usage) would otherwise be scored on
@@ -15,6 +15,13 @@
 //!   older ones are the ones in prefill), each prompt discounted by the
 //!   rank's recent hit rate since its own cached count is not known until it
 //!   starts;
+//! - prefill capacity uses actual computed tokens over the union of their
+//!   engine scheduled-to-first-output intervals (not summed request latencies).
+//!   It excludes initial queueing and idle gaps, but is still an observed
+//!   service-rate estimate, not GPU kernel time. At least two valid samples
+//!   are required; up to 64 are retained for 60 seconds. Missing engine timing,
+//!   preemptions, zero-work hits and intervals shorter than 1 ms do not calibrate
+//!   capacity. vLLM must enable `log_stats` to emit the scheduling events;
 //! - generation throughput is the tokens the rank streamed over the last
 //!   [`THROUGHPUT_WINDOW`];
 //! - the hit rate is cached over prompt tokens across the rank's last
@@ -35,14 +42,19 @@ use std::{
 pub(crate) const THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
 /// How many first outputs the hit rate averages over.
 pub(crate) const HIT_RATE_SAMPLES: usize = 64;
+/// Bound the input-capacity estimator independently of cache-hit history.
+const PREFILL_SAMPLES: usize = 64;
+const PREFILL_SAMPLE_TTL: Duration = Duration::from_secs(60);
 
-/// The three fields, as `GetLoads` reports them for one rank.
+/// The estimated fields, as `GetLoads` reports them for one rank.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct LoadEstimate {
     /// Uncached prompt tokens of the requests the rank has not started.
     pub queued_token_work: i32,
     /// Tokens the rank streamed per second over the window.
     pub gen_throughput: f64,
+    /// Actual computed input tokens per active prefill second.
+    pub prefill_throughput: Option<f64>,
     /// Cached over prompt tokens of the rank's recent first outputs, in
     /// `[0, 1]`.
     pub cache_hit_rate: f64,
@@ -65,6 +77,8 @@ struct Rank {
     /// Tokens streamed, by time, within the window.
     generated: VecDeque<(Instant, u64)>,
     generated_sum: u64,
+    /// (observed locally, computed tokens, engine start, engine end).
+    prefills: VecDeque<(Instant, u32, f64, f64)>,
 }
 
 impl Rank {
@@ -76,6 +90,36 @@ impl Rank {
             self.generated.pop_front();
             self.generated_sum -= tokens;
         }
+    }
+
+    /// Estimate active input capacity from a bounded window of completed prefills.
+    fn prefill_throughput(&mut self, now: Instant) -> Option<f64> {
+        // Retain capacity across short idle periods, but never indefinitely.
+        self.prefills
+            .retain(|(at, ..)| now.saturating_duration_since(*at) <= PREFILL_SAMPLE_TTL);
+        if self.prefills.len() < 2 {
+            return None;
+        }
+        let tokens: f64 = self
+            .prefills
+            .iter()
+            .map(|(_, tokens, ..)| f64::from(*tokens))
+            .sum();
+        let mut intervals: Vec<_> = self
+            .prefills
+            .iter()
+            .map(|(_, _, start, end)| (*start, *end))
+            .collect();
+        intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut seconds = 0.0;
+        let mut until = f64::NEG_INFINITY;
+        for (start, end) in intervals {
+            // Union concurrent intervals: each engine second counts once.
+            seconds += (end - start.max(until)).max(0.0);
+            until = until.max(end);
+        }
+        let rate = tokens / seconds;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
     }
 
     fn hit_rate(&self) -> f64 {
@@ -147,6 +191,30 @@ impl LoadTracker {
         }
     }
 
+    /// Record an actual prefill computation, using one engine clock for both
+    /// ends. Zero-work cache hits and invalid timings cannot calibrate capacity.
+    pub(crate) fn prefill_computed(&self, rank: i32, tokens: u32, start: f64, end: f64) {
+        self.prefill_computed_at(rank, tokens, start, end, Instant::now());
+    }
+
+    /// Validate and retain a sample with a local expiry timestamp.
+    fn prefill_computed_at(&self, rank: i32, tokens: u32, start: f64, end: f64, now: Instant) {
+        if tokens == 0
+            || !start.is_finite()
+            || !end.is_finite()
+            || start < 0.0
+            || end - start < 0.001
+        {
+            return;
+        }
+        let mut inner = self.lock();
+        let figures = inner.ranks.entry(rank).or_default();
+        figures.prefills.push_back((now, tokens, start, end));
+        if figures.prefills.len() > PREFILL_SAMPLES {
+            figures.prefills.pop_front();
+        }
+    }
+
     /// `rank` streamed `tokens` to the client at `at` (the instant the
     /// caller already read for its own bookkeeping).
     pub(crate) fn generated_at(&self, rank: i32, tokens: u32, at: Instant) {
@@ -171,6 +239,7 @@ impl LoadTracker {
         self.estimate_at(rank, num_waiting_reqs, Instant::now())
     }
 
+    /// Estimate rank load at a supplied observation time.
     pub(crate) fn estimate_at(
         &self,
         rank: i32,
@@ -178,15 +247,16 @@ impl LoadTracker {
         now: Instant,
     ) -> LoadEstimate {
         let mut inner = self.lock();
-        let (hit_rate, gen_throughput) = match inner.ranks.get_mut(&rank) {
+        let (hit_rate, gen_throughput, prefill_throughput) = match inner.ranks.get_mut(&rank) {
             Some(figures) => {
                 figures.trim(now);
                 (
                     figures.hit_rate(),
                     figures.generated_sum as f64 / THROUGHPUT_WINDOW.as_secs_f64(),
+                    figures.prefill_throughput(now),
                 )
             }
-            None => (0.0, 0.0),
+            None => (0.0, 0.0, None),
         };
         let waiting = usize::try_from(num_waiting_reqs).unwrap_or(0);
         let queued: f64 = inner
@@ -200,6 +270,7 @@ impl LoadTracker {
         LoadEstimate {
             queued_token_work: queued.round().clamp(0.0, f64::from(i32::MAX)) as i32,
             gen_throughput,
+            prefill_throughput,
             cache_hit_rate: hit_rate,
         }
     }
@@ -224,6 +295,60 @@ fn drop_pending(inner: &mut Inner, request_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent intervals count once and capacity expires independently per rank.
+    #[test]
+    fn prefill_capacity_unions_concurrency_preserves_idle_and_expires_per_rank() {
+        let tracker = LoadTracker::default();
+        let now = Instant::now();
+        tracker.prefill_computed_at(0, 1_000, 10.0, 12.0, now);
+        assert_eq!(tracker.estimate_at(0, 0, now).prefill_throughput, None);
+        tracker.prefill_computed_at(0, 2_000, 11.0, 13.0, now);
+        // 3000 computed tokens / 3 active seconds, not 4 summed request seconds.
+        assert_eq!(
+            tracker.estimate_at(0, 0, now).prefill_throughput,
+            Some(1_000.0)
+        );
+        tracker.generated_at(0, 1, now);
+        assert_eq!(tracker.estimate_at(0, 0, now).gen_throughput, 0.5);
+        assert_eq!(
+            tracker
+                .estimate_at(0, 0, now + Duration::from_secs(30))
+                .prefill_throughput,
+            Some(1_000.0)
+        );
+        assert_eq!(tracker.estimate_at(1, 0, now).prefill_throughput, None);
+        assert_eq!(
+            tracker
+                .estimate_at(0, 0, now + Duration::from_secs(61))
+                .prefill_throughput,
+            None
+        );
+    }
+
+    /// Invalid timings and cache-only work cannot train the capacity estimate.
+    #[test]
+    fn prefill_capacity_rejects_cache_hits_and_invalid_samples() {
+        let tracker = LoadTracker::default();
+        let now = Instant::now();
+        for (tokens, start, end) in [
+            (0, 1.0, 2.0),
+            (100, 2.0, 1.0),
+            (100, 1.0, 1.0),
+            (100, f64::NAN, 2.0),
+            (100, 1.0, f64::INFINITY),
+        ] {
+            tracker.prefill_computed_at(0, tokens, start, end, now);
+        }
+        assert_eq!(tracker.estimate_at(0, 0, now).prefill_throughput, None);
+        tracker.prefill_computed_at(0, 1_000, 1.0, 2.0, now);
+        tracker.prefill_computed_at(0, 1_000, 100.0, 101.0, now);
+        // Idle engine time between requests is excluded.
+        assert_eq!(
+            tracker.estimate_at(0, 0, now).prefill_throughput,
+            Some(1_000.0)
+        );
+    }
 
     #[test]
     fn queued_token_work_is_the_youngest_waiting_prompts_discounted_by_the_hit_rate() {

@@ -20,6 +20,13 @@ def _module(name, **attrs):
     return module
 
 
+@pytest.fixture(autouse=True)
+def python_servicer(monkeypatch):
+    """These tests drive the Python servicer's start-up: since the Rust servicer
+    became the default, the Python one is an explicit choice."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
+
+
 @pytest.fixture
 def server_mod(monkeypatch):
     """Load server.py with lightweight stand-ins for optional runtime deps."""
@@ -695,7 +702,7 @@ def test_request_tracing_initializes_after_the_runtime_context_is_published(
 
     monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     with pytest.raises(RuntimeError, match="stop here"):
         asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
     assert events == ["publish:tokenizer", "tracing", "launch"]
@@ -711,7 +718,7 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     and the same log line."""
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
 
     def serve(configure):
@@ -768,7 +775,7 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     from smg_grpc_servicer import rust_lifecycle
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
     refusal = "no block of 1 consecutive free ports for the KV event publishers"
 

@@ -3,6 +3,7 @@ pub(crate) mod eof;
 mod failure;
 mod generate_bytes;
 mod generate_finish;
+mod generate_tokens;
 mod isolation;
 mod local_stop;
 mod messages_bytes;

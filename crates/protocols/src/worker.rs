@@ -1481,6 +1481,9 @@ pub struct SchedulerLoadSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
+    /// Actual non-cached input tokens per active prefill second; unknown/stale is None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,

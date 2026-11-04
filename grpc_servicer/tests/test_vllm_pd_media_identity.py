@@ -18,6 +18,10 @@ from smg_grpc_proto.generated import common_pb2  # noqa: E402
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer  # noqa: E402
 from vllm.outputs import CompletionOutput, RequestOutput  # noqa: E402
 
+# Every case builds the Python servicer directly: the explicit choice its
+# constructor requires (conftest).
+pytestmark = pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
+
 PREFILL_KV = json.dumps({"do_remote_decode": True, "do_remote_prefill": False})
 
 

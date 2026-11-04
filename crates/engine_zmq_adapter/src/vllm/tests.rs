@@ -1483,3 +1483,85 @@ async fn an_error_or_abort_finish_of_a_constrained_request_keeps_the_engines_own
     }
     engine_task.await.unwrap();
 }
+
+/// Capacity needs engine timing and successful, non-preempted input work;
+/// consuming a sample cannot make a later decode output calibrate it again.
+#[tokio::test]
+async fn prefill_samples_require_timing_and_skip_preemption_and_errors() {
+    use engine_zmq_client::protocol::vllm::{
+        output::{EngineCoreEvent, EngineCoreEventType},
+        stats::PrefillStats,
+    };
+    let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    for (index, (scheduled, preempted, finish, expected)) in [
+        (true, false, None, Some((2, 10.0, 12.0))),
+        (false, false, None, None),
+        (true, true, None, None),
+        (true, false, Some(EngineCoreFinishReason::Abort), None),
+        (true, false, Some(EngineCoreFinishReason::Error), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = vllm::GenerateRequest {
+            request_id: format!("sample-{index}"),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut streams = client.generate_vllm_streams(request).await.unwrap();
+        let stream = &mut streams[0];
+        let mut events = vec![];
+        if scheduled {
+            events.push(EngineCoreEvent {
+                r#type: EngineCoreEventType::Scheduled,
+                timestamp: 10.0,
+            });
+        }
+        if preempted {
+            events.push(EngineCoreEvent {
+                r#type: EngineCoreEventType::Preempted,
+                timestamp: 11.0,
+            });
+        }
+        let response = stream.map_output(EngineCoreOutput {
+            events: Some(events),
+            batch_timestamp: Some(12.0),
+            finish_reason: finish,
+            prefill_stats: Some(PrefillStats {
+                num_prompt_tokens: 3,
+                num_cached_tokens: 1,
+                num_computed_tokens: 2,
+                ..Default::default()
+            }),
+            new_token_ids: vec![10],
+            ..Default::default()
+        });
+        assert_eq!(
+            response.is_err(),
+            finish == Some(EngineCoreFinishReason::Error)
+        );
+        assert_eq!(stream.take_prefill_sample(), expected);
+        assert_eq!(stream.take_prefill_sample(), None);
+        if finish.is_some() {
+            continue;
+        }
+        stream
+            .map_output(EngineCoreOutput {
+                batch_timestamp: Some(13.0),
+                new_token_ids: vec![11],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stream.take_prefill_sample(), None);
+    }
+}
