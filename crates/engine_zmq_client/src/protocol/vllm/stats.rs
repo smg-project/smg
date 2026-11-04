@@ -2,7 +2,8 @@
 // (vllm-project/vllm): protocol/stats.rs.
 
 //! The scheduler statistics an engine piggybacks on every output batch, as far as this client
-//! reads them: the per-rank load signal and the prefill counters.
+//! reads them (the per-rank load signal), and the per-request prefill counters an output carries
+//! when its prefill is newly scheduled.
 
 use serde::{Deserialize, Serialize};
 
