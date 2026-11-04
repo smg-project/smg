@@ -962,6 +962,79 @@ mod tests {
         assert_eq!(param.as_deref(), Some("dependency.nope"));
     }
 
+    /// A Messages content block the gateway cannot read is refused by its
+    /// position and its own reason, which the envelope's `param` and `code`
+    /// follow: the `param` is serde's path, ending in the tag's key or the
+    /// missing field, as the module names fields (the unknown `type` is a
+    /// value, not a shape).
+    #[tokio::test]
+    async fn an_unreadable_messages_block_is_named_by_position() {
+        use crate::messages::CreateMessageRequest;
+
+        let refusal = |body: String| async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let Err(refused) =
+                ValidatedJson::<CreateMessageRequest>::from_request(request, &()).await
+            else {
+                panic!("accepted");
+            };
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+        };
+        let json = refusal(
+            json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(
+            json["error"]["param"], "messages[1].content[0].type",
+            "{json}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `mcp_tool_use`, expected one of `text`, `image`"
+            ),
+            "{message}"
+        );
+        let json = refusal(
+            json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [{"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}]
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(
+            json["error"]["code"], "missing_required_parameter",
+            "{json}"
+        );
+        assert_eq!(
+            json["error"]["param"], "messages[0].content[0].tool_use_id",
+            "{json}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("messages[0].content[0]: missing field `tool_use_id`"),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
     async fn syntax_errors_have_no_param() {
         let (status, json) = reject(r#"{"value": "#).await;
