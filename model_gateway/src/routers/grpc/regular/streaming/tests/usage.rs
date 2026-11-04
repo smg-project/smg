@@ -31,15 +31,12 @@ use super::{
     super::*,
     eof::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
-        mock_worker_endpoint, processor, scripted_stream, trailers_frame, CharacterTokenizer,
+        mock_worker_endpoint, processor, response_processor, scripted_stream, trailers_frame,
+        CharacterTokenizer,
     },
     symphony_chat::assigned_message,
 };
-use crate::{
-    rate_limit::test_support::RecordingBackend,
-    routers::grpc::{pipeline::RequestPipeline, regular::processor::ResponseProcessor},
-    worker::WorkerRegistry,
-};
+use crate::{rate_limit::test_support::RecordingBackend, routers::grpc::pipeline::RequestPipeline};
 
 /// A scripted worker stream and the mock server that owns its connection.
 type Scripted = (ProtoStream, JoinHandle<()>);
@@ -177,19 +174,6 @@ fn dispatch() -> context::DispatchMetadata {
         created: 1,
         weight_version: None,
     }
-}
-
-/// The non-streamed processor with the parsers of [`processor`].
-fn response_processor() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
 }
 
 fn tokenizer() -> Arc<dyn Tokenizer> {

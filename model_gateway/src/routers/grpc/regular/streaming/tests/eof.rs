@@ -819,6 +819,16 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
     Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap())
 }
 
+/// The non-streaming processor with the parsers of [`processor`] (the Qwen3
+/// reasoning parser, no tool parser named).
+pub(crate) fn response_processor() -> ResponseProcessor {
+    unary_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        None,
+        Some("qwen3".to_string()),
+    ))
+}
+
 /// The Messages response spec of a plain text turn: thinking on or off, no
 /// tools, no stops. The streaming tests that want nothing else build theirs here.
 pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
@@ -1162,11 +1172,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         byte_fallback_reasoning_tokenizer(),
         llm_tokenizer::CacheConfig::default(),
     ));
-    let processor = unary_processor(utils::ParserResolver::with_flags(
-        Arc::new(WorkerRegistry::new()),
-        None,
-        Some("qwen3".into()),
-    ));
+    let processor = response_processor();
     for ids in [
         b"<think>ab</think>de"
             .iter()
@@ -1371,7 +1377,7 @@ async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
 
 /// Per choice, the role and finish reason of each of its deltas, in stream
 /// order.
-fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
+pub(crate) fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
     events
         .iter()
         .filter_map(|event| {
@@ -1903,21 +1909,17 @@ async fn chat_unary_logprobs_cover_every_generated_token() {
     let stop = Some(StringOrArray::String("STOP".to_string()));
     let mut decoder =
         utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
-    let (response, _) = unary_processor(utils::ParserResolver::with_flags(
-        Arc::new(WorkerRegistry::new()),
-        None,
-        Some("qwen3".to_string()),
-    ))
-    .process_non_streaming_chat_response(
-        context::ExecutionResult::Single { stream },
-        chat_spec(false),
-        dispatch(),
-        tokenizer,
-        &mut decoder,
-        false,
-    )
-    .await
-    .unwrap_or_else(|response| panic!("{}", response.status()));
+    let (response, _) = response_processor()
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
     let choice = &serde_json::to_value(response).unwrap()["choices"][0];
     assert_eq!(choice["message"]["reasoning_content"], "why");
