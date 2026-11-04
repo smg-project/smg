@@ -1770,4 +1770,137 @@ mod tests {
         assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
         assert_eq!(policy.load_state_for_test("http://b:8000"), (true, 1024, 1));
     }
+
+    /// SplitMix64: the replay's fleet state, the same run to run.
+    fn mix(mut value: u64) -> u64 {
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    /// Worker `worker`'s report for round `round` of the replay: queued
+    /// token-work, running and waiting requests, KV pressure, a live rate
+    /// that is sometimes missing, a second rank on every third worker, and
+    /// the instant it was sampled.
+    fn replay_report(round: u64, worker: u64, sampled_at: Instant) -> WorkerLoadResponse {
+        let draw = |salt: u64| mix(round * 1_000 + worker * 10 + salt);
+        let mut load = one_rank_load(
+            (draw(1) % 8_192) as i32,
+            (draw(2) % 95) as f64 / 100.0,
+            if draw(3) % 4 == 0 {
+                0.0
+            } else {
+                500.0 + (draw(3) % 3_500) as f64
+            },
+        );
+        load.loads[0].num_running_reqs = (draw(4) % 12) as i32;
+        load.loads[0].num_waiting_reqs = (draw(5) % 6) as i32;
+        if worker % 3 == 0 {
+            let mut rank = load.loads[0].clone();
+            rank.dp_rank = 1;
+            rank.num_running_reqs = (draw(6) % 12) as i32;
+            rank.num_waiting_uncached_tokens = (draw(7) % 8_192) as i32;
+            rank.gen_throughput = (draw(8) % 3_000) as f64;
+            load.loads.push(rank);
+            load.dp_rank_count = 2;
+        }
+        load.sampled_at = Some(sampled_at);
+        load
+    }
+
+    /// An instant every later dispatch is strictly after, so a report
+    /// sampled then releases exactly the dispatches made before it.
+    fn instant_before_the_next_dispatch() -> Instant {
+        let at = Instant::now();
+        while Instant::now() <= at {}
+        at
+    }
+
+    /// The pick sequence over a replayed fleet: twelve workers, one of them
+    /// prefill and one that never reports; reports published with explicit
+    /// sample instants between rounds of picks; the router's in-flight
+    /// counts moving with the dispatches and with completions; token counts
+    /// known and unknown; every third pick over every other worker with a
+    /// holder's credit, as cache-aware picks; ties drawn from a seeded
+    /// generator. The sequence was recorded from the scorer that looked each
+    /// candidate up at every step of a decision; the scorer that resolves a
+    /// candidate once must pick the same.
+    #[test]
+    fn the_replayed_fleet_picks_the_recorded_sequence() {
+        const WORKERS: usize = 12;
+        const PREFILL: usize = 3;
+        const DARK: usize = 11;
+        const ROUNDS: u64 = 8;
+        const PICKS_PER_ROUND: usize = 12;
+        const RECORDED: [usize; 96] = [
+            11, 10, 10, 9, 11, 10, 9, 9, 10, 9, 9, 10, 1, 1, 8, 1, 11, 0, 1, 4, 0, 11, 0, 8, 5, 5,
+            2, 5, 2, 2, 5, 10, 2, 5, 2, 8, 0, 4, 8, 9, 7, 4, 5, 9, 2, 8, 5, 2, 4, 10, 4, 10, 4, 4,
+            10, 4, 10, 2, 10, 4, 7, 1, 2, 7, 1, 2, 1, 5, 8, 7, 1, 2, 7, 7, 10, 7, 7, 4, 7, 3, 10,
+            3, 7, 4, 0, 0, 0, 0, 8, 2, 6, 8, 2, 6, 0, 2,
+        ];
+        let policy = LeastLoadPolicy::with_params(0.15, 1024, 2_000.0).with_tie_break_seed(11);
+        let feed = TestFeed::attached_to(&policy);
+        let workers: Vec<Arc<dyn Worker>> = (0..WORKERS)
+            .map(|i| {
+                let role = if i == PREFILL {
+                    WorkerType::Prefill
+                } else {
+                    WorkerType::Regular
+                };
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i:02}:8000"))
+                        .worker_type(role)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let prompt: Vec<u32> = (0..4_096).collect();
+        let every_other: Vec<usize> = (0..WORKERS).step_by(2).collect();
+        let held = |idx: usize| 256 + (idx as u64 * 97) % 2_048;
+        let mut picks = Vec::with_capacity(RECORDED.len());
+        for round in 0..ROUNDS {
+            let sampled_at = instant_before_the_next_dispatch();
+            let reports = (0..WORKERS)
+                .filter(|&i| i != DARK)
+                .map(|i| {
+                    (
+                        workers[i].url().to_string(),
+                        replay_report(round, i as u64, sampled_at),
+                    )
+                })
+                .collect();
+            feed.publish(&reports);
+            for pick in 0..PICKS_PER_ROUND {
+                let draw = mix(round * 100 + pick as u64);
+                let tokens = (draw % 3 != 0).then(|| &prompt[..64 + (draw % 4_000) as usize]);
+                let info = SelectWorkerInfo {
+                    tokens,
+                    ..Default::default()
+                };
+                let chosen = if pick % 3 == 2 {
+                    policy.select_min_expected_wait_credited(
+                        &workers,
+                        &every_other,
+                        &info,
+                        "replay",
+                        Some(&held),
+                    )
+                } else {
+                    policy.select_worker(&workers, &info)
+                }
+                .expect("a healthy pool picks");
+                workers[chosen].increment_load();
+                picks.push(chosen);
+                if pick % 4 == 3 {
+                    // A completion: the request dispatched three picks ago ends.
+                    workers[picks[picks.len() - 4]].decrement_load();
+                }
+            }
+        }
+        assert_eq!(
+            picks, RECORDED,
+            "the replay picked {picks:?}; the recorded sequence is the decision"
+        );
+    }
 }
