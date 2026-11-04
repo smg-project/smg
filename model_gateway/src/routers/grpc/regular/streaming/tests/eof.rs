@@ -734,19 +734,7 @@ async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
 async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
     let (tx, rx) = sse_channel();
-    let spec = MessagesResponseSpec {
-        thinking_requested: false,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    };
+    let spec = messages_spec(false);
     let result = processor(false)
         .process_messages_streaming_chunks(
             stream,
@@ -831,7 +819,9 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
     Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap())
 }
 
-fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
+/// The Messages response spec of a plain text turn: thinking on or off, no
+/// tools, no stops. The streaming tests that want nothing else build theirs here.
+pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -953,7 +943,7 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
                 dispatch(),
                 tokenizer.clone(),
                 (None, None, false, false, true),
-                byte_fallback_messages_spec(false),
+                messages_spec(false),
                 &tx,
                 None,
             )
@@ -999,7 +989,7 @@ async fn byte_fallback_messages_transport_eof_reports_local_stop_with_the_chunk_
                 false,
                 true,
             ),
-            byte_fallback_messages_spec(false),
+            messages_spec(false),
             &tx,
             None,
         )
@@ -1141,7 +1131,7 @@ async fn byte_fallback_messages_complete_counts_held_thinking_tokens() {
             dispatch(),
             byte_fallback_reasoning_tokenizer(),
             (None, None, false, false, true),
-            byte_fallback_messages_spec(true),
+            messages_spec(true),
             &tx,
             None,
         )
@@ -1219,7 +1209,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         let (message, _) = processor
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single { stream },
-                byte_fallback_messages_spec(true),
+                messages_spec(true),
                 dispatch(),
                 tokenizer.clone(),
                 &mut decoder,
@@ -2144,19 +2134,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         }
         let (stream, server) = scripted_stream(responses, "0").await;
         let (tx, rx) = sse_channel();
-        let spec = MessagesResponseSpec {
-            thinking_requested: true,
-            thinking_text_returned: true,
-            reasoning_in_prefill: false,
-            tool_choice: None,
-            has_tools: false,
-            history_tool_calls_count: 0,
-            chat_tools: Vec::new().into(),
-            stop_sequences: None,
-            symphony: None,
-            first_tool_call_only: false,
-            parser_names: None,
-        };
+        let spec = messages_spec(true);
         let result = processor(false)
             .process_messages_streaming_chunks(
                 stream,
@@ -3409,7 +3387,7 @@ async fn messages_stream_cut_keeps_upstream_failure_and_does_not_finish_decoding
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
-            byte_fallback_messages_spec(false),
+            messages_spec(false),
             &tx,
             None,
         )

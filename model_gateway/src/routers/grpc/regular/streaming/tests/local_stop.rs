@@ -41,7 +41,7 @@ use super::{
     super::*,
     eof::{
         chat_spec, chat_text, collect_events, complete, complete_with_prompt, dispatch,
-        gated_stream, processor, scripted_stream, CharacterTokenizer,
+        gated_stream, messages_spec, processor, scripted_stream, CharacterTokenizer,
     },
 };
 use crate::routers::{
@@ -274,23 +274,6 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     assert_eq!(outcome.completion_tokens, 8);
 }
 
-/// A plain Messages spec: text only, no thinking, no tools.
-fn messages_spec() -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: false,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    }
-}
-
 #[tokio::test]
 async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
@@ -302,7 +285,7 @@ async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             stop_string("STOP"),
-            messages_spec(),
+            messages_spec(false),
             &tx,
             None,
         ),
@@ -732,7 +715,7 @@ async fn a_stop_the_engine_ends_the_message_on_is_read_to_the_engines_end() {
             dispatch(),
             Arc::new(CharacterTokenizer::with_eos(vec![u32::from('$')])),
             no_stops(),
-            messages_spec(),
+            messages_spec(false),
             &tx,
             None,
         ),

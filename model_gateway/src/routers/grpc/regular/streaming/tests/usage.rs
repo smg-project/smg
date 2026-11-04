@@ -30,8 +30,8 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use super::{
     super::*,
     eof::{
-        chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
-        processor, scripted_stream, trailers_frame, CharacterTokenizer,
+        chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
+        mock_worker_endpoint, processor, scripted_stream, trailers_frame, CharacterTokenizer,
     },
     symphony_chat::assigned_message,
 };
@@ -371,23 +371,6 @@ async fn non_streamed_generate(
         .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
     responses
-}
-
-/// A Messages request with thinking on or off, no tools.
-fn messages_spec(thinking: bool) -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: thinking,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    }
 }
 
 /// Drive the Messages streaming path over `stream` with a reservation to
