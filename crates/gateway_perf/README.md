@@ -67,6 +67,7 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `tools` | chat with 4 function schemas, 2 earlier tool rounds in the messages | a JSON tool call the gateway parses into `tool_calls` | 500/s |
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
+| `stream_logprobs` (opt-in: name it in `PERF_PATHS`) | the `stream` request with `logprobs: true, top_logprobs: 5` | 128 tokens, one per frame, the sampled logprob and 5 candidates each, `length` | 100/s |
 
 Three streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
 per second near the `stream` path's):

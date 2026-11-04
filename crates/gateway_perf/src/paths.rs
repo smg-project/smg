@@ -64,6 +64,28 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             finish: "length",
             label: "chat stream, 128 deltas of one token",
         },
+        // Not in `DEFAULT_PATHS` (`PERF_PATHS` names it): the stream with the
+        // sampled logprob and five candidates per token, the gateway reading,
+        // converting and decoding six token ids per delta.
+        PathSpec {
+            name: "stream_logprobs",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--logprobs",
+                "5",
+                "--seed",
+                "109",
+            ],
+            answer: words(128),
+            finish: "length",
+            label:
+                "chat stream, 128 deltas of one token, the sampled logprob and 5 candidates each",
+        },
         PathSpec {
             name: "tools",
             rate: 500.0,
@@ -196,18 +218,20 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
 
 /// The scripted answers of one cell: `count` copies, served in order to the next
 /// requests of every worker (the mock worker's shared queue), the text encoded by the
-/// worker with the bed's tokenizer; one token per streamed frame, no pause.
+/// worker with the bed's tokenizer; one token per streamed frame, no pause. A path
+/// whose requests ask for logprobs gets the worker's made-up sampled logprobs, one
+/// per token, and the candidates the worker draws from the answer's own tokens.
 pub fn answers(spec: &PathSpec, count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|_| {
-            json!({
-                "output_text": spec.answer,
-                "finish_reason": spec.finish,
-                "chunk_tokens": 1,
-                "delay_ms": 0,
-            })
-        })
-        .collect()
+    let mut answer = json!({
+        "output_text": spec.answer,
+        "finish_reason": spec.finish,
+        "chunk_tokens": 1,
+        "delay_ms": 0,
+    });
+    if spec.client.contains(&"--logprobs") {
+        answer["logprobs"] = json!("sampled");
+    }
+    (0..count).map(|_| answer.clone()).collect()
 }
 
 /// Repeat i alternates which side goes first (as scripts/bench_gate.py does).
@@ -296,6 +320,27 @@ mod tests {
                 .split_whitespace()
                 .count(),
             8
+        );
+    }
+
+    #[test]
+    fn the_logprobs_stream_is_opt_in_and_its_answers_carry_sampled_logprobs() {
+        let spec = path_named("stream_logprobs").unwrap();
+        assert_eq!(spec.finish, "length");
+        assert!(spec.client.contains(&"--stream"));
+        assert!(spec.client.contains(&"--logprobs"));
+        assert_eq!(spec.answer, path_named("stream").unwrap().answer);
+        assert!(
+            !DEFAULT_PATHS.split(',').any(|p| p == "stream_logprobs"),
+            "opt-in"
+        );
+        let scripted = answers(spec, 2);
+        assert_eq!(scripted.len(), 2);
+        assert_eq!(scripted[0]["logprobs"], json!("sampled"));
+        assert_eq!(
+            answers(path_named("stream").unwrap(), 1)[0].get("logprobs"),
+            None,
+            "the plain stream scripts none"
         );
     }
 

@@ -84,6 +84,10 @@ pub struct Answer {
     /// The sampled token's logprob per output token, sent when the request
     /// asks for logprobs.
     pub logprobs: Option<Vec<f32>>,
+    /// `"logprobs": "sampled"`: the logprobs are made up, one per output id,
+    /// once the ids are known (the encode of a text answer), so a scripted
+    /// text can answer a request that asks for logprobs on a token wire.
+    pub sampled_logprobs: bool,
     /// The pause before every frame but the first.
     pub delay: Duration,
     /// Tokens per frame.
@@ -303,8 +307,13 @@ impl Answer {
         let prompt_tokens = count("prompt_tokens")?
             .map(|n| to_u32("prompt_tokens", n))
             .transpose()?;
+        let mut sampled_logprobs = false;
         let logprobs = match object.get("logprobs") {
             None | Some(Value::Null) => None,
+            Some(Value::String(mode)) if mode == "sampled" => {
+                sampled_logprobs = true;
+                None
+            }
             Some(Value::Array(values)) => {
                 let logprobs = values
                     .iter()
@@ -328,7 +337,11 @@ impl Answer {
                 }
                 Some(logprobs)
             }
-            Some(other) => return Err(format!("logprobs: expected an array, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "logprobs: expected an array or \"sampled\", got {other}"
+                ))
+            }
         };
         let delay = Duration::from_millis(count("delay_ms")?.unwrap_or(0));
         let chunk_tokens = match count("chunk_tokens")? {
@@ -349,6 +362,7 @@ impl Answer {
                 cached_tokens,
                 prompt_tokens,
                 logprobs,
+                sampled_logprobs,
                 delay,
                 chunk_tokens,
             },
@@ -361,6 +375,7 @@ impl Answer {
     /// answer with ids, or without text, is returned as it is.
     pub fn encoded_with(mut self, tokenizer: &dyn Tokenizer) -> Result<Self, String> {
         if !self.output_ids.is_empty() {
+            self.synthesize_logprobs();
             return Ok(self);
         }
         let Some(pieces) = &self.output_text else {
@@ -371,6 +386,7 @@ impl Answer {
             .encode(&text, false)
             .map_err(|e| format!("encoding the scripted text: {e}"))?;
         self.output_ids = encoding.token_ids().to_vec();
+        self.synthesize_logprobs();
         // Per-piece logprobs align with the ids only when the pieces were
         // tokens, which the encode does not promise: an answer that wants
         // logprobs on a token wire gives ids.
@@ -436,6 +452,19 @@ impl Answer {
             self.output_ids.len()
         };
         u32::try_from(units).unwrap_or(u32::MAX)
+    }
+
+    /// The made-up logprobs of a `"logprobs": "sampled"` answer, one per
+    /// output id: eight values from -0.125 to -1.0, repeating, so a top-`k`
+    /// reading finds alternatives among the answer's tokens.
+    fn synthesize_logprobs(&mut self) {
+        if self.sampled_logprobs && self.logprobs.is_none() {
+            self.logprobs = Some(
+                (0..self.output_ids.len())
+                    .map(|i| -0.125 * ((i % 8) as f32 + 1.0))
+                    .collect(),
+            );
+        }
     }
 
     /// The whole output text, for a non-streaming HTTP answer.
@@ -1362,6 +1391,28 @@ mod tests {
             .load(&path)
             .expect_err("a script line is keyed by its prompt, never by a text")
             .contains("needs key or input_ids"));
+    }
+
+    #[test]
+    fn sampled_logprobs_are_made_up_once_the_ids_are_known() {
+        use llm_tokenizer::MockTokenizer;
+        let tokenizer = MockTokenizer::new();
+        let answer = parse(r#"{"output_text": "hello world", "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer;
+        assert_eq!(answer.logprobs, None, "nothing before the encode");
+        let encoded = answer.encoded_with(&tokenizer).expect("encoded");
+        let logprobs = encoded.logprobs.expect("one logprob per id");
+        assert_eq!(logprobs.len(), encoded.output_ids.len());
+        assert!(logprobs.iter().all(|lp| *lp < 0.0));
+        let with_ids = parse(r#"{"output_ids": [4, 5], "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer
+            .encoded_with(&tokenizer)
+            .expect("encoded");
+        assert_eq!(with_ids.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(with_ids.token_frames().len(), 2, "one logprob per frame");
+        assert!(parse(r#"{"output_text": "x", "logprobs": "random"}"#).is_err());
     }
 
     #[test]
