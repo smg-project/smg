@@ -23,6 +23,7 @@ REGRESSIONS = (
     (".github/workflows/pr-test-rust.yml", "scripts/tests/test_ci_amd_sglang_callers.py"),
     ("scripts/ci_run_sglang_rocm_units.sh", "scripts/tests/test_ci_sglang_rocm_units.py"),
     ("scripts/ci_verify_sglang_rocm_e2e.py", "scripts/tests/test_ci_sglang_rocm_e2e.py"),
+    (".github/workflows/e2e-gpu-job.yml", "scripts/tests/test_ci_final_environment_scope.py"),
     (".github/workflows/e2e-gpu-job.yml", "scripts/tests/test_ci_e2e_log_pump_lifetime.py"),
     ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
     ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),

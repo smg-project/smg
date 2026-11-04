@@ -702,3 +702,219 @@ def test_real_verifier_reports_changed_sglang_or_torch_before_native_context(
     assert "tilelang" not in leading_diagnostic and "torch-c-dlpack-ext" not in leading_diagnostic
     assert "native dependency versions (TVM, TileLang, DLPack)" not in message
     assert "full cohort observed=" in message and "expected=" in message
+
+
+# Both benchmark job templates install more packages after their initial image
+# setup. Check that the strict cohort verification also runs after that install.
+# These tests inspect Source only: no backend, model or native verifier starts.
+def _nightly_sglang_postinstall_contract(job):
+    import shlex
+
+    steps = job["steps"]
+    checks = [
+        (index, entry)
+        for index, entry in enumerate(steps)
+        if "ci_setup_sglang_rocm_image.sh --verify-only" in entry.get("run", "")
+    ]
+    assert len(checks) == 1, "expected one post-install SGLang cohort check"
+    index, check = checks[0]
+    installs = [
+        position
+        for position, entry in enumerate(steps)
+        if "pip install wheel/*.whl" in entry.get("run", "")
+        and "bash scripts/ci_install_e2e_deps.sh" in entry.get("run", "")
+    ]
+    benchmarks = [
+        position
+        for position, entry in enumerate(steps)
+        if "pytest e2e_test/benchmarks/test_nightly_perf.py" in entry.get("run", "")
+    ]
+    assert len(installs) == len(benchmarks) == 1
+    assert index == installs[0] + 1 and index < benchmarks[0]
+    assert check["if"] == (
+        "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'"
+    )
+    assert check["env"] == {"SMG_SGLANG_ROCM_IMAGE": "${{ matrix.variant.image }}"}
+    assert check["timeout-minutes"] == 2
+    assert check.get("continue-on-error", False) is False
+    commands = [shlex.split(line) for line in check["run"].splitlines() if line.strip()]
+    assert commands == [
+        ["mkdir", "-p", "nightly_gateway_logs"],
+        [
+            "bash",
+            "scripts/ci_setup_sglang_rocm_image.sh",
+            "--verify-only",
+            "nightly_gateway_logs/sglang-native-environment-prepared.json",
+        ],
+    ]
+    return index
+
+
+def _nightly_sglang_benchmark_job(job_id):
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/nightly-benchmark-amd.yml").read_text()
+    )
+    return workflow["jobs"][job_id]
+
+
+@pytest.mark.parametrize("job_id", ["single-worker", "multi-worker"])
+def test_nightly_sglang_postinstall_after_dependencies(job_id):
+    _nightly_sglang_postinstall_contract(_nightly_sglang_benchmark_job(job_id))
+
+
+@pytest.mark.parametrize("job_id", ["single-worker", "multi-worker"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "before_dependencies",
+        "unfiltered",
+        "wrong_runtime",
+        "wrong_image",
+        "continue_on_error",
+        "suppressed_exit",
+        "wrong_report",
+        "duplicate",
+        "unbounded_timeout",
+    ],
+)
+def test_nightly_sglang_postinstall_rejects_broken_wiring(job_id, mutation):
+    import copy
+
+    job = copy.deepcopy(_nightly_sglang_benchmark_job(job_id))
+    index = _nightly_sglang_postinstall_contract(job)
+    check = job["steps"][index]
+    if mutation == "missing":
+        job["steps"].pop(index)
+    elif mutation == "before_dependencies":
+        job["steps"].insert(index - 1, job["steps"].pop(index))
+    elif mutation == "unfiltered":
+        check["if"] = "matrix.variant.runtime == 'sglang'"
+    elif mutation == "wrong_runtime":
+        check["if"] = "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'vllm'"
+    elif mutation == "wrong_image":
+        check["env"]["SMG_SGLANG_ROCM_IMAGE"] = "an-unbound-image"
+    elif mutation == "continue_on_error":
+        check["continue-on-error"] = True
+    elif mutation == "suppressed_exit":
+        check["run"] += " || true"
+    elif mutation == "wrong_report":
+        check["run"] = check["run"].replace(
+            "nightly_gateway_logs/sglang-native-environment-prepared.json", "unretained.json"
+        )
+    elif mutation == "duplicate":
+        job["steps"].insert(index, copy.deepcopy(check))
+    elif mutation == "unbounded_timeout":
+        check["timeout-minutes"] = 1440
+    with pytest.raises(AssertionError):
+        _nightly_sglang_postinstall_contract(job)
+
+
+# The verifier owns the image pin. Exercise real helper parsing with private
+# Source fixtures; these commands never install packages or load native modules.
+def _pin_source_fixture(tmp_path, monkeypatch, declaration, *, missing_file=False):
+    source = tmp_path / "source"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("ci_setup_sglang_rocm_image.sh", "ci_retry.sh"):
+        original = ROOT / "scripts" / name
+        (scripts / name).write_bytes(original.read_bytes())
+    verifier = (ROOT / "scripts/ci_verify_sglang_rocm_cohort.py").read_text()
+    original_pin = 'IMAGE = "' + FIXED_IMAGE + '"'
+    assert verifier.splitlines().count(original_pin) == 1
+    if not missing_file:
+        (scripts / "ci_verify_sglang_rocm_cohort.py").write_text(
+            verifier.replace(original_pin, declaration, 1)
+        )
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", source)
+    return source
+
+
+def _pin_rejects_before_tools(tmp_path, monkeypatch):
+    import shlex
+
+    # If the guard reaches Python or the old dirname subprocess, fail visibly.
+    marker = tmp_path / "unexpected-tool"
+    monkeypatch.setattr(
+        sys.modules[__name__], "FAKE",
+        "from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n"
+        "raise SystemExit(99)\n",
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    for name in ("dirname", "pin_payload"):
+        command = binary / name
+        command.write_text("#!/bin/sh\nprintf unexpected > " + shlex.quote(str(marker)) + "\nexit 99\n")
+        command.chmod(0o755)
+    return marker
+
+
+@pytest.mark.parametrize("requested", ["new-pin", "old-pin"])
+def test_verify_only_follows_the_verifier_image_pin(tmp_path, monkeypatch, requested):
+    new_image = FIXED_IMAGE[:-64] + "a" * 64
+    _pin_source_fixture(tmp_path, monkeypatch, 'IMAGE = "' + new_image + '"')
+    if requested == "old-pin":
+        marker = _pin_rejects_before_tools(tmp_path, monkeypatch)
+    report = tmp_path / "native.json"
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)),
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0",
+                   "SMG_SGLANG_ROCM_IMAGE": new_image if requested == "new-pin" else FIXED_IMAGE},
+    )
+    if requested == "new-pin":
+        assert result.returncode == 0, result.stderr
+        assert calls == [["-m", "pip", "check"]]
+        assert json.loads(report.read_text())["verified"] is True
+        assert not (tmp_path / "github.env").exists()
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "unsupported E2E SGLang image" in result.stderr
+        assert calls == [] and not marker.exists()
+        assert not report.exists() and not (tmp_path / "native.jsonl").exists()
+        assert not (tmp_path / "github.env").exists()
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["missing-file", "missing-pin", "duplicate", "unclosed", "short-digest",
+     "computed", "multiline", "annotated", "source-looking"],
+)
+def test_verify_only_rejects_invalid_authoritative_pin_before_tools(tmp_path, monkeypatch, state):
+    literal = 'IMAGE = "' + FIXED_IMAGE + '"'
+    declaration = {
+        "missing-file": literal,
+        "missing-pin": "# no IMAGE declaration",
+        "duplicate": literal + "\n" + literal,
+        "unclosed": 'IMAGE = "' + FIXED_IMAGE,
+        "short-digest": 'IMAGE = "' + FIXED_IMAGE[:-1] + '"',
+        "computed": literal + ' + ""',
+        "multiline": 'IMAGE = (\n    "' + FIXED_IMAGE + '"\n)',
+        "annotated": literal.replace("IMAGE =", "IMAGE: str ="),
+        "source-looking": 'IMAGE = "$(pin_payload)"',
+    }[state]
+    _pin_source_fixture(tmp_path, monkeypatch, declaration, missing_file=state == "missing-file")
+    marker = _pin_rejects_before_tools(tmp_path, monkeypatch)
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only",),
+        extra_env={"SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
+    )
+    assert result.returncode == 1, result.stderr
+    assert "invalid verifier IMAGE pin" in result.stderr
+    assert calls == [] and not marker.exists()
+    assert not (tmp_path / "native.jsonl").exists()
+    assert not (tmp_path / "github.env").exists()
+
+
+def test_verify_only_accepts_a_single_quoted_authoritative_pin(tmp_path, monkeypatch):
+    _pin_source_fixture(tmp_path, monkeypatch, "IMAGE = '" + FIXED_IMAGE + "'")
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh", arguments=("--verify-only",),
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == [["-m", "pip", "check"]]
+    assert not (tmp_path / "github.env").exists()
