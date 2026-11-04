@@ -1,6 +1,9 @@
 // Adapted from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/dtype.rs and protocol/logprobs/array.rs.
 
+//! Numpy dtype strings on the wire: the model dtype the engine reports, the scalar type and
+//! endianness a field's dtype names, and the decoders of that field's bytes.
+
 use std::io::Cursor;
 
 use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt};
