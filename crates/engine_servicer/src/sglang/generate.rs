@@ -14,7 +14,7 @@ use std::{
 };
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
-use futures::{stream::SelectAll, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
 use tonic::Status;
 
@@ -22,7 +22,7 @@ use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
 use crate::{
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
-    stream::{poll_engine_item, Choice, RequestStream},
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
@@ -139,7 +139,7 @@ pub(super) async fn generate(
         max_tokens,
         n,
     );
-    let mut choices = SelectAll::new();
+    let mut choices = Choices::new();
     for sub in subs {
         choices.push(ChoiceStream {
             request_id: Arc::clone(&request_id),
