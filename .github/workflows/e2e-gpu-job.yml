@@ -229,6 +229,8 @@ jobs:
           grep -Fqx "IMAGE = \"$CHECK_IMAGE\"" scripts/ci_verify_sglang_rocm_cohort.py
           test -s scripts/ci_setup_sglang_rocm_image.sh
           test -s scripts/ci_verify_sglang_rocm_cohort.py
+          test -s scripts/ci_setup_sglang_rocm_e2e.sh
+          test -s scripts/ci_verify_sglang_rocm_e2e.py
 
       # Engine-specific setup
       - name: Setup SGLang backend
@@ -239,7 +241,7 @@ jobs:
         if: inputs.final_environment_check
         env:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
-        run: bash scripts/ci_setup_sglang_rocm_image.sh
+        run: bash scripts/ci_setup_sglang_rocm_e2e.sh
 
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
@@ -296,11 +298,32 @@ jobs:
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
       - name: Run engine-gated servicer unit tests
+        id: engine-units
         if: inputs.servicer_unit_tests
+        env:
+          UNIT_ENGINE: ${{ inputs.engine }}
+          UNIT_VENDOR: ${{ inputs.gpu_vendor }}
+          UNIT_FINAL_ENV: ${{ inputs.final_environment_check }}
+          UNIT_SGLANG_IMAGE: ${{ inputs.container_image }}
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          if [ "$UNIT_VENDOR" = amd ] && [ "$UNIT_ENGINE" = sglang ] && [ "$UNIT_FINAL_ENV" = true ]; then
+            SMG_SGLANG_ROCM_IMAGE="$UNIT_SGLANG_IMAGE" bash scripts/ci_run_sglang_rocm_units.sh
+          else
+            pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          fi
+
+      - name: Upload AMD SGLang unit results
+        if: >-
+          always() && inputs.servicer_unit_tests && inputs.final_environment_check
+          && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+          && steps.engine-units.outputs.artifact != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.engine-units.outputs.artifact }}
+          path: unit-junit/
+          if-no-files-found: ignore
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -321,6 +344,15 @@ jobs:
         env:
           EXTRA_MODELS: ${{ inputs.extra_models }}
         run: bash scripts/ci_download_model.sh $EXTRA_MODELS
+
+      - name: Recheck AMD SGLang cohort before E2E
+        if: inputs.final_environment_check
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          mkdir -p e2e-logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment.json
 
       # Run tests
       - name: Run E2E tests

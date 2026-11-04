@@ -48,6 +48,18 @@ def lane_decisions(path, tmp_path, monkeypatch):
             "chat-completions completions embeddings agentic go-bindings",
         ),
         (
+            "scripts/ci_setup_sglang_rocm_e2e.sh",
+            "chat-completions completions embeddings agentic go-bindings",
+        ),
+        (
+            "scripts/ci_verify_sglang_rocm_e2e.py",
+            "chat-completions completions embeddings agentic go-bindings",
+        ),
+        (
+            "scripts/ci_run_sglang_rocm_units.sh",
+            "chat-completions completions embeddings agentic go-bindings",
+        ),
+        (
             "scripts/ci_setup_vllm_rocm_image.sh",
             "chat-completions completions embeddings realtime",
         ),

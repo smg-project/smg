@@ -985,6 +985,9 @@ jobs:
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
+              ("scripts/ci_setup_sglang_rocm_e2e.sh", SGLANG),
+              ("scripts/ci_verify_sglang_rocm_e2e.py", SGLANG),
+              ("scripts/ci_run_sglang_rocm_units.sh", SGLANG),
               ("scripts/ci_verify_sglang_rocm_cohort.py",          SGLANG),
               ("scripts/ci_setup_vllm_rocm_image.sh",             VLLM + " embeddings"),
               ("scripts/ci_*",                                   FULL),
@@ -2274,8 +2277,37 @@ jobs:
           name: genai-bench-results-go-bindings
           path: benchmark_go_bindings/
 
+  e2e-1gpu-chat-zmq-amd:
+    name: e2e-1gpu-chat-zmq-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_ZMQ == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 48
+      test_dirs: e2e_test/chat_completions
+      connection_mode: zmq
+      min_selected: 209
+      servicer_unit_tests: true
+      final_environment_check: true
+      gpu_vendor: amd
+      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [e2e-1gpu-chat-zmq-amd, detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2336,7 +2368,8 @@ jobs:
           # every e2e lane skips on a pull request (on a push the e2e lanes, the
           # EPD lane included, run on its empty outputs); a skipped job passes this
           # check, so its own result gates here (smg-project/smg-lab#172).
-          if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
+          if [[ "${{ needs.e2e-1gpu-chat-zmq-amd.result }}" =~ $bad || \
+                "${{ needs.detect-changes.result }}" =~ $bad || \
                 "${{ needs.pre-commit.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \
                 "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
