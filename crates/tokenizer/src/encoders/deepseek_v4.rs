@@ -26,7 +26,7 @@ use super::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
         find_last_user_index, merge_tool_messages, push_tools_and_response_format,
         render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, to_json,
-        tool_schemas, DsmlTags, Turn,
+        tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     RendererProfile,
 };
@@ -457,7 +457,7 @@ pub(crate) fn render_messages(
     // thinking, a user turn otherwise.
     let messages = marks::without_marks(messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(&messages);
+    let merged = merge_tool_messages(&messages, IncomingBlocks::Rebuilt);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -997,5 +997,44 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The reference writes the response-format section under `if
+    /// response_format:`, so `null` and `{}` render no section, on a system
+    /// and on a developer message (the engine's own encoder copy renders
+    /// these bytes).
+    #[test]
+    fn a_falsy_response_format_renders_no_section() {
+        for (mode, thinking_token) in [
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+        ] {
+            for falsy in [json!(null), json!({})] {
+                let messages = [
+                    json!({ "role": "system", "content": "You are terse.", "response_format": falsy }),
+                    user("hello"),
+                ];
+                let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "{BOS_TOKEN}You are terse.{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    ),
+                    "{falsy}"
+                );
+            }
+        }
+        let messages = [
+            json!({ "role": "developer", "content": "Answer in one line.", "response_format": null }),
+            user("hello"),
+        ];
+        let out = encode_messages(&messages, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one line.{USER_SP_TOKEN}hello\
+                 {ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
     }
 }
