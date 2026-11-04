@@ -126,7 +126,7 @@ mod tests {
 
     #[async_trait]
     impl RateLimitBackend for CountingBackend {
-        async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+        async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
             ReserveOutcome::Admitted
         }
 

@@ -262,6 +262,11 @@ harness = false
 path = "benches/scheduler_admission.rs"
 
 [[bench]]
+name = "rate_limit_reserve"
+harness = false
+path = "benches/rate_limit_reserve.rs"
+
+[[bench]]
 name = "scheduler_load"
 harness = false
 path = "benches/scheduler_load.rs"

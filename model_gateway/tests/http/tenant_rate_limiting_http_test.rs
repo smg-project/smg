@@ -180,11 +180,18 @@ pub(super) async fn mock_worker() -> MockWorker {
 // The limiter and the router under test.
 // ---------------------------------------------------------------------------
 
+/// What a reservation asked for, kept past the call (the request borrows
+/// its model id).
+struct Reserved {
+    estimated_input_tokens: u32,
+    model_id: Option<String>,
+}
+
 /// A backend that admits every reservation and records every call made to
 /// it: what was reserved, settled, closed unsettled and abandoned.
 #[derive(Default)]
 pub(super) struct RecordingBackend {
-    reserves: Mutex<Vec<ReserveRequest>>,
+    reserves: Mutex<Vec<Reserved>>,
     settlements: Mutex<Vec<UsageSettlement>>,
     closes: AtomicUsize,
     abandons: AtomicUsize,
@@ -235,8 +242,11 @@ impl RecordingBackend {
 
 #[async_trait]
 impl RateLimitBackend for RecordingBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
-        self.reserves.lock().push(request);
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
+        self.reserves.lock().push(Reserved {
+            estimated_input_tokens: request.estimated_input_tokens,
+            model_id: request.model_id.map(str::to_owned),
+        });
         ReserveOutcome::Admitted
     }
 

@@ -152,7 +152,7 @@ impl KeepingBackend {
 
 #[async_trait]
 impl RateLimitBackend for KeepingBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         if !self.seen.lock().insert(request.request_charge_id) {
             return ReserveOutcome::Admitted;
         }
