@@ -1,19 +1,33 @@
 //! The tokenizer SMG serves with, for Python: `llm-tokenizer`'s load, encode
-//! and decode, so that a training pipeline gets the token ids serving feeds
-//! the model.
+//! and decode, and the gateway's own chat rendering, so that a training
+//! pipeline gets the token ids serving feeds the model.
+//!
+//! A chat renders through the functions serving calls, from the request a
+//! client would send to `/v1/chat/completions`: deserialized, normalized and
+//! validated as the HTTP layer does, refused where the gRPC router refuses
+//! it, its tools narrowed by `tool_choice`, rendered (content format,
+//! tool-call arguments, template kwargs, the thinking toggle,
+//! `continue_final_message`), and encoded as the gateway's tokenize step
+//! does: the rendered text without special tokens, or the encode a
+//! segment-aware renderer prepared, which a flat encode of the text does not
+//! reproduce. The request renders under the tokenizer's model id, as the
+//! router renders it under the served model's id: that id selects the
+//! provider profile whose rewrites apply.
 //!
 //! Short work runs on the calling thread with the GIL held. Work that can
 //! reach rayon (loading, batches, long texts) runs on a pool this module
 //! owns, one per process (see [`pool`]), with the GIL released.
 
 use std::{
-    cell::Cell,
-    env, fmt,
+    cell::{Cell, RefCell},
+    env,
+    fmt::{self, Write as _},
+    fs,
     panic::{self, AssertUnwindSafe},
-    path::{self, Path},
+    path::{self, Component, Path},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, PoisonError,
+        Arc, LazyLock, Mutex, PoisonError,
     },
 };
 
@@ -21,7 +35,13 @@ use llm_tokenizer::{
     factory::{create_tokenizer_with_chat_template_blocking, is_likely_openai_model},
     hub::download_tokenizer_from_hf,
     traits::Tokenizer as TokenizerTrait,
-    Encoding, HuggingFaceTokenizer, TiktokenTokenizer,
+    Encoding, HuggingFaceTokenizer, PromptEncoding, TiktokenTokenizer,
+};
+use openai_protocol::{
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::ContentPart,
+    profile::ProviderProfile,
+    validated::Normalizable,
 };
 use pyo3::{
     exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError},
@@ -29,7 +49,23 @@ use pyo3::{
     types::PyDict,
 };
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
-use smg::version;
+use serde_json::Value;
+use smg::{
+    routers::grpc::{
+        is_harmony_card, text_only_output_refusal,
+        utils::{process_chat_messages_with_encoding, request_as_rendered},
+        ProcessedMessages,
+    },
+    version,
+};
+use tracing::{
+    field::{Field, Visit},
+    level_filters::LevelFilter,
+    span,
+    subscriber::Interest,
+    Dispatch, Event, Level, Metadata, Subscriber,
+};
+use validator::Validate;
 
 /// Texts shorter than this encode on the calling thread, with the GIL held.
 /// llm-tokenizer's native encoder splits a text of 64 KiB or more across
@@ -78,7 +114,7 @@ impl From<Failure> for PyErr {
 
 /// `work`, with a panic caught as its failure. pyo3 raises an uncaught panic
 /// as a `PanicException`, which `except Exception` does not catch, so one
-/// text that trips the tokenizer would end a data job; serving fails that
+/// request that trips a renderer would end a data job; serving fails that
 /// request alone, and so does this.
 fn caught<T>(work: impl FnOnce() -> Result<T, Failure>) -> Result<T, Failure> {
     panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|payload| {
@@ -233,6 +269,114 @@ fn in_pool<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, Failure> {
 }
 
 // ---------------------------------------------------------------------------
+// The gateway's warnings during a render
+// ---------------------------------------------------------------------------
+
+/// The warnings the gateway logs while it renders a request (tool-call
+/// `arguments` that are not a JSON object rendered as `{}`, another
+/// provider's message extensions dropped, deprecated fields migrated),
+/// which serving writes to its log and a Python caller would never see:
+/// collected for the render running on the current thread (see
+/// [`captured`]).
+struct WarningCapture;
+
+thread_local! {
+    /// The warnings of the render running on this thread, while one does.
+    static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// One dispatcher for the process: creating one per render would rebuild
+/// every callsite's interest under tracing's global lock each time.
+static WARNINGS: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(WarningCapture));
+
+impl Subscriber for WarningCapture {
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if self.enabled(metadata) {
+            Interest::sometimes()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.is_event() && *metadata.level() <= Level::WARN
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::WARN)
+    }
+
+    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut line = WarningLine::default();
+        event.record(&mut line);
+        CAPTURED.with_borrow_mut(|captured| {
+            if let Some(captured) = captured {
+                captured.push(line.finish());
+            }
+        });
+    }
+
+    fn enter(&self, _: &span::Id) {}
+
+    fn exit(&self, _: &span::Id) {}
+}
+
+/// A warning as one line: its message, then its fields in parentheses.
+#[derive(Default)]
+struct WarningLine {
+    message: String,
+    fields: String,
+}
+
+impl WarningLine {
+    fn field(&mut self, field: &Field, value: fmt::Arguments<'_>) {
+        if field.name() == "message" {
+            self.message.write_fmt(value).ok();
+        } else {
+            if !self.fields.is_empty() {
+                self.fields.push_str(", ");
+            }
+            write!(self.fields, "{}={value}", field.name()).ok();
+        }
+    }
+
+    fn finish(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else {
+            format!("{} ({})", self.message, self.fields)
+        }
+    }
+}
+
+impl Visit for WarningLine {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.field(field, format_args!("{value}"));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.field(field, format_args!("{value:?}"));
+    }
+}
+
+/// `work`, run with the gateway's warnings collected (see
+/// [`WarningCapture`]); `work` must not panic (see [`caught`]).
+fn captured<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let outer = CAPTURED.replace(Some(Vec::new()));
+    let result = tracing::dispatcher::with_default(&WARNINGS, work);
+    let warnings = CAPTURED.replace(outer).unwrap_or_default();
+    (result, warnings)
+}
+
+// ---------------------------------------------------------------------------
 // Encode, decode, load
 // ---------------------------------------------------------------------------
 
@@ -281,6 +425,44 @@ fn absolute(path: &Path) -> Result<String, Failure> {
         .map_err(|path| Failure::Input(format!("{} is not valid UTF-8", path.display())))
 }
 
+/// The chat template file, made absolute; the gateway's `--chat-template`
+/// takes an existing file too.
+fn resolve_chat_template(path: &str) -> Result<String, Failure> {
+    if !Path::new(path).is_file() {
+        return Err(Failure::Input(format!(
+            "chat template file not found: {path}"
+        )));
+    }
+    absolute(Path::new(path))
+}
+
+/// The Hub model id of a snapshot in the Hugging Face cache
+/// (`.../models--{org}--{name}/snapshots/{revision}`, or a path in one), as
+/// the cache spells it: a Hub name holds no `--`, so the first one is the
+/// `/` between the owner and the name. `..` counts by name, as
+/// [`path::absolute`] leaves it: a snapshot is a real directory.
+fn hub_id_of_snapshot(path: &Path) -> Option<String> {
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components.last().is_some_and(|last| *last != "/") {
+                    components.pop();
+                }
+            }
+            component => components.extend(component.as_os_str().to_str()),
+        }
+    }
+    components.windows(3).rev().find_map(|window| match window {
+        [repository, "snapshots", _] => repository
+            .strip_prefix("models--")
+            .filter(|id| !id.is_empty())
+            .map(|id| id.replacen("--", "/", 1)),
+        _ => None,
+    })
+}
+
 /// A Hub model id's tokenizer files, downloaded as the gateway downloads
 /// them (`HF_TOKEN`, `HF_HOME` and `HF_ENDPOINT` honoured, the revision
 /// `main`): the directory of the snapshot.
@@ -299,6 +481,264 @@ fn download(model_id: &str) -> Result<String, Failure> {
         .block_on(download_tokenizer_from_hf(model_id))
         .map_err(|error| failed(&format_args!("{error:#}")))?;
     absolute(&dir)
+}
+
+/// The checkpoint fields serving's Harmony rule reads off a worker's model
+/// card, from the `config.json` beside the tokenizer: its architectures and
+/// its model type. A source that is no path (a model name) has none.
+fn read_card(path: &Path) -> (Vec<String>, Option<String>) {
+    let dir = if path.is_dir() {
+        Some(path)
+    } else if path.is_file() {
+        path.parent()
+    } else {
+        None
+    };
+    let config = dir
+        .and_then(|dir| fs::read_to_string(dir.join("config.json")).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let Some(config) = config else {
+        return (Vec::new(), None);
+    };
+    let architectures = config
+        .get("architectures")
+        .and_then(Value::as_array)
+        .map(|architectures| {
+            architectures
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_type = config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (architectures, model_type)
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+/// What chat rendering reads beyond the tokenizer: the model id requests
+/// render under, and the checkpoint's card for serving's Harmony rule.
+struct Chat {
+    model: Option<String>,
+    architectures: Vec<String>,
+    model_type: Option<String>,
+}
+
+/// The request as the HTTP layer reads it (`ValidatedJson`): parsed into the
+/// typed request directly, and parsed again with the failing field's path
+/// tracked only when that fails. It renders under `model` when that is set,
+/// as the router renders a request under the served model's id; a request
+/// that names no model takes it, one that names another is rewritten to it.
+fn parse_request(text: &str, model: Option<&str>) -> Result<ChatCompletionRequest, Failure> {
+    let mut request = match serde_json::from_str::<ChatCompletionRequest>(text) {
+        Ok(request) => request,
+        Err(_) if names_no_model(text) => {
+            let Some(model) = model else {
+                return Err(Failure::Input(
+                    "the request names no model, and this tokenizer has no model id to render \
+                     it under: pass Tokenizer(..., model=...), the id SMG serves this checkpoint \
+                     as (it selects the provider profile, DeepSeek, Kimi, MiniMax or GLM, whose \
+                     rewrites apply), or name the model in the request"
+                        .to_string(),
+                ));
+            };
+            let text = with_model(text, model);
+            serde_json::from_str(&text).map_err(|_| refused(&text))?
+        }
+        Err(_) => return Err(refused(text)),
+    };
+    if let Some(model) = model {
+        request.model = model.to_string();
+    }
+    Ok(request)
+}
+
+/// Whether `text` is a JSON object without a `model` member.
+fn names_no_model(text: &str) -> bool {
+    matches!(
+        serde_json::from_str::<Value>(text),
+        Ok(Value::Object(members)) if !members.contains_key("model")
+    )
+}
+
+/// `text`, a JSON object, with `model` as its first member: the rest of the
+/// text parses as it was, duplicate members refused as before.
+fn with_model(text: &str, model: &str) -> String {
+    let rest = text.trim_start();
+    let rest = rest.strip_prefix('{').unwrap_or(rest);
+    let separator = if rest.trim_start().starts_with('}') {
+        ""
+    } else {
+        ","
+    };
+    format!("{{\"model\":{}{separator}{rest}", Value::from(model))
+}
+
+/// Why the typed request refuses `text`, with the path of the failing field
+/// (the HTTP layer's second parse).
+fn refused(text: &str) -> Failure {
+    let deserializer = &mut serde_json::Deserializer::from_str(text);
+    let error =
+        match serde_path_to_error::deserialize::<_, ChatCompletionRequest>(&mut *deserializer) {
+            Ok(_) => match deserializer.end() {
+                Ok(()) => "the request does not parse".to_string(),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
+        };
+    Failure::Input(format!("SMG does not accept this request: {error}"))
+}
+
+/// Refuse media content: SMG replaces each image, video or audio part with
+/// the model's own tokens for that item when it serves the request, which a
+/// tokenizer alone cannot reproduce. Every media part is refused, those
+/// serving renders as text included (an assistant message's, a template's
+/// that writes media as text): a superset of serving's expansion, and the
+/// match on the part types fails to build when a new one appears.
+fn refuse_media(messages: &[ChatMessage]) -> Result<(), Failure> {
+    for (index, message) in messages.iter().enumerate() {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. }
+            | ChatMessage::Root { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        };
+        let Some(MessageContent::Parts(parts)) = content else {
+            continue;
+        };
+        for part in parts {
+            let kind = match part {
+                ContentPart::ImageUrl { .. } => "image_url",
+                ContentPart::AudioUrl { .. } => "audio_url",
+                ContentPart::InputAudio { .. } => "input_audio",
+                ContentPart::VideoUrl { .. } => "video_url",
+                ContentPart::Text { .. } | ContentPart::Unknown(_) => continue,
+            };
+            return Err(Failure::Input(format!(
+                "messages[{index}] has {kind} content; SMG expands media into the model's own \
+                 tokens when it serves a request, which this tokenizer does not reproduce, so \
+                 it renders text-only conversations"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Render one chat completion request (JSON text) as serving does, up to the
+/// tokenize step: the HTTP layer's steps (deserialize, normalize: the
+/// provider profile's rewrites, the deprecated fields, the `tool_choice`
+/// default; validate), the gRPC router's refusal of output other than text,
+/// this binding's own refusals of what a tokenizer cannot reproduce (a model
+/// serving renders with Harmony, media content), then the chat preparation
+/// stage's: the tools `tool_choice` renders, and the rendering.
+fn prepare(
+    tokenizer: &dyn TokenizerTrait,
+    chat: &Chat,
+    text: &str,
+) -> Result<(ProcessedMessages, PromptEncoding), Failure> {
+    let mut request = parse_request(text, chat.model.as_deref())?;
+    request.normalize();
+    request
+        .validate()
+        .map_err(|error| Failure::Input(format!("SMG rejects this request: {error}")))?;
+    if let Some((_, message)) = text_only_output_refusal(&request) {
+        return Err(Failure::Input(format!(
+            "SMG rejects this request: {message}"
+        )));
+    }
+    if is_harmony_card(
+        &chat.architectures,
+        chat.model_type.as_deref(),
+        &request.model,
+    ) {
+        return Err(Failure::Input(format!(
+            "SMG renders gpt-oss models with Harmony, not the chat template, so this tokenizer \
+             cannot render requests for them (model {})",
+            request.model
+        )));
+    }
+    refuse_media(&request.messages)?;
+    let request = request_as_rendered(&request);
+    process_chat_messages_with_encoding(&request, tokenizer, None).map_err(Failure::Input)
+}
+
+/// The gateway's tokenize step: the text without special tokens (the
+/// template wrote those it renders), or the renderer's own encode.
+fn encode_prompt(
+    tokenizer: &dyn TokenizerTrait,
+    text: &str,
+    encoding: PromptEncoding,
+) -> Result<Vec<u32>, Failure> {
+    match encoding {
+        PromptEncoding::FromText => encode_ids(tokenizer, text, false),
+        PromptEncoding::Deferred(job) => caught(|| {
+            job.run()
+                .map(into_ids)
+                .map_err(|error| Failure::Input(format!("{error:#}")))
+        }),
+    }
+}
+
+/// A rendered chat, as `render_chat` hands it to Python: the prompt text,
+/// its token ids, whether those are the text's flat encode, whether the
+/// renderer wrote its generation header, whether it kept the final message
+/// open (a native continuation), and the warnings the gateway logged.
+type Rendered = (String, Vec<u32>, bool, bool, bool, Vec<String>);
+
+fn rendered(
+    processed: ProcessedMessages,
+    token_ids: Vec<u32>,
+    from_text: bool,
+    warnings: Vec<String>,
+) -> Rendered {
+    (
+        processed.text,
+        token_ids,
+        from_text,
+        processed.generation_prompt,
+        processed.continued_final_message,
+        warnings,
+    )
+}
+
+/// Render and encode one request on the current thread (a batch's item, on
+/// the pool).
+fn render_one(
+    tokenizer: &dyn TokenizerTrait,
+    chat: &Chat,
+    text: &str,
+) -> Result<Rendered, Failure> {
+    let (result, warnings) = captured(|| {
+        caught(|| {
+            let (processed, encoding) = prepare(tokenizer, chat, text)?;
+            let from_text = matches!(encoding, PromptEncoding::FromText);
+            let token_ids = encode_prompt(tokenizer, &processed.text, encoding)?;
+            Ok((processed, token_ids, from_text))
+        })
+    });
+    let (processed, token_ids, from_text) = result?;
+    Ok(rendered(processed, token_ids, from_text, warnings))
+}
+
+/// The name of the provider profile a model id selects.
+fn profile_name(model: &str) -> &'static str {
+    match ProviderProfile::for_model(model) {
+        ProviderProfile::Generic => "generic",
+        ProviderProfile::OpenAi => "openai",
+        ProviderProfile::Kimi => "kimi",
+        ProviderProfile::Minimax => "minimax",
+        ProviderProfile::Zai => "zai",
+        ProviderProfile::DeepSeek => "deepseek",
+    }
 }
 
 /// The tokenizer tiktoken builds for an OpenAI model name, built on the pool
@@ -321,15 +761,28 @@ fn openai_tokenizer(py: Python<'_>, name: &str) -> PyResult<Option<Arc<dyn Token
 pub struct PyTokenizer {
     inner: Arc<dyn TokenizerTrait>,
     source: String,
+    chat_template: Option<String>,
+    chat: Chat,
 }
 
 #[pymethods]
 impl PyTokenizer {
     /// Load the tokenizer of `source` (a checkpoint directory, a tokenizer
-    /// file, or a Hugging Face model id) as the gateway does.
+    /// file, or a Hugging Face model id) as the gateway does, with the chat
+    /// template file `chat_template` instead of the checkpoint's own when
+    /// given. `model` is the model id chat requests render under; it
+    /// defaults to the Hub id of a Hub source or of a Hugging Face cache
+    /// snapshot, and to none for any other path.
     #[new]
-    fn new(py: Python<'_>, source: &str) -> PyResult<Self> {
+    #[pyo3(signature = (source, chat_template=None, model=None))]
+    fn new(
+        py: Python<'_>,
+        source: &str,
+        chat_template: Option<&str>,
+        model: Option<String>,
+    ) -> PyResult<Self> {
         register_fork_hooks(py)?;
+        let chat_template = chat_template.map(resolve_chat_template).transpose()?;
         let path = Path::new(source);
         // A path, made absolute; a name that can only be a path (absolute,
         // relative to `.` or `~`, or of more than two segments), refused when
@@ -338,8 +791,11 @@ impl PyTokenizer {
         // name, a Hub id, downloaded here and loaded from its snapshot. The
         // download releases the GIL, and stays off the pool, whose threads it
         // must not hold.
-        let (location, openai) = if path.exists() {
-            (absolute(path)?, None)
+        let (location, hub_id, openai) = if path.exists() {
+            // Read off the absolute path: `.` inside a snapshot is one too.
+            let location = absolute(path)?;
+            let hub_id = hub_id_of_snapshot(Path::new(&location));
+            (location, hub_id, None)
         } else if path.is_absolute()
             || source.starts_with(['.', '~'])
             || source.matches('/').count() > 1
@@ -348,29 +804,42 @@ impl PyTokenizer {
                 "no such file or directory: {source}"
             )));
         } else if let Some(tokenizer) = openai_tokenizer(py, source)? {
-            (source.to_string(), Some(tokenizer))
+            (source.to_string(), None, Some(tokenizer))
         } else {
-            (py.detach(|| caught(|| download(source)))?, None)
+            let dir = py.detach(|| caught(|| download(source)))?;
+            (dir, Some(source.to_string()), None)
         };
+        let model = model
+            .or(hub_id)
+            .or_else(|| (!Path::new(&location).exists()).then(|| location.clone()));
         let inner = match openai {
             Some(tokenizer) => tokenizer,
             None => py.detach(|| {
                 in_pool(|| {
                     caught(|| {
-                        create_tokenizer_with_chat_template_blocking(&location, None).map_err(
-                            |error| {
-                                Failure::Internal(format!(
-                                    "loading the tokenizer from {location}: {error:#}"
-                                ))
-                            },
+                        create_tokenizer_with_chat_template_blocking(
+                            &location,
+                            chat_template.as_deref(),
                         )
+                        .map_err(|error| {
+                            Failure::Internal(format!(
+                                "loading the tokenizer from {location}: {error:#}"
+                            ))
+                        })
                     })
                 })?
             })?,
         };
+        let (architectures, model_type) = read_card(Path::new(&location));
         Ok(Self {
             inner,
             source: location,
+            chat_template,
+            chat: Chat {
+                model,
+                architectures,
+                model_type,
+            },
         })
     }
 
@@ -380,6 +849,24 @@ impl PyTokenizer {
     #[getter]
     fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The absolute path of the chat template file given at load, if any.
+    #[getter]
+    fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// The model id chat requests render under, if any.
+    #[getter]
+    fn model(&self) -> Option<&str> {
+        self.chat.model.as_deref()
+    }
+
+    /// The provider profile the model id selects, if there is one.
+    #[getter]
+    fn provider_profile(&self) -> Option<&'static str> {
+        self.chat.model.as_deref().map(profile_name)
     }
 
     /// The smg release and commit this binding was built from.
@@ -508,6 +995,56 @@ impl PyTokenizer {
         })?;
         Ok(texts)
     }
+
+    /// Render a chat completion request, given as JSON text, as the gateway
+    /// does; see `smg.tokenizer.Tokenizer.render_chat`.
+    fn render_chat(&self, py: Python<'_>, request: &str) -> PyResult<Rendered> {
+        let tokenizer = &*self.inner;
+        let chat = &self.chat;
+        // The rendering reaches no rayon: a short request renders here with
+        // the GIL held, a long one with it released.
+        let render = || captured(|| caught(|| prepare(tokenizer, chat, request)));
+        let (prepared, mut warnings) = if request.len() < INLINE_ENCODE_MAX_BYTES {
+            render()
+        } else {
+            py.detach(render)
+        };
+        let (processed, encoding) = prepared?;
+        let from_text = matches!(encoding, PromptEncoding::FromText);
+        let token_ids = {
+            // The prompt's encode can reach rayon by the prompt's length,
+            // which a template can make many times the request's.
+            let text = processed.text.as_str();
+            let encode = || captured(|| encode_prompt(tokenizer, text, encoding));
+            let (token_ids, more) = if text.len() < INLINE_ENCODE_MAX_BYTES {
+                encode()
+            } else {
+                py.detach(|| in_pool(encode))?
+            };
+            warnings.extend(more);
+            token_ids?
+        };
+        Ok(rendered(processed, token_ids, from_text, warnings))
+    }
+
+    /// Render chat completion requests, given as JSON texts, in parallel.
+    fn render_chat_batch(&self, py: Python<'_>, requests: Vec<String>) -> PyResult<Vec<Rendered>> {
+        let tokenizer = &*self.inner;
+        let chat = &self.chat;
+        let rendered = py.detach(|| {
+            in_pool(|| {
+                requests
+                    .par_iter()
+                    .enumerate()
+                    .map(|(index, request)| {
+                        render_one(tokenizer, chat, request)
+                            .map_err(|failure| failure.of_item("requests", index))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        })?;
+        Ok(rendered)
+    }
 }
 
 #[cfg(test)]
@@ -515,10 +1052,132 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_hub_cache_snapshot_names_its_model_id() {
+        let snapshot = Path::new("/home/u/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/0123abc");
+        let deepseek = Some("deepseek-ai/DeepSeek-V4-Flash");
+        assert_eq!(hub_id_of_snapshot(snapshot).as_deref(), deepseek);
+        assert_eq!(
+            hub_id_of_snapshot(&snapshot.join("tokenizer.json")).as_deref(),
+            deepseek
+        );
+        assert_eq!(
+            hub_id_of_snapshot(Path::new("/cache/models--gpt2/snapshots/abc")).as_deref(),
+            Some("gpt2")
+        );
+        assert_eq!(hub_id_of_snapshot(Path::new("/models/Qwen3-8B")), None);
+        assert_eq!(hub_id_of_snapshot(Path::new("/models/snapshots/abc")), None);
+        // `..` counts by name: out of the snapshot, no Hub id; into another
+        // revision, that one's.
+        assert_eq!(
+            hub_id_of_snapshot(&snapshot.join("../../../../models/my-ckpt")),
+            None
+        );
+        assert_eq!(
+            hub_id_of_snapshot(&snapshot.join("../4567def")).as_deref(),
+            deepseek
+        );
+    }
+
+    #[test]
+    fn a_missing_chat_template_is_refused() {
+        let Err(Failure::Input(error)) = resolve_chat_template("/no/such/template.jinja") else {
+            panic!("refused as an input error");
+        };
+        assert_eq!(
+            error,
+            "chat template file not found: /no/such/template.jinja"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_card_is_read_from_its_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = dir.path().join("config.json");
+        fs::write(
+            &config,
+            r#"{"architectures": ["GptOssForCausalLM"], "model_type": "gpt_oss"}"#,
+        )
+        .expect("config");
+        let card = (
+            vec!["GptOssForCausalLM".to_string()],
+            Some("gpt_oss".to_string()),
+        );
+        assert_eq!(read_card(dir.path()), card);
+        let file = dir.path().join("tokenizer.json");
+        fs::write(&file, "{}").expect("tokenizer file");
+        assert_eq!(read_card(&file), card);
+        fs::write(&config, "not json").expect("config");
+        assert_eq!(read_card(dir.path()), (Vec::new(), None));
+        // A name that is no path reads no config.json, not even the one in
+        // the directory it would sit in.
+        fs::write(&config, r#"{"architectures": ["GptOssForCausalLM"]}"#).expect("config");
+        assert_eq!(read_card(&dir.path().join("gpt-4o")), (Vec::new(), None));
+    }
+
+    #[test]
+    fn media_parts_are_refused_and_text_parts_are_not() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
+        ]))
+        .expect("messages");
+        assert!(refuse_media(&messages[..1]).is_ok());
+        let Err(Failure::Input(error)) = refuse_media(&messages) else {
+            panic!("refused as an input error");
+        };
+        assert!(error.starts_with("messages[1] has image_url content;"));
+    }
+
+    #[test]
+    fn a_request_renders_under_the_tokenizer_model() {
+        let request = r#"{"model": "alias", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let parsed = parse_request(request, Some("served")).ok().expect("parsed");
+        assert_eq!(parsed.model, "served");
+        let parsed = parse_request(request, None).ok().expect("parsed");
+        assert_eq!(parsed.model, "alias");
+        let unnamed = r#" { "messages": [{"role": "user", "content": "hi"}]}"#;
+        let parsed = parse_request(unnamed, Some("served")).ok().expect("parsed");
+        assert_eq!(parsed.model, "served");
+        let Err(Failure::Input(error)) = parse_request(unnamed, None) else {
+            panic!("refused as an input error");
+        };
+        assert!(error.starts_with("the request names no model"));
+        assert_eq!(with_model("{}", "m"), r#"{"model":"m"}"#);
+        assert_eq!(with_model(" { } ", "m"), r#"{"model":"m" } "#);
+    }
+
+    #[test]
+    fn a_duplicate_member_is_refused_with_or_without_a_model() {
+        for request in [
+            r#"{"model": "m", "messages": [], "messages": []}"#,
+            r#"{"messages": [], "messages": []}"#,
+        ] {
+            let Err(Failure::Input(error)) = parse_request(request, Some("served")) else {
+                panic!("refused as an input error: {request}");
+            };
+            assert!(error.contains("duplicate field `messages`"), "{error}");
+        }
+    }
+
+    #[test]
     fn a_panic_is_an_internal_failure() {
         let Err(Failure::Internal(error)) = caught::<()>(|| panic!("boom")) else {
             panic!("caught as an internal failure");
         };
         assert_eq!(error, "SMG's tokenizer panicked: boom");
+    }
+
+    #[test]
+    fn warnings_are_captured_for_the_work_that_logs_them() {
+        let ((), warnings) = captured(|| {
+            tracing::warn!(tool = "search", bytes = 3, "arguments rendered as {{}}");
+            tracing::info!("not a warning");
+        });
+        assert_eq!(
+            warnings,
+            ["arguments rendered as {} (tool=search, bytes=3)"]
+        );
+        let ((), outside) = captured(|| ());
+        assert!(outside.is_empty());
     }
 }
