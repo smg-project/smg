@@ -599,3 +599,111 @@ def test_real_verifier_reports_changed_sglang_or_torch_before_native_context(
     assert "tilelang" not in leading_diagnostic and "torch-c-dlpack-ext" not in leading_diagnostic
     assert "native dependency versions (TVM, TileLang, DLPack)" not in message
     assert "full cohort observed=" in message and "expected=" in message
+
+
+# Both benchmark job templates install more packages after their initial image
+# setup. Check that the strict cohort verification also runs after that install.
+# These tests inspect Source only: no backend, model or native verifier starts.
+def _nightly_sglang_postinstall_contract(job):
+    import shlex
+
+    steps = job["steps"]
+    checks = [
+        (index, entry)
+        for index, entry in enumerate(steps)
+        if "ci_setup_sglang_rocm_image.sh --verify-only" in entry.get("run", "")
+    ]
+    assert len(checks) == 1, "expected one post-install SGLang cohort check"
+    index, check = checks[0]
+    installs = [
+        position
+        for position, entry in enumerate(steps)
+        if "pip install wheel/*.whl" in entry.get("run", "")
+        and "bash scripts/ci_install_e2e_deps.sh" in entry.get("run", "")
+    ]
+    benchmarks = [
+        position
+        for position, entry in enumerate(steps)
+        if "pytest e2e_test/benchmarks/test_nightly_perf.py" in entry.get("run", "")
+    ]
+    assert len(installs) == len(benchmarks) == 1
+    assert index == installs[0] + 1 and index < benchmarks[0]
+    assert check["if"] == (
+        "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'"
+    )
+    assert check["env"] == {"SMG_SGLANG_ROCM_IMAGE": "${{ matrix.variant.image }}"}
+    assert check["timeout-minutes"] == 2
+    assert check.get("continue-on-error", False) is False
+    commands = [shlex.split(line) for line in check["run"].splitlines() if line.strip()]
+    assert commands == [
+        ["mkdir", "-p", "nightly_gateway_logs"],
+        [
+            "bash",
+            "scripts/ci_setup_sglang_rocm_image.sh",
+            "--verify-only",
+            "nightly_gateway_logs/sglang-native-environment-prepared.json",
+        ],
+    ]
+    return index
+
+
+def _nightly_sglang_benchmark_job(job_id):
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/nightly-benchmark-amd.yml").read_text()
+    )
+    return workflow["jobs"][job_id]
+
+
+@pytest.mark.parametrize("job_id", ["single-worker", "multi-worker"])
+def test_nightly_sglang_postinstall_after_dependencies(job_id):
+    _nightly_sglang_postinstall_contract(_nightly_sglang_benchmark_job(job_id))
+
+
+@pytest.mark.parametrize("job_id", ["single-worker", "multi-worker"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "before_dependencies",
+        "unfiltered",
+        "wrong_runtime",
+        "wrong_image",
+        "continue_on_error",
+        "suppressed_exit",
+        "wrong_report",
+        "duplicate",
+        "unbounded_timeout",
+    ],
+)
+def test_nightly_sglang_postinstall_rejects_broken_wiring(job_id, mutation):
+    import copy
+
+    job = copy.deepcopy(_nightly_sglang_benchmark_job(job_id))
+    index = _nightly_sglang_postinstall_contract(job)
+    check = job["steps"][index]
+    if mutation == "missing":
+        job["steps"].pop(index)
+    elif mutation == "before_dependencies":
+        job["steps"].insert(index - 1, job["steps"].pop(index))
+    elif mutation == "unfiltered":
+        check["if"] = "matrix.variant.runtime == 'sglang'"
+    elif mutation == "wrong_runtime":
+        check["if"] = "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'vllm'"
+    elif mutation == "wrong_image":
+        check["env"]["SMG_SGLANG_ROCM_IMAGE"] = "an-unbound-image"
+    elif mutation == "continue_on_error":
+        check["continue-on-error"] = True
+    elif mutation == "suppressed_exit":
+        check["run"] += " || true"
+    elif mutation == "wrong_report":
+        check["run"] = check["run"].replace(
+            "nightly_gateway_logs/sglang-native-environment-prepared.json", "unretained.json"
+        )
+    elif mutation == "duplicate":
+        job["steps"].insert(index, copy.deepcopy(check))
+    elif mutation == "unbounded_timeout":
+        check["timeout-minutes"] = 1440
+    with pytest.raises(AssertionError):
+        _nightly_sglang_postinstall_contract(job)
