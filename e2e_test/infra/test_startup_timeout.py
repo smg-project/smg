@@ -649,6 +649,82 @@ def test_mooncake_pd2_rejects_unowned_role_geometry_or_backend(monkeypatch, over
         worker_module.validate_startup_profile_worker(**(kwargs | override))
 
 
+@pytest.mark.parametrize(
+    "spec_timeout,floor,expected",
+    [(None, None, DEFAULT_STARTUP_TIMEOUT), (900, None, 900), (900, "1800", 1800)],
+    ids=["default", "model", "floor"],
+)
+def test_unprofiled_pd_parallel_readiness_uses_worker_resolver(
+    monkeypatch, spec_timeout, floor, expected
+):
+    from infra import constants as constants_module
+
+    setup = importlib.import_module("fixtures.setup_backend")
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_SELECTION", None)
+    monkeypatch.delenv(constants_module.ENV_STARTUP_PROFILE, raising=False)
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.delenv("E2E_KV_BACKEND", raising=False)
+    monkeypatch.setenv("E2E_VLLM_KV_BACKEND", "nixl")
+    if floor is not None:
+        monkeypatch.setenv(ENV_STARTUP_TIMEOUT, floor)
+    model = "fixture-unprofiled-pd"
+    spec = {"tp": 1}
+    if spec_timeout is not None:
+        spec["startup_timeout"] = spec_timeout
+    monkeypatch.setattr(setup, "get_model_spec", lambda _: spec)
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: spec)
+    waits, pools, resolved, stopped, events = [], [], [], [], []
+    clock = iter((100.0, 100.0, 101.0))
+    monkeypatch.setattr(setup, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(setup, "_worker_start_failures", {})
+
+    def resolve(model_id):
+        resolved.append(model_id)
+        events.append("resolve")
+        assert worker_startup_timeout(model_id) == expected
+        # A future resolver term must reach this wait too; duplicating today's
+        # default/spec/floor calculation must not satisfy this control.
+        return expected + 7
+
+    def pool(**kwargs):
+        pools.append(kwargs)
+        events.append("pool")
+        return [SimpleNamespace(wait_ready=lambda bound: waits.append(bound))]
+
+    monkeypatch.setattr(setup, "worker_startup_timeout", resolve)
+    monkeypatch.setattr(setup, "_start_pd_pool", pool)
+    monkeypatch.setattr(setup, "stop_workers", lambda workers: stopped.extend(workers))
+    monkeypatch.setattr(setup, "_start_gateway", lambda *args, **kwargs: events.append("start"))
+    monkeypatch.setattr(setup, "_wait_for_serving", lambda *args: None)
+    monkeypatch.setattr(setup, "_make_openai_client", lambda _: "client")
+    gateway = SimpleNamespace(
+        base_url="http://127.0.0.1:30000",
+        shutdown=lambda: events.append("shutdown"),
+    )
+    profile = setup._setup_pd(
+        model,
+        model,
+        "vllm",
+        worker_module.ConnectionMode.GRPC,
+        {"parallel_start": True},
+        {"timeout": 60},
+        gateway,
+        None,
+    )
+    try:
+        assert next(profile)[0] == "pd_grpc"
+        assert resolved == [model]
+        assert waits == [expected + 7, expected + 6]
+        assert events == ["pool", "pool", "resolve", "start"]
+    finally:
+        profile.close()
+    assert events[-1] == "shutdown"
+    assert len(pools) == len(stopped) == 2
+    assert all(kwargs["wait_ready"] is False for kwargs in pools)
+    assert setup._worker_start_failures == {}
+
+
 @pytest.mark.parametrize("elapsed", [1.0, 301.0])
 def test_mooncake_pd2_real_pd_parallel_path_uses_shared300_deadline(monkeypatch, elapsed):
     import importlib

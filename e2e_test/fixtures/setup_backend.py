@@ -779,11 +779,7 @@ def _setup_pd(
             # the session's fail-fast budget as it does on the sequential path.
             # Evicting the previous pool and staggering new launches must not
             # consume the replacement fleet's readiness budget.
-            readiness_bound = (
-                worker_startup_timeout(model_id)
-                if mooncake_pd2
-                else effective_startup_timeout(spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT))
-            )
+            readiness_bound = worker_startup_timeout(model_id)
             deadline = time.monotonic() + readiness_bound
             try:
                 for worker in all_workers:
