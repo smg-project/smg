@@ -2294,7 +2294,11 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
-            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+            help=(
+                "Cap on the distinct tenants the scheduler's clamp and unknown-priority "
+                "counters keep as tenant series of their own (the first N seen; the remainder "
+                'bucket under tenant="other").'
+            ),
         )
 
         # Tenant rate limit configuration
