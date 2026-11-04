@@ -740,8 +740,10 @@ impl ResponseProcessor {
             });
         }
 
-        // The records a streamed generate answer makes at its end, which
-        // counts no prompt figures either.
+        // The records a streamed generate answer makes at its end, from the
+        // counters the settlement reads: the prompt and its cache hit once
+        // per request, the completion tokens of every choice.
+        let counts = response_formatting::TokenCounts::of_generated(&result_array);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -749,12 +751,9 @@ impl ResponseProcessor {
             endpoint: metrics_endpoint,
             ttft: None,
             generation_duration: started.elapsed(),
-            input_tokens: None,
-            cached_tokens: None,
-            output_tokens: result_array
-                .iter()
-                .map(|response| u64::from(response.meta_info.completion_tokens))
-                .sum(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
         });
         Ok(result_array)
     }
