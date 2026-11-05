@@ -994,8 +994,8 @@ impl Router {
             })
         };
 
-        // IGW does not override backend or disaggregated modes; IGW-only keeps
-        // the Python binding's existing empty startup-worker behavior.
+        // IGW selects routers per request; it does not change which configured
+        // workers are registered at startup, or override backend/disaggregated modes.
         let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
             provider
         } else if self.epd_disaggregation {
@@ -1036,11 +1036,7 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: if self.enable_igw {
-                    vec![]
-                } else {
-                    self.worker_urls.clone()
-                },
+                worker_urls: self.worker_urls.clone(),
             }
         };
 
