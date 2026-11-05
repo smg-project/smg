@@ -184,7 +184,8 @@ pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
 }
 
-/// [`BufferPool::recycle`] on the process's pool.
+/// A buffer back to the process's pool: kept for the next request of its
+/// class, or freed when it is outside the classes or the pool is at its bound.
 pub fn recycle(buf: Vec<u8>) {
     shared().recycle(buf);
 }
