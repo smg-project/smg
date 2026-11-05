@@ -343,7 +343,8 @@ impl StreamingProcessor {
     ///
     /// This is the high-level entry point for streaming responses, handling:
     /// - Channel creation
-    /// - Background task spawning
+    /// - Building the reading of the engine's answer, which the response
+    ///   body drives (see `DrivenBody`)
     /// - SSE response building
     ///
     /// The `load_guards` (and the reservation's safety net) ride in the
