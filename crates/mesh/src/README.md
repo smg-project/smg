@@ -29,9 +29,15 @@ RPCs of the `Gossip` service in `proto/gossip.proto`:
   the next failure `Down`, and the new status is broadcast. A verdict is the
   peers' word; the member's own word wins over it: a member that reads a
   verdict on itself in a probe's table refutes it (`Alive`, one version
-  above), and a member that probes a peer is alive again on that peer
-  whatever verdict it held (the probe names its sender), so a late answer, a
-  pause or a restart under the same name heal within a probe round.
+  above), and a member's own entry in a probe or a broadcast it sends (both
+  name their sender) wins on the receiver whatever version it held, `Alive`
+  again after a verdict or `Leaving` when it stops, so a late answer, a pause
+  or a restart under the same name heal within a probe round and a clean stop
+  is not undone by a verdict. A stopping member broadcasts `Leaving` twice,
+  once at the stop and once after its propagation wait: a probe that was in
+  flight when the stop began carries its table from before it, and a peer
+  that reads that `Alive` after the first broadcast holds the member alive
+  again until the second one.
 - **State** (`SyncStream`, bidirectional streaming): one long-lived stream per
   pair of members. Every second each end sends the round's new entries of the
   stream namespaces and the CRDT operations the peer has not acknowledged

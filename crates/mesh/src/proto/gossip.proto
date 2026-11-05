@@ -31,10 +31,11 @@ message StateSync {
 
 message Ping {
   StateSync state_sync = 1;
-  // The name of the member that sends the probe, when the probe carries its
-  // table: its own entry there is its word about itself, and a member that
-  // speaks is alive whatever verdict the receiver holds on it. Empty in a
-  // status broadcast and from members that predate the field.
+  // The name of the member that sends the probe or the broadcast: its own
+  // entry in the table it carries is its word about itself, and it wins on
+  // the receiver whatever version the receiver holds it at (alive again after
+  // a verdict, leaving when it stops). Empty from members that predate the
+  // field.
   string sender = 2;
 }
 

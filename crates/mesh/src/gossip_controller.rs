@@ -483,6 +483,7 @@ impl GossipController {
                             target_nodes,
                             None, // Use default timeout
                             Arc::clone(&self.dialer),
+                            &self.self_name,
                         )
                         .await;
 

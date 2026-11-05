@@ -237,14 +237,19 @@ impl GossipService {
     /// This node's own entry is never replaced by a peer's copy of it: a
     /// verdict on this node other than `Alive` is refuted (`refute_or_adopt`),
     /// and the probe's answer and the tables of the next probes carry the
-    /// refutation. The entry of `sender`, the member whose probe this table
-    /// came with, says `Alive` from a member that is speaking: when this node
-    /// holds that member `Suspected`, `Down` or `Leaving` (a probe it
-    /// answered late, a crash or a clean stop before this life of it), it is
-    /// alive again, written above the held version so the verdict loses to it
-    /// everywhere, as the member itself refutes it. Without this, a verdict
-    /// outlived the member's return: `Down` and `Leaving` members are never
-    /// probed, and a member back under its name starts counting at version 1.
+    /// refutation. The entry of `sender`, the member whose probe or broadcast
+    /// this table came with, is that member's own word about itself and wins
+    /// whatever version this node holds it at: `Alive` from a member this
+    /// node holds `Suspected`, `Down` or `Leaving` (a probe it answered late,
+    /// a crash or a clean stop before this life of it) makes it alive again,
+    /// and `Leaving` from a member this node holds above its own version (it
+    /// was alive again here after a verdict, and had not read that version
+    /// back) makes it leaving; both written above the held version so the
+    /// stale entry loses to it everywhere, as the member itself refutes a
+    /// verdict. Without this, a verdict outlived the member's return (`Down`
+    /// and `Leaving` members are never probed, and a member back under its
+    /// name starts counting at version 1), and a re-admitted member's clean
+    /// stop was learned through failed probes alone.
     fn merge_state(&self, incoming_nodes: Vec<NodeState>, sender: &str) -> bool {
         let mut state = self.state.write();
         let mut updated = false;
@@ -266,17 +271,19 @@ impl GossipService {
                 }
                 Some(entry)
                     if node.name == sender
-                        && node.status == NodeStatus::Alive as i32
-                        && entry.status != NodeStatus::Alive as i32 =>
+                        && node.status != entry.status
+                        && (node.status == NodeStatus::Alive as i32
+                            || node.status == NodeStatus::Leaving as i32) =>
                 {
                     log::info!(
-                        "Member {} speaks: alive again at version {} (held {:?} at version {})",
+                        "Member {} speaks: {:?} at version {} by its own word (held {:?} at version {})",
                         node.name,
+                        NodeStatus::try_from(node.status).unwrap_or(NodeStatus::Init),
                         entry.version + 1,
                         NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init),
                         entry.version
                     );
-                    entry.status = NodeStatus::Alive as i32;
+                    entry.status = node.status;
                     entry.version += 1;
                     entry.address = node.address;
                     updated = true;
