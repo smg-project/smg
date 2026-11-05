@@ -83,6 +83,18 @@ elif args[0] == "-c":
                 type("PyCapsule", (), {})() if mode == "present" else object()
             )
         sys.modules["torch"] = torch
+    if "from nixl._api import nixl_agent" in args[1]:
+        with open(os.environ["NIXL_IMPORT_LOG"], "a") as log:
+            log.write("selected\n")
+        package = types.ModuleType("nixl")
+        package.__path__ = []
+        api = types.ModuleType("nixl._api")
+        bindings = types.ModuleType("nixl._bindings")
+        if os.environ.get("MISSING_NIXL_SYMBOL") != "agent":
+            api.nixl_agent = object()
+        if os.environ.get("MISSING_NIXL_SYMBOL") != "disconnect":
+            bindings.nixlRemoteDisconnectError = type("Disconnect", (Exception,), {})
+        sys.modules.update({"nixl": package, "nixl._api": api, "nixl._bindings": bindings})
     exec(args[1])
 elif args[:2] == ["-m", "pip"]:
     known = (
@@ -156,6 +168,10 @@ def run_installer(
         "IMAGE_DLPACK_LIB",
         "FAIL_PIP_STAGE",
         "FAIL_NATIVE_CHECK",
+        "E2E_KV_BACKEND",
+        "E2E_SGLANG_TRANSFER_BACKEND",
+        "NIXL_IMPORT_LOG",
+        "MISSING_NIXL_SYMBOL",
     ):
         env.pop(name, None)
     env.update(extra_env or {})
@@ -608,6 +624,82 @@ def test_real_verifier_native_version_mismatch_reports_observed_and_expected(tmp
     assert "observed=('0.2.0', '0.1.16', '0.1.6')" in message
     assert "expected=('0.1.12', '0.1.15', '0.1.5')" in message
     assert "full cohort observed=" in message and "expected=" in message
+
+
+@pytest.mark.parametrize(
+    ("backend", "transfer", "expected_calls"),
+    [("", "", 0), ("nixl", "", 1), ("", "nixl", 1), ("nixl", "nixl", 1), ("moriio", "mooncake", 0)],
+)
+def test_fixed_rocm_setup_checks_nixl_only_when_selected(
+    tmp_path, backend, transfer, expected_calls
+):
+    log = tmp_path / "nixl-import.log"
+    result, _ = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "E2E_KV_BACKEND": backend,
+            "E2E_SGLANG_TRANSFER_BACKEND": transfer,
+            "NIXL_IMPORT_LOG": str(log),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert (log.read_text().splitlines() if log.exists() else []) == ["selected"] * expected_calls
+
+
+@pytest.mark.parametrize("missing", ["agent", "disconnect"])
+@pytest.mark.parametrize("verify_only", [False, True])
+def test_fixed_rocm_setup_rejects_missing_selected_nixl_symbols(tmp_path, missing, verify_only):
+    log = tmp_path / "nixl-import.log"
+    report = tmp_path / "native-report.json"
+    result, _ = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)) if verify_only else (),
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": load_cohort_verifier().IMAGE,
+            "E2E_KV_BACKEND": "nixl",
+            "NIXL_IMPORT_LOG": str(log),
+            "MISSING_NIXL_SYMBOL": missing,
+        },
+    )
+    assert result.returncode != 0
+    assert "ImportError" in result.stderr
+    assert log.read_text().splitlines() == ["selected"]
+    assert not (tmp_path / "github.env").exists()
+    assert not report.exists()
+    assert not (tmp_path / "native.jsonl").exists()
+
+
+@pytest.mark.parametrize("verify_only", [False, True])
+def test_fixed_rocm_setup_sanitizes_ambient_nixl_selection(tmp_path, monkeypatch, verify_only):
+    ambient = tmp_path / "ambient-nixl.log"
+    for name, value in {
+        "E2E_KV_BACKEND": "nixl",
+        "E2E_SGLANG_TRANSFER_BACKEND": "nixl",
+        "NIXL_IMPORT_LOG": str(ambient),
+        "MISSING_NIXL_SYMBOL": "agent",
+    }.items():
+        monkeypatch.setenv(name, value)
+    report = tmp_path / "native-report.json"
+    result, _ = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)) if verify_only else (),
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": load_cohort_verifier().IMAGE,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert not ambient.exists()
+    assert report.exists() is verify_only
+    assert (tmp_path / "github.env").exists() is not verify_only
 
 
 @pytest.mark.parametrize(
