@@ -764,6 +764,7 @@ impl MockScheduler {
                     max_running_requests: 0,
                     token_usage: 0.0,
                     gen_throughput: 0.0,
+                    prefill_throughput: None,
                     cache_hit_rate: 0.0,
                     num_cached_blocks: 0,
                     num_preemptions: 0,
@@ -1283,6 +1284,7 @@ fn load_record(
             .then(|| unsigned(snapshot.num_waiting_uncached_tokens)),
         token_usage: snapshot.token_usage,
         gen_throughput: snapshot.gen_throughput,
+        prefill_throughput: snapshot.prefill_throughput,
         max_running_requests: unsigned(snapshot.max_running_requests),
         age_ms: 0,
         sample,
@@ -1311,21 +1313,31 @@ fn silence_ms(engine: &engine::Engine) -> Option<u32> {
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: the Rust relay's rule (any queue, running or window change, KV
-/// usage by half a percent, the rate by 5 % or 50 tokens per second, the
-/// engine's silence by a whole second).
+/// usage by half a percent, either rate by 5 % or 50 tokens per second, the
+/// measured input capacity appearing or expiring, the engine's silence by a
+/// whole second).
 fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.running_requests != current.running_requests
+    let prefill_changed = match (last.prefill_throughput, current.prefill_throughput) {
+        (Some(last), Some(current)) => throughput_changed(last, current),
+        (None, None) => false,
+        _ => true,
+    };
+    prefill_changed
+        || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
         || (last.token_usage - current.token_usage).abs() > 0.005
-        || {
-            let delta = (last.gen_throughput - current.gen_throughput).abs();
-            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
-        }
+        || throughput_changed(last.gen_throughput, current.gen_throughput)
         || last.engine_silence_ms.map(|ms| ms / 1000)
             != current.engine_silence_ms.map(|ms| ms / 1000)
         || last.prefill_pending_tokens != current.prefill_pending_tokens
+}
+
+/// Rate noise is no change; a move of 5 % or 50 tokens per second is.
+fn throughput_changed(last: f64, current: f64) -> bool {
+    let delta = (last - current).abs();
+    delta > 50.0 || delta > 0.05 * last.max(current)
 }
 
 /// How often the stream checks the record while no batch flows, the silence
@@ -1953,6 +1965,13 @@ mod tests {
         assert_eq!(loads.dp_rank_count, 4);
         let ranks: Vec<i32> = loads.loads.iter().map(|load| load.dp_rank).collect();
         assert_eq!(ranks, vec![0, 1, 2, 3]);
+        assert!(
+            loads
+                .loads
+                .iter()
+                .all(|load| load.prefill_throughput.is_none()),
+            "no rank has prefilled: no measured capacity yet"
+        );
         let one = service
             .get_loads(Request::new(ts::GetLoadsRequest {
                 dp_rank: Some(3),
@@ -2035,9 +2054,33 @@ mod tests {
             assert!(batch.events.is_empty(), "{batch:?}");
             assert!(batch.load.as_ref().is_some_and(|load| load.load_only));
             if batch.dp_rank == Some(1) {
+                // The rank prefilled the request: its record carries the
+                // measured prefill capacity, as the servicers' records do.
+                assert!(
+                    batch
+                        .load
+                        .as_ref()
+                        .and_then(|load| load.prefill_throughput)
+                        .is_some_and(|rate| rate > 0.0),
+                    "{batch:?}"
+                );
                 break;
             }
         }
+        let rank1 = service
+            .get_loads(Request::new(ts::GetLoadsRequest {
+                dp_rank: Some(1),
+                include: Vec::new(),
+            }))
+            .await
+            .expect("loads")
+            .into_inner();
+        assert!(
+            rank1.loads[0]
+                .prefill_throughput
+                .is_some_and(|rate| rate > 0.0),
+            "the poll reports it too: {rank1:?}"
+        );
     }
 
     /// One subscription carries every rank's stream with one record state,
@@ -2307,6 +2350,26 @@ mod tests {
         let constraint = injected_status(422);
         assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
         assert!(smg_grpc_client::is_constraint_failure(&constraint));
+    }
+
+    /// The measured input capacity alone moves a record: appearing, expiring
+    /// or moving by the relay's margin is a change worth a push, noise within
+    /// the margin is not.
+    #[test]
+    fn the_measured_input_capacity_alone_changes_a_record() {
+        let last = common::EngineLoad {
+            prefill_throughput: Some(20_000.0),
+            ..Default::default()
+        };
+        let with = |rate| common::EngineLoad {
+            prefill_throughput: rate,
+            ..last.clone()
+        };
+        assert!(!load_changed(&last, &with(Some(20_000.0))), "unmoved");
+        assert!(!load_changed(&last, &with(Some(20_040.0))), "noise");
+        assert!(load_changed(&last, &with(Some(22_000.0))), "5 % more");
+        assert!(load_changed(&last, &with(None)), "expired");
+        assert!(load_changed(&with(None), &last), "appeared");
     }
 
     /// The per-request line of a worker of several ranks carries the pin as

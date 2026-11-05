@@ -522,6 +522,14 @@ pub struct LoadSnapshot {
     pub max_running_requests: i32,
     pub token_usage: f64,
     pub gen_throughput: f64,
+    /// Computed prompt tokens per second over the recent prefill passes
+    /// (the timing model's prefill cost per pass); `None` before the first
+    /// pass that prefilled anything and again once the last one is a minute
+    /// old (`PREFILL_RATE_TTL`, applied where the engine's snapshot is read,
+    /// so an idle engine expires it too), as the servicers' trackers report
+    /// it (they want two samples within the minute, the mock reports from
+    /// its first).
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     /// Cached blocks (referenced or idle) in the KV pool.
     pub num_cached_blocks: i32,
@@ -537,7 +545,7 @@ pub struct LoadSnapshot {
 
 /// Shared state readable from the transport handlers while the actor runs.
 struct EngineShared {
-    snapshot: RwLock<LoadSnapshot>,
+    snapshot: RwLock<PublishedLoad>,
     /// Every published batch, as the publisher task releases it.
     kv_tx: broadcast::Sender<Published>,
     /// Hands batches from the actor to the publisher task with their release time.
@@ -572,6 +580,34 @@ impl EngineShared {
     fn note_output(&self) {
         let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_output_ms.store(millis, Ordering::Relaxed);
+    }
+
+    /// Publish the actor's snapshot with the time of its last prefill pass.
+    fn publish(&self, state: &SchedulerState, snapshot: LoadSnapshot) {
+        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = PublishedLoad {
+            snapshot,
+            prefill_at: state.prefill_at(),
+        };
+    }
+}
+
+/// The actor's last snapshot and when its last prefill pass ended. The actor
+/// publishes a snapshot at the end of a pass and once more when it goes
+/// idle, then builds none until its next message; the rate's expiry is
+/// applied where the snapshot is read ([`Engine::load`]), so an idle or
+/// paused engine stops reporting the rate a minute after that pass, as a
+/// servicer's tracker does once its samples expired.
+struct PublishedLoad {
+    snapshot: LoadSnapshot,
+    prefill_at: Option<Instant>,
+}
+
+impl PublishedLoad {
+    fn idle(p: &EngineParams) -> Self {
+        Self {
+            snapshot: LoadSnapshot::idle(p),
+            prefill_at: None,
+        }
     }
 }
 
@@ -736,6 +772,11 @@ fn records() -> &'static Mutex<(u64, VecDeque<RequestRecord>)> {
 
 const RECORD_CAPACITY: usize = 500_000;
 
+/// How long the last prefill pass keeps the snapshot's measured input
+/// capacity: the servicers' load trackers drop their samples after a minute,
+/// and a worker idle that long is priced by the fallback again.
+const PREFILL_RATE_TTL: Duration = Duration::from_secs(60);
+
 /// All engines registered in this process.
 pub(crate) fn fleet_engines() -> Vec<Engine> {
     fleet().lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -809,7 +850,7 @@ impl Engine {
         let (publish_tx, publish_rx) = mpsc::unbounded_channel();
         let (deliver_tx, deliver_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(EngineShared {
-            snapshot: RwLock::new(LoadSnapshot::idle(&params)),
+            snapshot: RwLock::new(PublishedLoad::idle(&params)),
             kv_tx: kv_tx.clone(),
             publish_tx,
             deliver_tx,
@@ -1112,13 +1153,30 @@ impl Engine {
         prompt_blocks(prompt_token_ids, block_size).0
     }
 
-    /// Current load snapshot.
+    /// Current load snapshot. The measured input capacity expires here, at
+    /// the read: an idle engine builds no new snapshot, and the one it
+    /// published when its last pass ended would carry that pass's rate for
+    /// as long as the engine sits idle (a paused one too), where a servicer's
+    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`).
     pub fn load(&self) -> LoadSnapshot {
-        self.shared
+        self.load_at(Instant::now())
+    }
+
+    /// [`Self::load`] as read at `now` (a test reads a minute ahead).
+    fn load_at(&self, now: Instant) -> LoadSnapshot {
+        let published = self
+            .shared
             .snapshot
             .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut snapshot = published.snapshot.clone();
+        let expired = published
+            .prefill_at
+            .is_none_or(|at| now.saturating_duration_since(at) > PREFILL_RATE_TTL);
+        if expired {
+            snapshot.prefill_throughput = None;
+        }
+        snapshot
     }
 
     /// Whether this engine emits KV-cache events.
@@ -1176,7 +1234,7 @@ async fn run(
         // When there is nothing to do, publish an idle snapshot and block on the
         // request channel — an idle engine consumes no CPU.
         if state.is_idle() {
-            *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = state.snapshot(&params);
+            shared.publish(&state, state.snapshot(&params));
             match rx.recv().await {
                 Some(msg) => handle_msg(&mut state, &shared, &params, msg),
                 None => return, // all handles dropped
@@ -1281,7 +1339,7 @@ async fn run(
         }
         shared.note_output();
         shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
-        *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = step.snapshot;
+        shared.publish(&state, step.snapshot);
     }
 }
 
@@ -1347,8 +1405,7 @@ fn handle_msg(
         EngineMsg::Abort(request_id) => {
             if let Some((tx, event)) = state.abort(&request_id, params) {
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
-                *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
-                    state.snapshot(params);
+                shared.publish(state, state.snapshot(params));
                 if params.request_overhead_ms > 0.0 {
                     // Keep the terminal event behind tokens awaiting delivery.
                     let _ = shared.deliver_tx.send((Instant::now(), tx, event));
@@ -1597,6 +1654,9 @@ struct SchedulerState {
     kv_seq: u64,
     kv_event_id: u64,
     gen_tp_ewma: f64,
+    /// Computed prompt tokens per second of the recent prefill passes and
+    /// when the last of them ran; `None` until a pass prefilled anything.
+    prefill_tp: Option<(Instant, f64)>,
     cache_hit_ewma: f64,
     preemptions: u64,
     /// A reset was requested; the next pass clears the cache and says so.
@@ -1644,6 +1704,7 @@ impl SchedulerState {
             kv_seq: 0,
             kv_event_id: 0,
             gen_tp_ewma: 0.0,
+            prefill_tp: None,
             cache_hit_ewma: 0.0,
             preemptions: 0,
             reset_pending: false,
@@ -1757,6 +1818,19 @@ impl SchedulerState {
         self.running.iter().map(|r| u64::from(r.seq_len())).sum()
     }
 
+    /// The measured input capacity while the last prefill pass is within
+    /// [`PREFILL_RATE_TTL`]: `None` before the first and after a minute idle,
+    /// as the servicers' trackers report it once their samples expired.
+    fn prefill_throughput(&self) -> Option<f64> {
+        let (at, rate) = self.prefill_tp?;
+        (Instant::now().saturating_duration_since(at) <= PREFILL_RATE_TTL).then_some(rate)
+    }
+
+    /// When the last pass that prefilled ended (the published snapshot's stamp).
+    fn prefill_at(&self) -> Option<Instant> {
+        self.prefill_tp.map(|(at, _)| at)
+    }
+
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
         let used = self.active_tokens();
         let waiting_uncached: i64 = self
@@ -1773,6 +1847,7 @@ impl SchedulerState {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: (used as f64 / p.kv_capacity_tokens.max(1) as f64).clamp(0.0, 1.0),
             gen_throughput: self.gen_tp_ewma,
+            prefill_throughput: self.prefill_throughput(),
             cache_hit_rate: self.cache_hit_ewma,
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
@@ -2072,12 +2147,27 @@ impl SchedulerState {
         if secs <= 0.0 && !self.is_idle() {
             secs = 0.001; // never busy-spin while work remains
         }
+        let duration = Duration::from_secs_f64(secs.max(0.0));
         let throughput_sample = if secs > 0.0 && decode_tokens > 0 {
             f64::from(decode_tokens) / secs
         } else {
             0.0
         };
         self.gen_tp_ewma = ewma(self.gen_tp_ewma, throughput_sample, 0.3);
+        // The pass's prefill rate: what it computed over what the timing
+        // model charged for it (a pass that prefilled nothing is no sample);
+        // an expired rate is gone, as the trackers' samples are, and the new
+        // sample starts over. The sample is stamped at the pass's end, when
+        // `run` has slept the pass's duration and publishes it: stamped at
+        // its start, a pass longer than the ttl would expire as it ended.
+        if prefill_tokens > 0 && prefill_ms > 0.0 {
+            let sample = f64::from(prefill_tokens) / (prefill_ms / 1000.0);
+            let rate = match self.prefill_throughput() {
+                Some(prev) => ewma(prev, sample, 0.3),
+                None => sample,
+            };
+            self.prefill_tp = Some((Instant::now() + duration, rate));
+        }
 
         let batch = if kv.is_empty() {
             None
@@ -2096,7 +2186,7 @@ impl SchedulerState {
         };
 
         Step {
-            duration: Duration::from_secs_f64(secs.max(0.0)),
+            duration,
             sends,
             batch,
             snapshot: self.snapshot(p),
@@ -2390,6 +2480,7 @@ impl LoadSnapshot {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: 0.0,
             gen_throughput: 0.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.0,
             num_cached_blocks: 0,
             num_preemptions: 0,
@@ -2561,6 +2652,55 @@ mod tests {
         assert_ne!(
             cold, different,
             "the partial tail participates in output identity"
+        );
+    }
+
+    /// The snapshot's prefill rate: none before any pass prefilled, then
+    /// the computed tokens over the timing model's cost of the pass (what a
+    /// servicer measures of its engine), unmoved by a pass that decodes
+    /// alone, gone once the last prefill pass is a minute old, and started
+    /// over (not averaged with the stale figure) by the next.
+    #[test]
+    fn the_snapshot_reports_the_prefill_rate_of_the_passes_it_ran() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "no pass yet");
+        let (r, _rx) = req("prefill", vec![7; 256], 4);
+        st.enqueue(r, &p);
+        let before = Instant::now();
+        let step = st.step(&p);
+        assert!(
+            st.prefill_at().expect("a stamp") >= before + step.duration,
+            "the sample is stamped at the pass's end, not its start"
+        );
+        let rate = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("one pass prefilled");
+        let expected = 256.0 / (p.timing.prefill_pass_ms(256, 256) / 1000.0);
+        assert!((rate - expected).abs() < 1e-6, "{rate} vs {expected}");
+        st.step(&p);
+        assert_eq!(
+            st.snapshot(&p).prefill_throughput,
+            Some(rate),
+            "a decode-only pass is no prefill sample"
+        );
+        let stale = Instant::now()
+            .checked_sub(PREFILL_RATE_TTL + Duration::from_secs(1))
+            .expect("a clock older than the ttl");
+        st.prefill_tp = st.prefill_tp.map(|(_, rate)| (stale, rate));
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "a minute idle");
+        let (r, _rx) = req("again", vec![9; 128], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let restarted = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("the next pass that prefilled");
+        let expected = 128.0 / (p.timing.prefill_pass_ms(128, 128) / 1000.0);
+        assert!(
+            (restarted - expected).abs() < 1e-6,
+            "{restarted} vs {expected}: not averaged with the stale rate"
         );
     }
 
@@ -3206,6 +3346,7 @@ mod tests {
             max_running_requests: 128,
             token_usage: 0.59,
             gen_throughput: 3_000.0,
+            prefill_throughput: Some(20_000.0),
             cache_hit_rate: 0.4,
             num_cached_blocks: 42_000,
             num_preemptions: 0,
@@ -3225,6 +3366,11 @@ mod tests {
             "no queued token-work or used-token count"
         );
         assert_eq!((v.gen_throughput, v.cache_hit_rate), (0.0, 0.0));
+        assert_eq!(
+            v.prefill_throughput,
+            Some(20_000.0),
+            "the measured prefill capacity is reported on every shape"
+        );
         assert_eq!("vllm".parse::<LoadsLike>(), Ok(LoadsLike::Vllm));
         assert!("other".parse::<LoadsLike>().is_err());
     }
@@ -3606,6 +3752,50 @@ mod tests {
             .ok()
             .flatten()
             .and_then(Result::ok)
+    }
+
+    /// The published rate expires at the read: an idle engine builds no new
+    /// snapshot after the one it published when its last pass ended, so the
+    /// poll (`Engine::load`, what `GetLoads`, `/v1/loads` and the pushed
+    /// record read) applies the ttl itself, as the trackers' expiry would.
+    #[tokio::test]
+    async fn an_idle_engine_stops_reporting_its_prefill_rate_at_the_read() {
+        let engine = live();
+        let mut rx = submit(&engine, "one", vec![7; 256]);
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The pass's snapshot is published after its events are sent.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rate = loop {
+            if let Some(rate) = engine.load().prefill_throughput {
+                break rate;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pass's rate was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(rate > 0.0, "{rate}");
+        let within = Instant::now() + PREFILL_RATE_TTL - Duration::from_secs(1);
+        assert_eq!(
+            engine.load_at(within).prefill_throughput,
+            Some(rate),
+            "within the minute the published rate stands"
+        );
+        let later = Instant::now() + PREFILL_RATE_TTL + Duration::from_secs(1);
+        assert_eq!(
+            engine.load_at(later).prefill_throughput,
+            None,
+            "a minute idle, with no new snapshot, reads none"
+        );
+        assert_eq!(engine.load().num_running_reqs, 0, "the engine is idle");
     }
 
     #[tokio::test]

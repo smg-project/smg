@@ -145,7 +145,7 @@ impl SglangScheduler for MockScheduler {
                 max_total_num_tokens: s.max_total_num_tokens,
                 token_usage: s.token_usage,
                 gen_throughput: s.gen_throughput,
-                prefill_throughput: None,
+                prefill_throughput: s.prefill_throughput,
                 cache_hit_rate: s.cache_hit_rate,
                 utilization: s.token_usage,
                 max_running_requests: s.max_running_requests,
