@@ -2,8 +2,9 @@
 //! for each policy, what the host pays to gather the inputs from a 128-worker overlap map
 //! before calling it, what one least-load decision pays over a fed pool (the expected-wait
 //! scorer that least_load, power_of_two and cache-aware share), what one request pays inside
-//! the two ring policies over a ready pool with its ring, and what one pick of the simple
-//! policies (power_of_two, random, round_robin, passthrough) pays over the same pool.
+//! the two ring policies over a ready pool with its ring, what one pick of the simple
+//! policies (power_of_two, random, round_robin, passthrough) pays over the same pool, and what
+//! a keyed request pays for a sticky hit, under the routing-key override and in the manual policy.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -16,11 +17,12 @@ use std::{collections::HashMap, hint::black_box, sync::Arc};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
+    config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PassthroughPolicy,
-        PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
-        SelectWorkerInfo,
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualPolicy,
+        PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+        RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
@@ -293,12 +295,86 @@ fn bench_simple_policy_pick(c: &mut Criterion) {
     group.finish();
 }
 
+/// `workers` ready regular workers (no health checker behind them).
+fn ready_pool(workers: usize) -> Vec<Arc<dyn Worker>> {
+    (0..workers)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://worker-{i:03}:8000"))
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect()
+}
+
+/// A keyed hit over a ready pool: sixteen conversations pinned once, then one request per
+/// iteration under a key already pinned, through the routing-key override (delegating its
+/// assignments to a round-robin registry) and through the manual policy on its own.
+fn bench_keyed_sticky_hit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("keyed_sticky/hit");
+    let keys: Vec<String> = (0..16).map(|i| format!("conversation-{i:04}")).collect();
+    for workers in [8, 32, 128] {
+        let pool = ready_pool(workers);
+        let model_id = pool[0].model_id().to_string();
+        let registry = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..Default::default()
+            },
+        );
+        let policy = registry.get_default_policy();
+        let manual = ManualPolicy::new();
+        let infos: Vec<SelectWorkerInfo> = keys
+            .iter()
+            .map(|key| SelectWorkerInfo {
+                rid_key: Some(key),
+                ..Default::default()
+            })
+            .collect();
+        for info in &infos {
+            black_box(registry.select_worker_for_model(&policy, &model_id, &pool, info));
+            black_box(manual.select_worker(&pool, info));
+        }
+        group.throughput(Throughput::Elements(1));
+        let mut next = 0usize;
+        group.bench_with_input(BenchmarkId::new("override", workers), &workers, |b, _| {
+            b.iter(|| {
+                let info = &infos[next % infos.len()];
+                next += 1;
+                black_box(registry.select_worker_for_model(
+                    &policy,
+                    &model_id,
+                    black_box(&pool),
+                    black_box(info),
+                ))
+            });
+        });
+        let mut next = 0usize;
+        group.bench_with_input(BenchmarkId::new("manual", workers), &workers, |b, _| {
+            b.iter(|| {
+                let info = &infos[next % infos.len()];
+                next += 1;
+                black_box(manual.select_worker(black_box(&pool), black_box(info)))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_select,
     bench_gather_and_select,
     bench_least_load_decision,
     bench_ring_policies,
-    bench_simple_policy_pick
+    bench_simple_policy_pick,
+    bench_keyed_sticky_hit
 );
 criterion_main!(benches);
