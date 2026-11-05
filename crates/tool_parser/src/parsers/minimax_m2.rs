@@ -23,7 +23,7 @@ use crate::{
 /// - Parameters as `<parameter name="key">value</parameter>`
 /// - Incremental JSON streaming for parameters
 ///
-/// Reference: https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default
+/// Reference: <https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default>
 pub struct MinimaxM2Parser {
     // Regex patterns
     tool_call_extractor: Regex,

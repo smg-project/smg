@@ -20,6 +20,16 @@ async fn main() -> ExitCode {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    // Help goes to stdout and succeeds, so `mock-worker --help` also shows
+    // that the binary runs.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        println!("{}", mock_worker::config::usage());
+        return ExitCode::SUCCESS;
+    }
+
     let cfg = match Config::from_args() {
         Ok(cfg) => Arc::new(cfg),
         Err(message) => {
@@ -38,6 +48,21 @@ async fn main() -> ExitCode {
                 path.display()
             );
             return ExitCode::from(2);
+        }
+    }
+
+    // A script file that cannot be read or holds a bad line is a config
+    // error too: checked once here, loaded for every worker.
+    if let Some(path) = &cfg.replay.script {
+        match mock_worker::script::load(path) {
+            Ok(answers) => tracing::info!(
+                "mock-worker: {answers} scripted answers from {}",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("mock-worker: cannot load script: {e}");
+                return ExitCode::from(2);
+            }
         }
     }
 

@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError, Weak},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     time::Duration,
 };
 
@@ -17,7 +17,35 @@ use crate::config::RouterConfig;
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// The connect timeout every gateway HTTP client starts from (the worker
+/// clients and the shared external-provider client), clamped below the
+/// request timeout by [`connect_timeout_secs_below`].
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// The connect timeout a client may use under `request_timeout_secs`: the
+/// requested `connect_timeout_secs`, clamped to one second below the request
+/// timeout. A total timeout that runs out while the connect is still pending
+/// reads as the request's own (`retry::is_request_timeout`: terminal for the
+/// retry layer), so a host that has gone dark must fail as a connect timeout
+/// first, which the retry layer routes around; with the defaults (10 s
+/// against 1800 s) nothing changes. Whole seconds cannot go below one: a
+/// request timeout of 1 s (or 0) keeps a 1 s connect timeout, and the two
+/// timers race there. Every client the gateway builds with a request timeout
+/// takes its connect timeout from here (the worker clients through
+/// [`WorkerHttpClientCache`], the shared client for external providers in
+/// `AppContext::with_client`), so the two cannot drift.
+pub(crate) const fn connect_timeout_secs_below(
+    connect_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> u64 {
+    let below = request_timeout_secs.saturating_sub(1);
+    let floor = if below < 1 { 1 } else { below };
+    if connect_timeout_secs < floor {
+        connect_timeout_secs
+    } else {
+        floor
+    }
+}
 
 /// HTTP/2 tuning for `--upstream-http2`, applied to every worker client under
 /// the flag; only the prior-knowledge bucket forces h2 on cleartext.
@@ -44,6 +72,10 @@ fn tune_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 /// process-constant, so they apply to every entry instead of keying it.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ClientKey {
+    /// Below `timeout_secs` where whole seconds allow it
+    /// ([`connect_timeout_secs_below`]): the connect phase times out as a
+    /// connect failure, not as the request's own timeout, except under a 1 s
+    /// request timeout, where the two timers race.
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
     /// `0` keeps idle connections indefinitely.
@@ -100,19 +132,24 @@ impl WorkerHttpClientCache {
     }
 
     fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
-        ClientKey {
-            connect_timeout_secs: pool_config
+        let timeout_secs = pool_config
+            .timeout_secs
+            .unwrap_or(self.request_timeout_secs);
+        let connect_timeout_secs = connect_timeout_secs_below(
+            pool_config
                 .connect_timeout_secs
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            timeout_secs,
+        );
+        ClientKey {
+            connect_timeout_secs,
             pool_max_idle_per_host: pool_config
                 .pool_max_idle_per_host
                 .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
             pool_idle_timeout_secs: pool_config
                 .pool_idle_timeout_secs
                 .unwrap_or(self.pool_idle_timeout_secs),
-            timeout_secs: pool_config
-                .timeout_secs
-                .unwrap_or(self.request_timeout_secs),
+            timeout_secs,
             http2,
         }
     }
@@ -150,7 +187,7 @@ impl WorkerHttpClientCache {
             .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
         let make_builder = || {
-            let mut builder = crate::http_client::client_builder()
+            let mut builder = crate::clients::http_client_builder()
                 .pool_max_idle_per_host(key.pool_max_idle_per_host)
                 .pool_idle_timeout(pool_idle_timeout)
                 .timeout(Duration::from_secs(key.timeout_secs))
@@ -260,6 +297,59 @@ fn describe(error: &(dyn std::error::Error + 'static)) -> String {
         );
     }
     text
+}
+
+/// A worker's HTTP client handle, materialized on first use.
+///
+/// Registration hands in a shared client from the worker client cache. A
+/// worker built without one whose connection mode never speaks HTTP (ZMQ:
+/// local health check, admin ops rejected up front) would otherwise pay for a
+/// connector and idle pool it can never use, so the fallback client is built
+/// only when a caller actually asks for it.
+pub struct LazyHttpClient {
+    cell: OnceLock<Arc<reqwest::Client>>,
+}
+
+impl LazyHttpClient {
+    /// Wrap an already-built client (the registration paths hand one in).
+    /// The strong handle is what keeps the client's cache entry alive.
+    pub fn ready(client: Arc<reqwest::Client>) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(client);
+        Self { cell }
+    }
+
+    /// Defer construction until [`Self::client`] is first called.
+    pub fn deferred() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    /// Whether the client is still unbuilt (test-only observation of laziness).
+    #[cfg(test)]
+    pub(crate) fn cell_is_empty(&self) -> bool {
+        self.cell.get().is_none()
+    }
+
+    /// The client, building the default one on first use. The fallback sets
+    /// no total timeout: dispatch deadlines come from the router config via
+    /// the client cache, and every health/admin call site sets its own.
+    pub fn client(&self) -> &reqwest::Client {
+        self.init()
+    }
+
+    /// A strong handle to the client if one was materialized, for a
+    /// replacement worker to adopt. Never forces the lazy cell: a worker
+    /// that never spoke HTTP hands its replacement a still-deferred slot.
+    pub fn handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.cell.get().map(Arc::clone)
+    }
+
+    fn init(&self) -> &Arc<reqwest::Client> {
+        self.cell
+            .get_or_init(|| Arc::new(crate::clients::http_client()))
+    }
 }
 
 /// Test support: run one `#[test]` of this binary in a child process whose
@@ -432,6 +522,84 @@ mod tests {
             axum::serve(listener, app).await.expect("echo serve");
         });
         format!("http://{addr}/probe")
+    }
+
+    /// The connect timeout never reaches the request timeout where whole
+    /// seconds allow it: a request timeout of 2 s clamps the default 10 s
+    /// connect timeout to 1 s, a worker's own 30 s request timeout leaves it
+    /// at 10 s, and an explicit connect timeout above the request timeout is
+    /// clamped the same way, so a host that has gone dark fails as a connect
+    /// timeout (routed around) before the request's own timeout (terminal)
+    /// can fire; a 1 s request timeout keeps the 1 s floor (the two timers
+    /// race there), as the helper's doc says.
+    #[test]
+    fn connect_timeout_stays_below_the_request_timeout() {
+        assert_eq!(connect_timeout_secs_below(10, 1800), 10);
+        assert_eq!(connect_timeout_secs_below(10, 2), 1);
+        assert_eq!(connect_timeout_secs_below(3, 2), 1);
+        assert_eq!(connect_timeout_secs_below(10, 1), 1, "the floor");
+        assert_eq!(connect_timeout_secs_below(10, 0), 1, "the floor");
+        assert_eq!(connect_timeout_secs_below(10, 11), 10);
+        assert_eq!(connect_timeout_secs_below(10, 10), 9);
+        let floor = cache(RouterConfig {
+            request_timeout_secs: 1,
+            ..RouterConfig::default()
+        });
+        assert_eq!(
+            floor
+                .key(
+                    &HttpPoolConfig {
+                        timeout_secs: Some(1),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            1
+        );
+        let short = cache(RouterConfig {
+            request_timeout_secs: 2,
+            ..RouterConfig::default()
+        });
+        assert_eq!(
+            short
+                .key(&HttpPoolConfig::default(), false)
+                .connect_timeout_secs,
+            1
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        timeout_secs: Some(30),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        connect_timeout_secs: Some(3),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            1
+        );
+        let long = cache(RouterConfig {
+            request_timeout_secs: 1800,
+            ..RouterConfig::default()
+        });
+        let key = long.key(&HttpPoolConfig::default(), false);
+        assert_eq!(
+            (key.connect_timeout_secs, key.timeout_secs),
+            (DEFAULT_CONNECT_TIMEOUT_SECS, 1800)
+        );
     }
 
     #[test]

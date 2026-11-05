@@ -1,22 +1,31 @@
 //! Common test utilities for tokenizer tests
 #![allow(dead_code)] // each integration test binary uses a subset of these helpers
 
+pub mod counting_alloc;
+pub mod hub_fetch;
+
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
 };
 
 use rustls::crypto::ring;
+use tokenizers::{
+    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    models::bpe::{Merges, Vocab, BPE},
+    pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
+    processors::byte_level::ByteLevel as ByteLevelProcessor,
+    AddedToken, Tokenizer,
+};
 
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
     "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
+/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
+/// standing in for the hub.
+const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
 const CACHE_DIR: &str = ".tokenizer_cache";
 const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
-
-// Global mutex to prevent concurrent downloads
-static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// The blocking HTTP client of the download helpers. The client takes the
 /// process-level TLS crypto provider (reqwest's `rustls-no-provider`
@@ -42,62 +51,16 @@ pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
 }
 
-/// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
-/// Returns the path to the cached tokenizer file.
-///
-/// This function is thread-safe and will only download the tokenizer once
-/// even if called from multiple threads concurrently.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+/// The TinyLlama tokenizer file, downloaded into the cache once per process
+/// unless it is there already ([`hub_fetch::cached_download`]: one download
+/// at a time, a rate-limited hub waited out, a lock a failed download left
+/// poisoned taken back). Returns the path to the cached tokenizer file.
 pub fn ensure_tokenizer_cached() -> PathBuf {
-    // Get or initialize the mutex
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-
-    // Lock to ensure only one thread downloads at a time
-    let _guard = mutex.lock().unwrap();
-
-    let cache_dir = PathBuf::from(CACHE_DIR);
-    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
-
-    // Create cache directory if it doesn't exist
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-    }
-
-    // Download tokenizer if not already cached
-    if !tokenizer_path.exists() {
-        println!("Downloading TinyLlama tokenizer from HuggingFace...");
-
-        // Use blocking reqwest client since we're in tests/benchmarks
-        let client = http_client();
-        let response = client
-            .get(TINYLLAMA_TOKENIZER_URL)
-            .send()
-            .expect("Failed to download tokenizer");
-
-        assert!(
-            response.status().is_success(),
-            "Failed to download tokenizer: HTTP {}",
-            response.status()
-        );
-
-        let content = response.bytes().expect("Failed to read tokenizer content");
-
-        assert!(
-            content.len() >= 100,
-            "Downloaded content too small: {} bytes",
-            content.len()
-        );
-
-        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
-        println!(
-            "Tokenizer downloaded and cached successfully ({} bytes)",
-            tokenizer_path.metadata().unwrap().len()
-        );
-    }
-
-    tokenizer_path
+    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
+        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
+    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
+    hub_fetch::cached_download(&http_client(), &url, &path, 100);
+    path
 }
 
 /// Common test prompts for consistency across tests
@@ -126,7 +89,6 @@ const KIMI_K3_CACHE_DIR: &str = ".tokenizer_cache/kimi_k3";
 /// `KIMI_K3_MODEL_DIR` points at a full checkpoint directory and skips the
 /// download; otherwise the two tokenizer files are fetched once from the
 /// public repository into `.tokenizer_cache/kimi_k3/`.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
 #[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[expect(clippy::panic, reason = "test helper — panics are intentional")]
@@ -135,8 +97,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(KIMI_K3_CACHE_DIR);
     if !cache_dir.exists() {
@@ -153,16 +114,14 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         }
         println!("Downloading Kimi-K3 {file} from HuggingFace...");
         let client = http_client();
-        let response = client
-            .get(format!("{KIMI_K3_REPO}/{file}"))
-            .send()
+        let answer = hub_fetch::fetch(&client, &format!("{KIMI_K3_REPO}/{file}"))
             .unwrap_or_else(|e| panic!("Failed to download {file}: {e}"));
         assert!(
-            response.status().is_success(),
+            answer.status.is_success(),
             "Failed to download {file}: HTTP {}",
-            response.status()
+            answer.status
         );
-        let content = response.bytes().expect("Failed to read download");
+        let content = answer.body;
         assert!(
             content.len() >= min_bytes,
             "Downloaded {file} too small: {} bytes",
@@ -196,11 +155,13 @@ const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 /// Downloads one tokenizer file of the model `label` from `base` into
 /// `dir/file`, mirroring the Kimi-K3 helper's approach: write to a `.part`
 /// file and rename into place, so a failed write never leaves a short file
-/// that a later run would trust. Only a transport failure (no connection,
-/// TLS, timeout) returns `false` so the caller can skip when offline; a
-/// reachable but wrong response (non-success status, short body) or an
-/// unwritable cache panics with the reason, so a moved or gated file fails
-/// loudly instead of silently disabling the parity gate.
+/// that a later run would trust. Only a transport failure that no try got
+/// past (no connection, TLS, a timeout before the answer; the GET is sent
+/// again a few times first) returns `false` so the caller can skip when
+/// offline; a reachable but wrong response (non-success status, short body,
+/// a body broken at every try) or an unwritable cache panics with the reason,
+/// so a moved or gated file fails loudly instead of silently disabling the
+/// parity gate.
 #[expect(
     clippy::print_stdout,
     clippy::panic,
@@ -216,21 +177,20 @@ fn download_tokenizer_file(
     println!("Downloading {label} {file} from HuggingFace...");
     let client = http_client();
     let url = format!("{base}/{file}");
-    let response = match client.get(&url).send() {
-        Ok(response) => response,
-        Err(error) => {
+    let answer = match hub_fetch::fetch(&client, &url) {
+        Ok(answer) => answer,
+        Err(error) if !hub_fetch::answered(&error) => {
             println!("{label} download skipped (transport error): {error}");
             return false;
         }
+        Err(error) => panic!("{label} {file} download body error: {error}"),
     };
-    let status = response.status();
+    let status = answer.status;
     assert!(
         status.is_success(),
         "{label} {file} download failed: HTTP {status} from {url}"
     );
-    let content = response
-        .bytes()
-        .unwrap_or_else(|error| panic!("{label} {file} download body error: {error}"));
+    let content = answer.body;
     assert!(
         content.len() >= min_bytes,
         "{label} {file} download is {} bytes, expected at least {min_bytes}",
@@ -247,6 +207,8 @@ fn download_tokenizer_file(
 /// A directory holding the DeepSeek-V4.1-Flash tokenizer files
 /// (`tokenizer.json`, `tokenizer_config.json`) plus a minimal `config.json`
 /// naming the architecture so renderer detection selects DeepSeek-V4.1.
+/// Without the checkpoint's `encoding/` directory the renderer uses the
+/// rescaled effort table the checkpoint carries today.
 ///
 /// `DEEPSEEK_V41_MODEL_DIR` points at a full checkpoint directory and skips
 /// the download; otherwise the two tokenizer files are fetched once from the
@@ -254,18 +216,13 @@ fn download_tokenizer_file(
 /// only when offline (the repository is unreachable) and no override is set;
 /// a local failure (unwritable cache directory or file) panics so the parity
 /// gate cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DEEPSEEK_V41_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(DEEPSEEK_V41_CACHE_DIR);
     if !cache_dir.exists() {
@@ -323,18 +280,13 @@ const DEEPSEEK_V4_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v4";
 /// only when offline (the repository is unreachable) and no override is set;
 /// a local failure (unwritable cache directory or file) panics so the parity
 /// gate cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_deepseek_v4_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DEEPSEEK_V4_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(DEEPSEEK_V4_CACHE_DIR);
     if !cache_dir.exists() {
@@ -381,18 +333,13 @@ const MINIMAX_M3_CACHE_DIR: &str = ".tokenizer_cache/minimax_m3";
 /// offline (the repository is unreachable) and no override is set; a local
 /// failure (unwritable cache directory or file) panics so the parity gate
 /// cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MINIMAX_M3_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(MINIMAX_M3_CACHE_DIR);
     if !cache_dir.exists() {
@@ -415,3 +362,111 @@ pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
 
     Some(cache_dir)
 }
+
+/// The 256 characters a byte-level BPE spells its bytes with: the printable
+/// bytes as themselves, the others from U+0100 on.
+#[expect(
+    clippy::expect_used,
+    reason = "every byte maps to a scalar value; a helper of tests that stop on a broken setup"
+)]
+pub fn byte_level_alphabet() -> Vec<char> {
+    let mut next = 0x100;
+    (0u32..256)
+        .map(|byte| {
+            let printable = (0x21..=0x7E).contains(&byte)
+                || (0xA1..=0xAC).contains(&byte)
+                || (0xAE..=0xFF).contains(&byte);
+            let code = if printable {
+                byte
+            } else {
+                next += 1;
+                next - 1
+            };
+            char::from_u32(code).expect("a character of the byte-level alphabet")
+        })
+        .collect()
+}
+
+/// Seven merges of a small byte-level BPE: `the` and ` the` (the space as
+/// the byte-level `Ġ`), and `llo`.
+pub const FEW_MERGES: [(&str, &str); 7] = [
+    ("t", "h"),
+    ("th", "e"),
+    ("Ġ", "t"),
+    ("Ġt", "h"),
+    ("Ġth", "e"),
+    ("l", "l"),
+    ("ll", "o"),
+];
+
+/// A byte-level BPE of the common shape: the byte-level alphabet as the
+/// vocabulary, `merges` applied in order (each merged pair added to the
+/// vocabulary), the byte-level pre-tokenizer without a prefix space, the
+/// byte-level decoder and post-processor (which adds no token), and
+/// `special_tokens` in the added vocabulary.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of tests that stop on a broken setup"
+)]
+pub fn byte_level_bpe(merges: &[(&str, &str)], special_tokens: &[&str]) -> Tokenizer {
+    let mut vocab = Vocab::default();
+    for (id, letter) in byte_level_alphabet().into_iter().enumerate() {
+        vocab.insert(letter.to_string(), id as u32);
+    }
+    let mut merged = Merges::new();
+    for (a, b) in merges {
+        let next = vocab.len() as u32;
+        vocab.insert(format!("{a}{b}"), next);
+        merged.push((a.to_string(), b.to_string()));
+    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merged)
+        .build()
+        .expect("a byte-level BPE");
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(
+        ByteLevelPreTokenizer::default().add_prefix_space(false),
+    ));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
+    tokenizer
+        .add_special_tokens(
+            special_tokens
+                .iter()
+                .map(|token| AddedToken::from(*token, true)),
+        )
+        .expect("the special tokens");
+    tokenizer
+}
+
+/// A minimal tokenizer.json that loads cleanly: a one-word BPE vocabulary. The only
+/// requirement is that it parses; the renderers under test do not call back into it.
+pub const MIN_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": { "type": "Whitespace" },
+    "post_processor": null,
+    "decoder": null,
+    "model": { "type": "BPE", "vocab": { "hello": 0 }, "merges": [] }
+}"#;
+
+/// [`MIN_TOKENIZER_JSON`] with `<s>` and `</s>` in its vocabulary, for the renderers
+/// that look the sentinels up.
+pub const MIN_TOKENIZER_JSON_WITH_SENTINELS: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": { "type": "Whitespace" },
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+        "type": "BPE",
+        "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
+        "merges": []
+    }
+}"#;

@@ -5,9 +5,9 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
-    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
+    AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
+    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig,
     RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
@@ -70,30 +70,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// With separate policies
-    pub fn prefill_decode_mode_with_policies(
-        mut self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-        prefill_policy: Option<PolicyConfig>,
-        decode_policy: Option<PolicyConfig>,
-    ) -> Self {
-        self.config.mode = RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-        };
-        self
-    }
-
     pub fn openai_mode(mut self, worker_urls: Vec<String>) -> Self {
         self.config.mode = RoutingMode::OpenAI { worker_urls };
-        self
-    }
-
-    pub fn gemini_mode(mut self, worker_urls: Vec<String>) -> Self {
-        self.config.mode = RoutingMode::Gemini { worker_urls };
         self
     }
 
@@ -132,23 +110,13 @@ impl RouterConfigBuilder {
         eviction_interval_secs: u64,
         max_tree_size: usize,
     ) -> Self {
-        self.config.policy = PolicyConfig::CacheAware {
+        self.config.policy = PolicyConfig::cache_aware(
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: CacheIndexKind::Tree,
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-        };
+        );
         self
     }
 
@@ -180,11 +148,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn http_connection(mut self) -> Self {
-        self.config.connection_mode = ConnectionMode::Http;
-        self
-    }
-
     pub fn grpc_connection(mut self) -> Self {
         self.config.connection_mode = ConnectionMode::Grpc;
         self
@@ -202,6 +165,12 @@ impl RouterConfigBuilder {
 
     pub fn health_check_port(mut self, health_check_port: Option<u16>) -> Self {
         self.config.health_check_port = health_check_port;
+        self
+    }
+
+    /// Set optional per-role capacity thresholds for PD/EPD readiness.
+    pub fn pd_readiness(mut self, pd_readiness: Option<PdReadinessConfig>) -> Self {
+        self.config.pd_readiness = pd_readiness;
         self
     }
 
@@ -267,6 +236,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The bound on a request to a gRPC worker, from its dispatch to its last
+    /// message; `0` arms no deadline.
+    pub fn grpc_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.grpc_request_timeout_secs = secs;
+        self
+    }
+
     pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
         self.config.sse_keepalive_secs = secs;
         self
@@ -274,6 +250,11 @@ impl RouterConfigBuilder {
 
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
+        self
+    }
+
+    pub fn zmq_startup_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.zmq_startup_timeout_secs = timeout;
         self
     }
 
@@ -363,23 +344,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn kv_indexer_ttl_secs(mut self, ttl: Option<u64>) -> Self {
-        self.config.kv_indexer_ttl_secs = ttl;
-        self
-    }
-
-    pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
-        self.config.kv_indexer_max_entries = max;
-        self
-    }
-
-    /// Deprecated: the chain index is the only KV index; `chain` is accepted
-    /// and changes nothing, `positional` fails validation.
-    pub fn kv_index(mut self, kind: Option<String>) -> Self {
-        self.config.kv_index = kind;
-        self
-    }
-
     pub fn engine_metrics(mut self, enabled: bool) -> Self {
         self.config.engine_metrics = enabled;
         self
@@ -418,6 +382,18 @@ impl RouterConfigBuilder {
     /// Host-DRAM budget (MiB) for router-side preprocessed media.
     pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
         self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Image/audio download timeout in milliseconds; unset uses env/default.
+    pub fn mm_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_fetch_timeout_ms = timeout;
+        self
+    }
+
+    /// Video download timeout in milliseconds; unset uses env/default.
+    pub fn mm_video_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_video_fetch_timeout_ms = timeout;
         self
     }
 
@@ -471,12 +447,6 @@ impl RouterConfigBuilder {
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
         self.config.max_concurrent_requests = max;
-        self
-    }
-
-    /// Remove the in-flight bound entirely (`max_concurrent_requests = 0`).
-    pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = 0;
         self
     }
 
@@ -567,11 +537,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn add_cors_origin<S: Into<String>>(mut self, origin: S) -> Self {
-        self.config.cors_allowed_origins.push(origin.into());
-        self
-    }
-
     // ==================== Retry ====================
 
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
@@ -584,11 +549,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn enable_retries(mut self) -> Self {
-        self.config.disable_retries = false;
-        self
-    }
-
     // ==================== Circuit Breaker ====================
 
     pub fn circuit_breaker_config(mut self, circuit_breaker: CircuitBreakerConfig) -> Self {
@@ -598,11 +558,6 @@ impl RouterConfigBuilder {
 
     pub fn disable_circuit_breaker(mut self) -> Self {
         self.config.disable_circuit_breaker = true;
-        self
-    }
-
-    pub fn enable_circuit_breaker(mut self) -> Self {
-        self.config.disable_circuit_breaker = false;
         self
     }
 
@@ -642,14 +597,6 @@ impl RouterConfigBuilder {
         self.config.trace_config = Some(TraceConfig {
             enable_trace: true,
             otlp_traces_endpoint: endpoint.into(),
-        });
-        self
-    }
-
-    pub fn disable_trace(mut self) -> Self {
-        self.config.trace_config = Some(TraceConfig {
-            enable_trace: false,
-            otlp_traces_endpoint: String::new(),
         });
         self
     }
@@ -696,12 +643,6 @@ impl RouterConfigBuilder {
 
     pub fn enable_igw(mut self) -> Self {
         self.config.enable_igw = true;
-        self
-    }
-
-    /// Use proxy mode
-    pub fn disable_igw(mut self) -> Self {
-        self.config.enable_igw = false;
         self
     }
 
@@ -762,25 +703,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn memory_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::Memory;
-        self
-    }
-
-    pub fn no_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::None;
-        self
-    }
-
     pub fn oracle_history(mut self, oracle_config: OracleConfig) -> Self {
         self.config.history_backend = HistoryBackend::Oracle;
         self.config.oracle = Some(oracle_config);
-        self
-    }
-
-    pub fn redis_history(mut self, redis_config: RedisConfig) -> Self {
-        self.config.history_backend = HistoryBackend::Redis;
-        self.config.redis = Some(redis_config);
         self
     }
 
@@ -800,18 +725,6 @@ impl RouterConfigBuilder {
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
         self.config.tokenizer_cache = cache;
-        self
-    }
-
-    // ==================== Data Parallelism ====================
-
-    pub fn enable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = true;
-        self
-    }
-
-    pub fn disable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = false;
         self
     }
 
@@ -913,13 +826,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn maybe_tenant_header_name(mut self, header_name: Option<impl Into<String>>) -> Self {
-        if let Some(header_name) = header_name {
-            self.config.tenant_resolution.tenant_header_name = header_name.into();
-        }
-        self
-    }
-
     pub fn maybe_rate_limit_tokens_per_second(mut self, tokens: Option<i32>) -> Self {
         self.config.rate_limit_tokens_per_second = tokens;
         self
@@ -982,17 +888,6 @@ impl RouterConfigBuilder {
 
     // ==================== mTLS ====================
 
-    /// Both paths must be provided together. Files read during build()
-    pub fn client_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.client_cert_path = Some(cert_path.into());
-        self.client_key_path = Some(key_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn maybe_client_cert_and_key(
         mut self,
@@ -1004,12 +899,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// File read during build()
-    pub fn add_ca_certificate<S: Into<String>>(mut self, ca_cert_path: S) -> Self {
-        self.ca_cert_paths.push(ca_cert_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn add_ca_certificates<S: Into<String>>(mut self, ca_cert_paths: Vec<S>) -> Self {
         self.ca_cert_paths
@@ -1018,17 +907,6 @@ impl RouterConfigBuilder {
     }
 
     // ==================== Server TLS ====================
-
-    /// Both paths must be provided together. Files read during build()
-    pub fn server_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.server_cert_path = Some(cert_path.into());
-        self.server_key_path = Some(key_path.into());
-        self
-    }
 
     /// Files read during build()
     pub fn maybe_server_cert_and_key(

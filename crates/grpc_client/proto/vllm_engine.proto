@@ -20,6 +20,12 @@ service VllmEngine {
   // Invalidate the local KV prefix cache without preempting requests.
   rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
 
+  // Start the engine's profiler (configured at its launch) on every rank
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export its traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
@@ -77,6 +83,13 @@ message SamplingParams {
   bool include_stop_str_in_output = 25;  // Whether to include stop strings in output
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
+  // The constraint starts at the first generated token whatever reasoning
+  // parser the engine runs: the gateway led it with the model's thought and
+  // its close for a worker whose grammar starts there, so an engine that holds
+  // a grammar back until its reasoning parser has seen the close starts this
+  // one at once (vLLM: the request's `reasoning_ended`). Unset for a
+  // constraint the gateway did not shape, which starts where the engine does.
+  bool grammar_from_first_token = 28;
 
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {
@@ -170,8 +183,8 @@ message MultimodalInputs {
 }
 
 // One media item the worker fetches and processes itself. `url` is forwarded
-// verbatim from the API request: http(s)://, data:<mime>;base64,..., or
-// file://. The worker's MediaConnector applies --allowed-media-domains /
+// verbatim from the API request: `http(s)://`, `data:<mime>;base64,...`, or
+// `file://`. The worker's MediaConnector applies --allowed-media-domains /
 // --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
 message MediaRef {
   smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
@@ -496,6 +509,17 @@ message GetServerInfoResponse {
   // holds each item to; the worker-side pipeline takes the same number from
   // its launcher.
   int32 mm_encoder_budget = 25;
+
+  // The vocabulary of structural-tag nodes the engine's grammar compiler
+  // takes: "older" when the xgrammar installed beside the engine predates the
+  // `optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release
+  // with them) and refuses a tag that carries one at compile time; "" for a
+  // current one, another backend, or nothing known. Flattened into the
+  // `structural_tag_vocabulary` worker label, by which the router spells such
+  // a worker's structural tags without `optional`, `plus` and `star`, the same
+  // language; a `token` node stays as derived, so a table that writes
+  // single-token markers still meets the older compiler's refusal.
+  string structural_tag_vocabulary = 26;
 }
 
 // =====================
@@ -540,8 +564,9 @@ message SchedulerLoad {
   double utilization = 10;
   int32 max_running_requests = 11;
   // Queued token-work: prompt tokens of waiting requests not served from the
-  // prefix cache, what the gateway's expected-wait score drains at
-  // gen_throughput. The servicer estimates it from the requests it forwarded
+  // prefix cache. The servicer estimates it from the requests it forwarded
   // that the engine has not started (same semantics as the SGLang field).
   int32 num_waiting_uncached_tokens = 12;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 13;
 }

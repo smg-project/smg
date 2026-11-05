@@ -16,7 +16,7 @@ on:
       - "e2e_test/infra/constants.py"
       - ".github/workflows/pr-test-mlx.yml"
   pull_request:
-    branches: [main]
+    branches: [main, release/**]
     types: [opened, synchronize, reopened]
     paths:
       - "crates/grpc_client/proto/mlx_engine.proto"

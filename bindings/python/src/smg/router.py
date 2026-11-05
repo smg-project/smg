@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 from smg.router_args import RouterArgs
 from smg.smg_rs import (
     BackendType,
@@ -14,6 +16,113 @@ from smg.smg_rs import (
     PyRole,
 )
 from smg.smg_rs import Router as _Router
+
+
+def _is_set(value: object) -> bool:
+    """Whether a discovery field was given: an empty string was, so Rust's
+    validation refuses it rather than this reading it as unset; an empty list
+    is the default of a repeatable flag never given."""
+    return value is not None and value != []
+
+
+@dataclasses.dataclass(frozen=True)
+class _MappedProvider:
+    """A discovery provider `_Router` takes as the tagged `discovery` mapping:
+    the RouterArgs fields that configure it, each under its mapping key, and
+    the fields it cannot start without."""
+
+    name: str
+    fields: dict[str, str]
+    required: tuple[str, ...]
+
+    def given(self, args: RouterArgs) -> list[str]:
+        """This provider's fields that `args` sets."""
+        return [field for field in self.fields if _is_set(getattr(args, field))]
+
+    def mapping(self, args: RouterArgs) -> dict[str, object]:
+        missing = [field for field in self.required if not _is_set(getattr(args, field))]
+        if missing:
+            raise ValueError(f"discovery_provider={self.name!r} needs {', '.join(missing)}")
+        mapping: dict[str, object] = {"provider": self.name}
+        mapping.update({self.fields[field]: getattr(args, field) for field in self.given(args)})
+        return mapping
+
+
+_MAPPED_PROVIDERS = {
+    provider.name: provider
+    for provider in [
+        _MappedProvider("file", {"discovery_file": "path"}, required=("discovery_file",)),
+        _MappedProvider(
+            "slurm",
+            {
+                "slurm_job_name": "job_names",
+                "slurm_encode_job_name": "encode_job_names",
+                "slurm_prefill_job_name": "prefill_job_names",
+                "slurm_decode_job_name": "decode_job_names",
+                "slurm_port": "port",
+                "slurm_bootstrap_port": "bootstrap_port",
+                "slurm_user": "user",
+                "slurm_account": "account",
+                "slurm_partition": "partition",
+            },
+            required=("slurm_port",),
+        ),
+        _MappedProvider(
+            "consul",
+            {
+                "consul_service": "service",
+                "consul_address": "address",
+                "consul_datacenter": "datacenter",
+            },
+            required=("consul_service",),
+        ),
+    ]
+}
+
+# The RouterArgs fields that only select or configure discovery. `from_args`
+# replaces them with the `_Router` arguments `_discovery_arguments` gives.
+_DISCOVERY_FIELDS = (
+    "discovery_provider",
+    "discovery_check_interval_secs",
+    *(field for provider in _MAPPED_PROVIDERS.values() for field in provider.fields),
+)
+
+
+def _discovery_arguments(args: RouterArgs) -> dict[str, object]:
+    """The `_Router` arguments for the discovery provider `args` selects.
+
+    Kubernetes, by either spelling, is `service_discovery=True`, its settings
+    (the interval included) being `_Router`'s own arguments; the other
+    providers are the tagged `discovery` mapping, which carries their
+    interval. Refused: a provider's fields without that provider, the
+    interval without any provider, a provider without a field it needs, and a
+    provider this cannot pass on, which must not start the router without
+    discovery.
+    """
+    provider = args.selected_discovery_provider()
+    for other in _MAPPED_PROVIDERS.values():
+        given = other.given(args)
+        if given and other.name != provider:
+            verb = "applies" if len(given) == 1 else "apply"
+            raise ValueError(f"{', '.join(given)} {verb} only to discovery_provider={other.name!r}")
+    interval = args.discovery_check_interval_secs
+    if interval is not None and provider is None:
+        raise ValueError("discovery_check_interval_secs needs a discovery provider")
+
+    arguments: dict[str, object] = {
+        "service_discovery": provider == "kubernetes",
+        # Kubernetes takes its interval as a constructor argument, as it does
+        # its other settings; a mapping carries its own.
+        "discovery_check_interval_secs": interval if provider == "kubernetes" else None,
+    }
+    if provider in (None, "kubernetes"):
+        return arguments
+    if provider not in _MAPPED_PROVIDERS:
+        raise ValueError(f"Router.from_args cannot pass discovery provider {provider!r} to Rust")
+    mapping = _MAPPED_PROVIDERS[provider].mapping(args)
+    if interval is not None:
+        mapping["check_interval_secs"] = interval
+    return {**arguments, "discovery": mapping}
 
 
 def policy_from_str(policy_str: str | None) -> PolicyType:
@@ -49,6 +158,10 @@ def backend_from_str(backend_str: str | None) -> BackendType:
         # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
         "vllm": BackendType.Vllm,
         "tokenspeed": BackendType.Tokenspeed,
+        # As on the Rust CLI: trtllm labels the start-up record and pins no
+        # wire; gemini selects the Gemini provider route.
+        "trtllm": BackendType.Trtllm,
+        "gemini": BackendType.Gemini,
     }
     backend_lower = backend_str.lower()
     if backend_lower not in backend_map:
@@ -203,15 +316,29 @@ class Router:
         balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
             for the least-loaded one when its load exceeds the healthy-fleet mean by
             this many requests AND by balance_rel_threshold; the margin is capped at
-            the in-flight count's natural swing at the pool's current mean (two
-            standard deviations, never under four requests unless this value is
-            lower), so a small pool can spill at all; with the bucket policy the
+            the larger of the in-flight count's natural swing at the pool's current
+            mean (two standard deviations, never under four requests unless this
+            value is lower) and the held prefix's price (balance_prefix_margin_tokens),
+            so a small pool can spill at all; with the bucket policy the
             pair keeps its own rule (balancing when (max_load - min_load) exceeds
             this value and max_load exceeds min_load times the relative
             threshold). Default: 64
         balance_rel_threshold: Spill gate, relative part: the multiple of the
             healthy-fleet mean a matched worker's load must exceed, together with
             the absolute part. Default: 1.5
+        balance_prefix_margin_tokens: Spill gate, price of a held prefix in tokens
+            per request: a matched worker's absolute margin is at least the tokens
+            of the request's prefix it holds over this value, rounded up, up to
+            balance_abs_threshold, so a priced deep prefix keeps its holder through
+            a skew that moves a shallow one (decode picks are never priced). Suits
+            prefill pools serving long multi-turn sessions, e.g. 1024. Default: 0
+            (unpriced)
+        balance_uncached_credit: Credit a cache-aware pick on a worker holding the
+            request's prefix with the prompt it still has to prefill (its token
+            count less the held tokens, never under the mean prefill nor over the
+            whole prompt) instead of the whole prompt, in the expected-wait
+            estimate later picks read. Misses, spills and decode picks keep the
+            whole prompt. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
@@ -227,7 +354,11 @@ class Router:
             all workers; eviction keeps every tree at or under this bound.
             Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
-        dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
+        dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
+            ranks' reported token loads: the HTTP prefill-decode router, for an engine
+            registered as one worker. Under dp_aware the engine's ranks are workers and
+            the policy's pick among them is the rank choice, so this chooses nothing
+            there (warned at start-up). Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that
@@ -304,7 +435,18 @@ class Router:
             'smg.ai/kv-connector'
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
-        request_timeout_secs: Request timeout in seconds. Default: 600
+        request_timeout_secs: Request timeout in seconds: the read of the body
+            overall, and each attempt at an HTTP worker from its dispatch to
+            its last message (504 call_upstream_timeout past it, the request's
+            answer; a worker's own pool timeout_secs takes this value's place,
+            on an HTTP worker and on a ZMQ worker's link, whose streams carry
+            the same bound). A request to a gRPC worker is bounded by
+            grpc_request_timeout_secs instead. Default: 1800
+        grpc_request_timeout_secs: Seconds a request to a gRPC worker may take
+            from its dispatch to its last message (504 call_upstream_timeout
+            past it, the request's answer; the call to the worker is dropped,
+            which cancels the request on the worker). 0 arms no deadline (the
+            default): the bound is opt-in. Default: 0
         max_concurrent_requests: Maximum standing concurrent requests. -1 derives
             the bound from the host (1024 per available core, at least 4096); 0
             disables it. Default: -1
@@ -343,33 +485,10 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
-        # Kubernetes, by either spelling, reaches Rust as service_discovery;
-        # the file provider as the tagged `discovery` mapping. A provider this
-        # cannot pass on fails here instead of quietly starting the router
-        # without discovery.
         provider = args.selected_discovery_provider()
-        file_flags = (
-            args.discovery_file is not None or args.discovery_check_interval_secs is not None
-        )
-        if file_flags and provider != "file":
-            raise ValueError(
-                "discovery_file and discovery_check_interval_secs apply only to"
-                " discovery_provider='file'"
-            )
-        if provider == "file":
-            if not args.discovery_file:
-                raise ValueError("discovery_provider='file' needs discovery_file")
-            discovery: dict[str, str | int] = {"provider": "file", "path": args.discovery_file}
-            if args.discovery_check_interval_secs is not None:
-                discovery["check_interval_secs"] = args.discovery_check_interval_secs
-            args_dict["discovery"] = discovery
-        elif provider not in (None, "kubernetes"):
-            raise ValueError(
-                f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
-            )
-        args_dict["service_discovery"] = provider == "kubernetes"
-        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
-            args_dict.pop(key)
+        for field in _DISCOVERY_FIELDS:
+            del args_dict[field]
+        args_dict.update(_discovery_arguments(args))
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []

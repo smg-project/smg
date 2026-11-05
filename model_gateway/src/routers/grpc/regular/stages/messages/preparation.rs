@@ -5,8 +5,9 @@ use axum::response::Response;
 use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
+    profile::ProviderProfile,
 };
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     routers::{
@@ -14,8 +15,13 @@ use crate::{
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
-            multimodal,
-            regular::symphony,
+            regular::{
+                stages::{
+                    reading,
+                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                },
+                symphony,
+            },
             spec::MessagesResponseSpec,
             utils::{self, message_utils},
         },
@@ -80,11 +86,8 @@ impl MessagePreparationStage {
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
         let spec = Box::new(MessagesResponseSpec::from(request));
-        let filtered_tools = message_utils::template_tools(
-            &spec.chat_tools,
-            request.tool_choice.as_ref(),
-            tokenizer.renderer_capabilities(),
-        );
+        let filtered_tools =
+            message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
         let tools_for_template = (!filtered_tools.is_empty()).then_some(&*filtered_tools);
 
@@ -96,9 +99,16 @@ impl MessagePreparationStage {
             model_id,
             &*tokenizer,
             &request.messages,
+            true,
         )
         .await?;
         let media_order = media.media_order;
+
+        // The model's provider profile, derived once for the request, before
+        // the render that reads it (the thinking the prompt is rendered with)
+        // and read by the later stages from the state.
+        let provider = ProviderProfile::for_model(&request.model);
+        ctx.state.provider = Some(provider);
 
         // Step 2: Process messages and apply chat template
         let (processed_messages, prompt_encoding) = match message_utils::process_messages(
@@ -107,6 +117,7 @@ impl MessagePreparationStage {
             tools_for_template,
             media.placeholders(),
             media_order,
+            provider,
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -115,132 +126,23 @@ impl MessagePreparationStage {
             }
         };
 
-        // Step 3: Tokenize the prompt the way its renderer said to
-        let encoding = match utils::encode_prompt_blocking(
-            tokenizer.clone(),
+        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // the media anchors checked, the media processed or kept as
+        // references (shared with the chat stage).
+        let RenderedPrompt {
+            token_ids,
+            multimodal_intermediate,
+            multimodal_refs,
+        } = prepare_rendered_prompt(
+            ctx,
+            &tokenizer,
             &processed_messages.text,
             prompt_encoding,
+            media.media,
+            self.wire_pools,
+            "MessagePreparationStage::execute",
         )
-        .await
-        {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!(function = "MessagePreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(
-                    "tokenization_failed",
-                    format!("Tokenization failed: {e}"),
-                ));
-            }
-        };
-
-        let mut token_ids = encoding.token_ids().to_vec();
-
-        if let Some(media) = media.media.as_ref() {
-            multimodal::validate_rendered_media_anchors(
-                &media.plan,
-                &media.placeholders,
-                &*tokenizer,
-                &token_ids,
-            )
-            .map_err(|error| {
-                error!(
-                    function = "MessagePreparationStage::execute",
-                    %error,
-                    "Rendered multimodal anchors do not match request media"
-                );
-                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
-            })?;
-        }
-
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
-        // or keep the media references for a worker that processes them itself.
-        let mut multimodal_intermediate = None;
-        let mut multimodal_refs = None;
-        if let Some(message_utils::MediaContext {
-            plan: media_plan,
-            placeholders,
-            components: mm_components,
-            tokenizer_id,
-            tokenizer_source,
-        }) = media.media
-        {
-            let processing = multimodal::resolve_mm_processing(
-                &mm_components,
-                &ctx.components.worker_registry,
-                model_id,
-                &media_plan,
-                &placeholders,
-            )
-            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            if processing == multimodal::MmProcessing::Worker {
-                debug!(
-                    function = "MessagePreparationStage::execute",
-                    media_items = media_plan.parts().len(),
-                    "Forwarding media references for worker-side processing"
-                );
-                // Which of the workers that process references may take the
-                // plan (see `resolve_mm_processing` and `PipelinePin`).
-                ctx.state.media_refs_pipeline =
-                    multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
-                multimodal_refs = Some(media_plan);
-            } else {
-                // The dtype every worker the selection can pick reads image
-                // pixels in, when they agree (and the one-pass write is not
-                // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
-                // then writes it directly; otherwise `None`, and the write
-                // happens at assembly. Resolved over the pools of this
-                // pipeline's mode, the pools the pixels can reach, as the
-                // selection draws them.
-                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The frames decode under the destination engine's own
-                // transparency rule, resolved over the same pools as the dtype.
-                let transparency = multimodal::engine_transparency_policy(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The engine's per-item bound, the smallest its workers
-                // advertise: an item above it would never be scheduled.
-                let encoder_budget =
-                    multimodal::engine_encoder_budget(&ctx.components.worker_registry, model_id);
-                match multimodal::process_multimodal_plan(
-                    media_plan,
-                    model_id,
-                    &*tokenizer,
-                    token_ids,
-                    &mm_components,
-                    &tokenizer_id,
-                    &tokenizer_source,
-                    image_wire_dtype,
-                    transparency,
-                    encoder_budget,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        debug!(
-                            function = "MessagePreparationStage::execute",
-                            expanded_tokens = output.expanded_token_ids.len(),
-                            "Multimodal processing complete"
-                        );
-                        token_ids = output.expanded_token_ids;
-                        multimodal_intermediate = Some(output.intermediate);
-                    }
-                    Err(e) => {
-                        error!(
-                            function = "MessagePreparationStage::execute",
-                            error = %multimodal::processing_failed_message(&e),
-                            "Multimodal processing failed"
-                        );
-                        return Err(multimodal::processing_failed_response(&e));
-                    }
-                }
-            }
-        }
+        .await?;
 
         // Step 4: Build tool constraints if tools present. When Symphony reads
         // the message, its table gives a forced call its tag (see
@@ -249,86 +151,37 @@ impl MessagePreparationStage {
         // parser with a reasoning prefix gets its tag wrapped so a forced call
         // follows the reasoning instead of preempting it. The table's refusal
         // waits for request building, which decides on the selected worker
-        // (`regular::symphony::worker_constraint`).
-        let names = ctx.components.parser_resolver.names(&request.model);
-        // The thinking switch's answer, or the table's replay of the rendered
-        // prompt where a table reads the message: a turn the prompt leaves
-        // unopened starts inside the thought whatever the switch says, and the
-        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let reasoning = utils::messages_reasoning_starts_in_prefill(
-            request,
-            processed_messages.continued_final_message,
-            tokenizer.as_ref(),
-        ) || symphony::reasoning_open(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &processed_messages.text,
-        )
-        .is_some_and(|thought| thought.open);
-        let workers = ctx
-            .components
-            .worker_registry
-            .get_by_model(&ctx.input.model_id);
-        let symphony_constraint = symphony::constraint(
-            parser,
-            &names,
+        // (`regular::symphony::worker_constraint`). All of it, and whether the
+        // decoder keeps the special tokens the reader needs, is decided as for
+        // a chat request (`reading::prepare`), over the tools the template
+        // renders.
+        let reading::Prepared {
+            constraint: tool_call_constraint,
+            json_schema: json_schema_constraint,
+            keeps_special_tokens: preserve_reasoning_special_tokens,
+            names: parser_names,
+            prompt_thought,
+            reading,
+        } = reading::prepare(
+            ctx,
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
             },
             &filtered_tools,
-            reasoning,
-            symphony::grammar_start_of(&workers),
-            &ctx.components.templates,
-        );
-        let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
-            (Ok(None), Some(tool_choice)) if !filtered_tools.is_empty() => Ok(ctx
-                .components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components.parser_resolver.legacy_tool(&names),
-                    &filtered_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?),
-            (prepared, _) => prepared,
-        };
-
-        let json_schema_constraint =
-            matches!(&tool_call_constraint, Ok(Some(c)) if c.is_json_schema());
-        // A Symphony table whose markers the decoder would drop as special tokens needs them
-        // kept: without them the table reads neither the thought nor the calls. Where a table
-        // reads the message its markers alone decide, and no legacy reasoning parser is built to
-        // be asked; under a JSON-schema constraint no table reads (request building makes no
-        // assignment: `regular::symphony::assign_messages`), so the legacy parsers answer for
-        // themselves, as they do where no table reads at all.
-        let preserve_reasoning_special_tokens = match symphony::keeps_special_tokens(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &tokenizer,
-        ) {
-            Some(kept) if !json_schema_constraint => kept,
-            _ => utils::reasoning_parser_requires_special_tokens(
-                &ctx.components.reasoning_parser_factory,
-                ctx.components
-                    .parser_resolver
-                    .reasoning_parser(&request.model)
-                    .as_deref(),
-                &request.model,
+            &processed_messages.text,
+            utils::messages_reasoning_starts_in_prefill_for(
+                request,
+                provider,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
             ),
-        };
+            &tokenizer,
+            "MessagePreparationStage::execute",
+        )?;
+        ctx.state.parser_names = Some(parser_names);
+        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved
@@ -336,19 +189,14 @@ impl MessagePreparationStage {
         // - structural_tag or no constraint (auto): parser needs trigger tokens
         let skip_special_tokens = if preserve_reasoning_special_tokens {
             false
+        } else if json_schema_constraint {
+            true
         } else {
-            match &tool_call_constraint {
-                Ok(Some(c)) if c.is_json_schema() => true,
-                _ if !filtered_tools.is_empty()
-                    && !matches!(
-                        chat_tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
-                }
-                _ => true,
-            }
+            filtered_tools.is_empty()
+                || matches!(
+                    chat_tool_choice,
+                    Some(ToolChoice::Value(ToolChoiceValue::None))
+                )
         };
 
         // Step 5: the stop sequence decoder, over the stop sequences the spec
@@ -406,31 +254,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// The stage renders `output_config.effort` as the `reasoning_effort`
-    /// template kwarg, renders none without it, and refuses another type.
-    #[tokio::test]
-    async fn the_stage_renders_output_config_effort() {
-        use std::sync::Arc;
+    /// A byte-level tokenizer over `template`, in a directory the caller keeps
+    /// alive for as long as the tokenizer is used.
+    fn byte_tokenizer_with_template(
+        template: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>,
+    ) {
+        use serde_json::json;
 
-        use llm_tokenizer::{traits::Tokenizer, HuggingFaceTokenizer, TokenizerRegistry};
-        use openai_protocol::messages::CreateMessageRequest;
-        use reasoning_parser::ParserFactory as ReasoningParserFactory;
-        use serde_json::{json, Value};
-        use tool_parser::ParserFactory as ToolParserFactory;
-
-        use crate::{
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext, SharedComponents},
-                regular::{
-                    stages::messages::MessagePreparationStage, symphony::template::Templates,
-                },
-                utils::ParserResolver,
-            },
-            worker::WorkerRegistry,
-        };
-
-        const MODEL: &str = "effort-model";
         let dir = tempfile::TempDir::new().unwrap();
         let vocab: serde_json::Map<_, _> = (0..=255u32)
             .map(|byte| (format!("<0x{byte:02X}>"), json!(byte)))
@@ -443,37 +276,50 @@ mod tests {
         });
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, tokenizer.to_string()).unwrap();
-        let template = dir.path().join("template.jinja");
-        std::fs::write(
-            &template,
-            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-             effort={{ reasoning_effort | default('unset') }}",
+        let template_path = dir.path().join("template.jinja");
+        std::fs::write(&template_path, template).unwrap();
+        let tokenizer = llm_tokenizer::HuggingFaceTokenizer::from_file_with_chat_template(
+            path.to_str().unwrap(),
+            Some(template_path.to_str().unwrap()),
         )
         .unwrap();
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
-            HuggingFaceTokenizer::from_file_with_chat_template(
-                path.to_str().unwrap(),
-                Some(template.to_str().unwrap()),
-            )
-            .unwrap(),
+        (dir, std::sync::Arc::new(tokenizer))
+    }
+
+    /// The stage renders `output_config.effort` as the `reasoning_effort`
+    /// template kwarg, renders none without it, and refuses another type.
+    #[tokio::test]
+    async fn the_stage_renders_output_config_effort() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::TokenizerRegistry;
+        use openai_protocol::messages::CreateMessageRequest;
+        use serde_json::{json, Value};
+
+        use crate::{
+            routers::grpc::{
+                common::stages::PipelineStage,
+                context::{PreparationOutput, RequestContext},
+                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            },
+            worker::WorkerRegistry,
+        };
+
+        const MODEL: &str = "effort-model";
+        let (_dir, tokenizer) = byte_tokenizer_with_template(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+             effort={{ reasoning_effort | default('unset') }}",
         );
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         tokenizer_registry
             .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
             .await
             .unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+        let components = components_over(
             tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
-        });
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
             (json!({"effort": 2}), Ok("effort=2")),
@@ -501,6 +347,79 @@ mod tests {
                 },
             };
             assert_eq!(got, rendered.map(str::to_string), "{output_config}");
+        }
+    }
+
+    /// The stage derives the request model's profile once, keeps it on the
+    /// request state and hands that one to the render: under a MiniMax model
+    /// id `output_config.effort: none` leaves the template's default, under a
+    /// self-hosted id it switches thinking off, and the stored profile is the
+    /// model's in both cases.
+    #[tokio::test]
+    async fn the_stage_hands_the_render_the_request_models_profile() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::TokenizerRegistry;
+        use openai_protocol::{messages::CreateMessageRequest, profile::ProviderProfile};
+        use serde_json::json;
+
+        use crate::{
+            routers::grpc::{
+                common::stages::PipelineStage,
+                context::{PreparationOutput, RequestContext},
+                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            },
+            worker::WorkerRegistry,
+        };
+
+        let (_dir, tokenizer) = byte_tokenizer_with_template(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+             thinking={{ enable_thinking | default('unset') }}",
+        );
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        for model in ["MiniMax-M3", "self-hosted-model"] {
+            let loaded = Arc::clone(&tokenizer);
+            tokenizer_registry
+                .load(model, model, "test", || async move { Ok(loaded) })
+                .await
+                .unwrap();
+        }
+        let components = components_over(
+            tokenizer_registry,
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
+        for (model, profile, rendered) in [
+            ("MiniMax-M3", ProviderProfile::Minimax, "thinking=unset"),
+            (
+                "self-hosted-model",
+                ProviderProfile::Generic,
+                "thinking=False",
+            ),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": model, "max_tokens": 8, "output_config": {"effort": "none"},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let mut ctx = RequestContext::for_messages(
+                Arc::new(request),
+                None,
+                model.into(),
+                components.clone(),
+            );
+            MessagePreparationStage::new(&[])
+                .execute(&mut ctx)
+                .await
+                .unwrap_or_else(|response| panic!("{model}: {}", response.status()));
+            assert_eq!(ctx.state.provider, Some(profile), "{model}");
+            let text = match &ctx.state.preparation {
+                Some(PreparationOutput::Messages {
+                    processed_messages, ..
+                }) => processed_messages.text.lines().last().unwrap().to_string(),
+                _ => panic!("{model}: no messages preparation"),
+            };
+            assert_eq!(text, rendered, "{model}");
         }
     }
 

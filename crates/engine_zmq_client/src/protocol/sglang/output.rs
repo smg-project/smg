@@ -1,21 +1,26 @@
-// SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
-// declared by the SMG plugin that runs inside the scheduler
-// (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
-// of parallel per-request columns. **Field order is the wire contract** — do
-// not reorder; the plugin appends only.
+//! SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
+//! declared by the SMG plugin that runs inside the scheduler
+//! (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
+//! of parallel per-request columns. **Field order is the wire contract** — do
+//! not reorder; the plugin appends only.
 
+use bytes::Bytes;
 use serde::{
     de::{SeqAccess, Visitor},
     ser::SerializeTuple,
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+// The control reply is the same message on every slim wire; it keeps its
+// place in this module's API.
+pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 use crate::{
-    codec::OpaqueValue,
+    codec::decode_msgpack,
     error::{Error, Result},
     protocol::{
+        control::read_control_reply_after_tag,
         positional::{drain_trailing, expect_tag, next_field},
-        EngineOutput,
+        EngineBatch, EngineLoad, EngineOutput, UtilityReply,
     },
 };
 
@@ -23,8 +28,6 @@ use crate::{
 pub const BATCH_TOKEN_ID_SLIM_OUTPUT_TAG: &str = "BatchTokenIDSlimOutput";
 /// The msgspec tag for [`BatchEmbeddingSlimOutput`] (element 0 on the wire).
 pub const BATCH_EMBEDDING_SLIM_OUTPUT_TAG: &str = "BatchEmbeddingSlimOutput";
-/// The msgspec tag for [`ControlReplySlim`] (element 0 on the wire).
-pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
 
 /// What a request stopped on: the scheduler reports the matched stop token id
 /// or stop string in its finish reason, and the plugin forwards it.
@@ -92,13 +95,40 @@ pub struct BatchTokenIDSlimOutput {
     /// Appended; absent from older plugins.
     pub output_token_ids_logprobs_val: Vec<Vec<Vec<f64>>>,
     pub output_token_ids_logprobs_idx: Vec<Vec<Vec<u32>>>,
+    /// The scheduler's `err_type` of an `abort` finish (the name it gives
+    /// the failure next to the message and the status; the plugin stamps
+    /// the grammar's rejection of a sampled token with its own, see the
+    /// adapter); `None` for other finishes. Appended; empty from a plugin
+    /// that predates the column.
+    pub finished_err_types: Vec<Option<String>>,
+    /// The final hidden layer's vectors a request that asked for them
+    /// (`return_hidden_states`) gained with this step: the rows new since the
+    /// plugin's last output for it (the prompt positions the prefill
+    /// computed, flattened from the engine's block, then one row per decode
+    /// step; the engine keeps the list cumulative, the plugin sends what is
+    /// new), `None` for a request that did not ask. Appended; empty from a
+    /// plugin that predates the column. Kept as `f32`, the proto's `float`,
+    /// as the embedding vectors are.
+    pub output_hidden_states: Vec<Option<Vec<Vec<f32>>>>,
 }
 
 impl Serialize for BatchTokenIDSlimOutput {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let has_selected = !self.output_token_ids_logprobs_val.is_empty()
+        let has_hidden_states = !self.output_hidden_states.is_empty();
+        let has_err_types = has_hidden_states || !self.finished_err_types.is_empty();
+        let has_selected = has_err_types
+            || !self.output_token_ids_logprobs_val.is_empty()
             || !self.output_token_ids_logprobs_idx.is_empty();
-        let mut tuple = serializer.serialize_tuple(if has_selected { 26 } else { 24 })?;
+        let len = if has_hidden_states {
+            28
+        } else if has_err_types {
+            27
+        } else if has_selected {
+            26
+        } else {
+            24
+        };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(BATCH_TOKEN_ID_SLIM_OUTPUT_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -126,6 +156,12 @@ impl Serialize for BatchTokenIDSlimOutput {
         if has_selected {
             tuple.serialize_element(&self.output_token_ids_logprobs_val)?;
             tuple.serialize_element(&self.output_token_ids_logprobs_idx)?;
+        }
+        if has_err_types {
+            tuple.serialize_element(&self.finished_err_types)?;
+        }
+        if has_hidden_states {
+            tuple.serialize_element(&self.output_hidden_states)?;
         }
         tuple.end()
     }
@@ -207,6 +243,8 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         input_top_logprobs_idx: appended_column(seq)?,
         output_token_ids_logprobs_val: appended_column(seq)?,
         output_token_ids_logprobs_idx: appended_column(seq)?,
+        finished_err_types: appended_column(seq)?,
+        output_hidden_states: appended_column(seq)?,
     };
     drain_trailing(seq)?;
     Ok(batch)
@@ -223,6 +261,8 @@ pub struct SglangOutput {
     pub finish_message: Option<String>,
     /// The HTTP status an abort carried, when the scheduler reported one.
     pub finish_status: Option<u16>,
+    /// The scheduler's `err_type` of an abort, when it named one.
+    pub finish_err_type: Option<String>,
     pub matched_stop: Option<MatchedStop>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -247,6 +287,11 @@ pub struct SglangOutput {
     /// the routed output prevents isolated malformed batches being dropped
     /// by the connector and leaving their requests waiting indefinitely.
     pub selected_logprobs_error: Option<String>,
+    /// The final hidden layer's vectors this step added (the prompt positions
+    /// the prefill computed first, then a decode step's rows), when the
+    /// request asked for them; empty otherwise. The plugin sends each step's
+    /// new rows; the adapter accumulates them.
+    pub output_hidden_states: Vec<Vec<f32>>,
     /// The pooled vector of an embedding request (its one, finished, output).
     pub embedding: Option<Vec<f32>>,
 }
@@ -305,6 +350,8 @@ impl BatchTokenIDSlimOutput {
             ),
             ("input_top_logprobs_val", self.input_top_logprobs_val.len()),
             ("input_top_logprobs_idx", self.input_top_logprobs_idx.len()),
+            ("finished_err_types", self.finished_err_types.len()),
+            ("output_hidden_states", self.output_hidden_states.len()),
         ];
         if let Some((name, len)) = columns
             .iter()
@@ -324,6 +371,7 @@ impl BatchTokenIDSlimOutput {
         let mut finished_reasons = self.finished_reasons.into_iter();
         let mut finished_messages = self.finished_messages.into_iter();
         let mut finished_status = self.finished_status.into_iter();
+        let mut finished_err_types = self.finished_err_types.into_iter();
         let mut top_val = self.output_top_logprobs_val.into_iter();
         let mut top_idx = self.output_top_logprobs_idx.into_iter();
         let mut finished_matched = self.finished_matched.into_iter();
@@ -339,6 +387,7 @@ impl BatchTokenIDSlimOutput {
         let mut input_top_idx = self.input_top_logprobs_idx.into_iter();
         let mut selected_val = self.output_token_ids_logprobs_val.into_iter();
         let mut selected_idx = self.output_token_ids_logprobs_idx.into_iter();
+        let mut hidden_states = self.output_hidden_states.into_iter();
         Ok(self
             .rids
             .into_iter()
@@ -360,6 +409,7 @@ impl BatchTokenIDSlimOutput {
                     finish_reason: (!reason.is_empty()).then_some(reason),
                     finish_message: finished_messages.next().flatten(),
                     finish_status: finished_status.next().flatten(),
+                    finish_err_type: finished_err_types.next().flatten(),
                     matched_stop: finished_matched.next().flatten(),
                     prompt_tokens: prompt_tokens.next().unwrap_or(0),
                     completion_tokens: completion_tokens.next().unwrap_or(0),
@@ -376,6 +426,7 @@ impl BatchTokenIDSlimOutput {
                     output_token_ids_logprobs_val: selected_values,
                     output_token_ids_logprobs_idx: selected_ids,
                     selected_logprobs_error,
+                    output_hidden_states: hidden_states.next().flatten().unwrap_or_default(),
                     embedding: None,
                 }
             })
@@ -516,82 +567,6 @@ impl BatchEmbeddingSlimOutput {
     }
 }
 
-/// The plugin's answer to a control call (`ControlReplySlim`): the
-/// scheduler's `success`/`message` for the call id SMG issued.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ControlReplySlim {
-    pub call_id: i64,
-    pub success: bool,
-    pub message: Option<String>,
-    pub engine_index: u32,
-}
-
-impl Serialize for ControlReplySlim {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(5)?;
-        tuple.serialize_element(CONTROL_REPLY_SLIM_TAG)?;
-        tuple.serialize_element(&self.call_id)?;
-        tuple.serialize_element(&self.success)?;
-        tuple.serialize_element(&self.message)?;
-        tuple.serialize_element(&self.engine_index)?;
-        tuple.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ControlReplySlim {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct ReplyVisitor;
-
-        impl<'de> Visitor<'de> for ReplyVisitor {
-            type Value = ControlReplySlim;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "a tagged ControlReplySlim positional array")
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                expect_tag(&mut seq, CONTROL_REPLY_SLIM_TAG)?;
-                read_control_reply_after_tag(&mut seq)
-            }
-        }
-
-        deserializer.deserialize_seq(ReplyVisitor)
-    }
-}
-
-fn read_control_reply_after_tag<'de, A: SeqAccess<'de>>(
-    seq: &mut A,
-) -> std::result::Result<ControlReplySlim, A::Error> {
-    let reply = ControlReplySlim {
-        call_id: next_field(seq, "call_id")?,
-        success: next_field(seq, "success")?,
-        message: next_field(seq, "message")?,
-        engine_index: seq.next_element::<u32>()?.unwrap_or(0),
-    };
-    drain_trailing(seq)?;
-    Ok(reply)
-}
-
-impl ControlReplySlim {
-    /// The reply as a utility outcome: a map of `success` and `message`, so
-    /// a refused flush (success false) is a reply, not a transport failure.
-    pub fn into_outcome(self) -> OpaqueValue {
-        OpaqueValue::Map(vec![
-            (
-                OpaqueValue::from("success"),
-                OpaqueValue::Boolean(self.success),
-            ),
-            (
-                OpaqueValue::from("message"),
-                self.message.map_or(OpaqueValue::Nil, OpaqueValue::from),
-            ),
-        ])
-    }
-}
-
 /// One output message on the wire, told apart by its tag. The token batch is
 /// boxed: it is by far the largest and the common case.
 #[derive(Debug, Clone, PartialEq)]
@@ -637,6 +612,83 @@ impl<'de> Deserialize<'de> for SglangWireOutput {
     }
 }
 
+/// Decode one output message of the slim wire (frame 0; aux frames are
+/// ignored, the slim records carry no tensor fields) into a batch: a token or
+/// embedding record becomes the per-request outputs plus the load tail, a
+/// control reply the batch's utility reply. Shared by every protocol whose
+/// engine side answers with these records.
+pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOutput>> {
+    if frames.len() > 1 {
+        tracing::debug!(
+            aux_frames = frames.len() - 1,
+            "ignoring aux frames on a slim output (the slim records have no tensor fields)"
+        );
+    }
+    let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
+    let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
+        SglangWireOutput::Tokens(batch) => (
+            batch.engine_index,
+            load_of(
+                batch.num_running,
+                batch.num_waiting,
+                batch.kv_used_tokens,
+                batch.kv_total_tokens,
+            ),
+            (*batch).into_outputs()?,
+        ),
+        SglangWireOutput::Embeddings(batch) => (
+            batch.engine_index,
+            load_of(
+                batch.num_running,
+                batch.num_waiting,
+                batch.kv_used_tokens,
+                batch.kv_total_tokens,
+            ),
+            batch.into_outputs()?,
+        ),
+        SglangWireOutput::ControlReply(reply) => {
+            return Ok(EngineBatch {
+                engine_index: reply.engine_index,
+                utility: Some(UtilityReply {
+                    call_id: reply.call_id,
+                    outcome: Ok(reply.into_outcome()),
+                }),
+                ..EngineBatch::default()
+            });
+        }
+    };
+    let finished_request_ids = outputs
+        .iter()
+        .filter(|output| output.finish_reason.is_some())
+        .map(|output| output.request_id.clone())
+        .collect();
+    Ok(EngineBatch {
+        engine_index,
+        outputs,
+        finished_request_ids,
+        load,
+        kv_transfer: None,
+        wave: None,
+        utility: None,
+    })
+}
+
+/// The load tail as a signal. A zero capacity marks a batch sent before the
+/// load probe was wired (or a probe that failed): report no load rather than
+/// an empty scheduler that least-loaded selection would trust.
+fn load_of(
+    num_running: u64,
+    num_waiting: u64,
+    kv_used_tokens: u64,
+    kv_total_tokens: u64,
+) -> Option<EngineLoad> {
+    (kv_total_tokens > 0).then(|| EngineLoad {
+        num_running,
+        num_waiting,
+        kv_cache_usage: kv_used_tokens as f64 / kv_total_tokens as f64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +710,16 @@ mod tests {
     const PYTHON_EMBED: &str = "9db84261746368456d62656464696e67536c696d4f757470757491a265319192cb3fd0000000000000cbbfe00000000000009103910091a473746f7091c091c00100000000";
     /// The plugin's control reply for call 7: success, no message, engine 1.
     const PYTHON_CONTROL: &str = "95b0436f6e74726f6c5265706c79536c696d07c3c001";
+    /// The plugin's 27-element batch for rids a/b, both aborted: `a` with the
+    /// scheduler's bare `Aborted`, `b` with the grammar's rejection of a
+    /// sampled token named in the last column (`GrammarRejectedToken`), no
+    /// status on either, engine 1.
+    const PYTHON_SLIM27: &str = "dc001bb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a561626f7274a561626f727492a741626f72746564d924746865206772616d6d61722072656a656374656420612073616d706c656420746f6b656e92c0c0920304920102920001929092cbbfe0000000000000cbbfd00000000000009290921415010000000092c0c092909192cbbfe0000000000000cbbff000000000000092909192151692000092909092909092909092909092909092909092c0b44772616d6d617252656a6563746564546f6b656e";
+    /// The plugin's 28-element batch for rids a/b: `a` asked for nothing,
+    /// `b` (finished on token 42) asked for hidden states and carries the
+    /// prefill's three prompt rows and its one decoded token's row (hidden
+    /// size 2); engine 1, load 2/0/40/400, no abort status or name.
+    const PYTHON_SLIM28: &str = "dc001cb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a911492a0a473746f7092c0c092c02a92030392010192000092909092909001020028cd019092c0c092909092909092000092909092909092909092909092909092909092c0c092c09492cb3fe0000000000000cbbfe000000000000092cb3fd0000000000000cb3fe800000000000092cb3ff0000000000000cb000000000000000092cbbff0000000000000cb4000000000000000";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
 
@@ -737,6 +799,103 @@ mod tests {
             decode_msgpack::<SglangWireOutput>(&hex(PYTHON_SLIM24)).unwrap(),
             SglangWireOutput::Tokens(_)
         ));
+    }
+
+    /// The scheduler's `err_type` of an abort rides the last appended column:
+    /// a batch that carries it encodes 27 elements and reads back the name
+    /// per request; the 24- and 26-element batches of earlier plugins decode
+    /// with no name, and re-encode as they came.
+    #[test]
+    fn the_abort_err_type_column_is_appended_and_optional() {
+        let mut batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM24)).unwrap();
+        assert!(batch.finished_err_types.is_empty());
+        assert!(batch
+            .clone()
+            .into_outputs()
+            .unwrap()
+            .iter()
+            .all(|output| output.finish_err_type.is_none()));
+        batch.finished_reasons[1] = "abort".to_string();
+        batch.finished_messages[1] = Some("the grammar rejected a sampled token".to_string());
+        batch.finished_err_types = vec![None, Some("GrammarRejectedToken".to_string())];
+        let encoded = encode_msgpack(&batch).unwrap();
+        // The array header grows from 24 to 27 elements (one byte each way).
+        assert_eq!(encoded[0..3], [0xdc, 0x00, 0x1b]);
+        let decoded: BatchTokenIDSlimOutput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, batch);
+        let outputs = decoded.into_outputs().unwrap();
+        assert_eq!(outputs[0].finish_err_type, None);
+        assert_eq!(
+            outputs[1].finish_err_type.as_deref(),
+            Some("GrammarRejectedToken")
+        );
+        assert_eq!(outputs[1].finish_reason.as_deref(), Some("abort"));
+        // A ragged column is a protocol bug, as for every other column.
+        let mut ragged = batch;
+        ragged.finished_err_types.pop();
+        let error = ragged.into_outputs().unwrap_err().to_string();
+        assert!(error.contains("finished_err_types"), "{error}");
+        // The plugin's own bytes for the two aborts: the name per request,
+        // and the re-encoding byte for byte.
+        let pinned: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM27)).unwrap();
+        assert_eq!(
+            pinned.finished_err_types,
+            vec![None, Some("GrammarRejectedToken".to_string())]
+        );
+        assert_eq!(pinned.finished_status, vec![None, None]);
+        assert_eq!(encode_msgpack(&pinned).unwrap(), hex(PYTHON_SLIM27));
+        let outputs = pinned.into_outputs().unwrap();
+        assert_eq!(outputs[0].finish_message.as_deref(), Some("Aborted"));
+        assert_eq!(outputs[0].finish_err_type, None);
+        assert_eq!(
+            outputs[1].finish_message.as_deref(),
+            Some("the grammar rejected a sampled token")
+        );
+        assert_eq!(
+            outputs[1].finish_err_type.as_deref(),
+            Some("GrammarRejectedToken")
+        );
+    }
+
+    /// Hidden states ride the last appended column as the rows an output
+    /// added per request: the plugin's 28-element batch reads back the rows
+    /// for the request that asked and none for the other, the value
+    /// round-trips (Python writes float64, this side keeps the proto's
+    /// float32), the 27-element batches of earlier plugins decode with no
+    /// rows, and a ragged column is a protocol bug.
+    #[test]
+    fn the_hidden_states_column_is_appended_and_optional() {
+        let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM28)).unwrap();
+        let rows = vec![
+            vec![0.5, -0.5],
+            vec![0.25, 0.75],
+            vec![1.0, 0.0],
+            vec![-1.0, 2.0],
+        ];
+        assert_eq!(batch.output_hidden_states, vec![None, Some(rows.clone())]);
+        assert_eq!(batch.finished_err_types, vec![None, None]);
+        assert_eq!(batch.finished_matched[1], Some(MatchedStop::TokenId(42)));
+        let encoded = encode_msgpack(&batch).unwrap();
+        assert_eq!(encoded[0..3], [0xdc, 0x00, 0x1c]);
+        assert_eq!(
+            decode_msgpack::<BatchTokenIDSlimOutput>(&encoded).unwrap(),
+            batch
+        );
+        let outputs = batch.clone().into_outputs().unwrap();
+        assert!(outputs[0].output_hidden_states.is_empty());
+        assert_eq!(outputs[1].output_hidden_states, rows);
+        assert_eq!(outputs[1].finish_reason.as_deref(), Some("stop"));
+        let older: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM27)).unwrap();
+        assert!(older.output_hidden_states.is_empty());
+        assert!(older
+            .into_outputs()
+            .unwrap()
+            .iter()
+            .all(|output| output.output_hidden_states.is_empty()));
+        let mut ragged = batch;
+        ragged.output_hidden_states.pop();
+        let error = ragged.into_outputs().unwrap_err().to_string();
+        assert!(error.contains("output_hidden_states"), "{error}");
     }
 
     #[test]

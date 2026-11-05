@@ -15,6 +15,10 @@ name: CI node health
 #   [CRIT] GPU row-remap failure     cordon; OCI hardware ticket
 #   [CRIT] Node disk over 85%        root: delete finished runner pods, crictl rmi --prune; /raid: prune hub/
 #   [CRIT] GPU runner label starved  kubectl get autoscalingrunnersets -n actions-runner-system; listener logs
+#       one job queued, no runner of its label, every pool idle, right after a wave = the set drained to
+#       zero with the job still queued; raise the set's minRunners until the job is picked up, then
+#       restore the overlay's value; never cancel + re-run. Not in the issue body: see the README,
+#       "A queued job left behind when a scale set drains to zero"
 #   [CRIT] Failed runners occupy pool capacity  inspect error; manually clean confirmed Failed records
 #   [CRIT] Monitor cannot read runner status    check trigger logs and its read-only RBAC
 #   [CRIT] Monitor cannot reach Prometheus   kubectl -n monitoring get pods | grep prometheus

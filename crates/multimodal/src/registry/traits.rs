@@ -10,7 +10,7 @@ use crate::{
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, VisionPreProcessor},
 };
 
 /// The format of the encoder inputs a spec's processors emit, which decides
@@ -44,6 +44,12 @@ pub enum ModelRegistryError {
     UnsupportedModality {
         spec: &'static str,
         modality: Modality,
+    },
+    #[error("the {modality} processor of model spec {spec} cannot serve its preprocessor config: {reason}")]
+    InvalidPreprocessorConfig {
+        spec: &'static str,
+        modality: Modality,
+        reason: String,
     },
     #[error("model spec {spec} supports at most {limit} {modality} inputs; got {requested}")]
     ModalityLimitExceeded {
@@ -123,10 +129,15 @@ fn check_media_counts(
     Ok(())
 }
 
-/// Ordering of media and text parts when rendering a multipart message.
+/// Where a message's media parts go relative to its text when the chat
+/// template takes one string per message and so cannot place them itself. A
+/// template that takes content parts places them itself and always gets them
+/// in the request's order, as the serving engine's own server hands them to
+/// such a template; this order does not apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPartOrder {
-    /// Emit media parts before text (the serving engine's `interleave_mm_strings=false` order).
+    /// Emit media parts before text (the serving engine's placement for a
+    /// string-content template).
     MediaFirst,
     /// Keep parts in request order; part order is protocol-visible.
     Authored,
@@ -251,9 +262,11 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
-    /// Ordering of media/text parts this model's chat template expects. Most
-    /// models use the serving engine's media-first order; families whose template renders
-    /// parts positionally override to `Authored`.
+    /// Where this model's media parts go relative to its text when its
+    /// template takes one string per message (see [`MediaPartOrder`]): the
+    /// serving engine's media-first order by default; a family whose string
+    /// renderer is positional overrides to `Authored`. A template that takes
+    /// content parts gets them in the request's order whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
     }
@@ -344,6 +357,27 @@ pub trait ModelProcessorSpec: Send + Sync {
                 .get(&modality)
                 .copied()
                 .or_else(|| modality_limit_override(modality))
+        })
+    }
+
+    /// Build the vision preprocessor of `modality` (image or video) for this
+    /// model from that modality's preprocessor config.
+    ///
+    /// The spec that owns a model's prompt and placeholder logic also selects
+    /// its vision processors, so the two cannot disagree. A caller builds each
+    /// processor once per loaded model and reuses it across requests; a
+    /// config the processor cannot serve is an error here rather than on a
+    /// request. A modality the spec does not preprocess is
+    /// [`ModelRegistryError::UnsupportedModality`].
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        _preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        Err(ModelRegistryError::UnsupportedModality {
+            spec: self.name(),
+            modality,
         })
     }
 
@@ -476,14 +510,14 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Frame rate to sample a video at when the request names no `fps`: the
     /// model's reference processor default, so token counts match it. `None`
     /// keeps the media connector's default.
-    fn default_video_sample_fps(&self) -> Option<f32> {
+    fn default_video_sample_fps(&self) -> Option<f64> {
         None
     }
 
     /// [`Self::default_video_sample_fps`] given the video preprocessor config
     /// the checkpoint ships, for a family whose reference reads the rate from
     /// it; the default ignores the config.
-    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f32> {
+    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f64> {
         self.default_video_sample_fps()
     }
 

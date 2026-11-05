@@ -3,7 +3,12 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fs, io, iter,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 
 use anyhow::{anyhow, Result};
 use chrono::{
@@ -17,8 +22,8 @@ use minijinja::{
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    value::{Kwargs, ValueKind},
-    Environment, Error as MinijinjaError, ErrorKind, Value,
+    value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
+    Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
 };
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
@@ -846,7 +851,7 @@ pub struct ChatTemplateParams<'a> {
     pub thinking: Option<bool>,
     /// The instant the template's `strftime_now` writes, for a render that
     /// must come out the same each time; `None` is the clock (see
-    /// [`render_instant`]).
+    /// `render_instant`).
     pub now: Option<DateTime<FixedOffset>>,
     /// Leave the final message open for the model to continue, as
     /// transformers' `continue_final_message` does: the conversation is
@@ -856,43 +861,317 @@ pub struct ChatTemplateParams<'a> {
     /// (`ChatTemplateOutput::continued_final_message` says which happened),
     /// and a message that also has `reasoning_content` is refused.
     pub continue_final_message: bool,
+    /// `tools` converted for the render once ([`PreparedTools::new`] of these
+    /// same values): the render takes it instead of converting `tools` again,
+    /// so a caller that keeps one per distinct tool set spares every request
+    /// that carries the same tools the conversion. It must be made of
+    /// `tools`: one made of other values is not read, and the render converts
+    /// `tools` as without it.
+    pub prepared_tools: Option<&'a PreparedTools>,
 }
 
-/// JSON separator pair passed through HuggingFace's `tojson` filter.
+/// The tools of a request converted for the render once, so a caller can keep
+/// the conversion per distinct tool set and hand it to every request that
+/// carries the same tools instead of having the render convert the values
+/// again ([`ChatTemplateParams::prepared_tools`]). The conversion is the one
+/// the render makes of [`ChatTemplateParams::tools`], so a render with the
+/// prepared value is the render without it, byte for byte.
+pub struct PreparedTools {
+    tools: Vec<JsonValue>,
+    value: Value,
+    /// The same tools with the keys of every map in them sorted, prepared
+    /// as these were, for a checkpoint whose own tokenizer class reads them
+    /// so ([`Self::key_sorted`]); made on the first such render.
+    key_sorted: OnceLock<Box<PreparedTools>>,
+}
+
+impl PreparedTools {
+    /// How many `tojson` texts each tool keeps at most, one per distinct
+    /// argument set of the filter, each about the tool's serialized bytes
+    /// (more under `indent`): what a keeper of prepared tools charges for
+    /// them on top of the values.
+    pub const KEPT_TOJSON_TEXTS_PER_TOOL: usize = KEPT_TOJSON_TEXTS_PER_TOOL;
+
+    /// Converts `tools` as a render converts [`ChatTemplateParams::tools`]:
+    /// the same values, each tool read through a `PreparedTool` that keeps
+    /// its `tojson` text once written.
+    pub fn new(tools: Vec<JsonValue>) -> Self {
+        let value = Value::from(
+            tools
+                .iter()
+                .map(PreparedTool::value)
+                .collect::<Vec<Value>>(),
+        );
+        Self {
+            tools,
+            value,
+            key_sorted: OnceLock::new(),
+        }
+    }
+
+    /// How many `tojson` texts the tools keep between them.
+    #[cfg(test)]
+    fn kept_tojson_texts(&self) -> Vec<usize> {
+        self.value
+            .try_iter()
+            .into_iter()
+            .flatten()
+            .map(|tool| {
+                tool.downcast_object_ref::<PreparedTool>()
+                    .map_or(0, PreparedTool::kept_texts)
+            })
+            .collect()
+    }
+
+    /// The values this was made of: what a caller passes as
+    /// [`ChatTemplateParams::tools`] beside it.
+    pub fn tools(&self) -> &[JsonValue] {
+        &self.tools
+    }
+
+    /// Whether this was made of `tools` (the same slice): the only tools it
+    /// is read for.
+    pub(crate) fn is_of(&self, tools: &[JsonValue]) -> bool {
+        std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len()
+    }
+
+    /// These tools with the keys of every map in them sorted, at every depth
+    /// (a tool's `function` before its `type`, a schema's `properties` before
+    /// its `type`), prepared as these were: what a checkpoint whose own
+    /// tokenizer class sorts the tools before its template or tool encoder
+    /// reads them renders. Made once, on the first call, and kept beside the
+    /// plain form, so a caller that keeps a prepared set per distinct tool
+    /// set spares the sort and the conversion per request as it spares them
+    /// for the plain form.
+    pub(crate) fn key_sorted(&self) -> &PreparedTools {
+        self.key_sorted
+            .get_or_init(|| Box::new(Self::key_sorted_of(&self.tools)))
+    }
+
+    /// `tools` with the keys of every map in them sorted, prepared
+    /// ([`Self::new`] of the sorted values); see [`Self::key_sorted`].
+    pub(crate) fn key_sorted_of(tools: &[JsonValue]) -> PreparedTools {
+        Self::new(tools.iter().map(sort_json_keys).collect())
+    }
+
+    /// The render's value of `tools`, when they are the values this was made
+    /// of (the same slice).
+    fn value_of(&self, tools: &[JsonValue]) -> Option<Value> {
+        self.is_of(tools).then(|| self.value.clone())
+    }
+}
+
+/// One tool of a [`PreparedTools`] value: the converted map, which the render
+/// reads as it reads any map (every read delegates to it), and that map's
+/// `tojson` texts by argument set, kept from the first filter call. A kept
+/// text is what the filter wrote for the map under those arguments, so
+/// `tool | tojson` renders the same bytes kept or written; written, it is a
+/// serialization of the schema for every request (one boxed iterator per map
+/// or array in it), kept, it is a clone of the text.
+struct PreparedTool {
+    map: Value,
+    texts: Mutex<Vec<(TojsonArgs, Value)>>,
+}
+
+/// The arguments a kept `tojson` text was written with. Texts under
+/// `sort_keys` are not kept: they are written from the value's tree.
+#[derive(Debug)]
+struct TojsonArgs {
+    indent: Option<Vec<u8>>,
+    separators: JsonSeparators,
+    ensure_ascii: bool,
+}
+
+impl TojsonArgs {
+    fn matches(
+        &self,
+        indent: Option<&[u8]>,
+        separators: &JsonSeparators,
+        ensure_ascii: bool,
+    ) -> bool {
+        self.ensure_ascii == ensure_ascii
+            && self.indent.as_deref() == indent
+            && self.separators.item == separators.item
+            && self.separators.key == separators.key
+    }
+}
+
+/// How many argument sets a tool keeps a text for: a template applies one
+/// form of the filter to a tool, two at most.
+const KEPT_TOJSON_TEXTS_PER_TOOL: usize = 4;
+
+impl PreparedTool {
+    /// The render's value of one tool: a map read through this, or the plain
+    /// value where the tool is not a map (nothing to keep a text for).
+    fn value(tool: &JsonValue) -> Value {
+        let map = Value::from_serialize(tool);
+        if map.kind() != ValueKind::Map {
+            return map;
+        }
+        Value::from_object(Self {
+            map,
+            texts: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn map(&self) -> Option<&DynObject> {
+        self.map.as_object()
+    }
+
+    /// The map's `tojson` text under these arguments: the kept one, else
+    /// written now and kept (up to [`KEPT_TOJSON_TEXTS_PER_TOOL`] sets).
+    fn tojson_text(
+        &self,
+        indent: Option<&[u8]>,
+        separators: &JsonSeparators,
+        ensure_ascii: bool,
+    ) -> std::result::Result<Value, MinijinjaError> {
+        let kept = self
+            .texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(args, _)| args.matches(indent, separators, ensure_ascii))
+            .map(|(_, text)| text.clone());
+        if let Some(text) = kept {
+            return Ok(text);
+        }
+        let text = Value::from_safe_string(serialize_with_python_json(
+            &self.map,
+            indent,
+            separators.clone(),
+            ensure_ascii,
+        )?);
+        let mut texts = self.texts.lock().unwrap_or_else(PoisonError::into_inner);
+        if texts.len() < KEPT_TOJSON_TEXTS_PER_TOOL
+            && !texts
+                .iter()
+                .any(|(args, _)| args.matches(indent, separators, ensure_ascii))
+        {
+            texts.push((
+                TojsonArgs {
+                    indent: indent.map(<[u8]>::to_vec),
+                    separators: separators.clone(),
+                    ensure_ascii,
+                },
+                text.clone(),
+            ));
+        }
+        Ok(text)
+    }
+
+    #[cfg(test)]
+    fn kept_texts(&self) -> usize {
+        self.texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// Prints as the map it reads through (`pprint`, `debug`).
+impl std::fmt::Debug for PreparedTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.map, f)
+    }
+}
+
+/// Every read a template makes of a tool (`tool.function`, `tool | items`,
+/// `tool | length`, `if tool`, `{{ tool }}`, equality, the slow `tojson`
+/// paths through `Serialize`) goes to the converted map, so the value
+/// behaves as the map did; only [`tojson_filter`] tells the two apart.
+impl Object for PreparedTool {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.map()?.get_value_by_str(key)
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.map()?.get_value(key)
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        self.map().map_or(Enumerator::Empty, DynObject::enumerate)
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        self.map()?.enumerator_len()
+    }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        self.map().is_some_and(DynObject::is_true)
+    }
+
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        match self.map() {
+            Some(map) => map.render(f),
+            None => f.write_str("{}"),
+        }
+    }
+}
+
+impl ChatTemplateParams<'_> {
+    /// Whether a render under these parameters carries the generation header
+    /// unless it continues the final message: the one `add_generation_prompt`
+    /// asks for, or the one a continuation the renderer cannot honour falls
+    /// back to, with the message's text after it. A render that continued
+    /// the message carries none (`ChatTemplateOutput::generation_prompt`).
+    pub fn generation_prompt_unless_continued(&self) -> bool {
+        self.add_generation_prompt || self.continue_final_message
+    }
+}
+
+/// The initial size of a `tojson` output buffer: room for a function schema
+/// of the usual size without a reallocation.
+const TOJSON_BUFFER_BYTES: usize = 1024;
+
+/// JSON separator pair passed through HuggingFace's `tojson` filter. The
+/// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
 struct JsonSeparators {
-    item: Vec<u8>,
-    key: Vec<u8>,
+    item: Cow<'static, [u8]>,
+    key: Cow<'static, [u8]>,
 }
 
 impl JsonSeparators {
-    fn python_default(indent: Option<i64>) -> Self {
-        // Python's json.dumps defaults to `(', ', ': ')` for compact output
-        // and `(',', ': ')` when pretty indentation is enabled.
-        let item = if indent.is_some() { "," } else { ", " };
+    /// Python's defaults: `(', ', ': ')` for compact output and `(',', ': ')`
+    /// when an indent was given (`pretty`), whatever the indent is: an empty
+    /// one still puts every item on its own line.
+    fn python_default(pretty: bool) -> Self {
+        let item: &'static [u8] = if pretty { b"," } else { b", " };
         Self {
-            item: item.as_bytes().to_vec(),
-            key: b": ".to_vec(),
+            item: Cow::Borrowed(item),
+            key: Cow::Borrowed(b": "),
         }
     }
 }
 
 /// Formatter matching Python's `json.dumps` separator and ASCII escaping rules.
 #[derive(Debug, Clone)]
-struct PythonJsonFormatter {
+struct PythonJsonFormatter<'a> {
     current_indent: usize,
     has_value: bool,
-    indent: Option<Vec<u8>>,
+    indent: Option<&'a [u8]>,
     separators: JsonSeparators,
     ensure_ascii: bool,
 }
 
-impl PythonJsonFormatter {
-    fn new(indent: Option<usize>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
+impl<'a> PythonJsonFormatter<'a> {
+    /// `indent` is the bytes written per level of nesting, borrowed from the
+    /// filter call that owns them, `None` for compact output; an empty indent
+    /// breaks the lines and indents nothing, as Python's `json.dumps(indent=0)`
+    /// does.
+    fn new(indent: Option<&'a [u8]>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
         Self {
             current_indent: 0,
             has_value: false,
-            indent: indent.map(|spaces| vec![b' '; spaces]),
+            indent,
             separators,
             ensure_ascii,
         }
@@ -924,7 +1203,7 @@ where
     ])
 }
 
-impl Formatter for PythonJsonFormatter {
+impl Formatter for PythonJsonFormatter<'_> {
     fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
     where
         W: ?Sized + io::Write,
@@ -969,7 +1248,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             self.current_indent -= 1;
             if self.has_value {
                 writer.write_all(b"\n")?;
@@ -983,7 +1262,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             if first {
                 writer.write_all(b"\n")?;
             } else {
@@ -1021,7 +1300,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             self.current_indent -= 1;
             if self.has_value {
                 writer.write_all(b"\n")?;
@@ -1035,7 +1314,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             if first {
                 writer.write_all(b"\n")?;
             } else {
@@ -1070,15 +1349,47 @@ fn invalid_tojson_option(message: impl Into<String>) -> MinijinjaError {
     MinijinjaError::new(ErrorKind::InvalidOperation, message.into())
 }
 
+/// The indent `tojson(indent=...)` asked for, as Python's `json.dumps` reads
+/// it: nothing (compact output); an integer, that many spaces, and none at
+/// all when it is zero or negative (Python multiplies one space by it, so the
+/// lines still break); a bool as the integer it is in Python (`True` is one
+/// space); a string as the literal indent (`"\t"`, `""`); any other kind is
+/// refused, as Python refuses a float.
+fn parse_indent(indent: Option<Value>) -> std::result::Result<Option<Vec<u8>>, MinijinjaError> {
+    let Some(indent) = indent else {
+        return Ok(None);
+    };
+    match indent.kind() {
+        ValueKind::None | ValueKind::Undefined => Ok(None),
+        ValueKind::Bool => Ok(Some(if indent.is_true() {
+            vec![b' ']
+        } else {
+            Vec::new()
+        })),
+        ValueKind::Number if indent.is_integer() => {
+            let spaces = indent.as_i64().ok_or_else(|| {
+                invalid_tojson_option("indent is too large to be a number of spaces")
+            })?;
+            Ok(Some(vec![b' '; usize::try_from(spaces).unwrap_or(0)]))
+        }
+        ValueKind::String => Ok(Some(
+            indent.as_str().unwrap_or_default().as_bytes().to_vec(),
+        )),
+        other => Err(invalid_tojson_option(format!(
+            "indent must be an integer or a string, not {other}"
+        ))),
+    }
+}
+
 fn parse_separators(
     separators: Option<Value>,
-    indent: Option<i64>,
+    pretty: bool,
 ) -> std::result::Result<JsonSeparators, MinijinjaError> {
     let Some(separators) = separators else {
-        return Ok(JsonSeparators::python_default(indent));
+        return Ok(JsonSeparators::python_default(pretty));
     };
     if separators.is_none() || separators.is_undefined() {
-        return Ok(JsonSeparators::python_default(indent));
+        return Ok(JsonSeparators::python_default(pretty));
     }
 
     let parsed: serde_json::Value = serde_json::to_value(&separators).map_err(|e| {
@@ -1103,29 +1414,21 @@ fn parse_separators(
         .ok_or_else(|| invalid_tojson_option("key separator must be a string"))?;
 
     Ok(JsonSeparators {
-        item: item.as_bytes().to_vec(),
-        key: key.as_bytes().to_vec(),
+        item: Cow::Owned(item.as_bytes().to_vec()),
+        key: Cow::Owned(key.as_bytes().to_vec()),
     })
 }
 
 fn serialize_with_python_json<T: Serialize>(
     value: &T,
-    indent: Option<i64>,
+    indent: Option<&[u8]>,
     separators: JsonSeparators,
     ensure_ascii: bool,
 ) -> std::result::Result<String, MinijinjaError> {
-    let indent = indent
-        .map(|spaces| {
-            if spaces < 0 {
-                Err(invalid_tojson_option("indent cannot be negative"))
-            } else {
-                Ok(spaces as usize)
-            }
-        })
-        .transpose()?;
-
     let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
-    let mut buf = Vec::new();
+    // Sized for a tool schema up front: a buffer grown from empty is
+    // reallocated at every doubling on the way to the same size.
+    let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
     value.serialize(&mut serializer).map_err(|e| {
         MinijinjaError::new(
@@ -1141,50 +1444,88 @@ fn serialize_with_python_json<T: Serialize>(
     })
 }
 
+/// Compact JSON spelling shared by the Jinja filter and native renderers.
+pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
+    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
+        .map_err(Into::into)
+}
+
+/// Whether a filter call passed no keyword argument at all. `Kwargs::args`
+/// lists the string keys only, so a splat with a non-string key would read
+/// as empty; the engine's own check, run before any read, is `Ok` for an
+/// empty map alone (a string key reads as unknown, a non-string key as its
+/// own error), and costs nothing on an empty map.
+fn passed_no_keyword(kwargs: &Kwargs) -> bool {
+    kwargs.args().next().is_none() && kwargs.assert_all_used().is_ok()
+}
+
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
 ///
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
 /// keyword arguments beyond what standard Jinja2 provides:
 /// - `ensure_ascii` (bool): Whether to escape non-ASCII characters
-/// - `indent` (int): Number of spaces for indentation (pretty-printing)
+/// - `indent` (int or str): the indent per level of nesting, as Python reads it: a number of
+///   spaces (zero or negative breaks the lines and indents nothing) or the literal string
 /// - `separators`: Custom item/key separators for JSON output
 /// - `sort_keys` (bool): Whether to sort dictionary keys
 ///
 /// This is necessary for compatibility with chat templates from HuggingFace Hub models.
-/// See: https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py
+/// See: <https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py>
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
-    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
-    let indent: Option<i64> = kwargs.get("indent")?;
-    let separators: Option<Value> = kwargs.get("separators")?;
-    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    // A call without keyword arguments, the common `value | tojson`, takes the
+    // defaults without reading the keywords: `Kwargs::get` records every key
+    // it reads in a set the engine allocates per call, so the four reads cost
+    // six allocations on each call, paid before a kept text is found. A call
+    // with keywords reads them as before, and an unknown one still raises the
+    // engine's own error.
+    let (ensure_ascii, indent, separators, sort_keys): (
+        Option<bool>,
+        Option<Value>,
+        Option<Value>,
+        Option<bool>,
+    ) = if passed_no_keyword(&kwargs) {
+        (None, None, None, None)
+    } else {
+        let ensure_ascii = kwargs.get("ensure_ascii")?;
+        let indent = kwargs.get("indent")?;
+        let separators = kwargs.get("separators")?;
+        let sort_keys = kwargs.get("sort_keys")?;
+        kwargs.assert_all_used()?;
+        (ensure_ascii, indent, separators, sort_keys)
+    };
 
-    // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
-    kwargs.assert_all_used()?;
-
-    let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
-        MinijinjaError::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to convert to JSON value: {e}"),
-        )
-    })?;
-
-    // Serialize with options
-    let json_str: std::result::Result<String, MinijinjaError> = {
-        let sorted_json;
-        let value_to_serialize = if sort_keys.unwrap_or(false) {
-            sorted_json = sort_json_keys(&json_value);
-            &sorted_json
-        } else {
-            &json_value
-        };
-
-        let separators = parse_separators(separators, indent)?;
+    let indent = parse_indent(indent)?;
+    let separators = parse_separators(separators, indent.is_some())?;
+    let ensure_ascii = ensure_ascii.unwrap_or(false);
+    // A tool of a prepared tool set keeps the text written for it under these
+    // arguments, so every later request with the same tools reads the text
+    // instead of serializing the schema again; sorted keys are written from
+    // the tree below, as for any value.
+    if !sort_keys.unwrap_or(false) {
+        if let Some(tool) = value.downcast_object_ref::<PreparedTool>() {
+            return tool.tojson_text(indent.as_deref(), &separators, ensure_ascii);
+        }
+    }
+    // The template value is written straight into its JSON text: its serde
+    // form is what a `serde_json::Value` built from it would serialize as
+    // (the same `Serialize` impl drives both, in the same key order), so
+    // the tree is built only when the keys are to be sorted, which needs
+    // the value as a whole.
+    let json_str = if sort_keys.unwrap_or(false) {
+        let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to convert to JSON value: {e}"),
+            )
+        })?;
         serialize_with_python_json(
-            value_to_serialize,
-            indent,
+            &sort_json_keys(&json_value),
+            indent.as_deref(),
             separators,
-            ensure_ascii.unwrap_or(false),
+            ensure_ascii,
         )
+    } else {
+        serialize_with_python_json(&value, indent.as_deref(), separators, ensure_ascii)
     };
 
     json_str.map(Value::from_safe_string)
@@ -1353,6 +1694,11 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
+    // Jinja2 writes `{{ x }}` as Python's `str(x)`, so a list or a dict comes
+    // out as its repr; minijinja would write it in Rust's debug form (see
+    // `python_formatter`).
+    env.set_formatter(python_formatter);
+
     // Register the template with owned storage (no lifetime dependency on caller)
     env.add_template_owned("chat".to_owned(), template)
         .map_err(|e| anyhow!("Failed to add template: {e}"))?;
@@ -1364,12 +1710,403 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // This overrides minijinja's built-in tojson to support additional kwargs
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
+    // Jinja2's `string` and `trim` filters start with `str(value)` too: a
+    // value `spelled_by_python` (a sequence, a map, a float) is written as
+    // Python spells it.
+    env.add_filter("string", python_string_filter);
+    env.add_filter("trim", python_trim_filter);
+    // So do `join` (of every item), `replace`, `upper`, `lower`,
+    // `capitalize` and `title`. Two remain with the engine: the `~` operator
+    // concatenates inside it (minijinja's own spelling of a list or a dict)
+    // and cannot be hooked from here; `format` reads its format string, a
+    // string in any template that uses it, and writes its arguments inside
+    // the engine too.
+    env.add_filter("join", python_join_filter);
+    env.add_filter("replace", python_replace_filter);
+    env.add_filter("upper", python_upper_filter);
+    env.add_filter("lower", python_lower_filter);
+    env.add_filter("capitalize", python_capitalize_filter);
+    env.add_filter("title", python_title_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
     env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// `str(value)` as Jinja2's string filters apply it: a string is itself, a
+/// value `spelled_by_python` (a sequence, a map, a float) is written as
+/// Python spells it (see `python_formatter`), anything else keeps
+/// minijinja's spelling.
+fn python_str(value: &Value) -> Cow<'_, str> {
+    match value.kind() {
+        ValueKind::String => Cow::Borrowed(value.as_str().unwrap_or_default()),
+        _ if spelled_by_python(value) => {
+            let mut text = String::new();
+            // Writing into a String cannot fail.
+            let _ = write_python_repr(&mut text, value);
+            Cow::Owned(text)
+        }
+        _ => Cow::Owned(value.to_string()),
+    }
+}
+
+/// Whether `str(value)` differs from the template engine's own spelling: a
+/// sequence or a map (Python's repr of it) and a float (`1e-05`, `1e+16`,
+/// `nan`, where the engine writes `0.00001`, `10000000000000000.0`, `NaN`).
+/// An integer, a string, `True` / `False` / `None` spell alike.
+fn spelled_by_python(value: &Value) -> bool {
+    match value.kind() {
+        ValueKind::Seq | ValueKind::Map => true,
+        ValueKind::Number => !value.is_integer(),
+        _ => false,
+    }
+}
+
+/// Jinja2's `string` filter, `str(value)`: a value `spelled_by_python` comes
+/// out as Python spells it, as it does from `{{ x }}`.
+fn python_string_filter(value: Value) -> Value {
+    match value.kind() {
+        ValueKind::String => value,
+        _ => Value::from(python_str(&value).into_owned()),
+    }
+}
+
+/// Jinja2's `trim` filter, `str(value).strip(chars)`: the same `str` as the
+/// `string` filter, then minijinja's trim.
+fn python_trim_filter(value: Value, chars: Option<Cow<'_, str>>) -> String {
+    let text = python_str(&value);
+    match chars {
+        Some(chars) => {
+            let chars: Vec<char> = chars.chars().collect();
+            text.trim_matches(&chars[..]).to_string()
+        }
+        None => text.trim().to_string(),
+    }
+}
+
+/// Jinja2's `join` filter, `joiner.join(str(item) for item in value)`: an
+/// item that is not a string goes through the same `str`; with
+/// `attribute=`, each item's attribute (a dotted path) is joined instead.
+fn python_join_filter(
+    value: Value,
+    joiner: Option<Cow<'_, str>>,
+    kwargs: Kwargs,
+) -> std::result::Result<String, MinijinjaError> {
+    // As in `tojson_filter`: no keyword, no recorded read.
+    let attribute: Option<Cow<'_, str>> = if passed_no_keyword(&kwargs) {
+        None
+    } else {
+        let attribute = kwargs.get("attribute")?;
+        kwargs.assert_all_used()?;
+        attribute
+    };
+    let joiner = joiner.as_deref().unwrap_or_default();
+    let mut text = String::new();
+    for (index, item) in value.try_iter()?.enumerate() {
+        if index > 0 {
+            text.push_str(joiner);
+        }
+        let item =
+            match &attribute {
+                // Jinja2's attribute getter: a dotted path, each segment an index
+                // when it is a number and an attribute otherwise.
+                Some(attribute) => attribute.split('.').try_fold(item, |value, segment| {
+                    match segment.parse::<usize>() {
+                        Ok(index) => value.get_item(&Value::from(index)),
+                        Err(_) => value.get_attr(segment),
+                    }
+                })?,
+                None => item,
+            };
+        text.push_str(&python_str(&item));
+    }
+    Ok(text)
+}
+
+/// Jinja2's `replace` filter, `str(value).replace(old, new, count)`: a
+/// non-negative `count` bounds the replacements, as Python's does.
+fn python_replace_filter(
+    value: Value,
+    old: Cow<'_, str>,
+    new: Cow<'_, str>,
+    count: Option<i64>,
+) -> String {
+    let text = python_str(&value);
+    match count.and_then(|count| usize::try_from(count).ok()) {
+        Some(count) => text.replacen(&*old, &new, count),
+        None => text.replace(&*old, &new),
+    }
+}
+
+/// Jinja2's `upper` filter, `str(value).upper()`.
+fn python_upper_filter(value: Value) -> String {
+    python_str(&value).to_uppercase()
+}
+
+/// Jinja2's `lower` filter, `str(value).lower()`.
+fn python_lower_filter(value: Value) -> String {
+    python_str(&value).to_lowercase()
+}
+
+/// Jinja2's `capitalize` filter, `str(value).capitalize()`: the first
+/// character upper-cased, the rest lower-cased in the whole string's context,
+/// so a sigma right after the first character takes the final form Python
+/// gives it (`'ΑΣ'` is `Ας` here and `Ασ` under `title`, which slices the
+/// word first). Python 3.8+ title-cases the first character: the same as
+/// upper-casing it but for `ß`, the digraphs, the ligatures, Georgian and
+/// the Greek letters with an iota subscript.
+fn python_capitalize_filter(value: Value) -> String {
+    let text = python_str(&value);
+    let Some(first) = text.chars().next() else {
+        return String::new();
+    };
+    // The whole string lower-cased keeps the first character in the sigma
+    // rule's context, as CPython's `capitalize` reads it; the first
+    // character's own lower-case form is then swapped for the upper-case one.
+    let lowered = text.to_lowercase();
+    let first_lowered = first.to_lowercase().map(char::len_utf8).sum::<usize>();
+    let mut out = String::with_capacity(lowered.len());
+    out.extend(first.to_uppercase());
+    out.push_str(&lowered[first_lowered..]);
+    out
+}
+
+/// Jinja2's `title` filter (not Python's `str.title()`): each word's first
+/// character upper-cased and the rest lower-cased as one string (a word-final
+/// sigma takes the final form Python's `lower()` gives it), a word starting
+/// after a run of `-`, `(`, `{`, `[`, `<` or Python's `\s` (Jinja2's
+/// `_word_beginning_split_re`, `([-\s({\[<]+)`; see `python_isspace`), on
+/// the Python `str`.
+fn python_title_filter(value: Value) -> String {
+    let is_separator = |c: char| python_isspace(c) || matches!(c, '-' | '(' | '{' | '[' | '<');
+    let text = python_str(&value);
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find(|c: char| !is_separator(c)) {
+        let (separators, word) = rest.split_at(start);
+        out.push_str(separators);
+        let end = word.find(is_separator).unwrap_or(word.len());
+        let mut chars = word[..end].chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(&chars.as_str().to_lowercase());
+        }
+        rest = &word[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The output formatter of `{{ }}`: a sequence, a map or a float is written
+/// as Python's `str` spells it (see `spelled_by_python`), everything else as
+/// minijinja's default formatter writes it (a string as it is, integers,
+/// `True` / `False` / `None` already spell as `str` does). The `~` operator
+/// and the string filters not re-registered in `build_environment` go
+/// through the engine's own `Display`, which this renderer cannot hook.
+/// A template that prints a message's content where the engine's chat utils
+/// handed it a list of parts writes `[{'type': 'text', 'text': 'Hi'}]` into
+/// the prompt, and so must this renderer; minijinja's debug form
+/// (`[{"type": "text", "text": "Hi"}]`) is different bytes.
+fn python_formatter(
+    out: &mut Output,
+    state: &State,
+    value: &Value,
+) -> std::result::Result<(), MinijinjaError> {
+    if spelled_by_python(value) {
+        write_python_repr(out, value).map_err(Into::into)
+    } else {
+        minijinja::escape_formatter(out, state, value)
+    }
+}
+
+/// `repr(value)` of a JSON value, as the template renderer writes a value
+/// `spelled_by_python` it prints (a sequence, a map, a float; see
+/// `write_python_repr`): for a native encoder that must write the bytes the
+/// checkpoint's template would.
+pub(crate) fn python_repr(value: &JsonValue) -> String {
+    let mut text = String::new();
+    // Writing into a String cannot fail.
+    let _ = write_python_repr(&mut text, &Value::from_serialize(value));
+    text
+}
+
+/// `repr(value)` as Python writes it: strings quoted with Python's quote
+/// choice and escapes, `True` / `False` / `None`, Python's float spelling,
+/// `[a, b]` for a sequence and `{k: v}` for a map in insertion order. A value
+/// of another kind (bytes, an iterator, a plain object) keeps minijinja's
+/// spelling.
+fn write_python_repr(out: &mut dyn std::fmt::Write, value: &Value) -> std::fmt::Result {
+    match value.kind() {
+        ValueKind::None => out.write_str("None"),
+        ValueKind::Bool => out.write_str(if value.is_true() { "True" } else { "False" }),
+        ValueKind::Number if value.is_integer() => write!(out, "{value}"),
+        ValueKind::Number => match f64::try_from(value.clone()) {
+            Ok(number) => write_python_float(out, number),
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::String => write_python_str(out, value.as_str().unwrap_or_default()),
+        ValueKind::Seq => match value.try_iter() {
+            Ok(items) => {
+                out.write_str("[")?;
+                for (index, item) in items.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("]")
+            }
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::Map => match value.as_object().and_then(|map| map.try_iter_pairs()) {
+            Some(pairs) => {
+                out.write_str("{")?;
+                for (index, (key, item)) in pairs.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &key)?;
+                    out.write_str(": ")?;
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("}")
+            }
+            None => write!(out, "{value}"),
+        },
+        _ => write!(out, "{value}"),
+    }
+}
+
+/// `repr(float)`: the shortest digits that read back to the number, written
+/// positionally when the decimal point falls within 1e-4 .. 1e16 and in
+/// exponent form with a sign and at least two exponent digits beyond
+/// (`1e+16`, `1e-05`), `.0` on a whole number, `nan`, `inf` and `-inf`.
+fn write_python_float(out: &mut dyn std::fmt::Write, number: f64) -> std::fmt::Result {
+    if number.is_nan() {
+        return out.write_str("nan");
+    }
+    if number.is_infinite() {
+        return out.write_str(if number < 0.0 { "-inf" } else { "inf" });
+    }
+    if number.is_sign_negative() {
+        out.write_str("-")?;
+    }
+    // Rust's `{:e}` is the shortest round-trip form: `d.ddde[-]x`.
+    let scientific = format!("{:e}", number.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // The digits before the decimal point (Python's `decpt`).
+    let point = exponent + 1;
+    if !(-3..=16).contains(&point) {
+        out.write_str(&digits[..1])?;
+        if digits.len() > 1 {
+            write!(out, ".{}", &digits[1..])?;
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return write!(out, "e{sign}{:02}", exponent.abs());
+    }
+    if point <= 0 {
+        write!(
+            out,
+            "0.{}{digits}",
+            "0".repeat(point.unsigned_abs() as usize)
+        )
+    } else if point as usize >= digits.len() {
+        write!(
+            out,
+            "{digits}{}.0",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        let (whole, fraction) = digits.split_at(point as usize);
+        write!(out, "{whole}.{fraction}")
+    }
+}
+
+/// `repr(str)`: single quotes, or double quotes when the text holds a single
+/// quote and no double quote; `\\`, the quote, `\t`, `\n`, `\r` escaped, and
+/// every other character `str.isprintable` rejects as `\xNN`, `\uNNNN` or
+/// `\UNNNNNNNN`.
+fn write_python_str(out: &mut dyn std::fmt::Write, text: &str) -> std::fmt::Result {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.write_char(quote)?;
+    // The text is written in runs between the characters that need an
+    // escape; printable ASCII, the common case, is one run.
+    let mut plain = 0;
+    for (at, c) in text.char_indices() {
+        let code = c as u32;
+        if (0x20..0x7f).contains(&code) && c != '\\' && c != quote {
+            continue;
+        }
+        if code >= 0x80 && python_printable(c) {
+            continue;
+        }
+        out.write_str(&text[plain..at])?;
+        match c {
+            '\\' => out.write_str("\\\\")?,
+            '\t' => out.write_str("\\t")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            c if c == quote => {
+                out.write_char('\\')?;
+                out.write_char(c)?;
+            }
+            _ if code < 0x100 => write!(out, "\\x{code:02x}")?,
+            _ if code < 0x10000 => write!(out, "\\u{code:04x}")?,
+            _ => write!(out, "\\U{code:08x}")?,
+        }
+        plain = at + c.len_utf8();
+    }
+    out.write_str(&text[plain..])?;
+    out.write_char(quote)
+}
+
+/// `str.isprintable` for one character, which decides what `repr` escapes:
+/// everything but the control (Cc), format (Cf), private-use (Co), separator
+/// (Zs other than the space, Zl, Zp) characters and the noncharacters. An
+/// unassigned code point (Cn), which Python also escapes, is written as it is.
+fn python_printable(c: char) -> bool {
+    let code = c as u32;
+    !(c.is_control()
+        || matches!(
+            code,
+            0xa0 | 0x1680 | 0x2000..=0x200a | 0x202f | 0x205f | 0x3000
+        )
+        || matches!(code, 0x2028 | 0x2029)
+        || matches!(
+            code,
+            0xad | 0x600..=0x605
+                | 0x61c
+                | 0x6dd
+                | 0x70f
+                | 0x890
+                | 0x891
+                | 0x8e2
+                | 0x180e
+                | 0x200b..=0x200f
+                | 0x202a..=0x202e
+                | 0x2060..=0x2064
+                | 0x2066..=0x206f
+                | 0xfeff
+                | 0xfff9..=0xfffb
+                | 0x110bd
+                | 0x110cd
+                | 0x13430..=0x1343f
+                | 0x1bca0..=0x1bca3
+                | 0x1d173..=0x1d17a
+                | 0xe0001
+                | 0xe0020..=0xe007f
+        )
+        || matches!(code, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+        || matches!(code, 0xfdd0..=0xfdef)
+        || (code & 0xfffe) == 0xfffe)
 }
 
 /// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
@@ -1449,7 +2186,9 @@ fn detect_root_role_support(template: &str) -> bool {
 /// message is not the first message (the engine's `_consolidate_system_messages`,
 /// which follows the rewrite in its renderer). `None` when no message has
 /// the role, so the caller keeps its slice.
-fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn developer_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_developer =
         |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
     if !messages.iter().any(is_developer) {
@@ -1481,7 +2220,9 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
 /// [`developer_messages_as_system`]), so a template that reads one leading
 /// system message keeps a system message that followed the root. `None`
 /// when no message has the role, so the caller keeps its slice.
-fn root_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn root_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_root = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("root");
     if !messages.iter().any(is_root) {
         return None;
@@ -1554,9 +2295,10 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
 /// the prompt is cut where it lands.
 const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
-/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
-/// checkpoints' whitespace runs go by: Unicode white space plus the
-/// separators U+001C..=U+001F.
+/// Python's `str.isspace` (and `re`'s `\s` on a `str` pattern), which
+/// transformers' `strip`/`rstrip`, the checkpoints' whitespace runs and
+/// Jinja2's `title` go by: Unicode white space plus the separators
+/// U+001C..=U+001F.
 pub(crate) fn python_isspace(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
@@ -1671,6 +2413,18 @@ fn render_continuing_final_message(
     messages: &[JsonValue],
     params: ChatTemplateParams,
 ) -> Result<(String, bool)> {
+    continue_final_message(messages, params, |messages, params| {
+        render_messages(env, messages.iter(), params).map(|(text, _)| text)
+    })
+}
+
+/// Continue a message with the same marker, cut and fallback rules for both
+/// Jinja and native renderers. The supplied renderer receives no continuation flag.
+pub(crate) fn continue_final_message(
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+    render: impl Fn(&[JsonValue], ChatTemplateParams) -> Result<String>,
+) -> Result<(String, bool)> {
     if params.add_generation_prompt {
         return Err(anyhow!(
             "continue_final_message and add_generation_prompt are not compatible"
@@ -1689,7 +2443,9 @@ fn render_continuing_final_message(
             continue_final_message: false,
             ..params
         };
-        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        let mut tagged_messages = head.to_vec();
+        tagged_messages.push(tagged);
+        let rendered = render(&tagged_messages, params)?;
         cut_at_final_message(rendered, text, &marker)
     })();
     let reason = match continued {
@@ -1707,8 +2463,7 @@ fn render_continuing_final_message(
         ));
     }
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
-    let (mut prompt, _) = render_chat_template(
-        env,
+    let mut prompt = render(
         head,
         ChatTemplateParams {
             add_generation_prompt: true,
@@ -1763,10 +2518,15 @@ fn render_messages<'a>(
     // request carries none: the names are defined and hold none. A template
     // may test them either way (`tools is none`, `tools is defined and tools`,
     // `tools is iterable`); undefined would send a template that tests
-    // `is none` down its tools branch with nothing to write.
-    let tools_value = params
-        .tools
-        .map_or_else(|| Value::from(()), Value::from_serialize);
+    // `is none` down its tools branch with nothing to write. A caller that
+    // converted the tools once hands the value in; else they are converted here.
+    let tools_value = match params.tools {
+        Some(tools) => params
+            .prepared_tools
+            .and_then(|prepared| prepared.value_of(tools))
+            .unwrap_or_else(|| Value::from_serialize(tools)),
+        None => Value::from(()),
+    };
     let documents_value = params
         .documents
         .map_or_else(|| Value::from(()), Value::from_serialize);
@@ -1815,7 +2575,9 @@ fn render_messages<'a>(
 
 /// The messages with every string `content` of a non-tool message replaced by
 /// a one-item text part list, or `None` when no message has one.
-fn string_content_as_text_parts(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn string_content_as_text_parts(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     fn needs_wrap(message: &serde_json::Value) -> bool {
         message
             .get("content")
@@ -1895,9 +2657,115 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
         ));
     }
 
-    // Plain .jinja file
-    let template = content.trim().replace("\\n", "\n");
-    Ok(Some(template))
+    // A plain .jinja file is the template as written: transformers' tokenizer
+    // reads a checkpoint's `chat_template.jinja` whole, and so does the
+    // `--chat-template` loader of the engine the render fixtures are recorded
+    // against, and neither translates its text: a newline the template opens
+    // with reaches the prompt (`\n<|im_start|>system`), and a backslash
+    // followed by an `n` in the file's text stays the two characters it is
+    // (only inside a string literal does the template engine's own escape
+    // make a newline of it, in Jinja2 and here alike), so a checkpoint whose
+    // file is one escaped line renders as the engine renders it. An engine's
+    // own HTTP server may load an operator-supplied file with a loader of its
+    // own; this renderer follows transformers. The template engine drops
+    // exactly one trailing newline of the source, as Jinja2 does. A file
+    // written for a loader that unescaped the pair is logged once here,
+    // since nothing else at runtime would say why its prompts carry it.
+    if text_outside_tags_holds_backslash_n(&content) {
+        tracing::warn!(
+            path = %template_path,
+            "chat template text contains a literal backslash-n outside its tags; it is rendered as written, as transformers does"
+        );
+    }
+    Ok(Some(content))
+}
+
+/// Whether the template's text outside its `{{ }}`, `{% %}` and `{# #}` tags
+/// holds a backslash followed by an `n`: the pair a loader that unescaped it
+/// (an engine's own `--chat-template` loader) turned into a newline and this
+/// loader renders as written. Inside a tag the template engine's own string
+/// escape makes the newline, as in Jinja2, so the pair there is not counted.
+fn text_outside_tags_holds_backslash_n(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    let mut close: Option<&[u8]> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        match close {
+            Some(end) if rest.starts_with(end) => {
+                close = None;
+                i += end.len();
+            }
+            Some(_) => i += 1,
+            None if rest.starts_with(b"{{") => {
+                close = Some(b"}}");
+                i += 2;
+            }
+            None if rest.starts_with(b"{%") => {
+                close = Some(b"%}");
+                i += 2;
+            }
+            None if rest.starts_with(b"{#") => {
+                close = Some(b"#}");
+                i += 2;
+            }
+            None if rest.starts_with(b"\\n") => return true,
+            None => i += 1,
+        }
+    }
+    false
+}
+
+/// The chat templates a `tokenizer_config.json` `chat_template` value holds:
+/// a string is the one template; a list of named templates (`[{"name":
+/// "default", "template": ...}, {"name": "tool_use", "template": ...}]`) is
+/// read as transformers reads it into a dict, and the engine's chat utils
+/// take `tool_use` when the request declares tools and `default` otherwise
+/// (`get_chat_template`). A later entry of a name replaces an earlier one;
+/// any other value is no template.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigChatTemplates {
+    pub default: Option<String>,
+    pub tool_use: Option<String>,
+}
+
+impl ConfigChatTemplates {
+    pub fn read(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            Some(serde_json::Value::String(template)) => Self {
+                default: Some(template.clone()),
+                tool_use: None,
+            },
+            Some(serde_json::Value::Array(entries)) => {
+                let mut templates = Self::default();
+                for entry in entries {
+                    let name = entry.get("name").and_then(serde_json::Value::as_str);
+                    let template = entry.get("template").and_then(serde_json::Value::as_str);
+                    match (name, template) {
+                        (Some("default"), Some(template)) => {
+                            templates.default = Some(template.to_string());
+                        }
+                        (Some("tool_use"), Some(template)) => {
+                            templates.tool_use = Some(template.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                templates
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Whether the value names a template at all.
+    pub fn is_some(&self) -> bool {
+        self.default.is_some() || self.tool_use.is_some()
+    }
+
+    /// Whether the value names no template.
+    pub fn is_none(&self) -> bool {
+        !self.is_some()
+    }
 }
 
 /// Chat template state that can be embedded in any tokenizer struct.
@@ -1933,6 +2801,23 @@ pub struct ChatTemplateState {
     /// messages, the way such a request was dispatched before the MiniMax
     /// profile kept the role, instead of letting the template drop them.
     root_role_supported: bool,
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent (see [`Self::raw_tool_call_arguments`]).
+    raw_tool_call_arguments: bool,
+    /// The `tool_use` template of a configuration that names its templates
+    /// (see [`ConfigChatTemplates`]), rendered in place of the default one
+    /// when the request declares tools, as the engine's chat utils render.
+    /// The accessors answer for the default template.
+    tool_use: Option<Box<ChatTemplateState>>,
+    /// The processor's template of a checkpoint that ships one beside the
+    /// tokenizer's and differs from it (see [`Self::from_checkpoint`]),
+    /// rendered in place of the default one when the request declares no
+    /// tools, as the engine's server resolves a request's template: the
+    /// request's own first, the processor's second unless tools are
+    /// declared, the tokenizer's third. The accessors answer for the default
+    /// template, which the processor's agrees with on the thinking answers;
+    /// [`Self::content_format_for_tools`] answers for the one selected.
+    processor: Option<Box<ChatTemplateState>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1942,6 +2827,8 @@ impl std::fmt::Debug for ChatTemplateState {
             .field("content_format", &self.content_format)
             .field("thinking_toggle", &self.thinking_toggle)
             .field("think_in_prefill", &self.think_in_prefill)
+            .field("has_tool_use", &self.tool_use.is_some())
+            .field("has_processor", &self.processor.is_some())
             .finish()
     }
 }
@@ -1960,7 +2847,7 @@ impl ChatTemplateState {
             .is_none_or(detect_developer_role_support);
         let root_role_supported = template.as_deref().is_none_or(detect_root_role_support);
         let env = template.map(build_environment).transpose()?;
-        Ok(Self {
+        let mut state = Self {
             env,
             content_format,
             thinking_toggle,
@@ -1969,7 +2856,124 @@ impl ChatTemplateState {
             prefill_opens_think_block,
             developer_role_supported,
             root_role_supported,
-        })
+            raw_tool_call_arguments: false,
+            tool_use: None,
+            processor: None,
+        };
+        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
+    }
+
+    /// The templates of a configuration (see [`ConfigChatTemplates`]): the
+    /// default one, and the `tool_use` one for requests that declare tools.
+    pub fn from_config(templates: ConfigChatTemplates) -> Result<Self> {
+        let mut state = Self::new(templates.default)?;
+        if let Some(template) = templates.tool_use {
+            let tool_use = Self::new(Some(template))?;
+            // A request is prepared (its content shape, its thinking switch)
+            // and its answer read (the prefill's think block) by the default
+            // template's answers before the template is chosen; a pair that
+            // disagrees on them is prepared for the wrong one when tools are
+            // declared, so say so once at load, naming every answer tested.
+            if tool_use.content_format != state.content_format
+                || tool_use.thinking_toggle != state.thinking_toggle
+                || tool_use.thinking_key_name != state.thinking_key_name
+                || tool_use.think_in_prefill != state.think_in_prefill
+                || tool_use.prefill_opens_think_block != state.prefill_opens_think_block
+            {
+                tracing::warn!(
+                    default_content_format = ?state.content_format,
+                    tool_use_content_format = ?tool_use.content_format,
+                    default_thinking_toggle = ?state.thinking_toggle,
+                    tool_use_thinking_toggle = ?tool_use.thinking_toggle,
+                    default_thinking_key_name = ?state.thinking_key_name,
+                    tool_use_thinking_key_name = ?tool_use.thinking_key_name,
+                    default_think_in_prefill = state.think_in_prefill,
+                    tool_use_think_in_prefill = tool_use.think_in_prefill,
+                    default_prefill_opens_think_block = state.prefill_opens_think_block,
+                    tool_use_prefill_opens_think_block = tool_use.prefill_opens_think_block,
+                    "the named chat templates disagree on how a request is prepared; \
+                     requests are prepared by the default template's answers"
+                );
+            }
+            state.tool_use = Some(Box::new(tool_use));
+        }
+        Ok(state)
+    }
+
+    /// The templates of a checkpoint: the configuration's (see
+    /// [`Self::from_config`]) and the processor's, the legacy
+    /// `chat_template.json` a multimodal checkpoint may ship beside the
+    /// tokenizer's template. The engine's server renders a request that
+    /// declares no tools through the processor's template when the checkpoint
+    /// has one, and one that declares tools through the tokenizer's, so the
+    /// processor's is kept for the tool-less requests where it differs from
+    /// the default template; one equal to it, or one without a default
+    /// template to differ from (the loaders take the legacy file as the one
+    /// template of such a configuration), changes nothing.
+    ///
+    /// The processor's template is kept only when it agrees with the default
+    /// one on how a request's thinking is prepared and its answer read (the
+    /// toggle and its key, the prefill's think block) and on how a history
+    /// tool call's arguments are written: those answers are read from the
+    /// default template before the request's template is chosen, so a
+    /// processor template that disagrees would render a prompt the parser is
+    /// not set up for. Such a template, like one that does not compile, is
+    /// not used, every request renders through the tokenizer's templates as
+    /// before, and the load says why. The content format may differ: it
+    /// follows the selected template ([`Self::content_format_for_tools`]).
+    pub fn from_checkpoint(
+        templates: ConfigChatTemplates,
+        processor: Option<String>,
+    ) -> Result<Self> {
+        let processor = processor.filter(|template| {
+            templates
+                .default
+                .as_deref()
+                .is_some_and(|default| default != template)
+        });
+        let mut state = Self::from_config(templates)?;
+        if let Some(template) = processor {
+            match Self::new(Some(template)) {
+                Ok(processor) if state.prepares_thinking_as(&processor) => {
+                    state.processor = Some(Box::new(processor));
+                }
+                Ok(processor) => tracing::warn!(
+                    default_thinking_toggle = ?state.thinking_toggle,
+                    processor_thinking_toggle = ?processor.thinking_toggle,
+                    default_thinking_key_name = ?state.thinking_key_name,
+                    processor_thinking_key_name = ?processor.thinking_key_name,
+                    default_think_in_prefill = state.think_in_prefill,
+                    processor_think_in_prefill = processor.think_in_prefill,
+                    default_prefill_opens_think_block = state.prefill_opens_think_block,
+                    processor_prefill_opens_think_block = processor.prefill_opens_think_block,
+                    default_raw_tool_call_arguments = state.raw_tool_call_arguments(),
+                    processor_raw_tool_call_arguments = processor.raw_tool_call_arguments(),
+                    "the checkpoint's processor chat template disagrees with the tokenizer's on \
+                     how a request's thinking is prepared and read or on how a history tool \
+                     call's arguments are written, and is not used; requests render through the \
+                     tokenizer's template"
+                ),
+                Err(e) => tracing::warn!(
+                    "the checkpoint's processor chat template does not compile and is not used; \
+                     requests render through the tokenizer's template: {e}"
+                ),
+            }
+        }
+        Ok(state)
+    }
+
+    /// Whether `other` prepares a request's thinking, reads its answer and
+    /// writes a history tool call's arguments as this template does (see
+    /// [`Self::from_checkpoint`]).
+    fn prepares_thinking_as(&self, other: &Self) -> bool {
+        other.thinking_toggle == self.thinking_toggle
+            && other.thinking_key_name == self.thinking_key_name
+            && other.think_in_prefill == self.think_in_prefill
+            && other.prefill_opens_think_block == self.prefill_opens_think_block
+            // The answer the gateway reads: a named pair's comes from its
+            // `tool_use` template (see [`Self::raw_tool_call_arguments`]).
+            && other.raw_tool_call_arguments == self.raw_tool_call_arguments()
     }
 
     /// Create a `ChatTemplateState` with no template set.
@@ -1986,6 +2990,9 @@ impl ChatTemplateState {
             prefill_opens_think_block: false,
             developer_role_supported: true,
             root_role_supported: true,
+            raw_tool_call_arguments: false,
+            tool_use: None,
+            processor: None,
         }
     }
 
@@ -2004,6 +3011,42 @@ impl ChatTemplateState {
     /// after the generation prompt (see
     /// [`ChatTemplateParams::continue_final_message`]).
     pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        self.template_for(&params)
+            .render_with_continuation(messages, params)
+    }
+
+    /// The template a request renders through (see
+    /// [`Self::template_for_tools`]).
+    fn template_for(&self, params: &ChatTemplateParams) -> &Self {
+        self.template_for_tools(params.tools.is_some())
+    }
+
+    /// The template a request renders through: the `tool_use` one of a
+    /// configuration that names it when the request declares tools, the
+    /// processor's one of a checkpoint that ships it when the request
+    /// declares none, else this one.
+    fn template_for_tools(&self, has_tools: bool) -> &Self {
+        let selected = if has_tools {
+            &self.tool_use
+        } else {
+            &self.processor
+        };
+        selected.as_deref().unwrap_or(self)
+    }
+
+    /// The content format of the template a request renders through
+    /// (`template_for_tools`): what the request's message content is
+    /// shaped into before the render, as the engine's server detects it on
+    /// the template it resolved for the request.
+    pub fn content_format_for_tools(&self, has_tools: bool) -> ChatTemplateContentFormat {
+        self.template_for_tools(has_tools).content_format
+    }
+
+    fn render_with_continuation(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
@@ -2127,6 +3170,10 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        // A replacement template stands alone, as a template file does.
+        self.tool_use = None;
+        self.processor = None;
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
 
@@ -2167,821 +3214,54 @@ impl ChatTemplateState {
     pub fn prefill_opens_think_block(&self) -> bool {
         self.prefill_opens_think_block
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Transformers' `{% generation %}` block (the assistant-token mask marker)
-    /// renders its body; the engine here has no such statement, so the block
-    /// is rewritten to a plain `if` before parsing, and the content-format
-    /// detection parses such a template as well.
-    #[test]
-    fn generation_blocks_render_their_body() {
-        let template = "{%- for m in messages -%}\n{%- if m.role == 'assistant' -%}\n\
-                        {% generation %}\n<a>{{ m.content }}</a>\n{%- endgeneration -%}\n\
-                        {%- else -%}\n<u>{{ m.content }}</u>\n{%- endif -%}\n{%- endfor -%}";
-        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
-        let messages = [
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": "yo"}),
-        ];
-        let rendered = processor
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(rendered, "<u>hi</u><a>yo</a>");
-
-        let parts_template = "{% for message in messages %}{% if message['role'] == 'user' %}USER: \
-                              {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}\
-                              {% generation %}{{ content['text'] + ' ' }}{% endgeneration %}{% endfor %}\
-                              {% endif %}{% endfor %}";
-        assert_eq!(
-            detect_chat_template_content_format(parts_template),
-            ChatTemplateContentFormat::OpenAI
-        );
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent: the Jinja renderer's answer to
+    /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
+    /// arguments as a JSON string and the gateway parses them into the object
+    /// the Transformers docs say a template reads; a template that writes
+    /// them by string concatenation of `'<sep>'`, `tool['function']['arguments']`
+    /// and `'<end>'` cannot render that object, so the string must reach it as
+    /// written. Resolved when the template is bound (see
+    /// `Self::writes_tool_call_arguments_as_text`).
+    pub fn raw_tool_call_arguments(&self) -> bool {
+        // In a named pair the `tool_use` template is the one with the
+        // tool-call branch, and every request that renders a tool call goes
+        // through it; the default template (plain chat, as a rule) has no
+        // answer of its own.
+        self.tool_use
+            .as_ref()
+            .map_or(self.raw_tool_call_arguments, |tool_use| {
+                tool_use.raw_tool_call_arguments
+            })
     }
 
-    /// A template that keeps the messages it loops over in a namespace
-    /// attribute (`ns.rest = messages[1:]`) and renders each message's
-    /// content through a macro that walks its parts is of the "openai"
-    /// format: its parts reach the template, which writes the media anchors
-    /// itself. Any other non-name assignment target still falls back to the
-    /// "string" format.
-    #[test]
-    fn namespace_message_lists_are_followed_to_their_content_loop() {
-        let template = "{%- macro render_content(content) -%}\
-                        {%- if content is string -%}{{ content }}\
-                        {%- else -%}{%- for part in content -%}\
-                        {%- if part.get('type', '') in ['image', 'image_url'] -%}<|patch|>\
-                        {%- elif part.get('type', '') == 'text' -%}{{ part.get('text', '') }}\
-                        {%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}\
-                        {%- set ns = namespace(rest=messages) -%}\
-                        {%- if messages and messages[0]['role'] == 'system' -%}\
-                        {%- set ns.rest = messages[1:] -%}{%- endif -%}\
-                        {%- for message in ns.rest -%}\
-                        <|start|>{{ message['role'] }}<|message|>{{ render_content(message['content']) }}<|eot|>\
-                        {%- endfor -%}";
-        assert_eq!(
-            detect_chat_template_content_format(template),
-            ChatTemplateContentFormat::OpenAI
-        );
-        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
-        let messages = [serde_json::json!({"role": "user", "content": [
-            {"type": "image"}, {"type": "text", "text": "what is this?"}
-        ]})];
-        let rendered = processor
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<|start|>user<|message|><|patch|>what is this?<|eot|>"
-        );
-
-        // A plain string-content template with the same namespace shape stays string-format.
-        let plain = "{%- set ns = namespace(rest=messages) -%}{%- for message in ns.rest -%}\
-                     {{ message['content'] }}{%- endfor -%}";
-        assert_eq!(
-            detect_chat_template_content_format(plain),
-            ChatTemplateContentFormat::String
-        );
-    }
-
-    /// The rewrite keeps each tag's whitespace modifiers and leaves a template
-    /// without the block untouched.
-    #[test]
-    fn generation_tags_are_rewritten_with_their_modifiers() {
-        assert_eq!(
-            plain_generation_blocks(
-                "{%- generation -%}x{% endgeneration %}y{%+ generation %}z{%-endgeneration-%}"
-            ),
-            "{%- if true -%}x{% endif %}y{%+ if true %}z{%- endif -%}"
-        );
-        assert!(matches!(
-            plain_generation_blocks("{% if add_generation_prompt %}a{% endif %}"),
-            Cow::Borrowed(_)
-        ));
-    }
-
-    /// transformers' `strftime_now(format)`: the render's instant written with
-    /// the format; a template may guard it with `is defined`; a render that
-    /// names no instant writes today; an invalid format is an error.
-    #[test]
-    fn strftime_now_writes_the_render_instant() {
-        let template = "{%- if strftime_now is defined -%}Current date: \
-                        {{ strftime_now('%Y-%m-%d') }}. {{ strftime_now('%H:%M') }}{%- endif -%}";
-        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
-        let messages: [serde_json::Value; 0] = [];
-        let now = DateTime::parse_from_rfc3339("2026-10-07T09:30:00+02:00").unwrap();
-        let params = ChatTemplateParams {
-            now: Some(now),
-            ..Default::default()
-        };
-        let rendered = processor.apply_chat_template(&messages, params).unwrap();
-        assert_eq!(rendered, "Current date: 2026-10-07. 09:30");
-
-        let today = processor
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            today.len(),
-            "Current date: 2026-10-07. 09:30".len(),
-            "{today}"
-        );
-
-        let invalid = ChatTemplateProcessor::new("{{ strftime_now('%Q') }}".to_string()).unwrap();
-        let error = invalid
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("strftime_now"), "{error}");
-    }
-
-    /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
-    /// mapping or from an iterable of key/value pairs, keyword arguments are
-    /// written over the result, and a repeated key keeps its first position
-    /// with its last value. A template merges a schema's `$defs` entry into
-    /// the property that references it as `dict((a | items | list) + (b |
-    /// items | list))`; the engine's own `dict` takes a mapping only.
-    #[test]
-    fn dict_builds_a_map_from_pairs_as_python_does() {
-        let template = "{{ dict([('a', 1), ('b', 2), ('a', 3)]) | tojson }}|\
-                        {{ dict({'x': 1}, y=2) | tojson }}|{{ dict() | tojson }}|\
-                        {{ dict((messages[0].defs | items | list) + \
-                        (messages[0].spec | items | rejectattr('0', 'equalto', '$ref') | list)) | tojson }}";
-        let messages = [serde_json::json!({
-            "role": "user",
-            "defs": {"type": "string", "pattern": "^[A-Z]{3}$"},
-            "spec": {"$ref": "#/$defs/airport", "description": "IATA code"},
-        })];
-        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
-        let rendered = processor
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            r#"{"a": 3, "b": 2}|{"x": 1, "y": 2}|{}|{"type": "string", "pattern": "^[A-Z]{3}$", "description": "IATA code"}"#
-        );
-
-        // An element that is not a key/value pair is an error, as in Python.
-        let processor = ChatTemplateProcessor::new("{{ dict([['a']]) }}".to_string()).unwrap();
-        let error = processor
-            .apply_chat_template(&[], ChatTemplateParams::default())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("2 is required"), "{error}");
-    }
-
-    /// transformers renders with `tools=None` and `documents=None` when the
-    /// request carries none, so a template that tests `tools is none` (Olmo 3)
-    /// takes its no-tools branch, and one that guards with `is defined and
-    /// tools` does too.
-    #[test]
-    fn absent_tools_and_documents_are_none_as_transformers_passes_them() {
-        let template = "{% if tools is none %}no tools{% else %}{{ tools | tojson }}{% endif %}|\
-                        {% if tools is defined and tools %}has tools{% else %}none{% endif %}|\
-                        {% if tools is iterable and tools | length > 0 %}iterable{% else %}not iterable{% endif %}|\
-                        {% if documents is none %}no documents{% endif %}";
-        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
-        let messages: [serde_json::Value; 0] = [];
-        let rendered = processor
-            .apply_chat_template(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(rendered, "no tools|none|not iterable|no documents");
-
-        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
-        let params = ChatTemplateParams {
-            tools: Some(&tools),
-            ..Default::default()
-        };
-        let rendered = processor.apply_chat_template(&messages, params).unwrap();
-        assert_eq!(
-            rendered,
-            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|has tools|iterable|no documents"
-        );
-    }
-
-    #[test]
-    fn test_chat_template_state_no_template() {
-        let state = ChatTemplateState::new(None).unwrap();
-        assert_eq!(state.content_format(), ChatTemplateContentFormat::String);
-        let result = state.apply(&[], ChatTemplateParams::default());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_chat_template_state_set() {
-        let mut state = ChatTemplateState::new(None).unwrap();
-        state.set("{{ messages }}".to_string()).unwrap();
-        assert_eq!(state.content_format(), ChatTemplateContentFormat::String);
-    }
-
-    #[test]
-    fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
-        // The template names system/user/assistant only: a developer message
-        // would render nothing. The engine's renderer turns it into a system message.
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
-                        {% if messages[0].tools is defined %}TOOLS{% endif %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "developer", "content": "Be terse.", "tools": [{"name": "t"}]}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(rendered, "<sys>Be terse.</sys><usr>hi</usr>");
-    }
-
-    /// With a system message of its own in the request, the rewritten
-    /// developer message is no longer the first message: the two merge into
-    /// one system turn at the front, as the engine's renderer merges them.
-    #[test]
-    fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": "You are terse."}),
-            serde_json::json!({"role": "developer", "content": "Answer in French."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<sys>You are terse.\n\nAnswer in French.</sys><usr>hi</usr>"
-        );
-    }
-
-    /// A developer message in the middle of the conversation becomes the
-    /// system turn at the front; the other messages keep their order, and a
-    /// parts list contributes its text parts.
-    #[test]
-    fn a_developer_message_after_an_assistant_turn_moves_to_the_front() {
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>\
-                        {% elif m.role == 'assistant' %}<ast>{{ m.content }}</ast>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": "hello"}),
-            serde_json::json!({"role": "developer", "content": [
-                {"type": "text", "text": "Be brief."},
-                {"type": "text", "text": "No lists."},
-            ]}),
-            serde_json::json!({"role": "user", "content": "go on"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<sys>Be brief.\nNo lists.</sys><usr>hi</usr><ast>hello</ast><usr>go on</usr>"
-        );
-    }
-
-    /// A template that never names the `root` role (the MiniMax templates
-    /// before M3 read `messages[0].role == "system"` only) would drop a root
-    /// message: it gets the message as the leading system message instead.
-    #[test]
-    fn a_root_message_renders_as_the_system_message_when_the_template_has_no_root_branch() {
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "root", "content": "Answer in French."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(rendered, "<sys>Answer in French.</sys><usr>hi</usr>");
-    }
-
-    /// A system message after the root is not lost on such a template: the
-    /// two merge into one system turn, the root's text first.
-    #[test]
-    fn a_system_message_after_a_root_merges_into_one_system_turn_without_a_root_branch() {
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "root", "content": "Answer in French."}),
-            serde_json::json!({"role": "system", "content": "You are terse."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<sys>Answer in French.\n\nYou are terse.</sys><usr>hi</usr>"
-        );
-    }
-
-    /// A root followed by a developer message on a template with neither
-    /// branch: both become the one system turn, the root's text first.
-    #[test]
-    fn a_root_and_a_developer_message_merge_root_first_without_either_branch() {
-        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "root", "content": "Answer in French."}),
-            serde_json::json!({"role": "developer", "content": "Be brief."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<sys>Answer in French.\n\nBe brief.</sys><usr>hi</usr>"
-        );
-    }
-
-    #[test]
-    fn a_root_message_reaches_a_template_that_handles_the_role() {
-        let template = "{% for m in messages %}{% if m.role == 'root' %}<root>{{ m.content }}</root>\
-                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "root", "content": "Answer in French."}),
-            serde_json::json!({"role": "system", "content": "You are terse."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "<root>Answer in French.</root><sys>You are terse.</sys><usr>hi</usr>"
-        );
-    }
-
-    #[test]
-    fn developer_message_reaches_a_template_that_handles_the_role() {
-        let template = "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}</dev>\
-                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
-                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        let messages = vec![
-            serde_json::json!({"role": "developer", "content": "Be terse."}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-        ];
-        let rendered = state
-            .apply(&messages, ChatTemplateParams::default())
-            .unwrap();
-        assert_eq!(rendered, "<dev>Be terse.</dev><usr>hi</usr>");
-    }
-
-    /// A non-thinking template without a switch whose generation prompt
-    /// writes an empty, closed think block: `<think>` is in the prefill, but
-    /// the completion starts in content, so the parser must not be armed.
-    #[test]
-    fn a_closed_think_block_in_the_generation_prompt_does_not_open_reasoning() {
-        let closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                      {%- if add_generation_prompt -%}<|im_start|>assistant\n<think>\n\n</think>\n\n{%- endif -%}";
-        let state = ChatTemplateState::new(Some(closed.to_string())).unwrap();
-        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
-        assert!(
-            state.think_in_prefill(),
-            "the loose flag still sees the tag"
-        );
-        assert!(!state.prefill_opens_think_block());
-
-        // Opened in one branch, closed in another: the open branch counts.
-        let branched = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|>\
-                        {%- if clear_thinking is defined and clear_thinking -%}<think></think>\
-                        {%- else -%}<think>{%- endif -%}{%- endif -%}";
-        let state = ChatTemplateState::new(Some(branched.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-
-        // Both branches open a block and the prompt closes it after them.
-        let closed_after_branches = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|>\
-                        {%- if clear_thinking is defined and clear_thinking -%}<think>\
-                        {%- else -%}<think>\n{%- endif -%}</think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(closed_after_branches.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-
-        // A block opened only when there is no generation prompt is not the
-        // prompt's; the else branch of that condition is.
-        let not_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if not add_generation_prompt -%}<think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(not_prompt.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-        let else_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if not add_generation_prompt -%}done{%- else -%}<|assistant|><think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(else_prompt.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-
-        // A comparison is not a positive reference either: this true body
-        // runs without a generation prompt.
-        let compared = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt == false -%}<think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(compared.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-        let conjunction = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt and messages -%}<|assistant|><think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(conjunction.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-
-        // The prompt written in two generation-prompt blocks: the second may
-        // close what the first opened, or open what the first left closed.
-        let open_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
-                        {%- if add_generation_prompt -%}\n\n</think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(open_then_closed.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-        let closed_then_open = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|><think></think>{%- endif -%}\
-                        {%- if add_generation_prompt -%}<think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(closed_then_open.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-
-        // Two blocks that run on different requests (a conjunction each):
-        // either may leave the block open, so the prompt counts as opening
-        // whichever order they come in; a block that always runs still closes
-        // what an earlier one opened.
-        let exclusive = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
-                        {%- if add_generation_prompt and not thinking -%}<|assistant|><think></think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(exclusive.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-        let maybe_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
-                        {%- if add_generation_prompt -%}</think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(maybe_then_closed.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-
-        // Conditions the variable alone decides: `not (add_generation_prompt
-        // == false)` (the parse of the unparenthesised form) and
-        // `add_generation_prompt == true` run their true body for a
-        // generation prompt; `add_generation_prompt or x` always runs too, so
-        // it closes what an earlier block opened; `not (add_generation_prompt
-        // or x)` always runs its false body.
-        let negated_comparison = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if not add_generation_prompt == false -%}<think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(negated_comparison.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-        let eq_true = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt == true -%}<|assistant|><think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(eq_true.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-        let or_closes = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
-                        {%- if add_generation_prompt or continue_final_message -%}</think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(or_closes.to_string())).unwrap();
-        assert!(!state.prefill_opens_think_block());
-        let not_or = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if not (add_generation_prompt or continue_final_message) -%}done\
-                        {%- else -%}<|assistant|><think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(not_or.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-
-        // A test on the variable inside a condition something else also
-        // decides: the block may run, so what it opens counts.
-        let is_true_and = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt is true and not tools -%}<|assistant|><think>{%- endif -%}";
-        let state = ChatTemplateState::new(Some(is_true_and.to_string())).unwrap();
-        assert!(state.prefill_opens_think_block());
-    }
-
-    #[test]
-    fn clear_thinking_is_not_a_thinking_switch() {
-        // GLM-5.3: the template reads `clear_thinking` and `reasoning_effort`
-        // and always opens the think block; it has no switch.
-        let template =
-            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\
-                        {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
-                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}";
-        assert_eq!(
-            detect_thinking_toggle(template),
-            (ThinkingToggle::None, None)
-        );
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
-        assert!(state.think_in_prefill());
-        assert!(state.prefill_opens_think_block());
-
-        // A real `thinking` variable is still a switch, in each spelling.
-        for template in [
-            "{% if thinking is defined and not thinking %}off{% endif %}",
-            "{% if thinking == false %}off{% endif %}",
-            "{% if thinking %}on{% endif %}",
-            "{% set thinking = thinking %}",
-        ] {
-            assert_eq!(
-                detect_thinking_toggle(template),
-                (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
-                "{template}"
-            );
+    /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
+    /// not its source: one history call rendered with the arguments as the
+    /// string and as the object. The template takes the text only when the
+    /// object fails to render and the string renders, so a template that
+    /// takes the object (`tojson`, indexing, an `is string` branch) and one
+    /// that renders neither keep the parsed form the gateway hands every
+    /// template today.
+    fn writes_tool_call_arguments_as_text(&self) -> bool {
+        if self.env.is_none() {
+            return false;
         }
-    }
-
-    #[test]
-    fn test_chat_template_state_invalid_template() {
-        let result = ChatTemplateState::new(Some("{% invalid".to_string()));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Failed to add template"),
-            "Error should explain parse failure, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_chat_template_processor_invalid_template() {
-        let result = ChatTemplateProcessor::new("{% invalid".to_string());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_raise_exception_surfaces_template_validation_message() {
-        let state = ChatTemplateState::new(Some(
-            "{{ raise_exception('reasoning_effort is invalid') }}".to_string(),
-        ))
-        .unwrap();
-
-        let error = state
-            .apply(&[], ChatTemplateParams::default())
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("reasoning_effort is invalid"), "{error}");
-    }
-
-    #[test]
-    fn test_special_tokens_injected_into_context() {
-        let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let special_tokens = crate::traits::SpecialTokens {
-            bos_token: Some("<s>".to_string()),
-            eos_token: Some("</s>".to_string()),
-            ..Default::default()
+        let renders = |arguments: serde_json::Value| {
+            let messages = [
+                serde_json::json!({"role": "user", "content": "probe"}),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "probe"}),
+            ];
+            self.apply(&messages, ChatTemplateParams::default()).is_ok()
         };
-
-        let result = state
-            .apply(
-                &messages,
-                ChatTemplateParams {
-                    special_tokens: Some(&special_tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        assert_eq!(result, "<s>hello</s>");
-    }
-
-    #[test]
-    fn test_special_tokens_undefined_when_not_provided() {
-        let template = "{% if bos_token is defined %}{{ bos_token }}{% endif %}hello";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-
-        let result = state.apply(&[], ChatTemplateParams::default()).unwrap();
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_special_tokens_partial() {
-        let template =
-            "{{ bos_token }}hello{% if eos_token is defined %}{{ eos_token }}{% endif %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-
-        let special_tokens = crate::traits::SpecialTokens {
-            bos_token: Some("<s>".to_string()),
-            eos_token: None,
-            ..Default::default()
-        };
-
-        let result = state
-            .apply(
-                &[],
-                ChatTemplateParams {
-                    special_tokens: Some(&special_tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        assert_eq!(result, "<s>hello");
-    }
-
-    #[test]
-    fn thinking_param_sets_template_key_and_explicit_wins() {
-        use std::collections::HashMap;
-
-        // Template echoes the enable_thinking value so we can observe what was set.
-        let state = ChatTemplateState::new(Some("{{ enable_thinking }}".to_string())).unwrap();
-        assert_eq!(
-            state.thinking_key_name(),
-            Some(ThinkingKeyName::EnableThinking)
-        );
-
-        // thinking = Some(false) injects enable_thinking=false under the model's key.
-        // Rendered Python-style: transformers evaluates these templates under
-        // Jinja2, where `{{ False }}` is "False", so a template that echoes the
-        // flag into the prompt must produce the same bytes we would there.
-        let out = state
-            .apply(
-                &[],
-                ChatTemplateParams {
-                    thinking: Some(false),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(out, "False");
-
-        // An explicit template_kwargs entry overrides the injected default.
-        let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-        kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
-        let out = state
-            .apply(
-                &[],
-                ChatTemplateParams {
-                    thinking: Some(false),
-                    template_kwargs: Some(&kwargs),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(out, "True");
-    }
-
-    #[test]
-    fn gemma4_filter_default_keeps_thinking_off() {
-        let template = "{%- set enable_thinking = enable_thinking | default(false) -%}{% if enable_thinking %}<|channel>thought\n{% endif %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
-        assert_eq!(
-            state.thinking_key_name(),
-            Some(ThinkingKeyName::EnableThinking)
-        );
-        for (thinking, expected) in [
-            (None, ""),
-            (Some(false), ""),
-            (Some(true), "<|channel>thought\n"),
-        ] {
-            assert_eq!(
-                state
-                    .apply(
-                        &[],
-                        ChatTemplateParams {
-                            thinking,
-                            ..Default::default()
-                        }
-                    )
-                    .unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
-        for template in [
-            "{{ message.thinking | default(false) }}{% if enable_thinking %}<think>{% endif %}",
-            "{{ other_thinking | default(false) }}{% if thinking %}<think>{% endif %}",
-        ] {
-            assert_eq!(
-                detect_thinking_toggle(template).0,
-                ThinkingToggle::DefaultOn
-            );
-        }
-        assert_eq!(
-            detect_thinking_toggle(
-                "{% set thinking = thinking | default(false) %}{% if thinking %}<think>{% endif %}"
-            ),
-            (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
-        );
-    }
-
-    #[test]
-    fn thinking_mode_detects_tristate_and_injects_strings() {
-        // MiniMax M3-style tri-state toggle.
-        let template = r#"{%- if thinking_mode is defined and thinking_mode == "enabled" -%}<mm:think>{%- endif -%}"#;
-        assert_eq!(
-            detect_thinking_toggle(template),
-            (
-                ThinkingToggle::DefaultOff,
-                Some(ThinkingKeyName::ThinkingMode)
-            )
-        );
-
-        // Mentioning the variable without branching on it must not trigger
-        // tri-state detection.
-        assert_eq!(
-            detect_thinking_toggle("{{ enable_thinking }}{# thinking_mode note #}"),
-            (
-                ThinkingToggle::DefaultOn,
-                Some(ThinkingKeyName::EnableThinking)
-            )
-        );
-
-        // The resolved boolean preference injects the template's string values.
-        let state = ChatTemplateState::new(Some(
-            "{% if thinking_mode is defined %}{{ thinking_mode }}{% endif %}".to_string(),
-        ))
-        .unwrap();
-        assert_eq!(
-            state.thinking_key_name(),
-            Some(ThinkingKeyName::ThinkingMode)
-        );
-        for (thinking, rendered) in [(true, "enabled"), (false, "disabled")] {
-            let out = state
-                .apply(
-                    &[],
-                    ChatTemplateParams {
-                        thinking: Some(thinking),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            assert_eq!(out, rendered);
-        }
-    }
-
-    /// Regression: a conditional expression used as a keyword-argument value.
-    /// Jinja2 accepts it, so published chat templates use it — Muse-Glimmer's
-    /// does, in a `namespace(...)` call — but minijinja rejected it before
-    /// 2.24, which made the whole template uncompilable and left the model
-    /// unservable rather than merely mis-rendered.
-    #[test]
-    fn conditional_expression_in_keyword_argument_compiles() {
-        let template = "{%- set r = namespace(name=x if x else '') -%}{{ r.name }}";
-        let state = ChatTemplateState::new(Some(template.to_string()))
-            .expect("conditional kwargs must compile");
-        let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
-        assert_eq!(out, "");
-    }
-
-    /// None renders Python-style too, for the same Jinja2-parity reason.
-    #[test]
-    fn none_renders_python_style() {
-        let state = ChatTemplateState::new(Some("{{ undefined_value }}".to_string())).unwrap();
-        let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
-        assert_eq!(out, "");
+        renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
     }
 }
 
 #[cfg(test)]
-mod hy_v4_tests {
-    use super::*;
-    #[test]
-    fn hy4_effort_controls_prefill_and_explicit_kwarg_wins() {
-        let template = "{% set think_begin_token = '<think:6124c78e>' %}{% if reasoning_effort is not defined %}{% set reasoning_effort = 'high' %}{% endif %}{{ think_begin_token }}{% if reasoning_effort == 'no_think' %}</think:6124c78e>{% endif %}";
-        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
-        assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOn);
-        assert_eq!(
-            state.thinking_key_name(),
-            Some(ThinkingKeyName::ReasoningEffort)
-        );
-        assert_eq!(state.native_reasoning_effort_values(), &["high"]);
-        assert_eq!(state.native_reasoning_effort_off_values(), &["no_think"]);
-        for (thinking, expected) in [
-            (None, "<think:6124c78e>"),
-            (Some(true), "<think:6124c78e>"),
-            (Some(false), "<think:6124c78e></think:6124c78e>"),
-        ] {
-            assert_eq!(
-                state
-                    .apply(
-                        &[],
-                        ChatTemplateParams {
-                            thinking,
-                            ..Default::default()
-                        }
-                    )
-                    .unwrap(),
-                expected
-            );
-        }
-        let kwargs = HashMap::from([(
-            "reasoning_effort".to_string(),
-            serde_json::json!("no_think"),
-        )]);
-        assert_eq!(
-            state
-                .apply(
-                    &[],
-                    ChatTemplateParams {
-                        thinking: Some(true),
-                        template_kwargs: Some(&kwargs),
-                        ..Default::default()
-                    }
-                )
-                .unwrap(),
-            "<think:6124c78e></think:6124c78e>"
-        );
-    }
-}
+mod tests;

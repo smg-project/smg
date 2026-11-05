@@ -1,13 +1,12 @@
 //! Generate request building stage: Build proto GenerateRequest for generate requests
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, BuildStage},
+        common::stages::helpers,
         context::{
             stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
             ExecutionPlanKind, RequestContext,
@@ -33,9 +32,10 @@ impl GenerateRequestBuildingStage {
     }
 }
 
-#[async_trait]
-impl BuildStage for GenerateRequestBuildingStage {
-    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+impl GenerateRequestBuildingStage {
+    /// The stage's work, a plain function (nothing in it awaits); the
+    /// chat+generate dispatcher calls it directly.
+    pub(crate) fn build_plan(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         let prep = stage_output(
             ctx.state.preparation.as_ref(),
             "GenerateRequestBuildingStage::build",
@@ -116,12 +116,11 @@ impl BuildStage for GenerateRequestBuildingStage {
         })
     }
 
-    fn name(&self) -> &'static str {
-        "GenerateRequestBuilding"
-    }
-
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test (through the
+    /// chat+generate dispatcher's own `signature`).
     #[cfg(test)]
-    fn signature(&self) -> String {
+    pub(crate) fn signature(&self) -> String {
         format!(
             "GenerateRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind

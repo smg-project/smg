@@ -3,11 +3,16 @@ package ffi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrPostprocessorClosed is the error of a chunk or a flush that arrives after
+// Close freed the converter.
+var ErrPostprocessorClosed = errors.New("invalid converter handle: the postprocessor is closed")
 
 // BatchPostprocessor handles batch postprocessing of stream chunks to reduce FFI overhead
 type BatchPostprocessor struct {
@@ -43,6 +48,9 @@ func (b *BatchPostprocessor) AddChunk(chunkJSON string) (results []string, shoul
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.converter == nil {
+		return nil, false, ErrPostprocessorClosed
+	}
 	if b.batchSize == 1 {
 		openaiJSON, _, err := PostprocessStreamChunk(b.converter, chunkJSON)
 		if err != nil {
@@ -70,9 +78,31 @@ func (b *BatchPostprocessor) Flush() (results []string, err error) {
 	if len(b.buffer) == 0 {
 		return nil, nil
 	}
+	if b.converter == nil {
+		return nil, ErrPostprocessorClosed
+	}
 
 	res, _, err := b.processBatchLocked()
 	return res, err
+}
+
+// Close frees the converter under the lock that every chunk and flush takes,
+// so a chunk still inside the converter finishes first and a later one gets
+// ErrPostprocessorClosed instead of a freed converter. A second Close frees
+// nothing more.
+func (b *BatchPostprocessor) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.converter != nil {
+		FreeGrpcResponseConverter(b.converter)
+		b.converter = nil
+	}
+	b.buffer = b.buffer[:0]
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
 }
 
 // processBatchLocked processes the current buffer and returns results

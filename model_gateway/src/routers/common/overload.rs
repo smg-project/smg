@@ -98,6 +98,14 @@ pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
             .all(|w| w.is_overloaded() || w.stall_reason().is_some())
 }
 
+/// Whether `worker` is kept out of selection by the overload thresholds
+/// alone: over them, and otherwise routable (ready, circuit closed, not
+/// vetoed by the liveness tracker).
+pub fn vetoed_by_overload_alone(worker: &dyn Worker) -> bool {
+    let state = worker.routing_state();
+    state.overloaded && state.eligible_ignoring_overload()
+}
+
 /// The steering answer to a pool whose every worker is vetoed: the
 /// least-loaded worker that is routable but for its veto (ready, circuit
 /// closed). A fleet that is uniformly over the thresholds, or whose last
@@ -153,7 +161,7 @@ pub fn fallback_if_all_vetoed(
     debug!(
         branch,
         stage,
-        worker = worker.url(),
+        worker = worker.redacted_url(),
         model_id,
         "Veto fallback"
     );
@@ -192,7 +200,7 @@ pub fn shed_if_worker_overloaded(
     if !shedding || !worker.is_overloaded() {
         return None;
     }
-    let url = worker.url();
+    let url = worker.redacted_url();
     Some(shed(
         BRANCH_OVERLOADED_AT_DISPATCH,
         STAGE_DISPATCH,
@@ -469,7 +477,7 @@ mod tests {
     /// to an overloaded one.
     #[test]
     fn all_stalled_falls_back_to_the_least_loaded_ready_worker() {
-        use crate::worker::worker::StallReason;
+        use crate::worker::basic::StallReason;
 
         let a = worker("http://127.0.0.1:9841", "m");
         let b = worker("http://127.0.0.1:9842", "m");

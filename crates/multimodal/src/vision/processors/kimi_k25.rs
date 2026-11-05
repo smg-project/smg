@@ -46,6 +46,8 @@ impl KimiK25Processor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 in_patch_limit: DEFAULT_IN_PATCH_LIMIT,
                 patch_limit_on_one_side: DEFAULT_PATCH_LIMIT_ON_ONE_SIDE,
+                mean: PreProcessorConfig::CLIP_MEAN,
+                std: PreProcessorConfig::CLIP_STD,
             },
         }
     }
@@ -76,22 +78,15 @@ impl VisionPreProcessor for KimiK25Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
-        config: &PreProcessorConfig,
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         // K2.5 ships no `transparent_bg_config`, so alpha is dropped.
-        moonvit::preprocess(self.params.resolved(config), images, config, None)
+        moonvit::preprocess(self.params, images, None)
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         Ok(self
             .params
-            .resolved(config)
             .compute_resize_config(width as usize, height as usize)
             .num_tokens)
     }
@@ -100,21 +95,20 @@ impl VisionPreProcessor for KimiK25Processor {
         "kimi-k2.5"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::{
+        test_support::create_test_image,
+        vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
+    };
 
     #[test]
     fn test_defaults() {
@@ -182,16 +176,16 @@ mod tests {
 
     #[test]
     fn test_preprocess_4d_output() {
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             do_normalize: Some(true),
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
             ..Default::default()
         };
+        let p = KimiK25Processor::from_preprocessor_config(&config);
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         // 4D output: [total_patches, 3, 14, 14]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -207,13 +201,12 @@ mod tests {
     #[test]
     fn test_preprocess_multiple_images() {
         let p = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
-        let images = vec![
+        let images = [
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = p.preprocess(&images, &config).unwrap();
+        let result = p.preprocess(&images.iter().collect::<Vec<_>>()).unwrap();
 
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
@@ -240,8 +233,7 @@ mod tests {
     #[test]
     fn test_calculate_num_tokens() {
         let p = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
-        let tokens = p.calculate_num_tokens(600, 400, &config).unwrap();
+        let tokens = p.calculate_num_tokens(600, 400).unwrap();
         assert_eq!(tokens, 330);
     }
 
@@ -262,17 +254,17 @@ mod tests {
 
     #[test]
     fn test_zero_padding_applied() {
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
             ..Default::default()
         };
+        let p = KimiK25Processor::from_preprocessor_config(&config);
 
         // 100x100 white image — after normalization: (255/255 - 0.5) / 0.5 = 1.0
         // Padded region: (0/255 - 0.5) / 0.5 = -1.0
         let image = create_test_image(100, 100, Rgb([255, 255, 255]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
 
         let flat = result.encoder_input_flat();
         // Padded region should be normalized black (-1.0)
@@ -293,14 +285,14 @@ mod tests {
     #[test]
     fn test_preprocess_tiny_image() {
         // 1x1 image should not panic — padded to 28x28
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
             ..Default::default()
         };
+        let p = KimiK25Processor::from_preprocessor_config(&config);
         let image = create_test_image(1, 1, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = p.preprocess(&[&image]).unwrap();
         assert_eq!(result.encoder_input.ndim(), 4);
         assert!(result.encoder_input.shape()[0] > 0);
         assert!(result.feature_token_counts[0] > 0);
@@ -312,7 +304,6 @@ mod tests {
         // stored RGB kept. The reference does that at load time, before any
         // resize; resizing RGBA first would premultiply and discard the colour
         // under transparent pixels, so transparent red must survive as red.
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
@@ -324,13 +315,14 @@ mod tests {
             .collect(),
             ..Default::default()
         };
+        let p = KimiK25Processor::from_preprocessor_config(&config);
         let hidden_red = DynamicImage::from(image::RgbaImage::from_pixel(
             112,
             112,
             image::Rgba([255, 0, 0, 0]),
         ));
 
-        let result = p.preprocess(&[hidden_red], &config).unwrap();
+        let result = p.preprocess(&[&hidden_red]).unwrap();
         // [patches, 3, patch_size, patch_size]. 112px caps to 2 * 14 per side,
         // so every patch is content and none of it is padding.
         let &[patches, 3, ph, pw] = result.encoder_input.shape() else {
@@ -354,16 +346,17 @@ mod tests {
     #[test]
     fn test_in_patch_limit_resolved_from_config() {
         // A model shipping a larger budget must not be capped by the K2.5 default.
-        let p = KimiK25Processor::new();
         let mut config = PreProcessorConfig::default();
         config
             .extra
             .insert("in_patch_limit".to_string(), serde_json::json!(65536));
 
-        let default_tokens = p
-            .calculate_num_tokens(4000, 3000, &PreProcessorConfig::default())
+        let default_tokens = KimiK25Processor::new()
+            .calculate_num_tokens(4000, 3000)
             .unwrap();
-        let raised_tokens = p.calculate_num_tokens(4000, 3000, &config).unwrap();
+        let raised_tokens = KimiK25Processor::from_preprocessor_config(&config)
+            .calculate_num_tokens(4000, 3000)
+            .unwrap();
         assert!(
             raised_tokens > default_tokens,
             "raising in_patch_limit should raise the token count \

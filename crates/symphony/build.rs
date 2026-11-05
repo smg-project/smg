@@ -1,8 +1,9 @@
 //! Writes the registry's checkpoint groups as Rust.
 //!
 //! `src/formats/groups.json` is the one place a group is spelled: the primary's id, its other
-//! checkpoints, the table that reads the group by name, and the group's own turn opener, one
-//! group per line in bellwether's slug order. This script reads the file and writes the constant
+//! checkpoints, the table that reads the group by name, the group's own turn opener and what its
+//! template writes after the thought's close where that is not the table's, one group per line in
+//! bellwether's slug order. This script reads the file and writes the constant
 //! `formats::registry` includes, so the compiled tables are the literals they were when they were
 //! written by hand, and a tool that records a group writes a line of data, not Rust.
 
@@ -21,6 +22,7 @@ struct Group {
     also: Vec<String>,
     table: String,
     opener: Option<String>,
+    after: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -49,6 +51,10 @@ fn render(groups: &[Group]) -> Result<String, std::fmt::Error> {
         match &group.opener {
             Some(opener) => writeln!(out, "        opener: Some({opener:?}),")?,
             None => writeln!(out, "        opener: None,")?,
+        }
+        match &group.after {
+            Some(after) => writeln!(out, "        after: Some({after:?}),")?,
+            None => writeln!(out, "        after: None,")?,
         }
         writeln!(out, "    }},")?;
     }

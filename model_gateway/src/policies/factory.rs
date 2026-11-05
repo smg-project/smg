@@ -26,13 +26,11 @@ impl PolicyFactory {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                max_waiting_requests,
                 ..
             } => Arc::new(LeastLoadPolicy::with_params(
                 *kv_pressure_weight,
                 *mean_prefill_tokens,
                 *default_throughput,
-                *max_waiting_requests,
             )),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -50,6 +48,8 @@ impl PolicyFactory {
                 cache_boundaries,
                 selection_policy,
                 selection_accounting_ttl_ms,
+                balance_prefix_margin_tokens,
+                balance_uncached_credit,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -67,6 +67,8 @@ impl PolicyFactory {
                     cache_boundaries: cache_boundaries.clone(),
                     selection_policy: selection_policy.clone(),
                     selection_accounting_ttl_ms: *selection_accounting_ttl_ms,
+                    balance_prefix_margin_tokens: *balance_prefix_margin_tokens,
+                    balance_uncached_credit: *balance_uncached_credit,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -152,23 +154,8 @@ mod tests {
         });
         assert_eq!(policy.name(), "power_of_two");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-        });
+        let policy =
+            PolicyFactory::create_from_config(&PolicyConfig::cache_aware(0.7, 10, 1.5, 30, 1000));
         assert_eq!(policy.name(), "cache_aware");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {

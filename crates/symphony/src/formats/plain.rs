@@ -27,7 +27,7 @@ mod tests {
         Declared,
     };
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(plain(), Declared::default()),
             prompt,

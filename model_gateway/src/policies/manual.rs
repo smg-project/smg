@@ -283,7 +283,7 @@ impl ManualPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> (Option<usize>, ExecutionBranch) {
-        let healthy_indices = get_healthy_worker_indices(workers);
+        let healthy_indices = get_healthy_worker_indices(workers, info);
         if healthy_indices.is_empty() {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
@@ -400,17 +400,10 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 mod tests {
     use std::collections::HashMap;
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()

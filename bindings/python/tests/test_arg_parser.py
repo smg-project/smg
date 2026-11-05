@@ -13,12 +13,56 @@ from unittest.mock import patch
 
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
-from smg.router import Router, policy_from_str
-from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
+from smg.router import Router, backend_from_str, policy_from_str
+from smg.smg_rs import (
+    BackendType,
+    get_available_reasoning_parsers,
+    get_available_tool_call_parsers,
+)
 
 
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    def test_pd_readiness_capacity_flags(self, role):
+        """Both roles expose fixed-denominator percentage and absolute gates."""
+        args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                f"--{role}-expected-workers",
+                "8",
+                f"--{role}-min-ready-workers",
+                "4",
+                f"--{role}-min-ready-percent",
+                "75",
+            ]
+        )
+        assert getattr(args, f"{role}_expected_workers") == 8
+        assert getattr(args, f"{role}_min_ready_workers") == 4
+        assert getattr(args, f"{role}_min_ready_percent") == 75
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    @pytest.mark.parametrize("percent", ["0", "101"])
+    def test_pd_readiness_invalid_percentage(self, role, percent):
+        """Invalid percentages fail parsing rather than silently disabling readiness."""
+        with pytest.raises(SystemExit):
+            parse_router_args([f"--{role}-min-ready-percent", percent])
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    def test_pd_readiness_reaches_native_validation(self, role):
+        """The Python wrapper forwards role gates to Rust before startup."""
+        args = RouterArgs(pd_disaggregation=True, **{f"{role}_min_ready_percent": 75})
+        with pytest.raises(ValueError, match="expected_workers"):
+            Router.from_args(args).start()
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    @pytest.mark.parametrize("flag", ["expected-workers", "min-ready-workers"])
+    @pytest.mark.parametrize("count", ["0", "-1"])
+    def test_pd_readiness_invalid_worker_count(self, role, flag, count):
+        """Invalid counts fail parsing before conversion to the unsigned native type."""
+        with pytest.raises(SystemExit):
+            parse_router_args([f"--{role}-{flag}", count])
 
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""
@@ -43,6 +87,12 @@ class TestRouterArgs:
         assert args.selected_discovery_provider() is None
         assert args.discovery_file is None
         assert args.discovery_check_interval_secs is None
+        assert args.slurm_job_name == []
+        assert args.slurm_port is None
+        assert args.slurm_user is None
+        assert args.consul_service is None
+        assert args.consul_address is None
+        assert args.consul_datacenter is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -244,6 +294,7 @@ class TestRouterArgs:
             router_request_id_headers=["x-request-id", "x-trace-id"],
             router_storage_context_headers=["x-tenant-id=tenant_id", "x-user-id=user_id"],
             router_request_timeout_secs=1200,
+            router_grpc_request_timeout_secs=30,
             router_max_concurrent_requests=512,
             router_queue_size=200,
             router_queue_timeout_secs=120,
@@ -301,6 +352,7 @@ class TestRouterArgs:
             "x-user-id": "user_id",
         }
         assert router_args.request_timeout_secs == 1200
+        assert router_args.grpc_request_timeout_secs == 30
         assert router_args.max_concurrent_requests == 512
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
@@ -376,6 +428,7 @@ class TestRouterArgs:
             router_request_id_headers=None,
             router_storage_context_headers=None,
             router_request_timeout_secs=1800,
+            router_grpc_request_timeout_secs=0,
             router_max_concurrent_requests=256,
             router_queue_size=100,
             router_queue_timeout_secs=60,
@@ -447,6 +500,7 @@ class TestRouterArgs:
             request_id_headers=None,
             storage_context_headers=None,
             request_timeout_secs=1800,
+            grpc_request_timeout_secs=0,
             max_concurrent_requests=256,
             queue_size=100,
             queue_timeout_secs=60,
@@ -547,6 +601,18 @@ class TestPolicyFromStr:
             policy_from_str("invalid_policy")
 
 
+class TestBackendChoices:
+    """``--backend`` takes the Rust CLI's seven names, so the Gemini provider
+    route and the TensorRT-LLM label can be chosen from Python and the chart."""
+
+    @pytest.mark.parametrize(
+        "name", ["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"]
+    )
+    def test_every_cli_backend_parses_and_converts(self, name):
+        assert parse_router_args(["--backend", name]).backend == name
+        assert backend_from_str(name) == getattr(BackendType, name.capitalize())
+
+
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
 
@@ -632,6 +698,20 @@ class TestParseRouterArgs:
             with pytest.raises(SystemExit):
                 parse_router_args([flag, "-1"])
         assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
+
+    @pytest.mark.parametrize("name", ["fetch_timeout_ms", "video_fetch_timeout_ms"])
+    def test_media_fetch_timeout_flags(self, name):
+        """Positive millisecond overrides reach the binding; unset preserves fallback."""
+        flag = "--mm-" + name.replace("_", "-")
+        assert getattr(parse_router_args([]), "mm_" + name) is None
+        args = parse_router_args([flag, "60000"])
+        assert getattr(args, "mm_" + name) == 60000
+        with patch("smg.router._Router") as native:
+            Router.from_args(args)
+        assert native.call_args.kwargs["mm_" + name] == 60000
+        for raw in ("0", "-1", "invalid", "1.5"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, raw])
 
     def test_rdma_listen_ip_takes_an_ip_address_only(self):
         """The RDMA listener address is parsed as the router validates it: a plain IPv4
@@ -747,14 +827,12 @@ class TestParseRouterArgs:
         disabled = parse_router_args(["--disable-worker-overload-protection"])
         assert disabled.worker_overload_protection is False
 
-    def test_parse_overload_shed_liveness_warmup_index_and_selection_flags(self):
+    def test_parse_overload_shed_liveness_warmup_and_selection_flags(self):
         """Every RouterConfig field the Rust CLI exposes reaches RouterArgs,
         with the CLI's defaults when the flags are absent."""
         router_args = parse_router_args(
             [
                 "--worker-overload-shed",
-                "--kv-index",
-                "chain",
                 "--worker-stall-secs",
                 "5",
                 "--worker-wedge-secs",
@@ -775,17 +853,15 @@ class TestParseRouterArgs:
                 "cache-aware-default",
                 "--selection-accounting-ttl-ms",
                 "250",
+                "--zmq-startup-timeout-secs",
+                "900",
+                "--balance-prefix-margin-tokens",
+                "4096",
+                "--balance-uncached-credit",
             ]
         )
         assert router_args.worker_overload_shed is True
-        # Deprecated: chain is the only value, read in any case as the Rust CLI
-        # reads it; the removed positional index and any other spelling are
-        # refused by the parser.
-        assert router_args.kv_index == "chain"
-        assert parse_router_args(["--kv-index", " Chain "]).kv_index == "chain"
-        for value in ("positional", "Positional", "run", "tree"):
-            with pytest.raises(SystemExit):
-                parse_router_args(["--kv-index", value])
+        assert router_args.zmq_startup_timeout_secs == 900
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
         assert router_args.worker_stale_secs == 9
@@ -796,10 +872,12 @@ class TestParseRouterArgs:
         assert router_args.worker_warmup_divert_every == 4
         assert router_args.selection_policy == "cache-aware-default"
         assert router_args.selection_accounting_ttl_ms == 250
+        assert router_args.balance_prefix_margin_tokens == 4096
+        assert router_args.balance_uncached_credit is True
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
-        assert defaults.kv_index is None
+        assert defaults.zmq_startup_timeout_secs == 3600
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
         assert defaults.worker_stale_secs == 15
@@ -810,6 +888,22 @@ class TestParseRouterArgs:
         assert defaults.worker_warmup_divert_every == 8
         assert defaults.selection_policy == "cache-aware-default"
         assert defaults.selection_accounting_ttl_ms == 0
+        assert defaults.balance_prefix_margin_tokens == 0
+        assert defaults.balance_uncached_credit is False
+
+    def test_removed_kv_index_flags_are_refused(self):
+        """The deprecated --kv-index, --kv-indexer-ttl-secs and
+        --kv-indexer-max-entries flags went with the positional indexer they
+        configured, from the Rust CLI and the launcher alike: a launch line
+        that still carries one is refused by the parser, not accepted and
+        ignored."""
+        for argv in (
+            ["--kv-index", "chain"],
+            ["--kv-indexer-ttl-secs", "600"],
+            ["--kv-indexer-max-entries", "500000"],
+        ):
+            with pytest.raises(SystemExit):
+                parse_router_args(argv)
 
     def test_parse_tenancy_flags(self):
         """The tenancy flags of the Rust CLI reach RouterArgs: tenant header
@@ -1088,6 +1182,71 @@ class TestParseRouterArgs:
         assert router_args.selected_discovery_provider() == "file"
         assert router_args.discovery_file == "/run/smg/workers.json"
         assert router_args.discovery_check_interval_secs == 5
+
+    def test_parse_discovery_provider_slurm(self):
+        """The Slurm provider's flags parse into RouterArgs, the job-name
+        flags repeatable."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "slurm",
+                "--slurm-encode-job-name",
+                "encode",
+                "--slurm-prefill-job-name",
+                "prefill-a",
+                "--slurm-prefill-job-name",
+                "prefill-b",
+                "--slurm-decode-job-name",
+                "decode",
+                "--slurm-port",
+                "8000",
+                "--slurm-bootstrap-port",
+                "8998",
+                "--slurm-user",
+                "svc",
+                "--slurm-account",
+                "acct",
+                "--slurm-partition",
+                "gpu",
+                "--discovery-check-interval-secs",
+                "10",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "slurm"
+        assert router_args.slurm_job_name == []
+        assert router_args.slurm_encode_job_name == ["encode"]
+        assert router_args.slurm_prefill_job_name == ["prefill-a", "prefill-b"]
+        assert router_args.slurm_decode_job_name == ["decode"]
+        assert router_args.slurm_port == 8000
+        assert router_args.slurm_bootstrap_port == 8998
+        assert router_args.slurm_user == "svc"
+        assert router_args.slurm_account == "acct"
+        assert router_args.slurm_partition == "gpu"
+        assert router_args.discovery_check_interval_secs == 10
+
+    def test_parse_discovery_provider_consul(self):
+        """The Consul provider's flags parse into RouterArgs."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "consul",
+                "--consul-service",
+                "smg-worker",
+                "--consul-address",
+                "https://consul.internal:8501",
+                "--consul-datacenter",
+                "dc2",
+                "--discovery-check-interval-secs",
+                "10",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "consul"
+        assert router_args.consul_service == "smg-worker"
+        assert router_args.consul_address == "https://consul.internal:8501"
+        assert router_args.consul_datacenter == "dc2"
+        assert router_args.discovery_check_interval_secs == 10
 
     def test_service_discovery_and_discovery_provider_are_exclusive(self):
         """Both spellings of one choice is a usage error, not a precedence rule."""
@@ -1706,6 +1865,36 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestHelpGroups:
+    """The launcher's --help lists an option under the heading of what it bounds."""
+
+    @staticmethod
+    def options_by_group() -> dict[str, set[str]]:
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return {
+            group.title: {
+                spelling for action in group._group_actions for spelling in action.option_strings
+            }
+            for group in parser._action_groups
+            if group.title is not None
+        }
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--worker-startup-timeout-secs",
+            "--worker-startup-delay",
+            "--worker-startup-check-interval",
+        ],
+    )
+    def test_the_worker_start_up_bounds_are_worker_configuration_options(self, flag):
+        """They bound every worker's start-up, not a disaggregated deployment's."""
+        groups = self.options_by_group()
+        assert flag in groups["Worker Configuration"], f"{flag} is listed under another heading"
+        assert flag not in groups["PD/EPD Disaggregation"]
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""
@@ -1786,6 +1975,21 @@ class TestPrometheusHostDefault:
         assert args.prometheus_host is None
 
 
+class TestPrometheusBucketsReachNativeValidation:
+    """The launcher passes the bucket list through; the native router refuses
+    the shapes the binary refuses at parse time, before anything binds."""
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "1", "0.5"])
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            Router.from_args(args).start()
+
+    def test_a_bucket_bound_of_zero_is_refused_before_start(self):
+        args = parse_router_args(["--prometheus-duration-buckets", "0", "1"])
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            Router.from_args(args).start()
+
+
 class TestControlPlaneApiKeyEntryErrors:
     """A malformed entry is refused without the entry in the message: it carries the credential."""
 
@@ -1802,12 +2006,15 @@ class TestControlPlaneApiKeyEntryErrors:
 
 
 class TestParserFlag:
-    """--parser picks the gateway's chat parser: legacy by default, or symphony."""
+    """--parser picks the gateway's chat parser: symphony by default, or legacy."""
 
-    def test_defaults_to_legacy_and_takes_symphony(self):
+    def test_defaults_to_symphony_and_takes_legacy(self):
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
-        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "legacy"
+        assert RouterArgs().parser == "symphony"
+        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "symphony"
+        chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "legacy"]))
+        assert chosen.parser == "legacy"
         chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "symphony"]))
         assert chosen.parser == "symphony"
 

@@ -5,14 +5,15 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
-        sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
-        UNKNOWN_MODEL_ID,
+        endpoint::Endpoint, sampling_defaults::SamplingDefaults, ConnectionMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
@@ -100,13 +101,47 @@ struct VersionResponse {
 // ---------------------------------------------------------------------------
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
+/// Why a metadata endpoint gave no answer: the engine does not offer it (a
+/// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
+/// other than 404, an unparsable body). Registration tolerates both; a strict
+/// refresh tolerates only the first.
+#[derive(Debug)]
+enum MetadataError {
+    NotOffered,
+    Failed(String),
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOffered => f.write_str("not offered (404)"),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_url: &str,
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<T, String> {
+    get_json_with_fallback_classified(client, base_url, endpoint, api_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    base_url: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<T, MetadataError> {
     let url = format!("{base_url}/{endpoint}");
+    // The addresses as every failure below names them: a userinfo in them
+    // masked (the texts end in the step's failure message and its lines).
+    let shown = Endpoint::redacted_str(&url);
     let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -115,12 +150,13 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Fallback to deprecated /get_<endpoint> prefix
         warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
         let old_url = format!("{base_url}/get_{endpoint}");
+        let shown_old = Endpoint::redacted_str(&old_url);
         let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -128,32 +164,41 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("Failed to connect to {old_url}: {e}"))?;
+            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown_old}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(MetadataError::NotOffered);
+        }
         if !resp.status().is_success() {
-            return Err(format!("status {} from {}", resp.status(), old_url));
+            return Err(MetadataError::Failed(format!(
+                "status {} from {shown_old}",
+                resp.status()
+            )));
         }
         return resp
             .json::<T>()
             .await
-            .map_err(|e| format!("Failed to parse {old_url}: {e}"));
+            .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown_old}: {e}")));
     }
 
     if !response.status().is_success() {
-        return Err(format!("status {} from {}", response.status(), url));
+        return Err(MetadataError::Failed(format!(
+            "status {} from {shown}",
+            response.status()
+        )));
     }
 
     response
         .json::<T>()
         .await
-        .map_err(|e| format!("Failed to parse {url}: {e}"))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
-/// GET JSON (no fallback).
-async fn http_get_json<T: serde::de::DeserializeOwned>(
+async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
-) -> Result<T, String> {
+) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -161,13 +206,19 @@ async fn http_get_json<T: serde::de::DeserializeOwned>(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(MetadataError::NotOffered);
+    }
     if !resp.status().is_success() {
-        return Err(format!("status {} from {}", resp.status(), url));
+        return Err(MetadataError::Failed(format!(
+            "status {} from {shown}",
+            resp.status()
+        )));
     }
     resp.json::<T>()
         .await
-        .map_err(|e| format!("Failed to parse {url}: {e}"))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
 pub async fn get_server_info(
@@ -178,95 +229,174 @@ pub async fn get_server_info(
     get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
 }
 
-pub async fn get_model_info(
+/// The labels an engine reports about itself, read the way registration
+/// reads them: an HTTP engine's metadata endpoints (by runtime), or a gRPC
+/// engine's model and server info. Callable again for a worker that is
+/// already registered, so its labels can follow the engine when it comes
+/// back into service or finishes loading. Returns the labels and, for a gRPC
+/// engine, the runtime the probe confirmed. Registration reads tolerantly
+/// (`strict == false`: a failed endpoint leaves a gap); a refresh reads
+/// strictly, because a gap would read as labels the engine dropped: a read
+/// that fails (transport, timeout, a non-2xx other than 404, an unparsable
+/// body, an unknown gRPC error) is an error, while an endpoint the engine does
+/// not offer (404 on every spelling, gRPC `Unimplemented`) is tolerated in
+/// both modes.
+pub(crate) async fn discover_engine_labels(
     client: &Client,
     url: &str,
+    connection_mode: ConnectionMode,
+    runtime_type: &str,
     api_key: Option<&str>,
-) -> Result<ModelInfo, String> {
-    get_json_with_fallback(client, &http_base_url(url), "model_info", api_key).await
+    strict: bool,
+) -> Result<(HashMap<String, String>, Option<String>), String> {
+    match connection_mode {
+        ConnectionMode::Http => {
+            let labels = match runtime_type {
+                "vllm" => fetch_vllm_http_metadata_checked(client, url, api_key, strict).await?,
+                _ => fetch_sglang_http_metadata_checked(client, url, api_key, strict).await?,
+            };
+            Ok((labels, None))
+        }
+        ConnectionMode::Grpc => fetch_grpc_metadata(url, runtime_type, strict)
+            .await
+            .map(|(labels, runtime)| (labels, Some(runtime))),
+        ConnectionMode::Zmq => Err(
+            "a ZMQ engine reports its metadata at the handshake, not at an endpoint".to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-backend metadata fetchers
 // ---------------------------------------------------------------------------
 
+/// The tolerant read as a plain map, kept for the tests of the registration shape.
+#[cfg(test)]
 async fn fetch_sglang_http_metadata(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
 ) -> HashMap<String, String> {
+    fetch_sglang_http_metadata_checked(client, url, api_key, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// The SGLang HTTP metadata. Registration tolerates an endpoint that fails
+/// (`strict == false`: the gap is left); a refresh must not mistake a failed
+/// read for an engine that reports less, so with `strict` every endpoint has
+/// to answer or the read is an error.
+async fn fetch_sglang_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
-    if let Ok(info) = get_server_info(client, &base, api_key).await {
-        labels.extend(flat_labels(&info));
+    match get_json_with_fallback_classified::<ServerInfo>(client, &base, "server_info", api_key)
+        .await
+    {
+        Ok(info) => labels.extend(flat_labels(&info)),
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("server_info: {e}")),
+        Err(_) => {}
     }
-    if let Ok(info) = get_model_info(client, &base, api_key).await {
-        labels.extend(flat_labels(&info));
+    match get_json_with_fallback_classified::<ModelInfo>(client, &base, "model_info", api_key).await
+    {
+        Ok(info) => labels.extend(flat_labels(&info)),
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("model_info: {e}")),
+        Err(_) => {}
     }
 
     // /v1/models gives us model identity and max_model_len when a compatible
     // local frontend does not expose the SGLang-specific metadata endpoints.
-    if let Ok(models) =
-        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
+    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
+        .await
     {
-        if let Some(m) = models.data.first() {
-            if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
-                labels
-                    .entry("served_model_name".to_string())
-                    .or_insert_with(|| id.clone());
-            }
-            if let Some(root) = m.root.as_ref().filter(|root| !root.is_empty()) {
-                labels
-                    .entry("model_path".to_string())
-                    .or_insert_with(|| root.clone());
-            }
-            if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
-                labels
-                    .entry("max_model_len".to_string())
-                    .or_insert_with(|| len.to_string());
+        Ok(models) => {
+            if let Some(m) = models.data.first() {
+                if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
+                    labels
+                        .entry("served_model_name".to_string())
+                        .or_insert_with(|| id.clone());
+                }
+                if let Some(root) = m.root.as_ref().filter(|root| !root.is_empty()) {
+                    labels
+                        .entry("model_path".to_string())
+                        .or_insert_with(|| root.clone());
+                }
+                if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
+                    labels
+                        .entry("max_model_len".to_string())
+                        .or_insert_with(|| len.to_string());
+                }
             }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
+        Err(_) => {}
     }
 
-    labels
+    Ok(labels)
 }
 
+/// The tolerant read as a plain map, kept for the tests of the registration shape.
+#[cfg(test)]
 async fn fetch_vllm_http_metadata(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
 ) -> HashMap<String, String> {
+    fetch_vllm_http_metadata_checked(client, url, api_key, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// The vLLM HTTP metadata; `strict` as for the SGLang fetcher.
+async fn fetch_vllm_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    if let Ok(models) =
-        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
+    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
+        .await
     {
-        if let Some(m) = models.data.first() {
-            if let Some(ref root) = m.root {
-                labels.insert("model_path".to_string(), root.clone());
-            }
-            if let Some(ref id) = m.id {
-                labels.insert("served_model_name".to_string(), id.clone());
-            }
-            if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
-                labels.insert("max_model_len".to_string(), len.to_string());
+        Ok(models) => {
+            if let Some(m) = models.data.first() {
+                if let Some(ref root) = m.root {
+                    labels.insert("model_path".to_string(), root.clone());
+                }
+                if let Some(ref id) = m.id {
+                    labels.insert("served_model_name".to_string(), id.clone());
+                }
+                if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
+                    labels.insert("max_model_len".to_string(), len.to_string());
+                }
             }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
+        Err(_) => {}
     }
 
     // /version
-    if let Ok(v) =
-        http_get_json::<VersionResponse>(client, &format!("{base}/version"), api_key).await
+    match http_get_json_classified::<VersionResponse>(client, &format!("{base}/version"), api_key)
+        .await
     {
-        if !v.version.is_empty() {
-            labels.insert("version".to_string(), v.version);
+        Ok(v) => {
+            if !v.version.is_empty() {
+                labels.insert("version".to_string(), v.version);
+            }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/version: {e}")),
+        Err(_) => {}
     }
 
-    labels
+    Ok(labels)
 }
 
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
@@ -293,9 +423,14 @@ pub(crate) async fn discover_grpc_kv_engine_id(
     Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
 }
 
+/// The gRPC model and server info as labels. Registration tolerates a
+/// server-info failure (`strict == false`: the model info alone is kept); a
+/// refresh must not mistake it for an engine that reports less, so with
+/// `strict` it is an error.
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: &str,
+    strict: bool,
 ) -> Result<(HashMap<String, String>, String), String> {
     let grpc_url = grpc_base_url(url);
 
@@ -311,6 +446,11 @@ async fn fetch_grpc_metadata(
 
     match client.get_server_info().await {
         Ok(info) => labels.extend(info.to_labels()),
+        // An engine that does not implement the call offers nothing to read;
+        // any other failure fails a strict read.
+        Err(e) if strict && e.code() != tonic::Code::Unimplemented => {
+            return Err(format!("Failed to fetch gRPC server info: {e}"));
+        }
         Err(e) => warn!("Failed to fetch gRPC server info: {}", e),
     }
 
@@ -323,6 +463,26 @@ async fn fetch_grpc_metadata(
 /// does), one declaring a different model keeps its own defaults.
 fn zmq_model(router_model: Option<String>, declared_model: &str) -> Option<String> {
     router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
+}
+
+/// The labels of a ZMQ worker before its handshake: the model's sampling
+/// defaults ([`zmq_model_labels`]) and where its grammars start. The gateway's
+/// own link fronts an engine it did not launch, whose handshake does not say
+/// whether a reasoning parser gates its grammars, so the worker says the start
+/// the gateway's tags are shaped for: the first generated token, the thought
+/// closed ahead of the calls or the schema (the `constrained_decoding_start`
+/// label a servicer's worker carries for its engine's real gate). An engine
+/// that starts there applies such a tag at once; one that gates behind a
+/// parser is told by the request that this grammar starts at the first token
+/// (`GenerateRequestBuildOptions::first_token_grammar`), and a grammar the
+/// gateway did not shape starts where the engine does, on either kind.
+async fn zmq_worker_labels(model: Option<&str>) -> HashMap<String, String> {
+    let mut labels = zmq_model_labels(model).await;
+    labels.insert(
+        GrammarStart::LABEL.to_string(),
+        GrammarStart::FIRST_TOKEN.to_string(),
+    );
+    labels
 }
 
 /// Labels for a ZMQ worker from the gateway's model: the sampling defaults in
@@ -486,12 +646,15 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                         "sglang"
                     });
                 let client = context.data.http_client("discover_metadata")?;
-                let api_key = config.api_key.as_deref();
-                let labels = match runtime {
-                    "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
-                    _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
-                };
-                Ok((labels, None))
+                discover_engine_labels(
+                    &client,
+                    &config.url,
+                    ConnectionMode::Http,
+                    runtime,
+                    config.api_key.as_deref(),
+                    false,
+                )
+                .await
             }
             ConnectionMode::Grpc => {
                 let config_runtime = config.runtime_type.to_string();
@@ -500,19 +663,20 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .detected_runtime_type
                     .as_deref()
                     .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type)
+                fetch_grpc_metadata(&config.url, runtime_type, false)
                     .await
                     .map(|(labels, rt)| (labels, Some(rt)))
             }
             // A ZMQ engine reports its geometry at the handshake, which runs
-            // after this step; the one fact worth having earlier is the
+            // after this step; the facts worth having earlier are the
             // model's own sampling defaults, read from the model the gateway
             // was started with (a local directory, or a Hub id through the
             // HF cache), for a worker that serves that model (one registered
-            // for another model, by spec or label, must not inherit them).
-            // The runtime stays `None`: the handshake is shared across
-            // engines, so it cannot be probed here and the configured or
-            // detected runtime is preserved.
+            // for another model, by spec or label, must not inherit them),
+            // and where the gateway's own link starts a grammar, which is
+            // the link's rule and needs no engine. The runtime stays `None`:
+            // the handshake is shared across engines, so it cannot be probed
+            // here and the configured or detected runtime is preserved.
             ConnectionMode::Zmq => {
                 let router_model = context
                     .data
@@ -520,7 +684,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
                 let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_model_labels(model.as_deref()).await, None))
+                Ok((zmq_worker_labels(model.as_deref()).await, None))
             }
         }
         .unwrap_or_else(|e| {
@@ -608,6 +772,31 @@ mod tests {
 
     use super::*;
 
+    /// A ZMQ worker's labels say its grammars start at the first generated
+    /// token (the gateway's own link holds them there), with or without the
+    /// model's sampling defaults, in the value the grammar-start reader names.
+    #[tokio::test]
+    async fn zmq_labels_say_the_links_grammar_start() {
+        let labels = zmq_worker_labels(None).await;
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!(
+            GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
+            GrammarStart::FirstToken
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.7, "top_p": 0.8}"#,
+        )
+        .unwrap();
+        let labels = zmq_worker_labels(Some(dir.path().to_str().unwrap())).await;
+        assert!(labels.contains_key(DEFAULT_SAMPLING_PARAMS_LABEL));
+        assert_eq!(
+            labels.get(GrammarStart::LABEL).map(String::as_str),
+            Some(GrammarStart::FIRST_TOKEN)
+        );
+    }
+
     /// Every engine's spelling of the parallelism widths folds into the
     /// canonical labels, and an existing canonical label is never overwritten.
     #[test]
@@ -663,9 +852,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_http_metadata() {
-        let labels =
-            fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
-                .await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::clients::http_client(),
+            "http://0.0.0.0:30000",
+            None,
+        )
+        .await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
@@ -675,7 +867,7 @@ mod tests {
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_http_metadata() {
         let labels =
-            fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
+            fetch_vllm_http_metadata(&crate::clients::http_client(), "http://0.0.0.0:20000", None)
                 .await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
@@ -685,7 +877,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang")
+        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang", false)
             .await
             .expect("grpc metadata");
         dump_labels("SGLang gRPC", &labels);
@@ -695,7 +887,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm")
+        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm", false)
             .await
             .expect("grpc metadata");
         dump_labels("vLLM gRPC", &labels);
@@ -813,7 +1005,7 @@ mod tests {
         });
 
         let labels = fetch_sglang_http_metadata(
-            &crate::http_client::client(),
+            &crate::clients::http_client(),
             &format!("http://{addr}"),
             None,
         )
@@ -831,6 +1023,49 @@ mod tests {
         assert_eq!(
             labels.get("max_model_len").map(String::as_str),
             Some("4096")
+        );
+    }
+
+    /// A credentialed worker that answers 401 (a wrong password): the error
+    /// text names the address masked, never the secret. The status error is
+    /// the likeliest failure of such a worker, and it ends in the DP
+    /// discovery's warning and the step's failure message.
+    #[tokio::test]
+    async fn a_status_error_names_the_address_masked() {
+        use axum::{http::StatusCode, Router};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering 401; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|| async { (StatusCode::UNAUTHORIZED, "no") }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = get_server_info(
+            &crate::clients::http_client(),
+            &format!("http://user:secret@127.0.0.1:{port}"),
+            None,
+        )
+        .await
+        .expect_err("401 is a failure");
+        server.abort();
+
+        assert!(!err.contains("secret"), "{err}");
+        assert!(!err.contains("user:"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "401 Unauthorized from http://***@127.0.0.1:{port}/server_info"
+            )),
+            "{err}"
         );
     }
 }

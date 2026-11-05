@@ -1,6 +1,8 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/lora.rs.
 
+//! The LoRA adapter request a generate request names, in the engine's field order.
+
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::codec::OpaqueValue;

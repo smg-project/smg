@@ -350,9 +350,20 @@ impl<'a> Parser<'a> {
         }
 
         if hex.len() == 4 {
-            u32::from_str_radix(&hex, 16)
-                .ok()
-                .and_then(char::from_u32)
+            let mut code = u32::from_str_radix(&hex, 16)
+                .map_err(|_| ParserError::ParsingFailed("Invalid unicode escape".into()))?;
+            // A high surrogate is only a char together with the low surrogate escape after it.
+            if (0xD800..=0xDBFF).contains(&code) {
+                let mut ahead = self.chars.clone();
+                if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                    let low: String = ahead.take(4).collect();
+                    if let Ok(low @ 0xDC00..=0xDFFF) = u32::from_str_radix(&low, 16) {
+                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                        (0..6).for_each(|_| self.advance());
+                    }
+                }
+            }
+            char::from_u32(code)
                 .ok_or_else(|| ParserError::ParsingFailed("Invalid unicode escape".into()))
         } else if self.allow_incomplete {
             Ok('\u{FFFD}') // Replacement character

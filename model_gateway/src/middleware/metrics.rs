@@ -5,7 +5,7 @@
 //! `InFlightRequestTracker`. The path label is the matched axum route
 //! template (or `"other"` when unmatched) to bound metric cardinality.
 //! The layer is the outermost one with a duty that ends with the response
-//! body, and the one that wraps the body: the [`EdgeBody`] it builds carries
+//! body, and the one that wraps the body: the `EdgeBody` it builds carries
 //! this layer's in-flight guard and response count together with what the
 //! layers inside hand it (the request span, the admission permit, the SSE
 //! keep-alive), so a streamed frame crosses one wrapper.
@@ -64,7 +64,7 @@ use crate::{
 /// built in the protocols crate, outside the builder), else `""` (a success,
 /// or an upstream body: an upstream's `X-SMG-Error-Code` header is never read,
 /// so forged codes cannot grow the label set).
-pub(crate) fn error_code_label(response: &Response) -> &str {
+fn error_code_label(response: &Response) -> &str {
     let code = extract_error_code_from_response(response);
     if !code.is_empty() {
         return code;

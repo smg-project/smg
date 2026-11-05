@@ -5,7 +5,10 @@ use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::workflow::data::WorkerUpdateWorkflowData;
+use crate::{
+    worker::{endpoint::Endpoint, registry::WorkerId},
+    workflow::data::WorkerUpdateWorkflowData,
+};
 
 /// Step to find workers to update based on URL.
 ///
@@ -41,7 +44,27 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         debug!(
             "Found {} worker(s) to update for {}",
             workers_to_update.len(),
-            worker_url
+            Endpoint::redacted_str(worker_url)
+        );
+
+        // The update writes back against the registration found here, by id
+        // and revision captured once: a worker updated, replaced (a provider
+        // registering its address included), or removed and registered again
+        // at the same address in the meantime must not receive a rebuild of
+        // what was found here. A refresh's engine read in between may be
+        // retried, which widens the window. A worker gone before this line
+        // gets an id nothing matches.
+        let registry = std::sync::Arc::clone(&app_context.worker_registry);
+        context.data.snapshot = Some(
+            workers_to_update
+                .iter()
+                .map(|worker| {
+                    let id = registry
+                        .get_id_by_url(worker.url())
+                        .unwrap_or_else(|| WorkerId::from_string(String::new()));
+                    (id, worker.revision())
+                })
+                .collect(),
         );
 
         context.data.workers_to_update = Some(workers_to_update);

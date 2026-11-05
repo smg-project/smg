@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use super::registry::{ConnectionState, RealtimeRegistry};
+use crate::upstream_body;
 
 // ---------------------------------------------------------------------------
 // Termination policy
@@ -70,14 +71,12 @@ fn bridge_ended_successfully(
 /// Error returned by [`WebRtcBridge::setup`].
 #[derive(Debug)]
 pub enum BridgeSetupError {
-    /// Upstream returned a non-success HTTP status (e.g. 401, 400).
-    /// Contains the status code and response body so the caller can forward
-    /// the appropriate error to the client instead of always returning 502.
-    UpstreamHttp {
-        status: reqwest::StatusCode,
-        body: String,
-        content_type: Option<String>,
-    },
+    /// Upstream returned a non-success HTTP status (e.g. 401, 400). Carries
+    /// the answer as read ([`upstream_body::read_error`]: bounded, the
+    /// provider's account identifiers removed, its words in the log) so the
+    /// caller answers the client under the upstream's status instead of a
+    /// 502.
+    UpstreamHttp { error: upstream_body::UpstreamError },
     /// Any other setup failure (network, SDP parsing, ICE, etc.).
     Other(anyhow::Error),
 }
@@ -85,11 +84,8 @@ pub enum BridgeSetupError {
 impl std::fmt::Display for BridgeSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UpstreamHttp { status, body, .. } => {
-                write!(
-                    f,
-                    "Upstream SDP exchange failed: status={status}, body={body}"
-                )
+            Self::UpstreamHttp { error } => {
+                write!(f, "Upstream SDP exchange failed: status={}", error.status)
             }
             Self::Other(e) => write!(f, "{e}"),
         }
@@ -199,6 +195,7 @@ impl WebRtcBridge {
         http_client: &reqwest::Client,
         bind_addr: IpAddr,
         stun_server: Option<SocketAddr>,
+        model: &str,
     ) -> Result<(Self, String), BridgeSetupError> {
         // -- 1. Bind two UDP sockets (ephemeral ports) -----------------------
         // In production, `bind_addr` is typically `0.0.0.0` and both sockets
@@ -275,6 +272,7 @@ impl WebRtcBridge {
             auth_header,
             &upstream_offer.to_sdp_string(),
             session_config,
+            model,
         )
         .await?;
 
@@ -864,13 +862,16 @@ fn log_data_channel(call_id: &str, data: &ChannelData, direction: &str) {
 // ---------------------------------------------------------------------------
 
 /// Send SMG's SDP offer to upstream (OpenAI) and parse the returned SDP
-/// answer.  Supports multipart (with session config) and direct SDP.
+/// answer.  Supports multipart (with session config) and direct SDP. A
+/// refusal is read here, where the response is ([`upstream_body::read_error`]
+/// under `model`), and carried to the caller.
 async fn send_sdp_to_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
     auth_header: &str,
     sdp_offer: &str,
     session_config: Option<serde_json::Value>,
+    model: &str,
 ) -> Result<SdpAnswer, BridgeSetupError> {
     let req = client
         .post(upstream_url)
@@ -895,18 +896,9 @@ async fn send_sdp_to_upstream(
             .await?
     };
 
-    let status = resp.status();
-    if !status.is_success() {
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let body = resp.text().await.unwrap_or_default();
+    if !resp.status().is_success() {
         return Err(BridgeSetupError::UpstreamHttp {
-            status,
-            body,
-            content_type,
+            error: upstream_body::read_error(resp, model).await,
         });
     }
 

@@ -41,6 +41,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
 use super::RendererProfile;
+pub(crate) use super::{join_segments, PromptSegment};
 use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
@@ -50,7 +51,9 @@ use crate::{
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
-    // Content parts are rendered positionally, so the gateway passes them through.
+    // Content parts are rendered positionally, so the gateway passes them
+    // through in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted).
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     // No Jinja template; the native renderer defaults thinking ON (the
     // reference's `build_chat_segments(thinking=True)`).
@@ -69,13 +72,12 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // written. The engine's own server rewrites `enable_thinking` into the
     // encoder's `thinking` before rendering, so the renderer and the parser
     // read the alias. `build_chat_segments` declares every tool it is given
-    // and renders `tool_choice=none` as an internal system message that
-    // forbids the call (the served entry point forwards both as sent), so the
-    // gateway keeps the tools of such a request.
+    // and renders the `tool_choice` kwarg of `none` as an internal system
+    // message that forbids the call, as the served entry point does with the
+    // tools and the choice it is given.
     capabilities: RendererCapabilities {
         raw_tool_call_arguments: true,
         enable_thinking_alias: true,
-        declares_tools_under_tool_choice_none: true,
         ..RendererProfile::NO_CAPABILITIES
     },
     // The encoder resolves the mode by its own rule; the parser is armed
@@ -83,44 +85,40 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     thinking_mode: Some(resolve_thinking),
 };
 
+/// Kimi-K3.1's profile: the K3 one with `medium` among the native efforts.
+pub(crate) const K31_PROFILE: RendererProfile = RendererProfile {
+    native_effort_values: &["low", "medium", "high", "max"],
+    ..PROFILE
+};
+
+/// The checkpoint whose `encoding_k3.py` the renderer follows. Kimi-K3.1's
+/// encoder is Kimi-K3's with `medium` among the `thinking_effort` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KimiXtml {
+    K3,
+    K31,
+}
+
+impl KimiXtml {
+    /// The `thinking_effort` values the checkpoint's encoder accepts.
+    pub fn efforts(self) -> &'static [&'static str] {
+        self.profile().native_effort_values
+    }
+
+    pub(crate) fn profile(self) -> RendererProfile {
+        match self {
+            Self::K3 => PROFILE,
+            Self::K31 => K31_PROFILE,
+        }
+    }
+}
+
 const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
 const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// The gateway's per-image anchor (`KimiK3VisionSpec::placeholder_token`).
 const MEDIA_ANCHOR: &str = "<|media_pad|>";
-
-/// One piece of a rendered prompt, tagged with how special-token strings in
-/// it must be encoded: the reference's `EncodeSegment { text, allow_special }`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptSegment {
-    pub(crate) text: String,
-    /// `true`: special-token strings map to their control ids (structural
-    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
-    /// marker string inside message text stays text.
-    pub(crate) allow_special: bool,
-}
-
-impl PromptSegment {
-    pub(crate) fn control(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: true,
-        }
-    }
-
-    pub(crate) fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: false,
-        }
-    }
-}
-
-/// The flat prompt string: segment texts concatenated in order.
-pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
-    segments.iter().map(|s| s.text.as_str()).collect()
-}
 
 /// A rendered prompt and the span of its response-channel opener.
 #[derive(Debug)]
@@ -153,7 +151,7 @@ pub const DEFAULT_THINKING_EFFORT: &str = "max";
 /// assistant reasoning.
 pub fn apply_kimi_k3_xtml(messages: &[Value], params: &ChatTemplateParams) -> Result<String> {
     Ok(join_segments(
-        &render_xtml(messages, params, None)?.segments,
+        &render_xtml(KimiXtml::K3, messages, params, None)?.segments,
     ))
 }
 
@@ -161,11 +159,12 @@ pub fn apply_kimi_k3_xtml(messages: &[Value], params: &ChatTemplateParams) -> Re
 /// [`apply_kimi_k3_xtml`], except that a request naming no effort falls back to
 /// [`DEFAULT_THINKING_EFFORT`] rather than emitting no directive.
 pub fn apply_kimi_k3_xtml_with_effort_default(
+    model: KimiXtml,
     messages: &[Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
     Ok(join_segments(
-        &render_xtml(messages, params, Some(DEFAULT_THINKING_EFFORT))?.segments,
+        &render_xtml(model, messages, params, Some(DEFAULT_THINKING_EFFORT))?.segments,
     ))
 }
 
@@ -179,11 +178,12 @@ pub fn apply_kimi_k3_xtml_with_effort_default(
 /// prefill byte for byte. A prefill of ordinary text encodes the same either
 /// way.
 pub(crate) fn render_kimi_k3_xtml_prompt(
+    model: KimiXtml,
     messages: &[Value],
     params: &ChatTemplateParams,
     assistant_prefix: Option<&str>,
 ) -> Result<RenderedXtml> {
-    let mut out = render_xtml(messages, params, Some(DEFAULT_THINKING_EFFORT))?;
+    let mut out = render_xtml(model, messages, params, Some(DEFAULT_THINKING_EFFORT))?;
     if let Some(prefix) = assistant_prefix {
         push_control(&mut out.segments, prefix);
     }
@@ -223,10 +223,17 @@ pub fn resolve_thinking(
 }
 
 fn render_xtml(
+    model: KimiXtml,
     messages: &[Value],
     params: &ChatTemplateParams,
     default_effort: Option<&str>,
 ) -> Result<RenderedXtml> {
+    // The engine's renderer rewrites a `developer` message as a `system` one
+    // (and merges the system messages when one is not first) before the
+    // vendor encoding sees the conversation, whose loop has no branch for the
+    // role and would skip it; the same rule here.
+    let developer = crate::chat_template::developer_messages_as_system(messages);
+    let messages = developer.as_deref().unwrap_or(messages);
     // Re-sort tool results by tool_call_id, then normalize each message
     // (deep-sort tool schemas, coerce tool-call arguments) — both side-effect
     // free, mirroring the Python entry point.
@@ -251,7 +258,12 @@ fn render_xtml(
     // while thinking is on, mirroring the Python reference (both the validation
     // and the emit are gated on `thinking`).
     if thinking {
-        push_effort_directive(&mut out, params.template_kwargs, default_effort)?;
+        push_effort_directive(
+            &mut out,
+            model.efforts(),
+            params.template_kwargs,
+            default_effort,
+        )?;
     }
 
     // Tracks the most recent assistant `tool_calls` so tool messages can resolve
@@ -311,16 +323,17 @@ fn render_xtml(
 ///      validated strictly — a provided-but-unsupported value is a hard error,
 ///      matching the reference `assert thinking_effort in _VALID_THINKING_EFFORTS`.
 ///   2. Otherwise the OpenAI-standard top-level `reasoning_effort` level is
-///      used, but only when it names a supported K3 effort (`low`/`high`/`max`).
-///      `minimal`/`none` already switch thinking off upstream and `medium` has
-///      no K3 equivalent, so such values emit no directive rather than erroring
-///      on an otherwise-valid OpenAI field.
+///      used, but only when it names one of the checkpoint's `efforts`.
+///      `minimal`/`none` already switch thinking off upstream and K3 has no
+///      `medium`, so such values emit no directive rather than erroring on an
+///      otherwise-valid OpenAI field.
 ///   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
 ///      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
 ///
 /// `preserve_thinking` is not read by the reference renderer and is ignored.
 fn push_effort_directive(
     out: &mut Vec<PromptSegment>,
+    efforts: &[&str],
     template_kwargs: Option<&HashMap<String, Value>>,
     default_effort: Option<&str>,
 ) -> Result<()> {
@@ -328,21 +341,21 @@ fn push_effort_directive(
         .and_then(|k| k.get("thinking_effort"))
         .filter(|v| !v.is_null())
     {
-        match effort_val.as_str() {
-            Some(effort @ ("low" | "high" | "max")) => {
-                push_thinking_effort(out, effort);
-            }
-            _ => {
+        match effort_val.as_str().filter(|e| efforts.contains(e)) {
+            Some(effort) => push_thinking_effort(out, effort),
+            None => {
+                // The reference's message: `sorted(_VALID_THINKING_EFFORTS)`.
+                let mut supported = efforts.to_vec();
+                supported.sort_unstable();
                 return Err(anyhow!(
-                    "Unsupported thinking_effort={effort_val}; \
-                     supported values are [\"high\", \"low\", \"max\"]."
+                    "Unsupported thinking_effort={effort_val}; supported values are {supported:?}."
                 ));
             }
         }
     } else if let Some(effort) = template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
-        .filter(|e| matches!(*e, "low" | "high" | "max"))
+        .filter(|e| efforts.contains(e))
         .or(default_effort)
     {
         push_thinking_effort(out, effort);
@@ -638,9 +651,9 @@ fn push_tool_declare(out: &mut Vec<PromptSegment>, tools: &Value, dynamic: bool)
 ///
 /// Mirrors the Python reference `_internal_system_message("thinking-effort", …)`:
 /// a `role="system" type="thinking-effort"` message whose (stripped) body states
-/// the requested effort. `effort` is pre-validated to `low`/`high`/`max`; the
-/// body text intentionally reproduces the reference verbatim (including its
-/// mention of `medium`, which the validation set does not accept).
+/// the requested effort. `effort` is pre-validated to the checkpoint's efforts;
+/// the body text reproduces the reference verbatim (including its mention of
+/// `medium`, which only Kimi-K3.1's validation set accepts).
 fn push_thinking_effort(out: &mut Vec<PromptSegment>, effort: &str) {
     let body = format!(
         concat!(
@@ -1241,7 +1254,9 @@ mod tests {
             "function": {"name": "f", "parameters": {"type": "object"}}
         })];
         let params = params(Some(true), Some(&tools));
-        let segments = render_xtml(&messages, &params, None).unwrap().segments;
+        let segments = render_xtml(KimiXtml::K3, &messages, &params, None)
+            .unwrap()
+            .segments;
         assert_eq!(
             join_segments(&segments),
             apply_kimi_k3_xtml(&messages, &params).unwrap()
@@ -1255,7 +1270,7 @@ mod tests {
             json!({"role": "user", "content": "Hi"}),
             json!({"role": "assistant", "content": "ok"}),
         ];
-        let segments = render_xtml(&messages, &params(Some(true), None), None)
+        let segments = render_xtml(KimiXtml::K3, &messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         let markers = [OPEN_TOKEN, CLOSE_TOKEN, SEP_TOKEN, END_OF_MSG_TOKEN];
@@ -1284,8 +1299,12 @@ mod tests {
             json!({"role": "user", "content": "Bye"}),
         ];
         let params = params(Some(true), None);
-        let segments = render_xtml(&messages, &params, None).unwrap().segments;
-        let plain_segments = render_xtml(&plain, &params, None).unwrap().segments;
+        let segments = render_xtml(KimiXtml::K3, &messages, &params, None)
+            .unwrap()
+            .segments;
+        let plain_segments = render_xtml(KimiXtml::K3, &plain, &params, None)
+            .unwrap()
+            .segments;
 
         let injected_segments: Vec<&PromptSegment> =
             segments.iter().filter(|s| s.text == injected).collect();
@@ -1298,7 +1317,7 @@ mod tests {
     #[test]
     fn attribute_pieces_are_separate_text_segments() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
-        let segments = render_xtml(&messages, &params(Some(true), None), None)
+        let segments = render_xtml(KimiXtml::K3, &messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         let expected = [
@@ -1325,7 +1344,7 @@ mod tests {
     #[test]
     fn media_anchor_spellings_in_message_text_stay_text() {
         let messages = vec![json!({"role": "user", "content": "see <|media_pad|> here"})];
-        let segments = render_xtml(&messages, &params(Some(true), None), None)
+        let segments = render_xtml(KimiXtml::K3, &messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         assert_eq!(
@@ -1343,7 +1362,7 @@ mod tests {
         let text = "Describe the image set in one short sentence.";
         let render = |parts: Vec<Value>| {
             let messages = [json!({"role": "user", "content": parts})];
-            render_xtml(&messages, &params(Some(true), None), None)
+            render_xtml(KimiXtml::K3, &messages, &params(Some(true), None), None)
                 .unwrap()
                 .segments
         };
@@ -1398,11 +1417,11 @@ mod tests {
     fn prefill_is_appended_as_one_control_piece() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
         let params = params(Some(true), None);
-        let base = render_kimi_k3_xtml_prompt(&messages, &params, None)
+        let base = render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params, None)
             .unwrap()
             .segments;
         let prefix = "<|close|>think<|sep|>Sure";
-        let with = render_kimi_k3_xtml_prompt(&messages, &params, Some(prefix))
+        let with = render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params, Some(prefix))
             .unwrap()
             .segments;
         assert_eq!(&with[..base.len()], &base[..]);
@@ -1410,7 +1429,7 @@ mod tests {
         assert_eq!(join_segments(&with), join_segments(&base) + prefix);
         // An empty prefill adds nothing.
         assert_eq!(
-            render_kimi_k3_xtml_prompt(&messages, &params, Some(""))
+            render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params, Some(""))
                 .unwrap()
                 .segments,
             base
@@ -1428,24 +1447,32 @@ mod tests {
             ]
         };
 
-        let think = render_xtml(&messages, &params(Some(true), None), None).unwrap();
+        let think = render_xtml(KimiXtml::K3, &messages, &params(Some(true), None), None).unwrap();
         assert_eq!(think.pending.end, think.segments.len());
         assert_eq!(think.segments[think.pending].to_vec(), stub("think"));
 
-        let response = render_xtml(&messages, &params(Some(false), None), None).unwrap();
+        let response =
+            render_xtml(KimiXtml::K3, &messages, &params(Some(false), None), None).unwrap();
         assert_eq!(
             response.segments[response.pending].to_vec(),
             stub("response")
         );
 
         let kwargs = HashMap::new();
-        let no_tail = render_xtml(&messages, &params_kw(Some(true), &kwargs, false), None).unwrap();
+        let no_tail = render_xtml(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(Some(true), &kwargs, false),
+            None,
+        )
+        .unwrap();
         assert!(no_tail.pending.is_empty());
 
         // The prefill follows the stub without moving it.
         let params = params(Some(true), None);
-        let base = render_kimi_k3_xtml_prompt(&messages, &params, None).unwrap();
-        let prefilled = render_kimi_k3_xtml_prompt(&messages, &params, Some("Sure")).unwrap();
+        let base = render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params, None).unwrap();
+        let prefilled =
+            render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params, Some("Sure")).unwrap();
         assert_eq!(prefilled.pending, base.pending);
         assert_eq!(
             prefilled.segments[prefilled.pending.clone()].to_vec(),
@@ -1460,16 +1487,25 @@ mod tests {
     /// The reference `build_chat_segments` lists recorded in
     /// `tests/fixtures/kimi_k3/k3_render_fixtures.json`, compared piece by
     /// piece (text and `allow_special`), so the split is checked without a
-    /// checkpoint.
+    /// checkpoint. Kimi-K3.1's `encoding_k3.py` records the same lists for
+    /// these cases; `k31_render_fixtures.json` holds the `medium` effort only
+    /// K3.1 takes.
     #[test]
     fn segments_match_reference_fixture_lists() {
-        let raw = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/kimi_k3/k3_render_fixtures.json"),
-        )
-        .unwrap();
-        let fixtures: Value = serde_json::from_str(&raw).unwrap();
-        let expected = |case: &str| -> Vec<PromptSegment> {
+        let read = |name: &str| -> Value {
+            let raw = std::fs::read_to_string(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/kimi_k3")
+                    .join(name),
+            )
+            .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        let (k3_fixtures, k31_fixtures) = (
+            read("k3_render_fixtures.json"),
+            read("k31_render_fixtures.json"),
+        );
+        let segments = |fixtures: &Value, case: &str| -> Vec<PromptSegment> {
             fixtures[case]["segments"]
                 .as_array()
                 .unwrap_or_else(|| panic!("fixture `{case}` has no segments"))
@@ -1536,23 +1572,28 @@ mod tests {
                 Some(true),
             ),
         ];
-        for (case, messages, tools, thinking) in cases {
-            let got = render_xtml(&messages, &params(thinking, tools), None)
-                .unwrap()
-                .segments;
-            assert_eq!(got, expected(case), "case {case}");
+        for model in [KimiXtml::K3, KimiXtml::K31] {
+            for (case, messages, tools, thinking) in &cases {
+                let got = render_xtml(model, messages, &params(*thinking, *tools), None)
+                    .unwrap()
+                    .segments;
+                assert_eq!(got, segments(&k3_fixtures, case), "{model:?} case {case}");
+            }
         }
 
-        let kwargs: HashMap<String, Value> =
-            HashMap::from([("thinking_effort".to_string(), json!("low"))]);
-        let got = render_xtml(&hi, &params_kw(Some(true), &kwargs, true), None)
-            .unwrap()
-            .segments;
-        assert_eq!(
-            got,
-            expected("thinking_effort_low"),
-            "case thinking_effort_low"
-        );
+        for (model, fixtures, effort) in [
+            (KimiXtml::K3, &k3_fixtures, "low"),
+            (KimiXtml::K31, &k3_fixtures, "low"),
+            (KimiXtml::K31, &k31_fixtures, "medium"),
+        ] {
+            let kwargs: HashMap<String, Value> =
+                HashMap::from([("thinking_effort".to_string(), json!(effort))]);
+            let got = render_xtml(model, &hi, &params_kw(Some(true), &kwargs, true), None)
+                .unwrap()
+                .segments;
+            let case = format!("thinking_effort_{effort}");
+            assert_eq!(got, segments(fixtures, &case), "{model:?} case {case}");
+        }
     }
 
     #[test]
@@ -1626,12 +1667,18 @@ mod tests {
         ];
         let alias = HashMap::from([("enable_thinking".to_string(), json!(false))]);
         let native = HashMap::from([("thinking".to_string(), json!(false))]);
-        let with_alias =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &alias, true))
-                .unwrap();
-        let with_native =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &native, true))
-                .unwrap();
+        let with_alias = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(None, &alias, true),
+        )
+        .unwrap();
+        let with_native = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(None, &native, true),
+        )
+        .unwrap();
         assert_eq!(
             with_alias, with_native,
             "enable_thinking=false must render like thinking=false"
@@ -1652,9 +1699,12 @@ mod tests {
         // The alias set by the caller outranks the request-level toggle the
         // gateway derived from a top-level `reasoning_effort`.
         let on = HashMap::from([("enable_thinking".to_string(), json!(true))]);
-        let with_on =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &on, true))
-                .unwrap();
+        let with_on = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(Some(false), &on, true),
+        )
+        .unwrap();
         assert!(
             with_on.ends_with("<|open|>think<|sep|>"),
             "enable_thinking=true keeps thinking on: {with_on}"
@@ -1668,9 +1718,12 @@ mod tests {
             ("enable_thinking".to_string(), json!(false)),
             ("thinking".to_string(), json!(true)),
         ]);
-        let rendered =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
-                .unwrap();
+        let rendered = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(None, &kwargs, true),
+        )
+        .unwrap();
         assert!(
             rendered.ends_with("<|open|>think<|sep|>"),
             "thinking=true outranks the alias: {rendered}"
@@ -1681,9 +1734,12 @@ mod tests {
     fn kwargs_reasoning_effort_none_switches_thinking_off() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
         let kwargs = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
-        let rendered =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
-                .unwrap();
+        let rendered = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(None, &kwargs, true),
+        )
+        .unwrap();
         assert!(
             rendered.ends_with("<|open|>response<|sep|>"),
             "reasoning_effort=none in the kwargs switches thinking off: {rendered}"
@@ -1699,9 +1755,12 @@ mod tests {
             ("reasoning_effort".to_string(), json!("none")),
             ("enable_thinking".to_string(), json!(true)),
         ]);
-        let rendered =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &both, true))
-                .unwrap();
+        let rendered = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(Some(false), &both, true),
+        )
+        .unwrap();
         assert!(
             rendered.ends_with("<|open|>think<|sep|>"),
             "enable_thinking=true outranks reasoning_effort=none: {rendered}"
@@ -1765,6 +1824,79 @@ mod tests {
         assert!(apply_kimi_k3_xtml(&messages, &params_kw(None, &kwargs, true)).is_err());
     }
 
+    fn rendered(
+        model: KimiXtml,
+        messages: &[Value],
+        params: &ChatTemplateParams,
+    ) -> Result<String> {
+        Ok(join_segments(
+            &render_xtml(model, messages, params, None)?.segments,
+        ))
+    }
+
+    #[test]
+    fn k31_takes_medium_as_thinking_effort_and_reasoning_effort() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        for key in ["thinking_effort", "reasoning_effort"] {
+            let kwargs = HashMap::from([(key.to_string(), json!("medium"))]);
+            let k31 = rendered(KimiXtml::K31, &messages, &params_kw(None, &kwargs, true)).unwrap();
+            assert!(
+                k31.contains("Now the system is invoked with `thinking_effort=medium`."),
+                "{key}=medium must pick the medium directive on K3.1: {k31}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_thinking_effort_names_the_checkpoint_efforts() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        for (model, effort, supported) in [
+            (KimiXtml::K3, "medium", r#"["high", "low", "max"]"#),
+            (
+                KimiXtml::K31,
+                "minimal",
+                r#"["high", "low", "max", "medium"]"#,
+            ),
+        ] {
+            let kwargs = HashMap::from([("thinking_effort".to_string(), json!(effort))]);
+            let error = rendered(model, &messages, &params_kw(None, &kwargs, true)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Unsupported thinking_effort=\"{effort}\"; supported values are {supported}."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn k31_renders_what_k3_renders_for_the_efforts_both_take() {
+        let tools = [json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let messages = vec![
+            json!({"role": "system", "content": "Be brief."}),
+            json!({"role": "user", "content": "Hi"}),
+            json!({"role": "assistant", "content": "", "reasoning_content": "think",
+                   "tool_calls": [{"id": "c0", "type": "function",
+                                   "function": {"name": "f", "arguments": "{\"x\": 1e2}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c0", "content": "ok"}),
+        ];
+        for effort in [None, Some("low"), Some("high"), Some("max")] {
+            let kwargs: HashMap<String, Value> = effort
+                .map(|effort| ("thinking_effort".to_string(), json!(effort)))
+                .into_iter()
+                .collect();
+            let params = ChatTemplateParams {
+                tools: Some(&tools),
+                ..params_kw(None, &kwargs, true)
+            };
+            assert_eq!(
+                rendered(KimiXtml::K31, &messages, &params).unwrap(),
+                rendered(KimiXtml::K3, &messages, &params).unwrap(),
+                "effort {effort:?}"
+            );
+        }
+    }
+
     #[test]
     fn effort_directive_suppressed_when_thinking_off() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
@@ -1797,9 +1929,12 @@ mod tests {
         // `max`, so a request naming none still gets the directive.
         let messages = vec![json!({"role": "user", "content": "Hi"})];
         let kwargs = HashMap::new();
-        let rendered =
-            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
-                .unwrap();
+        let rendered = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
+            &messages,
+            &params_kw(None, &kwargs, true),
+        )
+        .unwrap();
         assert!(
             rendered.contains("Now the system is invoked with `thinking_effort=max`."),
             "served path must default to max: {rendered}"
@@ -1819,9 +1954,12 @@ mod tests {
                 "high",
             ),
         ] {
-            let rendered =
-                apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
-                    .unwrap();
+            let rendered = apply_kimi_k3_xtml_with_effort_default(
+                KimiXtml::K3,
+                &messages,
+                &params_kw(None, &kwargs, true),
+            )
+            .unwrap();
             assert!(
                 rendered.contains(&format!(
                     "Now the system is invoked with `thinking_effort={expected}`."
@@ -1840,6 +1978,7 @@ mod tests {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
         let kwargs = HashMap::new();
         let rendered = apply_kimi_k3_xtml_with_effort_default(
+            KimiXtml::K3,
             &messages,
             &params_kw(Some(false), &kwargs, true),
         )
@@ -1973,5 +2112,25 @@ mod tests {
             ),
             "schema must be deep-sorted and compacted: {rendered}"
         );
+    }
+
+    /// The engine's renderer hands the encoder a `developer` message as a
+    /// `system` one; the XTML loop has no branch for the role and dropped it.
+    #[test]
+    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
+        let developer = vec![
+            json!({"role": "developer", "content": "Answer in one word."}),
+            json!({"role": "user", "content": "Colour of the sky?"}),
+        ];
+        let system = vec![
+            json!({"role": "system", "content": "Answer in one word."}),
+            json!({"role": "user", "content": "Colour of the sky?"}),
+        ];
+        let rendered = apply_kimi_k3_xtml(&developer, &params(None, None)).unwrap();
+        assert_eq!(
+            rendered,
+            apply_kimi_k3_xtml(&system, &params(None, None)).unwrap()
+        );
+        assert!(rendered.contains("Answer in one word."), "{rendered}");
     }
 }

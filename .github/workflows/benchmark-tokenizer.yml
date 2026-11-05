@@ -15,7 +15,7 @@ on:
       - '!crates/tokenizer/**/*_test.rs'
       - '!crates/tokenizer/**/test_*.rs'
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths:
       - '.github/workflows/benchmark-tokenizer.yml'
       - '.github/bench-gates/tokenizer.toml'
@@ -34,10 +34,6 @@ on:
 concurrency:
   group: benchmark-tokenizer-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read

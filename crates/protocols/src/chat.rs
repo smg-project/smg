@@ -346,6 +346,14 @@ pub struct ChatCompletionRequest {
     )]
     pub continue_final_message: bool,
 
+    /// Whether the prompt ends with the assistant's generation header, the
+    /// template's `add_generation_prompt`: absent is `true`, what the engines
+    /// apply without the field; `false` leaves the conversation closed for
+    /// the model to continue on its own. Serialized only when set. Set to
+    /// `true` beside `continue_final_message` it is refused, as the engine
+    /// that has the field refuses the pair.
+    pub add_generation_prompt: Option<bool>,
+
     /// Skip special tokens during detokenization. Serialized only when
     /// `false`, like `separate_reasoning`: `true` is what the engine applies
     /// without the field.
@@ -453,29 +461,24 @@ impl ChatCompletionRequest {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
     }
 
-    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
-    /// a profile whose contract lets an explicit effort outrank
-    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
-    /// drops that toggle from a request that carries an effort.
-    pub fn effective_thinking_toggle(&self) -> Option<bool> {
-        let toggle = self.thinking_toggle();
-        if toggle == Some(false)
-            && self.effective_reasoning_effort().is_some()
-            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
-        {
-            return None;
-        }
-        toggle
+    /// The thinking preference the prompt is rendered with: the typed
+    /// `thinking.type` toggle, else the provider profile's reading of the
+    /// effective `reasoning_effort`
+    /// ([`ProviderProfile::thinking_from_reasoning_effort`]). An explicit
+    /// toggle wins over the profile's reading of any effort, as it does in
+    /// the engine's own server, which keeps a `chat_template_kwargs` toggle
+    /// over the one it would derive from `reasoning_effort`; a renderer with
+    /// a native template effort still ranks that effort above the toggle
+    /// when it reads the prompt (the gateway's parser precedence).
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
     }
 
-    /// The thinking preference the prompt is rendered with: the effective
-    /// typed toggle, else the provider profile's reading of the effective
-    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
-    pub fn template_thinking(&self) -> Option<bool> {
-        self.effective_thinking_toggle().or_else(|| {
-            ProviderProfile::for_model(&self.model)
-                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
-        })
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        self.thinking_toggle()
+            .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
     }
 
     /// Whether `continue_final_message` applies: it is set and the request
@@ -483,6 +486,12 @@ impl ChatCompletionRequest {
     pub fn continues_final_assistant(&self) -> bool {
         self.continue_final_message
             && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether the prompt ends with the assistant's generation header: the
+    /// request's `add_generation_prompt`, `true` when absent.
+    pub fn adds_generation_prompt(&self) -> bool {
+        self.add_generation_prompt.unwrap_or(true)
     }
 
     /// Whether `parallel_tool_calls: false` asks for one tool call at most.
@@ -693,7 +702,17 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 10. A continued final message and the generation header exclude each
+    //     other: the pair set together is refused, as the engine that has
+    //     the field refuses it; `continue_final_message` alone continues.
+    if req.continue_final_message && req.add_generation_prompt == Some(true) {
+        return Err(invalid(
+            "add_generation_prompt_conflicts_with_continue_final_message",
+            "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
+        ));
+    }
+
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -1147,14 +1166,159 @@ pub struct ChatStreamChoice {
     pub matched_stop: Option<Value>,
 }
 
+/// [`ChatMessageDelta`] over text it may borrow: the same fields, attributes
+/// and bytes on the wire, for a stream that writes each delta once and need
+/// not copy its text out of the buffer the delta was read into.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessageDeltaRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<Cow<'a, str>>,
+}
+
+/// [`ChatStreamChoice`] with a [`ChatMessageDeltaRef`]: the same bytes on the
+/// wire as the owned choice.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatStreamChoiceRef<'a> {
+    pub index: u32,
+    pub delta: ChatMessageDeltaRef<'a>,
+    pub logprobs: Option<ChatLogProbs>,
+    pub finish_reason: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+impl<'a> From<ChatStreamChoice> for ChatStreamChoiceRef<'a> {
+    /// The owned choice's text as its own (an owned [`Cow`] each). The owned
+    /// types are taken apart field by field with no rest pattern, so a field
+    /// added to either of them is a compile error here until the borrowed
+    /// type carries it too.
+    fn from(choice: ChatStreamChoice) -> Self {
+        let ChatStreamChoice {
+            index,
+            delta,
+            logprobs,
+            finish_reason,
+            matched_stop,
+        } = choice;
+        let ChatMessageDelta {
+            role,
+            content,
+            tool_calls,
+            reasoning_content,
+        } = delta;
+        ChatStreamChoiceRef {
+            index,
+            delta: ChatMessageDeltaRef {
+                role: role.map(Cow::Owned),
+                content: content.map(Cow::Owned),
+                tool_calls,
+                reasoning_content: reasoning_content.map(Cow::Owned),
+            },
+            logprobs,
+            finish_reason: finish_reason.map(Cow::Owned),
+            matched_stop,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest, ThinkingParam,
-        ThinkingType,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
+        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
+        ThinkingParam, ThinkingType,
     };
+    use crate::common::{FunctionCallDelta, ToolCallDelta};
+
+    /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
+    /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
+    /// a role, a matched stop.
+    #[test]
+    fn borrowed_stream_choice_serializes_as_the_owned_one() {
+        let delta = |role: Option<&str>,
+                     content: Option<&str>,
+                     reasoning: Option<&str>,
+                     tool_calls: Option<Vec<ToolCallDelta>>| ChatMessageDelta {
+            role: role.map(str::to_string),
+            content: content.map(str::to_string),
+            tool_calls,
+            reasoning_content: reasoning.map(str::to_string),
+        };
+        let call = |id: Option<&str>, name: Option<&str>, arguments: Option<&str>| {
+            vec![ToolCallDelta {
+                index: 1,
+                id: id.map(str::to_string),
+                tool_type: id.map(|_| "function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: name.map(str::to_string),
+                    arguments: arguments.map(str::to_string),
+                }),
+            }]
+        };
+        let shapes = [
+            (
+                delta(None, Some("Hello, \"world\" \u{1f600}"), None, None),
+                None,
+                None,
+            ),
+            (delta(None, None, Some("let me think"), None), None, None),
+            (
+                delta(
+                    None,
+                    None,
+                    None,
+                    Some(call(Some("call_1"), Some("lookup"), None)),
+                ),
+                None,
+                None,
+            ),
+            (
+                delta(None, None, None, Some(call(None, None, Some("{\"q\":")))),
+                None,
+                None,
+            ),
+            (delta(None, None, None, None), Some("tool_calls"), None),
+            (delta(Some("assistant"), Some(""), None, None), None, None),
+            (
+                delta(None, Some("done"), None, None),
+                Some("stop"),
+                Some(json!("</s>")),
+            ),
+        ];
+        for (delta, finish_reason, matched_stop) in shapes {
+            let owned = ChatStreamChoice {
+                index: 3,
+                delta,
+                logprobs: None,
+                finish_reason: finish_reason.map(str::to_string),
+                matched_stop,
+            };
+            let expected = serde_json::to_string(&owned).unwrap();
+            let borrowed = ChatStreamChoiceRef {
+                index: owned.index,
+                delta: ChatMessageDeltaRef {
+                    role: owned.delta.role.as_deref().map(Into::into),
+                    content: owned.delta.content.as_deref().map(Into::into),
+                    tool_calls: owned.delta.tool_calls.clone(),
+                    reasoning_content: owned.delta.reasoning_content.as_deref().map(Into::into),
+                },
+                logprobs: None,
+                finish_reason: owned.finish_reason.as_deref().map(Into::into),
+                matched_stop: owned.matched_stop.clone(),
+            };
+            assert_eq!(serde_json::to_string(&borrowed).unwrap(), expected);
+            let from_owned: ChatStreamChoiceRef<'static> = owned.into();
+            assert_eq!(serde_json::to_string(&from_owned).unwrap(), expected);
+        }
+    }
 
     /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
     #[test]
@@ -1182,6 +1346,62 @@ mod tests {
             object.insert((*name).to_string(), field_value.clone());
         }
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    /// `add_generation_prompt`: absent is none and reads as `true`, so a
+    /// request without the field serializes without it; `false` round-trips
+    /// as sent; null is absent.
+    #[test]
+    fn add_generation_prompt_is_read_only_when_sent_and_defaults_to_true() {
+        let absent = request_with_output_fields(&[]);
+        assert_eq!(absent.add_generation_prompt, None);
+        assert!(absent.adds_generation_prompt());
+        let value = serde_json::to_value(&absent).expect("serialize");
+        assert!(value.get("add_generation_prompt").is_none());
+
+        let off = request_with_output_fields(&[("add_generation_prompt", json!(false))]);
+        assert_eq!(off.add_generation_prompt, Some(false));
+        assert!(!off.adds_generation_prompt());
+        let value = serde_json::to_value(&off).expect("serialize");
+        assert_eq!(value["add_generation_prompt"], false);
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert_eq!(back.add_generation_prompt, Some(false));
+
+        let nulled = request_with_output_fields(&[("add_generation_prompt", Value::Null)]);
+        assert_eq!(nulled.add_generation_prompt, None);
+    }
+
+    /// The generation header and a continued final message exclude each
+    /// other: both set is refused with the engine's wording;
+    /// `continue_final_message` alone, or beside `add_generation_prompt:
+    /// false`, passes, as does `false` alone.
+    #[test]
+    fn add_generation_prompt_true_is_refused_beside_continue_final_message() {
+        use validator::Validate;
+        let both = request_with_output_fields(&[
+            ("continue_final_message", json!(true)),
+            ("add_generation_prompt", json!(true)),
+        ]);
+        let error = both
+            .validate()
+            .expect_err("the pair is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
+            ),
+            "{error}"
+        );
+        for passing in [
+            vec![("continue_final_message", json!(true))],
+            vec![
+                ("continue_final_message", json!(true)),
+                ("add_generation_prompt", json!(false)),
+            ],
+            vec![("add_generation_prompt", json!(false))],
+        ] {
+            assert!(request_with_output_fields(&passing).validate().is_ok());
+        }
     }
 
     #[test]
@@ -1241,9 +1461,10 @@ mod tests {
     }
 
     /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
-    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
-    /// explicit effort outranks `thinking.type: disabled`; every other
-    /// profile keeps the OpenAI reading and honours the toggle.
+    /// (the default depth) and `minimal` (`low`) keep thinking on; every
+    /// other profile keeps the OpenAI reading. An explicit `thinking.type:
+    /// disabled` wins over any effort under every profile, as an explicit
+    /// toggle wins over the effort in the engine's own server.
     #[test]
     fn minimax_profile_keeps_thinking_on_for_every_effort() {
         let request = |model: &str, fields: Value| -> ChatCompletionRequest {
@@ -1266,8 +1487,8 @@ mod tests {
                     json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
                 )
                 .template_thinking(),
-                None,
-                "MiniMax {effort} outranks thinking.disabled"
+                Some(false),
+                "MiniMax {effort}: thinking.disabled wins"
             );
         }
         assert_eq!(

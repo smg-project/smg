@@ -11,6 +11,7 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use http::StatusCode;
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 
@@ -28,24 +29,28 @@ static MODEL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_M
 static TOOL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_TOOL_LABELS));
 static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
 
-/// Intern a client-controlled label with a hard cardinality cap.
-///
-/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
-/// (client-supplied model names, model-generated tool names) cannot grow the
-/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
-/// admitted values are never evicted and re-admitted, which would keep minting new
-/// series in the recorder even as the map churned.
 /// A label set that admits at most `cap` distinct values; everything past
-/// the cap maps to the sentinel. Admission reserves a slot before touching
-/// the map, so a burst of distinct labels cannot overshoot the cap.
-struct BoundedLabels {
+/// the cap maps to the sentinel `other`.
+///
+/// Distinct values beyond `cap` collapse to the shared sentinel, so untrusted
+/// input (client-supplied model names, model-generated tool names, tenant
+/// keys) cannot grow the interner, or the metric's Prometheus series set,
+/// without bound. Unlike an LRU, admitted values are never evicted and
+/// re-admitted, which would keep minting new series in the recorder even as
+/// the map churned. Admission reserves a slot before touching the map, so a
+/// burst of distinct labels cannot overshoot the cap. The model and tool
+/// labels are two process-wide sets; a label another part of the gateway
+/// bounds by a setting of its own (the scheduler's tenant label) gets a set
+/// of its own.
+pub struct BoundedLabels {
     map: DashMap<String, Arc<str>>,
     admitted: AtomicUsize,
     cap: usize,
 }
 
 impl BoundedLabels {
-    fn new(cap: usize) -> Self {
+    /// A set that admits `cap` distinct values.
+    pub fn new(cap: usize) -> Self {
         Self {
             map: DashMap::new(),
             admitted: AtomicUsize::new(0),
@@ -53,7 +58,9 @@ impl BoundedLabels {
         }
     }
 
-    fn intern(&self, s: &str) -> Arc<str> {
+    /// `s` as the label value: its own interned copy while the set has room,
+    /// the sentinel `other` once it has none.
+    pub fn intern(&self, s: &str) -> Arc<str> {
         if let Some(entry) = self.map.get(s) {
             return Arc::clone(entry.value());
         }
@@ -83,13 +90,13 @@ impl BoundedLabels {
     }
 }
 
-/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
+/// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
     MODEL_LABELS.intern(model_id)
 }
 
 /// Intern a client/model-controlled MCP tool-name label, bounded by
-/// [`MAX_TOOL_LABELS`].
+/// `MAX_TOOL_LABELS`.
 pub fn intern_tool_label(tool_name: &str) -> Arc<str> {
     TOOL_LABELS.intern(tool_name)
 }
@@ -139,6 +146,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
     pub const ENDPOINT_CLASSIFY: &str = "classify";
     pub const ENDPOINT_MESSAGES: &str = "messages";
+    pub const ENDPOINT_INTERACTIONS: &str = "interactions";
     pub const ENDPOINT_REALTIME: &str = "realtime";
     pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
     pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
@@ -160,6 +168,9 @@ pub mod metrics_labels {
     // Token types
     pub const TOKEN_INPUT: &str = "input";
     pub const TOKEN_OUTPUT: &str = "output";
+    /// The prompt tokens the engine served from its cache: a share of
+    /// `input`, counted again under its own type.
+    pub const TOKEN_CACHED: &str = "cached";
 
     // PD KV connector modes (smg_pd_kv_connector_mode_total)
     pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
@@ -189,6 +200,7 @@ pub mod metrics_labels {
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
     pub const DISCOVERY_FILE: &str = "file";
+    pub const DISCOVERY_SLURM: &str = "slurm";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
 
@@ -201,6 +213,11 @@ pub mod metrics_labels {
     // and rejected as invalid
     pub const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
     pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
+
+    // Discovered workers a provider left out of an otherwise good snapshot:
+    // their record could not be used, or one started earlier at their address
+    pub const DISCOVERY_SKIP_INVALID: &str = "invalid";
+    pub const DISCOVERY_SKIP_CONFLICT: &str = "conflict";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
@@ -240,6 +257,95 @@ pub mod metrics_labels {
     /// The engine itself reported that the request failed (its finish
     /// reason was `error`), as opposed to a failed call to the worker.
     pub const ERROR_ENGINE: &str = "engine_error";
+    /// The engine could not continue the request under the request's own
+    /// constraint (a grammar it could not keep to): the request's outcome,
+    /// not the worker's failure; the client reads a 422 `constraint_failed`.
+    pub const ERROR_CONSTRAINT: &str = "constraint_error";
+
+    // Router error reasons: the cause behind an `error_type`, as far as the
+    // router that counted the error could tell it. The set is fixed; a
+    // failure outside it counts as `other`.
+    /// The call or the stream ran past its time bound: the worker answered
+    /// DEADLINE_EXCEEDED, a side was silent past its liveness bound, an
+    /// upstream call timed out (a 504 or 408).
+    pub const REASON_DEADLINE: &str = "deadline";
+    /// The worker's connection failed under the call: an HTTP/2 or socket
+    /// fault below the status, the worker's side cancelling the call, a
+    /// connect failure, a relayed body cut short (a 502).
+    pub const REASON_TRANSPORT_DISCONNECT: &str = "transport_disconnect";
+    /// The engine finished the request with an error of its own.
+    pub const REASON_ENGINE_ERROR: &str = "engine_error";
+    /// The worker answered INTERNAL (not the engine's own report), UNKNOWN or
+    /// DATA_LOSS, or a 500 of its own.
+    pub const REASON_ENGINE_INTERNAL: &str = "engine_internal";
+    /// The worker answered UNAVAILABLE or a 503 of its own.
+    pub const REASON_ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+    /// The worker pushed the request back for capacity (RESOURCE_EXHAUSTED,
+    /// a 429 of its own).
+    pub const REASON_OVERLOADED: &str = "overloaded";
+    /// The gateway's own tenant rate limit refused the request.
+    pub const REASON_RATE_LIMITED: &str = "rate_limited";
+    /// The gateway shed the request on a capacity bound of its own: its
+    /// overload protection, a full prefill admission queue, or another
+    /// budget or cap it holds (a 429 under a code of the gateway's).
+    pub const REASON_OVERLOAD_SHED: &str = "overload_shed";
+    /// The request waited longer than an admission bound inside the gateway:
+    /// the selection queue's timeout, or the prefill admission queue's.
+    pub const REASON_SELECTION_QUEUE_TIMEOUT: &str = "selection_queue_timeout";
+    /// Every worker of the model was unavailable (unhealthy, behind an open
+    /// circuit breaker, or declined by the policy).
+    pub const REASON_NO_AVAILABLE_WORKERS: &str = "no_available_workers";
+    /// No worker of the model has what the request needs (media
+    /// processing, a compatible prefill/decode pair): a configuration
+    /// verdict, not a pool state.
+    pub const REASON_NO_CAPABLE_WORKER: &str = "no_capable_worker";
+    /// No worker serves the model the request named.
+    pub const REASON_MODEL_NOT_FOUND: &str = "model_not_found";
+    /// The request's own fault: a 400, INVALID_ARGUMENT, FAILED_PRECONDITION,
+    /// OUT_OF_RANGE, missing or malformed credentials.
+    pub const REASON_INVALID_REQUEST: &str = "invalid_request";
+    /// The request's media failed (a reference the worker could not fetch
+    /// within its budget, an item over the size limit).
+    pub const REASON_MEDIA_FAULT: &str = "media_fault";
+    /// The engine could not continue the request under the request's own
+    /// constraint.
+    pub const REASON_CONSTRAINT_FAILED: &str = "constraint_failed";
+    /// The worker answered, but its answer could not be read.
+    pub const REASON_BAD_RESPONSE: &str = "bad_response";
+    /// The gateway's own processing failed.
+    pub const REASON_INTERNAL: &str = "internal";
+    /// A status outside the classes above.
+    pub const REASON_OTHER: &str = "other";
+}
+
+/// The `reason` label of a router error known by its HTTP status alone: a
+/// worker's answer relayed as it came, or a relayed body cut short. The
+/// status is the worker's, so a 5xx is read as the worker's failure (the
+/// gateway's own failures carry their code, and the gateway's routers read
+/// the reason off the code first).
+pub fn error_reason_from_status(status: StatusCode) -> &'static str {
+    use metrics_labels::*;
+    match status.as_u16() {
+        400 => REASON_INVALID_REQUEST,
+        404 => REASON_MODEL_NOT_FOUND,
+        408 | 504 => REASON_DEADLINE,
+        429 => REASON_OVERLOADED,
+        500 => REASON_ENGINE_INTERNAL,
+        502 => REASON_TRANSPORT_DISCONNECT,
+        503 => REASON_ENGINE_UNAVAILABLE,
+        _ => REASON_OTHER,
+    }
+}
+
+/// The `reason` label of a request the router could not place: the pool's
+/// refusal is a 404 for a model no worker serves and a 503 for a model whose
+/// workers are all unavailable.
+pub fn error_reason_for_refused_selection(status: StatusCode) -> &'static str {
+    if status == StatusCode::NOT_FOUND {
+        metrics_labels::REASON_MODEL_NOT_FOUND
+    } else {
+        metrics_labels::REASON_NO_AVAILABLE_WORKERS
+    }
 }
 
 /// Per-thread caches of the handles the per-request records go through.
@@ -600,7 +706,8 @@ impl Metrics {
             );
         });
     }
-    /// Record a router error.
+    /// Record a router error: its class (`error_type`) and the cause behind
+    /// it (`reason`, one of the `metrics_labels::REASON_*` values).
     /// Uses string interning for model_id.
     pub fn record_router_error(
         router_type: &'static str,
@@ -609,6 +716,7 @@ impl Metrics {
         model_id: &str,
         endpoint: &'static str,
         error_type: &'static str,
+        reason: &'static str,
     ) {
         let model = intern_model_label(model_id);
         counter!(
@@ -618,7 +726,8 @@ impl Metrics {
             "connection_mode" => connection_mode,
             "model" => model,
             "endpoint" => endpoint,
-            "error_type" => error_type
+            "error_type" => error_type,
+            "reason" => reason
         )
         .increment(1);
     }
@@ -794,6 +903,87 @@ mod tests {
                 kept.join("\n")
             );
         }
+    }
+
+    /// A router error known by its status alone reads as the worker's: the
+    /// status classes an operator asks about first (a deadline, a dropped
+    /// connection, capacity pushback, the worker's own failure) each get
+    /// their reason, and a status outside them is `other`.
+    #[test]
+    fn a_status_alone_names_the_reason_of_the_workers_answer() {
+        use metrics_labels::*;
+        for (status, reason) in [
+            (StatusCode::BAD_REQUEST, REASON_INVALID_REQUEST),
+            (StatusCode::NOT_FOUND, REASON_MODEL_NOT_FOUND),
+            (StatusCode::REQUEST_TIMEOUT, REASON_DEADLINE),
+            (StatusCode::GATEWAY_TIMEOUT, REASON_DEADLINE),
+            (StatusCode::TOO_MANY_REQUESTS, REASON_OVERLOADED),
+            (StatusCode::INTERNAL_SERVER_ERROR, REASON_ENGINE_INTERNAL),
+            (StatusCode::BAD_GATEWAY, REASON_TRANSPORT_DISCONNECT),
+            (StatusCode::SERVICE_UNAVAILABLE, REASON_ENGINE_UNAVAILABLE),
+            (StatusCode::UNAUTHORIZED, REASON_OTHER),
+            (StatusCode::CONFLICT, REASON_OTHER),
+            (StatusCode::NOT_IMPLEMENTED, REASON_OTHER),
+        ] {
+            assert_eq!(error_reason_from_status(status), reason, "{status}");
+        }
+        // The pool's two refusals of a request it could not place.
+        assert_eq!(
+            error_reason_for_refused_selection(StatusCode::NOT_FOUND),
+            REASON_MODEL_NOT_FOUND
+        );
+        assert_eq!(
+            error_reason_for_refused_selection(StatusCode::SERVICE_UNAVAILABLE),
+            REASON_NO_AVAILABLE_WORKERS
+        );
+    }
+
+    /// Every sample of the router error family carries its `reason` next to
+    /// its `error_type`, so a sum over `reason` is the count the family had
+    /// before the label existed, and two causes under one class are two
+    /// series.
+    #[test]
+    fn a_router_error_is_counted_under_its_class_and_its_reason() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for reason in [
+                metrics_labels::REASON_TRANSPORT_DISCONNECT,
+                metrics_labels::REASON_ENGINE_INTERNAL,
+                metrics_labels::REASON_ENGINE_INTERNAL,
+            ] {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_GRPC,
+                    "reason-test",
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_BACKEND,
+                    reason,
+                );
+            }
+        });
+        let rendered = handle.render();
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(r#"model="reason-test""#)
+            })
+            .collect();
+        assert_eq!(samples.len(), 2, "{rendered}");
+        let value = |reason: &str| -> u64 {
+            let line = samples
+                .iter()
+                .find(|line| line.contains(&format!(r#"reason="{reason}""#)))
+                .unwrap_or_else(|| panic!("a {reason} series:\n{rendered}"));
+            assert!(line.contains(r#"error_type="backend_error""#), "{line}");
+            line.rsplit(' ').next().unwrap().parse().unwrap()
+        };
+        assert_eq!(value("transport_disconnect"), 1);
+        assert_eq!(value("engine_internal"), 2);
     }
 
     #[test]

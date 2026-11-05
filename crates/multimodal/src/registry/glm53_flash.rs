@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -10,20 +12,27 @@ use crate::{
     types::{
         FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{Glm53FlashProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 const IMAGE: &str = "<|image|>";
 const VIDEO: &str = "<|video|>";
 const BEGIN: &str = "<|begin_of_image|>";
 const END: &str = "<|end_of_image|>";
-/// The serving engine's default video loader keeps at most this many frames
-/// of a clip, spread from the first to the last, and its processor takes
-/// them as they come; a clip costs on this path what it costs on the
-/// engine's own server only when the frames are the same.
-const LOADER_FRAMES: usize = 32;
+/// The serving engine samples a clip of this family with the family's own
+/// video loader, not its generic one: `trunc(duration x LOADER_FPS)` frames,
+/// at most this many, by a walk at twice the rate re-spread evenly over the
+/// clip; its processor then takes the frames as they come (and resamples a
+/// clip the loader kept whole with the same rule, which changes nothing). A
+/// clip costs on this path what it costs on the engine's own server only
+/// when the frames are the same.
+const LOADER_MAX_FRAMES: usize = 2048;
+/// The rate the family's loader samples at, which is also the reference
+/// video processor's (`Glm5NextVideoProcessor`) `fps`.
+const LOADER_FPS: f64 = 2.0;
 /// Frames per temporal group: the engine's timestamps take every second
-/// sampled frame, whatever the configured temporal patch size.
+/// sampled frame, whatever the configured temporal patch size; the loader's
+/// walk is scaled by the same two.
 const FRAMES_PER_GROUP: usize = 2;
 
 pub(super) struct Glm53FlashSpec;
@@ -246,6 +255,29 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         Ok(limits)
     }
 
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Glm53FlashProcessor::from_config_for(preprocessor_config, modality).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -293,13 +325,30 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         Self::video_replacements(metadata, preprocessed, &seconds)
     }
 
-    /// The engine's own server takes a clip from its default video loader,
-    /// which keeps at most `LOADER_FRAMES` frames spread from the first to
-    /// the last; the processor's own rate-based sampling never runs there.
+    /// The engine's own server samples a clip of this family with the
+    /// family's own loader: `trunc(duration x rate)` frames, at most
+    /// `LOADER_MAX_FRAMES`, by a walk at twice the rate re-spread evenly, each
+    /// distinct frame once; its processor takes them as they come.
     fn video_frame_sampling(&self) -> FrameSampling {
-        FrameSampling::UpTo {
-            max_frames: LOADER_FRAMES,
+        FrameSampling::RateWalk {
+            max_frames: LOADER_MAX_FRAMES,
+            temporal_patch_size: FRAMES_PER_GROUP,
         }
+    }
+
+    /// The rate the family's loader samples at, the reference video
+    /// processor's `fps`.
+    fn default_video_sample_fps(&self) -> Option<f64> {
+        Some(LOADER_FPS)
+    }
+
+    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
+        Some(
+            config
+                .and_then(|config| config.get_extra::<f64>("fps"))
+                .filter(|fps| fps.is_finite() && *fps > 0.0)
+                .unwrap_or(LOADER_FPS),
+        )
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -353,10 +402,17 @@ mod tests {
         let spec = registry.lookup(&metadata).unwrap();
         assert_eq!(
             spec.video_frame_sampling(),
-            FrameSampling::UpTo {
-                max_frames: LOADER_FRAMES
+            FrameSampling::RateWalk {
+                max_frames: LOADER_MAX_FRAMES,
+                temporal_patch_size: FRAMES_PER_GROUP,
             }
         );
+        let video_config = PreProcessorConfig::from_value(json!({"fps": 1})).unwrap();
+        assert_eq!(
+            spec.default_video_sample_fps_with(Some(&video_config)),
+            Some(1.0)
+        );
+        assert_eq!(spec.default_video_sample_fps_with(None), Some(LOADER_FPS));
 
         // Four temporal groups of two tokens each, from eight frames the
         // loader picked at 30 fps: the groups start at frames 0, 17, 35, 53.

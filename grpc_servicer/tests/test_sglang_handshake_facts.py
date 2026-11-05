@@ -5,15 +5,86 @@ either engine release."""
 
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 
 # The wire module rides on pyzmq and msgspec; the plain unit-test job installs
 # msgspec but not pyzmq and skips this module, as it does the wire's own tests.
-pytest.importorskip("msgspec")
+msgspec = pytest.importorskip("msgspec")
 pytest.importorskip("zmq")
 from smg_grpc_servicer.sglang import zmq_msgpack as wire  # noqa: E402
+
+
+def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    parent, _, child = name.rpartition(".")
+    if parent:
+        parent_module = sys.modules.get(parent) or _install(monkeypatch, parent)
+        # Undone with the test: the parent is the real package where an engine is installed.
+        monkeypatch.setattr(parent_module, child, module, raising=False)
+    return module
+
+
+@pytest.fixture(autouse=True)
+def request_structs(monkeypatch):
+    """The engine's request structs the ready response reads its field order
+    off, as small as the shape allows: tagged, positional, base class first."""
+
+    class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
+        rid: str | None = None
+        http_worker_ipc: str | None = None
+
+    class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+        input_ids: list[int] | None = None
+        stream: bool = False
+
+    class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
+        input_ids: list[int] | None = None
+        dimensions: int | None = None
+
+    class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+        error_msg: str | None = None
+        error_code: int | None = None
+
+    class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
+        max_new_tokens: int | None = 128
+        custom_params: dict | None = None
+        stop_strs: list[str] | None = None
+
+    class MultimodalDataItem(msgspec.Struct, kw_only=True, array_like=True):
+        modality: int | None = None
+        offsets: list[tuple[int, int]] | None = None
+
+    class MultimodalProcessorOutput(msgspec.Struct, kw_only=True, array_like=True):
+        mm_items: list[MultimodalDataItem] | None = None
+        im_token_id: int | None = None
+
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.io_struct",
+        TokenizedGenerateReqInput=TokenizedGenerateReqInput,
+        TokenizedEmbeddingReqInput=TokenizedEmbeddingReqInput,
+        EncoderDispatchErrorReq=EncoderDispatchErrorReq,
+    )
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.schedule_batch",
+        MultimodalProcessorOutput=MultimodalProcessorOutput,
+        MultimodalDataItem=MultimodalDataItem,
+    )
+    _install(monkeypatch, "sglang.srt.sampling.sampling_params", SamplingParams=SamplingParams)
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.schedule_batch",
+        MultimodalProcessorOutput=MultimodalProcessorOutput,
+        MultimodalDataItem=MultimodalDataItem,
+    )
 
 
 def _scheduler(**server_args):
@@ -71,6 +142,25 @@ def test_plain_data_parallelism_and_a_single_scheduler_report_their_own_figures(
     assert _facts(single) == (1, 16, 2048, 16)
     assert (single.max_model_len, single.block_size, single.num_gpu_blocks) == (8192, 16, 256)
     assert single.instance_id == "served" and single.data_parallel_rank == 0
+
+
+def test_the_handshake_declares_the_request_structs_field_order():
+    """What SMG compares the prefixes it encodes with: each struct's fields in
+    declaration order, base classes first, the tag not counted, under the
+    class name; a plain map in the ready response."""
+    layouts = {
+        "TokenizedGenerateReqInput": ["rid", "http_worker_ipc", "input_ids", "stream"],
+        "TokenizedEmbeddingReqInput": ["rid", "http_worker_ipc", "input_ids", "dimensions"],
+        "EncoderDispatchErrorReq": ["rid", "http_worker_ipc", "error_msg", "error_code"],
+        "SamplingParams": ["max_new_tokens", "custom_params", "stop_strs"],
+        "MultimodalProcessorOutput": ["mm_items", "im_token_id"],
+        "MultimodalDataItem": ["modality", "offsets"],
+    }
+    assert wire.request_layouts() == layouts
+    ready = wire.ready_response_for_scheduler(_scheduler())
+    assert ready.positional_layouts == layouts
+    decoded = msgspec.msgpack.decode(wire.encode(ready))
+    assert decoded["positional_layouts"] == layouts
 
 
 def test_each_scheduler_reports_its_own_rank_on_either_release():

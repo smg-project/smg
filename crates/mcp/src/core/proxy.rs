@@ -88,27 +88,12 @@ pub(super) fn apply_proxy_to_builder(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::core::{config::McpTransport, orchestrator::http_client_builder};
+    use crate::core::{config::test_support::sse_server, orchestrator::http_client_builder};
 
     #[test]
     fn test_resolve_proxy_no_config() {
-        let server = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
+        let server = sse_server("test", "http://localhost:3000/sse");
 
         let result = resolve_proxy_config(&server, None);
         assert!(
@@ -119,20 +104,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proxy_global_only() {
-        let server = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
+        let server = sse_server("test", "http://localhost:3000/sse");
 
         let global = McpProxyConfig {
             http: Some("http://global-proxy:8080".to_string()),
@@ -161,18 +133,8 @@ mod tests {
         };
 
         let server = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
             proxy: Some(server_proxy),
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
+            ..sse_server("test", "http://localhost:3000/sse")
         };
 
         let global = McpProxyConfig {

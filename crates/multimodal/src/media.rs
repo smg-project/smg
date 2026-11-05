@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     process::{Output, Stdio},
@@ -41,10 +42,16 @@ const MAX_REDIRECTS: usize = 10;
 const DEFAULT_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
-/// Source frames one video decode may run through, by default: a dense
-/// sampling of a clip hours long is refused before any decoder starts
-/// (`SMG_VIDEO_MAX_DECODE_FRAMES`).
-const DEFAULT_VIDEO_MAX_DECODE_FRAMES: usize = 262_144;
+/// Pixels one video decode may run through (the source frames it decodes,
+/// each of the clip's width and height), by default: a decode past this is
+/// refused before any decoder starts (`SMG_VIDEO_MAX_DECODE_PIXELS`). Decode
+/// work follows pixels, not frames, so the one cap is ten hours of 1280x720
+/// at 30 fps, forty hours of 640x360, four and a half hours of 1920x1080 and
+/// an hour of 3840x2160: well past what the default process budget fits on
+/// a well-provisioned decoder (about 80 s of decode on sixteen threads at
+/// the measured rate), so that only a decode the budget could not have
+/// fitted anyway is refused outright; the budget bounds the rest.
+const DEFAULT_VIDEO_MAX_DECODE_PIXELS: u64 = 1_000_000_000_000;
 /// A clip is decoded by seeking to its picks only when it is at least this
 /// long, in frames, and holds at least [`SEEK_PLAN_MIN_FRAMES_PER_PICK`]
 /// frames per distinct pick: looking into a plan reads the stream's packet
@@ -61,7 +68,7 @@ static VIDEO_PROCESS_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 static IMAGE_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
-static VIDEO_MAX_DECODE_FRAMES: OnceLock<usize> = OnceLock::new();
+static VIDEO_MAX_DECODE_PIXELS: OnceLock<u64> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
@@ -126,7 +133,7 @@ impl Default for MediaConnectorConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageFetchConfig {
     pub detail: ImageDetail,
     /// MiniMax-M3 extension: cap the decoded image's long side.
@@ -147,7 +154,7 @@ impl Default for ImageFetchConfig {
 }
 
 /// Where the sampled frames sit within a clip.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FrameSampling {
     /// Spread evenly from the first frame to the last.
     #[default]
@@ -165,6 +172,31 @@ pub enum FrameSampling {
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
     /// way vLLM's default video loader samples. The rate is not a factor.
     UpTo { max_frames: usize },
+    /// [`Self::UpTo`], then, when that kept every frame of the clip, the
+    /// GLM-5-Next reference video processor's own `sample_frames` at the
+    /// configured rate over those frames, at most `rate_max_frames` of them
+    /// (`glm5_next_frame_indices`): vLLM hands that processor the loader's
+    /// frames and lets it resample exactly when the loader took them all
+    /// (`do_sample_frames`), and keeps a longer clip's loader picks as they
+    /// are.
+    UpToThenRate {
+        max_frames: usize,
+        rate_max_frames: usize,
+    },
+    /// `trunc(duration x rate)` frames, at most `max_frames`, by a walk over
+    /// the clip that takes one frame each time the stream's clock reaches the
+    /// next instant `1 / (temporal_patch_size x rate)` seconds on, up to the
+    /// clip's whole seconds, re-spread by `numpy.linspace(0, n - 1, count)`
+    /// truncated to integers where the walk took too many (the usual case) or
+    /// by `linspace(first, last, count)` where too few; a clip with fewer
+    /// frames than the count takes `floor(i x n / count)`; each distinct pick
+    /// once, in order (`rate_walk_frame_indices`). The rule of the GLM-5
+    /// family's own video loader, which samples a clip before its processor
+    /// sees it; the processor pads an odd count by repeating the last frame.
+    RateWalk {
+        max_frames: usize,
+        temporal_patch_size: usize,
+    },
     /// `trunc(duration x rate)` frames, at most `max_frames` and never more
     /// than the clip has, aligned down to a multiple of `frame_factor` (and
     /// never below it unless the clip is shorter), at the positions of
@@ -185,15 +217,44 @@ impl FrameSampling {
     /// place of its own constant, so a clip costs what it costs on the
     /// engine's own server; `0` is every frame, as vLLM reads a non-positive
     /// count. The rate-based samplers are not the loader's and keep their
-    /// rule; `None` leaves the spec's choice.
+    /// rule, and the rate walk's loader reads no frame budget; `None` leaves
+    /// the spec's choice.
     pub fn with_frame_budget(self, budget: Option<usize>) -> Self {
         match (self, budget) {
             (Self::UpTo { .. }, Some(0)) => Self::UpTo {
                 max_frames: usize::MAX,
             },
             (Self::UpTo { .. }, Some(max_frames)) => Self::UpTo { max_frames },
+            (
+                Self::UpToThenRate {
+                    rate_max_frames, ..
+                },
+                Some(0),
+            ) => Self::UpToThenRate {
+                max_frames: usize::MAX,
+                rate_max_frames,
+            },
+            (
+                Self::UpToThenRate {
+                    rate_max_frames, ..
+                },
+                Some(max_frames),
+            ) => Self::UpToThenRate {
+                max_frames,
+                rate_max_frames,
+            },
             (sampling, _) => sampling,
         }
+    }
+
+    /// Whether the rule samples the way the engine's loader does, over the
+    /// length the container claims (cut to the stream's own where that runs
+    /// shorter) rather than over the decoded frame count.
+    pub(crate) fn follows_the_loader(self) -> bool {
+        matches!(
+            self,
+            Self::UpTo { .. } | Self::UpToThenRate { .. } | Self::RateWalk { .. }
+        )
     }
 }
 
@@ -201,7 +262,10 @@ impl FrameSampling {
 pub struct VideoFetchConfig {
     pub min_frames: usize,
     pub max_frames: usize,
-    pub sample_fps: f32,
+    /// Frames a second to sample at, the double the model's reference
+    /// processor computes with: a rate binary32 cannot hold would move the
+    /// picks.
+    pub sample_fps: f64,
     /// MiniMax-M3 extension: cap each decoded frame's long side.
     pub max_long_side_pixel: Option<u32>,
     pub sampling: FrameSampling,
@@ -736,7 +800,7 @@ impl MediaConnector {
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
         let hash = crate::hasher::hash_audio(&bytes);
-        let decoded = decode_audio_mono_f32(&bytes).await?;
+        let decoded = decode_audio_mono_f32(bytes.clone()).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
@@ -1022,12 +1086,12 @@ pub fn audio_max_input_bytes() -> usize {
 enum DecodedVideoFrames {
     Images {
         frames: Vec<image::DynamicImage>,
-        sample_fps: f32,
+        sample_fps: f64,
         sampling: Option<VideoSamplingInfo>,
     },
     Rgb {
         video: DecodedRgbVideo,
-        sample_fps: f32,
+        sample_fps: f64,
         sampling: Option<VideoSamplingInfo>,
     },
 }
@@ -1683,6 +1747,22 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
 pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
+        FrameSampling::UpToThenRate { max_frames, .. } => resampled_after_loader(
+            up_to_frame_indices(total_frames, max_frames),
+            total_frames,
+            fps,
+            cfg,
+        ),
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => rate_walk_frame_indices(
+            total_frames,
+            fps,
+            cfg.sample_fps,
+            max_frames,
+            temporal_patch_size,
+        ),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
@@ -1710,7 +1790,7 @@ pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfi
 fn temporal_group_frame_indices(
     total_frames: usize,
     fps: f64,
-    sample_fps: f32,
+    sample_fps: f64,
     frame_factor: usize,
     max_frames: usize,
 ) -> Vec<usize> {
@@ -1721,7 +1801,7 @@ fn temporal_group_frame_indices(
     } else {
         ASSUMED_FPS
     };
-    let by_rate = (total_frames as f64 * f64::from(sample_fps) / fps) as usize;
+    let by_rate = (total_frames as f64 * sample_fps / fps) as usize;
     let count = by_rate.min(max_frames).min(total_frames);
     let count = (count / factor * factor).max(factor).min(total_frames);
     torch_linspace_indices(total_frames, count)
@@ -1776,20 +1856,259 @@ fn loader_frame_total(claimed: usize, visible: usize) -> usize {
 /// The loader's picks for such a container: its rule over the length it
 /// works with, less the frames past the end its sequential read never gets.
 fn loader_frame_indices(claimed: usize, visible: usize, max_frames: usize) -> Vec<usize> {
-    let indices = up_to_frame_indices(loader_frame_total(claimed, visible), max_frames);
+    read_before_the_end(
+        up_to_frame_indices(loader_frame_total(claimed, visible), max_frames),
+        claimed,
+        visible,
+    )
+}
+
+/// `picks` less the frames past the end a loader's read never gets, for a
+/// container claiming `claimed` frames of which `visible` can be read.
+fn read_before_the_end(picks: Vec<usize>, claimed: usize, visible: usize) -> Vec<usize> {
     if visible >= claimed {
-        return indices;
+        return picks;
     }
-    indices
-        .into_iter()
-        .filter(|index| *index < visible)
-        .collect()
+    picks.into_iter().filter(|index| *index < visible).collect()
+}
+
+/// The frames the engine's loader hands its processor for such a container
+/// under `cfg`'s rule ([`FrameSampling::follows_the_loader`]): the length the
+/// loader works with and the rule's picks over it, less the frames past the
+/// end; any other rule's picks over that length.
+fn loader_frames(
+    claimed: usize,
+    visible: usize,
+    fps: f64,
+    cfg: VideoFetchConfig,
+) -> (usize, Vec<usize>) {
+    let total_frames = loader_frame_total(claimed, visible);
+    let picks = match cfg.sampling {
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => read_before_the_end(
+            rate_walk_frame_indices(
+                total_frames,
+                fps,
+                cfg.sample_fps,
+                max_frames,
+                temporal_patch_size,
+            ),
+            claimed,
+            visible,
+        ),
+        FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. } => {
+            resampled_after_loader(
+                loader_frame_indices(claimed, visible, max_frames),
+                total_frames,
+                fps,
+                cfg,
+            )
+        }
+        FrameSampling::Even
+        | FrameSampling::EvenRounded
+        | FrameSampling::Interval
+        | FrameSampling::TemporalGroups { .. } => sampled_frame_indices(total_frames, fps, cfg),
+    };
+    (total_frames, picks)
+}
+
+/// The loader's `picks` of a clip of `total_frames` at `fps`, resampled by
+/// [`glm5_next_frame_indices`] at `cfg.sample_fps` when the sampling is
+/// [`FrameSampling::UpToThenRate`] and the loader kept every frame; the
+/// picks as they are otherwise, and for a clip whose rate is unknown.
+fn resampled_after_loader(
+    picks: Vec<usize>,
+    total_frames: usize,
+    fps: f64,
+    cfg: VideoFetchConfig,
+) -> Vec<usize> {
+    let FrameSampling::UpToThenRate {
+        rate_max_frames, ..
+    } = cfg.sampling
+    else {
+        return picks;
+    };
+    if picks.len() != total_frames {
+        return picks;
+    }
+    glm5_next_frame_indices(total_frames, fps, cfg.sample_fps, rate_max_frames).unwrap_or(picks)
+}
+
+/// `Glm5NextVideoProcessor.sample_frames` (transformers) over a clip of
+/// `total_frames` at `fps`, at `target_fps`, at most `max_frames`, with the
+/// clip's duration taken as `total_frames / fps` as vLLM's loader reports
+/// it: one frame each time the stream's clock reaches the next sampling
+/// instant, up to the clip's whole seconds, else numpy's `linspace`
+/// truncated to integers where that gives too few or too many; duplicates
+/// dropped, and the last frame repeated to an even count. `None` when the
+/// clip's rate is unknown or the rule picks nothing (a clip shorter than one
+/// sampling interval), both of which the reference refuses.
+fn glm5_next_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    target_fps: f64,
+    max_frames: usize,
+) -> Option<Vec<usize>> {
+    if total_frames == 0 || !(fps.is_finite() && fps > 0.0) {
+        return None;
+    }
+    let duration = total_frames as f64 / fps;
+    let max_seconds = duration.trunc();
+    let extract = ((duration * target_fps) as usize).min(max_frames);
+    let last = (total_frames - 1) as f64;
+    let mut picks = if total_frames < extract {
+        numpy_linspace_indices(0.0, last, extract)
+    } else {
+        let duration_per_frame = 1.0 / fps;
+        let interval = 1.0 / target_fps;
+        let mut current_second = 0.0;
+        let mut picks = Vec::new();
+        for index in 0..total_frames {
+            if index as f64 * duration_per_frame >= current_second {
+                current_second += interval;
+                picks.push(index);
+                if current_second >= max_seconds {
+                    break;
+                }
+            }
+        }
+        picks
+    };
+    if picks.len() < extract {
+        let (start, end) = match (picks.first(), picks.last()) {
+            (Some(&start), Some(&end)) => (start as f64, end as f64),
+            _ => (0.0, last),
+        };
+        picks = numpy_linspace_indices(start, end, extract);
+    } else if picks.len() > extract {
+        picks = numpy_linspace_indices(0.0, last, extract);
+    }
+    let mut seen = HashSet::new();
+    picks.retain(|index| seen.insert(*index));
+    let last_pick = *picks.last()?;
+    if picks.len() % 2 == 1 {
+        picks.push(last_pick);
+    }
+    Some(picks)
+}
+
+/// The GLM-5 family's own video loader rule over a clip of `total_frames` at
+/// `fps`, at `rate` frames a second, at most `max_frames`, with the clip's
+/// duration taken as `total_frames / fps` as the loader reports it (a clip
+/// claiming no frames is given `round(-1 / fps) + 1` seconds, ties to even,
+/// as the reference falls back): `trunc(duration x rate)` frames; a walk that
+/// takes one frame each time the stream's clock, `index x (1 / fps)`, reaches
+/// the next instant `1 / (temporal_patch_size x rate)` seconds on, until the
+/// instant reaches the clip's whole seconds; then numpy's `linspace(0, n - 1,
+/// count)` truncated to integers where the walk took too many (the usual
+/// case: it runs at a multiple of the rate), `linspace(first, last, count)`
+/// where too few; a clip with fewer frames than the count takes `floor(i x n
+/// / count)`. Each distinct pick once, ascending: the loader reads a frame
+/// once however often the rule names it (the reference's repeat of an odd
+/// last pick included), and the processor pads an odd count itself. Empty
+/// when the rule picks nothing (a clip shorter than one sampling interval,
+/// `1 / rate` s: `trunc(duration x rate)` is then 0)
+/// or the clip's rate is unusable.
+fn rate_walk_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    rate: f64,
+    max_frames: usize,
+    temporal_patch_size: usize,
+) -> Vec<usize> {
+    if !(fps.is_finite() && fps > 0.0)
+        || !(rate.is_finite() && rate > 0.0)
+        || temporal_patch_size == 0
+    {
+        return Vec::new();
+    }
+    let last = total_frames.saturating_sub(1) as f64;
+    let mut duration = total_frames as f64 / fps;
+    if duration == 0.0 {
+        duration = ((total_frames as f64 - 1.0) / fps).round_ties_even() + 1.0;
+    }
+    let count = ((duration * rate) as usize).min(max_frames);
+    let duration_per_frame = 1.0 / fps;
+    let max_second = duration.trunc();
+    let mut picks: Vec<usize> = if total_frames < count {
+        (0..count)
+            .map(|index| index * total_frames / count)
+            .collect()
+    } else {
+        let interval = 1.0 / (temporal_patch_size as f64 * rate);
+        let mut current_second = 0.0;
+        let mut picks = Vec::new();
+        // The reference scans every frame for the first whose clock reads
+        // `current_second` or later. The clock, `index x duration_per_frame`,
+        // is monotone in the index, so that frame is found from the index the
+        // division names, stepped to the exact predicate, and the walk costs
+        // its picks rather than the frames a container claims (billions, for
+        // a forged header). Once it holds more picks than the count the
+        // outcome is decided (the re-spread below), so it ends there too.
+        let mut index = 0;
+        while index < total_frames {
+            let mut pick = ((current_second / duration_per_frame) as usize).max(index);
+            while pick > index && (pick - 1) as f64 * duration_per_frame >= current_second {
+                pick -= 1;
+            }
+            while pick < total_frames && (pick as f64) * duration_per_frame < current_second {
+                pick += 1;
+            }
+            if pick >= total_frames {
+                break;
+            }
+            current_second += interval;
+            picks.push(pick);
+            if current_second >= max_second || picks.len() > count {
+                break;
+            }
+            index = pick + 1;
+        }
+        picks
+    };
+    if picks.len() < count {
+        let (start, end) = match (picks.first(), picks.last()) {
+            (Some(&start), Some(&end)) => (start as f64, end as f64),
+            _ => (0.0, last),
+        };
+        picks = numpy_linspace_indices(start, end, count);
+    } else if picks.len() > count {
+        picks = numpy_linspace_indices(0.0, last, count);
+    }
+    picks.sort_unstable();
+    picks.dedup();
+    picks
+}
+
+/// `numpy.linspace(start, end, count, dtype=int)`: `i * step`, then `+ start`
+/// (two roundings, as numpy computes it), in float64 for `step = (end -
+/// start) / (count - 1)`, the last position `end` itself, each truncated
+/// toward zero.
+fn numpy_linspace_indices(start: f64, end: f64, count: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![start as usize],
+        _ => {
+            let step = (end - start) / (count - 1) as f64;
+            (0..count)
+                .map(|index| {
+                    if index + 1 == count {
+                        end as usize
+                    } else {
+                        (index as f64 * step + start) as usize
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 fn even_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let mut target_frames = if fps.is_finite() && fps > 0.0 {
         let duration = total_frames as f64 / fps;
-        (duration * cfg.sample_fps as f64).round() as usize
+        (duration * cfg.sample_fps).round() as usize
     } else {
         cfg.max_frames
     };
@@ -1815,7 +2134,7 @@ fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
 /// temporal group, which the processor's own temporal padding does here.
 fn even_rounded_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let target_frames = if fps.is_finite() && fps > 0.0 {
-        (total_frames as f64 / fps * f64::from(cfg.sample_fps)).trunc() as usize
+        (total_frames as f64 / fps * cfg.sample_fps).trunc() as usize
     } else {
         cfg.max_frames
     };
@@ -1853,7 +2172,7 @@ fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) 
         return even_frame_indices(total_frames, fps, cfg);
     }
     const EPS: f64 = 1e-4;
-    let interval = 1.0 / cfg.sample_fps as f64;
+    let interval = 1.0 / cfg.sample_fps;
     let last_index = total_frames - 1;
 
     let mut indices: Vec<usize> = Vec::new();
@@ -1925,13 +2244,52 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
     MediaConnectorError::VideoDecode(format!("OpenCV video decode failed: {err}"))
 }
 
+/// Why a probed clip is refused before any decode: the rate walk picks no
+/// frame of a clip shorter than one sampling interval, `1 / rate` s (nor of
+/// a container claiming no frames at a low rate), and the engine's own
+/// loader hands its processor no frame of such a clip either, so the generic
+/// resampler must not stand in for the family's rule. `None` under any other
+/// rule, when the probe stated no rate, and whenever the rule picks a frame.
+fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<String> {
+    if !matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+        return None;
+    }
+    let source_fps = metadata.source_fps?;
+    let claimed = metadata.container_frames.unwrap_or(0);
+    let visible = metadata.total_frames.unwrap_or(claimed);
+    let (total_frames, picks) = loader_frames(claimed, visible, source_fps, cfg);
+    picks
+        .is_empty()
+        .then(|| the_familys_rule_picks_nothing(total_frames, source_fps, cfg))
+}
+
+/// The refusal's text: the clip, and the length the rule needs, `1 / rate` s
+/// at the rule's rate, so the client can see how long a clip has to be.
+fn the_familys_rule_picks_nothing(
+    total_frames: usize,
+    source_fps: f64,
+    cfg: VideoFetchConfig,
+) -> String {
+    let rate = cfg.sample_fps;
+    format!(
+        "the model's video sampling picks no frame of a clip of {total_frames} frames at \
+         {source_fps} fps: shorter than one sampling interval at {rate} frames a second ({:.3} s)",
+        1.0 / rate
+    )
+}
+
 async fn decode_video_with_ffmpeg(
     input_path: &Path,
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
+    // A probe that fails leaves the clip to the metadata-less runner, which
+    // reads the stream as it comes.
     let metadata = probe_video_metadata(input_path).await.ok();
-    let Some((probed, selection)) = metadata.and_then(|probed| {
+    if let Some(reason) = metadata.and_then(|probed| refused_by_the_familys_rule(probed, cfg)) {
+        return Err(MediaConnectorError::VideoDecode(reason));
+    }
+    let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
         return decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
@@ -1943,9 +2301,23 @@ async fn decode_video_with_ffmpeg(
     // its own segment and comes back short at once. The sequential decode
     // answers that, and anything else that goes wrong with the seeks, but a
     // run past the process budget: the plan is at most half the sequential
-    // decode's work, so that would run past it as well.
-    if let Some(plan) = seek_plan_for(input_path, &selection).await {
-        ensure_decode_work_limit(plan.decoded_frames(), &selection, probed)?;
+    // decode's work, so that would run past it as well. A probe that states
+    // no size (ffprobe's `0x0` for a stream whose codec parameters it could
+    // not find) frames nothing for the seek runner, as for the headed and
+    // raw ones: such a clip takes the sequential route, where the runner
+    // pass hands it to the PNG runner (`decode_video_with_ffmpeg_runners`),
+    // and the recoveries after it as a sized clip does; the work cap counts
+    // no pixels for it, and the process budget bounds it.
+    if probed.is_unsized() {
+        // No seeks.
+    } else if let Some(plan) = seek_plan_for(input_path, &selection).await {
+        probed = decode_work_limit_on_the_decoders_size(
+            plan.decoded_frames(),
+            &selection,
+            probed,
+            input_path,
+        )
+        .await?;
         let started = Instant::now();
         match decode_video_with_ffmpeg_seek(input_path, probed, &selection, &plan).await {
             Ok(video) => {
@@ -1981,12 +2353,18 @@ async fn decode_video_with_ffmpeg(
             }
         }
     }
-    ensure_decode_work_limit(selection.sequential_frames(), &selection, probed)?;
+    probed = decode_work_limit_on_the_decoders_size(
+        selection.sequential_frames(),
+        &selection,
+        probed,
+        input_path,
+    )
+    .await?;
     let selected_error = match decode_video_with_ffmpeg_runners(
         input_path,
         input_bytes,
         cfg,
-        metadata,
+        Some(probed),
         Some(&selection),
     )
     .await
@@ -2010,31 +2388,43 @@ async fn decode_video_with_ffmpeg(
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
     // it can see; the rate-based samplings resample instead.
-    if matches!(cfg.sampling, FrameSampling::UpTo { .. }) {
-        if let Some(resized) = probe_decoded_frame_count(input_path)
-            .await
-            .ok()
-            .and_then(|visible| selection.sized_to_visible(visible, cfg))
-        {
-            match decode_video_with_ffmpeg_runners(
-                input_path,
-                input_bytes,
-                cfg,
-                metadata,
-                Some(&resized),
-            )
-            .await
-            {
-                Ok(decoded) => return Ok(decoded),
-                Err(error) => {
-                    if log_video_decode_timing_enabled() {
-                        info!(
-                            error = %error,
-                            "smg_mm_timing video_decode_ffmpeg_resize_fallback"
-                        );
+    if cfg.sampling.follows_the_loader() {
+        let resized = match probe_decoded_frame_count(input_path).await {
+            Ok(visible) => selection.sized_to_visible(visible, cfg),
+            Err(_) => Resized::Unchanged,
+        };
+        match resized {
+            // The visible clip is one the family's rule picks nothing of: the
+            // engine's loader hands its processor no frame, so the refusal a
+            // probe of the true length gives stands here too, and no generic
+            // resampler takes the clip instead.
+            Resized::Empty { total_frames } => {
+                return Err(MediaConnectorError::VideoDecode(
+                    the_familys_rule_picks_nothing(total_frames, selection.source_fps, cfg),
+                ));
+            }
+            Resized::Selection(resized) => {
+                match decode_video_with_ffmpeg_runners(
+                    input_path,
+                    input_bytes,
+                    cfg,
+                    Some(probed),
+                    Some(&resized),
+                )
+                .await
+                {
+                    Ok(decoded) => return Ok(decoded),
+                    Err(error) => {
+                        if log_video_decode_timing_enabled() {
+                            info!(
+                                error = %error,
+                                "smg_mm_timing video_decode_ffmpeg_resize_fallback"
+                            );
+                        }
                     }
                 }
             }
+            Resized::Unchanged => {}
         }
     }
     // A probed frame count past the stream's end leaves the selection short; resample by rate.
@@ -2044,7 +2434,7 @@ async fn decode_video_with_ffmpeg(
             "smg_mm_timing video_decode_ffmpeg_select_fallback"
         );
     }
-    decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
+    decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, Some(probed), None)
         .await
         .map_err(|fallback_error| {
             let message = format!(
@@ -2064,6 +2454,23 @@ async fn decode_video_with_ffmpeg_runners(
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let sampling = selection.map(FrameSelection::sampling_info);
     if let Some(mut metadata) = metadata {
+        // A probe that states no size frames nothing for the headed and raw
+        // runners: straight to the PNG runner, whose frames carry their own
+        // size, with the selection when there is one (the decoder still
+        // decodes such a stream, its filter graph set up from the first
+        // frame); the caller's recoveries after a short selection apply as
+        // for a sized clip.
+        if metadata.is_unsized() {
+            return decode_video_png_frames(
+                input_path,
+                input_bytes,
+                cfg,
+                Some(metadata),
+                selection,
+                sampling,
+            )
+            .await;
+        }
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
         let mut started = Instant::now();
         let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
@@ -2087,17 +2494,27 @@ async fn decode_video_with_ffmpeg_runners(
                 .await
                 .and_then(|info| video_metadata_from(info, false))
             {
-                Ok(probed) => {
+                Ok(probed) if !probed.is_unsized() => {
+                    // The cap was judged on the container's stated size; the
+                    // probe's is the decoder's, so it is judged again before a
+                    // second decoder starts on it.
+                    if let Some(selection) = selection {
+                        ensure_decode_work_limit(selection.sequential_frames(), selection, probed)?;
+                    }
                     metadata = probed;
                     started = Instant::now();
                     headed =
                         decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
                 }
-                Err(error) => {
-                    info!(
-                        error = %error,
-                        "video probe after a frame size mismatch failed; the container's metadata stands"
-                    );
+                probed => {
+                    // A probe that cannot run, or states no size, leaves the
+                    // container's metadata standing.
+                    if let Err(error) = probed {
+                        info!(
+                            error = %error,
+                            "video probe after a frame size mismatch failed; the container's metadata stands"
+                        );
+                    }
                     return decode_video_png_frames(
                         input_path,
                         input_bytes,
@@ -2282,13 +2699,15 @@ fn video_max_decoded_bytes() -> usize {
     )
 }
 
-/// Source frames one video decode may run through (`SMG_VIDEO_MAX_DECODE_FRAMES`).
-fn video_max_decode_frames() -> usize {
-    env_byte_limit(
-        &VIDEO_MAX_DECODE_FRAMES,
-        "SMG_VIDEO_MAX_DECODE_FRAMES",
-        DEFAULT_VIDEO_MAX_DECODE_FRAMES,
-    )
+/// Pixels one video decode may run through (`SMG_VIDEO_MAX_DECODE_PIXELS`).
+fn video_max_decode_pixels() -> u64 {
+    *VIDEO_MAX_DECODE_PIXELS.get_or_init(|| {
+        std::env::var("SMG_VIDEO_MAX_DECODE_PIXELS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|pixels| *pixels > 0)
+            .unwrap_or(DEFAULT_VIDEO_MAX_DECODE_PIXELS)
+    })
 }
 
 /// The clip's length as its errors state it.
@@ -2303,23 +2722,67 @@ fn clip_length(metadata: VideoMetadata) -> String {
 }
 
 /// Refuses, before any decoder starts, a decode that would run through more
-/// source frames than the cap allows: the clip is the client's, and so is the
-/// answer (a shorter clip or a smaller frame budget).
+/// pixels than the cap allows (`frames` source frames, each of the clip's
+/// width and height): the clip is the client's, and so is the answer (a
+/// shorter or smaller clip, or a smaller frame budget).
 fn ensure_decode_work_limit(
     frames: usize,
     selection: &FrameSelection,
     metadata: VideoMetadata,
 ) -> Result<(), MediaConnectorError> {
-    let limit = video_max_decode_frames();
-    if frames <= limit {
+    let limit = video_max_decode_pixels();
+    let pixels = (frames as u64)
+        .saturating_mul(u64::from(metadata.width))
+        .saturating_mul(u64::from(metadata.height));
+    if pixels <= limit {
         return Ok(());
     }
     Err(MediaConnectorError::VideoDecode(format!(
-        "sampling {} frames of {} means decoding {frames} of its {} source frames, over SMG_VIDEO_MAX_DECODE_FRAMES={limit}; a shorter clip or a smaller frame budget fits it",
+        "sampling {} frames of {} means decoding {frames} of its {} source frames of {}x{}, {pixels} pixels, over {VIDEO_MAX_DECODE_PIXELS_KNOB}={limit}; a shorter or smaller clip or a smaller frame budget fits it",
         selection.frame_indices.len(),
         clip_length(metadata),
-        selection.total_frames
+        selection.total_frames,
+        metadata.width,
+        metadata.height
     )))
+}
+
+/// The work cap judged on `metadata`'s size ([`ensure_decode_work_limit`])
+/// and, where that size is the container's and the cap refuses, judged again
+/// on the probe's size, the decoder's, read once for it: a sample entry that
+/// overstates the stream's size does not refuse a decode the budget fits. A
+/// probe that cannot run, or states no size, leaves the container's refusal
+/// standing (the `0x0` clip keeps its own route, and its cap counts no
+/// pixels). Returns the metadata the decode goes on with.
+async fn decode_work_limit_on_the_decoders_size(
+    frames: usize,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    let refusal = match ensure_decode_work_limit(frames, selection, metadata) {
+        Ok(()) => return Ok(metadata),
+        Err(refusal) if metadata.from_container => refusal,
+        Err(refusal) => return Err(refusal),
+    };
+    match probe_video_info(input_path)
+        .await
+        .and_then(|info| video_metadata_from(info, false))
+    {
+        Ok(probed) if !probed.is_unsized() => {
+            ensure_decode_work_limit(frames, selection, probed)?;
+            Ok(probed)
+        }
+        probed => {
+            if let Err(error) = probed {
+                info!(
+                    error = %error,
+                    "video probe after a work-cap refusal on the container's size failed; the container's size stands"
+                );
+            }
+            Err(refusal)
+        }
+    }
 }
 
 /// The error of a decode that ran past the process budget, in the clip's
@@ -2377,11 +2840,17 @@ fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
 /// What `ensure_decoded_byte_limit` names in the error of a decode refused for its size.
 const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 
-/// `true` for the error of a decode refused for its size or ended for its
+/// What `ensure_decode_work_limit` names in the error of a decode refused for its work.
+const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
+
+/// `true` for the error of a decode refused for its size (the typed
+/// refusal) or its work (named in the decoder's message), or ended for its
 /// time: a budget no other runner over the same stream, and no resampling of
 /// it, can answer, so it ends the decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
-    is_video_command_timeout(error) || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+    is_video_command_timeout(error)
+        || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -2561,7 +3030,7 @@ async fn decode_video_with_ffmpeg_png(
     cfg: VideoFetchConfig,
     metadata: Option<VideoMetadata>,
     selection: Option<&FrameSelection>,
-) -> Result<(Vec<image::DynamicImage>, f32), MediaConnectorError> {
+) -> Result<(Vec<image::DynamicImage>, f64), MediaConnectorError> {
     let (frame_args, sample_fps) = match selection.zip(metadata) {
         Some((selection, metadata)) => (
             FfmpegFrameArgs::selected(selection).await,
@@ -2640,6 +3109,15 @@ struct VideoMetadata {
     from_container: bool,
 }
 
+impl VideoMetadata {
+    /// Whether the probe stated no size (ffprobe's `0x0` for a stream whose
+    /// codec parameters it could not find): nothing frames such a stream by
+    /// its size, and the work cap would count no pixels for it.
+    fn is_unsized(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ProbedVideoInfo {
     width: Option<u32>,
@@ -2674,6 +3152,11 @@ fn video_metadata_from(
     let height = info.height.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video height".to_string())
     })?;
+    // ffprobe states `0x0` for a stream whose codec parameters it could not
+    // find; the size is kept as stated ([`VideoMetadata::is_unsized`]) and
+    // `decode_video_with_ffmpeg` sends such a clip to the headed PNG runner,
+    // whose frames carry their own size, with the frames and duration the
+    // probe did state (the container's tables refuse a zero size already).
     Ok(VideoMetadata {
         width,
         height,
@@ -2711,13 +3194,18 @@ fn probed_from_container(container: &crate::mp4_metadata::ContainerVideoInfo) ->
     }
 }
 
-/// A test switch: on this thread the probe tool is treated as unable to run.
+/// Test switches: on this thread the probe tool is treated as unable to run,
+/// or answers with a stated probe instead of running.
 #[cfg(test)]
 mod probe_switch {
     use std::cell::Cell;
 
+    use super::ProbedVideoInfo;
+
     thread_local! {
         pub(super) static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+        /// The probe's answer on this thread, in place of running the tool.
+        pub(super) static ANSWER: Cell<Option<ProbedVideoInfo>> = const { Cell::new(None) };
     }
 }
 
@@ -2728,6 +3216,9 @@ async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaCon
             return Err(MediaConnectorError::VideoDecode(
                 "the probe tool is switched off for this test".to_string(),
             ));
+        }
+        if let Some(answer) = probe_switch::ANSWER.with(|answer| answer.get()) {
+            return Ok(answer);
         }
     }
     let mut command = Command::new("ffprobe");
@@ -3065,7 +3556,7 @@ fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> St
 fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
     if let Some(duration) = metadata.duration_seconds {
         if duration.is_finite() && duration > 0.0 {
-            return (duration * cfg.sample_fps as f64)
+            return (duration * cfg.sample_fps)
                 .round()
                 .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize;
         }
@@ -3073,14 +3564,14 @@ fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) 
     cfg.max_frames
 }
 
-fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f32 {
+fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f64 {
     duration_seconds
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .map(|duration| {
-            let target_frames = (duration * cfg.sample_fps as f64)
+            let target_frames = (duration * cfg.sample_fps)
                 .round()
                 .clamp(cfg.min_frames as f64, cfg.max_frames as f64);
-            (target_frames / duration) as f32
+            target_frames / duration
         })
         .filter(|fps| fps.is_finite() && *fps > 0.0)
         .unwrap_or(cfg.sample_fps)
@@ -3097,6 +3588,18 @@ const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// rate-based selection ends on the clip's last frame, one past its spread).
 const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 
+/// What the stream's visible frame count makes of a loader-following
+/// selection ([`FrameSelection::sized_to_visible`]).
+#[derive(Debug, PartialEq)]
+enum Resized {
+    /// Nothing changes: the picks stand, or the sampling is rate-based.
+    Unchanged,
+    /// The family's rule picks no frame of the visible clip of `total_frames`.
+    Empty { total_frames: usize },
+    /// The selection over the visible frames.
+    Selection(FrameSelection),
+}
+
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
 struct FrameSelection {
@@ -3111,31 +3614,24 @@ struct FrameSelection {
 
 impl FrameSelection {
     /// `None` unless ffprobe reported a frame rate and, for the rate-based
-    /// samplings, a frame count. `UpTo` follows the engine's loader instead:
-    /// the frames the container claims, cut down to the stream's own length
-    /// where the container runs longer, and the first frame alone when the
-    /// container claims none.
+    /// samplings, a frame count. A rule that follows the engine's loader reads
+    /// the container instead: the frames it claims, cut down to the stream's
+    /// own length where the container runs longer, and, for the generic
+    /// loader, the first frame alone when the container claims none; `None`
+    /// as well when the rate walk picks nothing, which its decode refuses
+    /// beforehand ([`refused_by_the_familys_rule`]).
     fn from_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<Self> {
         let source_fps = metadata.source_fps?;
-        let (total_frames, frame_indices) = match cfg.sampling {
-            FrameSampling::UpTo { max_frames } => {
-                let claimed = metadata.container_frames.unwrap_or(0);
-                let visible = metadata.total_frames.unwrap_or(claimed);
-                (
-                    loader_frame_total(claimed, visible),
-                    loader_frame_indices(claimed, visible, max_frames),
-                )
-            }
-            FrameSampling::Even
-            | FrameSampling::EvenRounded
-            | FrameSampling::Interval
-            | FrameSampling::TemporalGroups { .. } => {
-                let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
-                (
-                    total_frames,
-                    sampled_frame_indices(total_frames, source_fps, cfg),
-                )
-            }
+        let (total_frames, frame_indices) = if cfg.sampling.follows_the_loader() {
+            let claimed = metadata.container_frames.unwrap_or(0);
+            let visible = metadata.total_frames.unwrap_or(claimed);
+            loader_frames(claimed, visible, source_fps, cfg)
+        } else {
+            let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
+            (
+                total_frames,
+                sampled_frame_indices(total_frames, source_fps, cfg),
+            )
         };
         if frame_indices.is_empty() {
             return None;
@@ -3153,21 +3649,31 @@ impl FrameSelection {
         }
     }
 
-    /// The selection once the stream turns out to hold `visible` frames,
-    /// `None` when that changes nothing or the sampling is rate-based.
-    fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Option<Self> {
-        let FrameSampling::UpTo { max_frames } = cfg.sampling else {
-            return None;
-        };
-        let frame_indices = loader_frame_indices(self.total_frames, visible, max_frames);
-        if frame_indices.is_empty() || frame_indices == self.frame_indices {
-            return None;
+    /// The selection once the stream turns out to hold `visible` frames:
+    /// unchanged when that changes nothing or the sampling is rate-based;
+    /// empty when the rate walk picks no frame of the visible clip (the
+    /// engine's loader hands its processor none either, so the caller refuses
+    /// as it would have before any decode instead of resampling by rate).
+    fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Resized {
+        if !cfg.sampling.follows_the_loader() {
+            return Resized::Unchanged;
         }
-        Some(Self::new(
-            self.source_fps,
-            loader_frame_total(self.total_frames, visible),
-            frame_indices,
-        ))
+        let (total_frames, frame_indices) =
+            loader_frames(self.total_frames, visible, self.source_fps, cfg);
+        if frame_indices.is_empty() {
+            // A probe that decoded no frame at all says nothing about the clip's length: the
+            // decode goes on as before and reports its own errors; only a visible clip the
+            // rate walk picks nothing of is empty.
+            return if visible > 0 && matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+                Resized::Empty { total_frames }
+            } else {
+                Resized::Unchanged
+            };
+        }
+        if frame_indices == self.frame_indices {
+            return Resized::Unchanged;
+        }
+        Resized::Selection(Self::new(self.source_fps, total_frames, frame_indices))
     }
 
     fn unique_count(&self) -> usize {
@@ -3502,14 +4008,14 @@ fn fps_filter_for_duration(duration: f64, cfg: VideoFetchConfig) -> Option<Strin
     if !duration.is_finite() || duration <= 0.0 {
         return None;
     }
-    let target_frames = (duration * cfg.sample_fps as f64)
+    let target_frames = (duration * cfg.sample_fps)
         .round()
         .clamp(cfg.min_frames as f64, cfg.max_frames as f64);
     let fps = (target_frames / duration).max(f64::EPSILON);
     Some(format!("fps={fps:.6}"))
 }
 
-async fn sampling_filter_for_video(input_path: &Path, cfg: VideoFetchConfig) -> (String, f32) {
+async fn sampling_filter_for_video(input_path: &Path, cfg: VideoFetchConfig) -> (String, f64) {
     if let Ok(duration) = probe_video_duration_seconds(input_path).await {
         if let Some(filter) = fps_filter_for_duration(duration, cfg) {
             return (filter, effective_sample_fps(Some(duration), cfg));
@@ -3775,2137 +4281,7 @@ fn skip_ppm_whitespace_and_comments(bytes: &[u8], pos: &mut usize) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Write as _;
-    /// Where the tools are installed: clips written by the encoder at several
-    /// frame rates and lengths, read through the container tables, equal the
-    /// probe tool's own report field by field (the numbers the frame
-    /// selection and the clip's sample rate are built from).
-    #[test]
-    fn container_tables_agree_with_the_probe_tool() {
-        use std::process::Command;
-        let have = |tool: &str| {
-            Command::new(tool)
-                .arg("-version")
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        };
-        if !have("ffmpeg") || !have("ffprobe") {
-            // Without the tools there is nothing to agree with; the unit tests
-            // on synthetic containers still run.
-            return;
-        }
-        let dir = tempfile::tempdir().expect("temp dir");
-        let cases = [
-            ("24", "1", "mp4"),
-            ("30000/1001", "2", "mp4"),
-            ("25", "3", "mov"),
-            ("60", "1", "mp4"),
-            ("24000/1001", "2", "mp4"),
-        ];
-        for (rate, seconds, container) in cases {
-            let path = dir.path().join(format!(
-                "clip_{}_{seconds}.{container}",
-                rate.replace('/', "_")
-            ));
-            // A codec every ffmpeg build carries; the tables under test are
-            // the container's, whichever codec fills them.
-            let encoded = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-nostdin",
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                ])
-                .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
-                .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg4"])
-                .arg(&path)
-                .output()
-                .expect("ffmpeg runs");
-            assert!(
-                encoded.status.success(),
-                "ffmpeg wrote {path:?}: {}",
-                String::from_utf8_lossy(&encoded.stderr)
-            );
-            let container_info = crate::mp4_metadata::read(&path)
-                .expect("readable")
-                .unwrap_or_else(|| panic!("{path:?} not accepted by the container reader"));
-            let output = Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
-                    "-of",
-                    "json",
-                ])
-                .arg(&path)
-                .output()
-                .expect("ffprobe runs");
-            assert!(output.status.success());
-            let probed = parse_ffprobe_video_info(&output.stdout).expect("probe parses");
-            assert_eq!(
-                super::probed_from_container(&container_info),
-                probed,
-                "{rate} fps, {seconds} s, {container}"
-            );
-        }
-    }
-
-    /// The engine's frame budget replaces only the loader-style budget: the
-    /// rate-based samplers keep their rule, `0` means every frame, `None`
-    /// changes nothing.
-    #[test]
-    fn frame_budget_applies_to_the_loader_style_sampler_only() {
-        let loader = FrameSampling::UpTo { max_frames: 32 };
-        assert_eq!(
-            loader.with_frame_budget(Some(16)),
-            FrameSampling::UpTo { max_frames: 16 }
-        );
-        assert_eq!(
-            loader.with_frame_budget(Some(0)),
-            FrameSampling::UpTo {
-                max_frames: usize::MAX
-            }
-        );
-        assert_eq!(loader.with_frame_budget(None), loader);
-        assert_eq!(
-            FrameSampling::Even.with_frame_budget(Some(16)),
-            FrameSampling::Even
-        );
-        assert_eq!(
-            FrameSampling::Interval.with_frame_budget(Some(16)),
-            FrameSampling::Interval
-        );
-        // A 50-frame clip under a budget of 16 is sampled like the loader does.
-        let cfg = VideoFetchConfig {
-            sampling: loader.with_frame_budget(Some(16)),
-            ..VideoFetchConfig::default()
-        };
-        assert_eq!(super::sampled_frame_indices(50, 10.0, cfg).len(), 16);
-        let cfg = VideoFetchConfig {
-            sampling: loader.with_frame_budget(Some(0)),
-            ..VideoFetchConfig::default()
-        };
-        assert_eq!(super::sampled_frame_indices(50, 10.0, cfg).len(), 50);
-    }
-
-    use bytes::Bytes;
-    use futures::stream;
-
-    use super::{
-        checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
-        decoder_unavailable, effective_sample_fps, ensure_input_byte_limit,
-        expected_sampled_frame_count, fallback_failed, fps_filter_for_metadata,
-        parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
-        read_file_with_limit, run_video_command_output, split_png_stream, video_temp_suffix,
-        write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
-        MediaConnectorError, MediaSource, VideoFetchConfig, VideoMetadata,
-    };
-    use crate::error::MediaFault;
-
-    const TINY_PNG: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
-        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 96, 96, 0, 0, 0, 3, 0,
-        1, 43, 9, 141, 84, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-
-    #[test]
-    fn splits_concatenated_png_stream() {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(TINY_PNG);
-        stream.extend_from_slice(TINY_PNG);
-
-        let frames = match split_png_stream(&stream) {
-            Ok(frames) => frames,
-            Err(err) => panic!("split png stream failed: {err}"),
-        };
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0], TINY_PNG);
-        assert_eq!(frames[1], TINY_PNG);
-    }
-
-    #[test]
-    fn parses_ffmpeg_duration() {
-        let stderr = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'video.mp4':\n  Duration: 00:01:23.45, start: 0.000000, bitrate: 123 kb/s";
-        assert_eq!(parse_ffmpeg_duration_seconds(stderr), Some(83.45));
-    }
-
-    #[test]
-    fn ffprobe_metadata_prefers_short_video_stream_over_long_container() {
-        let output = br#"{
-            "streams": [{
-                "width": 320,
-                "height": 240,
-                "duration": "1.000000",
-                "duration_ts": 30,
-                "time_base": "1/30"
-            }],
-            "format": {"duration": "120.000000"}
-        }"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.duration_seconds, Some(1.0));
-
-        let cfg = VideoFetchConfig {
-            min_frames: 4,
-            max_frames: 8,
-            sample_fps: 2.0,
-            max_long_side_pixel: None,
-            sampling: FrameSampling::Even,
-        };
-        let metadata = VideoMetadata {
-            width: info.width.expect("video width"),
-            height: info.height.expect("video height"),
-            duration_seconds: info.duration_seconds,
-            source_fps: info.source_fps,
-            total_frames: info.total_frames,
-            container_frames: info.container_frames,
-            from_container: false,
-        };
-        assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
-        assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
-    }
-
-    #[test]
-    fn ffprobe_metadata_uses_stream_time_base_before_container_duration() {
-        let output = br#"{
-            "streams": [{
-                "width": "640",
-                "height": "360",
-                "duration": "N/A",
-                "duration_ts": 45,
-                "time_base": "1/30"
-            }],
-            "format": {"duration": "90.000000"}
-        }"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.width, Some(640));
-        assert_eq!(info.height, Some(360));
-        assert_eq!(info.duration_seconds, Some(1.5));
-    }
-
-    #[test]
-    fn detects_video_temp_suffix_from_container_header() {
-        let mut mp4 = vec![0; 12];
-        mp4[4..8].copy_from_slice(b"ftyp");
-        assert_eq!(video_temp_suffix(&mp4), ".mp4");
-        assert_eq!(video_temp_suffix(&[0x1a, 0x45, 0xdf, 0xa3]), ".webm");
-        assert_eq!(video_temp_suffix(b"RIFF....AVI "), ".avi");
-        assert_eq!(video_temp_suffix(b"OggS"), ".ogv");
-        assert_eq!(video_temp_suffix(&[0x00, 0x00, 0x01, 0xba]), ".mpg");
-        assert_eq!(video_temp_suffix(b"unknown"), ".video");
-    }
-
-    /// The scratch file a decoder reads from is this process's own: in a
-    /// directory that is not there (or not writable) the error is this
-    /// process's fault, whatever bytes the request sent; the same bytes in a
-    /// writable directory are written as they are.
-    #[test]
-    fn a_scratch_file_that_cannot_be_written_is_our_fault() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let bytes = b"not a video, never decoded";
-        let written = write_temp_video_file(dir.path(), bytes).expect("a writable dir");
-        assert_eq!(
-            std::fs::read(written.path()).expect("the scratch file"),
-            bytes
-        );
-        let missing = dir.path().join("missing");
-        let error = write_temp_video_file(&missing, bytes).expect_err("a dir that is not there");
-        assert!(matches!(error, MediaConnectorError::DecodeIo(_)), "{error}");
-        assert_eq!(error.fault(), MediaFault::Internal);
-    }
-
-    /// A decode whose fallback failed too is judged by the fallback: on this
-    /// process's own I/O it stays this process's fault, with both decoders'
-    /// words kept; on the media it is the media's; a fallback that could not
-    /// start judged nothing, so the first decoder's verdict on the clip
-    /// stands and a corrupt clip stays the request's fault on a worker
-    /// without the fallback decoder.
-    #[test]
-    fn a_failed_fallback_keeps_an_internal_origin() {
-        let message = "first decoder failed: bad frame; fallback failed: no space left on device";
-        let bad_frame = || MediaConnectorError::VideoDecode("bad frame".to_string());
-        let ours = fallback_failed(
-            bad_frame(),
-            MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
-            message.to_string(),
-        );
-        assert_eq!(ours.fault(), MediaFault::Internal);
-        assert!(ours.to_string().contains(message), "{ours}");
-        let theirs = fallback_failed(
-            MediaConnectorError::DecodeIo(std::io::Error::other("broken pipe")),
-            MediaConnectorError::VideoDecode("no video stream".to_string()),
-            message.to_string(),
-        );
-        assert_eq!(theirs.fault(), MediaFault::Client);
-        assert!(
-            matches!(theirs, MediaConnectorError::VideoDecode(_)),
-            "{theirs}"
-        );
-        let judged_by_first = fallback_failed(
-            bad_frame(),
-            decoder_unavailable("ffmpeg executable not found".to_string()),
-            message.to_string(),
-        );
-        assert_eq!(judged_by_first.fault(), MediaFault::Client);
-        assert!(
-            matches!(judged_by_first, MediaConnectorError::VideoDecode(_)),
-            "{judged_by_first}"
-        );
-    }
-
-    /// A decoder this process cannot start is this process's fault, not the
-    /// media's, whatever clip the request sent: the executable is not there,
-    /// or is there but cannot be run; so is a backend this build does not
-    /// have. The operator's words stay on the error.
-    #[tokio::test]
-    async fn a_decoder_that_cannot_start_is_our_fault() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let missing = dir.path().join("ffprobe");
-        let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe")
-            .await
-            .expect_err("a decoder that is not there");
-        assert!(
-            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::NotFound),
-            "{error}"
-        );
-        assert_eq!(error.fault(), MediaFault::Internal);
-        assert!(
-            error
-                .to_string()
-                .contains("ffprobe executable not found; install ffprobe"),
-            "{error}"
-        );
-
-        let not_executable = dir.path().join("ffmpeg");
-        std::fs::write(&not_executable, b"not a program").expect("a plain file");
-        let error =
-            run_video_command_output(tokio::process::Command::new(&not_executable), "ffmpeg")
-                .await
-                .expect_err("a decoder that cannot be run");
-        assert!(
-            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
-            "{error}"
-        );
-        assert_eq!(error.fault(), MediaFault::Internal);
-        assert!(
-            error.to_string().contains("ffmpeg could not be started"),
-            "{error}"
-        );
-
-        let backend = decoder_unavailable(
-            "unsupported SMG_VIDEO_DECODE_BACKEND=gstreamer; expected auto, opencv, or ffmpeg"
-                .to_string(),
-        );
-        assert_eq!(backend.fault(), MediaFault::Internal);
-        assert!(
-            matches!(&backend, MediaConnectorError::DecoderUnavailable(_)),
-            "{backend}"
-        );
-        assert!(backend.to_string().contains("gstreamer"), "{backend}");
-    }
-
-    #[test]
-    fn parses_concatenated_ppm_stream() {
-        let stream = b"P6\n2 1\n255\n\x01\x02\x03\x04\x05\x06P6\n# comment\n1 2\n255\n\x07\x08\x09\x0a\x0b\x0c";
-
-        let frames = match parse_ppm_stream(stream) {
-            Ok(frames) => frames,
-            Err(err) => panic!("parse ppm stream failed: {err}"),
-        };
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].width(), 2);
-        assert_eq!(frames[0].height(), 1);
-        assert_eq!(frames[1].width(), 1);
-        assert_eq!(frames[1].height(), 2);
-    }
-
-    #[test]
-    fn effective_sample_fps_tracks_min_and_max_frame_clamps() {
-        let cfg = VideoFetchConfig {
-            min_frames: 4,
-            max_frames: 8,
-            sample_fps: 2.0,
-            max_long_side_pixel: None,
-            sampling: FrameSampling::Even,
-        };
-
-        assert_eq!(effective_sample_fps(Some(1.0), cfg), 4.0);
-        assert!((effective_sample_fps(Some(10.0), cfg) - 0.8).abs() < 1e-6);
-        assert_eq!(effective_sample_fps(Some(3.0), cfg), 2.0);
-        assert_eq!(effective_sample_fps(None, cfg), 2.0);
-    }
-
-    #[test]
-    fn rejects_truncated_ppm_stream() {
-        assert!(parse_ppm_stream(b"P6\n2 1\n255\n\x01\x02").is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_ppm_header() {
-        assert!(parse_ppm_stream(b"P3\n1 1\n255\n\x01\x02\x03").is_err());
-        assert!(parse_ppm_stream(b"P6\n1 1\n65535\n\x01\x02\x03").is_err());
-    }
-
-    #[test]
-    fn rejects_zero_dimension_ppm_stream() {
-        assert!(parse_ppm_stream(b"P6\n0 1\n255\n").is_err());
-        assert!(parse_ppm_stream(b"P6\n1 0\n255\n").is_err());
-    }
-
-    #[test]
-    fn rejects_overflowing_ppm_frame_size() {
-        assert!(parse_ppm_stream(b"P6\n4294967295 4294967295\n255\n").is_err());
-    }
-
-    #[test]
-    fn enforces_media_payload_limit_for_each_label() {
-        for media in ["image", "video", "audio"] {
-            assert!(ensure_input_byte_limit(4, 4, media).is_ok());
-            assert!(matches!(
-                ensure_input_byte_limit(5, 4, media),
-                Err(MediaConnectorError::PayloadTooLarge { media: actual, limit: 4 })
-                    if actual == media
-            ));
-        }
-
-        assert!(checked_payload_length(usize::MAX, 1, usize::MAX, "audio").is_err());
-    }
-
-    #[test]
-    fn enforces_base64_payload_limit_before_and_after_decode() {
-        for media in ["image", "video", "audio"] {
-            assert_eq!(decode_base64_with_limit("AAAA", 3, media).unwrap().len(), 3);
-            assert!(matches!(
-                decode_base64_with_limit("AAAA", 2, media),
-                Err(MediaConnectorError::PayloadTooLarge { media: actual, limit: 2 })
-                    if actual == media
-            ));
-        }
-
-        assert!(matches!(
-            decode_base64_with_limit("AAAAAAAAAAAAAAAA", 8, "audio"),
-            Err(MediaConnectorError::PayloadTooLarge {
-                media: "audio",
-                limit: 8
-            })
-        ));
-        assert!(matches!(
-            decode_base64_with_limit("AAAAAAAAAAAA", 8, "audio"),
-            Err(MediaConnectorError::PayloadTooLarge {
-                media: "audio",
-                limit: 8
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn reads_files_at_limit_and_rejects_limit_plus_one(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut file = tempfile::NamedTempFile::new()?;
-        file.write_all(b"12345")?;
-        file.flush()?;
-
-        for media in ["image", "video", "audio"] {
-            let bytes = read_file_with_limit(file.path(), 5, media).await?;
-            assert_eq!(bytes, Bytes::from_static(b"12345"));
-
-            assert!(matches!(
-                read_file_with_limit(file.path(), 4, media).await,
-                Err(MediaConnectorError::PayloadTooLarge { media: actual, limit: 4 })
-                    if actual == media
-            ));
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn collects_http_body_with_content_and_streaming_limits(
-    ) -> Result<(), MediaConnectorError> {
-        let known_oversized = reqwest::Response::from(http::Response::new(reqwest::Body::from(
-            Bytes::from_static(b"12345"),
-        )));
-        assert!(matches!(
-            collect_http_body_with_limit(known_oversized, 4, "image").await,
-            Err(MediaConnectorError::PayloadTooLarge {
-                media: "image",
-                limit: 4
-            })
-        ));
-
-        let oversized_stream = stream::iter([
-            Ok::<_, std::io::Error>(Bytes::from_static(b"123")),
-            Ok(Bytes::from_static(b"45")),
-        ]);
-        let unknown_oversized = reqwest::Response::from(http::Response::new(
-            reqwest::Body::wrap_stream(oversized_stream),
-        ));
-        assert!(matches!(
-            collect_http_body_with_limit(unknown_oversized, 4, "video").await,
-            Err(MediaConnectorError::PayloadTooLarge {
-                media: "video",
-                limit: 4
-            })
-        ));
-
-        let within_limit_stream = stream::iter([
-            Ok::<_, std::io::Error>(Bytes::from_static(b"12")),
-            Ok(Bytes::from_static(b"34")),
-        ]);
-        let within_limit = reqwest::Response::from(http::Response::new(
-            reqwest::Body::wrap_stream(within_limit_stream),
-        ));
-        let body = collect_http_body_with_limit(within_limit, 4, "audio").await?;
-        assert_eq!(body, Bytes::from_static(b"1234"));
-        Ok(())
-    }
-
-    #[test]
-    fn sampled_frame_indices_preserve_min_frames_for_short_clips() {
-        let cfg = VideoFetchConfig {
-            min_frames: 4,
-            max_frames: 8,
-            sample_fps: 2.0,
-            max_long_side_pixel: None,
-            sampling: FrameSampling::Even,
-        };
-        let indices = super::sampled_frame_indices(1, 30.0, cfg);
-        assert_eq!(indices, vec![0, 0, 0, 0]);
-        assert_eq!(super::counted_frame_indices(&indices), vec![(0, 4)]);
-    }
-
-    #[test]
-    fn temporal_group_sampling_picks_the_reference_processors_frames() {
-        // The frames the Muse Spark family's reference video processor picks
-        // at its 2 fps rate (`torch.linspace(0, n - 1, count).long()` for
-        // `count = min(trunc(n x 2 / fps), cap, n)` aligned down to pairs),
-        // recorded from torch for these clips.
-        let cfg = VideoFetchConfig {
-            sampling: FrameSampling::TemporalGroups {
-                frame_factor: 2,
-                max_frames: 600,
-            },
-            ..VideoFetchConfig::default()
-        };
-        assert_eq!(
-            super::sampled_frame_indices(17, 8.0, cfg),
-            vec![0, 5, 10, 16]
-        );
-        // Shorter than one pair: every frame; one frame alone.
-        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
-        assert_eq!(super::sampled_frame_indices(3, 30.0, cfg), vec![0, 2]);
-        assert_eq!(super::sampled_frame_indices(45, 30.0, cfg), vec![0, 44]);
-        assert_eq!(super::sampled_frame_indices(11, 8.0, cfg), vec![0, 10]);
-        assert_eq!(super::sampled_frame_indices(8, 8.0, cfg), vec![0, 7]);
-        let long = super::sampled_frame_indices(300, 8.0, cfg);
-        assert_eq!(long.len(), 74);
-        assert_eq!(&long[..6], &[0, 4, 8, 12, 16, 20]);
-        assert_eq!(&long[35..39], &[143, 147, 151, 155]);
-        assert_eq!(&long[70..], &[286, 290, 294, 299]);
-        let ten_minutes = super::sampled_frame_indices(18000, 30.0, cfg);
-        assert_eq!(ten_minutes.len(), 600);
-        assert_eq!(&ten_minutes[..6], &[0, 30, 60, 90, 120, 150]);
-        assert_eq!(&ten_minutes[298..302], &[8954, 8984, 9014, 9044]);
-        assert_eq!(&ten_minutes[596..], &[17908, 17938, 17968, 17999]);
-        let ntsc = super::sampled_frame_indices(301, 29.970_029_970_029_97, cfg);
-        assert_eq!(ntsc.len(), 20);
-        assert_eq!(&ntsc[..6], &[0, 15, 31, 47, 63, 78]);
-        assert_eq!(&ntsc[8..12], &[126, 142, 157, 173]);
-        assert_eq!(&ntsc[16..], &[252, 268, 284, 300]);
-        // The reference classes' own 96-frame budget.
-        let class_default = VideoFetchConfig {
-            sampling: FrameSampling::TemporalGroups {
-                frame_factor: 2,
-                max_frames: 96,
-            },
-            ..VideoFetchConfig::default()
-        };
-        let capped = super::sampled_frame_indices(18000, 30.0, class_default);
-        assert_eq!(capped.len(), 96);
-        assert_eq!(&capped[..4], &[0, 189, 378, 568]);
-        assert_eq!(&capped[93..], &[17620, 17809, 17999]);
-        // An unknown rate is taken as 24 fps, as the reference assumes.
-        assert_eq!(super::sampled_frame_indices(48, 0.0, cfg).len(), 4);
-    }
-
-    #[test]
-    fn even_rounded_sampling_picks_the_reference_processors_frames() {
-        // The frames the Qwen3-VL family's reference video processor picks at
-        // its 2 fps rate, as the engine's own loader recorded them for these
-        // clips: trunc(duration x 2) frames, at least 4, never more than the
-        // clip has, at the nearest frames of an even spread (ties to even).
-        let cfg = VideoFetchConfig {
-            sampling: FrameSampling::EvenRounded,
-            ..VideoFetchConfig::default()
-        };
-        assert_eq!(
-            super::sampled_frame_indices(24, 24.0, cfg),
-            vec![0, 8, 15, 23]
-        );
-        assert_eq!(
-            super::sampled_frame_indices(120, 24.0, cfg),
-            vec![0, 13, 26, 40, 53, 66, 79, 93, 106, 119]
-        );
-        let thirty_seconds = super::sampled_frame_indices(720, 24.0, cfg);
-        assert_eq!(thirty_seconds.len(), 60);
-        assert_eq!(&thirty_seconds[..6], &[0, 12, 24, 37, 49, 61]);
-        let ten_minutes = super::sampled_frame_indices(14400, 24.0, cfg);
-        assert_eq!(ten_minutes.len(), 768);
-        assert_eq!(&ten_minutes[..8], &[0, 19, 38, 56, 75, 94, 113, 131]);
-        assert_eq!(ten_minutes[767], 14399);
-        // A clip shorter than the minimum gives each of its frames once.
-        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
-        assert_eq!(super::sampled_frame_indices(3, 10.0, cfg), vec![0, 1, 2]);
-        // An unknown rate takes the maximum, bounded by the clip.
-        assert_eq!(
-            super::sampled_frame_indices(5, 0.0, cfg),
-            vec![0, 1, 2, 3, 4]
-        );
-    }
-
-    #[test]
-    fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
-        let args = |autorotate: bool| {
-            super::ffmpeg_decode_command(3, autorotate)
-                .as_std()
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            args(true),
-            [
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-threads",
-                "3",
-                "-i"
-            ]
-        );
-        assert_eq!(args(false).last().map(String::as_str), Some("-i"));
-        assert!(args(false).contains(&"-noautorotate".to_string()));
-    }
-
-    #[test]
-    fn decoder_threads_share_cpu_budget_across_active_decodes() {
-        assert_eq!(super::adaptive_decoder_threads(224, 1), 16);
-        assert_eq!(super::adaptive_decoder_threads(2, 1), 4);
-        assert_eq!(super::adaptive_decoder_threads(4, 2), 4);
-        assert_eq!(super::adaptive_decoder_threads(8, 4), 4);
-        assert_eq!(super::adaptive_decoder_threads(8, 8), 1);
-        assert_eq!(super::adaptive_decoder_threads(8, 9), 1);
-        assert_eq!(super::adaptive_decoder_threads(16, 8), 4);
-        assert_eq!(super::adaptive_decoder_threads(16, 16), 1);
-        assert_eq!(super::adaptive_decoder_threads(224, 8), 8);
-        assert_eq!(super::adaptive_decoder_threads(224, 32), 6);
-        assert_eq!(super::adaptive_decoder_threads(8, 32), 1);
-        assert_eq!(super::adaptive_decoder_threads(1, 0), 2);
-    }
-
-    /// Defense in depth for the video path: the tracker validates M3's range,
-    /// but the decoder must reject a zero or off-grid cap itself, before it
-    /// spends a decode on the clip, exactly as the image decoder does.
-    #[tokio::test]
-    async fn decode_video_rejects_an_invalid_long_side_cap() {
-        let connector = MediaConnector::new(
-            crate::test_support::http_client_builder(),
-            MediaConnectorConfig::default(),
-        )
-        .expect("default connector");
-        for value in [0, 505] {
-            let cfg = VideoFetchConfig {
-                max_long_side_pixel: Some(value),
-                ..VideoFetchConfig::default()
-            };
-            let err = connector
-                .fetch_video(MediaSource::InlineBytes(vec![0u8; 16]), cfg)
-                .await
-                .expect_err("an invalid cap must be rejected");
-            assert!(
-                matches!(
-                    err,
-                    MediaConnectorError::InvalidMaxLongSidePixel { value: got, factor: 28 }
-                        if got == value
-                ),
-                "cap {value}: unexpected error {err:?}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod video_sampling_tests {
-    use super::*;
-
-    fn cfg() -> VideoFetchConfig {
-        VideoFetchConfig {
-            min_frames: 4,
-            max_frames: 8,
-            sample_fps: 2.0,
-            max_long_side_pixel: None,
-            sampling: FrameSampling::Even,
-        }
-    }
-
-    fn interval_cfg(sample_fps: f32, max_frames: usize) -> VideoFetchConfig {
-        VideoFetchConfig {
-            min_frames: 1,
-            max_frames,
-            sample_fps,
-            max_long_side_pixel: None,
-            sampling: FrameSampling::Interval,
-        }
-    }
-
-    #[test]
-    fn interval_sampling_takes_one_frame_per_interval_and_keeps_the_last() {
-        assert_eq!(
-            sampled_frame_indices(360, 30.0, interval_cfg(1.0, 768)),
-            vec![0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 359]
-        );
-        assert_eq!(
-            sampled_frame_indices(60, 30.0, interval_cfg(1.0, 768)),
-            vec![0, 30, 59]
-        );
-        assert_eq!(
-            sampled_frame_indices(100, 25.0, interval_cfg(0.5, 768)),
-            vec![0, 50, 99]
-        );
-        assert_eq!(
-            sampled_frame_indices(300, 29.97, interval_cfg(2.0, 768)),
-            vec![
-                0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255,
-                270, 285, 299
-            ]
-        );
-    }
-
-    fn up_to_cfg(max_frames: usize) -> VideoFetchConfig {
-        VideoFetchConfig {
-            sampling: FrameSampling::UpTo { max_frames },
-            ..VideoFetchConfig::default()
-        }
-    }
-
-    /// `numpy.linspace(0, n - 1, min(n, 32), dtype=int)`, the engine's default
-    /// video loader; the min/max frame counts and the rate play no part.
-    #[test]
-    fn up_to_sampling_takes_every_frame_or_spreads_the_budget() {
-        assert_eq!(
-            sampled_frame_indices(16, 8.0, up_to_cfg(32)),
-            (0..16).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            sampled_frame_indices(32, 30.0, up_to_cfg(32)),
-            (0..32).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            sampled_frame_indices(50, 10.0, up_to_cfg(32)),
-            vec![
-                0, 1, 3, 4, 6, 7, 9, 11, 12, 14, 15, 17, 18, 20, 22, 23, 25, 26, 28, 30, 31, 33,
-                34, 36, 37, 39, 41, 42, 44, 45, 47, 49
-            ]
-        );
-        assert_eq!(
-            sampled_frame_indices(36, 12.0, up_to_cfg(32)),
-            vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24,
-                25, 27, 28, 29, 30, 31, 32, 33, 35
-            ]
-        );
-        let long = sampled_frame_indices(1000, 30.0, up_to_cfg(32));
-        assert_eq!(long.len(), 32);
-        assert_eq!((long[0], long[1], long[16], long[31]), (0, 32, 515, 999));
-        assert_eq!(sampled_frame_indices(1, 30.0, up_to_cfg(32)), vec![0]);
-        assert_eq!(sampled_frame_indices(2, 30.0, up_to_cfg(32)), vec![0, 1]);
-        assert_eq!(sampled_frame_indices(5, 30.0, up_to_cfg(0)), vec![0]);
-        // The loader reads the first frame of a clip whose count it does not know.
-        assert_eq!(sampled_frame_indices(0, 30.0, up_to_cfg(32)), vec![0]);
-    }
-
-    #[test]
-    fn the_loader_sizes_a_clip_by_what_it_can_see() {
-        // The claim holds: the usual spread; nothing claimed: the first frame.
-        assert_eq!(loader_frame_indices(60, 60, 32), spread_evenly(60, 32));
-        assert_eq!(
-            loader_frame_indices(16, 16, 32),
-            (0..16).collect::<Vec<_>>()
-        );
-        assert_eq!(loader_frame_indices(16, 16, 0), vec![0]);
-        assert_eq!(loader_frame_indices(0, 0, 32), vec![0]);
-        // A claim two or more frames too long gives way to the visible count.
-        assert_eq!(loader_frame_total(58, 40), 40);
-        assert_eq!(loader_frame_indices(58, 40, 32), spread_evenly(40, 32));
-        assert_eq!(loader_frame_indices(77, 60, 32), spread_evenly(60, 32));
-        // One frame too long: the claim stands and the pick past the end is left out.
-        assert_eq!(loader_frame_total(61, 60), 61);
-        let expected: Vec<usize> = spread_evenly(61, 32)
-            .into_iter()
-            .filter(|index| *index < 60)
-            .collect();
-        assert_eq!(expected.len(), 31);
-        assert_eq!(expected.last(), Some(&58));
-        assert_eq!(loader_frame_indices(61, 60, 32), expected);
-        // Nothing visible at all: nothing to read.
-        assert_eq!(loader_frame_indices(60, 0, 32), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn interval_sampling_thins_to_the_frame_budget_and_fills_to_the_minimum() {
-        assert_eq!(
-            sampled_frame_indices(3000, 30.0, interval_cfg(1.0, 10)),
-            vec![0, 330, 660, 990, 1320, 1680, 2010, 2340, 2670, 2999]
-        );
-        let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0, 768));
-        assert_eq!(long.len(), 768);
-        assert_eq!(long.last(), Some(&53_999));
-
-        let mut short = interval_cfg(1.0, 768);
-        short.min_frames = 4;
-        assert_eq!(sampled_frame_indices(2, 30.0, short), vec![0, 0, 0, 1]);
-        assert_eq!(sampled_frame_indices(0, 30.0, short), Vec::<usize>::new());
-    }
-
-    fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {
-        VideoMetadata {
-            width: 64,
-            height: 48,
-            duration_seconds: Some(2.0),
-            source_fps,
-            total_frames,
-            container_frames: total_frames,
-            from_container: false,
-        }
-    }
-
-    /// Frames and sampling of a decode, whichever runner produced them.
-    fn frames_and_sampling(
-        decoded: DecodedVideoFrames,
-    ) -> (Vec<Vec<u8>>, Option<VideoSamplingInfo>) {
-        match decoded {
-            DecodedVideoFrames::Rgb {
-                video, sampling, ..
-            } => (
-                video
-                    .frame_refs()
-                    .expect("frame refs")
-                    .iter()
-                    .map(|frame| frame.data.to_vec())
-                    .collect(),
-                sampling,
-            ),
-            DecodedVideoFrames::Images {
-                frames, sampling, ..
-            } => (
-                frames
-                    .iter()
-                    .map(|frame| frame.to_rgb8().into_raw())
-                    .collect(),
-                sampling,
-            ),
-        }
-    }
-
-    /// `false` when ffmpeg is not on PATH or will not write the clip.
-    async fn generate_clip(path: &Path, source: &str, output_args: &[&str]) -> bool {
-        let generated = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-f",
-                "lavfi",
-                "-i",
-                source,
-            ])
-            .args(output_args)
-            .arg("-y")
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        let probed = Command::new("ffprobe")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
-    }
-
-    #[test]
-    fn both_backends_sample_the_same_source_indices() {
-        assert_eq!(sampled_frame_indices(60, 30.0, cfg()), vec![0, 19, 39, 59]);
-        // Long clips clamp to max_frames; short ones repeat frames up to min_frames.
-        assert_eq!(
-            sampled_frame_indices(300, 30.0, cfg()),
-            vec![0, 42, 85, 128, 170, 213, 256, 299]
-        );
-        assert_eq!(sampled_frame_indices(2, 30.0, cfg()), vec![0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn frame_selection_needs_a_frame_rate_and_a_frame_count() {
-        assert_eq!(
-            FrameSelection::from_metadata(metadata(None, Some(60)), cfg()),
-            None
-        );
-        assert_eq!(
-            FrameSelection::from_metadata(metadata(Some(30.0), None), cfg()),
-            None
-        );
-        assert_eq!(
-            FrameSelection::from_metadata(metadata(Some(30.0), Some(0)), cfg()),
-            None
-        );
-
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
-            .expect("frame rate and count are known");
-        assert_eq!(selection.frame_indices, vec![0, 19, 39, 59]);
-        assert_eq!(
-            selection.unique_frames,
-            vec![(0, 1), (19, 1), (39, 1), (59, 1)]
-        );
-        assert_eq!(
-            selection.sampling_info(),
-            VideoSamplingInfo {
-                source_fps: 30.0,
-                frame_indices: vec![0, 19, 39, 59],
-            }
-        );
-    }
-
-    #[test]
-    fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
-        let cfg = up_to_cfg(32);
-        // No frame count anywhere: the loader reads one frame.
-        let selection = FrameSelection::from_metadata(
-            VideoMetadata {
-                total_frames: None,
-                container_frames: None,
-                ..metadata(Some(25.0), None)
-            },
-            cfg,
-        )
-        .expect("a frame rate is enough");
-        assert_eq!(selection.frame_indices, vec![0]);
-        assert_eq!(
-            selection.sampling_info(),
-            VideoSamplingInfo {
-                source_fps: 25.0,
-                frame_indices: vec![0],
-            }
-        );
-        assert_eq!(
-            FrameSelection::from_metadata(metadata(None, None), cfg),
-            None
-        );
-        // The container runs longer than the stream (an audio tail): sized by the stream.
-        let selection = FrameSelection::from_metadata(
-            VideoMetadata {
-                total_frames: Some(60),
-                container_frames: Some(77),
-                ..metadata(Some(30.0), None)
-            },
-            cfg,
-        )
-        .expect("frame rate and counts");
-        assert_eq!(selection.total_frames, 60);
-        assert_eq!(selection.frame_indices, spread_evenly(60, 32));
-        // Longer by one frame: the claim stands, the pick past the end is left out.
-        let selection = FrameSelection::from_metadata(
-            VideoMetadata {
-                total_frames: Some(60),
-                container_frames: Some(61),
-                ..metadata(Some(30.0), None)
-            },
-            cfg,
-        )
-        .expect("frame rate and counts");
-        assert_eq!(selection.total_frames, 61);
-        assert_eq!(selection.frame_indices.len(), 31);
-        assert_eq!(selection.frame_indices.last(), Some(&58));
-        // A decode that shows the stream shorter than claimed resizes the loader's way.
-        let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), cfg)
-            .expect("frame rate and count");
-        assert_eq!(claimed.frame_indices, spread_evenly(58, 32));
-        let resized = claimed
-            .sized_to_visible(40, cfg)
-            .expect("shorter than claimed");
-        assert_eq!(resized.total_frames, 40);
-        assert_eq!(resized.frame_indices, spread_evenly(40, 32));
-        assert_eq!(resized.unique_count(), 32);
-        assert_eq!(claimed.sized_to_visible(58, cfg), None);
-        assert_eq!(claimed.sized_to_visible(0, cfg), None);
-        // The rate-based samplings keep needing a count and are never resized.
-        assert_eq!(
-            FrameSelection::from_metadata(
-                VideoMetadata {
-                    total_frames: None,
-                    container_frames: None,
-                    ..metadata(Some(25.0), None)
-                },
-                self::cfg(),
-            ),
-            None
-        );
-        let even = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), self::cfg())
-            .expect("frame rate and count");
-        assert_eq!(even.sized_to_visible(40, self::cfg()), None);
-    }
-
-    #[test]
-    fn select_filter_escapes_commas_and_lists_each_distinct_index_once() {
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(2)), cfg())
-            .expect("frame rate and count are known");
-        assert_eq!(selection.frame_indices, vec![0, 0, 0, 1]);
-        assert_eq!(selection.unique_count(), 2);
-        assert_eq!(selection.select_filter(), r"select='eq(n\,0)+eq(n\,1)'");
-
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
-            .expect("frame rate and count are known");
-        assert_eq!(
-            selection.select_filter(),
-            r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
-        );
-    }
-
-    #[test]
-    fn a_long_selection_is_described_rather_than_listed() {
-        // The nearest-frame spread spells ties-to-even out of floor, gt, eq and
-        // mod, as spread_select_filter documents; x is the picker's own position.
-        let x = "round(n*767/17999)*(17999/767)";
-        for (sampling, expected) in [
-            (
-                FrameSampling::Even,
-                r"select='eq(n\,floor(round(n*767/17999)*17999/767))'".to_string(),
-            ),
-            (
-                FrameSampling::EvenRounded,
-                format!(
-                    r"select='eq(n\,floor({x})+gt({x}-floor({x})\,0.5)+eq({x}-floor({x})\,0.5)*mod(floor({x})\,2))'"
-                ),
-            ),
-        ] {
-            let long = VideoFetchConfig {
-                max_frames: 768,
-                sampling,
-                ..cfg()
-            };
-            let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
-                .expect("frame rate and count are known");
-            assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
-
-            let filter = selection.select_filter();
-            assert_eq!(filter, expected, "{sampling:?}");
-            assert!(
-                filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
-                "a selection past the cutoff is described, not listed"
-            );
-        }
-    }
-
-    /// The selection run through ffmpeg itself, where it is installed: a
-    /// synthetic clip longer than the list cutoff, the filter as the crate
-    /// builds it in both of its shapes (the described spread and the explicit
-    /// list), the frames ffmpeg hands back read as the source indices they
-    /// carry, so the frames picked are the Rust selection's.
-    #[tokio::test]
-    async fn the_selection_picks_the_same_frames_through_ffmpeg() {
-        use std::process::{Command as Sync, Stdio};
-        let have = |tool: &str| {
-            Sync::new(tool)
-                .arg("-version")
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        };
-        if !have("ffmpeg") {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("temp dir");
-        let total = 900usize;
-        let fps = 30.0;
-        let path = dir.path().join("clip.mkv");
-        // Frame i carries i in its pixels: sixteen 4x4 blocks, white where
-        // the bit is set, black elsewhere, kept exact by a lossless codec
-        // every ffmpeg build carries, so a decoded frame names its own index.
-        let side = 16usize;
-        let mut raw = Vec::with_capacity(total * side * side * 3);
-        for index in 0..total {
-            for y in 0..side {
-                for x in 0..side {
-                    let bit = (y / 4) * 4 + x / 4;
-                    let value = if (index >> bit) & 1 == 1 { 255u8 } else { 0u8 };
-                    raw.extend_from_slice(&[value, value, value]);
-                }
-            }
-        }
-        let mut encode = Sync::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-s",
-                "16x16",
-                "-r",
-                "30",
-                "-i",
-                "pipe:0",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "ffv1",
-            ])
-            .arg(&path)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg runs");
-        {
-            use std::io::Write;
-            let mut stdin = encode.stdin.take().expect("ffmpeg stdin");
-            stdin.write_all(&raw).expect("frames written");
-        }
-        let encoded = encode.wait_with_output().expect("ffmpeg finishes");
-        assert!(
-            encoded.status.success(),
-            "ffmpeg encode: {}",
-            String::from_utf8_lossy(&encoded.stderr)
-        );
-        // every frame, decoded the way the selected frames are decoded
-        let mut all = ffmpeg_decode_command(2, true);
-        all.arg(&path);
-        all.args([
-            "-vf",
-            RGB_CONVERSION,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "ppm",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]);
-        let all = run_video_command_output(all, "ffmpeg")
-            .await
-            .expect("full decode");
-        assert!(all.status.success());
-        let every_frame = parse_ppm_stream(&all.stdout).expect("ppm frames");
-        assert_eq!(every_frame.len(), total, "the clip holds every frame");
-        let index_of = |frame: &image::DynamicImage| -> usize {
-            let rgb = frame.to_rgb8();
-            assert_eq!((rgb.width(), rgb.height()), (16, 16));
-            (0..16u32).fold(0usize, |index, bit| {
-                let (x, y) = (bit % 4 * 4 + 2, bit / 4 * 4 + 2);
-                let bright = rgb.get_pixel(x, y)[0] > 127;
-                index | (usize::from(bright) << bit)
-            })
-        };
-        assert_eq!(
-            every_frame.iter().map(index_of).collect::<Vec<_>>(),
-            (0..total).collect::<Vec<_>>(),
-            "the clip's frames decode to their own indices, in order"
-        );
-        // The loader's spread, an exact rate spread, and a rate whose picks
-        // end on the clip's last frame (the spread plus one explicit term):
-        // all three are the described form, and all three go through ffmpeg.
-        for (label, config, extra_terms) in [
-            ("loader spread", up_to_cfg(300), 0),
-            (
-                "rate spread ending on the last frame",
-                interval_cfg(15.0, 768),
-                1,
-            ),
-            (
-                "exact rate spread",
-                VideoFetchConfig {
-                    sample_fps: 12.0,
-                    max_frames: 768,
-                    ..cfg()
-                },
-                0,
-            ),
-        ] {
-            let selection = FrameSelection::from_metadata(metadata(Some(fps), Some(total)), config)
-                .expect("frame rate and count are known");
-            assert!(
-                selection.unique_count() > FFMPEG_MAX_SELECT_TERMS,
-                "{label}: {} distinct frames are past the list limit",
-                selection.unique_count()
-            );
-            let filter = selection.select_filter();
-            assert!(
-                filter.starts_with("select='eq(n\\,floor("),
-                "{label}: described, not listed: {filter}"
-            );
-            assert_eq!(
-                filter.matches('+').count(),
-                extra_terms,
-                "{label}: explicit terms beyond the spread: {filter}"
-            );
-            let mut command = ffmpeg_decode_command(2, true);
-            command.arg(&path);
-            FfmpegFrameArgs::selected(&selection)
-                .await
-                .apply(&mut command);
-            command.args([
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "ppm",
-                "-pix_fmt",
-                "rgb24",
-                "pipe:1",
-            ]);
-            let output = run_video_command_output(command, "ffmpeg")
-                .await
-                .expect("selected decode");
-            assert!(
-                output.status.success(),
-                "{label}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let picked = parse_ppm_stream(&output.stdout).expect("ppm frames");
-            let indices: Vec<usize> = picked.iter().map(index_of).collect();
-            let expected: Vec<usize> = selection
-                .unique_frames
-                .iter()
-                .map(|(index, _)| *index)
-                .collect();
-            assert_eq!(
-                indices, expected,
-                "{label}: ffmpeg picked other frames than the selection"
-            );
-        }
-    }
-
-    /// `(offset, header length, size)` of the first `kind` box in
-    /// `bytes[start..end]`.
-    fn mp4_child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, usize, usize) {
-        let mut offset = start;
-        while offset + 8 <= end {
-            let stated = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
-            let (size, header) = match stated {
-                1 => (
-                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize,
-                    16,
-                ),
-                0 => (end - offset, 8),
-                stated => (stated as usize, 8),
-            };
-            if bytes[offset + 4..offset + 8] == kind {
-                return (offset, header, size);
-            }
-            offset += size;
-        }
-        panic!("no {} box", String::from_utf8_lossy(&kind));
-    }
-
-    /// The payload bounds of the box at the end of `kinds`, each kind
-    /// the first of its name inside the previous one.
-    fn mp4_payload(bytes: &[u8], kinds: &[[u8; 4]]) -> (usize, usize) {
-        let (mut start, mut end) = (0, bytes.len());
-        for kind in kinds {
-            let (offset, header, size) = mp4_child(bytes, start, end, *kind);
-            start = offset + header;
-            end = offset + size;
-        }
-        (start, end)
-    }
-
-    /// Writes `width` into the first track's first sample entry, the muxer's
-    /// stated size the container reader reports: a clip whose stated size is
-    /// not the decoder's.
-    fn narrow_first_sample_entry(path: &Path, width: u16) {
-        use std::fs as std_fs;
-        let mut bytes = std_fs::read(path).expect("clip bytes");
-        let (stsd, _) = mp4_payload(
-            &bytes,
-            &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
-        );
-        // After the sample description's version, flags and entry count, the
-        // first entry: its width sits 32 bytes in (the sample entry header,
-        // then the visual entry's reserved fields).
-        let entry = stsd + 8;
-        bytes[entry + 32..entry + 34].copy_from_slice(&width.to_be_bytes());
-        std_fs::write(path, bytes).expect("clip rewritten");
-    }
-
-    /// Writes a 90-degree display rotation into the first track's header
-    /// matrix, the way a phone stores a portrait recording: the rotation lives
-    /// in the container, the coded size stays what it was. Written by hand
-    /// because not every ffmpeg build turns a `rotate` tag into the matrix.
-    fn rotate_first_track(path: &Path) {
-        use std::fs as std_fs;
-        let mut bytes = std_fs::read(path).expect("clip bytes");
-        let (tkhd, _) = mp4_payload(&bytes, &[*b"moov", *b"trak", *b"tkhd"]);
-        let payload = tkhd;
-        let matrix = payload + if bytes[payload] == 1 { 52 } else { 40 };
-        let rotated: [i32; 9] = [0, 65536, 0, -65536, 0, 0, 0, 0, 1 << 30];
-        let (slots, _) = bytes[matrix..matrix + 36].as_chunks_mut::<4>();
-        for (slot, value) in slots.iter_mut().zip(rotated) {
-            *slot = value.to_be_bytes();
-        }
-        std_fs::write(path, bytes).expect("clip rewritten");
-    }
-
-    /// A one-second 64x48 clip at 24 fps written by ffmpeg into `dir`, or
-    /// `None` where the tools are not installed.
-    fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
-        use std::process::Command as Sync;
-        let have = |tool: &str| {
-            Sync::new(tool)
-                .arg("-version")
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        };
-        if !have("ffmpeg") || !have("ffprobe") {
-            return None;
-        }
-        let path = dir.join(name);
-        let encoded = Sync::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x48:rate=24:duration=1",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "mpeg4",
-            ])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg runs");
-        assert!(
-            encoded.status.success(),
-            "ffmpeg wrote the clip: {}",
-            String::from_utf8_lossy(&encoded.stderr)
-        );
-        Some(path)
-    }
-
-    /// A clip stored with a 90-degree display rotation (the portrait phone
-    /// shape) through both runners, where the tools are installed: the headed
-    /// decode autorotates and hands back the transposed size, which the size
-    /// check accepts on the first decode; the raw runner, without
-    /// autorotation, frames the coded size.
-    #[tokio::test]
-    async fn a_rotated_clip_decodes_through_both_runners() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let Some(path) = small_clip(dir.path(), "rotated.mp4") else {
-            return;
-        };
-        rotate_first_track(&path);
-        let metadata = probe_video_metadata(&path).await.expect("metadata");
-        assert_eq!(
-            (metadata.width, metadata.height),
-            (64, 48),
-            "the coded size"
-        );
-        let config = up_to_cfg(4);
-        let selection = FrameSelection::from_metadata(metadata, config)
-            .expect("frame rate and count are known");
-        let headed = decode_video_with_ffmpeg_ppm(&path, config, metadata, Some(&selection))
-            .await
-            .expect("the headed decode accepts the transposed frames");
-        assert_eq!(headed.frames.len(), selection.frame_indices.len());
-        assert_eq!((headed.frames[0].width, headed.frames[0].height), (48, 64));
-        let raw = decode_video_with_ffmpeg_raw(&path, config, metadata, Some(&selection))
-            .await
-            .expect("the raw decode frames the coded size");
-        assert_eq!(raw.frames.len(), selection.frame_indices.len());
-        assert_eq!((raw.frames[0].width, raw.frames[0].height), (64, 48));
-    }
-
-    /// A clip whose sample entry states half its width: the container path
-    /// reports that size, the headed decode fails on the frames' real size,
-    /// the probe is read, and the second headed decode returns the frames at
-    /// the probe's size.
-    #[tokio::test]
-    async fn a_container_size_the_decoder_disagrees_with_is_re_read_from_the_probe() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let Some(path) = small_clip(dir.path(), "narrow.mp4") else {
-            return;
-        };
-        narrow_first_sample_entry(&path, 32);
-        let metadata = probe_video_metadata(&path).await.expect("metadata");
-        assert!(metadata.from_container, "read from the container's tables");
-        assert_eq!(
-            (metadata.width, metadata.height),
-            (32, 48),
-            "the stated size"
-        );
-        let config = up_to_cfg(4);
-        let selection = FrameSelection::from_metadata(metadata, config)
-            .expect("frame rate and count are known");
-        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
-        let decoded = decode_video_with_ffmpeg_runners(
-            &path,
-            input_bytes,
-            config,
-            Some(metadata),
-            Some(&selection),
-        )
-        .await
-        .expect("the retry on the probe's size succeeds");
-        let DecodedVideoFrames::Rgb { video, .. } = decoded else {
-            panic!("the second headed decode returns raw RGB frames");
-        };
-        assert_eq!(video.frames.len(), selection.frame_indices.len());
-        assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
-    }
-
-    /// The same clip with the probe unable to run: the mismatch stands and
-    /// the request ends in the headed PNG runner, whose frames carry their
-    /// own size, never framed raw by the container's.
-    #[tokio::test]
-    async fn a_container_size_mismatch_with_no_probe_ends_in_the_headed_png_runner() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let Some(path) = small_clip(dir.path(), "narrow-no-probe.mp4") else {
-            return;
-        };
-        narrow_first_sample_entry(&path, 32);
-        let metadata = probe_video_metadata(&path).await.expect("metadata");
-        assert!(metadata.from_container);
-        let config = up_to_cfg(4);
-        let selection = FrameSelection::from_metadata(metadata, config)
-            .expect("frame rate and count are known");
-        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
-        probe_switch::UNAVAILABLE.with(|off| off.set(true));
-        let decoded = decode_video_with_ffmpeg_runners(
-            &path,
-            input_bytes,
-            config,
-            Some(metadata),
-            Some(&selection),
-        )
-        .await;
-        probe_switch::UNAVAILABLE.with(|off| off.set(false));
-        let DecodedVideoFrames::Images { frames, .. } = decoded.expect("the headed PNG runner")
-        else {
-            panic!("a size mismatch without a probe ends in the headed PNG runner");
-        };
-        assert_eq!(frames.len(), selection.frame_indices.len());
-        assert_eq!((frames[0].width(), frames[0].height()), (64, 48));
-    }
-
-    #[test]
-    fn the_described_selection_covers_the_same_frames() {
-        // ffmpeg evaluates the expression per frame with its own `round` (half
-        // away from zero); the clips include the parity set's 10-minute clip at
-        // 24 fps and the shapes the nearest-frame spread is checked against.
-        let cases = [
-            (30.0, 9_000, 768),
-            (30.0, 18_000, 768),
-            (30.0, 36_000, 768),
-            (30.0, 7_500, 300),
-            (24.0, 14_400, 768),
-            (30.0, 1_800, 768),
-            (24.0, 2_400, 768),
-            (24.0, 1_500, 768),
-            // 103 picks over 1238 frames: pick 51 falls on 618.5 exactly, a tie
-            // whose floor is even (the connector takes 618, ffmpeg's `round`
-            // would take 619).
-            (24.0, 1_238, 768),
-            (25.0, 1_289, 768),
-            // 139 picks over 1672 frames: step 69 is a tie in exact arithmetic
-            // (835.5) that the picker's `i * step` lands just under (835).
-            (24.0, 1_672, 768),
-        ];
-        for sampling in [FrameSampling::Even, FrameSampling::EvenRounded] {
-            for (fps, total, max_frames) in cases {
-                let selection = FrameSelection::from_metadata(
-                    metadata(Some(fps), Some(total)),
-                    VideoFetchConfig {
-                        max_frames,
-                        sampling,
-                        ..cfg()
-                    },
-                )
-                .expect("frame rate and count are known");
-                assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
-                let last = total - 1;
-                let denom = selection.frame_indices.len() - 1;
-                let frame_at = |step: f64| match sampling {
-                    // The picker's arithmetic: the stride rounded once, then scaled.
-                    FrameSampling::EvenRounded => {
-                        (step * (last as f64 / denom as f64)).round_ties_even() as usize
-                    }
-                    _ => (step * last as f64 / denom as f64).floor() as usize,
-                };
-                let described: Vec<usize> = (0..total)
-                    .filter(|index| {
-                        let step = ((index * denom) as f64 / last as f64).round();
-                        frame_at(step) == *index
-                    })
-                    .collect();
-                let listed: Vec<usize> = selection
-                    .unique_frames
-                    .iter()
-                    .map(|(index, _)| *index)
-                    .collect();
-                assert_eq!(
-                    described, listed,
-                    "{sampling:?} total={total} max_frames={max_frames}"
-                );
-                assert!(
-                    selection.spread_select_filter().is_some(),
-                    "{sampling:?} total={total} max_frames={max_frames}: not described"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_nearest_frame_tie_is_described_to_even() {
-        // 10 frames at 4 fps, 5 picks at 0, 2.25, 4.5, 6.75 and 9: the connector
-        // takes 0, 2, 4 (the tie, to even), 7 and 9. ffmpeg's `round` would take
-        // the tie to 5 and its `floor` would take 6.75 to 6; the ties-to-even
-        // expression picks this set. Five frames are still listed (under the
-        // term limit), but the description is there for a longer clip.
-        let rounded = VideoFetchConfig {
-            sampling: FrameSampling::EvenRounded,
-            ..cfg()
-        };
-        assert_eq!(sampled_frame_indices(10, 4.0, rounded), vec![0, 2, 4, 7, 9]);
-        let selection = FrameSelection::from_metadata(metadata(Some(4.0), Some(10)), rounded)
-            .expect("frame rate and count are known");
-        let described = selection
-            .spread_select_filter()
-            .expect("a tie to even is described");
-        assert!(described.contains("mod(floor("), "{described}");
-        assert_eq!(
-            selection.select_filter(),
-            r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
-        );
-    }
-
-    /// Every nearest-frame spread over the term limit is described, ties
-    /// included: a sweep over the clip lengths from 51 s to 400 s at the
-    /// common frame rates (every length at 24 fps, every 13th at the others),
-    /// where the half-away-from-zero form left about one clip in five listed.
-    #[test]
-    fn every_nearest_frame_spread_over_the_term_limit_is_described() {
-        let rounded = VideoFetchConfig {
-            max_frames: 768,
-            sampling: FrameSampling::EvenRounded,
-            ..cfg()
-        };
-        let mut checked = 0usize;
-        for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
-            for total in (51 * fps..=400 * fps).step_by(stride) {
-                let selection =
-                    FrameSelection::from_metadata(metadata(Some(fps as f64), Some(total)), rounded)
-                        .expect("frame rate and count are known");
-                if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
-                    continue;
-                }
-                checked += 1;
-                assert!(
-                    selection.spread_select_filter().is_some(),
-                    "{fps} fps, {total} frames ({} picks): listed, not described",
-                    selection.unique_count()
-                );
-            }
-        }
-        assert!(checked > 8_000, "{checked} selections checked");
-    }
-
-    /// A selection with no even spread in it (gaps alternating 4 and 2) keeps
-    /// the explicit list; one that is its own even spread plus a trailing
-    /// frame, which the picker's whole-stream spread misses, is described by
-    /// that spread, bounded to its last frame, plus the frame.
-    #[test]
-    fn a_selection_the_formula_misses_keeps_the_explicit_list() {
-        let mut selection =
-            FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), cfg())
-                .expect("frame rate and count are known");
-        selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
-            .map(|index| (index * 3 + index % 2, 1))
-            .collect();
-        assert!(selection.spread_select_filter().is_none());
-        assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
-
-        selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
-            .map(|index| (index * 3, 1))
-            .collect();
-        let filter = selection.select_filter();
-        assert_eq!(
-            filter,
-            r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
-        );
-    }
-
-    #[test]
-    fn a_frame_count_the_container_made_up_still_builds_a_filter() {
-        // The count is whatever the file claims. Walking every frame of it to
-        // find the ones the formula picks turns a made-up claim into a stall
-        // before ffmpeg is even started.
-        let selection = FrameSelection::from_metadata(
-            metadata(Some(30.0), Some(usize::MAX / 2)),
-            VideoFetchConfig {
-                max_frames: 768,
-                ..cfg()
-            },
-        )
-        .expect("frame rate and count are known");
-
-        let filter = selection.select_filter();
-        assert!(
-            filter.contains("floor(round("),
-            "described, not listed: {filter}"
-        );
-    }
-
-    #[test]
-    fn expanding_selected_frames_repeats_them_to_match_the_indices() {
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(2)), cfg())
-            .expect("frame rate and count are known");
-        assert_eq!(
-            selection
-                .expand(vec!['a', 'b'])
-                .expect("one frame per distinct index"),
-            vec!['a', 'a', 'a', 'b']
-        );
-        // A short or long decode fails the runner instead of misaligning the indices.
-        assert!(selection.expand(vec!['a']).is_err());
-        assert!(selection.expand(vec!['a', 'b', 'c']).is_err());
-    }
-
-    #[test]
-    fn passthrough_flag_follows_the_ffmpeg_version() {
-        for version in [
-            "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers\nbuilt with gcc",
-            "ffmpeg version 5.1.4-0+deb12u1 Copyright (c) 2000-2023 the FFmpeg developers",
-            "ffmpeg version n7.0.2-6-gabcdef Copyright (c) 2000-2024 the FFmpeg developers",
-            "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024",
-        ] {
-            assert_eq!(
-                passthrough_flag_for_version(version),
-                FPS_MODE_PASSTHROUGH,
-                "{version}"
-            );
-        }
-        for version in [
-            "ffmpeg version 5.0.3 Copyright (c) 2000-2022 the FFmpeg developers",
-            "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
-            "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
-            "",
-        ] {
-            assert_eq!(
-                passthrough_flag_for_version(version),
-                VSYNC_PASSTHROUGH,
-                "{version}"
-            );
-        }
-    }
-
-    #[test]
-    fn ffprobe_prefers_avg_frame_rate_and_nb_frames() {
-        let output = br#"{
-            "streams": [{
-                "width": 640,
-                "height": 360,
-                "duration": "10.010000",
-                "r_frame_rate": "30/1",
-                "avg_frame_rate": "30000/1001",
-                "nb_frames": "300"
-            }]
-        }"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        let source_fps = info.source_fps.expect("frame rate");
-        assert!((source_fps - 30000.0 / 1001.0).abs() < 1e-9, "{source_fps}");
-        assert_eq!(info.total_frames, Some(300));
-    }
-
-    #[test]
-    fn ffprobe_falls_back_to_r_frame_rate() {
-        // An unknown average rate is reported as `0/0`.
-        let output = br#"{"streams": [{"width": 640, "height": 360, "r_frame_rate": "25/1", "avg_frame_rate": "0/0"}]}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.source_fps, Some(25.0));
-        assert_eq!(info.total_frames, None);
-
-        let output = br#"{"streams": [{"width": 640, "height": 360, "r_frame_rate": "25/1"}]}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.source_fps, Some(25.0));
-    }
-
-    #[test]
-    fn ffprobe_derives_the_frame_count_from_the_duration() {
-        for nb_frames in [r#""nb_frames": "N/A","#, r#""nb_frames": "0","#, ""] {
-            let output = format!(
-                r#"{{"streams": [{{"width": 640, "height": 360, "duration": "2.500000", "avg_frame_rate": "24/1", {nb_frames} "time_base": "1/24"}}]}}"#
-            );
-            let info = parse_ffprobe_video_info(output.as_bytes()).expect("valid ffprobe output");
-            assert_eq!(info.total_frames, Some(60), "{nb_frames}");
-        }
-    }
-
-    #[test]
-    fn ffprobe_sizes_the_container_claim_by_the_format_duration_first() {
-        // The container outlasts its video stream (an audio tail).
-        let output = br#"{"streams": [{"width": 320, "height": 240, "duration": "2.000000", "avg_frame_rate": "30/1"}], "format": {"duration": "2.566667"}}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.total_frames, Some(60));
-        assert_eq!(info.container_frames, Some(77));
-        // nb_frames settles both.
-        let output = br#"{"streams": [{"width": 320, "height": 240, "duration": "2.000000", "avg_frame_rate": "30/1", "nb_frames": "40"}], "format": {"duration": "2.566667"}}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(
-            (info.total_frames, info.container_frames),
-            (Some(40), Some(40))
-        );
-        // A live-muxed container states no duration at all.
-        let output = br#"{"streams": [{"width": 320, "height": 240, "avg_frame_rate": "25/1", "r_frame_rate": "25/1"}], "format": {}}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.source_fps, Some(25.0));
-        assert_eq!((info.total_frames, info.container_frames), (None, None));
-    }
-
-    #[test]
-    fn a_timed_out_command_is_told_apart_from_other_decode_failures() {
-        assert!(is_video_command_timeout(&MediaConnectorError::VideoDecode(
-            "ffmpeg timed out after 30.000 seconds".to_string()
-        )));
-        assert!(!is_video_command_timeout(
-            &MediaConnectorError::VideoDecode("ffmpeg produced 31 frames, expected 32".to_string())
-        ));
-        assert!(!is_video_command_timeout(&MediaConnectorError::Timeout {
-            url: "https://media.example/clip.mp4".to_string(),
-            budget: Duration::from_secs(30),
-        }));
-    }
-
-    #[test]
-    fn ffprobe_without_a_frame_rate_reports_nothing() {
-        let output = br#"{"streams": [{"width": 640, "height": 360, "duration": "2.0", "avg_frame_rate": "0/0", "r_frame_rate": "0/0", "nb_frames": "N/A"}]}"#;
-        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
-        assert_eq!(info.source_fps, None);
-        assert_eq!(info.total_frames, None);
-    }
-
-    /// Skipped when ffmpeg or ffprobe is not on PATH.
-    #[tokio::test]
-    async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("clip.mp4");
-        let generated = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x48:rate=30:duration=2",
-                "-c:v",
-                "mpeg4",
-                "-pix_fmt",
-                "yuv420p",
-                "-y",
-            ])
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        let probed = Command::new("ffprobe")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
-        {
-            return;
-        }
-
-        let metadata = probe_video_metadata(&path).await.expect("ffprobe metadata");
-        assert_eq!(metadata.total_frames, Some(60));
-        assert_eq!(metadata.source_fps, Some(30.0));
-
-        let input_bytes = fs::read(&path).await.expect("generated clip").len();
-        let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
-            .await
-            .expect("ffmpeg decode");
-        let (frames, sampling): (Vec<Vec<u8>>, _) = match decoded {
-            DecodedVideoFrames::Rgb {
-                video, sampling, ..
-            } => (
-                video
-                    .frame_refs()
-                    .expect("frame refs")
-                    .iter()
-                    .map(|frame| frame.data.to_vec())
-                    .collect(),
-                sampling,
-            ),
-            DecodedVideoFrames::Images {
-                frames, sampling, ..
-            } => (
-                frames
-                    .iter()
-                    .map(|frame| frame.to_rgb8().into_raw())
-                    .collect(),
-                sampling,
-            ),
-        };
-        let sampling = sampling.expect("ffprobe reports the frame rate and count");
-        assert!(
-            (sampling.source_fps - 30.0).abs() < 1e-6,
-            "{}",
-            sampling.source_fps
-        );
-        assert_eq!(
-            sampling.frame_indices,
-            sampled_frame_indices(60, 30.0, cfg())
-        );
-        assert_eq!(sampling.frame_indices, vec![0, 19, 39, 59]);
-        assert_eq!(frames.len(), sampling.frame_indices.len());
-        // Distinct source frames: padding to a constant rate would repeat frame 0 instead.
-        for pair in frames.windows(2) {
-            assert_ne!(pair[0], pair[1]);
-        }
-
-        // A frame count past the stream's end leaves the selection short and fails the runner.
-        let overshoot = VideoMetadata {
-            total_frames: Some(61),
-            ..metadata
-        };
-        let selection =
-            FrameSelection::from_metadata(overshoot, cfg()).expect("frame rate and count");
-        assert_eq!(selection.frame_indices, vec![0, 20, 40, 60]);
-        let error = decode_video_with_ffmpeg_ppm(&path, cfg(), overshoot, Some(&selection))
-            .await
-            .expect_err("frame 60 does not exist");
-        assert!(error.to_string().contains("expected 4"), "{error}");
-    }
-
-    /// Every frame of a generated clip as the engine's own loader hands it
-    /// over: libswscale's 32-bit RGB conversion, padding byte dropped.
-    async fn engine_loader_frames(path: &Path, width: usize, height: usize) -> Vec<Vec<u8>> {
-        let output = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-            .arg(path)
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .expect("ffmpeg");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let frame_bytes = width * height * 4;
-        assert_eq!(output.stdout.len() % frame_bytes, 0);
-        output
-            .stdout
-            .chunks_exact(frame_bytes)
-            .map(|frame| {
-                frame
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .flat_map(|pixel| pixel[..3].iter().copied())
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// The RGB bytes of each decoded frame, whichever runner produced them.
-    fn decoded_rgb_frames(
-        decoded: DecodedVideoFrames,
-    ) -> (Vec<Vec<u8>>, Option<VideoSamplingInfo>) {
-        match decoded {
-            DecodedVideoFrames::Rgb {
-                video, sampling, ..
-            } => (
-                video
-                    .frame_refs()
-                    .expect("frame refs")
-                    .iter()
-                    .map(|frame| frame.data.to_vec())
-                    .collect(),
-                sampling,
-            ),
-            DecodedVideoFrames::Images {
-                frames, sampling, ..
-            } => (
-                frames
-                    .iter()
-                    .map(|frame| frame.to_rgb8().into_raw())
-                    .collect(),
-                sampling,
-            ),
-        }
-    }
-
-    /// The pipeline's frames are the engine loader's frames, pixel for pixel,
-    /// on every ffmpeg runner. Skipped when ffmpeg or ffprobe is not on PATH.
-    #[tokio::test]
-    async fn ffmpeg_path_converts_frames_like_the_engine_loader() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("clip.mp4");
-        // Rows of 16 pixels and an even height: the sizes the SIMD converters take.
-        let generated = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x48:rate=30:duration=1",
-                "-c:v",
-                "mpeg4",
-                "-pix_fmt",
-                "yuv420p",
-                "-y",
-            ])
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        let probed = Command::new("ffprobe")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
-        {
-            return;
-        }
-
-        let reference = engine_loader_frames(&path, 64, 48).await;
-        assert_eq!(reference.len(), 30);
-        let metadata = probe_video_metadata(&path).await.expect("ffprobe metadata");
-        assert_eq!((metadata.width, metadata.height), (64, 48));
-        let selection =
-            FrameSelection::from_metadata(metadata, cfg()).expect("frame rate and count");
-        assert_eq!(selection.frame_indices, vec![0, 9, 19, 29]);
-
-        let input_bytes = fs::read(&path).await.expect("generated clip").len();
-        let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
-            .await
-            .expect("ffmpeg decode");
-        let (frames, sampling) = decoded_rgb_frames(decoded);
-        let sampling = sampling.expect("ffprobe reports the frame rate and count");
-        assert_eq!(sampling.frame_indices, selection.frame_indices);
-        let raw = decode_video_with_ffmpeg_raw(&path, cfg(), metadata, Some(&selection))
-            .await
-            .expect("rawvideo decode");
-        let raw: Vec<Vec<u8>> = raw
-            .frame_refs()
-            .expect("frame refs")
-            .iter()
-            .map(|frame| frame.data.to_vec())
-            .collect();
-        let (png, _) = decode_video_with_ffmpeg_png(&path, cfg(), Some(metadata), Some(&selection))
-            .await
-            .expect("png decode");
-        let png: Vec<Vec<u8>> = png.iter().map(|frame| frame.to_rgb8().into_raw()).collect();
-
-        for (runner, frames) in [("ppm", &frames), ("rawvideo", &raw), ("png", &png)] {
-            assert_eq!(frames.len(), selection.frame_indices.len(), "{runner}");
-            for (frame, &index) in frames.iter().zip(&selection.frame_indices) {
-                let expected = &reference[index];
-                assert_eq!(frame.len(), expected.len(), "{runner} frame {index}");
-                let differing = frame.iter().zip(expected).filter(|(a, b)| a != b).count();
-                assert_eq!(
-                    differing, 0,
-                    "{runner} frame {index}: {differing} of {} bytes differ from the engine loader's conversion",
-                    frame.len()
-                );
-            }
-        }
-    }
-
-    /// Skipped when ffmpeg or ffprobe is not on PATH. A container that states
-    /// no frame count makes the engine's loader read one frame; one that claims
-    /// more frames than its stream holds makes it sample over what it can see.
-    #[tokio::test]
-    async fn up_to_sampling_without_frame_metadata_follows_the_engine_loader() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let cfg = up_to_cfg(32);
-
-        // A live-muxed Matroska stream: a frame rate (the track's default
-        // duration), no duration, no frame count.
-        let live = dir.path().join("live.mkv");
-        if !generate_clip(
-            &live,
-            "testsrc=size=64x48:rate=25:duration=2",
-            &[
-                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-f", "matroska", "-live", "1",
-            ],
-        )
-        .await
-        {
-            return;
-        }
-        let metadata = probe_video_metadata(&live).await.expect("ffprobe metadata");
-        assert_eq!(metadata.source_fps, Some(25.0));
-        assert_eq!(
-            (metadata.total_frames, metadata.container_frames),
-            (None, None)
-        );
-        let input_bytes = fs::read(&live).await.expect("generated clip").len();
-        let decoded = decode_video_with_ffmpeg(&live, input_bytes, cfg)
-            .await
-            .expect("ffmpeg decode");
-        let (frames, sampling) = frames_and_sampling(decoded);
-        assert_eq!(
-            sampling,
-            Some(VideoSamplingInfo {
-                source_fps: 25.0,
-                frame_indices: vec![0],
-            })
-        );
-        assert_eq!(frames.len(), 1);
-
-        // A fragmented MP4 (empty moov): no nb_frames, the duration at the
-        // frame rate claims the 60 frames the stream holds.
-        let fragmented = dir.path().join("fragmented.mp4");
-        if !generate_clip(
-            &fragmented,
-            "testsrc=size=64x48:rate=30:duration=2",
-            &[
-                "-c:v",
-                "mpeg4",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "frag_keyframe+empty_moov",
-            ],
-        )
-        .await
-        {
-            return;
-        }
-        let metadata = probe_video_metadata(&fragmented)
-            .await
-            .expect("ffprobe metadata");
-        assert_eq!(metadata.source_fps, Some(30.0));
-        assert_eq!(metadata.container_frames, Some(60));
-        let input_bytes = fs::read(&fragmented).await.expect("generated clip").len();
-        let decoded = decode_video_with_ffmpeg(&fragmented, input_bytes, cfg)
-            .await
-            .expect("ffmpeg decode");
-        let (frames, sampling) = frames_and_sampling(decoded);
-        let sampling = sampling.expect("frame rate and claim");
-        assert_eq!(sampling.frame_indices, spread_evenly(60, 32));
-        assert_eq!(frames.len(), 32);
-
-        // A variable-rate Matroska stream: 30 frames in the first second, 10
-        // in the next; the segment's duration at the track's nominal rate
-        // claims more frames than the 40 it holds.
-        let passthrough = ffmpeg_passthrough_flag().await;
-        let variable = dir.path().join("variable.mkv");
-        if !generate_clip(
-            &variable,
-            "testsrc=size=64x48:rate=30:duration=1[a];testsrc=size=64x48:rate=10:duration=1[b];[a][b]concat=n=2:v=1:a=0",
-            &[passthrough[0], passthrough[1], "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-f", "matroska"],
-        )
-        .await
-        {
-            return;
-        }
-        let metadata = probe_video_metadata(&variable)
-            .await
-            .expect("ffprobe metadata");
-        assert_eq!(metadata.source_fps, Some(30.0));
-        let claimed = metadata
-            .container_frames
-            .expect("duration at the nominal rate");
-        assert!(claimed > 41, "{claimed}");
-        let input_bytes = fs::read(&variable).await.expect("generated clip").len();
-        let decoded = decode_video_with_ffmpeg(&variable, input_bytes, cfg)
-            .await
-            .expect("ffmpeg decode");
-        let (frames, sampling) = frames_and_sampling(decoded);
-        let sampling = sampling.expect("frame rate and claim");
-        assert_eq!(sampling.frame_indices, spread_evenly(40, 32));
-        assert_eq!(frames.len(), 32);
-        for pair in frames.windows(2) {
-            assert_ne!(pair[0], pair[1]);
-        }
-    }
-
-    #[cfg(feature = "opencv-video")]
-    #[test]
-    fn opencv_path_reports_the_source_fps_and_one_index_per_frame() {
-        use opencv::core::{Scalar, Size, CV_8UC3};
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("clip.avi");
-        let fourcc = videoio::VideoWriter::fourcc('M', 'J', 'P', 'G').expect("fourcc");
-        let mut writer = videoio::VideoWriter::new(
-            path.to_str().expect("utf-8 path"),
-            fourcc,
-            30.0,
-            Size::new(64, 48),
-            true,
-        )
-        .expect("video writer");
-        for shade in 0..60 {
-            let frame = Mat::new_rows_cols_with_default(
-                48,
-                64,
-                CV_8UC3,
-                Scalar::all(f64::from(shade) * 4.0),
-            )
-            .expect("frame");
-            writer.write(&frame).expect("write frame");
-        }
-        writer.release().expect("release writer");
-
-        let decoded = decode_video_with_opencv_file(&path, cfg()).expect("opencv decode");
-        let DecodedVideoFrames::Rgb {
-            video, sampling, ..
-        } = decoded
-        else {
-            panic!("expected RGB");
-        };
-        let sampling = sampling.expect("CAP_PROP_FPS is known");
-        assert!(
-            (sampling.source_fps - 30.0).abs() < 1e-6,
-            "{}",
-            sampling.source_fps
-        );
-        assert_eq!(sampling.frame_indices.len(), video.frames.len());
-        assert_eq!(sampling.frame_indices, vec![0, 19, 39, 59]);
-    }
-}
+mod tests;
 
 /// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
 /// (patch_size 14 * spatial merge 2).
@@ -7339,6 +5715,9 @@ mod seek_decode_tests {
         );
     }
 
+    /// The cap is in pixels, so it follows the clip's size: ten hours at
+    /// 30 fps are 1,080,000 source frames, 3.3 gigapixels at 64x48 and
+    /// 2.2 terapixels at 1920x1080, over the terapixel.
     #[test]
     fn a_decode_past_the_work_cap_is_refused_before_it_starts() {
         let metadata = long_clip_metadata();
@@ -7346,16 +5725,118 @@ mod seek_decode_tests {
             .expect("a selection");
         assert_eq!(selection.frame_indices.len(), 768);
         assert_eq!(selection.sequential_frames(), 1_080_000);
-        let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, metadata)
-            .expect_err("ten hours at 30 fps are over the cap");
+        assert!(
+            ensure_decode_work_limit(selection.sequential_frames(), &selection, metadata).is_ok()
+        );
+        let full_hd = VideoMetadata {
+            width: 1920,
+            height: 1080,
+            ..metadata
+        };
+        let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, full_hd)
+            .expect_err("ten hours of 1920x1080 at 30 fps are over the cap");
+        assert!(
+            is_video_budget_error(&error),
+            "the refusal ends the decode; no fallback runner or resampling answers it"
+        );
         let text = error.to_string();
         assert!(
-            text.contains("decoding 1080000 of its 1080000 source frames")
-                && text.contains("SMG_VIDEO_MAX_DECODE_FRAMES")
+            text.contains(
+                "decoding 1080000 of its 1080000 source frames of 1920x1080, 2239488000000 pixels"
+            ) && text.contains("SMG_VIDEO_MAX_DECODE_PIXELS=1000000000000")
                 && text.contains("a clip of 36000 s"),
             "{text}"
         );
-        assert!(ensure_decode_work_limit(1_000, &selection, metadata).is_ok());
+        // The frames one cap admits scale with the frame: four times as many
+        // at 640x360 as at 1280x720.
+        let hd = VideoMetadata {
+            width: 1280,
+            height: 720,
+            ..metadata
+        };
+        assert!(ensure_decode_work_limit(1_085_069, &selection, hd).is_ok());
+        assert!(ensure_decode_work_limit(1_085_070, &selection, hd).is_err());
+        let sd = VideoMetadata {
+            width: 640,
+            height: 360,
+            ..metadata
+        };
+        assert!(ensure_decode_work_limit(4_340_277, &selection, sd).is_ok());
+        assert!(ensure_decode_work_limit(4_340_278, &selection, sd).is_err());
+    }
+
+    /// A container that overstates the stream's size is judged again on the
+    /// probe's size before its refusal stands: the decoder's size fits the
+    /// cap, so the decode goes on with it. A probe that states no size or
+    /// cannot run leaves the refusal standing, a size the probe itself stated
+    /// is not probed again, and a size under the cap asks no probe.
+    #[tokio::test]
+    async fn an_overstated_container_size_is_judged_again_on_the_probes_size() {
+        let metadata = long_clip_metadata();
+        let selection = FrameSelection::from_metadata(metadata, VideoFetchConfig::default())
+            .expect("a selection");
+        let overstated = VideoMetadata {
+            width: 65_535,
+            height: 65_535,
+            from_container: true,
+            ..metadata
+        };
+        let frames = 1_000;
+        assert!(ensure_decode_work_limit(frames, &selection, overstated).is_err());
+        let path = Path::new("overstated.mp4");
+        let decoders = ProbedVideoInfo {
+            width: Some(64),
+            height: Some(48),
+            duration_seconds: metadata.duration_seconds,
+            source_fps: metadata.source_fps,
+            total_frames: metadata.total_frames,
+            container_frames: metadata.container_frames,
+        };
+        probe_switch::ANSWER.with(|answer| answer.set(Some(decoders)));
+        let judged = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect("the decoder's size fits the cap");
+        assert_eq!((judged.width, judged.height), (64, 48));
+        assert!(!judged.from_container);
+        // A probe that states no size leaves the refusal standing.
+        probe_switch::ANSWER.with(|answer| {
+            answer.set(Some(ProbedVideoInfo {
+                width: Some(0),
+                height: Some(0),
+                ..decoders
+            }));
+        });
+        let error = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect_err("no size from the probe: the container's refusal stands");
+        assert!(is_video_budget_error(&error));
+        probe_switch::ANSWER.with(|answer| answer.set(None));
+        // So does a probe that cannot run.
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let error = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect_err("no probe: the container's refusal stands");
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        assert!(is_video_budget_error(&error));
+        // A size the probe itself stated is final: no second probe is asked.
+        probe_switch::ANSWER.with(|answer| answer.set(Some(decoders)));
+        let probed = VideoMetadata {
+            from_container: false,
+            ..overstated
+        };
+        assert!(
+            decode_work_limit_on_the_decoders_size(frames, &selection, probed, path)
+                .await
+                .is_err()
+        );
+        probe_switch::ANSWER.with(|answer| answer.set(None));
+        // A size under the cap goes on as it is, no probe asked.
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let kept = decode_work_limit_on_the_decoders_size(frames, &selection, metadata, path)
+            .await
+            .expect("under the cap");
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        assert_eq!((kept.width, kept.height), (metadata.width, metadata.height));
     }
 
     #[test]

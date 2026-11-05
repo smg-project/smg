@@ -197,6 +197,92 @@ impl StepTracker {
     }
 }
 
+/// The verdict of a step's `run_if` condition, read before the step runs.
+enum Gate {
+    /// No condition, or the condition held.
+    Run,
+    /// The condition did not hold.
+    Skip,
+    /// The context the condition reads could not be loaded; the step fails
+    /// with this text rather than proceeding blindly.
+    Fail(String),
+}
+
+/// How a finished step reports itself: the signal its dependents get (which
+/// names the tracker set it lands in), and the step state to write after the
+/// tracker lock is released, on the paths that owe one: a step the gate
+/// skipped or failed before it ran, and a `ContinueNextStep` failure, whose
+/// `Failed` state is overwritten as `Skipped`.
+struct Completion {
+    signal: StepResult,
+    state: Option<(StepStatus, Option<String>)>,
+}
+
+impl Completion {
+    /// The step's own result folded with its failure action: a failure under
+    /// `ContinueNextStep` signals as a skip so the dependents get scheduled,
+    /// and is recorded as skipped.
+    fn of(result: WorkflowResult<StepResult>, on_failure: FailureAction) -> Self {
+        match result {
+            Ok(StepResult::Success) => Self {
+                signal: StepResult::Success,
+                state: None,
+            },
+            Ok(StepResult::Skip) => Self {
+                signal: StepResult::Skip,
+                state: None,
+            },
+            Ok(StepResult::Failure) | Err(_) => match on_failure {
+                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self {
+                    signal: StepResult::Failure,
+                    state: None,
+                },
+                FailureAction::ContinueNextStep => Self {
+                    signal: StepResult::Skip,
+                    state: Some((StepStatus::Skipped, None)),
+                },
+            },
+        }
+    }
+
+    /// A step its `run_if` condition skipped before it ran.
+    fn skipped() -> Self {
+        Self {
+            signal: StepResult::Skip,
+            state: Some((StepStatus::Skipped, None)),
+        }
+    }
+
+    /// A step that failed before it ran, with the reason for its state.
+    fn failed(error: String) -> Self {
+        Self {
+            signal: StepResult::Failure,
+            state: Some((StepStatus::Failed, Some(error))),
+        }
+    }
+}
+
+/// One run of a step's executor: what came of it, the context it ran on
+/// (the hooks read it), and how long it took.
+struct Attempt<D: WorkflowData> {
+    outcome: Outcome,
+    context: WorkflowContext<D>,
+    duration: Duration,
+}
+
+/// What one attempt came to, in the terms the retry rule reads.
+enum Outcome {
+    Success,
+    Skip,
+    /// The error text for the step's state and events, and whether another
+    /// attempt is allowed: the executor's word for its own errors, always
+    /// for a timeout, never for a plain `Failure` result.
+    Failed {
+        error: String,
+        retryable: bool,
+    },
+}
+
 /// Fixed backoff that returns the same delay every time
 struct FixedBackoff(Duration);
 
@@ -727,8 +813,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         Ok(())
     }
 
-    /// One launched step, on its own task: the `run_if` condition, the step
-    /// with its retries, and the completion into the tracker and the channel.
+    /// One launched step, on its own task: the `run_if` gate, the step with
+    /// its retries, and the completion into the tracker and the channel.
     async fn run_step(
         self,
         def: Arc<WorkflowDefinition<D>>,
@@ -738,145 +824,119 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         tracker: Arc<RwLock<StepTracker>>,
     ) {
         let engine = self;
-        let step_id = def.steps[step_idx].id.clone();
-
         let step = &def.steps[step_idx];
+        let step_id = step.id.clone();
 
-        // Evaluate run_if condition if present
-        if let Some(ref condition) = step.run_if {
-            match engine.state_store.get_context(instance_id).await {
-                Ok(ctx) => {
-                    if !condition(&ctx) {
-                        // Condition is false - skip this step
-                        tracing::debug!(
-                            step_id = %step_id,
-                            "Step skipped due to run_if condition"
-                        );
+        let completion = match engine.run_if_gate(instance_id, step).await {
+            Gate::Run => {
+                let result = engine
+                    .execute_step_with_retry(instance_id, step, &def)
+                    .await;
+                Completion::of(result, step.on_failure)
+            }
+            Gate::Skip => Completion::skipped(),
+            Gate::Fail(error) => Completion::failed(error),
+        };
 
-                        // Remove from running and send the skip signal in one
-                        // lock scope so the deadlock re-drain never sees
-                        // running == 0 with the completion still unsent.
-                        {
-                            let mut t = tracker.write();
-                            t.running.remove(&step_id);
-                            t.skipped.insert(step_id.clone());
-                            let _ = tx.try_send((step_id.clone(), StepResult::Skip));
-                        }
+        Self::settle(&tracker, &tx, &step_id, completion.signal);
 
-                        // Update state store
-                        let _ = engine
-                            .state_store
-                            .update(instance_id, |s| {
-                                if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                    step_state.status = StepStatus::Skipped;
-                                }
-                            })
-                            .await;
-                        return;
-                    }
-                }
-                Err(e) => {
-                    // Failed to get context - fail the step rather than proceeding blindly
+        // The state store is written after the tracker lock is released.
+        if let Some((status, last_error)) = completion.state {
+            engine
+                .record_step_status(instance_id, &step_id, status, last_error)
+                .await;
+        }
+    }
+
+    /// The `run_if` verdict: a step without a condition runs; one whose
+    /// condition does not hold is skipped; one whose context cannot be read
+    /// fails rather than proceeding blindly.
+    async fn run_if_gate(&self, instance_id: WorkflowInstanceId, step: &StepDefinition<D>) -> Gate {
+        let Some(condition) = step.run_if.as_ref() else {
+            return Gate::Run;
+        };
+        match self.state_store.get_context(instance_id).await {
+            Ok(ctx) if condition(&ctx) => Gate::Run,
+            Ok(_) => {
+                tracing::debug!(
+                    step_id = %step.id,
+                    "Step skipped due to run_if condition"
+                );
+                Gate::Skip
+            }
+            Err(e) => {
+                tracing::error!(
+                    step_id = %step.id,
+                    error = ?e,
+                    "Failed to get context for run_if evaluation, failing step"
+                );
+                Gate::Fail(format!("run_if context error: {e}"))
+            }
+        }
+    }
+
+    /// The step leaves `running` for the set its signal names and its
+    /// dependents are told, in one lock scope: the deadlock re-drain never
+    /// sees running == 0 with the completion still unsent.
+    fn settle(
+        tracker: &RwLock<StepTracker>,
+        tx: &mpsc::Sender<(StepId, StepResult)>,
+        step_id: &StepId,
+        signal: StepResult,
+    ) {
+        let mut t = tracker.write();
+        t.running.remove(step_id);
+        match signal {
+            StepResult::Success => t.completed.insert(step_id.clone()),
+            StepResult::Skip => t.skipped.insert(step_id.clone()),
+            StepResult::Failure => t.failed.insert(step_id.clone()),
+        };
+
+        if let Err(e) = tx.try_send((step_id.clone(), signal)) {
+            use mpsc::error::TrySendError;
+            match e {
+                TrySendError::Full(_) => {
                     tracing::error!(
                         step_id = %step_id,
-                        error = ?e,
-                        "Failed to get context for run_if evaluation, failing step"
+                        "Channel full when sending step completion - this is a bug"
                     );
-
-                    // Remove from running and send the failure signal in one
-                    // lock scope so the deadlock re-drain never sees
-                    // running == 0 with the completion still unsent.
-                    {
-                        let mut t = tracker.write();
-                        t.running.remove(&step_id);
-                        t.failed.insert(step_id.clone());
-                        let _ = tx.try_send((step_id.clone(), StepResult::Failure));
-                    }
-
-                    // Update state store
-                    let _ = engine
-                        .state_store
-                        .update(instance_id, |s| {
-                            if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                step_state.status = StepStatus::Failed;
-                                step_state.last_error = Some(format!("run_if context error: {e}"));
-                            }
-                        })
-                        .await;
-                    return;
+                }
+                TrySendError::Closed(_) => {
+                    tracing::debug!(
+                        step_id = %step_id,
+                        "Channel closed, workflow likely cancelled"
+                    );
                 }
             }
         }
+    }
 
-        let result = engine
-            .execute_step_with_retry(instance_id, step, &def)
-            .await;
-
-        // Track whether we need to update state to Skipped after releasing lock
-        let needs_skip_update = {
-            let mut t = tracker.write();
-            t.running.remove(&step_id);
-
-            let (sig, needs_update) = match result {
-                Ok(StepResult::Success) => {
-                    t.completed.insert(step_id.clone());
-                    (StepResult::Success, false)
-                }
-                Ok(StepResult::Skip) => {
-                    t.skipped.insert(step_id.clone());
-                    (StepResult::Skip, false)
-                }
-                Ok(StepResult::Failure) | Err(_) => match step.on_failure {
-                    FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
-                        t.failed.insert(step_id.clone());
-                        (StepResult::Failure, false)
-                    }
-                    FailureAction::ContinueNextStep => {
-                        t.skipped.insert(step_id.clone());
-                        // Signal as Skip so dependents get scheduled
-                        (StepResult::Skip, true)
-                    }
-                },
-            };
-
-            if let Err(e) = tx.try_send((step_id.clone(), sig)) {
-                use mpsc::error::TrySendError;
-                match e {
-                    TrySendError::Full(_) => {
-                        tracing::error!(
-                            step_id = %step_id,
-                            "Channel full when sending step completion - this is a bug"
-                        );
-                    }
-                    TrySendError::Closed(_) => {
-                        tracing::debug!(
-                            step_id = %step_id,
-                            "Channel closed, workflow likely cancelled"
-                        );
+    /// The step state a completion owes after the tracker lock: the status,
+    /// and the error text when the step failed before it ran.
+    async fn record_step_status(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step_id: &StepId,
+        status: StepStatus,
+        last_error: Option<String>,
+    ) {
+        if let Err(e) = self
+            .state_store
+            .update(instance_id, |s| {
+                if let Some(step_state) = s.step_states.get_mut(step_id) {
+                    step_state.status = status;
+                    if last_error.is_some() {
+                        step_state.last_error = last_error;
                     }
                 }
-            }
-
-            needs_update
-        };
-
-        // Perform async state update after releasing the tracker lock
-        if needs_skip_update {
-            if let Err(e) = engine
-                .state_store
-                .update(instance_id, |s| {
-                    if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                        step_state.status = StepStatus::Skipped;
-                    }
-                })
-                .await
-            {
-                tracing::warn!(
-                    step_id = %step_id,
-                    error = ?e,
-                    "Failed to update step state to Skipped"
-                );
-            }
+            })
+            .await
+        {
+            tracing::warn!(
+                step_id = %step_id,
+                error = ?e,
+                "Failed to update step state to {status:?}"
+            );
         }
     }
 
@@ -977,7 +1037,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         Ok(())
     }
 
-    /// Execute a step with retry logic
+    /// Execute a step with retry logic: each attempt is begun (state and
+    /// event), run under the step timeout with its context written back, and
+    /// ends the step or waits out the backoff for the next attempt.
     async fn execute_step_with_retry(
         &self,
         instance_id: WorkflowInstanceId,
@@ -1001,161 +1063,224 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 return Err(WorkflowError::Cancelled(instance_id));
             }
 
-            // Update step state
-            self.state_store
-                .update(instance_id, |s| {
-                    s.current_step = Some(step.id.clone());
-                    if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                        step_state.status = if attempt == 1 {
-                            StepStatus::Running
-                        } else {
-                            StepStatus::Retrying
-                        };
-                        step_state.attempt = attempt;
-                        step_state.started_at = Some(Utc::now());
-                    }
-                })
-                .await?;
+            self.begin_attempt(instance_id, step, attempt).await?;
+            let Attempt {
+                outcome,
+                context,
+                duration,
+            } = self.run_once(instance_id, step, step_timeout).await?;
 
-            // Emit step started event
-            self.event_bus
-                .publish(WorkflowEvent::StepStarted {
-                    instance_id,
-                    step_id: step.id.clone(),
-                    attempt,
-                })
-                .await;
-
-            let mut context = self.state_store.get_context(instance_id).await?;
-
-            // Execute step with timeout
-            let step_start = std::time::Instant::now();
-            let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
-
-            let step_duration = step_start.elapsed();
-
-            // Persist the step's context mutations back to shared state — but not
-            // for a Skip. A Skip is a pre-mutation early return (the step ran no
-            // logic), so `context` is just the stale full-copy read at step start;
-            // writing it back would clobber a concurrent parallel-branch step
-            // under last-writer-wins. Concretely: an instantly-skipping external
-            // branch step would erase the `connection_mode` a just-finished local
-            // branch step committed, because the whole context is snapshotted and
-            // rewritten wholesale rather than field-merged.
-            if !matches!(result, Ok(Ok(StepResult::Skip))) {
-                self.state_store
-                    .update(instance_id, |s| {
-                        s.context = context.clone();
-                    })
-                    .await?;
-            }
-
-            match result {
-                Ok(Ok(StepResult::Success)) => {
-                    // Step succeeded
-                    self.state_store
-                        .update(instance_id, |s| {
-                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                                step_state.status = StepStatus::Succeeded;
-                                step_state.completed_at = Some(Utc::now());
-                            }
-                        })
-                        .await?;
-
-                    self.event_bus
-                        .publish(WorkflowEvent::StepSucceeded {
-                            instance_id,
-                            step_id: step.id.clone(),
-                            duration: step_duration,
-                        })
-                        .await;
-
-                    // Call on_success hook
-                    if let Err(e) = step.executor.on_success(&context).await {
-                        tracing::warn!(step_id = %step.id, error = ?e, "on_success hook failed");
-                    }
-
+            match outcome {
+                Outcome::Success => {
+                    self.succeed(instance_id, step, &context, duration).await?;
                     return Ok(StepResult::Success);
                 }
-                Ok(Ok(StepResult::Skip)) => {
-                    return Ok(StepResult::Skip);
-                }
-                Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
-                    let (error_msg, should_retry) = match result {
-                        Ok(Err(e)) => {
-                            let msg = format!("{e}");
-                            let retryable = step.executor.is_retryable(&e);
-                            (msg, retryable)
-                        }
-                        Err(_) => (
-                            format!("Step timeout after {step_timeout:?}"),
-                            true, // Timeouts are retryable
-                        ),
-                        _ => ("Step failed".to_string(), false),
-                    };
-
-                    let will_retry = should_retry && attempt < max_attempts;
-
-                    // Update step state
-                    self.state_store
-                        .update(instance_id, |s| {
-                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                                step_state.status = if will_retry {
-                                    StepStatus::Retrying
-                                } else {
-                                    StepStatus::Failed
-                                };
-                                step_state.last_error = Some(error_msg.clone());
-                                if !will_retry {
-                                    step_state.completed_at = Some(Utc::now());
-                                }
-                            }
-                        })
+                Outcome::Skip => return Ok(StepResult::Skip),
+                Outcome::Failed { error, retryable } => {
+                    let will_retry = retryable && attempt < max_attempts;
+                    self.record_failure(instance_id, step, &error, will_retry)
                         .await?;
-
-                    // Emit step failed event
-                    self.event_bus
-                        .publish(WorkflowEvent::StepFailed {
-                            instance_id,
-                            step_id: step.id.clone(),
-                            error: error_msg.clone(),
-                            will_retry,
-                        })
-                        .await;
-
-                    if will_retry {
-                        // Calculate backoff delay
-                        let delay = backoff
-                            .next_backoff()
-                            .unwrap_or_else(|| Duration::from_secs(1));
-
-                        self.event_bus
-                            .publish(WorkflowEvent::StepRetrying {
-                                instance_id,
-                                step_id: step.id.clone(),
-                                attempt: attempt + 1,
-                                delay,
-                            })
-                            .await;
-
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                    } else {
-                        // No more retries, call on_failure hook
-                        // Create a generic error for the hook
-                        let hook_error = WorkflowError::StepFailed {
-                            step_id: step.id.clone(),
-                            message: error_msg,
-                        };
-                        if let Err(hook_err) = step.executor.on_failure(&context, &hook_error).await
-                        {
-                            tracing::warn!(step_id = %step.id, error = ?hook_err, "on_failure hook failed");
-                        }
-
+                    if !will_retry {
+                        self.give_up(step, &context, error).await;
                         return Ok(StepResult::Failure);
                     }
+                    self.wait_before_retry(instance_id, step, &mut backoff, attempt)
+                        .await;
+                    attempt += 1;
                 }
             }
+        }
+    }
+
+    /// The attempt's start: the step state (running, or retrying from the
+    /// second attempt on) and the started event.
+    async fn begin_attempt(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        attempt: u32,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                s.current_step = Some(step.id.clone());
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = if attempt == 1 {
+                        StepStatus::Running
+                    } else {
+                        StepStatus::Retrying
+                    };
+                    step_state.attempt = attempt;
+                    step_state.started_at = Some(Utc::now());
+                }
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::StepStarted {
+                instance_id,
+                step_id: step.id.clone(),
+                attempt,
+            })
+            .await;
+        Ok(())
+    }
+
+    /// One attempt: the executor runs on a copy of the shared context under
+    /// the step timeout, and the copy is written back — but not for a Skip.
+    /// A Skip is a pre-mutation early return (the step ran no logic), so
+    /// `context` is just the stale full-copy read at step start; writing it
+    /// back would clobber a concurrent parallel-branch step under
+    /// last-writer-wins. Concretely: an instantly-skipping external branch
+    /// step would erase the `connection_mode` a just-finished local branch
+    /// step committed, because the whole context is snapshotted and rewritten
+    /// wholesale rather than field-merged.
+    async fn run_once(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        step_timeout: Duration,
+    ) -> WorkflowResult<Attempt<D>> {
+        let mut context = self.state_store.get_context(instance_id).await?;
+
+        let step_start = std::time::Instant::now();
+        let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+        let duration = step_start.elapsed();
+
+        let outcome = match result {
+            Ok(Ok(StepResult::Success)) => Outcome::Success,
+            Ok(Ok(StepResult::Skip)) => Outcome::Skip,
+            Ok(Ok(StepResult::Failure)) => Outcome::Failed {
+                error: "Step failed".to_string(),
+                retryable: false,
+            },
+            Ok(Err(e)) => Outcome::Failed {
+                error: format!("{e}"),
+                retryable: step.executor.is_retryable(&e),
+            },
+            Err(_) => Outcome::Failed {
+                error: format!("Step timeout after {step_timeout:?}"),
+                // Timeouts are retryable
+                retryable: true,
+            },
+        };
+
+        if !matches!(outcome, Outcome::Skip) {
+            self.state_store
+                .update(instance_id, |s| {
+                    s.context = context.clone();
+                })
+                .await?;
+        }
+
+        Ok(Attempt {
+            outcome,
+            context,
+            duration,
+        })
+    }
+
+    /// A successful attempt: the step state, the succeeded event and the
+    /// executor's `on_success` hook (its failure is logged, not propagated).
+    async fn succeed(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        context: &WorkflowContext<D>,
+        duration: Duration,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = StepStatus::Succeeded;
+                    step_state.completed_at = Some(Utc::now());
+                }
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::StepSucceeded {
+                instance_id,
+                step_id: step.id.clone(),
+                duration,
+            })
+            .await;
+
+        if let Err(e) = step.executor.on_success(context).await {
+            tracing::warn!(step_id = %step.id, error = ?e, "on_success hook failed");
+        }
+        Ok(())
+    }
+
+    /// A failed attempt: the step state (retrying, or failed with its
+    /// completion time) and the failed event.
+    async fn record_failure(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        error: &str,
+        will_retry: bool,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = if will_retry {
+                        StepStatus::Retrying
+                    } else {
+                        StepStatus::Failed
+                    };
+                    step_state.last_error = Some(error.to_string());
+                    if !will_retry {
+                        step_state.completed_at = Some(Utc::now());
+                    }
+                }
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::StepFailed {
+                instance_id,
+                step_id: step.id.clone(),
+                error: error.to_string(),
+                will_retry,
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Between attempts: the backoff's next delay (a second when it has none
+    /// left), the retrying event, and the wait.
+    async fn wait_before_retry(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        backoff: &mut BackoffImpl,
+        attempt: u32,
+    ) {
+        let delay = backoff
+            .next_backoff()
+            .unwrap_or_else(|| Duration::from_secs(1));
+
+        self.event_bus
+            .publish(WorkflowEvent::StepRetrying {
+                instance_id,
+                step_id: step.id.clone(),
+                attempt: attempt + 1,
+                delay,
+            })
+            .await;
+
+        tokio::time::sleep(delay).await;
+    }
+
+    /// The last failure: the executor's `on_failure` hook with the step's
+    /// error (its own failure is logged, not propagated).
+    async fn give_up(&self, step: &StepDefinition<D>, context: &WorkflowContext<D>, error: String) {
+        let hook_error = WorkflowError::StepFailed {
+            step_id: step.id.clone(),
+            message: error,
+        };
+        if let Err(hook_err) = step.executor.on_failure(context, &hook_error).await {
+            tracing::warn!(step_id = %step.id, error = ?hook_err, "on_failure hook failed");
         }
     }
 

@@ -1,9 +1,12 @@
 """The ``constrained_decoding_start`` and ``engine_reasoning_parser`` labels the
-servicers carry as ``server_args`` keys: the rule per engine, under each
-server configuration, and the entries written for the Router."""
+servicers carry as ``server_args`` keys, and the ``grammar_backend`` and
+``structural_tag_vocabulary`` keys beside them: the rule per engine, under each
+server configuration, and the entries written for the Router and the Rust
+servicer."""
 
 from __future__ import annotations
 
+import importlib.metadata
 from types import SimpleNamespace
 
 from smg_grpc_servicer import constrained_decoding as cd
@@ -102,3 +105,152 @@ def test_tokenspeed_starts_the_grammar_at_the_first_token_whatever_the_parser():
     assert cd.grammar_start_labels(
         SimpleNamespace(reasoning_parser=None), cd.tokenspeed_constrained_decoding_start()
     ) == {cd.CONSTRAINED_DECODING_START_KEY: "first_token"}
+
+
+def test_sglang_grammar_backend_is_the_resolved_argument_or_the_default():
+    # Given as typed.
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend="outlines")) == "outlines"
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend="none")) == "none"
+    # Not given: the engine's default, which its resolution hook declares in
+    # _resolved_overrides (last writer wins) and older releases set in place.
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend=None)) == "xgrammar"
+    declared = SimpleNamespace(
+        grammar_backend=None,
+        _resolved_overrides=[("_handle_grammar_backend", {"grammar_backend": "xgrammar"})],
+    )
+    assert cd.sglang_grammar_backend(declared) == "xgrammar"
+    # Without the scheduler's tokenizer its grammar manager builds no backend,
+    # whatever the flag says.
+    assert (
+        cd.sglang_grammar_backend(
+            SimpleNamespace(grammar_backend="xgrammar", skip_tokenizer_init=True)
+        )
+        == "none"
+    )
+    # No such field at all: say nothing.
+    assert cd.sglang_grammar_backend(SimpleNamespace(model_path="org/model")) == ""
+
+
+def test_tokenspeed_grammar_backend_is_the_flag_or_the_resolved_checkpoint_default():
+    # Given as typed.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend="xgrammar")) == "xgrammar"
+    explicit_none = SimpleNamespace(grammar_backend="none", _grammar_backend_unset=False)
+    assert cd.tokenspeed_grammar_backend(explicit_none) == "none"
+    # Not given: the engine starts from none and flips the checkpoints it
+    # defaults otherwise once it has read the checkpoint.
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=True
+            )
+        )
+        == "xgrammar"
+    )
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=False
+            )
+        )
+        == "none"
+    )
+    # Not read yet: unknown, say nothing.
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=None
+            )
+        )
+        == ""
+    )
+    # Not given and the engine's own post-init not run yet (the raw argument
+    # is None): unknown as well, say nothing.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend=None)) == ""
+    # No such field at all: say nothing.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(model="org/model")) == ""
+
+
+def test_grammar_backend_entry_replaces_the_raw_argument():
+    args = {"grammar_backend": None, "tp_size": 2}
+    cd.grammar_backend_entry(args, "xgrammar")
+    assert args == {"grammar_backend": "xgrammar", "tp_size": 2}
+    # Nothing known: no key, so the servicer judges nothing ahead of the engine.
+    args = {"grammar_backend": "none", "tp_size": 2}
+    cd.grammar_backend_entry(args, "")
+    assert args == {"tp_size": 2}
+    assert cd.GRAMMAR_BACKEND_KEY == "grammar_backend"
+
+
+def test_structural_tag_vocabulary_is_older_below_the_first_release_with_the_nodes():
+    # xgrammar 0.1.33 is the first release whose structural tags take the
+    # optional, plus, star and token nodes; 0.1.32 refuses them at compile
+    # time, so the label says `older` below 0.1.33 and nothing from it on.
+    assert cd.XGRAMMAR_CURRENT_VOCABULARY_SINCE == (0, 1, 33)
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.32") == cd.STRUCTURAL_TAG_VOCABULARY_OLDER
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.25") == "older"
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.32.post1") == "older"
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.33") == ""
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.34") == ""
+    assert cd.structural_tag_vocabulary("xgrammar", "0.2.7") == ""
+    assert cd.structural_tag_vocabulary("xgrammar", "1.0.0") == ""
+    # A pre-release or a local build of the first release carries the nodes.
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.33rc1") == ""
+    assert cd.structural_tag_vocabulary("xgrammar", "0.1.33.dev2+g1234567") == ""
+    # Nothing known: no xgrammar installed, or a version that does not parse.
+    assert cd.structural_tag_vocabulary("xgrammar", "") == ""
+    assert cd.structural_tag_vocabulary("xgrammar", "unknown") == ""
+    assert cd.STRUCTURAL_TAG_VOCABULARY_KEY == "structural_tag_vocabulary"
+
+
+def test_structural_tag_vocabulary_applies_to_the_backends_that_run_xgrammar():
+    # xgrammar by name, vLLM's auto (xgrammar for a structural tag) and a
+    # backend the launcher could not resolve (the engines default to xgrammar
+    # where one runs); another backend has a vocabulary of its own, and
+    # `none` enforces nothing: nothing is said for them.
+    for backend in ("xgrammar", " XGrammar ", "auto", ""):
+        assert cd.structural_tag_vocabulary(backend, "0.1.32") == "older", backend
+    for backend in ("none", "llguidance", "guidance", "outlines", "lm-format-enforcer"):
+        assert cd.structural_tag_vocabulary(backend, "0.1.32") == "", backend
+
+
+def test_structural_tag_vocabulary_reads_the_installed_xgrammar_from_its_metadata(monkeypatch):
+    # The distribution's metadata, never an import of xgrammar (which loads
+    # the engine's runtime); no distribution at all says nothing.
+    asked = []
+
+    def version(name):
+        asked.append(name)
+        if name == "xgrammar":
+            return "0.1.32"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    assert cd.installed_xgrammar_version() == "0.1.32"
+    assert cd.structural_tag_vocabulary("xgrammar") == "older"
+    assert asked == ["xgrammar", "xgrammar"]
+
+    def absent(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", absent)
+    assert cd.installed_xgrammar_version() == ""
+    assert cd.structural_tag_vocabulary("xgrammar") == ""
+
+
+def test_structural_tag_vocabulary_entry_writes_the_label_or_nothing(monkeypatch):
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    args = {"grammar_backend": "xgrammar", "tp_size": 2}
+    cd.structural_tag_vocabulary_entry(args, "xgrammar")
+    assert args == {
+        "grammar_backend": "xgrammar",
+        "tp_size": 2,
+        "structural_tag_vocabulary": "older",
+    }
+    # A current xgrammar: no key, and a stale one is cleared.
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.7")
+    cd.structural_tag_vocabulary_entry(args, "xgrammar")
+    assert args == {"grammar_backend": "xgrammar", "tp_size": 2}
+    # Another backend on an older xgrammar: nothing to say.
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    cd.structural_tag_vocabulary_entry(args, "llguidance")
+    assert "structural_tag_vocabulary" not in args

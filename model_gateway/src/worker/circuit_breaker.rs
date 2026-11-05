@@ -6,7 +6,7 @@ use std::{
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::observability::metrics::Metrics;
+use crate::{observability::metrics::Metrics, worker::endpoint::Endpoint};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +183,15 @@ impl CircuitBreaker {
         self.check_and_update_state_returning()
     }
 
+    /// The state as stored, without the timeout check [`Self::state`] runs:
+    /// for a reader that must not move the breaker (a comparison around a
+    /// record, a gauge of the state as it is). An open breaker past its
+    /// timeout still reads open here; the routing decision's read moves it.
+    #[inline]
+    pub fn peek_state(&self) -> CircuitState {
+        CircuitState::from_int(self.state.load(Ordering::Acquire))
+    }
+
     /// Check and update state, returning the current state (lock-free)
     #[inline]
     fn check_and_update_state_returning(&self) -> CircuitState {
@@ -235,7 +244,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %self.metric_label,
+                    worker_url = %Endpoint::redacted_str(&self.metric_label),
                     "Success recorded while circuit is open"
                 );
             }
@@ -297,7 +306,7 @@ impl CircuitBreaker {
         let (from, to) = (from.as_str(), to.as_str());
         // An absent `cause` records no field: the line reads as before.
         info!(
-            worker_url = %self.metric_label,
+            worker_url = %Endpoint::redacted_str(&self.metric_label),
             from,
             to,
             cause,
@@ -359,7 +368,7 @@ impl CircuitBreaker {
     /// Put an open circuit on trial now instead of at its timeout, because
     /// the worker's health has returned: the failures that opened it belong
     /// to an outage the probes have seen end. The trial is the one the
-    /// timeout would have started ([`Self::cas_open_to_half_open`]):
+    /// timeout would have started (`Self::cas_open_to_half_open`):
     /// requests flow again, `success_threshold` successes close the circuit
     /// and one failure reopens it for a full timeout. A circuit that is not
     /// open is left alone. Returns whether the circuit moved.

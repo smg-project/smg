@@ -35,14 +35,14 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason},
-        testing::{calls, content, drive},
+        testing::{calls, content, drive, finish},
         Declared,
     };
 
     /// The generation prompt's tail: the model's turn opened, and nothing more.
     const PROMPT: &str = "<start_of_turn>model\n";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(function_gemma(), Declared::default()),
             prompt,
@@ -50,31 +50,17 @@ mod tests {
         )
     }
 
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     #[test]

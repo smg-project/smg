@@ -65,25 +65,22 @@ pub struct RendererCapabilities {
     /// popping it into a text prefix.
     pub native_assistant_continuation: bool,
     /// The renderer parses tool-call `arguments` strings itself with the
-    /// reference's tolerance (non-object and double-encoded values); the
-    /// gateway must forward them as written instead of pre-parsing them.
+    /// reference's tolerance (non-object and double-encoded values), or its
+    /// template writes them as the text the request sent (a template that
+    /// concatenates them cannot render an object); the gateway must forward
+    /// them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
-    /// The renderer declares the request's tools when `tool_choice` is
-    /// `none` and tells the model not to call them, as its reference does;
-    /// the gateway keeps the tools for it. Without it the gateway renders no
-    /// tool under `none`, so the model is not offered a call it may not make.
-    pub declares_tools_under_tool_choice_none: bool,
-    /// The renderer's reference writes a turn of its own, and the assistant
-    /// header after the last one, for user and developer messages only: a
-    /// `system` message after the first renders as bare text with no role
-    /// marker, and one that ends the conversation leaves the prompt without
-    /// the header, so the model answers an empty turn. On the Messages path
-    /// the gateway renders a `system`-role message sent inside `messages[]`
-    /// past the leading run of system messages (the system prompt, which
-    /// every renderer writes, whether it came as the top-level `system` or
-    /// as the first messages) as a user turn at its position for such a
-    /// renderer; elsewhere the message is forwarded in place, for the
-    /// templates that render a system turn anywhere.
+    /// The renderer's reference writes a turn of its own for user and
+    /// developer messages only: a `system` message after the first renders
+    /// as bare text with no role marker, glued to the text before it (the
+    /// assistant header after it follows the reference's own rule, not the
+    /// message's role). On the Messages path the gateway renders a
+    /// `system`-role message sent inside `messages[]` past the leading run
+    /// of system messages (the system prompt, which every renderer writes,
+    /// whether it came as the top-level `system` or as the first messages)
+    /// as a user turn at its position for such a renderer; elsewhere the
+    /// message is forwarded in place, for the templates that render a
+    /// system turn anywhere.
     pub leading_system_only: bool,
 }
 
@@ -111,6 +108,15 @@ pub struct ChatTemplateOutput {
     /// the generation prompt instead: the completion then starts wherever
     /// that prompt leaves it, inside a reasoning block it opens for one.
     pub continued_final_message: bool,
+    /// The prompt is rendered for generation, as `add_generation_prompt: true`
+    /// renders it: the renderer's generation header follows the last turn
+    /// where its reference writes one. False when the request asked for no
+    /// header and the renderer honoured it, and when the final message was
+    /// continued instead. A renderer with an encoder of its own writes the
+    /// header whatever the request asked, as the engines' own encoders do,
+    /// and reports true; the reasoning decisions read this rather than the
+    /// request, since nothing opens a reasoning block without the header.
+    pub generation_prompt: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -128,6 +134,17 @@ pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
     /// the token only extends a multi-byte character or is skipped).
     fn step(&mut self, token_id: TokenIdType) -> Result<String>;
+
+    /// Feed one token; appends the text that became final with it to `out`
+    /// and says whether there was any (none when the token only extends a
+    /// multi-byte character or is skipped). The default goes through
+    /// [`step`](Self::step); a decoder that has the text at hand appends it
+    /// without a string of its own per token.
+    fn step_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        let text = self.step(token_id)?;
+        out.push_str(&text);
+        Ok(!text.is_empty())
+    }
 
     /// Forget all state, as for a new stream.
     fn reset(&mut self);
@@ -307,8 +324,10 @@ pub trait Tokenizer: Encoder + Decoder {
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
     /// hand back a deferred encode instead. The default reports a requested
-    /// `continue_final_message` as honored; renderers that can fall back
-    /// from it override this to report what they did.
+    /// `continue_final_message` as honored, and the generation header as
+    /// `add_generation_prompt` asked for it; renderers that can fall back
+    /// from a continuation, or write the header whatever was asked, override
+    /// this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
@@ -316,6 +335,7 @@ pub trait Tokenizer: Encoder + Decoder {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         let continued_final_message = params.continue_final_message;
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -325,12 +345,27 @@ pub trait Tokenizer: Encoder + Decoder {
             encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
             continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
     }
 
     /// Get the content format expected by the chat template.
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         ChatTemplateContentFormat::default()
+    }
+
+    /// The content format of the template a request renders through, by
+    /// whether the request declares tools: a checkpoint can ship one template
+    /// for requests with tools and another for those without (see
+    /// `ChatTemplateState::content_format_for_tools`), and the request's
+    /// message content takes the shape of the one that renders it. The
+    /// default template's format for a tokenizer with one template.
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        let _ = has_tools;
+        self.chat_template_content_format()
     }
 
     /// Get the thinking toggle support for this template.
@@ -459,6 +494,17 @@ impl Encoding {
         }
     }
 
+    /// The token ids, taken out of the encoding: the vector itself for the
+    /// encodings that own one (the direct and tiktoken paths, and every
+    /// exact-cache hit), a copy for the library's own encoding, which keeps
+    /// its ids behind a borrow.
+    pub fn into_token_ids(self) -> Vec<TokenIdType> {
+        match self {
+            Encoding::Hf(inner) => inner.get_ids().to_vec(),
+            Encoding::Plain(inner) | Encoding::Tiktoken(inner) => inner,
+        }
+    }
+
     /// Get a hash of the token IDs for caching purposes
     pub fn get_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -488,4 +534,20 @@ pub struct SpecialTokens {
     pub cls_token: Option<String>,
     pub mask_token: Option<String>,
     pub additional_special_tokens: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_encoding_that_owns_its_ids_hands_them_out_without_a_copy() {
+        for owned in [Encoding::Plain, Encoding::Tiktoken] {
+            let ids = vec![7u32, 8, 9];
+            let buffer = ids.as_ptr();
+            let taken = owned(ids).into_token_ids();
+            assert_eq!(taken, [7, 8, 9]);
+            assert_eq!(taken.as_ptr(), buffer, "the vector moved, not copied");
+        }
+    }
 }

@@ -6,20 +6,18 @@ for Apple Silicon inference.
 """
 
 import asyncio
-import hashlib
-import io
 import logging
 import os
 import threading
 import time
-import zipfile
 
 import grpc
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator, SequenceStateMachine
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
-from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -459,56 +457,6 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         if output_logprobs is not None:
             complete.output_logprobs.CopyFrom(output_logprobs)
         return mlx_engine_pb2.GenerateResponse(complete=complete)
-
-    _TOKENIZER_FILES = {
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",
-        "tiktoken.model",
-        "merges.txt",
-        "vocab.json",
-        "added_tokens.json",
-        # Chat template sidecars (newer HF convention, transformers>=4.43).
-        # Required for models like Gemma 4 whose tokenizer_config.json does
-        # NOT embed chat_template; router-side discover_chat_template_in_dir
-        # relies on these being present in the bundle.
-        "chat_template.json",
-        "chat_template.jinja",
-    }
-    # Additional extension-based matches for tiktoken-style BPE artifacts
-    # (e.g. `cl100k_base.tiktoken`). The router-side Rust tokenizer loader
-    # accepts these as valid directory tokenizers.
-    _TOKENIZER_SUFFIXES = (".tiktoken",)
-
-    @staticmethod
-    def _build_tokenizer_zip(model_dir):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for filename in sorted(os.listdir(model_dir)):
-                matched = filename in MlxEngineServicer._TOKENIZER_FILES or filename.endswith(
-                    MlxEngineServicer._TOKENIZER_SUFFIXES
-                )
-                if matched:
-                    filepath = os.path.join(model_dir, filename)
-                    if os.path.isfile(filepath):
-                        zf.write(filepath, filename)
-        zip_bytes = buf.getvalue()
-        sha256 = hashlib.sha256(zip_bytes).hexdigest()
-        return zip_bytes, sha256
-
-    @staticmethod
-    def _chunk_tokenizer_zip(zip_bytes, sha256, chunk_size=512 * 1024):
-        total = len(zip_bytes)
-        offset = 0
-        while offset < total:
-            end = min(offset + chunk_size, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=zip_bytes[offset:end],
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
 
     async def GetModelInfo(
         self,
@@ -1008,14 +956,16 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         return mlx_engine_pb2.HealthCheckResponse(healthy=True, message="OK")
 
     async def GetTokenizer(self, request, context):
+        """Stream the model directory's tokenizer files as the shared ZIP
+        bundle: the selection, order and chunking the other engines' servicers
+        send and the Router's loader expects, the archive's SHA-256 on the last
+        chunk. The archive is built in a worker thread the first time and
+        served from memory after that, so the streams keep flowing meanwhile.
+        """
         try:
-            zip_bytes, sha256 = self._build_tokenizer_zip(self.model_dir)
-            async for chunk in self._async_chunk_tokenizer(zip_bytes, sha256):
-                yield chunk
+            zip_data, sha256 = await tokenizer_bundle(self.model_dir)
         except Exception as e:
             logger.exception("GetTokenizer failed")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-    async def _async_chunk_tokenizer(self, zip_bytes, sha256):
-        for chunk in self._chunk_tokenizer_zip(zip_bytes, sha256):
+        for chunk in tokenizer_chunks(zip_data, sha256):
             yield chunk

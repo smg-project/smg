@@ -17,6 +17,12 @@
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
 //!   request.
+//! - `POST /admin/script/{worker}` with one scripted answer or an array of
+//!   them: what the worker's next requests get, in order (`all`: whichever
+//!   worker gets the request), or, with a `key` or `input_ids`, what every
+//!   worker answers to that prompt; `GET` reads the queue length and the hit
+//!   and miss counts, `DELETE` drops the queue ([`crate::script`]); a name no
+//!   worker of the process has is a 404, as on the fault routes.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
 //! addresses every worker.
@@ -41,6 +47,7 @@ use tokio::net::TcpListener;
 use crate::{
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
+    script,
 };
 
 struct AdminState {
@@ -70,7 +77,99 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
+        .route(
+            "/admin/script/{worker}",
+            get(script_status).post(script_enqueue).delete(script_clear),
+        )
+        // What a gRPC worker reports about itself, by port: whether its
+        // health check answers serving, and the info the gateway turns into
+        // labels. For beds that change an engine's reported settings between
+        // two health transitions.
+        .route("/admin/serving/{port}", get(serving_get).post(serving_set))
+        .route("/admin/info/{port}", get(info_get).post(info_patch))
         .with_state(state)
+}
+
+async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(json!({ "port": port, "serving": crate::overrides::for_port(port).serving() }))
+}
+
+/// Body `{"serving": true|false}`: whether the worker's gRPC health check
+/// answers healthy from now on.
+async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.get("serving").and_then(Value::as_bool) {
+        Some(serving) => {
+            crate::overrides::for_port(port).set_serving(serving);
+            Json(json!({ "port": port, "serving": serving })).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: {\"serving\": true|false}").into_response(),
+    }
+}
+
+async fn info_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(Value::Object(
+        crate::overrides::for_port(port)
+            .info()
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// Body: a JSON object merged into the info the worker reports (its gRPC
+/// `server_args`, and `supports_vision` of its model info); a `null` removes
+/// a key. Answers the info as it is now.
+async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.as_object() {
+        Some(patch) => {
+            let overrides = crate::overrides::for_port(port);
+            overrides.patch_info(patch);
+            Json(Value::Object(overrides.info().into_iter().collect())).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: a JSON object").into_response(),
+    }
+}
+
+/// Body: one scripted answer or an array of them ([`script::Answer::parse`]
+/// names the fields). Each goes to the end of the worker's queue (`all`: the
+/// queue every worker falls back to), under its prompt's key when it has
+/// one, or under the text a prompt must hold (`prompt_contains`). Answers
+/// the worker's script state.
+async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> Response {
+    let items: Vec<&Value> = match &body {
+        Value::Array(items) => items.iter().collect(),
+        one => vec![one],
+    };
+    let mut answers = Vec::with_capacity(items.len());
+    for (n, item) in items.into_iter().enumerate() {
+        match script::Answer::parse(item) {
+            Ok(scripted) => answers.push(scripted),
+            Err(why) => {
+                return (StatusCode::BAD_REQUEST, format!("answer {n}: {why}")).into_response()
+            }
+        }
+    }
+    script_state(script::enqueue(&worker, answers))
+}
+
+/// The worker's queued answers, the ones filed under a text, its hits and
+/// misses, and the keyed answers of the process.
+async fn script_status(Path(worker): Path<String>) -> Response {
+    script_state(script::status(&worker))
+}
+
+/// Drop the worker's queued answers and the ones filed under a text (`all`:
+/// every worker's); keyed answers stay.
+async fn script_clear(Path(worker): Path<String>) -> Response {
+    script_state(script::clear(&worker))
+}
+
+/// A script route's answer: the state, or 404 for a name no worker of the
+/// process has (the fault routes' answer to the same mistake).
+fn script_state(state: Option<Value>) -> Response {
+    match state {
+        Some(state) => Json(state).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown worker").into_response(),
+    }
 }
 
 /// Serve the admin API on `port` until the process exits.
@@ -185,10 +284,11 @@ fn optional<T: std::str::FromStr>(
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
-/// the stream with S. `finish=error` ends the stream as an engine that failed
-/// the request does, a `Complete` with finish reason `error` after K tokens
-/// (0 when unset), with no status needed. `status=0` alone clears; with
-/// `stall_ms` it stalls and then serves.
+/// the stream with S (on the gRPC wire, `status=422` is the engine's report
+/// that it could not continue the request under its constraint). `finish=error`
+/// ends the stream as an engine that failed the request does, a `Complete`
+/// with finish reason `error` after K tokens (0 when unset), with no status
+/// needed. `status=0` alone clears; with `stall_ms` it stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;

@@ -13,7 +13,10 @@ use engine_zmq_client::{
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
-        output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
+        output::{
+            EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
+            StopReason,
+        },
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
@@ -23,10 +26,15 @@ use futures::Stream;
 use smg_grpc_client::vllm_proto as vllm;
 
 use crate::{
+    context_window::admit_prompt,
     eos::EosTokenIds,
     fanout::fan_out_n,
     multimodal,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::{
+        refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
+        StructuredOutputsSupport,
+    },
 };
 
 /// Ranked candidates to emit per position for a requested logprob count:
@@ -92,9 +100,14 @@ pub struct VllmGenerateStream {
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    scheduled_at: Option<f64>,
+    prefill_sample: Option<(u32, f64, f64)>,
+    prefill_sampled: bool,
+    prefill_preempted: bool,
 }
 
 impl VllmGenerateStream {
+    /// Start one choice with no observed timing or capacity sample.
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
@@ -111,12 +124,27 @@ impl VllmGenerateStream {
             first_prompt_token,
             input_logprobs_emitted: false,
             pending: None,
+            scheduled_at: None,
+            prefill_sample: None,
+            prefill_sampled: false,
+            prefill_preempted: false,
         }
+    }
+
+    /// Consume one actual computed-token sample and its engine-clock interval.
+    /// Initial queueing is excluded; preempted requests have no reliable interval.
+    pub fn take_prefill_sample(&mut self) -> Option<(u32, f64, f64)> {
+        self.prefill_sample.take()
     }
 
     /// The choice `index` stamped on this stream's responses.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
     }
 
     /// The data-parallel rank this choice's engine request went to; `None`
@@ -172,50 +200,12 @@ impl VllmGenerateStream {
             Some((finish_reason, matched)),
             &mut pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         response
-    }
-
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk (the proto puts them in the first chunk only) and on every
-    /// `Complete`, including one parked in `pending`. Prefill precedes the
-    /// first sampled token, so the set is whole by the time a chunk carries
-    /// tokens.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        // Built per attachment site rather than up front: with
-        // `prompt_logprobs` requested this runs on every decode tick, and the
-        // common tick (a later chunk) attaches nothing.
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
-        match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
-            }
-            // Later chunks never repeat them (the proto carries them in the
-            // first chunk only), and neither do token-less prefill chunks.
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
-            }
-            None => {}
-        }
     }
 }
 
@@ -231,10 +221,37 @@ impl MappedGenerateStream for VllmGenerateStream {
         &mut self.pending
     }
 
+    /// Map a step while retaining its first valid prefill timing for the servicer.
+    /// Scheduling events require vLLM `log_stats`; missing events yield no sample.
     fn map_output(
         &mut self,
         output: EngineCoreOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        for event in output.events.iter().flatten() {
+            match event.r#type {
+                EngineCoreEventType::Scheduled if self.scheduled_at.is_none() => {
+                    self.scheduled_at = Some(event.timestamp);
+                }
+                EngineCoreEventType::Preempted => self.prefill_preempted = true,
+                _ => {}
+            }
+        }
+        if !self.prefill_sampled {
+            if let Some(stats) = &output.prefill_stats {
+                self.prefill_sampled = true;
+                if !self.prefill_preempted
+                    && !matches!(
+                        output.finish_reason,
+                        Some(EngineCoreFinishReason::Abort | EngineCoreFinishReason::Error)
+                    )
+                {
+                    self.prefill_sample = self
+                        .scheduled_at
+                        .zip(output.batch_timestamp)
+                        .map(|(start, end)| (stats.num_computed_tokens, start, end));
+                }
+            }
+        }
         let top_k = self.top_logprobs;
         let state = &mut self.state;
         if let Some(stats) = &output.prefill_stats {
@@ -310,7 +327,15 @@ impl MappedGenerateStream for VllmGenerateStream {
 
         // An engine-side request failure (e.g. grammar compilation) must
         // surface as an error, not as a normal completion with empty output —
-        // that would produce a 200 with no content.
+        // that would produce a 200 with no content. The engine names no cause
+        // on this wire: the same `Error` ends a request whose grammar rejected
+        // a token, a decode side whose KV load failed, an encoder-cache miss
+        // and a pre-processing fault, and an `Abort` the frontend did not ask
+        // for is a pause or a shutdown aborting every request; so a
+        // constrained request's `Error` stays the engine's own report (the
+        // router retries, charges and probes it as such) and its `Abort` keeps
+        // its shape. The constraint-failure status is raised only by a wire
+        // whose engine attributes the failure (see the SGLang stream).
         if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
@@ -329,9 +354,21 @@ impl MappedGenerateStream for VllmGenerateStream {
             finish,
             &mut self.pending,
         );
-        self.attach_input_logprobs(&mut response);
-        attach_kv_transfer_params(&mut response, &mut self.pending, output.kv_transfer_params);
-        attach_spec_decode_counts(&mut response, &mut self.pending, output.spec_decode_metrics);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
+        attach_kv_transfer_params(
+            &mut response,
+            &mut self.pending,
+            output.kv_transfer_params.map(|params| *params),
+        );
+        attach_spec_decode_counts(
+            &mut response,
+            &mut self.pending,
+            output.spec_decode_metrics.map(|metrics| *metrics),
+        );
         Ok(response)
     }
 }
@@ -449,19 +486,13 @@ pub(crate) fn translate_request(
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
 ) -> Result<EngineCoreRequest, String> {
-    translate_request_with_backend(req, max_model_len, model_dtype, eos, None)
-}
-
-/// The engine's `--structured-outputs-config.backend`, as it bears on the
-/// `_backend` this translation stamps on structured requests: `auto` (vLLM's
-/// default) resolves per constraint the way vLLM's frontend does
-/// ([`StructuredOutputsParams::with_auto_backend`]); an explicit backend is
-/// pinned on every request. The engine keeps the backend of its first
-/// structured request, as it does behind vLLM's own frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StructuredOutputsBackendConfig {
-    Auto,
-    Pinned(StructuredOutputBackend),
+    translate_request_with_backend(
+        req,
+        max_model_len,
+        model_dtype,
+        eos,
+        StructuredOutputsBackendConfig::default(),
+    )
 }
 
 /// [`StructuredOutputsBackendConfig`] from the configured backend name.
@@ -635,34 +666,37 @@ pub(crate) fn translated_from_processed(
     processed.into_translated(req, model_dtype)
 }
 
-/// [`translate_request`] with the grammar backend configured for the engine
-/// (`None` keeps the per-constraint default of the translation); the
-/// request's media is translated inline.
+/// [`translate_request`] with the grammar backend configured for the engine;
+/// the request's media is translated inline.
 #[cfg(test)]
 pub(crate) fn translate_request_with_backend(
     mut req: vllm::GenerateRequest,
     max_model_len: u64,
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     let media = translate_media(&mut req, model_dtype)?;
-    translate_request_with_media(req, media, max_model_len, eos, structured_backend)
+    translate_request_with_media(req, media, max_model_len, eos, structured_backend.into())
 }
 
 /// Translate a request whose media was already translated
 /// ([`translate_media`]), so the choices of one request share the work.
+/// An empty prompt, or one that fills the context window, is refused before
+/// it can reach the engine ([`admit_prompt`]).
 pub(crate) fn translate_request_with_media(
     req: vllm::GenerateRequest,
     media: TranslatedMedia,
     max_model_len: u64,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
-    prompt_token_ids(&req)?;
+    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
+    // (`max_model_len - prompt_len`).
+    let default_max_tokens = admit_prompt(prompt_token_ids(&req)?.len(), max_model_len)?;
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
         _ => None,
@@ -676,14 +710,20 @@ pub(crate) fn translate_request_with_media(
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
         .transpose()?;
-    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
-    // (`max_model_len - prompt_len`).
-    let prompt_len = prompt_token_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
-    let default_max_tokens =
-        u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
+        refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
+    // A grammar the gateway led with the model's thought for a worker whose
+    // grammar starts at the first token starts there whatever reasoning parser
+    // the engine runs: `reasoning_ended = true` is the engine's own switch for
+    // the gate behind its parser being passed. A request that constrains
+    // nothing, or whose grammar the gateway did not shape, says nothing of it,
+    // and the engine starts the grammar where it does.
+    let grammar_from_first_token = req
+        .sampling_params
+        .as_ref()
+        .is_some_and(|sp| sp.grammar_from_first_token && sp.constraint.is_some());
     let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
         (None, false) => None,
         (sp, _) => Some(translate_sampling(
@@ -691,7 +731,7 @@ pub(crate) fn translate_request_with_media(
             default_max_tokens,
             eos,
             kv_transfer_params,
-            structured_backend,
+            support.backend,
         )),
     };
     Ok(EngineCoreRequest {
@@ -702,6 +742,7 @@ pub(crate) fn translate_request_with_media(
         arrival_time: now_secs(),
         data_parallel_rank,
         cache_salt,
+        reasoning_ended: grammar_from_first_token.then_some(true),
         ..EngineCoreRequest::default()
     })
 }
@@ -742,7 +783,7 @@ pub(crate) fn translate_sampling(
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -798,15 +839,10 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
-        structured_outputs: sp.constraint.and_then(translate_constraint).map(|params| {
-            match structured_backend {
-                None => params,
-                Some(StructuredOutputsBackendConfig::Auto) => params.with_auto_backend(),
-                Some(StructuredOutputsBackendConfig::Pinned(backend)) => {
-                    params.with_backend(backend)
-                }
-            }
-        }),
+        structured_outputs: sp
+            .constraint
+            .and_then(translate_constraint)
+            .map(|params| params.with_backend(structured_backend.backend())),
         extra_args: kv_transfer_params
             .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
@@ -889,9 +925,26 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
-/// Map the proto `constraint` oneof onto typed structured-output params. The
-/// backend defaults to guidance engine-side; `json_object=false` selects no
-/// constraint (the caller opted out), so it maps to `None`.
+/// The request's constraint as the shared refusal reads it
+/// ([`refuse_unenforceable_constraint`]): the proto `constraint` one-of by
+/// kind, with its text. `json_object = false` is an opt-out, no constraint.
+pub(crate) fn constraint_ref(sp: &vllm::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use vllm::sampling_params::Constraint;
+    match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => Some(ConstraintRef::JsonSchema(schema)),
+        Constraint::Regex(regex) => Some(ConstraintRef::Regex(regex)),
+        Constraint::Grammar(grammar) => Some(ConstraintRef::Ebnf(grammar)),
+        Constraint::StructuralTag(tag) => Some(ConstraintRef::StructuralTag(tag)),
+        Constraint::JsonObject(true) => Some(ConstraintRef::JsonObject),
+        Constraint::JsonObject(false) => None,
+        Constraint::Choice(_) => Some(ConstraintRef::Choice),
+    }
+}
+
+/// Map the proto `constraint` oneof onto typed structured-output params (the
+/// backend is pinned by the caller, [`translate_sampling`]);
+/// `json_object=false` selects no constraint (the caller opted out), so it
+/// maps to `None`.
 pub(crate) fn translate_constraint(
     constraint: vllm::sampling_params::Constraint,
 ) -> Option<StructuredOutputsParams> {
@@ -935,1287 +988,4 @@ pub(crate) fn now_secs() -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
-        protocol::vllm::{
-            logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
-            output::{EngineCoreOutputs, RequestBatchOutputs},
-        },
-        EngineId,
-    };
-    use openai_protocol::worker::RuntimeType;
-
-    use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
-
-    fn batch(
-        request_id: &str,
-        token: u32,
-        logprob: Option<f32>,
-        finish: Option<EngineCoreFinishReason>,
-    ) -> EngineCoreOutputs {
-        let finished = finish.map(|_| BTreeSet::from([request_id.to_string()]));
-        let new_logprobs = logprob.map(|lp| Logprobs {
-            positions: vec![PositionLogprobs {
-                entries: vec![TokenLogprob {
-                    token_id: token,
-                    logprob: lp,
-                    rank: 1,
-                }],
-            }],
-        });
-        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
-            engine_index: 0,
-            outputs: vec![EngineCoreOutput {
-                request_id: request_id.to_string(),
-                new_token_ids: vec![token],
-                new_logprobs,
-                finish_reason: finish,
-                ..Default::default()
-            }],
-            finished_requests: finished,
-            ..Default::default()
-        })
-    }
-
-    /// End-to-end over ipc://: the adapter translates a vLLM-proto request to
-    /// EngineCore, and maps the engine's outputs back to vLLM-proto responses.
-    #[tokio::test]
-    async fn generate_e2e_translates_and_streams_vllm_proto() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "engine task ends after responding"
-        )]
-        let engine_task = tokio::spawn(async move {
-            let (mut input, mut output) = engine.split();
-            let inbound = input.recv().await.unwrap();
-            let request = match inbound {
-                EngineInbound::Add(request) => request,
-                other => panic!("expected Add, got {other:?}"),
-            };
-            assert_eq!(request.request_id, "r1");
-            assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
-            assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 2);
-            output
-                .send_outputs(&batch("r1", 10, Some(-0.5), None))
-                .await
-                .unwrap();
-            output
-                .send_outputs(&batch(
-                    "r1",
-                    11,
-                    Some(-1.25),
-                    Some(EngineCoreFinishReason::Length),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let req = vllm::GenerateRequest {
-            request_id: "r1".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2, 3],
-                },
-            )),
-            sampling_params: Some(vllm::SamplingParams {
-                max_tokens: Some(2),
-                logprobs: Some(1),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
-        let mut stream = client.generate_vllm(req).await.expect("generate");
-
-        let first = stream.next().await.expect("chunk item").expect("chunk ok");
-        match first.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![10]);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5]);
-                assert_eq!(logprobs.token_ids, vec![10]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        // The finish tick carried a new token, so its delta is emitted as a
-        // chunk before the (cumulative) terminal complete.
-        let second = stream.next().await.expect("chunk item").expect("chunk ok");
-        match second.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![11]);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-1.25]);
-                assert_eq!(logprobs.token_ids, vec![11]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        let third = stream
-            .next()
-            .await
-            .expect("complete item")
-            .expect("complete ok");
-        match third.response {
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                assert_eq!(complete.output_ids, vec![10, 11]);
-                assert_eq!(complete.finish_reason, "length");
-                assert_eq!(complete.completion_tokens, 2);
-                let logprobs = complete.output_logprobs.expect("complete logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5, -1.25]);
-                assert_eq!(logprobs.token_ids, vec![10, 11]);
-            }
-            other => panic!("expected complete, got {other:?}"),
-        }
-        assert!(stream.next().await.is_none());
-
-        engine_task.await.unwrap();
-    }
-
-    /// The sampled token also ranks first — the common case under greedy or
-    /// low-temperature decoding. The engine repeats it in the ranked columns,
-    /// so the shaped list must carry it once and still return `k` candidates.
-    #[test]
-    fn shape_top_logprobs_dedups_sampled_token_at_rank_one() {
-        let entries = vec![
-            TokenLogprob {
-                token_id: 10,
-                logprob: -0.1,
-                rank: 1,
-            },
-            TokenLogprob {
-                token_id: 10,
-                logprob: -0.1,
-                rank: 1,
-            },
-            TokenLogprob {
-                token_id: 20,
-                logprob: -0.3,
-                rank: 2,
-            },
-        ];
-        assert_eq!(
-            shape_top_logprobs(&entries, 2),
-            vllm::TopLogProbs {
-                values: vec![-0.1, -0.3],
-                token_ids: vec![10, 20],
-            }
-        );
-        assert_eq!(
-            shape_top_logprobs(&entries, 1),
-            vllm::TopLogProbs {
-                values: vec![-0.1],
-                token_ids: vec![10],
-            }
-        );
-    }
-
-    /// A sampled token outside the top-k leads the list and the ranked
-    /// candidates follow in order, truncated to the requested count.
-    #[test]
-    fn shape_top_logprobs_keeps_sampled_token_outside_top_k() {
-        let entries = vec![
-            TokenLogprob {
-                token_id: 10,
-                logprob: -0.5,
-                rank: 5,
-            },
-            TokenLogprob {
-                token_id: 20,
-                logprob: -0.1,
-                rank: 1,
-            },
-            TokenLogprob {
-                token_id: 30,
-                logprob: -0.3,
-                rank: 2,
-            },
-        ];
-        assert_eq!(
-            shape_top_logprobs(&entries, 2),
-            vllm::TopLogProbs {
-                values: vec![-0.5, -0.1],
-                token_ids: vec![10, 20],
-            }
-        );
-    }
-
-    /// With `logprobs=k`, each position's ranked candidates are shaped into
-    /// `top_logprobs`, taking the sampled entry plus the leading candidates up
-    /// to the requested count (matching the gRPC servicer's `islice` behaviour).
-    #[tokio::test]
-    async fn generate_shapes_top_logprobs_to_requested_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
-
-        // One position with the sampled token (actual vocab rank) first, then
-        // the engine's ranked candidates. The wire carries `k + 1` entries.
-        let position = PositionLogprobs {
-            entries: vec![
-                TokenLogprob {
-                    token_id: 10,
-                    logprob: -0.5,
-                    rank: 5,
-                },
-                TokenLogprob {
-                    token_id: 20,
-                    logprob: -0.1,
-                    rank: 1,
-                },
-                TokenLogprob {
-                    token_id: 30,
-                    logprob: -0.3,
-                    rank: 2,
-                },
-            ],
-        };
-        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
-            engine_index: 0,
-            outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
-                new_token_ids: vec![10],
-                new_logprobs: Some(Logprobs {
-                    positions: vec![position],
-                }),
-                finish_reason: Some(EngineCoreFinishReason::Length),
-                ..Default::default()
-            }],
-            finished_requests: Some(BTreeSet::from(["r1".to_string()])),
-            ..Default::default()
-        });
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "engine task ends after responding"
-        )]
-        let engine_task = tokio::spawn(async move {
-            let (mut input, mut output) = engine.split();
-            let inbound = input.recv().await.unwrap();
-            let request = match inbound {
-                EngineInbound::Add(request) => request,
-                other => panic!("expected Add, got {other:?}"),
-            };
-            assert_eq!(request.sampling_params.as_ref().unwrap().logprobs, Some(2));
-            output.send_outputs(&outputs).await.unwrap();
-        });
-
-        let req = vllm::GenerateRequest {
-            request_id: "r1".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2, 3],
-                },
-            )),
-            sampling_params: Some(vllm::SamplingParams {
-                max_tokens: Some(1),
-                logprobs: Some(2),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
-        let mut stream = client.generate_vllm(req).await.expect("generate");
-
-        // The requested count is 2, so `top_logprobs` keeps the sampled entry
-        // plus the leading candidate (the third entry is dropped).
-        let expected_top = vec![vllm::TopLogProbs {
-            values: vec![-0.5, -0.1],
-            token_ids: vec![10, 20],
-        }];
-
-        // The finish tick carried a token, so the delta streams as a chunk.
-        let chunk = stream.next().await.expect("chunk item").expect("chunk ok");
-        match chunk.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5]);
-                assert_eq!(logprobs.token_ids, vec![10]);
-                assert_eq!(logprobs.top_logprobs, expected_top);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        let complete = stream
-            .next()
-            .await
-            .expect("complete item")
-            .expect("complete ok");
-        match complete.response {
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                let logprobs = complete.output_logprobs.expect("complete logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5]);
-                assert_eq!(logprobs.token_ids, vec![10]);
-                assert_eq!(logprobs.top_logprobs, expected_top);
-            }
-            other => panic!("expected complete, got {other:?}"),
-        }
-        assert!(stream.next().await.is_none());
-
-        engine_task.await.unwrap();
-    }
-
-    /// Prompt logprobs end to end: the request carries `prompt_logprobs` to the
-    /// engine, and the engine's prompt tensors come back as `input_logprobs` on
-    /// the first token-bearing chunk (once) and on the terminal `Complete`.
-    #[tokio::test]
-    async fn generate_streams_prompt_logprobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
-
-        // Prompt position for input token 2 (the engine scores every prompt
-        // token but the first), with one ranked candidate behind it.
-        let prompt_tensors = Logprobs {
-            positions: vec![PositionLogprobs {
-                entries: vec![
-                    TokenLogprob {
-                        token_id: 2,
-                        logprob: -0.5,
-                        rank: 3,
-                    },
-                    TokenLogprob {
-                        token_id: 20,
-                        logprob: -0.1,
-                        rank: 1,
-                    },
-                ],
-            }],
-        };
-        let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
-            engine_index: 0,
-            outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
-                new_token_ids: vec![10],
-                new_prompt_logprobs_tensors: Some(prompt_tensors),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-        let decode = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
-            engine_index: 0,
-            outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
-                new_token_ids: vec![11],
-                finish_reason: Some(EngineCoreFinishReason::Length),
-                ..Default::default()
-            }],
-            finished_requests: Some(BTreeSet::from(["r1".to_string()])),
-            ..Default::default()
-        });
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "engine task ends after responding"
-        )]
-        let engine_task = tokio::spawn(async move {
-            let (mut input, mut output) = engine.split();
-            let inbound = input.recv().await.unwrap();
-            let request = match inbound {
-                EngineInbound::Add(request) => request,
-                other => panic!("expected Add, got {other:?}"),
-            };
-            assert_eq!(
-                request.sampling_params.as_ref().unwrap().prompt_logprobs,
-                Some(1),
-                "prompt_logprobs reaches the engine"
-            );
-            output.send_outputs(&prefill).await.unwrap();
-            output.send_outputs(&decode).await.unwrap();
-        });
-
-        let req = vllm::GenerateRequest {
-            request_id: "r1".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2],
-                },
-            )),
-            sampling_params: Some(vllm::SamplingParams {
-                max_tokens: Some(2),
-                prompt_logprobs: Some(1),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
-        let mut stream = client.generate_vllm(req).await.expect("generate");
-
-        // Prompt token 1 leads with a null logprob (nothing precedes it); the
-        // requested count of 1 keeps the prompt token's own ranked entry.
-        let expect_input_logprobs = |logprobs: Option<vllm::InputLogProbs>, whose: &str| {
-            let logprobs = logprobs.unwrap_or_else(|| panic!("{whose} input logprobs"));
-            assert_eq!(logprobs.token_ids, vec![1, 2]);
-            assert_eq!(
-                logprobs.token_logprobs,
-                vec![
-                    vllm::InputTokenLogProb { value: None },
-                    vllm::InputTokenLogProb { value: Some(-0.5) },
-                ]
-            );
-            assert_eq!(
-                logprobs.top_logprobs,
-                vec![
-                    vllm::TopLogProbs::default(),
-                    vllm::TopLogProbs {
-                        values: vec![-0.5],
-                        token_ids: vec![2],
-                    },
-                ]
-            );
-        };
-
-        let first = stream.next().await.expect("chunk item").expect("chunk ok");
-        match first.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                expect_input_logprobs(chunk.input_logprobs, "first chunk");
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        // The finish tick carried a token, so its delta streams as a chunk
-        // first — without repeating the prompt logprobs.
-        let second = stream.next().await.expect("chunk item").expect("chunk ok");
-        match second.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert!(
-                    chunk.input_logprobs.is_none(),
-                    "prompt logprobs ride the first chunk only"
-                );
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        let complete = stream
-            .next()
-            .await
-            .expect("complete item")
-            .expect("complete ok");
-        match complete.response {
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                expect_input_logprobs(complete.input_logprobs, "complete");
-            }
-            other => panic!("expected complete, got {other:?}"),
-        }
-
-        engine_task.await.unwrap();
-    }
-
-    #[test]
-    fn finish_reasons_map_to_vllm_strings() {
-        assert_eq!(finish_reason_str(EngineCoreFinishReason::Length), "length");
-        assert_eq!(
-            finish_reason_str(EngineCoreFinishReason::Repetition),
-            "stop"
-        );
-        assert_eq!(finish_reason_str(EngineCoreFinishReason::Abort), "abort");
-    }
-
-    fn tokenized_req(sampling: vllm::SamplingParams) -> vllm::GenerateRequest {
-        vllm::GenerateRequest {
-            request_id: "r1".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2, 3],
-                },
-            )),
-            sampling_params: Some(sampling),
-            stream: true,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn vllm_forwards_prompt_logprobs() {
-        // Prompt logprobs ride the wire sampling params verbatim.
-        let request = translate_request(
-            tokenized_req(vllm::SamplingParams {
-                prompt_logprobs: Some(2),
-                ..Default::default()
-            }),
-            4096,
-            ModelDtype::BFloat16,
-            &EosTokenIds::default(),
-        )
-        .expect("translated");
-        assert_eq!(
-            request.sampling_params.as_ref().unwrap().prompt_logprobs,
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
-        let mut req = tokenized_req(vllm::SamplingParams::default());
-        assert_eq!(kv_transfer_params(&req).unwrap(), None);
-
-        req.kv_transfer_params = Some(vllm::KvTransferParams {
-            remote_host: "10.0.0.1".to_string(),
-            remote_port: 5600,
-        });
-        assert_eq!(
-            kv_transfer_params(&req).unwrap(),
-            Some(serde_json::json!({"remote_host": "10.0.0.1", "remote_port": 5600}))
-        );
-        // The JSON field wins over the legacy pair.
-        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
-        assert_eq!(
-            kv_transfer_params(&req).unwrap(),
-            Some(serde_json::json!({"do_remote_decode": true}))
-        );
-        // Malformed params are the caller's error, as on the Python servicer.
-        req.kv_transfer_params_json = Some("[1]".to_string());
-        assert!(kv_transfer_params(&req)
-            .unwrap_err()
-            .contains("JSON object"));
-        req.kv_transfer_params_json = Some("{".to_string());
-        assert!(kv_transfer_params(&req).unwrap_err().contains("invalid"));
-        req.kv_transfer_params_json = None;
-        req.kv_transfer_params = Some(vllm::KvTransferParams {
-            remote_host: String::new(),
-            remote_port: 5600,
-        });
-        assert!(kv_transfer_params(&req)
-            .unwrap_err()
-            .contains("remote_host"));
-    }
-
-    #[test]
-    fn kv_transfer_params_ride_the_sampling_extra_args() {
-        let mut req = tokenized_req(vllm::SamplingParams::default());
-        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
-        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
-            .expect("translated");
-        let extra = request
-            .sampling_params
-            .as_ref()
-            .and_then(|sp| sp.extra_args.as_ref())
-            .expect("extra_args");
-        assert_eq!(
-            extra["kv_transfer_params"],
-            serde_json::json!({"do_remote_decode": true})
-        );
-        // A request without sampling params still carries them.
-        let mut req = tokenized_req(vllm::SamplingParams::default());
-        req.sampling_params = None;
-        req.kv_transfer_params_json = Some(r#"{"do_remote_decode":true}"#.to_string());
-        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
-            .expect("translated");
-        assert!(request
-            .sampling_params
-            .and_then(|sp| sp.extra_args)
-            .is_some_and(|extra| extra.contains_key("kv_transfer_params")));
-    }
-
-    #[test]
-    fn returned_kv_transfer_params_land_on_the_complete() {
-        let params = serde_json::json!({
-            "do_remote_prefill": true,
-            "remote_block_ids": [1, 2],
-            "remote_host": "10.0.0.1",
-            "remote_port": 5600,
-        });
-        // Direct Complete.
-        let mut response = vllm::GenerateResponse {
-            response: Some(vllm::generate_response::Response::Complete(
-                vllm::GenerateComplete::default(),
-            )),
-        };
-        let mut pending = None;
-        attach_kv_transfer_params(&mut response, &mut pending, Some(params.clone()));
-        let Some(vllm::generate_response::Response::Complete(complete)) = response.response else {
-            panic!("complete");
-        };
-        let json: serde_json::Value =
-            serde_json::from_str(complete.kv_transfer_params_json.as_deref().unwrap()).unwrap();
-        assert_eq!(json, params);
-        let legacy = complete.kv_transfer_params.unwrap();
-        assert_eq!(
-            (legacy.remote_host.as_str(), legacy.remote_port),
-            ("10.0.0.1", 5600)
-        );
-
-        // Complete parked behind the finish tick's chunk.
-        let mut response = vllm::GenerateResponse {
-            response: Some(vllm::generate_response::Response::Chunk(
-                vllm::GenerateStreamChunk::default(),
-            )),
-        };
-        let mut pending = Some(vllm::GenerateResponse {
-            response: Some(vllm::generate_response::Response::Complete(
-                vllm::GenerateComplete::default(),
-            )),
-        });
-        attach_kv_transfer_params(
-            &mut response,
-            &mut pending,
-            Some(serde_json::json!({"remote_engine_id": "eng-a"})),
-        );
-        let Some(vllm::generate_response::Response::Complete(parked)) = pending.unwrap().response
-        else {
-            panic!("parked complete");
-        };
-        assert_eq!(
-            parked.kv_transfer_params_json.as_deref(),
-            Some(r#"{"remote_engine_id":"eng-a"}"#)
-        );
-        // No host/port: no legacy mirror.
-        assert!(parked.kv_transfer_params.is_none());
-
-        // A non-finish chunk carries nothing.
-        let mut response = vllm::GenerateResponse {
-            response: Some(vllm::generate_response::Response::Chunk(
-                vllm::GenerateStreamChunk::default(),
-            )),
-        };
-        let mut pending = None;
-        attach_kv_transfer_params(&mut response, &mut pending, Some(params));
-        assert!(pending.is_none());
-    }
-
-    #[test]
-    fn structured_output_backend_follows_the_engine_config() {
-        use engine_zmq_client::protocol::vllm::structured_outputs::{
-            StructuredOutputBackend, StructuredOutputConstraint,
-        };
-        use StructuredOutputsBackendConfig::{Auto, Pinned};
-
-        assert_eq!(
-            structured_outputs_backend_from_config("guidance"),
-            Pinned(StructuredOutputBackend::Guidance)
-        );
-        assert_eq!(
-            structured_outputs_backend_from_config(" outlines "),
-            Pinned(StructuredOutputBackend::Outlines)
-        );
-        assert_eq!(
-            structured_outputs_backend_from_config("lm-format-enforcer"),
-            Pinned(StructuredOutputBackend::LmFormatEnforcer)
-        );
-        // vLLM reads the backend off an option-carrying spelling's prefix.
-        assert_eq!(
-            structured_outputs_backend_from_config("xgrammar:disable-any-whitespace"),
-            Pinned(StructuredOutputBackend::Xgrammar)
-        );
-        // `auto` (and anything unknown) resolves per constraint.
-        assert_eq!(structured_outputs_backend_from_config("auto"), Auto);
-        assert_eq!(structured_outputs_backend_from_config(""), Auto);
-
-        let constrained = || {
-            tokenized_req(vllm::SamplingParams {
-                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
-                ..Default::default()
-            })
-        };
-        let backend_of = |request: EngineCoreRequest| {
-            request
-                .sampling_params
-                .and_then(|sp| sp.structured_outputs)
-                .map(|so| so.backend)
-                .expect("structured outputs")
-        };
-        // Pinned by the caller: every constraint carries the engine's backend.
-        let request = translate_request_with_backend(
-            constrained(),
-            4096,
-            ModelDtype::BFloat16,
-            &EosTokenIds::default(),
-            Some(Pinned(StructuredOutputBackend::Guidance)),
-        )
-        .expect("translated");
-        assert_eq!(backend_of(request), StructuredOutputBackend::Guidance);
-        // Unpinned: the translation's own per-constraint default.
-        let request = translate_request(
-            constrained(),
-            4096,
-            ModelDtype::BFloat16,
-            &EosTokenIds::default(),
-        )
-        .expect("translated");
-        assert_eq!(backend_of(request), StructuredOutputBackend::default());
-
-        // `auto`: vLLM's per-constraint resolution. A Lark grammar goes to
-        // xgrammar unchanged (vLLM 0.30 parses Lark there); a schema with a
-        // feature xgrammar lacks goes to guidance; a choice headed for
-        // xgrammar is lowered to the grammar vLLM's frontend substitutes.
-        let auto = |constraint| {
-            translate_request_with_backend(
-                tokenized_req(vllm::SamplingParams {
-                    constraint: Some(constraint),
-                    ..Default::default()
-                }),
-                4096,
-                ModelDtype::BFloat16,
-                &EosTokenIds::default(),
-                Some(Auto),
-            )
-            .expect("translated")
-            .sampling_params
-            .and_then(|sp| sp.structured_outputs)
-            .expect("structured outputs")
-        };
-        let lark = "start: \"yes\" | \"no\"";
-        let params = auto(vllm::sampling_params::Constraint::Grammar(lark.to_string()));
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
-        assert_eq!(
-            params.constraint,
-            StructuredOutputConstraint::Grammar(lark.to_string())
-        );
-        let params = auto(vllm::sampling_params::Constraint::JsonSchema(
-            r#"{"type":"integer","multipleOf":3}"#.to_string(),
-        ));
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
-        let params = auto(vllm::sampling_params::Constraint::Choice(
-            vllm::ChoiceConstraint {
-                choices: vec!["a".to_string(), "b".to_string()],
-            },
-        ));
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
-        assert_eq!(
-            params.constraint,
-            StructuredOutputConstraint::Grammar("root ::= \"a\" | \"b\"".to_string())
-        );
-    }
-
-    #[test]
-    fn spec_decode_counts_land_on_the_complete() {
-        let metrics = SpecDecodeMetrics {
-            num_spec_tokens: 3,
-            histogram: vec![1, 2, 0, 1],
-            num_draft_tokens: 9,
-            ..Default::default()
-        };
-        // 0*1 + 1*2 + 2*0 + 3*1 accepted draft tokens, as the Python servicer sums.
-        assert_eq!(metrics.accepted_tokens(), 5);
-        let mut response = vllm::GenerateResponse {
-            response: Some(vllm::generate_response::Response::Complete(
-                vllm::GenerateComplete::default(),
-            )),
-        };
-        let mut pending = None;
-        attach_spec_decode_counts(&mut response, &mut pending, Some(metrics));
-        let Some(vllm::generate_response::Response::Complete(complete)) = response.response else {
-            panic!("complete");
-        };
-        assert_eq!(complete.spec_accepted_tokens, 5);
-        assert_eq!(complete.spec_draft_tokens, 9);
-    }
-
-    #[test]
-    fn ranked_candidate_count_maps_the_sentinels() {
-        assert_eq!(ranked_candidate_count(None), 0);
-        assert_eq!(ranked_candidate_count(Some(0)), 0);
-        assert_eq!(ranked_candidate_count(Some(3)), 3);
-        // -1 asks for every candidate the engine returned.
-        assert_eq!(ranked_candidate_count(Some(-1)), usize::MAX);
-    }
-
-    #[test]
-    fn vllm_defaults_unset_max_tokens_to_remaining_context() {
-        let max_tokens = |sampling, max_model_len| {
-            translate_request(
-                tokenized_req(sampling),
-                max_model_len,
-                ModelDtype::BFloat16,
-                &EosTokenIds::default(),
-            )
-            .expect("request translated")
-            .sampling_params
-            .expect("sampling params present")
-            .max_tokens
-        };
-
-        // Unset max_tokens defaults to `max_model_len - prompt_len` (prompt is
-        // 3 tokens), mirroring vLLM's bypassed OpenAI frontend.
-        assert_eq!(max_tokens(vllm::SamplingParams::default(), 100), 97);
-        // An explicit value is always honored.
-        assert_eq!(
-            max_tokens(
-                vllm::SamplingParams {
-                    max_tokens: Some(8),
-                    ..Default::default()
-                },
-                100,
-            ),
-            8,
-        );
-    }
-
-    #[test]
-    fn vllm_attaches_eos_stop_ids() {
-        let eos = EosTokenIds::new(Some(5), vec![7]);
-        let sampling = |sp| {
-            translate_request(tokenized_req(sp), 4096, ModelDtype::BFloat16, &eos)
-                .expect("request translated")
-                .sampling_params
-                .expect("sampling params present")
-        };
-
-        // Primary rides `_eos_token_id`, extras merge into `stop_token_ids`
-        // without duplicating, and the union lands in `_all_stop_token_ids`.
-        let sp = sampling(vllm::SamplingParams {
-            stop_token_ids: vec![7, 9],
-            ..Default::default()
-        });
-        assert_eq!(sp.eos_token_id, Some(5));
-        assert_eq!(sp.stop_token_ids, vec![7, 9]);
-        assert_eq!(sp.all_stop_token_ids, BTreeSet::from([5, 7, 9]));
-
-        // ignore_eos drops the EOS stops from the wire but keeps the
-        // bookkeeping set (mirrors the reference frontend).
-        let sp = sampling(vllm::SamplingParams {
-            stop_token_ids: vec![9],
-            ignore_eos: true,
-            ..Default::default()
-        });
-        assert_eq!(sp.eos_token_id, None);
-        assert_eq!(sp.stop_token_ids, vec![9]);
-        assert_eq!(sp.all_stop_token_ids, BTreeSet::from([5, 7, 9]));
-    }
-
-    #[test]
-    fn vllm_translates_structured_output_constraints() {
-        use engine_zmq_client::protocol::vllm::structured_outputs::{
-            StructuredOutputBackend, StructuredOutputConstraint,
-        };
-
-        let translate = |constraint| {
-            translate_request(
-                tokenized_req(vllm::SamplingParams {
-                    constraint: Some(constraint),
-                    ..Default::default()
-                }),
-                4096,
-                ModelDtype::BFloat16,
-                &EosTokenIds::default(),
-            )
-            .expect("constraint translated")
-            .sampling_params
-            .expect("sampling params present")
-            .structured_outputs
-        };
-
-        // Each constraint mode maps onto its typed counterpart, always lowering
-        // to the guidance backend engine-side.
-        let json_object = translate(vllm::sampling_params::Constraint::JsonObject(true))
-            .expect("json_object translated");
-        assert_eq!(
-            json_object.constraint,
-            StructuredOutputConstraint::JsonObject
-        );
-        assert_eq!(json_object.backend, StructuredOutputBackend::Guidance);
-
-        let regex = translate(vllm::sampling_params::Constraint::Regex("a.*".to_string()))
-            .expect("regex translated");
-        assert_eq!(
-            regex.constraint,
-            StructuredOutputConstraint::Regex("a.*".to_string())
-        );
-
-        let choice = translate(vllm::sampling_params::Constraint::Choice(
-            vllm::ChoiceConstraint {
-                choices: vec!["yes".to_string(), "no".to_string()],
-            },
-        ))
-        .expect("choice translated");
-        assert_eq!(
-            choice.constraint,
-            StructuredOutputConstraint::Choice(vec!["yes".to_string(), "no".to_string()])
-        );
-
-        // A JSON schema string is parsed to preserve object shape.
-        let json = translate(vllm::sampling_params::Constraint::JsonSchema(
-            r#"{"type":"object"}"#.to_string(),
-        ))
-        .expect("json schema translated");
-        assert_eq!(
-            json.constraint,
-            StructuredOutputConstraint::Json(serde_json::json!({"type": "object"}))
-        );
-
-        // json_object=false means the caller opted out: no constraint.
-        assert!(translate(vllm::sampling_params::Constraint::JsonObject(false)).is_none());
-    }
-
-    /// n=3 fans out into 3 single-sample wire requests with unique sub-rids.
-    /// An explicit seed derives per-sub seeds (`seed + i`) so the samples
-    /// differ deterministically; no seed stays `None` per sub (the engine
-    /// seeds each rid independently).
-    #[test]
-    fn fan_out_splits_n_into_single_sample_requests() {
-        let mut req = tokenized_req(vllm::SamplingParams {
-            n: 3,
-            seed: Some(7),
-            ..Default::default()
-        });
-        req.request_id = "r1".to_string();
-
-        let subs = fan_out_requests(req);
-        assert_eq!(subs.len(), 3);
-        let rids: Vec<&str> = subs.iter().map(|sub| sub.request_id.as_str()).collect();
-        assert_eq!(rids, vec!["r1-0", "r1-1", "r1-2"]);
-        for (i, sub) in subs.iter().enumerate() {
-            let sp = sub.sampling_params.as_ref().unwrap();
-            assert_eq!(sp.n, 1);
-            assert_eq!(sp.seed, Some(7 + i as i32));
-            // Everything else is shared verbatim.
-            assert_eq!(
-                sub.input,
-                Some(vllm::generate_request::Input::Tokenized(
-                    vllm::TokenizedInput {
-                        original_text: String::new(),
-                        input_ids: vec![1, 2, 3],
-                    }
-                ))
-            );
-        }
-
-        // No explicit seed: every sub keeps None.
-        let subs = fan_out_requests(tokenized_req(vllm::SamplingParams {
-            n: 2,
-            ..Default::default()
-        }));
-        assert!(subs
-            .iter()
-            .all(|sub| sub.sampling_params.as_ref().unwrap().seed.is_none()));
-
-        // n<=1 passes through untouched (rid keeps its original form).
-        let single = fan_out_requests(tokenized_req(vllm::SamplingParams::default()));
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].request_id, "r1");
-    }
-
-    /// n=2 over a vLLM EngineCore: two engine-side requests with distinct
-    /// sub-rids, and the merged stream yields two `Complete`s tagged with the
-    /// proto `index` (0 and 1) the pipeline demuxes choices by.
-    #[tokio::test]
-    async fn generate_e2e_fans_out_n2_vllm() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "engine task ends after responding"
-        )]
-        let engine_task = tokio::spawn(async move {
-            let (mut input, mut output) = engine.split();
-            let mut rids = Vec::new();
-            for _ in 0..2 {
-                let request = match input.recv().await.unwrap() {
-                    EngineInbound::Add(request) => request,
-                    other => panic!("expected Add, got {other:?}"),
-                };
-                // Each sub is a single-sample request with a derived seed.
-                let sp = request.sampling_params.as_ref().unwrap();
-                assert_eq!(sp.max_tokens, 4);
-                rids.push((request.request_id.clone(), sp.seed));
-            }
-            assert_eq!(
-                rids,
-                vec![("r1-0".to_string(), Some(5)), ("r1-1".to_string(), Some(6))],
-                "sub-rids must be unique and seeds derived per sub"
-            );
-            output
-                .send_outputs(&batch("r1-0", 10, None, Some(EngineCoreFinishReason::Stop)))
-                .await
-                .unwrap();
-            output
-                .send_outputs(&batch("r1-1", 11, None, Some(EngineCoreFinishReason::Stop)))
-                .await
-                .unwrap();
-        });
-
-        let mut req = tokenized_req(vllm::SamplingParams {
-            n: 2,
-            seed: Some(5),
-            max_tokens: Some(4),
-            ..Default::default()
-        });
-        req.request_id = "r1".to_string();
-        let mut stream = client.generate_vllm(req).await.expect("generate");
-
-        let mut completes = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item.expect("stream item").response {
-                Some(vllm::generate_response::Response::Complete(complete)) => {
-                    completes.push(complete);
-                }
-                Some(vllm::generate_response::Response::Chunk(_)) | None => {}
-            }
-        }
-        completes.sort_by_key(|complete| complete.index);
-        assert_eq!(completes.len(), 2, "one Complete per fanned-out sub");
-        assert_eq!(completes[0].index, 0);
-        assert_eq!(completes[0].output_ids, vec![10]);
-        assert_eq!(completes[1].index, 1);
-        assert_eq!(completes[1].output_ids, vec![11]);
-
-        engine_task.await.unwrap();
-    }
-
-    /// Dropping the merged stream before completion aborts EVERY fanned-out
-    /// engine-side sub-request, not just one.
-    #[tokio::test]
-    async fn dropping_fanned_out_stream_aborts_all_subs() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
-        let (mut engine_input, _engine_output) = engine.split();
-
-        let stream = client
-            .generate_vllm(tokenized_req(vllm::SamplingParams {
-                n: 2,
-                ..Default::default()
-            }))
-            .await
-            .expect("generate");
-
-        // Consume both Adds first so the drop-triggered aborts are the next
-        // inbound messages.
-        for _ in 0..2 {
-            match engine_input.recv().await.unwrap() {
-                EngineInbound::Add(_) => {}
-                other => panic!("expected Add, got {other:?}"),
-            }
-        }
-
-        drop(stream); // unfinished -> every sub auto-aborts
-
-        let mut aborted = BTreeSet::new();
-        while aborted.len() < 2 {
-            match engine_input.recv().await.unwrap() {
-                EngineInbound::Abort(rids) => aborted.extend(rids),
-                other => panic!("expected Abort, got {other:?}"),
-            }
-        }
-        assert_eq!(
-            aborted,
-            BTreeSet::from(["r1-0".to_string(), "r1-1".to_string()])
-        );
-    }
-
-    fn sampling_request(sampling: vllm::SamplingParams) -> vllm::GenerateRequest {
-        vllm::GenerateRequest {
-            request_id: "s".to_string(),
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1, 2, 3],
-                },
-            )),
-            sampling_params: Some(sampling),
-            ..Default::default()
-        }
-    }
-
-    /// Proto "unset" zeros for `top_p`/`repetition_penalty` mean disabled, as
-    /// the Python servicer translates them; the engine rejects literal zeros.
-    #[test]
-    fn translate_normalizes_unset_top_p_and_repetition_penalty() {
-        let request = translate_request(
-            sampling_request(vllm::SamplingParams::default()),
-            1024,
-            ModelDtype::Float32,
-            &EosTokenIds::default(),
-        )
-        .expect("defaults translate");
-        let sampling = request.sampling_params.expect("sampling params");
-        assert_eq!(sampling.top_p, 1.0);
-        assert_eq!(sampling.repetition_penalty, 1.0);
-        assert_eq!(sampling.temperature, 1.0);
-        // Unset max_tokens defaults to the remaining context.
-        assert_eq!(sampling.max_tokens, 1024 - 3);
-    }
-
-    /// vLLM's parameter checks run before submit: a request the engine would
-    /// reject on its input thread (killing it) is an invalid-argument error.
-    #[test]
-    fn translate_rejects_sampling_the_engine_would_refuse() {
-        let cases: Vec<(&str, vllm::SamplingParams)> = vec![
-            (
-                "temperature",
-                vllm::SamplingParams {
-                    temperature: Some(-0.5),
-                    ..Default::default()
-                },
-            ),
-            (
-                "top_p",
-                vllm::SamplingParams {
-                    top_p: 1.5,
-                    ..Default::default()
-                },
-            ),
-            (
-                "min_p",
-                vllm::SamplingParams {
-                    min_p: 2.0,
-                    ..Default::default()
-                },
-            ),
-            (
-                "presence_penalty",
-                vllm::SamplingParams {
-                    presence_penalty: 3.0,
-                    ..Default::default()
-                },
-            ),
-            (
-                "repetition_penalty",
-                vllm::SamplingParams {
-                    repetition_penalty: -1.0,
-                    ..Default::default()
-                },
-            ),
-            (
-                "max_tokens",
-                vllm::SamplingParams {
-                    max_tokens: Some(0),
-                    ..Default::default()
-                },
-            ),
-            (
-                "min_tokens",
-                vllm::SamplingParams {
-                    max_tokens: Some(4),
-                    min_tokens: 8,
-                    ..Default::default()
-                },
-            ),
-            (
-                "logprobs",
-                vllm::SamplingParams {
-                    logprobs: Some(-2),
-                    ..Default::default()
-                },
-            ),
-            // vLLM's `_verify_greedy_sampling`: no distinct choices at temperature 0.
-            (
-                "n must be 1 when using greedy sampling, got 2.",
-                vllm::SamplingParams {
-                    temperature: Some(0.0),
-                    n: 2,
-                    ..Default::default()
-                },
-            ),
-        ];
-        for (field, sampling) in cases {
-            let error = translate_request(
-                sampling_request(sampling),
-                1024,
-                ModelDtype::Float32,
-                &EosTokenIds::default(),
-            )
-            .expect_err(field);
-            assert!(error.contains(field), "{field}: {error}");
-        }
-    }
-}
+mod tests;

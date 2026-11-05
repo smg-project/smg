@@ -22,7 +22,8 @@
 //!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
 //!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open
 //!   (three names for the breach: `empty-arguments`, `tolerated-json`, `whole-json`, so that a
-//!   run allows a class already reported and still catches the others);
+//!   run allows a class already reported and still catches the others); and a pythonic call
+//!   that ended without its own `)` has its object left open, closed for it by nothing;
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
 //!
@@ -44,9 +45,9 @@ use serde_json::{json, Value};
 use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
-    json::PartialJson,
-    CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, Parser,
+    json::{PartialJson, Prefix},
+    CallIds, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
+    Input, MalformedReason, Parser,
 };
 
 /// The recorded output slices the seeds are made from, one definition with the crate's bench.
@@ -226,7 +227,7 @@ pub fn run(data: &[u8], table: Option<Table>) {
 ///
 /// As a replay does: a `feed` that fails is the `feed-failed` breach, and an engine that panics
 /// panics here.
-pub fn events(case: &Case, cuts: &[usize]) -> Vec<Event> {
+pub fn events(case: &Case, cuts: &[usize]) -> Vec<Event<'static>> {
     replay(case, cuts).events
 }
 
@@ -425,7 +426,7 @@ fn quoted(entry: &str) -> String {
 
 /// The events of one replay.
 struct Replayed {
-    events: Vec<Event>,
+    events: Vec<Event<'static>>,
 }
 
 /// The nonce both replays of a case count their call ids from: an engine draws its own at random
@@ -494,12 +495,12 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
     Replayed { events }
 }
 
-fn feed(
+fn feed<'d>(
     case: &Case,
     engine: &mut Engine,
-    input: Input<'_>,
-    out: &mut Events,
-    events: &mut Vec<Event>,
+    input: Input<'d>,
+    out: &mut Events<'d>,
+    events: &mut Vec<Event<'static>>,
 ) {
     let step = input.clone();
     let fed = engine.feed(input, out);
@@ -510,7 +511,7 @@ fn feed(
             .map_or_else(String::new, ToString::to_string);
         format!("{}: feed of {step:?} failed: {why}", describe(case))
     });
-    events.extend(out.drain());
+    events.extend(out.drain().into_iter().map(Event::into_owned));
 }
 
 /// The case, for a message.
@@ -527,13 +528,13 @@ fn describe(case: &Case) -> String {
 }
 
 /// The output bytes `event` accounts for.
-fn bytes_of(event: &Event) -> &str {
+fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::Content(t) | Event::Reasoning(t) => &t.text,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => &text.text,
         Event::ToolCallStart { source, .. }
         | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        | Event::ToolCallEnd { source, .. } => &source.text,
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }
@@ -652,13 +653,41 @@ fn closed_structure(text: &str) -> bool {
     open.is_empty() && !inside
 }
 
-/// Whether `text` is a JSON prefix the prefix parser takes whole.
-fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+/// The breach in the arguments so far, when the crate's own judge of a JSON prefix ([`Prefix`])
+/// refuses them, which it does at the first byte a strict reader refuses and from the backslash
+/// of an escape no continuation completes: `json-prefix` when the partial parser refuses them too
+/// (nesting past the bound, bytes after the value, a word that is no literal, a surrogate without
+/// its other half), and `tolerated-json` when that parser takes them whole, the shapes JSON
+/// refuses and it tolerates (a value left out, a trailing comma, an escape JSON lacks, a `\u`
+/// escape short of its digits before its string's closing quote, which it reads as unfinished
+/// and the quote as the string's text, whitespace outside JSON's, a number or a word cut short
+/// before a delimiter), the name the call's end gives the same shapes, so that a run's allowance
+/// means one thing at a cut and at a close. The judge lets a raw control character inside a
+/// string through, as the fragment that carries one writes it as its escape; a number's range is
+/// the client's, as [`whole_json`] says.
+fn prefix_breach(so_far: &str) -> Option<&'static str> {
+    // Where the judge refused, if it did: where it did not, there is no breach.
+    Prefix::default().feed(so_far)?;
+    let tolerated = matches!(
+        PartialJson::default().parse(so_far, true),
+        Ok((_, consumed)) if consumed == so_far.len()
+    );
+    Some(if tolerated {
+        "tolerated-json"
+    } else {
+        "json-prefix"
+    })
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.
 fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
+    // A pythonic call ends at its own `)`, which every template writes before the region's
+    // marker; the other syntaxes' ends may carry no bytes by design (the block's close ends
+    // the call).
+    let pythonic = matches!(
+        case.table.format().call_syntax(),
+        Some(CallSyntax::Pythonic(_))
+    );
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
@@ -668,11 +697,18 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
     let mut broke: Vec<u32> = Vec::new();
     let mut reasoning_open = false;
     let mut finished = false;
+    // Whether the last event was the word of a call, or a string in it, that the stream's stop
+    // closed (`Malformed { OpenAtTheStop }`, of no bytes), or of a string the call's closing
+    // marker closed (`Malformed { OpenAtTheMarker }`): the fragment right after it may close the
+    // string with no byte of the output behind it, since the model's own end of output, or of
+    // the call, is what closed it.
+    let mut after_the_stops_word = false;
     for (at, event) in replayed.events.iter().enumerate() {
         let place = || format!("{} ({which}), event {at}: {event:?}", describe(case));
         breach("after-finish", !finished, || {
             format!("{}: an event after Finish", place())
         });
+        let stop_closed = std::mem::take(&mut after_the_stops_word);
         match event {
             Event::ToolCallStart { index, .. } => {
                 breach("second-start", !started.contains(index), || {
@@ -696,10 +732,14 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     // A fragment that closes a string the arguments so far left open carries the
                     // bytes that closed it, the model's quote, closing tag or token: a closing
                     // quote with no byte of the output behind it (none, or whitespace alone) is
-                    // one the reader made up for a value the model never closed.
+                    // one the reader made up for a value the model never closed. The one
+                    // exception is the model's own end of output: the stop has no bytes, and the
+                    // word right before the fragment says the stop closed the string.
                     breach(
                         "made-up-quote",
-                        !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
+                        !closes_an_open_string(so_far, json)
+                            || !source.text.trim().is_empty()
+                            || stop_closed,
                         || {
                             format!(
                                 "{}: the fragment {json:?} closes a string with no byte of the output behind it",
@@ -746,17 +786,17 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                                 place()
                             )
                         });
-                    } else {
-                        breach("json-prefix", valid_json_prefix(so_far), || {
+                    } else if let Some(name) = prefix_breach(so_far) {
+                        breach(name, false, || {
                             format!(
-                                "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                                "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
                                 place()
                             )
                         });
                     }
                 }
             }
-            Event::ToolCallEnd { index, .. } => {
+            Event::ToolCallEnd { index, source } => {
                 breach("end-before-start", started.contains(index), || {
                     format!("{}: an end before the call's start", place())
                 });
@@ -777,9 +817,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     // Three names for one promise, so that a run allows a class already
                     // reported and still catches the others: a call that ended with no fragment
                     // at all; a value whose shape closed but whose tokens JSON refuses (what the
-                    // prefix judge tolerates: a value left out, a trailing comma, an escape JSON
-                    // lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
-                    // short); and the rest, the committed prefix of a value that never closed.
+                    // partial parser tolerates: a value left out, a trailing comma, an escape
+                    // JSON lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
+                    // short, the shapes [`prefix_breach`] names the same way at the fragment
+                    // that brings them); and the rest, the committed prefix of a value that
+                    // never closed.
                     if so_far.is_empty() {
                         breach("empty-arguments", false, || {
                             format!(
@@ -803,10 +845,36 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                         });
                     }
                 }
+                // A pythonic end with no bytes of its own is a call the region's marker or the
+                // stream's end cut: nothing closes its object for it, whatever it said. A cut
+                // call that said nothing and left its object open is one of the whole-JSON
+                // names' breaches above, so no event is named twice.
+                if pythonic && source.text.is_empty() {
+                    let so_far = arguments
+                        .iter()
+                        .find(|(i, _)| i == index)
+                        .map(|(_, so_far)| so_far.as_str())
+                        .unwrap_or_default();
+                    breach("pythonic-cut-call-closed", !whole_json(so_far), || {
+                        format!(
+                            "{}: a pythonic call ended without its `)` with arguments {so_far:?}: a cut call's object stays open",
+                            place()
+                        )
+                    });
+                }
             }
             Event::Malformed { text, why } => {
+                // The word of a call, or a string in it, that the stream's stop closed, or of a
+                // string the call's closing marker closed: the fragment right after it may close
+                // the string with no bytes behind it, and the call's arguments at its end are
+                // whole JSON, which the end checks as for a call no word was said about.
+                let stops_word = matches!(
+                    why,
+                    MalformedReason::OpenAtTheStop | MalformedReason::OpenAtTheMarker
+                ) && text.text.is_empty();
+                after_the_stops_word = stops_word;
                 for index in &started {
-                    if !ended.contains(index) && !malformed_inside.contains(index) {
+                    if !ended.contains(index) && !malformed_inside.contains(index) && !stops_word {
                         malformed_inside.push(*index);
                     }
                     if !ended.contains(index)
@@ -1206,7 +1274,7 @@ mod tests {
     /// The name of the breach `check_well_formed` reports on `events`, as the stream of one
     /// replay, or None when it holds: the checks on the shape of a stream, without a parser
     /// behind it, so that a check is tried on the event list it is about.
-    fn breach_in(table: Table, events: Vec<Event>) -> Option<String> {
+    fn breach_in(table: Table, events: Vec<Event<'static>>) -> Option<String> {
         // An allowance would turn a breach into a hold and the assertion into a riddle.
         assert!(
             allowances().is_empty(),
@@ -1235,7 +1303,7 @@ mod tests {
         }
     }
 
-    fn start(index: u32) -> Event {
+    fn start(index: u32) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -1244,29 +1312,29 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str, source: &str) -> Event {
+    fn arguments(index: u32, json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.to_string(),
-            source: Text::uncounted(source),
+            json: json.to_string().into(),
+            source: Text::uncounted(source.to_string()),
         }
     }
 
-    fn end(index: u32, source: &str) -> Event {
+    fn end(index: u32, source: &str) -> Event<'static> {
         Event::ToolCallEnd {
             index,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_string()),
         }
     }
 
-    fn malformed() -> Event {
+    fn malformed() -> Event<'static> {
         Event::Malformed {
             text: Text::uncounted(""),
             why: MalformedReason::UnterminatedRegion,
         }
     }
 
-    fn finish(tool_calls: u32) -> Event {
+    fn finish(tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason: FinishReason::ToolCalls,
             tool_calls,
@@ -1538,12 +1606,17 @@ mod tests {
             breach_in(Table::Qwen3, events)
         };
         assert_eq!(ended_with("").as_deref(), Some("empty-arguments"));
+        // A shape that closed with a value left out, a trailing comma or an escape JSON lacks
+        // is named at the fragment that brings it, by the judge of every fragment
+        // ([`prefix_breach`]); a scalar cut short passes that judge at every fragment and is
+        // named at the call's end. One name for both, since an allowance is by shape.
         for tolerated in [
             "{\"city\": \"Paris\", \"days\": ,}",
             "{\"a\": 1,}",
+            "\"\\h\"",
             "0e",
             "n",
-            "\"\\h\"",
+            "1.",
         ] {
             assert_eq!(
                 ended_with(tolerated).as_deref(),
@@ -1570,6 +1643,47 @@ mod tests {
         assert!(!closed_structure("}") && !closed_structure("{]") && !closed_structure("  "));
     }
 
+    /// The judge of every fragment names a refusal by what the partial parser makes of the text,
+    /// so that the scheduled run's allowance of `tolerated-json` hides no `json-prefix`: what
+    /// both refuse is `json-prefix`, what the judge refuses and the parser takes whole is
+    /// `tolerated-json`, at the fragment that brings it, and what the judge takes is no breach.
+    #[test]
+    fn a_fragments_breach_is_named_by_what_the_partial_parser_makes_of_it() {
+        let past_the_bound = format!("{{\"a\": {}", "[".repeat(33));
+        for (so_far, name) in [
+            // Nesting past the bound, and bytes after the closed object: both refuse.
+            (past_the_bound.as_str(), "json-prefix"),
+            ("{\"a\": 1}x", "json-prefix"),
+            // The short escape at a cut, and a trailing comma: the parser tolerates both.
+            ("{\"a\": [\"\\u1\"]", "tolerated-json"),
+            ("{\"a\": [1,]", "tolerated-json"),
+        ] {
+            assert_eq!(prefix_breach(so_far), Some(name), "{so_far:?}");
+            // The same text as the one fragment of a call, on the stream's own path.
+            let events = vec![
+                start(0),
+                arguments(0, so_far, so_far),
+                end(0, "</tool_call>"),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Qwen3, events).as_deref(),
+                Some(name),
+                "{so_far:?}"
+            );
+        }
+        for taken in [
+            "{\"a\": [1,",
+            "{\"a\": \"\\u1",
+            "{\"a\": 1.",
+            "{\"a\": -",
+            "",
+            "  ",
+        ] {
+            assert_eq!(prefix_breach(taken), None, "{taken:?}");
+        }
+    }
+
     #[test]
     fn the_events_of_both_replays_are_the_streams_a_reader_sees() -> Result<(), String> {
         let output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
@@ -1588,6 +1702,52 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_pythonic_call_that_ended_without_its_close_said_so_and_stays_open() {
+        // The region's marker cut the call: an end of no bytes with the object closed for it is
+        // a breach, with a word or without; with the word and the object left open it holds;
+        // and a tagged call ends without bytes of its own by design.
+        let closed_for_it = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"}", "city='Paris'"),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(
+            breach_in(Table::Lfm2_5, closed_for_it).as_deref(),
+            Some("pythonic-cut-call-closed")
+        );
+        let said_and_closed = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            malformed(),
+            arguments(0, "}", ""),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(
+            breach_in(Table::Lfm2_5, said_and_closed).as_deref(),
+            Some("pythonic-cut-call-closed")
+        );
+        let said = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            malformed(),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Lfm2_5, said), None);
+        let closed_itself = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"}", "city='Paris')"),
+            end(0, ")"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Lfm2_5, closed_itself), None);
+        let tagged = vec![start(0), arguments(0, "{}", ""), end(0, ""), finish(1)];
+        assert_eq!(breach_in(Table::Qwen3Tagged, tagged), None);
     }
 
     #[test]

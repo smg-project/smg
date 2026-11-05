@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import enum
 import functools
-import hashlib
 import json
 import logging
 import math
@@ -41,8 +40,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
 from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.engine_status import grpc_code_for_http_status
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import (
@@ -57,7 +58,12 @@ from smg_grpc_servicer.tokenspeed.loads import (
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
-from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+    tokenspeed_grammar_backend,
+)
 from ..pd_pairing import pairing_protocol_from_env
 
 if TYPE_CHECKING:
@@ -404,7 +410,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.HealthCheckResponse:
         """Deep health probe — sends a 1-token generation to the scheduler.
 
-        Any scheduler push within ``HEALTH_CHECK_TIMEOUT`` counts as alive.
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, counts as alive within
+        ``HEALTH_CHECK_TIMEOUT``; a probe the engine refuses at the request
+        (its stream raises, or ends without an output) is unhealthy at once.
         ``log_metrics=False`` so health checks don't skew Prometheus counters.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
@@ -434,7 +443,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         probe.rid = rid
 
-        tic = time.time()
+        started = time.time()
 
         async def _drive_probe() -> bool:
             # Held so the finally can close it, as Generate holds its own: the
@@ -460,23 +469,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         task = asyncio.create_task(_drive_probe())
         try:
-            while time.time() - tic < HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(0.5)
-                # Any scheduler push after we started counts as healthy.
-                if self.async_llm.last_receive_tstamp > tic:
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=True,
-                        message="Health check passed",
-                    )
-                if task.done():
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=bool(task.result()),
-                        message=(
-                            "Health check passed"
-                            if task.result()
-                            else "Scheduler returned no output"
-                        ),
-                    )
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.async_llm.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict is not None:
+                return tokenspeed_scheduler_pb2.HealthCheckResponse(
+                    healthy=verdict,
+                    message="Health check passed" if verdict else "Scheduler returned no output",
+                )
         finally:
             if not task.done():
                 task.cancel()
@@ -679,6 +682,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         server_args_dict.update(
             grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
         )
+        # The grammar backend the scheduler runs, resolved, under the same key
+        # the Rust servicer reads.
+        grammar_backend_entry(server_args_dict, tokenspeed_grammar_backend(self.server_args))
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no
@@ -1101,15 +1107,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             )
             return
 
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(Path(tokenizer_path))
+            zip_data, sha256 = await tokenizer_bundle(Path(tokenizer_path))
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
             return
 
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
         logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", len(zip_data), sha256)
 
         for chunk in tokenizer_chunks(zip_data, sha256):
@@ -1792,9 +1800,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         chunk_token = raw_token[-n_chunk:] if len(raw_token) >= n_chunk else raw_token
         chunk_top = raw_top[-n_chunk:] if len(raw_top) >= n_chunk else raw_top
         delta_token = chunk_token[:n_keep]
-        # Pad ``delta_top`` to align with ``delta_token`` — TokenSpeed leaves
-        # ``output_top_logprobs`` empty when ``--enable-top-logprobs`` is off,
-        # but the gateway expects one ``TopLogProbs`` per emitted token.
+        # Pad ``delta_top`` to align with ``delta_token`` — a position has no
+        # ranked alternatives when the request asked for none (the usual path)
+        # or the engine reported none for it (it fills ``output_top_logprobs``
+        # for prefill-sampled tokens only), but the gateway expects one
+        # ``TopLogProbs`` per emitted token.
         delta_top = chunk_top[:n_keep] + [None] * max(0, len(delta_token) - len(chunk_top))
 
         top_proto = []
@@ -1807,9 +1817,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     )
                 )
             else:
-                # Position with no top-K data (e.g. ``--enable-top-logprobs``
-                # is not yet implemented in TokenSpeed; we still emit a
-                # placeholder per position so the gateway can align indices).
+                # Position with no top-K data (top-k not requested, or a
+                # prefill-only entry; on a decode step the engine aborts a
+                # top-k request instead); a placeholder per position keeps
+                # the gateway's indices aligned.
                 top_proto.append(tokenspeed_scheduler_pb2.TopLogProbs())
 
         return tokenspeed_scheduler_pb2.OutputLogProbs(
@@ -1820,14 +1831,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
 
 def _abort_status_code(reason: dict) -> grpc.StatusCode:
-    status_code = reason.get("status_code")
-    if status_code == 400:
-        return grpc.StatusCode.INVALID_ARGUMENT
-    if status_code in (408, 504):
-        return grpc.StatusCode.DEADLINE_EXCEEDED
-    if status_code == 429:
-        return grpc.StatusCode.RESOURCE_EXHAUSTED
-    return grpc.StatusCode.INTERNAL
+    """The gRPC code for an abort the engine reports with an HTTP-style
+    ``status_code`` (400 for the caller's input, 429 for a full queue, 408 or
+    504 for a timeout, ...): the table every engine servicer shares, so the
+    same engine condition is the same status behind every engine. An abort
+    without a status (a pause, a shutdown, a capacity abort) is ``INTERNAL``,
+    as it was."""
+    return grpc_code_for_http_status(reason.get("status_code"))
 
 
 def _version_str(version: Any) -> str | None:

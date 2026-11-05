@@ -9,34 +9,41 @@
 // mid-conversation system messages count as user turns, and image content
 // parts collapse to [`IMAGE_PLACEHOLDER`].
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // `DsEncodingError` lives in `deepseek_common` (shared with V4); re-exported
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
-// The family's special tokens: the private markers for this module, the
-// public ones re-exported under this renderer's path (the formatter keeps
-// every `use` in this block; the version's own constants follow the imports).
-use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
 };
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
-// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
-// tools template are V4's too, apart from the tag strings and the last-turn
+// The message read (`Turn`), message-shape preprocessing, drop-thinking, DSML
+// argument rendering, the tools template and the tools-and-response-format
+// section are V4's too, apart from the tag strings and the last-turn
 // definition; see `deepseek_common` for the shared implementation and its
 // own doc comments.
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        has_tools, merge_tool_messages, render_v4_tools_template, sort_tool_results_by_call_order,
-        task_sp_token, to_json, tool_calls_from_openai_format, tool_schemas,
-        tools_from_openai_format, DsmlTags,
+        has_tools, merge_tool_messages, push_tools_and_response_format, render_v4_tools_template,
+        sort_tool_results_by_call_order, task_sp_token, text, to_json, tool_schemas, DsmlTags,
+        IncomingBlocks, Turn,
     },
-    RendererProfile,
+    truthy, RendererProfile,
+};
+// The family's special tokens: the private markers for this module, the
+// public ones re-exported under this renderer's path (the formatter keeps
+// every `use` in this block; the version's own constants follow the imports).
+use super::{
+    deepseek_common::{
+        mark_grounding_tokens, ASSISTANT, BOS, DSML, EOS, LATEST_REMINDER, THINKING_END,
+        THINKING_START, USER,
+    },
+    marks::{self, control},
 };
 use crate::{
     chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
@@ -52,7 +59,11 @@ use crate::{
 /// What every image content part renders as; the image payload itself is the
 /// serving layer's business, the prompt only carries this marker.
 pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
-const SYSTEM_SP_TOKEN: &str = "<｜System｜>";
+/// The placeholder as the renderer writes it for an image part: a control
+/// token of its own (the spelling typed in text is refused, see
+/// `validate_no_image_sp_tokens`).
+const IMAGE: &str = control!("<｜deepseek_image｜>");
+const SYSTEM: &str = control!("<｜System｜>");
 /// V4.1's DSML dialect: a leading space on the block name and on both tags
 /// (V4 uses bare `tool_calls`/`invoke`/`parameter`).
 const TOOL_CALLS_BLOCK_NAME: &str = " calls";
@@ -64,17 +75,18 @@ const DSML_TAGS: DsmlTags = DsmlTags {
 // ---------------------------------------------------------------------------
 // Reasoning effort
 // ---------------------------------------------------------------------------
-/// The effort names the Python encoder accepts (`REASONING_EFFORT_MAPPINGS`).
-pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "xhigh", "max"];
+/// The effort names the renderer takes as levels: the checkpoint's chat
+/// template's (`low`/`medium`/`high`/`max`) and the `xhigh` of its first
+/// published encoder (`REASONING_EFFORT_MAPPINGS`).
+pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // Message parts are preserved (OpenAI wire format) so the gateway passes
     // `image_url` / `image` parts through as a list instead of flattening to
-    // a string; the encoder turns each part into a placeholder at its
-    // position. Part *order* is still the gateway's media-part order (the
-    // multimodal spec declares `Authored`; without a spec the gateway moves
-    // media first).
+    // a string, in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted); the encoder turns
+    // each part into a placeholder at its position.
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     // Thinking defaults ON: `reasoning_effort: "none"` or an explicit
     // `thinking: false` (or the engine's `enable_thinking` alias, see the
@@ -87,14 +99,13 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `<｜Assistant｜><think>` ends the prompt when thinking is on.
     think_in_prefill: true,
     // The shim honours the engine's `enable_thinking` alias, renders a
-    // trailing assistant message itself when `add_generation_prompt` is
-    // false, and parses tool-call `arguments` strings with the reference's
+    // trailing assistant message itself when `continue_final_message` asks,
+    // and parses tool-call `arguments` strings with the reference's
     // tolerance.
     capabilities: RendererCapabilities {
         enable_thinking_alias: true,
         native_assistant_continuation: true,
         raw_tool_call_arguments: true,
-        declares_tools_under_tool_choice_none: false,
         ..RendererProfile::NO_CAPABILITIES
     },
     thinking_mode: None,
@@ -103,10 +114,76 @@ pub const REASONING_EFFORT_TEMPLATE: &str =
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
-/// Reasoning effort for the V4.1 numeric prompt prefix.
+/// Which budgets the effort names stand for: the checkpoint's own encoder
+/// (`encoding/encoding.py`, its `REASONING_EFFORT_MAPPINGS`) moved them once.
+///
+/// The first published encoder mapped low/high/xhigh/max to 25/50/75/100.
+/// The refresh that followed maps low/high/max to 50/75/100 and has no
+/// `xhigh`; the chat template the checkpoint ships since carries the same
+/// numbers and a `medium` of its own at 62. A checkpoint directory without
+/// its encoder (a tokenizer directory streamed from a worker carries none)
+/// gets the rescaled table, the one the checkpoint carries today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortTable {
+    /// low 25, high 50, xhigh 75, max 100; `medium`, which this encoder
+    /// has no budget for, renders `high`'s.
+    Original,
+    /// low 50, medium 62, high 75, max 100 (the chat template's numbers);
+    /// `xhigh` renders `high`'s budget.
+    #[default]
+    Rescaled,
+}
+
+impl EffortTable {
+    /// The budget `effort` renders under this table.
+    pub const fn budget(self, effort: ReasoningEffort) -> u8 {
+        match (self, effort) {
+            (_, ReasoningEffort::Budget(budget)) => budget,
+            (_, ReasoningEffort::Max) => 100,
+            (Self::Original, ReasoningEffort::Low) => 25,
+            (Self::Original, ReasoningEffort::Medium | ReasoningEffort::High) => 50,
+            (Self::Original, ReasoningEffort::XHigh) => 75,
+            (Self::Rescaled, ReasoningEffort::Low) => 50,
+            (Self::Rescaled, ReasoningEffort::Medium) => 62,
+            (Self::Rescaled, ReasoningEffort::High | ReasoningEffort::XHigh) => 75,
+        }
+    }
+
+    /// Identify the table from the checkpoint's own `encoding/encoding.py`
+    /// source: the budget its `REASONING_EFFORT_MAPPINGS` gives `low`, 25 in
+    /// the first published encoder. Any other value, or no readable mapping,
+    /// is the rescaled table.
+    pub fn detect_from_encoder_source(source: &str) -> Self {
+        const MAPPINGS: &str = "REASONING_EFFORT_MAPPINGS";
+        const LOW: &str = "\"low\"";
+        let Some(mappings) = source.find(MAPPINGS) else {
+            return Self::Rescaled;
+        };
+        let after = &source[mappings + MAPPINGS.len()..];
+        let Some(low) = after.find(LOW) else {
+            return Self::Rescaled;
+        };
+        let Some(value) = after[low + LOW.len()..].trim_start().strip_prefix(':') else {
+            return Self::Rescaled;
+        };
+        let digits: String = value
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        match digits.parse::<u8>() {
+            Ok(25) => Self::Original,
+            _ => Self::Rescaled,
+        }
+    }
+}
+
+/// Reasoning effort for the V4.1 numeric prompt prefix; what each name
+/// renders is the [`EffortTable`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Low,
+    Medium,
     High,
     XHigh,
     Max,
@@ -115,22 +192,11 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Spec D1: engine table. Flip these four numbers if the serving engines adopt
-    /// DeepSeek's 50/75/100.
-    pub const fn budget(self) -> u8 {
-        match self {
-            Self::Low => 25,
-            Self::High => 50,
-            Self::XHigh => 75,
-            Self::Max => 100,
-            Self::Budget(n) => n,
-        }
-    }
-
     /// Parse one of [`NATIVE_EFFORT_VALUES`].
     fn from_native(value: &str) -> Option<Self> {
         match value {
             "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
@@ -141,7 +207,7 @@ impl ReasoningEffort {
 
 /// Parse the request's `reasoning_effort` field.
 ///
-/// `None` = not present. Strings low/high/xhigh/max, integers 1..=100. The
+/// `None` = not present. Strings low/medium/high/xhigh/max, integers 1..=100. The
 /// thinking switch (`"none"`/`"minimal"`, see
 /// `openai_protocol::chat::thinking_from_reasoning_effort`) is handled by the
 /// caller — those mean "thinking off", not an effort level — so they land here
@@ -165,16 +231,18 @@ pub fn parse_reasoning_effort(value: &Value) -> Result<Option<ReasoningEffort>, 
 }
 
 /// Mirrors `render_reasoning_effort`: the prefix exists in thinking mode, at
-/// index 0, only.
+/// index 0, only; the budget is `table`'s for the effort, `high`'s when none
+/// was given.
 fn render_reasoning_effort(
     index: usize,
     thinking_mode: ThinkingMode,
     effort: Option<ReasoningEffort>,
+    table: EffortTable,
 ) -> String {
     if index != 0 || thinking_mode != ThinkingMode::Thinking {
         return String::new();
     }
-    let budget = effort.unwrap_or(DEFAULT_REASONING_EFFORT).budget();
+    let budget = table.budget(effort.unwrap_or(DEFAULT_REASONING_EFFORT));
     REASONING_EFFORT_TEMPLATE.replace("{budget}", &budget.to_string())
 }
 
@@ -185,13 +253,6 @@ fn render_reasoning_effort(
 /// block name and spaced tags.
 fn render_tools(tools: &[Value]) -> String {
     render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
-}
-
-fn render_response_format(schema: &Value) -> String {
-    format!(
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-        to_json(schema)
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -206,24 +267,102 @@ fn render_response_format(schema: &Value) -> String {
 /// Mirrors the engine's `_normalize_messages` flattening plus the HF
 /// `_validate_no_image_sp_tokens` check (see the header comment above): list
 /// content collapses to the text V4.1 encodes, and no text may carry the image
-/// placeholder.
+/// placeholder. A message's own content blocks go through the reference's
+/// image pass, and when they are its only content (no string content), their
+/// text blocks joined by a blank line become its content, as the reference
+/// fills it for every role.
 fn process_image_messages(messages: &[Value]) -> Result<Vec<Value>, DsEncodingError> {
     let mut processed: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let mut msg = msg.clone();
         validate_no_image_sp_tokens(&msg)?;
+        let content_is_text = matches!(msg.get("content"), Some(Value::String(_)));
         let flattened = match msg.get("content") {
             Some(Value::Array(parts)) => Some(flatten_content_parts(parts)?),
             _ => None,
         };
-        if let Some(text) = flattened {
-            if let Some(obj) = msg.as_object_mut() {
+        let blocks = match msg.get("content_blocks") {
+            Some(Value::Array(blocks)) => Some(process_content_blocks(text(&msg, "role"), blocks)?),
+            _ => None,
+        };
+        if let Some(obj) = msg.as_object_mut() {
+            if let Some(text) = flattened {
                 obj.insert("content".to_string(), Value::String(text));
+            }
+            if let Some(blocks) = blocks {
+                if !content_is_text && !blocks.is_empty() {
+                    obj.insert("content".to_string(), Value::String(blocks_text(&blocks)));
+                }
+                obj.insert("content_blocks".to_string(), Value::Array(blocks));
             }
         }
         processed.push(msg);
     }
     Ok(processed)
+}
+
+/// The text of processed content blocks as the reference writes it into a
+/// message's content: the text blocks' texts (an image block is one by then,
+/// a tool result is not) joined by a blank line.
+fn blocks_text(blocks: &[Value]) -> String {
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter(|block| text(block, "type") == "text")
+        .map(|block| text(block, "text"))
+        .collect();
+    texts.join("\n\n")
+}
+
+/// Mirrors `_process_image_blocks` over a message's own content blocks: an
+/// image block (`image` or `image_url`, the reference's set) with a source
+/// becomes a text block holding the placeholder and one without is refused,
+/// a tool result's list content is walked the same way, and a text block may
+/// not carry the placeholder; any other block stays as it is, for
+/// `render_content_block` to mark.
+fn process_content_blocks(role: &str, blocks: &[Value]) -> Result<Vec<Value>, DsEncodingError> {
+    blocks
+        .iter()
+        .map(|block| match text(block, "type") {
+            "image" | "image_url" if image_has_source(block) => {
+                Ok(json!({ "type": "text", "text": IMAGE }))
+            }
+            "image" | "image_url" => Err(DsEncodingError::InvalidMessage {
+                role: role.to_string(),
+                msg: "Image block does not contain a valid source".to_string(),
+            }),
+            "tool_result" => match block.get("content") {
+                Some(Value::Array(items)) => {
+                    let content = Value::Array(process_content_blocks(role, items)?);
+                    let mut block = block.clone();
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("content".to_string(), content);
+                    }
+                    Ok(block)
+                }
+                _ => Ok(block.clone()),
+            },
+            "text" if text(block, "text").contains(IMAGE_PLACEHOLDER) => {
+                Err(DsEncodingError::PlaceholderInText)
+            }
+            _ => Ok(block.clone()),
+        })
+        .collect()
+}
+
+/// Mirrors `_extract_image`'s source check: an `image_url` block names a URL
+/// (as a string or under `url`), an `image` block carries a `source`, `url`
+/// or `data`.
+fn image_has_source(block: &Value) -> bool {
+    if text(block, "type") == "image_url" {
+        return match block.get("image_url") {
+            Some(Value::String(url)) => !url.is_empty(),
+            Some(image_url) => !text(image_url, "url").is_empty(),
+            None => false,
+        };
+    }
+    ["source", "url", "data"]
+        .iter()
+        .any(|key| block.get(key).is_some_and(truthy))
 }
 
 /// Mirrors `_validate_no_image_sp_tokens`: user text may not smuggle in the
@@ -256,7 +395,7 @@ fn flatten_content_parts(parts: &[Value]) -> Result<String, DsEncodingError> {
                 }
                 texts.push(text);
             }
-            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE_PLACEHOLDER),
+            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE),
             other => return Err(DsEncodingError::UnsupportedContentPart(other.to_string())),
         }
     }
@@ -282,62 +421,6 @@ fn find_last_turn_index(messages: &[Value]) -> Option<usize> {
     None
 }
 
-/// One message as the renderer reads it: the fields of the OpenAI-shape
-/// value, read once, with the tools and tool calls in the encoder's shape
-/// and empty lists dropped the way Python's truthiness drops them.
-struct Turn<'m> {
-    index: usize,
-    msg: &'m Value,
-    role: &'m str,
-    content: &'m str,
-    tools: Option<Vec<Value>>,
-    /// Python `if response_format:` — absent, null and `{}` are all falsy.
-    response_format: Option<&'m Value>,
-    tool_calls: Option<Vec<Value>>,
-    reasoning_content: &'m str,
-    wo_eos: bool,
-}
-
-impl<'m> Turn<'m> {
-    fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
-        let Some(msg) = messages.get(index) else {
-            return Err(DsEncodingError::IndexOutOfRange {
-                index,
-                len: messages.len(),
-            });
-        };
-        let tools = msg
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .map(|tools| tools_from_openai_format(tools))
-            .filter(|tools| !tools.is_empty());
-        let tool_calls = msg
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
-            .filter(|tool_calls| !tool_calls.is_empty());
-        Ok(Self {
-            index,
-            msg,
-            role: text(msg, "role"),
-            content: text(msg, "content"),
-            tools,
-            response_format: msg
-                .get("response_format")
-                .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty())),
-            tool_calls,
-            reasoning_content: text(msg, "reasoning_content"),
-            wo_eos: msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false),
-        })
-    }
-}
-
-/// A string field of a message, empty when absent or not a string, as the
-/// reference's `msg.get(key, "")` reads it.
-fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
-    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
-}
-
 /// Mirrors the reference's `render_message`: one turn's text, by role in the
 /// reference's order, then the transition to the next turn.
 fn render_message(
@@ -346,16 +429,23 @@ fn render_message(
     thinking_mode: ThinkingMode,
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
 ) -> Result<String, DsEncodingError> {
-    let turn = Turn::read(index, messages)?;
+    let Some(msg) = messages.get(index) else {
+        return Err(DsEncodingError::IndexOutOfRange {
+            index,
+            len: messages.len(),
+        });
+    };
+    let turn = Turn::read(index, msg);
     let last_user_idx = find_last_turn_index(messages);
-    let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort);
+    let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort, effort_table);
     match turn.role {
         "system" => render_system(&turn, &mut prompt),
         "developer" => render_developer(&turn, &mut prompt)?,
         "user" => render_user(&turn, &mut prompt),
         "latest_reminder" => {
-            prompt.push_str(LATEST_REMINDER_SP_TOKEN);
+            prompt.push_str(LATEST_REMINDER);
             prompt.push_str(turn.content);
         }
         "tool" => return Err(DsEncodingError::UnmergedToolRole(index)),
@@ -387,12 +477,13 @@ fn render_prefix(
     turn: &Turn<'_>,
     thinking_mode: ThinkingMode,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
 ) -> String {
     let reasoning_effort_prompt =
-        render_reasoning_effort(turn.index, thinking_mode, reasoning_effort);
+        render_reasoning_effort(turn.index, thinking_mode, reasoning_effort, effort_table);
     let mut prompt = String::new();
     if turn.index == 0 && (!reasoning_effort_prompt.is_empty() || turn.role == "system") {
-        prompt.push_str(SYSTEM_SP_TOKEN);
+        prompt.push_str(SYSTEM);
     }
     prompt.push_str(&reasoning_effort_prompt);
     prompt
@@ -402,10 +493,15 @@ fn render_prefix(
 /// tools and the response format follow the content.
 fn render_system(turn: &Turn<'_>, prompt: &mut String) {
     if turn.index > 0 {
-        prompt.push_str(SYSTEM_SP_TOKEN);
+        prompt.push_str(SYSTEM);
     }
     prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
 /// A developer turn renders as a user turn; an empty one is an error.
@@ -416,29 +512,21 @@ fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodi
             msg: turn.msg.to_string(),
         });
     }
-    prompt.push_str(USER_SP_TOKEN);
+    prompt.push_str(USER);
     prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
     Ok(())
-}
-
-/// The tools template and the response format of a system or developer
-/// turn, each after a blank line, when the turn has them.
-fn push_tools_and_response_format(turn: &Turn<'_>, prompt: &mut String) {
-    if let Some(tools) = &turn.tools {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(schema) = turn.response_format {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_response_format(schema));
-    }
 }
 
 /// A user turn: its content blocks (text and the tool results
 /// `merge_tool_messages` folded in) joined by blank lines, else its content.
 fn render_user(turn: &Turn<'_>, prompt: &mut String) {
-    prompt.push_str(USER_SP_TOKEN);
+    prompt.push_str(USER);
     let blocks = turn
         .msg
         .get("content_blocks")
@@ -508,15 +596,15 @@ fn render_assistant(
         && !prev_has_task
         && (!drop_thinking || after_last_user(turn.index, last_user_idx))
     {
-        prompt.push_str(turn.reasoning_content);
-        prompt.push_str(THINKING_END_TOKEN);
+        prompt.push_str(&mark_grounding_tokens(turn.reasoning_content));
+        prompt.push_str(THINKING_END);
     }
-    prompt.push_str(turn.content);
+    prompt.push_str(&mark_grounding_tokens(turn.content));
     if let Some(tool_calls) = &turn.tool_calls {
         prompt.push_str(&tool_calls_block(tool_calls));
     }
-    if !turn.wo_eos {
-        prompt.push_str(EOS_TOKEN);
+    if !turn.wo_eos() {
+        prompt.push_str(EOS);
     }
 }
 
@@ -530,15 +618,13 @@ fn tool_calls_block(tool_calls: &[Value]) -> String {
             let arguments = tool_call.get("arguments").unwrap_or(&Value::Null);
             let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
             format!(
-                "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
+                "<{DSML}{invoke} name=\"{name}\">\n{args}\n</{DSML}{invoke}>",
                 invoke = DSML_TAGS.invoke,
             )
         })
         .collect();
     let joined = calls.join("\n");
-    format!(
-        "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
-    )
+    format!("\n\n<{DSML}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML}{TOOL_CALLS_BLOCK_NAME}>")
 }
 
 /// What follows the turn: nothing when a next message exists and is not an
@@ -567,23 +653,23 @@ fn push_transition(
         let sp_token =
             task_sp_token(task).ok_or_else(|| DsEncodingError::InvalidTask(task.to_string()))?;
         if task == "action" {
-            prompt.push_str(ASSISTANT_SP_TOKEN);
+            prompt.push_str(ASSISTANT);
             prompt.push_str(if thinking_mode == ThinkingMode::Thinking {
-                THINKING_START_TOKEN
+                THINKING_START
             } else {
-                THINKING_END_TOKEN
+                THINKING_END
             });
         }
         prompt.push_str(sp_token);
     } else if matches!(turn.role, "user" | "developer") || (turn.role == "system" && turn.index > 0)
     {
-        prompt.push_str(ASSISTANT_SP_TOKEN);
+        prompt.push_str(ASSISTANT);
         let opens_thinking = thinking_mode == ThinkingMode::Thinking
             && (!drop_thinking || at_or_after_last_user(turn.index, last_user_idx));
         prompt.push_str(if opens_thinking {
-            THINKING_START_TOKEN
+            THINKING_START
         } else {
-            THINKING_END_TOKEN
+            THINKING_END
         });
     }
     Ok(())
@@ -601,6 +687,8 @@ pub struct EncodeParams {
     pub add_default_bos_token: bool,
     pub drop_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The checkpoint revision's effort table (see [`EffortTable`]).
+    pub effort_table: EffortTable,
 }
 impl Default for EncodeParams {
     fn default() -> Self {
@@ -608,6 +696,7 @@ impl Default for EncodeParams {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: None,
+            effort_table: EffortTable::Rescaled,
         }
     }
 }
@@ -625,11 +714,34 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let normalized = process_image_messages(messages)?;
-    let merged = merge_tool_messages(&normalized);
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    // The engine's renderer hands the conversation to this encoder with a
+    // `developer` message as written (its developer-to-system rewrite belongs
+    // to its template path, which this encoder never takes), so the vendor
+    // encoding's own rules apply: dropped before the last user-like turn with
+    // the thinking, a user turn otherwise.
+    let messages = marks::without_marks(messages);
+    let normalized = process_image_messages(&messages)?;
+    let merged = merge_tool_messages(&normalized, IncomingBlocks::Kept);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };
@@ -649,6 +761,7 @@ pub fn encode_messages(
             thinking_mode,
             effective_drop_thinking,
             params.reasoning_effort,
+            params.effort_table,
         )?);
     }
     Ok(prompt)
@@ -661,7 +774,7 @@ pub fn encode_messages(
 mod tests {
     use serde_json::{json, Value};
 
-    use super::*;
+    use super::{super::deepseek_common::object_arguments_render_one_parameter_per_key_through, *};
 
     fn user(q: &str) -> Value {
         json!({ "role": "user", "content": q })
@@ -671,6 +784,7 @@ mod tests {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: effort,
+            effort_table: EffortTable::Rescaled,
         }
     }
 
@@ -684,35 +798,105 @@ mod tests {
     }
 
     #[test]
-    fn thinking_mode_prefixes_effort_line_with_default_50() {
+    fn thinking_mode_prefixes_effort_line_with_the_tables_default() {
+        // No effort given: `high` of the table, 75 under the rescaled one
+        // (what the checkpoint's template writes) and 50 under the original.
         let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
+        let original = EncodeParams {
+            effort_table: EffortTable::Original,
+            ..params(None)
+        };
+        let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &original).unwrap();
         assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
     }
 
     #[test]
-    fn effort_tiers_follow_engine_table() {
-        for (tier, n) in [
-            (ReasoningEffort::Low, 25),
-            (ReasoningEffort::High, 50),
-            (ReasoningEffort::XHigh, 75),
-            (ReasoningEffort::Max, 100),
-            (ReasoningEffort::Budget(42), 42),
+    fn effort_tiers_follow_the_checkpoints_table() {
+        // The first published encoder's table and the rescaled one the
+        // checkpoint carries since (its chat template agrees, and adds
+        // `medium` at 62; the first encoder has no `medium`, so it renders
+        // `high`'s budget there); an integer budget renders as given under
+        // both.
+        for (table, tiers) in [
+            (
+                EffortTable::Original,
+                [
+                    (ReasoningEffort::Low, 25),
+                    (ReasoningEffort::Medium, 50),
+                    (ReasoningEffort::High, 50),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
+            (
+                EffortTable::Rescaled,
+                [
+                    (ReasoningEffort::Low, 50),
+                    (ReasoningEffort::Medium, 62),
+                    (ReasoningEffort::High, 75),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
         ] {
-            let out =
-                encode_messages(&[user("q")], ThinkingMode::Thinking, &params(Some(tier))).unwrap();
-            assert!(
-                out.contains(&format!("Reasoning Effort: {n} (range")),
-                "{tier:?}"
-            );
+            for (tier, n) in tiers {
+                let encode_params = EncodeParams {
+                    effort_table: table,
+                    ..params(Some(tier))
+                };
+                let out =
+                    encode_messages(&[user("q")], ThinkingMode::Thinking, &encode_params).unwrap();
+                assert!(
+                    out.contains(&format!("Reasoning Effort: {n} (range")),
+                    "{table:?} {tier:?}: {out}"
+                );
+            }
         }
     }
 
     #[test]
-    fn parse_effort_rejects_minimal_medium_floats_and_out_of_range() {
+    fn effort_table_detected_from_the_encoders_mapping() {
+        let original = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 25,\n    \"high\": 50,\n    \"xhigh\": 75,\n    \"max\": 100,\n}\n";
+        let rescaled = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 50,\n    \"high\": 75,\n    \"max\": 100,\n}\n";
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(original),
+            EffortTable::Original
+        );
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(rescaled),
+            EffortTable::Rescaled
+        );
+        // One-line spelling, and a mention of the name before the mapping.
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(
+                "# see REASONING_EFFORT_MAPPINGS below\nREASONING_EFFORT_MAPPINGS = {\"low\": 25, \"max\": 100}"
+            ),
+            EffortTable::Original
+        );
+        // No mapping, no `low`, or a value that is not a budget: the rescaled table.
+        for source in [
+            "",
+            "REASONING_EFFORT_MAPPINGS = {}",
+            "REASONING_EFFORT_MAPPINGS = {\"low\": x}",
+        ] {
+            assert_eq!(
+                EffortTable::detect_from_encoder_source(source),
+                EffortTable::Rescaled,
+                "{source:?}"
+            );
+        }
+        assert_eq!(EffortTable::default(), EffortTable::Rescaled);
+    }
+
+    #[test]
+    fn parse_effort_rejects_minimal_none_floats_and_out_of_range() {
         for bad in [
             json!("minimal"),
-            json!("medium"),
             json!("none"),
+            json!("turbo"),
             json!(0),
             json!(101),
             json!(1.5),
@@ -724,6 +908,11 @@ mod tests {
         assert_eq!(
             parse_reasoning_effort(&json!("xhigh")).unwrap(),
             Some(ReasoningEffort::XHigh)
+        );
+        // The chat template's own level.
+        assert_eq!(
+            parse_reasoning_effort(&json!("medium")).unwrap(),
+            Some(ReasoningEffort::Medium)
         );
         assert_eq!(
             parse_reasoning_effort(&json!(7)).unwrap(),
@@ -862,43 +1051,152 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,", "wo_eos": true}),
         ];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
     }
 
+    fn developer(text: &str) -> Value {
+        json!({ "role": "developer", "content": text })
+    }
+
+    /// The engine's renderer hands this encoder a `developer` message as
+    /// written (its developer-to-system rewrite is the template path's), so
+    /// the encoding's own rules apply: in thinking mode the thinking-drop
+    /// removes a developer message before the last user-like turn entirely;
+    /// in chat mode it is a user turn, the user token and the content. The
+    /// recorded reference of the developer-role case is the thinking render,
+    /// byte for byte; never the system turn's prompt. An empty developer
+    /// message is refused where it is rendered and dropped where the
+    /// thinking-drop reaches it first.
     #[test]
-    fn developer_role_renders_as_a_user_turn() {
-        let msgs = [json!({"role": "developer", "content": "D"}), user("q")];
+    fn developer_message_renders_as_the_encoder_developer_turn() {
+        let msgs = [developer("Answer in one word."), user("Colour of the sky?")];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Colour of the sky?<｜Assistant｜><think>");
         let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
-        assert_eq!(
-            out,
-            "<｜begin▁of▁sentence｜><｜User｜>D<｜User｜>q<｜Assistant｜></think>"
-        );
-        // Empty developer content is rejected, as in the Python.
-        let empty = [json!({"role": "developer", "content": ""})];
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Answer in one word.<｜User｜>Colour of the sky?<｜Assistant｜></think>");
+        let as_system = [
+            json!({"role": "system", "content": "Answer in one word."}),
+            user("Colour of the sky?"),
+        ];
+        for mode in [ThinkingMode::Thinking, ThinkingMode::Chat] {
+            assert_ne!(
+                encode_messages(&msgs, mode, &params(None)).unwrap(),
+                encode_messages(&as_system, mode, &params(None)).unwrap()
+            );
+        }
+        let empty = [developer(""), user("q")];
+        let out = encode_messages(&empty, ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
         let err = encode_messages(&empty, ThinkingMode::Chat, &params(None)).unwrap_err();
         assert!(
-            matches!(err, DsEncodingError::InvalidMessage { .. }),
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
             "{err}"
         );
     }
 
+    /// Earlier in the conversation the same rule: gone with the thinking-drop,
+    /// a user turn in chat mode (the assistant turn after it closes as it does
+    /// after a user turn).
     #[test]
-    fn developer_message_is_dropped_before_the_last_user_turn() {
+    fn a_developer_message_before_the_last_user_turn_goes_with_the_thinking_drop() {
         let msgs = [
-            json!({"role": "developer", "content": "DEV"}),
+            developer("DEV"),
             user("q1"),
             json!({"role": "assistant", "content": "a1"}),
             user("q2"),
         ];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert!(!out.contains("DEV"), "{out}");
-        assert!(out.ends_with("<｜User｜>q2<｜Assistant｜><think>"), "{out}");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>");
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>DEV<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜></think>");
+    }
+
+    /// A developer message that ends the conversation is the last user-like
+    /// turn: kept in both modes, the assistant header and the thinking token
+    /// after it. Before a system message that ends the conversation it goes
+    /// with the thinking-drop (that system message is the last user-like turn
+    /// here) and the first system message left opens no turn; in chat mode it
+    /// stays a user turn and the mid-conversation system message, with its own
+    /// system token, opens the turn.
+    #[test]
+    fn a_trailing_developer_message_is_the_last_user_turn() {
+        let msgs = [user("Colour of the sky?"), developer("Answer in one word.")];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Colour of the sky?<｜User｜>Answer in one word.<｜Assistant｜><think>");
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Colour of the sky?<｜User｜>Answer in one word.<｜Assistant｜></think>");
+        let developer_then_system = [
+            developer("Be terse."),
+            json!({"role": "system", "content": "Answer in French."}),
+        ];
+        let out = encode_messages(
+            &developer_then_system,
+            ThinkingMode::Thinking,
+            &params(None),
+        )
+        .unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in French.");
+        let out =
+            encode_messages(&developer_then_system, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Be terse.<｜System｜>Answer in French.<｜Assistant｜></think>");
+    }
+
+    /// A developer message's own tools and response format render under its
+    /// content after a blank line, as a system turn's do; declared tools keep
+    /// the thinking-drop off, so the message stays in thinking mode too.
+    #[test]
+    fn a_developer_message_carries_its_tools_and_response_format() {
+        let with_tools = [json!({
+            "role": "developer",
+            "content": "Follow the policy.",
+            "tools": [{"type": "function", "function": {"name": "lookup_weather",
+                "description": "Look up", "parameters": {"type": "object",
+                "properties": {"query": {"type": "string"}}, "required": ["query"]}}}],
+        })];
+        let with_format = [json!({
+            "role": "developer",
+            "content": "Answer in one word.",
+            "response_format": {"type": "json_object"},
+        })];
+        const EFFORT: &str = "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        for (mode, prefix, thinking_token) in [
+            (ThinkingMode::Thinking, EFFORT, "<think>"),
+            (ThinkingMode::Chat, "<｜begin▁of▁sentence｜>", "</think>"),
+        ] {
+            let out = encode_messages(&with_tools, mode, &params(None)).unwrap();
+            assert!(
+                out.starts_with(&format!(
+                    "{prefix}<｜User｜>Follow the policy.\n\n## Tools\n\n"
+                )) && out.contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "schemas to invoke tool calls.\n<｜Assistant｜>{thinking_token}"
+                    )),
+                "{out}"
+            );
+            let out = encode_messages(&with_format, mode, &params(None)).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{prefix}<｜User｜>Answer in one word.\n\n## Response Format:\n\n\
+                     You MUST strictly adhere to the following schema to reply:\n\
+                     {{\"type\": \"json_object\"}}<｜Assistant｜>{thinking_token}"
+                )
+            );
+        }
     }
 
     #[test]
     fn bare_tool_role_reaching_render_message_errors() {
         let msgs = [json!({"role": "tool", "content": "x"})];
-        let err = render_message(0, &msgs, ThinkingMode::Chat, true, None).unwrap_err();
+        let err = render_message(
+            0,
+            &msgs,
+            ThinkingMode::Chat,
+            true,
+            None,
+            EffortTable::Rescaled,
+        )
+        .unwrap_err();
         assert!(matches!(err, DsEncodingError::UnmergedToolRole(0)), "{err}");
     }
 
@@ -909,7 +1207,10 @@ mod tests {
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
     }
 
-    /// Acceptance oracle: every prompt recorded from the reference encoder.
+    /// Acceptance oracle: every prompt recorded from the reference encoder,
+    /// under the effort table of the revision that recorded it (the file's
+    /// `revision` for the cases without an `encoder_revision` of their own,
+    /// its `current_revision` for the others).
     #[test]
     fn render_fixtures_match_recorded_text() {
         const FIXTURES: &str =
@@ -917,11 +1218,40 @@ mod tests {
 
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 29, "fixture case count");
+        assert_eq!(cases.len(), 32, "fixture case count");
+        let recorded_low = |tiers: &Value| tiers["low"].as_u64().unwrap();
+        let table_of = |tiers: &Value| match recorded_low(tiers) {
+            25 => EffortTable::Original,
+            50 => EffortTable::Rescaled,
+            other => panic!("no effort table gives low a budget of {other}"),
+        };
+        let recorded_table = table_of(&doc["effort_tiers"]);
+        let current_table = table_of(&doc["current_effort_tiers"]);
+        assert_ne!(
+            recorded_table, current_table,
+            "the fixture pins two revisions"
+        );
 
         for case in cases {
             let name = case["name"].as_str().unwrap();
+            let effort_table = match case.get("encoder_revision").and_then(Value::as_str) {
+                None => recorded_table,
+                Some(revision) if Some(revision) == doc["current_revision"].as_str() => {
+                    current_table
+                }
+                Some(revision) => panic!("case {name}: unknown encoder revision {revision}"),
+            };
             let mut messages: Vec<Value> = case["messages"].as_array().unwrap().clone();
+
+            // Three cases were recorded with their developer message folded
+            // into a system one by the recording script, not by the encoder
+            // (the engine's renderer hands the role as written, and the
+            // encoder drops the message or writes a user turn: the tests
+            // above); the fold stays here so those recordings still describe
+            // the system path they took.
+            if let Some(rewritten) = crate::chat_template::developer_messages_as_system(&messages) {
+                messages = rewritten;
+            }
 
             // Rule D4, as the generator and the shim's
             // `inject_tools_into_first_system_message` apply it: the request's
@@ -952,6 +1282,7 @@ mod tests {
                 add_default_bos_token: true,
                 drop_thinking: case["drop_thinking"].as_bool().unwrap_or(true),
                 reasoning_effort: parse_reasoning_effort(&case["reasoning_effort"]).unwrap(),
+                effort_table,
             };
 
             let out = encode_messages(&messages, thinking_mode, &encode_params).unwrap();
@@ -981,5 +1312,164 @@ mod tests {
             window(&expected_chars),
             window(&actual_chars)
         )
+    }
+
+    /// The reference keeps a `content_blocks` list a user message carries and
+    /// renders it in place of the content; an empty list falls back to the
+    /// content (the engine's own encoder copy renders these bytes).
+    #[test]
+    fn a_user_messages_own_content_blocks_render_in_place_of_its_content() {
+        let with_block = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "from the block" }],
+        })];
+        let out = encode_messages(&with_block, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>from the block<｜Assistant｜></think>"
+        );
+        let empty_list = [json!({ "role": "user", "content": "hello", "content_blocks": [] })];
+        let out = encode_messages(&empty_list, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn object_form_tool_call_arguments_render_params() {
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &params(None)),
+            " parameter",
+        );
+    }
+
+    #[test]
+    fn a_kept_empty_content_blocks_list_drops_its_messages_content_through_a_merge() {
+        // The reference rebuilds a user message's blocks from its content only
+        // when the list is absent (`if content_blocks is None`), so an empty
+        // list a message carries is kept and a following user message's blocks
+        // extend it: the first message's content is not rendered.
+        let with_empty_list = [
+            json!({ "role": "user", "content": "A", "content_blocks": [] }),
+            user("B"),
+        ];
+        let out = encode_messages(&with_empty_list, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>B<｜Assistant｜></think>"
+        );
+        let without = [user("A"), user("B")];
+        let out = encode_messages(&without, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>A\n\nB<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn image_blocks_among_a_user_messages_own_content_blocks_render_the_placeholder() {
+        let image = json!({ "type": "image_url", "image_url": { "url": "http://x" } });
+        let beside_text = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "look" }, image.clone()],
+        })];
+        let out = encode_messages(&beside_text, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>look\n\n<｜deepseek_image｜><｜Assistant｜></think>"
+        );
+        let inside_a_tool_result = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{
+                "type": "tool_result",
+                "tool_call_id": "c1",
+                "content": [{ "type": "text", "text": "seen" }, image],
+            }],
+        })];
+        let out =
+            encode_messages(&inside_a_tool_result, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜><tool_result>seen\n\n<｜deepseek_image｜></tool_result><｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn content_blocks_that_are_a_messages_only_content_render_their_text_for_every_role() {
+        let system = [
+            json!({
+                "role": "system",
+                "content_blocks": [
+                    { "type": "text", "text": "Be brief." },
+                    { "type": "text", "text": "Answer in French." },
+                ],
+            }),
+            user("hello"),
+        ];
+        let out = encode_messages(&system, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\nAnswer in French.<｜User｜>hello<｜Assistant｜></think>"
+        );
+        let with_image = [
+            json!({
+                "role": "system",
+                "content_blocks": [
+                    { "type": "text", "text": "Look:" },
+                    { "type": "image_url", "image_url": { "url": "http://x" } },
+                ],
+            }),
+            user("hello"),
+        ];
+        let out = encode_messages(&with_image, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜System｜>Look:\n\n<｜deepseek_image｜><｜User｜>hello<｜Assistant｜></think>"
+        );
+        let history = [
+            user("first"),
+            json!({
+                "role": "assistant",
+                "content_blocks": [{ "type": "text", "text": "earlier answer" }],
+            }),
+            user("second"),
+        ];
+        let out = encode_messages(&history, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>first<｜Assistant｜></think>earlier answer<｜end▁of▁sentence｜><｜User｜>second<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn a_users_own_content_blocks_are_refused_as_the_reference_refuses_them() {
+        let with_blocks = |blocks: Value| {
+            [json!({ "role": "user", "content": "ignored", "content_blocks": blocks })]
+        };
+        let placeholder =
+            with_blocks(json!([{ "type": "text", "text": "a <｜deepseek_image｜> b" }]));
+        let err = encode_messages(&placeholder, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(matches!(err, DsEncodingError::PlaceholderInText), "{err}");
+        let nested = with_blocks(json!([{
+            "type": "tool_result",
+            "tool_call_id": "c1",
+            "content": [{ "type": "text", "text": "x<｜deepseek_image｜>" }],
+        }]));
+        let err = encode_messages(&nested, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(matches!(err, DsEncodingError::PlaceholderInText), "{err}");
+        let no_source = with_blocks(json!([{ "type": "image" }]));
+        let err = encode_messages(&no_source, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DsEncodingError::InvalidMessage { ref msg, .. }
+                    if msg == "Image block does not contain a valid source"
+            ),
+            "{err}"
+        );
     }
 }

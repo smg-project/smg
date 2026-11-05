@@ -1,0 +1,1245 @@
+//! Verify that `HuggingFaceTokenizer` selects the right chat-template renderer
+//! based on `config.json::architectures`.
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, fs};
+
+    use llm_tokenizer::{
+        chat_template::{
+            ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        },
+        huggingface::HuggingFaceTokenizer,
+        TokenizerTrait,
+    };
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::common::MIN_TOKENIZER_JSON_WITH_SENTINELS;
+    fn write_dir(architectures: Option<&[&str]>) -> (TempDir, String) {
+        write_model_dir(None, architectures, None, None)
+    }
+
+    /// Build a model dir (optionally named, under the temp root) with the
+    /// minimal tokenizer, an optional config (`architectures` and/or
+    /// `model_type`), and an optional shipped Python encoder: a file name
+    /// under `encoding/` (`encoding_dsv4.py` for V4, `encoding.py` for V4.1)
+    /// and its source.
+    fn write_model_dir(
+        model_name: Option<&str>,
+        architectures: Option<&[&str]>,
+        model_type: Option<&str>,
+        encoder: Option<(&str, &str)>,
+    ) -> (TempDir, String) {
+        let temp = TempDir::new().unwrap();
+        let model_dir = match model_name {
+            Some(name) => {
+                let dir = temp.path().join(name);
+                fs::create_dir(&dir).unwrap();
+                dir
+            }
+            None => temp.path().to_path_buf(),
+        };
+        let tok_path = model_dir.join("tokenizer.json");
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
+        if architectures.is_some() || model_type.is_some() {
+            let mut config = serde_json::Map::new();
+            if let Some(archs) = architectures {
+                config.insert("architectures".to_string(), json!(archs));
+            }
+            if let Some(model_type) = model_type {
+                config.insert("model_type".to_string(), json!(model_type));
+            }
+            let body = serde_json::Value::Object(config).to_string();
+            fs::write(model_dir.join("config.json"), body).unwrap();
+        }
+        if let Some((file, source)) = encoder {
+            let encoding_dir = model_dir.join("encoding");
+            fs::create_dir(&encoding_dir).unwrap();
+            fs::write(encoding_dir.join(file), source).unwrap();
+        }
+        (temp, tok_path.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn config_with_deepseek_v32_arch_uses_v32_renderer() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        // V3.2 emits BOS + <｜User｜>Hello<｜Assistant｜></think> in chat mode.
+        assert!(out.contains("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"));
+        assert!(out.contains("<\u{FF5C}User\u{FF5C}>Hello<\u{FF5C}Assistant\u{FF5C}>"));
+        assert!(out.ends_with("</think>"));
+    }
+    #[test]
+    fn config_with_deepseek_v4_arch_uses_v4_renderer() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        // V4 renders the engine's default: BOS, the `high` effort preamble,
+        // <｜User｜>Hello<｜Assistant｜><think> (thinking mode).
+        assert!(
+            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>Reasoning Effort:")
+        );
+        assert!(out.contains("<\u{FF5C}User\u{FF5C}>Hello<\u{FF5C}Assistant\u{FF5C}>"));
+        assert!(out.ends_with("<think>"));
+        // `thinking: false` is chat mode: no preamble, `</think>` closed.
+        let kwargs = HashMap::from([("thinking".to_string(), json!(false))]);
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.starts_with(
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>Hello"
+        ));
+        assert!(out.ends_with("</think>"));
+    }
+
+    #[test]
+    fn config_with_unrelated_arch_falls_back_to_jinja() {
+        // A non-DeepSeek architecture should keep using the Jinja renderer; with
+        // no chat_template set, applying the template should error rather than
+        // silently picking a DeepSeek encoder.
+        let (_tmp, tok) = write_dir(Some(&["LlamaForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let result = tokenizer.apply_chat_template(&messages, ChatTemplateParams::default());
+        assert!(
+            result.is_err(),
+            "expected error from missing Jinja template"
+        );
+    }
+    #[test]
+    fn no_config_json_falls_back_to_jinja() {
+        // No sibling config.json — must still default to Jinja and not blow up.
+        let (_tmp, tok) = write_dir(None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let result = tokenizer.apply_chat_template(&messages, ChatTemplateParams::default());
+        // Without a chat template registered, the Jinja renderer surfaces an error.
+        // The important thing is that we did NOT auto-select a DeepSeek encoder.
+        assert!(result.is_err());
+    }
+    #[test]
+    fn malformed_config_json_falls_back_to_jinja() {
+        let temp = TempDir::new().unwrap();
+        let tok_path = temp.path().join("tokenizer.json");
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
+        fs::write(temp.path().join("config.json"), "{ this is not json").unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tok_path.to_str().unwrap()).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let result = tokenizer.apply_chat_template(&messages, ChatTemplateParams::default());
+        assert!(result.is_err());
+    }
+    #[test]
+    fn deepseek_v4_injects_tools_into_system_message() {
+        // Client passes tools at the request level (params.tools), not embedded
+        // in messages. The shim must attach them to a system message so the
+        // encoder renders the tools block.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(out.contains("## Tools"), "tools block missing: {out}");
+        assert!(
+            out.contains("get_weather"),
+            "tool name missing from prompt: {out}"
+        );
+        assert!(
+            out.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"),
+            "V4 DSML invocation grammar missing: {out}"
+        );
+    }
+
+    #[test]
+    fn deepseek_v32_injects_tools_into_system_message() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "ping", "description": "ping", "parameters": {} }
+        })];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(out.contains("## Tools"), "tools block missing: {out}");
+        assert!(out.contains("ping"), "tool name missing: {out}");
+        // V3.2 uses function_calls (vs V4's tool_calls).
+        assert!(
+            out.contains("<\u{FF5C}DSML\u{FF5C}function_calls>"),
+            "V3.2 DSML invocation grammar missing: {out}"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_attaches_tools_to_existing_system_message() {
+        // When a system message is already present, tools should attach to it
+        // rather than inserting a second system block.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![
+            json!({ "role": "system", "content": "Be concise." }),
+            json!({ "role": "user", "content": "Hi" }),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "ping", "description": "ping", "parameters": {} }
+        })];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(
+            out.contains("Be concise."),
+            "existing system content lost: {out}"
+        );
+        assert!(out.contains("ping"), "tool not attached: {out}");
+    }
+
+    #[test]
+    fn deepseek_renderers_report_thinking_introspection() {
+        // V3.2 / V4 inject `<think>` in the prefill when thinking is on, and
+        // gate thinking on the `thinking` kwarg. The trait methods must
+        // surface this so the gateway can call `mark_reasoning_started` on
+        // the conditional reasoning parser (deepseek_v31 etc). V3.2 defaults
+        // thinking off; V4 defaults it on like the engine's own server.
+        for (arch, toggle) in &[
+            ("DeepseekV32ForCausalLM", ThinkingToggle::DefaultOff),
+            ("DeepseekV4ForCausalLM", ThinkingToggle::DefaultOn),
+        ] {
+            let (_tmp, tok) = write_dir(Some(&[*arch]));
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            assert_eq!(
+                tokenizer.thinking_toggle(),
+                *toggle,
+                "{arch}: unexpected thinking toggle"
+            );
+            assert_eq!(
+                tokenizer.thinking_key_name(),
+                Some(ThinkingKeyName::Thinking),
+                "{arch}: expected Thinking key name"
+            );
+            assert!(
+                tokenizer.think_in_prefill(),
+                "{arch}: expected think_in_prefill=true"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v32_renderer_honors_the_enable_thinking_alias_like_thinking() {
+        // The engine's tokenizer wrapper switches thinking on from `thinking`
+        // or its `enable_thinking` alias: either alone ends the prompt with
+        // <think> (thinking mode); `thinking` wins when both are present, as
+        // the gateway reads them when it arms the reasoning parser; and the
+        // profile declares the alias so the gateway reads it at all.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert!(
+            tokenizer.renderer_capabilities().enable_thinking_alias,
+            "the V3.2 renderer declares the enable_thinking alias"
+        );
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let render = |kwargs: &HashMap<String, serde_json::Value>| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        template_kwargs: Some(kwargs),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+
+        let thinking_kwargs = HashMap::from([("thinking".to_string(), json!(true))]);
+        let out_thinking = render(&thinking_kwargs);
+        assert!(
+            out_thinking.ends_with("<think>"),
+            "thinking=true should enter thinking mode: {out_thinking}"
+        );
+
+        let alias_kwargs = HashMap::from([("enable_thinking".to_string(), json!(true))]);
+        let out_alias = render(&alias_kwargs);
+        assert_eq!(
+            out_alias, out_thinking,
+            "enable_thinking=true must render like thinking=true"
+        );
+
+        let alias_off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let out_alias_off = render(&alias_off);
+        assert!(
+            out_alias_off.ends_with("</think>"),
+            "enable_thinking=false stays in chat mode: {out_alias_off}"
+        );
+
+        let both = HashMap::from([
+            ("thinking".to_string(), json!(false)),
+            ("enable_thinking".to_string(), json!(true)),
+        ]);
+        let out_both = render(&both);
+        assert!(
+            out_both.ends_with("</think>"),
+            "thinking=false outranks the alias: {out_both}"
+        );
+    }
+
+    /// Render a V4 request the way the gateway's chat path does: the top-level
+    /// `reasoning_effort` projected into the template kwargs under the
+    /// request's own `chat_template_kwargs`, and into the protocol thinking
+    /// preference (`none`/`minimal` off, a level no opinion).
+    fn render_v4(
+        tokenizer: &HuggingFaceTokenizer,
+        chat_template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        reasoning_effort: Option<&str>,
+    ) -> String {
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(effort) = reasoning_effort {
+            kwargs.insert("reasoning_effort".to_string(), json!(effort));
+        }
+        if let Some(explicit) = chat_template_kwargs {
+            kwargs.extend(explicit.clone());
+        }
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            template_kwargs: (!kwargs.is_empty()).then_some(&kwargs),
+            thinking: openai_protocol::chat::thinking_from_reasoning_effort(reasoning_effort),
+            ..Default::default()
+        };
+        tokenizer.apply_chat_template(&messages, params).unwrap()
+    }
+
+    const V4_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum";
+    const V4_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum";
+
+    #[test]
+    fn deepseek_v4_defaults_to_thinking_with_the_engines_effort() {
+        // A plain request renders what the engine's own server renders:
+        // thinking mode with the `high` effort prompt.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let out = render_v4(&tokenizer, None, None);
+        assert!(out.ends_with("<think>"), "{out}");
+        assert!(out.contains(V4_HIGH_PREFIX), "{out}");
+        assert_eq!(
+            tokenizer.native_reasoning_effort_off_values(),
+            &["none"],
+            "the gateway disarms the reasoning parser on the renderer's off word"
+        );
+        assert!(tokenizer.renderer_capabilities().enable_thinking_alias);
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_switches_off_like_the_engine() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let chat = "<｜User｜>Hi<｜Assistant｜></think>";
+        // `thinking: false`, the engine's `enable_thinking: false` alias and
+        // `reasoning_effort: "none"` (kwarg or top-level) render chat mode
+        // without any effort prefix.
+        for kwargs in [
+            HashMap::from([("thinking".to_string(), json!(false))]),
+            HashMap::from([("enable_thinking".to_string(), json!(false))]),
+            HashMap::from([("reasoning_effort".to_string(), json!("none"))]),
+            HashMap::from([
+                ("thinking".to_string(), json!(false)),
+                ("reasoning_effort".to_string(), json!("max")),
+            ]),
+        ] {
+            let out = render_v4(&tokenizer, Some(&kwargs), None);
+            assert!(out.ends_with(chat), "{kwargs:?}: {out}");
+            assert!(!out.contains("Reasoning Effort"), "{kwargs:?}: {out}");
+        }
+        let out = render_v4(&tokenizer, None, Some("none"));
+        assert!(out.ends_with(chat), "{out}");
+        assert!(!out.contains("Reasoning Effort"), "{out}");
+        // The typed `thinking.type: disabled` toggle arrives as `params.thinking`.
+        let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    thinking: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.ends_with(chat), "{out}");
+        // The explicit toggle wins over the protocol preference, as it does
+        // when the gateway arms the parser.
+        let kwargs = HashMap::from([("thinking".to_string(), json!(true))]);
+        let out = render_v4(&tokenizer, Some(&kwargs), Some("minimal"));
+        assert!(out.ends_with("<think>"), "{out}");
+    }
+
+    #[test]
+    fn deepseek_v4_maps_reasoning_effort_like_the_engine() {
+        // The engine's mapping of the kwarg: `max` the top level, `low`/`minimal`/
+        // `medium` the bottom one (no prefix), everything else `high`; the
+        // top-level field counts the same as the kwarg.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        for (effort, prefix) in [
+            ("max", Some(V4_MAX_PREFIX)),
+            ("high", Some(V4_HIGH_PREFIX)),
+            ("xhigh", Some(V4_HIGH_PREFIX)),
+            ("medium", None),
+            ("minimal", None),
+            ("low", None),
+        ] {
+            let kwargs = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+            for out in [
+                render_v4(&tokenizer, Some(&kwargs), None),
+                render_v4(&tokenizer, None, Some(effort)),
+            ] {
+                assert!(out.ends_with("<think>"), "{effort}: {out}");
+                match prefix {
+                    Some(prefix) => assert!(out.contains(prefix), "{effort}: {out}"),
+                    None => assert!(!out.contains("Reasoning Effort"), "{effort}: {out}"),
+                }
+            }
+        }
+        // An explicit kwarg wins over the top-level field, as everywhere else
+        // in the gateway.
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!("low"))]);
+        let out = render_v4(&tokenizer, Some(&kwargs), Some("max"));
+        assert!(!out.contains("Reasoning Effort"), "{out}");
+    }
+
+    #[test]
+    fn deepseek_v4_renderer_passes_reasoning_effort() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        kwargs.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("max".to_string()),
+        );
+        kwargs.insert("thinking".to_string(), serde_json::Value::Bool(true));
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(
+            out.contains(V4_MAX_PREFIX),
+            "expected the engine's max effort prefix in V4 output: {out}"
+        );
+        assert!(
+            out.ends_with("<think>"),
+            "thinking mode should leave a <think> token open"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The effort table is the engine's, never the shipped encoder file's
+    // -----------------------------------------------------------------------
+
+    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint revision
+    /// ships (only the effort block differs between them); the renderer reads
+    /// neither, as the serving engine reads neither.
+    const BASE_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAX = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+)"#;
+    const V0731_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_PROMPTS = {
+    "low": "",
+    "high": "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "max": "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+}"#;
+
+    fn write_v4_model_dir(model_name: &str, encoder_source: Option<&str>) -> (TempDir, String) {
+        write_model_dir(
+            Some(model_name),
+            Some(&["DeepseekV4ForCausalLM"]),
+            None,
+            encoder_source.map(|source| ("encoding_dsv4.py", source)),
+        )
+    }
+
+    fn render_with_native_effort(
+        tokenizer: &HuggingFaceTokenizer,
+        effort: &str,
+    ) -> anyhow::Result<String> {
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        tokenizer.apply_chat_template(&messages, params)
+    }
+
+    #[test]
+    fn the_shipped_encoder_file_never_picks_the_effort_table() {
+        // The serving engine renders every V4 checkpoint with its own copy of
+        // the encoder, whose table is the refreshed one, and never reads the
+        // `encoding/encoding_dsv4.py` the checkpoint ships; so the file,
+        // whichever table it carries, and the directory name change nothing:
+        // a plain thinking request (the `high` effort) writes the "Absolute
+        // maximum" prompt, `max` the "Beyond maximum" one, `low` none.
+        for (name, encoder) in [
+            ("DeepSeek-V4-Flash", Some(BASE_ENCODER_SNIPPET)),
+            ("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET)),
+            ("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET)),
+        ] {
+            let (_tmp, tok) = write_v4_model_dir(name, encoder);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            assert_eq!(
+                tokenizer.native_reasoning_effort_values(),
+                &["low", "high", "max"],
+                "{name}"
+            );
+            assert!(
+                tokenizer.renderer_capabilities().leading_system_only,
+                "{name}: the one profile declares it (a system message after the first is a user turn)"
+            );
+            let out = render_v4(&tokenizer, None, None);
+            assert!(out.contains(V4_HIGH_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "max").unwrap();
+            assert!(out.contains(V4_MAX_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "high").unwrap();
+            assert!(
+                out.contains(V4_HIGH_PREFIX) && !out.contains(V4_MAX_PREFIX),
+                "{name}: {out}"
+            );
+            let out = render_with_native_effort(&tokenizer, "low").unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{name}: {out}");
+            assert!(out.ends_with("<think>"), "{name}: {out}");
+        }
+    }
+
+    #[test]
+    fn missing_encoder_renders_the_engines_effort_table() {
+        // Without the checkpoint's encoder (a tokenizer directory streamed from
+        // a worker has none), whatever the directory is called, the effort
+        // table is the one the engine's port renders for every V4 checkpoint.
+        for name in ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash", "tmp8f2k1"] {
+            let (_tmp, tok) = write_v4_model_dir(name, None);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            let out = render_with_native_effort(&tokenizer, "max").unwrap();
+            assert!(out.contains(V4_MAX_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "high").unwrap();
+            assert!(out.contains(V4_HIGH_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "low").unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{name}: {out}");
+            assert!(out.ends_with("<think>"), "{name}: {out}");
+        }
+    }
+
+    #[test]
+    fn merged_public_effort_levels_render_thinking_without_a_prefix() {
+        // `medium` and `minimal` are the bottom level to the engine: thinking
+        // mode, no effort prompt.
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        for effort in ["medium", "minimal"] {
+            let out = render_with_native_effort(&tokenizer, effort).unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{effort}: {out}");
+            assert!(out.ends_with("<think>"), "{effort}: {out}");
+        }
+    }
+
+    #[test]
+    fn native_effort_enables_thinking_unless_overridden() {
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+
+        // Effort alone implies thinking mode (the prefix only exists there).
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.ends_with("<think>"), "{out}");
+
+        // An explicit thinking=false still wins and suppresses the prefix.
+        let kwargs = HashMap::from([
+            ("reasoning_effort".to_string(), json!("max")),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.ends_with("</think>"), "{out}");
+        assert!(!out.contains("Reasoning Effort:"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // DeepSeek V4.1
+    // -----------------------------------------------------------------------
+
+    const V41_BOS: &str = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>";
+    const V41_EOS: &str = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>";
+    /// The system header carrying the default budget (thinking mode only):
+    /// `high` of the checkpoint's current effort table, 75.
+    const V41_DEFAULT_EFFORT_HEADER: &str = "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    /// The `REASONING_EFFORT_MAPPINGS` block of the checkpoint's first
+    /// published `encoding/encoding.py`, and the block of the refresh that
+    /// followed it (the chat template the checkpoint added later carries the
+    /// refreshed numbers).
+    const V41_ORIGINAL_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "low": 25,
+    "high": 50,
+    "xhigh": 75,
+    "max": 100,
+}
+DEFAULT_REASONING_EFFORT = "high""#;
+    const V41_RESCALED_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "low": 50,
+    "high": 75,
+    "max": 100,
+}
+DEFAULT_REASONING_EFFORT = "high""#;
+    /// Tail of a single-user-turn prompt in thinking mode.
+    const V41_THINKING_TAIL: &str = "<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>";
+    /// Tail of a single-user-turn prompt in chat mode.
+    const V41_CHAT_TAIL: &str = "<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>";
+
+    fn v41_tokenizer() -> (TempDir, HuggingFaceTokenizer) {
+        let (tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        (tmp, tokenizer)
+    }
+
+    /// A V4.1 model dir with the checkpoint's `encoding/encoding.py` when a
+    /// source is given.
+    fn write_v41_model_dir(encoder_source: Option<&str>) -> (TempDir, String) {
+        write_model_dir(
+            None,
+            Some(&["DeepseekV41ForCausalLM"]),
+            None,
+            encoder_source.map(|source| ("encoding.py", source)),
+        )
+    }
+
+    /// Render the single user turn `q` with a generation prompt.
+    fn render_v41_turn(
+        tokenizer: &HuggingFaceTokenizer,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> anyhow::Result<String> {
+        tokenizer.apply_chat_template(
+            &[json!({"role": "user", "content": "q"})],
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: kwargs,
+                thinking,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn v41_architecture_selects_the_v41_renderer_with_thinking_on_by_default() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert_eq!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn);
+        assert_eq!(
+            tokenizer.native_reasoning_effort_values(),
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(tokenizer.think_in_prefill());
+        let out = tokenizer
+            .apply_chat_template(
+                &[json!({"role": "user", "content": "q"})],
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn v41_model_type_alone_selects_the_v41_renderer() {
+        // Some checkpoints identify themselves only through `model_type`,
+        // with an unrelated `architectures` entry.
+        let (_tmp, tok) = write_model_dir(
+            None,
+            Some(&["LlamaForCausalLM"]),
+            Some("deepseek_v41"),
+            None,
+        );
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert_eq!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn);
+        assert_eq!(
+            tokenizer.thinking_key_name(),
+            Some(ThinkingKeyName::Thinking)
+        );
+        let out = render_v41_turn(&tokenizer, None, None).unwrap();
+        assert_eq!(
+            out,
+            format!("{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}{V41_THINKING_TAIL}")
+        );
+    }
+
+    #[test]
+    fn v41_shipped_encoder_selects_the_effort_table() {
+        // The checkpoint's own encoder decides the budgets: its first
+        // published table, the rescaled one, and, without an encoder (a
+        // tokenizer directory streamed from a worker carries none), the
+        // rescaled table the checkpoint carries today. `xhigh` stays a
+        // native word of the renderer and renders `high`'s budget where the
+        // table has none of its own; `medium`, the chat template's own
+        // level, renders its 62 under the rescaled table and `high`'s budget
+        // under the first encoder, which has none for it.
+        let original = [
+            ("low", 25),
+            ("high", 50),
+            ("xhigh", 75),
+            ("max", 100),
+            ("medium", 50),
+        ];
+        let rescaled = [
+            ("low", 50),
+            ("high", 75),
+            ("xhigh", 75),
+            ("max", 100),
+            ("medium", 62),
+        ];
+        for (encoder, expected) in [
+            (Some(V41_ORIGINAL_ENCODER_SNIPPET), original),
+            (Some(V41_RESCALED_ENCODER_SNIPPET), rescaled),
+            (None, rescaled),
+        ] {
+            let (_tmp, tok) = write_v41_model_dir(encoder);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            for (effort, budget) in expected {
+                let kw = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+                let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+                assert!(
+                    out.contains(&format!("Reasoning Effort: {budget} (range")),
+                    "{encoder:?} {effort}: {out}"
+                );
+            }
+            // No effort given: `high`'s budget.
+            let out = render_v41_turn(&tokenizer, None, None).unwrap();
+            let (_, high) = expected[1];
+            assert!(
+                out.contains(&format!("Reasoning Effort: {high} (range")),
+                "{encoder:?} default: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn v41_reasoning_effort_none_disables_thinking_and_bad_values_error() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({"role": "user", "content": "q"})];
+
+        let none_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let off = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    template_kwargs: Some(&none_kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Chat mode, and no effort line at all.
+        assert_eq!(
+            off,
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
+        );
+
+        let bad_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("turbo"))]);
+        let err = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    template_kwargs: Some(&bad_kwargs),
+                    ..Default::default()
+                },
+            )
+            .expect_err("expected an error for reasoning_effort=turbo")
+            .to_string();
+        assert!(err.contains("Invalid reasoning effort"), "{err}");
+    }
+
+    #[test]
+    fn v41_integer_effort_strings_are_restored_to_budgets() {
+        // The gateway deserialises a top-level `"reasoning_effort": 42` into
+        // the string "42" before forwarding it as a template kwarg; the shim
+        // must hand `parse_reasoning_effort` the integer budget again.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("reasoning_effort".to_string(), json!("42"))]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.contains("Reasoning Effort: 42 (range"), "{out}");
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        // Out-of-range integers are still rejected by `parse_reasoning_effort`.
+        for bad in ["0", "101"] {
+            let kw = HashMap::from([("reasoning_effort".to_string(), json!(bad))]);
+            let err = render_v41_turn(&tokenizer, Some(&kw), None)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("Invalid reasoning effort"), "{bad}: {err}");
+        }
+        // Only the gateway's exact form, ASCII digits, is restored: a sign or
+        // surrounding whitespace is not an integer budget and reaches the
+        // strict parser as the string it is.
+        for bad in ["+42", " 42 "] {
+            let kw = HashMap::from([("reasoning_effort".to_string(), json!(bad))]);
+            let err = render_v41_turn(&tokenizer, Some(&kw), None)
+                .expect_err(bad)
+                .to_string();
+            assert_eq!(
+                err,
+                format!("DeepSeek V4.1 reasoning_effort invalid: Invalid reasoning effort `{bad}`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v41_explicit_thinking_true_overrides_reasoning_effort_none() {
+        // Deliberate divergence from the engine's Python renderer, where "none" forces chat
+        // mode: the gateway arms the reasoning parser from the explicit toggle
+        // first, so the prompt must enter thinking mode as well. "none"
+        // carries no effort level, so the default budget is rendered.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([
+            ("reasoning_effort".to_string(), json!("none")),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.contains("Reasoning Effort: 75 (range"), "{out}");
+    }
+
+    #[test]
+    fn v41_reasoning_effort_minimal_renders_chat_mode_like_none() {
+        // `minimal` is the other spelling of the gateway's thinking switch
+        // (`thinking_from_reasoning_effort` maps both to off); the reference
+        // encoder knows neither, so the shim short-circuits both.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let none_kw = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let minimal_kw = HashMap::from([("reasoning_effort".to_string(), json!("minimal"))]);
+        let off = render_v41_turn(&tokenizer, Some(&none_kw), None).unwrap();
+        assert_eq!(
+            render_v41_turn(&tokenizer, Some(&minimal_kw), None).unwrap(),
+            off
+        );
+        assert!(off.ends_with(V41_CHAT_TAIL), "{off}");
+        // An explicit toggle wins over `minimal` exactly as it wins over `none`.
+        let kw = HashMap::from([
+            ("reasoning_effort".to_string(), json!("minimal")),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.contains("Reasoning Effort: 75 (range"), "{out}");
+    }
+
+    #[test]
+    fn v41_enable_thinking_alias_switches_the_mode_like_thinking() {
+        // The engine's `enable_thinking` alias is honoured on both sides: the shim
+        // reads it here and the gateway reads it when it arms the parser
+        // (`renderer_capabilities().enable_thinking_alias`).
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // Agreeing duplicates are fine ...
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // ... disagreeing ones are a request error naming both keys.
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(true)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("disagreeing toggles must error")
+            .to_string();
+        assert!(err.contains("disagree"), "{err}");
+        assert!(
+            err.contains("enable_thinking") && err.contains("thinking"),
+            "{err}"
+        );
+    }
+
+    /// Template replacement keeps native capabilities and media preprocessing intact.
+    #[test]
+    fn v41_reports_its_renderer_capabilities() {
+        let (_tmp, mut tokenizer) = v41_tokenizer();
+        let caps = tokenizer.renderer_capabilities();
+        assert!(caps.enable_thinking_alias, "{caps:?}");
+        assert!(caps.native_assistant_continuation, "{caps:?}");
+        assert!(caps.raw_tool_call_arguments, "{caps:?}");
+        assert_eq!(
+            caps.media_handling,
+            llm_tokenizer::traits::MediaHandling::Preprocess
+        );
+        // Replacing a Jinja template must not override the native renderer's profile.
+        tokenizer
+            .set_chat_template(include_str!("../fixtures/glm53/chat_template.jinja").into())
+            .unwrap();
+        assert_eq!(tokenizer.renderer_capabilities(), caps);
+    }
+
+    #[test]
+    fn v41_non_boolean_thinking_kwarg_errors() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("thinking".to_string(), json!("yes"))]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("a non-boolean thinking kwarg must error")
+            .to_string();
+        assert!(err.contains("must be a boolean"), "{err}");
+        // The message names the key and the offending value.
+        assert!(err.contains("thinking") && err.contains("yes"), "{err}");
+    }
+
+    #[test]
+    fn v41_non_boolean_drop_thinking_kwarg_errors() {
+        // Same rule as `thinking`: present but not a JSON boolean is an error
+        // naming the key and the value; JSON null counts as absent.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("drop_thinking".to_string(), json!("false"))]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("a non-boolean drop_thinking kwarg must error")
+            .to_string();
+        assert_eq!(
+            err,
+            "DeepSeek V4.1: template_kwargs[\"drop_thinking\"] must be a boolean, got \"false\""
+        );
+        let kw = HashMap::from([("drop_thinking".to_string(), serde_json::Value::Null)]);
+        assert_eq!(
+            render_v41_turn(&tokenizer, Some(&kw), None).unwrap(),
+            format!("{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}{V41_THINKING_TAIL}")
+        );
+    }
+
+    #[test]
+    fn v41_params_thinking_false_renders_chat_mode() {
+        // The gateway projects a top-level `reasoning_effort` of
+        // `none`/`minimal` onto `params.thinking = Some(false)`.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let out = render_v41_turn(&tokenizer, None, Some(false)).unwrap();
+        assert_eq!(out, format!("{V41_BOS}{V41_CHAT_TAIL}"));
+    }
+
+    #[test]
+    fn v41_drop_thinking_false_keeps_historical_reasoning() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let messages = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "reasoning_content": "r1", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        let render = |kwargs: Option<&HashMap<String, serde_json::Value>>| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        add_generation_prompt: true,
+                        template_kwargs: kwargs,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        // Default (`drop_thinking: true`): reasoning before the last user
+        // turn is dropped.
+        assert!(!render(None).contains("r1"));
+        let kw = HashMap::from([("drop_thinking".to_string(), json!(false))]);
+        let out = render(Some(&kw));
+        assert_eq!(
+            out,
+            format!(
+                "{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}<\u{FF5C}User\u{FF5C}>q1<\u{FF5C}Assistant\u{FF5C}><think>r1</think>a1{V41_EOS}<\u{FF5C}User\u{FF5C}>q2<\u{FF5C}Assistant\u{FF5C}><think>"
+            )
+        );
+    }
+
+    #[test]
+    fn v41_tools_attach_to_a_mid_conversation_system_message() {
+        // The engine's V4.1 rule: tools attach to the FIRST system message wherever
+        // it is, even when the conversation opens with a user turn — unlike
+        // V3.2/V4, which only rewrite a *leading* system/developer message.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(out.contains("get_weather"), "tool name missing: {out}");
+        // Tools must land on the existing mid-conversation system message's
+        // own content, not on a synthesized leading one.
+        assert!(
+            out.contains("S\n\n## Tools"),
+            "tools not attached to the mid-conversation system message: {out}"
+        );
+        assert_eq!(out.matches("## Tools").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn v41_typed_function_without_optional_fields_renders_like_raw_json() {
+        // D5: `openai_protocol::common::Function` skips its absent optional
+        // fields (`description`, `strict`) when serialised, so a typed tool
+        // reaches the schema block with the same bytes as the raw JSON a
+        // client sends without those keys.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let parameters = json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        });
+        let typed = serde_json::to_value(Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "lookup".to_string(),
+                description: None,
+                parameters: parameters.clone(),
+                strict: None,
+                extra: Default::default(),
+            },
+        })
+        .unwrap();
+        let raw = json!({
+            "type": "function",
+            "function": { "name": "lookup", "parameters": parameters }
+        });
+        let render = |tool: serde_json::Value| {
+            let tools = [tool];
+            tokenizer
+                .apply_chat_template(
+                    &[json!({"role": "user", "content": "q"})],
+                    ChatTemplateParams {
+                        add_generation_prompt: true,
+                        tools: Some(&tools),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let from_typed = render(typed);
+        assert_eq!(from_typed, render(raw));
+        assert!(
+            from_typed.contains(
+                "\n\n{\"name\": \"lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\n"
+            ),
+            "{from_typed}"
+        );
+    }
+
+    /// V4.1 continues a trailing assistant message when `continue_final_message`
+    /// asks: no trailing EOS, no generation header. `add_generation_prompt:
+    /// false` alone is not read, and the message is closed with EOS as the
+    /// renderer's reference closes it.
+    #[test]
+    fn v41_continues_the_final_assistant_message_only_when_asked() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,"}),
+        ];
+        let render = |continue_final_message: bool| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        add_generation_prompt: false,
+                        continue_final_message,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        // Thinking mode (default ON), reasoning kept (the assistant turn is
+        // after the last user turn), and no trailing EOS since the request
+        // continues the final message.
+        let continued = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,";
+        assert_eq!(render(true), continued);
+        // Without the continuation the same conversation ends with the
+        // message closed: the flag alone does not leave it open.
+        assert_eq!(
+            render(false),
+            format!("{continued}<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>")
+        );
+    }
+
+    #[test]
+    fn v41_chat_template_content_format_is_openai_v4_stays_string() {
+        let (_tmp, tok41) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer41 = HuggingFaceTokenizer::from_file(&tok41).unwrap();
+        assert_eq!(
+            tokenizer41.chat_template_content_format(),
+            ChatTemplateContentFormat::OpenAI
+        );
+
+        let (_tmp, tok4) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer4 = HuggingFaceTokenizer::from_file(&tok4).unwrap();
+        assert_eq!(
+            tokenizer4.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+    }
+
+    #[test]
+    fn deepseek_profile_thinking_matches_both_native_renderers() {
+        use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+        for (model, architecture) in [
+            ("deepseek-v4-pro", "DeepseekV4ForCausalLM"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "DeepseekV41ForCausalLM"),
+        ] {
+            let (_tmp, path) = write_dir(Some(&[architecture]));
+            let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+            for (extra, enabled) in [
+                (json!({}), true),
+                (json!({"reasoning_effort":"minimal"}), true),
+                (json!({"reasoning_effort":"none"}), false),
+                (
+                    json!({"thinking":{"type":"disabled"},"reasoning_effort":"high"}),
+                    false,
+                ),
+                (
+                    json!({"thinking":{"type":"enabled"},"reasoning_effort":"none"}),
+                    true,
+                ),
+                (
+                    json!({"chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high"}),
+                    false,
+                ),
+            ] {
+                let mut body =
+                    json!({"model":model,"messages":[{"role":"user","content":"hello"}]});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let mut req: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+                req.normalize();
+                // Match the gateway's merge: typed effort, then explicit kwargs.
+                let mut kwargs = HashMap::new();
+                if let Some(effort) = req.effective_reasoning_effort() {
+                    kwargs.insert("reasoning_effort".to_string(), json!(effort));
+                }
+                if let Some(explicit) = &req.chat_template_kwargs {
+                    kwargs.extend(explicit.clone());
+                }
+                let rendered = tokenizer
+                    .apply_chat_template(
+                        &[json!({"role":"user","content":"hello"})],
+                        ChatTemplateParams {
+                            add_generation_prompt: true,
+                            thinking: req.thinking_toggle(),
+                            template_kwargs: Some(&kwargs),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    rendered.ends_with(if enabled { "<think>" } else { "</think>" }),
+                    "{body}: {rendered}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn deepseek_v41_profile_preserves_requested_effort_budget_in_prompt() {
+        use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+        let (_tmp, tokenizer) = v41_tokenizer();
+        for (effort, budget) in [
+            (json!("medium"), 62),
+            (json!("xhigh"), 75),
+            (json!(42), 42),
+            (json!(1), 1),
+            (json!(100), 100),
+        ] {
+            let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"deepseek-ai/DeepSeek-V4.1-Flash", "messages":[{"role":"user","content":"hello"}],
+                "reasoning_effort":effort,
+            })).unwrap();
+            req.normalize();
+            let mut kwargs = HashMap::from([(
+                "reasoning_effort".to_string(),
+                json!(req.effective_reasoning_effort().unwrap()),
+            )]);
+            kwargs.extend(req.chat_template_kwargs.clone().unwrap_or_default());
+            let rendered =
+                render_v41_turn(&tokenizer, Some(&kwargs), req.thinking_toggle()).unwrap();
+            assert!(
+                rendered.contains(&format!("Reasoning Effort: {budget} (range")),
+                "{effort}: {rendered}"
+            );
+        }
+    }
+}

@@ -2,7 +2,8 @@
 //!
 //! [`for_model`] takes a model id, the Hugging Face id or the name a server gives the model, and
 //! gives the [`Format`] that reads its output: the table of the checkpoint group the model belongs
-//! to, with the group's own turn opener where its template writes one the table does not expect.
+//! to, with the group's own turn opener where its template writes one the table does not expect,
+//! and the text its template writes after the thought's close where that is not the table's.
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
@@ -20,13 +21,17 @@
 //! renamed checkpoint (`Qwen3-8B-FP8`) is not matched and gives `None`, so the gateway keeps its
 //! older parsers for it until its group lists the name under `also`.
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{Arc, LazyLock, OnceLock},
+};
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
     gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling,
-    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3,
-    plain, qwen2_5, qwen3, seed_oss, xlam,
+    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark,
+    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -130,6 +135,8 @@ tables! {
     DeepSeekV3_2 => "deepseek_v3.2", deepseek_v3_2;
     /// [`llama4()`].
     Llama4 => "llama4", llama4;
+    /// [`mistral()`].
+    Mistral => "mistral", mistral;
     /// [`kimi_k2()`].
     KimiK2 => "kimi_k2", kimi_k2;
 }
@@ -169,7 +176,10 @@ impl Table {
     /// other text. The gateway's older parser names are the gateway's to map (`qwen` for `qwen3`):
     /// the crate knows a table by its own name.
     pub fn named(name: &str) -> Option<Self> {
-        Self::exactly_named(&name.trim().to_ascii_lowercase())
+        let name = name.trim();
+        ROWS.iter()
+            .find(|row| row.name.eq_ignore_ascii_case(name))
+            .map(|row| row.table)
     }
 
     /// The table named `name` exactly, as [`Self::name`] spells it; `None` for any other text. A
@@ -213,6 +223,11 @@ struct Group {
     /// What the group's own template opens the model's turn with, when it is not the table's
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
+    /// What the group's own template writes after the thought's close before the first call,
+    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
+    /// ([`Format::with_thought_after`]).
+    after: Option<&'static str>,
 }
 
 impl Group {
@@ -221,11 +236,16 @@ impl Group {
         std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
     }
 
-    /// The group's table, with the group's own turn opener where its template writes one.
+    /// The group's table, with the group's own turn opener where its template writes one, and
+    /// its own text after the thought's close where its template writes other than the table's.
     fn format(&self) -> Format {
         let format = self.table.format();
-        match self.opener {
+        let format = match self.opener {
             Some(opener) => format.opens_turn(opener),
+            None => format,
+        };
+        match self.after {
+            Some(after) => format.with_thought_after(after),
             None => format,
         }
     }
@@ -269,19 +289,52 @@ const fn table_named(name: &str) -> Table {
 
 // Every group whose table is on main, in bellwether's slug order, as `const GROUPS: &[Group]`:
 // `groups.json` beside this module is the one place a group is spelled (the primary's id, its
-// other checkpoints, its table by name, its own turn opener), one group per line, and `build.rs`
+// other checkpoints, its table by name, its own turn opener, its own text after the thought's
+// close where the template writes other than the table's), one group per line, and `build.rs`
 // writes it as this constant, so the compiled tables are the literals they were.
 include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 
-/// Every group's checkpoints by repository name, each with its group's index, in the registry's
-/// order: worked out once, since a request looks its model up more than once.
-static REPOSITORIES: LazyLock<Vec<(&'static str, usize)>> = LazyLock::new(|| {
-    GROUPS
-        .iter()
-        .enumerate()
-        .flat_map(|(index, group)| group.repositories().map(move |own| (own, index)))
-        .collect()
+/// Every group's checkpoints by repository name, each with its group's index, keyed without
+/// regard to ASCII case ([`Caseless`]): worked out once, since a request looks its model up more
+/// than once, and read in constant time whatever the registry's size; a name two groups spell
+/// keeps the first in the registry's order, as the scan it replaces did.
+static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for (index, group) in GROUPS.iter().enumerate() {
+        for own in group.repositories() {
+            map.entry(Caseless(own)).or_insert(index);
+        }
+    }
+    map
 });
+
+/// A repository name as a map key, equal to another spelled in any ASCII case: hashed over its
+/// ASCII-lowercased bytes, compared with `eq_ignore_ascii_case`.
+#[derive(Clone, Copy, Debug)]
+struct Caseless<'a>(&'a str);
+
+impl PartialEq for Caseless<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Eq for Caseless<'_> {}
+
+impl Hash for Caseless<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Folded into a stack buffer and written once per piece: a hasher's per-byte writes
+        // cost more than the fold; the terminator is `str`'s own.
+        let mut buffer = [0u8; 64];
+        for chunk in self.0.as_bytes().chunks(buffer.len()) {
+            let folded = &mut buffer[..chunk.len()];
+            folded.copy_from_slice(chunk);
+            folded.make_ascii_lowercase();
+            state.write(folded);
+        }
+        state.write_u8(0xff);
+    }
+}
 
 /// Every group's table ([`Group::format`]), built once and shared, by the group's index.
 static GROUP_FORMATS: [OnceLock<Arc<Format>>; GROUPS.len()] =
@@ -294,10 +347,10 @@ fn group_for(model: &str) -> Option<(usize, &'static Group)> {
     if repository.is_empty() {
         return None;
     }
-    REPOSITORIES
-        .iter()
-        .find(|(own, _)| own.eq_ignore_ascii_case(repository))
-        .map(|&(_, index)| (index, &GROUPS[index]))
+    let repositories: &HashMap<Caseless<'_>, usize> = &REPOSITORIES;
+    repositories
+        .get(&Caseless(repository))
+        .map(|&index| (index, &GROUPS[index]))
 }
 
 /// The table that reads `model`'s output, with the model's own turn opener where its template has
@@ -345,11 +398,12 @@ mod tests {
             .map(|group| {
                 let also: Vec<String> = group.also.iter().map(|also| text(also)).collect();
                 format!(
-                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}}}"#,
+                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}, "after": {}}}"#,
                     text(group.model),
                     also.join(", "),
                     text(group.table.name()),
                     group.opener.map_or_else(|| "null".to_string(), text),
+                    group.after.map_or_else(|| "null".to_string(), text),
                 )
             })
             .collect();
@@ -430,6 +484,27 @@ mod tests {
             table_for("nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1"),
             Some(Table::Json)
         );
+        // The Llama 3.1 and 3.3 Instruct checkpoints write that syntax under their own ids, the 3.3
+        // template byte for byte the 3.1 one: the json table, replayed from the Llama 3 header as
+        // the 3.2 rows are. The 3.1 repositories' former names, still served, are listed too.
+        for llama in [
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "meta-llama/Llama-3.1-405B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            "meta-llama/Meta-Llama-3.1-70B-Instruct",
+            "meta-llama/Meta-Llama-3.1-405B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "llama-3.3-70b-instruct",
+        ] {
+            assert_eq!(table_for(llama), Some(Table::Json), "{llama}");
+            let format = for_model(llama).unwrap_or_else(|| panic!("{llama}"));
+            assert_eq!(
+                format.turn_opener(),
+                Some("<|start_header_id|>assistant<|end_header_id|>"),
+                "{llama}"
+            );
+        }
         assert_eq!(
             table_for("thinkingmachines/Inkling-NVFP4"),
             Some(Table::Inkling)
@@ -438,6 +513,22 @@ mod tests {
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
+        // DeepSeek-V4-Pro ships the V4-Flash group's encoder, tokenizer and configuration files:
+        // the V4 table, by the member's name alone as well.
+        for v4 in ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-v4-pro"] {
+            assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
+        }
+        // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+        // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
+        for v3_2 in [
+            "deepseek-ai/DeepSeek-V3.2",
+            "deepseek-ai/DeepSeek-V3.2-Speciale",
+            "deepseek-ai/DeepSeek-V3.2-Exp",
+            "deepseek-ai/DeepSeek-V3.2-Exp-Base",
+            "deepseek-v3.2-exp",
+        ] {
+            assert_eq!(table_for(v3_2), Some(Table::DeepSeekV3_2), "{v3_2}");
+        }
         for mimo in [
             "XiaomiMiMo/MiMo-V2.6-Flash-RL",
             "XiaomiMiMo/MiMo-V2.6-Pro-RL",
@@ -447,6 +538,18 @@ mod tests {
         ] {
             assert_eq!(table_for(mimo), Some(Table::Qwen3TaggedDirect), "{mimo}");
         }
+        // The R1 line writes V3's call spelling from its history and a thought the V3 table reads.
+        for r1 in [
+            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-R1-Zero",
+            "arcee-ai/DeepSeek-R1-bf16",
+            "deepseek-ai/DeepSeek-R1-0528",
+            "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        ] {
+            assert_eq!(table_for(r1), Some(Table::DeepSeekV3), "{r1}");
+        }
     }
 
     #[test]
@@ -454,6 +557,8 @@ mod tests {
         for model in [
             "Qwen/QwQ-32B",
             "Qwen/Qwen3-8B-FP8",
+            // A base checkpoint without the Instruct template: not a name a group lists.
+            "meta-llama/Llama-3.1-8B",
             "Qwen",
             "Qwen/",
             "",
@@ -462,6 +567,54 @@ mod tests {
             assert_eq!(table_for(model), None, "{model}");
             assert!(for_model(model).is_none(), "{model}");
         }
+    }
+
+    /// The index answers as the scan it replaced did: every checkpoint name of every group, as
+    /// the registry spells it and in upper and lower case, finds the first group in the
+    /// registry's order that spells it; a name no group spells finds nothing.
+    #[test]
+    fn every_checkpoint_name_is_found_by_the_index_as_the_scan_found_it_in_any_case() {
+        fn scanned(repository: &str) -> Option<usize> {
+            GROUPS.iter().position(|group| {
+                group
+                    .repositories()
+                    .any(|own| own.eq_ignore_ascii_case(repository))
+            })
+        }
+        for group in GROUPS {
+            for own in group.repositories() {
+                let spellings = [
+                    own.to_string(),
+                    own.to_ascii_uppercase(),
+                    own.to_ascii_lowercase(),
+                ];
+                for spelling in &spellings {
+                    let found = group_for(spelling).map(|(index, _)| index);
+                    assert_eq!(found, scanned(own), "{spelling}");
+                    assert!(found.is_some(), "{spelling}");
+                }
+            }
+        }
+        assert_eq!(
+            group_for("no-such-checkpoint").map(|(index, _)| index),
+            None
+        );
+        assert_eq!(
+            group_for("NO-SUCH-CHECKPOINT").map(|(index, _)| index),
+            None
+        );
+    }
+
+    /// Two spellings of one name are one key: equal, and hashed the same.
+    #[test]
+    fn a_caseless_key_is_equal_and_hashes_equal_across_ascii_case() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let state = RandomState::new();
+        let (upper, lower) = (Caseless("Qwen/QWEN3-8B"), Caseless("qwen/qwen3-8b"));
+        assert_eq!(upper, lower);
+        assert_eq!(state.hash_one(upper), state.hash_one(lower));
+        assert_ne!(Caseless("qwen3-8b"), Caseless("qwen3-8"));
     }
 
     #[test]
@@ -532,14 +685,93 @@ mod tests {
         }
     }
 
+    /// What a table writes after the thought's close, where it has a thought layout.
+    fn after_the_close(format: &Format) -> Option<&str> {
+        format
+            .layout()
+            .and_then(|layout| layout.thought.as_ref())
+            .map(|thought| &*thought.after)
+    }
+
     #[test]
-    fn every_table_builds_and_takes_its_groups_opener() {
+    fn every_table_builds_and_takes_its_groups_opener_and_text_after_the_close() {
         for group in GROUPS {
             let format = for_model(group.model).unwrap_or_else(|| panic!("{}", group.model));
             assert_eq!(format.validate(), Ok(()), "{}", group.model);
             let own = group.table.format();
             let expected = group.opener.or_else(|| own.turn_opener());
             assert_eq!(format.turn_opener(), expected, "{}", group.model);
+            // A group's own `after` replaces the table's, the close kept; a group with none keeps
+            // the table's; a group that names one on a table with no thought layout is refused.
+            let expected = group.after.or_else(|| after_the_close(&own));
+            assert_eq!(
+                after_the_close(&format),
+                expected,
+                "{}: the text after the thought's close",
+                group.model
+            );
+            if group.after.is_some() {
+                assert_eq!(
+                    format
+                        .layout()
+                        .and_then(|layout| layout.thought.as_ref())
+                        .and_then(|thought| thought.close.as_deref()),
+                    own.layout()
+                        .and_then(|layout| layout.thought.as_ref())
+                        .and_then(|thought| thought.close.as_deref()),
+                    "{}: the close is the table's",
+                    group.model
+                );
+            }
+        }
+    }
+
+    /// The NVIDIA Nemotron 3 groups and Step 3.5 Flash read with the Qwen 3.5 table, whose template
+    /// writes two newlines after the thought's close before a call; theirs write one (bellwether's rendered
+    /// `tools-call-arguments-object` for the group: `</think>\n<tool_call>`), which their entries
+    /// carry. A forced call written after the close begins with the one newline, and their
+    /// thinking-off prompt ends with the bare `<think></think>`, so the newline stays the tag's,
+    /// as for the table.
+    #[test]
+    fn a_nemotron_3_group_writes_its_templates_one_newline_after_the_thoughts_close() {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json;
+
+        use crate::grammar::{GrammarStart, Options};
+        let format = for_model("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16").expect("a table");
+        let own = Table::Qwen3Tagged.format();
+        assert_eq!(after_the_close(&format), Some("\n"));
+        assert_eq!(after_the_close(&own), Some("\n\n"));
+        let off = "<|im_start|>assistant\n<think></think>";
+        assert!(!format.thought_closed(off));
+        assert!(!format.reasoning_open(off));
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }];
+        for (format, newline) in [(&format, "\n"), (&own, "\n\n")] {
+            let tag = format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: false,
+                        thought_closed: false,
+                        one_call: true,
+                        start: GrammarStart::AfterReasoning,
+                    },
+                )
+                .expect("a tag")
+                .payload();
+            assert_eq!(tag["format"]["type"], "sequence");
+            assert_eq!(tag["format"]["elements"][0]["type"], "const_string");
+            assert_eq!(tag["format"]["elements"][0]["value"], newline);
         }
     }
 

@@ -3,10 +3,10 @@
 //! A typed-JSON handler collects its body after admission granted a permit.
 //! Nothing bounded that read: a client that stopped sending, or trickled,
 //! kept its connection, its in-flight entry and its admission permit for as
-//! long as it liked. `request_body_timeout_middleware` wraps the body so the
+//! long as it liked. [`RequestBodyTimeouts::layer`] wraps the body so the
 //! read fails once a single wait on the client lasts the stream-body stall
 //! timeout, or once the body is still incomplete at the request timeout; the
-//! middleware then answers 408 and the admission guard around the response
+//! layer then answers 408 and the admission guard around the response
 //! releases the permit as the response drops. Both clocks run only while the
 //! consumer is waiting on the client: a parsed body, a request parked at
 //! admission or a slow handler never trips them. A read the payload limit
@@ -25,16 +25,12 @@ use std::{
     time::Duration,
 };
 
-use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, extract::Request, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http_body::Frame;
+use pin_project_lite::pin_project;
 use tokio::time::Sleep;
+use tower::{Layer, Service};
 use tracing::warn;
 
 use crate::{config::types::RouterConfig, routers::error::create_error};
@@ -84,20 +80,18 @@ impl RequestBodyTimeouts {
     }
 }
 
-/// Route-layer middleware: wraps the request body in the watchdog and turns
-/// a read the watchdog ended into `408` with the matching error code, and a
-/// read the payload limit ended into `413`. The handler's own rejection of
-/// the failed read (the JSON extractor's 400) is replaced, so the client
-/// learns why its upload ended.
-pub async fn request_body_timeout_middleware(
-    State(timeouts): State<RequestBodyTimeouts>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+/// `request` with its body under the two clocks, and the flag the read's end
+/// is written to.
+fn timed(request: Request<Body>, timeouts: RequestBodyTimeouts) -> (Request<Body>, Arc<AtomicU8>) {
     let outcome = Arc::new(AtomicU8::new(READING));
     let request =
         request.map(|body| Body::new(TimedBody::new(body, timeouts, Arc::clone(&outcome))));
-    let response = next.run(request).await;
+    (request, outcome)
+}
+
+/// The response a request leaves with once its body read is settled: the
+/// inner service's own, or the 408 / 413 the read's end calls for.
+fn settled(timeouts: RequestBodyTimeouts, outcome: &AtomicU8, response: Response) -> Response {
     match outcome.load(Ordering::Acquire) {
         STALLED => {
             let timeout_secs = timeouts.stall.map_or(0, |stall| stall.as_secs());
@@ -125,6 +119,86 @@ pub async fn request_body_timeout_middleware(
         }
         TOO_LARGE => request_body_too_large_response(),
         _ => response,
+    }
+}
+
+impl RequestBodyTimeouts {
+    /// The body watchdog as a route layer: the body is wrapped before the
+    /// inner service is called and the response is settled from the
+    /// service's own future when it is ready. Hand-written rather than an
+    /// `axum::middleware::from_fn`, which clones the inner service and boxes
+    /// a future on every request.
+    pub fn layer(self) -> RequestBodyTimeoutLayer {
+        RequestBodyTimeoutLayer { timeouts: self }
+    }
+}
+
+/// [`RequestBodyTimeouts::layer`].
+#[derive(Clone, Copy, Debug)]
+pub struct RequestBodyTimeoutLayer {
+    timeouts: RequestBodyTimeouts,
+}
+
+impl<S> Layer<S> for RequestBodyTimeoutLayer {
+    type Service = RequestBodyTimeoutService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestBodyTimeoutService {
+            inner,
+            timeouts: self.timeouts,
+        }
+    }
+}
+
+/// The service [`RequestBodyTimeoutLayer`] wraps a route in.
+#[derive(Clone, Debug)]
+pub struct RequestBodyTimeoutService<S> {
+    inner: S,
+    timeouts: RequestBodyTimeouts,
+}
+
+impl<S, E> Service<Request<Body>> for RequestBodyTimeoutService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = E>,
+{
+    type Response = Response;
+    type Error = E;
+    type Future = SettledFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let (request, outcome) = timed(request, self.timeouts);
+        SettledFuture {
+            inner: self.inner.call(request),
+            outcome,
+            timeouts: self.timeouts,
+        }
+    }
+}
+
+pin_project! {
+    /// The inner service's future, its response settled by the body read's end.
+    pub struct SettledFuture<F> {
+        #[pin]
+        inner: F,
+        outcome: Arc<AtomicU8>,
+        timeouts: RequestBodyTimeouts,
+    }
+}
+
+impl<F, E> Future for SettledFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let response = std::task::ready!(this.inner.poll(cx))?;
+        Poll::Ready(Ok(settled(*this.timeouts, this.outcome, response)))
     }
 }
 
@@ -247,10 +321,7 @@ mod tests {
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
             .route("/echo", post(|body: Bytes| async move { body }))
-            .layer(axum::middleware::from_fn_with_state(
-                timeouts,
-                request_body_timeout_middleware,
-            ))
+            .layer(timeouts.layer())
     }
 
     fn echo(body: Body) -> Request<Body> {

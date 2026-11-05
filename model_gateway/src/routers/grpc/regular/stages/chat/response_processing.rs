@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
@@ -14,7 +13,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::{ProcessStage, RateLimitCell},
+            common::stages::RateLimitCell,
             context::{DispatchContext, FinalResponse},
             regular::{processor, streaming},
             spec::ResponseSpec,
@@ -41,9 +40,11 @@ impl ChatResponseProcessingStage {
     }
 }
 
-#[async_trait]
-impl ProcessStage for ChatResponseProcessingStage {
-    async fn process(
+impl ChatResponseProcessingStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn process_result(
         &self,
         ctx: &mut DispatchContext,
         spec: ResponseSpec,
@@ -167,9 +168,5 @@ impl ProcessStage for ChatResponseProcessingStage {
         ctx.response.engine_counts = Some(counts);
 
         Ok(None)
-    }
-
-    fn name(&self) -> &'static str {
-        "ChatResponseProcessing"
     }
 }

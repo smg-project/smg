@@ -6,6 +6,11 @@
 //! gateway's OpenAI-shaped envelope, a plain-text refusal, an empty body. The
 //! status is kept and `error.type` follows from it.
 
+use std::{
+    convert::Infallible,
+    task::{Context, Poll},
+};
+
 use axum::{
     body::{Body, Bytes},
     extract::Request,
@@ -13,11 +18,12 @@ use axum::{
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
         HeaderMap, HeaderValue, StatusCode,
     },
-    middleware::Next,
     response::Response,
 };
+use futures_util::future::{BoxFuture, Either};
 use openai_protocol::messages::{ErrorEnvelope, ErrorResponse};
 use serde_json::Value;
+use tower::{Layer, Service};
 
 use super::request_id::{generate_request_id, RequestId};
 
@@ -61,16 +67,58 @@ pub fn messages_error_type(status: StatusCode) -> &'static str {
 /// once more at the edge, outside the body-size limit, so a declared
 /// over-limit length (refused before any route layer runs) is covered too;
 /// a body already in the shape passes the second pass unchanged.
-pub async fn messages_error_envelope_middleware(request: Request, next: Next) -> Response {
-    if !is_messages_route(request.uri().path()) {
-        return next.run(request).await;
+///
+/// A layer that costs the other routes nothing: a request to a Messages route
+/// gets its error response re-shaped (a boxed future, as the body is read);
+/// any other request's future is the inner service's own, neither boxed nor
+/// wrapped. (An `axum::middleware::from_fn` form clones and boxes the inner
+/// service and boxes its own future on every request, Messages route or not:
+/// five allocations and several KiB per request on the chat path, measured
+/// 2026-10-21.)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MessagesErrorEnvelopeLayer;
+
+impl<S> Layer<S> for MessagesErrorEnvelopeLayer {
+    type Service = MessagesErrorEnvelope<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        MessagesErrorEnvelope { inner }
     }
-    let request_id = request_id_of(&request);
-    let response = next.run(request).await;
-    if !(response.status().is_client_error() || response.status().is_server_error()) {
-        return response;
+}
+
+/// The service [`MessagesErrorEnvelopeLayer`] wraps a route in.
+#[derive(Clone, Debug)]
+pub struct MessagesErrorEnvelope<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for MessagesErrorEnvelope<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible>,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
     }
-    into_messages_envelope(response, request_id).await
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        if !is_messages_route(request.uri().path()) {
+            return Either::Left(self.inner.call(request));
+        }
+        let request_id = request_id_of(&request);
+        let response = self.inner.call(request);
+        Either::Right(Box::pin(async move {
+            let Ok(response) = response.await;
+            if !(response.status().is_client_error() || response.status().is_server_error()) {
+                return Ok(response);
+            }
+            Ok(into_messages_envelope(response, request_id).await)
+        }))
+    }
 }
 
 /// The id the request-id middleware assigned (echoed as `x-request-id`), or
@@ -165,7 +213,6 @@ fn reason(status: StatusCode) -> String {
 mod tests {
     use axum::{
         http::header::{RETRY_AFTER, WWW_AUTHENTICATE},
-        middleware::from_fn,
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
@@ -235,7 +282,7 @@ mod tests {
                 "/v1/chat/completions",
                 post(|| async { route_error::bad_request("json_parse_error", "nope") }),
             )
-            .route_layer(from_fn(messages_error_envelope_middleware))
+            .route_layer(MessagesErrorEnvelopeLayer)
             .layer(RequestIdLayer::new(vec!["x-client-request-id".to_string()]))
     }
 

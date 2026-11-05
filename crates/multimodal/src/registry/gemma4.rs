@@ -30,6 +30,7 @@ use crate::{
         EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
         VideoSamplingInfo,
     },
+    vision::{Gemma4Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 /// The engine's default loader keeps at most this many frames of a clip.
@@ -225,7 +226,9 @@ impl ModelProcessorSpec for Gemma4Spec {
             || id.contains("gemma4")
     }
 
-    /// The template renders the parts in the order they were written.
+    /// The family's renderer is positional: a string template of it gets the
+    /// media parts where the request put them. Its own template takes the
+    /// parts and places them itself, whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }
@@ -323,6 +326,29 @@ impl ModelProcessorSpec for Gemma4Spec {
             limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Gemma4Processor::from_config_for(preprocessor_config, modality).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

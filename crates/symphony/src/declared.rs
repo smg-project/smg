@@ -38,6 +38,11 @@ impl Declared {
         Self::shared(Arc::from(tools))
     }
 
+    /// The request's tools, as it declared them, in its order.
+    pub(crate) fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+
     /// Whether a tool of the request declares `function`.
     pub fn declares(&self, function: &str) -> bool {
         self.tools.iter().any(|tool| tool.function.name == function)

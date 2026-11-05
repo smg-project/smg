@@ -2,12 +2,15 @@
 //! the answers that are not streamed to the client. The regular and the
 //! Harmony processors both collect here.
 
+use std::sync::Arc;
+
 use axum::response::Response;
 use tracing::error as trace_error;
 
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
+        common::pd_failure::{PdSide, SidePhase},
         error,
         grpc::{
             context::ExecutionResult,
@@ -16,11 +19,12 @@ use crate::{
                 ProtoStream,
             },
             utils::{
-                account_pd_side_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+                account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
+                stream_failure::UpstreamClass, tonic_ext::TonicStatusExt, DeadRendezvous,
             },
         },
     },
-    worker::PrefillLoadGuard,
+    worker::{PrefillLoadGuard, Worker},
 };
 
 /// Drain each Prefill sample through its terminal response, releasing only that
@@ -87,7 +91,7 @@ pub(crate) async fn collect_responses(
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
-            let responses = collect_stream_responses(&mut stream, "Single", None).await?;
+            let responses = collect_stream_responses(&mut stream, "Single", None, None).await?;
             stream.mark_completed();
             responses
         }
@@ -150,7 +154,7 @@ async fn collect_prefill_decode(
             }
             UpstreamClass::account_collected_failure(worker.as_ref(), &status);
         }
-        stream_failed("Prefill", &status)
+        stream_failed(Some(PdSide::Prefill), "Prefill", &status, None)
     })?;
 
     // The client's prompt-side usage is the prefill side's.
@@ -158,7 +162,8 @@ async fn collect_prefill_decode(
     let mut decode_responses = collect_stream_responses(
         &mut decode_stream,
         "Decode",
-        Some(metrics_labels::WORKER_DECODE),
+        Some(PdSide::Decode),
+        prefill_worker.as_ref(),
     )
     .await?;
 
@@ -190,41 +195,123 @@ fn merge_prefill_logprobs(
     }
 }
 
-/// The client's answer when `side`'s stream ended with `status` before its
-/// `Complete`: the status's own HTTP class with the wording clients know.
-fn stream_failed(side: &str, status: &tonic::Status) -> Response {
-    status.to_http_error(
-        "worker_stream_failed",
-        format!("{side} stream failed: {}", status.message()),
-    )
+/// The client's answer when `worker_name`'s stream ended with `status`
+/// before its `Complete`: the status's own HTTP class, under the code and
+/// with the words that name the dead rendezvous port when the gateway found
+/// one behind the failure; else, for a disaggregated `side`, the side's
+/// stream-phase code of the shared vocabulary (`pd_failure`), the one the
+/// HTTP prefill-decode router answers for the same failure; for a single
+/// worker the code clients know. A worker's report that the engine could not
+/// continue the request under its constraint is answered for the constraint.
+fn stream_failed(
+    side: Option<PdSide>,
+    worker_name: &str,
+    status: &tonic::Status,
+    rendezvous: Option<&DeadRendezvous>,
+) -> Response {
+    // The engine could not continue the request under its constraint: the
+    // request's answer, under its own code, final for the retry layer (see
+    // `TonicStatusExt::constraint_failure_response`).
+    if let Some(response) = status.constraint_failure_response() {
+        return response;
+    }
+    match (rendezvous, side) {
+        (Some(rendezvous), _) => status.to_http_error(
+            "pd_rendezvous_failed",
+            format!(
+                "{worker_name} stream failed: {}; {rendezvous}",
+                status.message()
+            ),
+        ),
+        (None, Some(side)) => {
+            let mut response =
+                side.answer(SidePhase::Stream, status.http_status(), status.message());
+            mark_error_reason(&mut response, status.error_reason());
+            response
+        }
+        (None, None) => status.to_http_error(
+            "worker_stream_failed",
+            format!("{worker_name} stream failed: {}", status.message()),
+        ),
+    }
 }
 
 /// Collect all `Complete` frames of a gRPC stream; chunks carry nothing a
 /// collected answer needs. `side` names the disaggregated side the stream
 /// belongs to, whose rendezvous failures are counted before they become the
-/// client's answer; a single worker's stream has none. A failed stream is not
-/// marked completed, so its drop sends the abort.
+/// client's answer: the engine's words by phase, and, for a decode side the
+/// engine failed without a reason before anything was read from its stream,
+/// the `prefill` side's bootstrap port probed now (see [`dead_rendezvous_of`]);
+/// a single worker's stream has none. A
+/// failed stream is not marked completed, so its drop sends the abort.
 async fn collect_stream_responses<S: FanoutChild>(
     stream: &mut S,
     worker_name: &str,
-    side: Option<&'static str>,
+    side: Option<PdSide>,
+    prefill: Option<&Arc<dyn Worker>>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
+    // Whether the stream handed anything, a chunk included: `all_responses`
+    // keeps the `Complete` frames alone.
+    let mut read_any = false;
 
     while let Some(response) = stream.next_item().await {
-        let gen_response = response.map_err(|status| {
-            if let Some(side) = side {
-                account_pd_side_failure(side, &status);
+        let gen_response = match response {
+            Ok(response) => {
+                read_any = true;
+                response
             }
-            trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?status.code(), error = ?status, "Worker stream error");
-            // The worker's failure counts against it as a streamed answer's
-            // does; the client's status and the router-error family are the
-            // pipeline's.
-            if let Some(worker) = stream.worker() {
-                UpstreamClass::account_collected_failure(worker.as_ref(), &status);
+            Err(status) => {
+                let rendezvous = match side {
+                    Some(side) => {
+                        account_pd_side_failure(side.name(), &status);
+                        // Before anything was read from the decode stream, as the
+                        // streamed path reads it before its first token: once a
+                        // response came, a chunk included, the sides met.
+                        if side == PdSide::Decode && !read_any {
+                            dead_rendezvous_of(prefill, &status).await
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                match &rendezvous {
+                    Some(DeadRendezvous(port)) => trace_error!(
+                        function = "collect_stream_responses",
+                        worker = %worker_name,
+                        grpc_code = ?status.code(),
+                        error = ?status,
+                        prefill = prefill.map_or("none", |prefill| prefill.url()),
+                        bootstrap_host = port.host.as_str(),
+                        bootstrap_port = port.port,
+                        bootstrap_port_source = port.source.label(),
+                        probe_error = %port.error,
+                        "Worker stream error, and the prefill side's bootstrap port did not accept \
+                         a connection: the sides could not rendezvous"
+                    ),
+                    None => trace_error!(
+                        function = "collect_stream_responses",
+                        worker = %worker_name,
+                        grpc_code = ?status.code(),
+                        error = ?status,
+                        "Worker stream error"
+                    ),
+                }
+                // The worker's failure counts against it as a streamed
+                // answer's does; the client's status and the router-error
+                // family are the pipeline's.
+                if let Some(worker) = stream.worker() {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &status);
+                }
+                return Err(stream_failed(
+                    side,
+                    worker_name,
+                    &status,
+                    rendezvous.as_ref(),
+                ));
             }
-            stream_failed(worker_name, &status)
-        })?;
+        };
         if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
             all_responses.push(complete);
         }
@@ -235,15 +322,19 @@ async fn collect_stream_responses<S: FanoutChild>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    use axum::http::StatusCode;
+    use smg_grpc_client::sglang_proto as sglang;
 
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-        worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
+        test_support::RefusedAddress,
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the
@@ -275,6 +366,70 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+    }
+
+    /// A stream that yields one chunk (nothing a collected answer keeps),
+    /// then the engine's report.
+    struct ChunkThenFailing(Option<tonic::Status>, bool);
+
+    impl FanoutChild for ChunkThenFailing {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            if !self.1 {
+                self.1 = true;
+                return Some(Ok(ProtoGenerateResponse::Sglang(Box::new(
+                    sglang::GenerateResponse {
+                        response: Some(sglang::generate_response::Response::Chunk(
+                            sglang::GenerateStreamChunk::default(),
+                        )),
+                        ..Default::default()
+                    },
+                ))));
+            }
+            self.0.take().map(Err)
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    /// A stream that yields one `Complete`, then the engine's report.
+    struct CompleteThenFailing(Option<tonic::Status>, bool);
+
+    impl FanoutChild for CompleteThenFailing {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            if !self.1 {
+                self.1 = true;
+                return Some(Ok(ProtoGenerateResponse::Sglang(Box::new(
+                    sglang::GenerateResponse {
+                        response: Some(sglang::generate_response::Response::Complete(
+                            sglang::GenerateComplete::default(),
+                        )),
+                        ..Default::default()
+                    },
+                ))));
+            }
+            self.0.take().map(Err)
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    /// A prefill side on the loopback host whose partners are handed `port`.
+    fn prefill_on(port: u16) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(port))
+                .build(),
+        )
     }
 
     #[tokio::test]
@@ -332,10 +487,12 @@ mod tests {
                 collect_stream_responses(
                     &mut FailingStream(Some(status.clone())),
                     "Decode",
-                    Some(metrics_labels::WORKER_DECODE),
+                    Some(PdSide::Decode),
+                    None,
                 )
                 .await,
-                collect_stream_responses(&mut FailingStream(Some(status)), "Single", None).await,
+                collect_stream_responses(&mut FailingStream(Some(status)), "Single", None, None)
+                    .await,
             )
         };
         assert!(decode.is_err(), "the failure becomes the answer");
@@ -349,6 +506,166 @@ mod tests {
         assert!(
             counted[0].contains(r#"leg="decode""#)
                 && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
+    }
+
+    /// The engine's reasonless report after a `Complete` already came from
+    /// the decode stream (a later choice of an `n > 1` request) is the
+    /// engine's report alone: the sides met, so the port is not probed and
+    /// nothing is counted under the request phase, dead port or not.
+    #[tokio::test]
+    async fn a_decode_leg_failed_after_a_response_came_keeps_the_engines_report() {
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let answer = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            collect_stream_responses(
+                &mut CompleteThenFailing(
+                    Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE)),
+                    false,
+                ),
+                "Decode",
+                Some(PdSide::Decode),
+                Some(&prefill),
+            )
+            .await
+            .err()
+            .expect("the failure becomes the answer")
+        };
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("decode_stream_error")
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("smg_pd_rendezvous_failures_total{")),
+            "nothing is probed once a response came:\n{rendered}"
+        );
+    }
+
+    /// A chunk the decode stream handed before the engine's reasonless report
+    /// means the sides met as much as a `Complete` does, though a collected
+    /// answer keeps nothing of it: the port is not probed, dead or not.
+    #[tokio::test]
+    async fn a_decode_side_failed_after_a_chunk_came_keeps_the_engines_report() {
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let answer = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            collect_stream_responses(
+                &mut ChunkThenFailing(Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE)), false),
+                "Decode",
+                Some(PdSide::Decode),
+                Some(&prefill),
+            )
+            .await
+            .err()
+            .expect("the failure becomes the answer")
+        };
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("decode_stream_error")
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("smg_pd_rendezvous_failures_total{")),
+            "nothing is probed once a chunk came:\n{rendered}"
+        );
+    }
+
+    /// A decode side the engine failed without a reason, behind a prefill side
+    /// whose bootstrap port nothing listens on: the non-streamed answer
+    /// names the rendezvous in its code and its message (the status's own
+    /// HTTP class kept), and the rendezvous family counts it under the
+    /// request phase on the prefill side. Behind a port that accepts, the
+    /// answer is the decode side's stream failure, as on the HTTP router.
+    #[tokio::test]
+    async fn a_decode_leg_the_engine_failed_without_a_reason_names_the_dead_rendezvous_port() {
+        let report = || tonic::Status::internal(ENGINE_ERROR_MESSAGE);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("address").port();
+        let refused = RefusedAddress::reserve();
+        let dead = refused.port();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (known, answer) = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            (
+                collect_stream_responses(
+                    &mut FailingStream(Some(report())),
+                    "Decode",
+                    Some(PdSide::Decode),
+                    Some(&prefill_on(live)),
+                )
+                .await
+                .err()
+                .expect("the failure becomes the answer"),
+                collect_stream_responses(
+                    &mut FailingStream(Some(report())),
+                    "Decode",
+                    Some(PdSide::Decode),
+                    Some(&prefill_on(dead)),
+                )
+                .await
+                .err()
+                .expect("the failure becomes the answer"),
+            )
+        };
+        assert_eq!(
+            known
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("decode_stream_error"),
+            "behind a port that accepts, the side's own stream failure"
+        );
+        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("pd_rendezvous_failed")
+        );
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 20)
+            .await
+            .expect("a body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("an error envelope");
+        assert_eq!(body["error"]["code"], "pd_rendezvous_failed", "{body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!(
+                "Decode stream failed: {ENGINE_ERROR_MESSAGE}; the prefill side's bootstrap port \
+                 did not accept a connection ("
+            )) && message.ends_with("), so the sides could not rendezvous"),
+            "{message}"
+        );
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="request""#)
                 && counted[0].ends_with(" 1"),
             "{rendered}"
         );

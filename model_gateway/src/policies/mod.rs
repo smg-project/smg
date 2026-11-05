@@ -7,7 +7,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, HashRing, Worker},
+    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
 };
 
 mod bucket;
@@ -25,6 +25,8 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -52,7 +54,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
-    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// Now uses `Arc<dyn Worker>` for better performance and to avoid unnecessary cloning.
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from
@@ -99,6 +101,28 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// the `WorkerMonitor` polls a group only while something needs the
     /// data. A policy's answer is a constant for its lifetime.
     fn needs_backend_loads(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy weighs a worker's load against the cache it holds
+    /// for the request and moves a request off a saturated holder itself
+    /// (cache-aware's count-pressure spill). Disaggregated pair placement
+    /// then leaves the absolute overload veto off a prefill pool this policy
+    /// places instead of steering a returning session away from the worker
+    /// holding its prefix (see `placement::select_pair`). A constant for the
+    /// policy's lifetime.
+    fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy places `info`'s request on the owner of its
+    /// explicit session key (a routing key, or the rid-derived key under the
+    /// routing-key override) rather than by load: consistent hashing's ring
+    /// owner. Single-worker placement over regular workers then leaves the
+    /// absolute overload veto off the selection instead of moving the session
+    /// off the worker holding its cache each time that worker crosses a
+    /// threshold (see `placement::select_from`).
+    fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
         false
     }
 
@@ -160,16 +184,37 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative). The margin is capped at the in-flight count's natural
-    /// swing at the pool's current mean (two standard deviations, never
-    /// under four requests unless this value is lower), so a pool whose
-    /// per-worker in-flight count
-    /// stays below this value can still spill.
+    /// (relative). The margin is capped at the larger of the in-flight
+    /// count's natural swing at the pool's current mean (two standard
+    /// deviations, never under four requests unless this value is lower) and
+    /// the held prefix's price (`balance_prefix_margin_tokens`), so a pool
+    /// whose per-worker in-flight count stays below this value can still
+    /// spill. Outside the fleet-wide KV-pressure fallback, a request with no
+    /// cache match routes among the workers under the same gate, so a burst
+    /// of misses is bounded by the same margins.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
     /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
+    /// Price of a held prefix in the candidate gate's absolute margin, in
+    /// tokens per request: a holder's margin is at least the tokens of the
+    /// request's prefix it holds over this, rounded up, up to
+    /// `balance_abs_threshold`. A spill gives the held prefix up and the
+    /// spill target prefills it again, so a deep prefix (a long
+    /// conversation's follow-up) keeps its holder through a skew that would
+    /// move a shallow one. `0` (the default) leaves the margin to the swing
+    /// alone. Suits prefill pools serving long multi-turn sessions (e.g.
+    /// 1024, the mean prefill LeastLoad prices a queued request at); decode
+    /// picks are never priced, as a decode worker prefills nothing again.
+    pub balance_prefix_margin_tokens: u32,
+    /// Credit a pick on a worker holding the request's prefix with the
+    /// prompt it still has to prefill (its token count less the held tokens,
+    /// never under the mean prefill nor over the whole prompt) instead of the
+    /// whole prompt, in the expected-wait estimate later picks read: a hit on
+    /// a long cached conversation is not booked as its whole context's work.
+    /// Misses, spills and decode picks keep the whole prompt. Off by default.
+    pub balance_uncached_credit: bool,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
@@ -231,6 +276,8 @@ impl Default for CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,
@@ -273,12 +320,23 @@ impl Default for BucketConfig {
 /// [`Worker::is_available`] folds the absolute overload veto into the health +
 /// circuit-breaker test it already performed, under the same guards and with
 /// the same short-circuit order — the veto is one more test on a word already
-/// in hand, never a second walk.
-pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
+/// in hand, never a second walk. A selection whose caller lifted that veto
+/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
+/// ([`RoutingState::eligible_ignoring_overload`]).
+pub(crate) fn get_healthy_worker_indices(
+    workers: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
+) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_available())
+        .filter(|(_, w)| {
+            if info.overload_lifted {
+                w.routing_state().eligible_ignoring_overload()
+            } else {
+                w.is_available()
+            }
+        })
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -351,21 +409,40 @@ pub struct SelectWorkerInfo<'a> {
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub role: WorkerRole,
+    /// The absolute overload veto does not apply to this selection: the
+    /// pool's policy balances load against cache affinity itself
+    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]), so it
+    /// takes a worker over the thresholds as it takes one under them, even
+    /// when every worker is over them (health, the circuit breaker and the
+    /// liveness veto still apply). Set by disaggregated pair placement for
+    /// such a prefill pool (see `placement::select_pair`); every other pool
+    /// keeps the veto and the least-loaded steering default. Single-worker
+    /// placement over regular workers also sets it for a request its policy
+    /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
+    pub overload_lifted: bool,
+}
+
+impl SelectWorkerInfo<'_> {
+    /// Whether a worker in routing `state` is a candidate for this
+    /// selection: [`RoutingState::eligible`], or every veto but the overload
+    /// one when the caller lifted that veto ([`Self::overload_lifted`]).
+    pub(crate) fn admits(&self, state: RoutingState) -> bool {
+        if self.overload_lifted {
+            state.eligible_ignoring_overload()
+        } else {
+            state.eligible()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
+    };
 
     #[test]
     fn test_get_healthy_worker_indices() {
@@ -394,12 +471,12 @@ mod tests {
         ];
 
         // All healthy initially
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 1, 2]);
 
         // Mark one unhealthy
         workers[1].set_status(WorkerStatus::NotReady);
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 2]);
     }
 
@@ -426,7 +503,7 @@ mod tests {
             );
             worker.set_status(status);
             let workers = vec![worker];
-            let indices = get_healthy_worker_indices(&workers);
+            let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
             assert_eq!(
                 indices == vec![0],
                 expected_included,
@@ -456,17 +533,40 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         // A busy worker is still eligible: load alone is not the veto.
         let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         workers[1].set_overloaded(true);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 2]
+        );
+
+        // A caller that lifted the veto (every worker of its pool over the
+        // thresholds) gets the worker back; the liveness veto still applies.
+        let lifted = SelectWorkerInfo {
+            overload_lifted: true,
+            ..Default::default()
+        };
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 1, 2]);
+        workers[1].set_stall(Some(StallReason::Wedged));
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 2]);
+        workers[1].set_stall(None);
 
         workers[1].set_overloaded(false);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]

@@ -13,14 +13,14 @@
 //!     The first non-empty `msg.peer_id` is written into
 //!     `learned_peer: Arc<RwLock<Option<String>>>` and later frames are
 //!     held to it. Each frame is handled by
-//!     [`handle_frame`](crate::transport::peer_stream::handle_frame), the
+//!     [`handle_frame`], the
 //!     same way the dialer handles its own; the idle timeout around
 //!     `incoming.next()` lives in
-//!     [`next_frame`](crate::transport::peer_stream::next_frame).
+//!     [`next_frame`].
 //!   - **Inbound-sender task** — every 1 Hz, reads the shared
 //!     [`RoundBatch`](crate::kv::RoundBatch) slot produced by
 //!     [`gossip_controller`](crate::gossip_controller)'s event loop and
-//!     runs [`send_round`](crate::transport::peer_stream::send_round)
+//!     runs [`send_round`]
 //!     for the learned peer.
 //!
 //! Asymmetry with the outbound side: the dialer (gossip_controller)
@@ -47,8 +47,8 @@ use tracing::instrument;
 
 use super::{
     crdt_kv::CrdtWatermark,
+    dialer::Dialer,
     metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
-    mtls::MTLSManager,
     partition::PartitionDetector,
     service::{
         gossip::{
@@ -56,7 +56,7 @@ use super::{
             gossip_server::{Gossip, GossipServer},
             GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
         },
-        try_ping, ClusterState,
+        ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
@@ -111,7 +111,9 @@ pub struct GossipService {
     advertise_addr: SocketAddr,
     self_name: String,
     partition_detector: Option<Arc<PartitionDetector>>,
-    mtls_manager: Option<Arc<MTLSManager>>,
+    /// The node's dials: the relayed probes go through it, and the listener's
+    /// TLS configuration comes from the identity it holds.
+    dialer: Arc<Dialer>,
     /// Shared reference to the current stream RoundBatch, drained once
     /// per round by the GossipController. Server-side handlers read
     /// broadcast drain_entries and also emit targeted_entries addressed
@@ -137,7 +139,7 @@ impl GossipService {
             advertise_addr,
             self_name: self_name.to_string(),
             partition_detector: None,
-            mtls_manager: None,
+            dialer: Dialer::new(None),
             current_stream_batch: None,
             mesh_kv: None,
         }
@@ -170,8 +172,10 @@ impl GossipService {
         self
     }
 
-    pub fn with_mtls_manager(mut self, mtls_manager: Arc<MTLSManager>) -> Self {
-        self.mtls_manager = Some(mtls_manager);
+    /// The node's dialer, shared with the gossip controller and the handler:
+    /// with the node's TLS identity, the listener serves TLS.
+    pub(crate) fn with_dialer(mut self, dialer: Arc<Dialer>) -> Self {
+        self.dialer = dialer;
         self
     }
 
@@ -181,7 +185,7 @@ impl GossipService {
     /// not where the server is polled.
     async fn server_builder(&self) -> Result<Server> {
         let mut server = Server::builder();
-        if let Some(mtls_manager) = &self.mtls_manager {
+        if let Some(mtls_manager) = self.dialer.mtls_manager() {
             let tls = mtls_manager
                 .server_tls_config()
                 .await
@@ -286,7 +290,7 @@ impl Gossip for GossipService {
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
                 log::info!("PingReq to node {} addr:{}", node.name, node.address);
-                let res = try_ping(&node, None, self.mtls_manager.clone()).await?;
+                let res = self.dialer.ping(&node, None).await?;
                 Ok(Response::new(res))
             }
             _ => Err(Status::invalid_argument("Invalid message payload")),

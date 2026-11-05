@@ -60,6 +60,12 @@ pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
     pub require_reasoning: bool,
+    /// `tool_constraints` was led with the model's thought and its close for
+    /// a worker whose engine starts the grammar at the first generated token:
+    /// the request says so where its dialect has a switch for the gate behind
+    /// the engine's reasoning parser
+    /// (`ProtoGenerateRequest::set_grammar_from_first_token`).
+    pub first_token_grammar: bool,
 }
 
 impl GrpcClient {
@@ -224,7 +230,11 @@ impl GrpcClient {
                 let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
-            _ => Err(tonic::Status::unimplemented(
+            Self::Trtllm(client) => {
+                let resp = client.get_loads(include()).await?;
+                Ok(WorkerLoadResponse::from(resp))
+            }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "GetLoads RPC not supported for this backend",
             )),
         }
@@ -255,7 +265,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.start_profile(req).await,
             Self::TokenSpeed(client) => client.start_profile(req).await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.start_profile(req).await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StartProfile RPC not supported for this backend",
             )),
         }
@@ -267,7 +278,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.stop_profile().await,
             Self::TokenSpeed(client) => client.stop_profile().await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.stop_profile().await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StopProfile RPC not supported for this backend",
             )),
         }
@@ -304,6 +316,25 @@ impl GrpcClient {
                     .subscribe_kv_events_with_load_records(start_seq)
                     .await
             }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
+    /// The servicer's load records alone, no events (`SubscribeKvEvents`
+    /// with `loads_only`): what a worker streams when routing reads its load
+    /// and keeps no KV index. A servicer that predates the field streams its
+    /// events too; the subscriber drops them. `Unimplemented` on backends
+    /// without the stream.
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.subscribe_load_records().await,
+            Self::Vllm(client) => client.subscribe_load_records().await,
+            Self::Trtllm(client) => client.subscribe_load_records().await,
+            Self::TokenSpeed(client) => client.subscribe_load_records().await,
             Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents RPC not supported for MLX backend",
             )),
@@ -536,6 +567,7 @@ impl GrpcClient {
             multimodal_inputs,
             tool_constraints,
             require_reasoning,
+            first_token_grammar,
         } = options;
         let EngineBuilders {
             sglang,
@@ -544,13 +576,15 @@ impl GrpcClient {
             mlx,
             tokenspeed,
         } = builders;
-        match self {
+        let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
-                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    MultimodalData::Sglang(data) => Some(data.into_protos()),
                     _ => None,
                 });
-                let req = sglang(
+                let (sglang_mm, extras) =
+                    sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+                let mut req = sglang(
                     client,
                     request_id,
                     body,
@@ -562,6 +596,7 @@ impl GrpcClient {
                         require_reasoning,
                     },
                 )?;
+                req.extra_mm_inputs = extras;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {
@@ -624,7 +659,9 @@ impl GrpcClient {
                     )
                 })
             }
-        }
+        }?;
+        request.set_grammar_from_first_token(first_token_grammar);
+        Ok(request)
     }
 
     /// The per-engine dispatch of a request kind with neither multimodal inputs
@@ -878,6 +915,8 @@ impl ServerInfo {
                 if let Some(ref args) = info.server_args {
                     pick_prost_fields(&mut labels, args, TOKENSPEED_GRPC_KEYS);
                 }
+                // TokenSpeed's global request window is shared by its attention-DP ranks.
+                labels.insert("enable_dp_attention".to_string(), "true".to_string());
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
                 }
@@ -928,6 +967,9 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    smg_grpc_client::sglang_media_identity::LABEL,
+    "mm_processor",
+    "mm_media_ref_schemes",
     "model_path",
     "served_model_name",
     "tokenizer_path",
@@ -969,6 +1011,13 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // servicer writes both.
     "engine_reasoning_parser",
     "constrained_decoding_start",
+    // The vocabulary of structural-tag nodes the engine's grammar compiler
+    // takes (`older` for an xgrammar that predates the `optional`, `plus`,
+    // `star` and `token` nodes), which the servicer reads off the installed
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
+    "structural_tag_vocabulary",
     // A servicer's own vision verdict. `GetModelInfo.supports_vision` is a
     // proto3 bool, so a `false` there cannot be told from a field the servicer
     // never set and is dropped for this runtime (`ModelInfo::to_labels`); a
@@ -1018,6 +1067,13 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // on a thinking prompt, as for SGLang above; the servicer writes both.
     "engine_reasoning_parser",
     "constrained_decoding_start",
+    // The vocabulary of structural-tag nodes the engine's grammar compiler
+    // takes (`older` for an xgrammar that predates the `optional`, `plus`,
+    // `star` and `token` nodes), which the servicer reads off the installed
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
+    "structural_tag_vocabulary",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1100,7 +1156,7 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
 
@@ -1156,6 +1212,87 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("constrained_decoding_start"));
+    }
+
+    /// The vocabulary of structural-tag nodes a worker's grammar compiler
+    /// takes becomes the `structural_tag_vocabulary` label on every runtime
+    /// whose servicer reports it: a field of the vLLM and TensorRT-LLM server
+    /// info, a `server_args` key of SGLang's and TokenSpeed's; a servicer
+    /// that says nothing (the proto default, no key) sets no label.
+    #[test]
+    fn server_info_to_labels_carries_the_structural_tag_vocabulary() {
+        let vllm = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            structural_tag_vocabulary: "older".to_string(),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert_eq!(
+            vllm.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        assert!(!ServerInfo::Vllm(Box::default())
+            .to_labels()
+            .contains_key("structural_tag_vocabulary"));
+
+        let trtllm = ServerInfo::Trtllm(trtllm_proto::GetServerInfoResponse {
+            structural_tag_vocabulary: "older".to_string(),
+            ..Default::default()
+        })
+        .to_labels();
+        assert_eq!(
+            trtllm.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        assert!(!ServerInfo::Trtllm(Default::default())
+            .to_labels()
+            .contains_key("structural_tag_vocabulary"));
+
+        let keyed = prost_types::Struct {
+            fields: BTreeMap::from([(
+                "structural_tag_vocabulary".to_string(),
+                string_value("older"),
+            )]),
+        };
+        let sglang = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(keyed.clone()),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert_eq!(
+            sglang.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        let tokenspeed =
+            ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                server_args: Some(keyed),
+                ..Default::default()
+            }))
+            .to_labels();
+        assert_eq!(
+            tokenspeed
+                .get("structural_tag_vocabulary")
+                .map(String::as_str),
+            Some("older")
+        );
+        let silent = prost_types::Struct {
+            fields: BTreeMap::from([("grammar_backend".to_string(), string_value("xgrammar"))]),
+        };
+        assert!(
+            !ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                server_args: Some(silent.clone()),
+                ..Default::default()
+            }))
+            .to_labels()
+            .contains_key("structural_tag_vocabulary")
+        );
+        assert!(
+            !ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                server_args: Some(silent),
+                ..Default::default()
+            }))
+            .to_labels()
+            .contains_key("structural_tag_vocabulary")
+        );
     }
 
     /// A TokenSpeed servicer's declared constrained-decoding policy travels as

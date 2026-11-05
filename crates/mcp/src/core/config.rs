@@ -474,7 +474,7 @@ impl fmt::Debug for McpTransport {
 /// MCP-specific proxy configuration (does NOT affect LLM API traffic)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpProxyConfig {
-    /// HTTP proxy URL (e.g., "http://proxy.internal:8080")
+    /// HTTP proxy URL (e.g., `http://proxy.internal:8080`)
     pub http: Option<String>,
 
     /// HTTPS proxy URL
@@ -679,11 +679,50 @@ impl McpConfig {
     }
 }
 
+/// Server configurations the crate's tests build: an SSE server with the
+/// defaults every test shares; a test that differs writes its difference as
+/// a struct update over it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+
+    use super::{McpServerConfig, McpTransport};
+
+    /// An SSE server named `name` at `url`: no token, no headers, no proxy,
+    /// not required, every tool, not a built-in, not internal.
+    pub(crate) fn sse_server(name: &str, url: &str) -> McpServerConfig {
+        sse_server_with_headers(name, url, HashMap::new())
+    }
+
+    /// [`sse_server`] with `headers` on its transport.
+    pub(crate) fn sse_server_with_headers(
+        name: &str,
+        url: &str,
+        headers: HashMap<String, String>,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse {
+                url: url.to_string(),
+                token: None,
+                headers,
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
 
     use super::*;
+    use crate::core::config::test_support::sse_server;
 
     #[test]
     fn test_call_timeout_default_override_and_disable() {
@@ -1425,20 +1464,7 @@ servers:
 
     #[test]
     fn test_validate_valid_config_no_builtin() {
-        let config = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
+        let config = sse_server("test", "http://localhost:3000/sse");
 
         assert!(config.validate().is_ok());
     }
@@ -1446,18 +1472,9 @@ servers:
     #[test]
     fn test_validate_valid_config_with_builtin() {
         let config = McpServerConfig {
-            name: "brave".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
             builtin_type: Some(BuiltinToolType::WebSearchPreview),
             builtin_tool_name: Some("brave_web_search".to_string()),
-            internal: false,
+            ..sse_server("brave", "http://localhost:3000/sse")
         };
 
         assert!(config.validate().is_ok());
@@ -1466,18 +1483,9 @@ servers:
     #[test]
     fn test_validate_missing_builtin_tool_name() {
         let config = McpServerConfig {
-            name: "brave".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
             builtin_type: Some(BuiltinToolType::WebSearchPreview),
             builtin_tool_name: None, // Missing!
-            internal: false,
+            ..sse_server("brave", "http://localhost:3000/sse")
         };
 
         let err = config.validate().unwrap_err();
@@ -1492,18 +1500,9 @@ servers:
     #[test]
     fn test_validate_missing_builtin_type() {
         let config = McpServerConfig {
-            name: "brave".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
             builtin_type: None, // Missing!
             builtin_tool_name: Some("brave_web_search".to_string()),
-            internal: false,
+            ..sse_server("brave", "http://localhost:3000/sse")
         };
 
         let err = config.validate().unwrap_err();
@@ -1520,32 +1519,14 @@ servers:
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
-                    name: "brave".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
                     builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("search".to_string()),
-                    internal: false,
+                    ..sse_server("brave", "http://localhost:3000/sse")
                 },
                 McpServerConfig {
-                    name: "code-runner".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
                     builtin_type: Some(BuiltinToolType::CodeInterpreter),
                     builtin_tool_name: Some("execute".to_string()),
-                    internal: false,
+                    ..sse_server("code-runner", "http://localhost:3001/sse")
                 },
             ],
             ..Default::default()
@@ -1559,32 +1540,14 @@ servers:
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
-                    name: "brave1".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
                     builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("search1".to_string()),
-                    internal: false,
+                    ..sse_server("brave1", "http://localhost:3000/sse")
                 },
                 McpServerConfig {
-                    name: "brave2".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: Some(BuiltinToolType::WebSearchPreview), // Duplicate!
+                    builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("search2".to_string()),
-                    internal: false,
+                    ..sse_server("brave2", "http://localhost:3001/sse")
                 },
             ],
             ..Default::default()

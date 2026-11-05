@@ -1,6 +1,6 @@
 [package]
 name = "smg-wasm"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2021"
 description = "WebAssembly runtime and module management for Shepherd Model Gateway"
 license = "Apache-2.0"
@@ -27,7 +27,6 @@ chrono = { workspace = true, features = ["serde"] }
 lru = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-sha2 = "0.11"
 smg-data-connector = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time"] }

@@ -14,21 +14,25 @@ use std::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
 use smg::{
+    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     policies::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
     routers::grpc::backend_client::BackendClient,
     worker::{
+        basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         circuit_breaker::{CircuitBreaker, CircuitState},
+        endpoint::Endpoint,
+        metadata::DecodingLabels,
         resilience::ResolvedResilience,
-        worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
@@ -67,10 +71,17 @@ impl GrpcWorker {
 
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
+            redacted_url: Endpoint::redacted_url(&endpoint),
+            decoding: DecodingLabels::of(&spec),
             spec: Arc::new(spec),
+            discovered_labels: Arc::default(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            // The binding's workers speak gRPC and never run the ZMQ startup handshake:
+            // the bound is the router's default, and nothing reads it here.
+            zmq_startup_timeout: Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS),
+            zmq_request_timeout: None,
             http2: false,
         };
         Self {
@@ -83,7 +94,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: Arc::new(smg::http_client::client()),
+            http_client: Arc::new(smg::clients::http_client()),
             resilience: ResolvedResilience::default(),
             weight_version: fingerprint_of(None),
         }
@@ -334,7 +345,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
 ) -> *mut MultiWorkerClientHandle {
     // The workers' HTTP clients use the process-level TLS provider the
     // gateway binary installs at start-up; this library has no start-up.
-    smg::tls::install_crypto_provider();
+    smg::clients::install_crypto_provider();
     if endpoints.is_null() || tokenizer_path.is_null() || policy_name.is_null() {
         set_error_message(error_out, "Invalid arguments: null pointer");
         return ptr::null_mut();
@@ -695,7 +706,7 @@ mod tests {
     fn connect(endpoint: &str) -> Arc<SglangSchedulerClient> {
         // The worker's HTTP client wants the process-level TLS provider the
         // create entry point installs.
-        smg::tls::install_crypto_provider();
+        smg::clients::install_crypto_provider();
         Arc::new(
             RUNTIME
                 .block_on(SglangSchedulerClient::connect(endpoint))

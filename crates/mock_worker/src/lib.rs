@@ -8,6 +8,8 @@ pub mod engine;
 pub mod grpc;
 pub mod http;
 pub mod kv_zmq;
+pub mod overrides;
 pub mod replay;
+pub mod script;
 pub mod tls;
 pub mod zmq;

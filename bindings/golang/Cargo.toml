@@ -1,6 +1,6 @@
 [package]
 name = "smg-golang"
-version = "1.13.0"
+version = "1.15.0-dev"
 edition = "2021"
 rust-version.workspace = true
 
@@ -15,12 +15,12 @@ serde_json = { version = "1.0", default-features = false, features = [
     "std",
     "preserve_order",
 ] }
-uuid = { version = "1.23", features = ["v7", "serde"] }
+uuid.workspace = true
 once_cell = "1.21.4"
 futures-util = "0.3"
-tracing = "0.1"
+tracing.workspace = true
 libc = "0.2.186"
-async-trait = "0.1"
+async-trait.workspace = true
 reqwest = { version = "0.13", default-features = false }
 
 [dependencies.smg]
@@ -45,26 +45,6 @@ default = []
 opencv-video = ["smg/opencv-video"]
 vendored-openssl = ["smg/vendored-openssl"]
 jemalloc-profiling = ["smg/jemalloc-profiling", "tikv-jemallocator/profiling"]
-
-[profile.release]
-opt-level = "z"     # Optimize for size
-lto = "fat"         # Full LTO for smaller binaries
-codegen-units = 1   # Better optimization, slower compile
-strip = true        # Strip debug symbols
-
-[profile.ci]
-inherits = "release"
-opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
-lto = "thin"        # Thin LTO - good balance
-codegen-units = 16  # More parallelization for faster builds
-strip = true
-
-[profile.dev]
-opt-level = 0
-debug = 1
-split-debuginfo = "unpacked"
-incremental = true
-codegen-units = 256
 
 [lints]
 workspace = true

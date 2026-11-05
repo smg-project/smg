@@ -6,6 +6,7 @@
 //! - Partition detection and recovery
 
 mod crdt_kv;
+mod dialer;
 mod gossip_controller;
 mod gossip_service;
 pub mod kv;

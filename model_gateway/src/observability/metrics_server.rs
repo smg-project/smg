@@ -108,7 +108,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
-            let resp = crate::http_client::client()
+            let resp = crate::clients::http_client()
                 .get(format!("http://{addr}/metrics"))
                 .send()
                 .await
@@ -153,7 +153,7 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
-        let resp = crate::http_client::client()
+        let resp = crate::clients::http_client()
             .get(format!("http://{addr}/metrics"))
             .send()
             .await

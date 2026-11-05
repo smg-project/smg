@@ -31,16 +31,18 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { workspace = true, features = ["json", "stream", "rustls-no-provider"] }
 serde = { workspace = true, features = ["derive"] }
 smg-grpc-client.workspace = true
+llm-tokenizer.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
+tonic-health.workspace = true
+prost-types.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-prost-types.workspace = true
 rmpv.workspace = true
 zeromq.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

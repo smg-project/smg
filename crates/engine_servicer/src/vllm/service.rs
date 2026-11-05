@@ -11,7 +11,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{admin, embed, generate, info, State};
-use crate::{kv_events, tokenizer_bundle, BoxStream};
+use crate::{kv_events, rpc, BoxStream};
 
 /// The `VllmEngine` service over the shared state.
 #[derive(Clone)]
@@ -30,9 +30,8 @@ impl VllmEngine for VllmEngineService {
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
-        generate::generate(&self.state, request.into_inner(), trace_headers)
-            .await
-            .map(Response::new)
+        let stream = generate::generate(&self.state, request.into_inner(), trace_headers).await;
+        rpc::generated(&self.state, stream)
     }
 
     async fn embed(
@@ -60,11 +59,30 @@ impl VllmEngine for VllmEngineService {
             .map(Response::new)
     }
 
+    async fn start_profile(
+        &self,
+        request: Request<common::StartProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        admin::start_profile(&self.state, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn stop_profile(
+        &self,
+        request: Request<common::StopProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        admin::stop_profile(&self.state, request)
+            .await
+            .map(Response::new)
+    }
+
     async fn abort(
         &self,
         request: Request<vllm::AbortRequest>,
     ) -> Result<Response<vllm::AbortResponse>, Status> {
         self.state
+            .shared
             .registry
             .abort(&request.into_inner().request_ids)?;
         Ok(Response::new(vllm::AbortResponse::default()))
@@ -95,18 +113,13 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
-            .await
-            .map(Response::new)
+        rpc::get_tokenizer(&self.state).await
     }
 
     async fn subscribe_kv_events(
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.kv_relay else {
-            return Err(Status::unimplemented(kv_events::VLLM_DISABLED_MESSAGE));
-        };
-        relay.subscribe(request.into_inner()).map(Response::new)
+        rpc::subscribe_kv_events(&self.state, request, kv_events::VLLM_DISABLED_MESSAGE)
     }
 }

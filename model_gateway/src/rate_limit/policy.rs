@@ -91,7 +91,7 @@ impl CompiledTenantPolicy {
 }
 
 /// Immutable, compiled rate-limit policy: a default plus per-tenant
-/// overrides, resolved in O(1) by [`Self::policy_for`].
+/// overrides, resolved in O(1) by `Self::policy_for`.
 #[derive(Debug, Clone)]
 pub struct CompiledPolicySet {
     default: CompiledTenantPolicy,

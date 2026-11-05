@@ -12,7 +12,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{body::Body, response::Response};
+use axum::{
+    body::{Body, BodyDataStream},
+    response::Response,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use openai_protocol::{
@@ -20,11 +23,10 @@ use openai_protocol::{
         ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
         ChatCompletionStreamResponse,
     },
-    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage, UsageInfo},
+    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     responses::{
-        IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
-        ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::{json, Value};
@@ -38,8 +40,8 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        dispatch_arguments, extract_all_tool_calls_from_chat, has_unfinished_mcp_call,
+        build_next_request, convert_mcp_tools_to_chat_tools, dispatch_arguments,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, partition_tool_calls,
         prepare_tool_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
         ResponsesCallContext, ToolLoopState,
     },
@@ -55,17 +57,23 @@ use crate::{
         },
         error,
         grpc::{
-            common::responses::{
-                await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stored_foreground, stream_startup_channel,
-                streaming::{
-                    attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+            common::{
+                responses::{
+                    await_stream_startup, build_sse_response, naming_parser,
+                    persist_response_if_needed, signal_stream_startup, stored_foreground,
+                    stream_startup_channel,
+                    streaming::{
+                        attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                    },
+                    utils::{
+                        custom_tool_input, custom_tool_names, cut_call, function_call_status,
+                        generation_failure_error, resolve_function_identity, response_status,
+                    },
+                    BackgroundStream, ResponsesContext,
                 },
-                utils::{
-                    function_call_status, generation_failure_error, resolve_function_identity,
-                },
-                BackgroundStream, ResponsesContext,
+                stages::{iteration_charge, RateLimitCell},
             },
+            regular::symphony,
             utils,
         },
     },
@@ -94,7 +102,11 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let response_id = params.response_id;
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
-    // Get chat streaming response
+    // Get chat streaming response, under the request's tenant rate-limit
+    // reservation, taken under a charge id of the iteration's own: the chat
+    // stream settles it with the engine's counts as it ends (the handoff to
+    // the body), a refused or failed start closes it with its debit kept.
+    let reservation = Arc::new(RateLimitCell::new());
     let chat_response = ctx
         .pipeline
         .execute_chat(
@@ -102,11 +114,8 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.headers,
             params.model_id,
             ctx.components.clone(),
-            Some(params.tenant_request_meta),
-            // Responses endpoint hasn't opted into tenant rate limiting yet
-            // (out of scope for this phase; see RequestPipeline::build's
-            // stage-insertion comment).
-            None,
+            Some(iteration_charge(&params.tenant_request_meta)),
+            Some(reservation.clone()),
             // Tool-loop iterations are not retried.
             None,
             // No startup barrier: the status is checked below before the
@@ -116,11 +125,14 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         .await;
 
     if !chat_response.status().is_success() {
+        reservation.close_unsettled().await;
         return chat_response;
     }
 
-    // Extract body from chat response
-    let (_parts, body) = chat_response.into_parts();
+    // The chat answer's body, and the parser that read it, which this
+    // answer names as the chat route does.
+    let (parts, body) = chat_response.into_parts();
+    let parser = parts.headers.get(symphony::HEADER).cloned();
 
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
@@ -178,7 +190,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     }
 
     // Build SSE response with transformed stream
-    build_sse_response(rx)
+    naming_parser(build_sse_response(rx), parser)
 }
 
 /// The SSE events of one frame of the chat stream's body.
@@ -244,6 +256,37 @@ fn stream_read_error(error: &impl fmt::Display) -> Value {
     json!({"code": "stream_error", "message": format!("Stream read error: {error}")})
 }
 
+/// One read of the chat body for the client at the receiving end of the
+/// Responses stream's channel (see [`next_frame`]).
+enum BodyRead {
+    /// A frame of the body, or the error the read met.
+    Frame(Result<Bytes, axum::Error>),
+    /// The body ended.
+    End,
+    /// The client left before the body yielded.
+    ClientLeft,
+}
+
+/// The next frame of the chat body `stream`, read for the client at the
+/// receiving end of `tx`'s channel. The relay that turns the chat stream
+/// into the Responses stream holds the chat layer's receiver through that
+/// body: parked on a body that stalled mid-stream, it would learn that its
+/// client left only when the body next yields, and the engine request behind
+/// the body would run on as long. Here every read races the body against the
+/// client's leaving, looked at first so a busy body cannot outrun it; on
+/// [`BodyRead::ClientLeft`] the caller returns, the body is dropped with it,
+/// and the chat layer ends the engine request the way it does for its own
+/// clients. A background response's `tx` is the sender of its relay, which
+/// closes with the work and not with the client: its reads are the body's
+/// own, and the work outlives the client as it is meant to.
+async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
+    tokio::select! {
+        biased;
+        () = tx.closed() => BodyRead::ClientLeft,
+        frame = stream.next() => frame.map_or(BodyRead::End, BodyRead::Frame),
+    }
+}
+
 /// Process chat SSE stream and transform to responses format
 #[expect(
     clippy::too_many_arguments,
@@ -298,13 +341,18 @@ async fn process_and_transform_sse_stream(
 
     let mut terminal_error = None;
     // Process the stream frame by frame; a frame holds one or more SSE events.
-    'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = match chunk_result {
-            Ok(chunk) => chunk,
-            Err(error) => {
+    'frames: loop {
+        let chunk = match next_frame(&mut stream, &tx).await {
+            BodyRead::Frame(Ok(chunk)) => chunk,
+            BodyRead::Frame(Err(error)) => {
                 terminal_error = Some(stream_read_error(&error));
                 break;
             }
+            BodyRead::End => break,
+            // The chat body goes with this return, which ends the generation
+            // on the engine; the stream ends as it does when the client's
+            // leaving is met at the next frame, and nothing of it is stored.
+            BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
         };
 
         let frame = String::from_utf8_lossy(&chunk);
@@ -525,55 +573,63 @@ impl StreamingResponseAccumulator {
             ));
         }
 
-        // Add tool calls
-        output.extend(self.tool_calls.into_iter().map(|mut item| {
-            if let ResponseOutputItem::FunctionToolCall {
+        // The cut-call read comes first, on the calls' function-shaped
+        // arguments: a custom tool's item carries no status.
+        let finish_reason = self.finish_reason.as_deref();
+        let cut = cut_call(
+            finish_reason,
+            self.tool_calls.iter().filter_map(|item| match item {
+                ResponseOutputItem::FunctionToolCall { arguments, .. } => Some(arguments.as_str()),
+                _ => None,
+            }),
+        );
+
+        // Add tool calls: a call to a custom tool maps back to its
+        // `custom_tool_call` item, as the non-streaming conversion maps it; a
+        // function call takes the status its arguments and the finish say.
+        let tools = self.original_request.tools.as_deref();
+        let custom_names = custom_tool_names(tools);
+        output.extend(self.tool_calls.into_iter().map(|item| match item {
+            ResponseOutputItem::FunctionToolCall {
+                id,
+                call_id,
                 name,
-                namespace,
                 arguments,
-                status,
+                output,
                 ..
-            } = &mut item
-            {
-                *status =
-                    function_call_status(self.finish_reason.as_deref(), arguments).to_string();
-                (*name, *namespace) =
-                    resolve_function_identity(self.original_request.tools.as_deref(), name);
+            } => {
+                let custom = custom_names.contains(&name);
+                let (name, namespace) = resolve_function_identity(tools, &name);
+                if custom {
+                    ResponseOutputItem::CustomToolCall {
+                        call_id,
+                        input: custom_tool_input(&arguments),
+                        name,
+                        id,
+                        namespace,
+                    }
+                } else {
+                    let status = function_call_status(finish_reason, &arguments).to_string();
+                    ResponseOutputItem::FunctionToolCall {
+                        id,
+                        call_id,
+                        name,
+                        namespace,
+                        arguments,
+                        output,
+                        status,
+                    }
+                }
             }
-            item
+            other => other,
         }));
 
-        // Determine final status. A `length` finish is a max_output_tokens
-        // truncation, reported as status=incomplete with incomplete_details,
-        // matching the non-streaming conversion and the streamed terminal
-        // event.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("stop") => (ResponseStatus::Completed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            Some("tool_calls") => (ResponseStatus::Completed, None),
-            Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-            _ => (ResponseStatus::Completed, None),
-        };
+        // The stored object's status is the terminal event's: a `length`
+        // finish is the token limit, a cut call leaves it incomplete as well.
+        let (status, incomplete_details) = response_status(finish_reason, cut);
 
         // Convert usage
-        let usage = self.usage.as_ref().map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        let usage = self.usage.as_ref().map(conversions::responses_usage);
 
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)
@@ -912,8 +968,12 @@ async fn execute_tool_loop_streaming_internal(
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
-        // Execute chat streaming
+        // Execute chat streaming, under the iteration's own tenant rate-limit
+        // reservation (every iteration is a generation, under a charge id of
+        // its own): the chat stream settles it with the engine's counts as
+        // it ends, a refused or failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
+        let reservation = Arc::new(RateLimitCell::new());
         let response = ctx
             .pipeline
             .execute_chat(
@@ -921,9 +981,8 @@ async fn execute_tool_loop_streaming_internal(
                 params.headers.clone(),
                 params.model_id.clone(),
                 ctx.components.clone(),
-                Some(params.tenant_request_meta.clone()),
-                // Responses endpoint hasn't opted into tenant rate limiting yet.
-                None,
+                Some(iteration_charge(&params.tenant_request_meta)),
+                Some(reservation.clone()),
                 // Tool-loop iterations are not retried.
                 None,
                 startup.take(),
@@ -931,6 +990,7 @@ async fn execute_tool_loop_streaming_internal(
             .await;
 
         if !response.status().is_success() {
+            reservation.close_unsettled().await;
             if startup_pending {
                 return Ok(());
             }
@@ -970,26 +1030,8 @@ async fn execute_tool_loop_streaming_internal(
         }
 
         if !tool_calls.is_empty() {
-            trace!(
-                "Tool loop iteration {}: found {} tool call(s)",
-                state.iteration,
-                tool_calls.len()
-            );
-
-            // Separate MCP and function tool calls using session-exposed names.
-            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
-                tool_calls
-                    .into_iter()
-                    .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
-
-            trace!(
-                "Separated tool calls: {} MCP, {} function",
-                mcp_tool_calls.len(),
-                function_tool_calls.len()
-            );
-
-            let tool_call_limit =
-                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
+            let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
+                partition_tool_calls(tool_calls, &session, &state, max_tool_calls, true);
 
             // Process each MCP tool call
             let site = CallSite {
@@ -1103,8 +1145,17 @@ async fn convert_and_accumulate_stream(
     let mut pending: HashMap<u32, Vec<ToolCallDelta>> = HashMap::new();
 
     // A frame holds one or more SSE events; every one of them counts.
-    'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|error| stream_read_error(&error))?;
+    'frames: loop {
+        let chunk = match next_frame(&mut stream, tx).await {
+            BodyRead::Frame(frame) => frame.map_err(|error| stream_read_error(&error))?,
+            BodyRead::End => break,
+            // The chat body goes with this return, which ends the generation
+            // on the engine; the loop ends with the error it meets when the
+            // client's leaving is found at the next frame.
+            BodyRead::ClientLeft => {
+                return Err(json!({"code": "stream_error", "message": "Client disconnected"}))
+            }
+        };
         let frame = String::from_utf8_lossy(&chunk);
         for event in chat_sse_events(&frame) {
             let mut chat_chunk = match event {
@@ -1279,37 +1330,51 @@ impl ChatResponseAccumulator {
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    };
 
     #[test]
     fn streaming_accumulator_serializes_responses_api_usage() {
         let request = ResponsesRequest::default();
         let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.usage = Some(
-            Usage::from_counts(12, 7)
-                .with_cached_tokens(3)
-                .with_reasoning_tokens(2),
-        );
+        accumulator.usage = Some(responses_api_test_usage());
 
         let wire = serde_json::to_value(accumulator.finalize())
             .expect("streaming response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
+        assert_responses_api_usage(&wire);
+    }
 
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+    /// Runs chat SSE frames through the Responses transform as an unstored
+    /// request over empty memory storages (no tenant, no request context) and
+    /// hands back the client's receiver once the transform has returned.
+    async fn transformed_chat_stream(
+        frames: Vec<String>,
+    ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            None,
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        rx
     }
 
     #[tokio::test]
@@ -1326,26 +1391,7 @@ mod tests {
                 format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
                 "data: [DONE]\n\n".into(),
             ];
-            let body = Body::from_stream(futures_util::stream::iter(
-                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-            ));
-            let (tx, mut rx) = mpsc::channel(64);
-            process_and_transform_sse_stream(
-                body,
-                ResponsesRequest {
-                    store: Some(false),
-                    ..Default::default()
-                },
-                None,
-                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-                None,
-                None,
-                tx,
-            )
-            .await
-            .unwrap();
+            let mut rx = transformed_chat_stream(frames).await;
             let mut terminal = None;
             while let Some(Ok(bytes)) = rx.recv().await {
                 let text = std::str::from_utf8(&bytes).unwrap();
@@ -1500,6 +1546,77 @@ mod tests {
         assert_eq!(wire["output"][1]["arguments"], "{\"tz\":");
     }
 
+    #[test]
+    fn a_stored_streamed_turn_whose_call_was_cut_reads_incomplete() {
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
+            let partial = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&partial);
+            let end = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&end);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_streamed_turn_whose_custom_call_was_cut_reads_incomplete_and_keeps_its_item() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let mut accumulator = StreamingResponseAccumulator::new(&request);
+            let partial = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&partial);
+            let end = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&end);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["type"], "custom_tool_call",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+        }
+    }
+
     #[tokio::test]
     async fn upstream_error_closes_reasoning_and_emits_failed_response() {
         let reasoning = json!({"id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
@@ -1507,26 +1624,7 @@ mod tests {
         let frames = vec![format!("data: {reasoning}\n\n"),
             "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n".into(),
             "data: [DONE]\n\n".into()];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();
@@ -1676,7 +1774,8 @@ mod tests {
             let body = Body::from(frame);
             let mut emitter =
                 ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-            let (tx, _) = mpsc::channel(64);
+            // The client stays (its receiver lives), so the body is read.
+            let (tx, _rx) = mpsc::channel(64);
             let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
                 .await
                 .unwrap_err();
@@ -1772,7 +1871,8 @@ mod tests {
         )]));
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-        let (tx, _) = mpsc::channel(64);
+        // The client stays (its receiver lives), so the body is read.
+        let (tx, _rx) = mpsc::channel(64);
         let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
             .await
             .unwrap_err();
@@ -1781,6 +1881,36 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// The reader parked on a chat body that stalled (nothing more on it)
+    /// ends the moment its client leaves, with the error it ends with when
+    /// it meets the dead client at the next frame, and the chat body goes
+    /// with it: its sender sees the drop, as the chat layer does.
+    #[tokio::test]
+    async fn a_client_that_leaves_while_the_chat_body_is_stalled_ends_the_read_at_once() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, rx) = mpsc::channel(64);
+        let read = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false);
+        let leave = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(rx);
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(read, leave)
+        })
+        .await
+        .expect("the body never yields; the client's leaving ends the read");
+        let error = outcome.unwrap_err();
+        assert_eq!(error["code"], "stream_error");
+        assert_eq!(error["message"], "Client disconnected");
+        assert!(
+            body_tx.is_closed(),
+            "the chat body is dropped with the read"
+        );
     }
 
     /// One reader for the chat stream's events: chunks, the error event as
@@ -1854,26 +1984,7 @@ mod tests {
             ]
             .concat(),
         ];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();

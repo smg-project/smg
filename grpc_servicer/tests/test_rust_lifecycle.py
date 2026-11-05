@@ -258,6 +258,135 @@ def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_pa
         _wait_dead(worker, "orphaned worker")
 
 
+# ── tracked from the spawn: a worker orphaned before the next pass ─────────────
+
+
+def test_the_workers_an_engine_has_at_its_spawn_are_tracked_before_any_poll(tmp_path, monkeypatch):
+    """The handle's construction is the first pass: a core that exits before
+    the supervisor's first poll, right after it spawned its workers, still has
+    them cleaned up. With the interval's passes off, that pass is the only one
+    that can have seen the worker."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_file, go = tmp_path / "worker.pid", tmp_path / "go"
+    launcher = subprocess.Popen(
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; {_exit_when(go, 3)}"]
+    )
+    worker_pid = _worker_pid(pid_file, launcher)
+
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+
+    assert worker_pid in engine._descendants
+    go.touch()
+    assert engine.wait(timeout=_PATIENCE_SECS) == 3  # no poll before the exit
+    assert _alive(worker_pid)
+    rust_lifecycle.terminate_engine(engine)
+    _wait_dead(worker_pid, "orphaned worker")
+
+
+def _spawns_on(spawn, pid_file) -> str:
+    """The head of a launcher's command: it spawns its worker once the test
+    creates ``spawn``, so a worker can appear after a pass."""
+    return f"until [ -e {spawn} ]; do sleep 0.02; done; sleep 300 & echo $! > {pid_file}"
+
+
+class _ServerOf:
+    """The Rust server as ``supervise`` sees it: running without an error,
+    connected to its engine when the test says so."""
+
+    def __init__(self):
+        self.engine_ready = False
+        self.last_error = None
+        self.running = True
+        self.events: list[str] = []
+
+    def set_serving(self, serving: bool) -> None:
+        self.events.append(f"serving:{serving}")
+
+    def stop(self, timeout: float) -> None:
+        self.events.append("stop")
+
+
+def test_the_engines_connection_takes_a_pass_before_the_servicer_serves(tmp_path, monkeypatch):
+    """A worker spawned during the engine's start, after its handle was built,
+    is recorded when the server reports the engine connected (its start is
+    over, its workers exist): a core that exits right after still has the
+    worker cleaned up at the end of the supervision, with the interval's
+    passes off."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_file, go, spawn = tmp_path / "worker.pid", tmp_path / "go", tmp_path / "spawn"
+    launcher = subprocess.Popen(
+        ["bash", "-c", f"{_spawns_on(spawn, pid_file)}; {_exit_when(go, 3)}"]
+    )
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+    server = _ServerOf()
+
+    async def run() -> tuple[int, int]:
+        supervision = asyncio.create_task(
+            rust_lifecycle.supervise(
+                server,
+                engine,
+                drain_secs=0.0,
+                stop_timeout=0.1,
+                stop_event=asyncio.Event(),
+                poll_secs=0.01,
+            )
+        )
+        await asyncio.sleep(0.05)  # the supervisor's first polls, with no worker to see
+        spawn.touch()
+        worker_pid = await asyncio.to_thread(_worker_pid, pid_file, launcher)
+        assert worker_pid not in engine._descendants
+        server.engine_ready = True
+        deadline = time.monotonic() + _PATIENCE_SECS
+        while worker_pid not in engine._descendants:
+            assert time.monotonic() < deadline, "the connection took no pass"
+            await asyncio.sleep(0.01)
+        go.touch()
+        return worker_pid, await supervision
+
+    worker_pid, code = asyncio.run(run())
+
+    assert code == 1  # the engine exited
+    assert server.events == ["serving:False", "stop"]
+    _wait_dead(worker_pid, "orphaned worker")
+
+
+def test_a_cores_exit_takes_a_pass_before_the_other_cores_are_shut_down(tmp_path, monkeypatch):
+    """The exit that ends the group shuts the other cores down over their
+    descendants as of then, as an explicit terminate does: a worker a sibling
+    spawned after the last pass is reached by the cleanup, with the interval's
+    passes off."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    go, spawn = tmp_path / "go", tmp_path / "spawn"
+    launchers = [
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; {_exit_when(go, 3)}"]
+        ),
+        subprocess.Popen(["bash", "-c", f"{_spawns_on(spawn, pid_files[1])}; wait"]),
+    ]
+    first_worker = _worker_pid(pid_files[0], launchers[0])
+    manager = _ManagerOf(launchers)
+    engines = rust_lifecycle.EngineProcessGroup(manager)
+    assert engines.poll() is None
+    spawn.touch()
+    late_worker = _worker_pid(pid_files[1], launchers[1])
+    assert first_worker in engines._engines[0]._descendants  # the pass at construction
+    assert late_worker not in engines._engines[1]._descendants
+
+    go.touch()
+    deadline = time.monotonic() + _PATIENCE_SECS
+    while engines.poll() is None:
+        assert time.monotonic() < deadline, "the first core never exited"
+        time.sleep(0.05)
+
+    assert manager.shutdowns == [None]
+    assert late_worker in engines._engines[1]._descendants  # the pass before the shutdown
+    assert engines.wait(timeout=_PATIENCE_SECS) == 3
+    rust_lifecycle.terminate_engine(engines)
+    for worker in (first_worker, late_worker):
+        _wait_dead(worker, "orphaned worker")
+
+
 class _FakeRank:
     """A ``multiprocessing``-shaped scheduler process this process started."""
 
@@ -516,6 +645,20 @@ def test_env_float_names_the_variable_on_a_value_it_cannot_use():
     assert issubclass(ConfigError, ValueError)
 
 
+def test_env_int_takes_a_whole_number_and_refuses_a_fraction():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={}) == 2000
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": " "}) == 2000
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "0"}, minimum=0) == 0
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "1500"}) == 1500
+    with pytest.raises(ConfigError, match="X_RATE='0.5' is not a whole number"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "0.5"})
+    with pytest.raises(ConfigError, match="X_RATE='abc' is not a whole number"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "abc"})
+    with pytest.raises(ConfigError, match="X_RATE='-1' must be at least 0"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "-1"}, minimum=0)
+
+
 def test_env_port_takes_a_port_or_none_and_refuses_the_rest():
     ConfigError = rust_lifecycle.ServicerConfigError
     assert rust_lifecycle.env_port("X_PORT", environ={}) is None
@@ -546,6 +689,8 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         drain_secs_env="X_DRAIN",
         startup_timeout_secs_env="X_START",
         startup_ceiling_secs_env="X_CEIL",
+        silence_timeout_secs_env="X_SILENCE",
+        prefill_tokens_per_sec_env="X_PREFILL",
     )
     socket_dir = {"SMG_ZMQ_SOCKET_DIR": str(tmp_path / "sockets")}
     knobs = rust_lifecycle.read_launcher_knobs(**names, environ=socket_dir)
@@ -554,16 +699,28 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         drain_secs=rust_lifecycle.DEFAULT_DRAIN_SECS,
         startup_timeout_secs=rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS,
         startup_ceiling_secs=rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS,
+        silence_timeout_secs=rust_lifecycle.DEFAULT_SILENCE_TIMEOUT_SECS,
+        prefill_tokens_per_sec=rust_lifecycle.DEFAULT_PREFILL_TOKENS_PER_SEC,
         socket_dir=str(tmp_path / "sockets"),
     )
     assert os.path.isdir(tmp_path / "sockets")
     knobs = rust_lifecycle.read_launcher_knobs(
         **names,
         socket_dir=str(tmp_path / "given"),
-        environ={"X_HS": "24321", "X_DRAIN": "0", "X_START": "42", "X_CEIL": "0", **socket_dir},
+        environ={
+            "X_HS": "24321",
+            "X_DRAIN": "0",
+            "X_START": "42",
+            "X_CEIL": "0",
+            "X_SILENCE": "900",
+            "X_PREFILL": "1000",
+            **socket_dir,
+        },
     )
     assert (knobs.handshake_port, knobs.drain_secs) == (24321, 0.0)
     assert (knobs.startup_timeout_secs, knobs.startup_ceiling_secs) == (42.0, 0.0)
+    assert (knobs.silence_timeout_secs, knobs.prefill_tokens_per_sec) == (900.0, 1000)
+    assert isinstance(knobs.prefill_tokens_per_sec, int)
     assert knobs.socket_dir == str(tmp_path / "given") and os.path.isdir(knobs.socket_dir)
     for name, value, text in [
         ("X_HS", "70000", "must be between 1 and 65535"),
@@ -573,6 +730,10 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         ("X_START", "abc", "is not a number"),
         ("X_START", "-1", "must be greater than 0"),
         ("X_CEIL", "-1", "must be at least 0"),
+        ("X_SILENCE", "0", "must be greater than 0"),
+        ("X_SILENCE", "abc", "is not a number"),
+        ("X_PREFILL", "-1", "must be at least 0"),
+        ("X_PREFILL", "0.5", "is not a whole number"),
     ]:
         with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
             rust_lifecycle.read_launcher_knobs(**names, environ={name: value, **socket_dir})
@@ -813,6 +974,39 @@ def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(capl
         assert apply(target, build, env_name=env, environ={}) is None
         assert target.kv_events_config is given
     assert len(built) == 4
+    # The engine's own word: a reason its publisher cannot serve this model
+    # keeps it off, said once with what turns it on, and no port is drawn; no
+    # reason, and the default applies. The question is not asked when a
+    # configuration was given or the variable says off.
+    asked: list[str | None] = []
+
+    def unless(reason: str | None):
+        def ask() -> str | None:
+            asked.append(reason)
+            return reason
+
+        return ask
+
+    target = types.SimpleNamespace(kv_events_config=None)
+    with caplog.at_level("INFO", logger=rust_lifecycle.logger.name):
+        assert apply(target, build, env_name=env, environ={}, unless=unless("no span")) is None
+    assert target.kv_events_config is None and len(built) == 4
+    assert (
+        "KV event publishing left off: no span; pass --kv-events-config to turn the publisher "
+        "on anyway"
+    ) in caplog.text
+    target = types.SimpleNamespace(kv_events_config=None)
+    assert apply(target, build, env_name=env, environ={}, unless=unless(None)) == {
+        "publisher": "zmq",
+        "endpoint": built[-1],
+    }
+    assert target.kv_events_config is not None and len(built) == 5
+    assert asked == ["no span", None]
+    given = types.SimpleNamespace(kv_events_config='{"publisher": "zmq"}')
+    assert apply(given, build, env_name=env, environ={}, unless=unless("no span")) is None
+    off = types.SimpleNamespace(kv_events_config=None)
+    assert apply(off, build, env_name=env, environ={env: "0"}, unless=unless("no span")) is None
+    assert asked == ["no span", None] and len(built) == 5
     # Server args that cannot be written are left alone, with a warning.
 
     class Frozen:
@@ -921,3 +1115,144 @@ def test_a_block_with_a_held_port_is_passed_over_for_another(monkeypatch):
     monkeypatch.setattr(rust_lifecycle, "_bindable", lambda port: False)
     with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
         rust_lifecycle.free_kv_events_endpoint(ranks=2)
+
+
+def test_the_kv_events_default_announcement_is_one_line_for_both_implementations(caplog):
+    """What the operator reads once the default applied, under either servicer
+    implementation: the engine's name, what is on, and the two ways to decide
+    otherwise; through the caller's own logger when it hands one over."""
+    env = "SMG_TEST_SERVICER_KV_EVENTS"
+    with caplog.at_level("INFO"):
+        rust_lifecycle.announce_kv_events_default("Engine", env)
+        rust_lifecycle.announce_kv_events_default("Engine", env, logging.getLogger("test.entry"))
+    assert [record.name for record in caplog.records] == [rust_lifecycle.logger.name, "test.entry"]
+    line = (
+        "KV event publishing enabled: no --kv-events-config was given, so Engine's ZMQ "
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {env}=0 to leave it off"
+    )
+    assert [record.getMessage() for record in caplog.records] == [line, line]
+
+
+@pytest.mark.parametrize("counts", [[0], [2, 1, 0]])
+def test_drain_finishes_when_requests_reach_zero(counts):
+    """An idle or completed server exits well before the configured deadline."""
+
+    class Server:
+        running = True
+        last_error = None
+
+        @property
+        def active_requests(self):
+            """Advance the simulated request lifetimes at each poll."""
+            return counts.pop(0)
+
+    async def run():
+        """Bound the test independently of the long drain deadline."""
+        engine = types.SimpleNamespace(poll=lambda: None)
+        return await asyncio.wait_for(rust_lifecycle.drain_server(Server(), engine, 1100, 0.001), 1)
+
+    assert asyncio.run(run())
+    assert not counts
+
+
+@pytest.mark.parametrize("count", [None, 1])
+def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
+    """Pending work and old bindings retain the bounded grace period."""
+    server = types.SimpleNamespace(running=True, last_error=None)
+    if count is not None:
+        server.active_requests = count
+    engine = types.SimpleNamespace(poll=lambda: None)
+
+    async def run():
+        """Measure that pending requests receive their full grace period."""
+        start = asyncio.get_running_loop().time()
+        assert await rust_lifecycle.drain_server(server, engine, 0.01, 0.002)
+        assert asyncio.get_running_loop().time() - start >= 0.01
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["engine", "server", "error", "clean_engine"])
+def test_drain_detects_failure_without_waiting_for_deadline(failure):
+    """Engine exits and server failures interrupt draining with their status."""
+    server = types.SimpleNamespace(running=True, last_error=None, active_requests=1)
+    engine = types.SimpleNamespace(poll=lambda: None)
+
+    async def run():
+        """Inject the failure after draining has started."""
+        task = asyncio.create_task(rust_lifecycle.drain_server(server, engine, 1100, 0.001))
+        await asyncio.sleep(0)
+        if failure in ("engine", "clean_engine"):
+            engine.poll = lambda: 0 if failure == "clean_engine" else 1
+        elif failure == "server":
+            server.running = False
+        else:
+            server.last_error = "failed"
+        assert await asyncio.wait_for(task, 1) == (failure == "clean_engine")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_drain", [False, True])
+def test_supervise_stops_server_then_engine_even_if_drain_is_cancelled(monkeypatch, cancel_drain):
+    """Normal completion and cancellation preserve teardown order."""
+    events = []
+    server = types.SimpleNamespace(
+        running=True,
+        last_error=None,
+        active_requests=int(cancel_drain),
+        set_serving=lambda serving: events.append(("serving", serving)),
+        stop=lambda timeout: events.append("server stopped"),
+    )
+    engine = types.SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(
+        rust_lifecycle, "terminate_engine", lambda _: events.append("engine stopped")
+    )
+
+    async def run():
+        """Start shutdown and optionally cancel its drain wait."""
+        stop = asyncio.Event()
+        stop.set()
+        task = asyncio.create_task(
+            rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=1100)
+        )
+        if cancel_drain:
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await asyncio.wait_for(task, 1) == 0
+
+    asyncio.run(run())
+    assert events == [("serving", False), "server stopped", "engine stopped"]
+
+
+@pytest.mark.parametrize("drain_secs", [0, 1100])
+@pytest.mark.parametrize("failure", ["engine", "server", "error", "clean_engine", "live_engine"])
+def test_supervise_reports_a_failure_at_the_drain_boundary(monkeypatch, failure, drain_secs):
+    """A signal preserves failures but allows a clean process-group shutdown."""
+    events = []
+    server = types.SimpleNamespace(
+        running=failure != "server",
+        last_error="failed" if failure == "error" else None,
+        active_requests=int(drain_secs == 0),
+        set_serving=lambda serving: events.append(("serving", serving)),
+        stop=lambda timeout: events.append("server stopped"),
+    )
+    engine = types.SimpleNamespace(poll=lambda: {"engine": 1, "clean_engine": 0}.get(failure))
+    monkeypatch.setattr(
+        rust_lifecycle, "terminate_engine", lambda _: events.append("engine stopped")
+    )
+
+    async def run():
+        """Enter supervision with the shutdown signal already pending."""
+        stop = asyncio.Event()
+        stop.set()
+        return await asyncio.wait_for(
+            rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=drain_secs), 1
+        )
+
+    assert asyncio.run(run()) == int(failure in ("engine", "server", "error"))
+    assert events == [("serving", False), "server stopped", "engine stopped"]

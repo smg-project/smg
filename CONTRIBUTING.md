@@ -98,6 +98,10 @@ The gateway's prefill-decode code uses one word per thing, so a reader never has
 
 "Leg" is not used for any of these: it meant all three at once, and it does not come back in code, comments, test names or log lines. Metric names and labels keep their published spelling.
 
+## Where a module's tests live
+
+Unit tests sit in `#[cfg(test)] mod tests` at the bottom of the file they test. When they outgrow the file, the whole module moves out of line under one name: `x.rs` declares `#[cfg(test)] mod tests;` once, and the tests live in `x/tests.rs`. Past about 1,500 lines, and once the tests fall into named topics, `x/tests.rs` becomes a directory: `x/tests/mod.rs` declares one file per topic (`x/tests/eof.rs`, `x/tests/usage.rs`; the directory already says they are tests, so the files carry no `_tests` suffix; a topic keeps a distinct name when the bare word would shadow a crate or a sibling module, so the Symphony cases are `symphony_chat.rs`, not `symphony.rs`), and the recorded fixtures the tests read sit in `x/tests/fixtures/`. A directory `x/` whose only child is production code is a submodule tree with one leaf: fold the leaf back into `x.rs`, or give the tree the children its name promises. A move is `git mv` plus the `mod` and `use` lines, never a test body change, so the diff reads as renames and the test list before and after is the same.
+
 ## Pull requests
 
 - **Fill in the [PR template](./.github/PULL_REQUEST_TEMPLATE.md)** — especially
@@ -157,11 +161,12 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
-| `SMG_RUNNER_GPU_8` | `8-gpu-h200` | 8-GPU benchmark jobs |
-| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
+| `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -214,6 +219,15 @@ They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.
+
+---
+
+## Releases
+
+A release is cut from `main` onto a `release/<x.y>` branch and moves there by pull requests
+(cherry-picks from `main`, candidate and final bumps); `main` never pauses, and nothing is
+published without a maintainer's dispatch. The steps, the `make release-*` targets and the
+gate are in [`scripts/release/README.md`](./scripts/release/README.md).
 
 ---
 

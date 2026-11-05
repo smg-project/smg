@@ -347,16 +347,6 @@ impl PreProcessorConfig {
             .unwrap_or(default)
     }
 
-    /// Whether this config changes Qwen-style processor structure or budgets.
-    pub(crate) fn has_structural_overrides(&self) -> bool {
-        self.patch_size.is_some()
-            || self.merge_size.is_some()
-            || self.min_pixels.is_some()
-            || self.max_pixels.is_some()
-            || self.temporal_patch_size.is_some()
-            || self.size.is_some()
-    }
-
     /// Whether the declared processor type is image-only rather than video-capable.
     pub(crate) fn is_image_only_processor_type(&self) -> bool {
         self.image_processor_type

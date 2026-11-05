@@ -9,6 +9,21 @@ generated token needs the thought and then the calls, so the call is not forced
 into the thought. The Router cannot tell the two apart from the outside, so the
 servicer that knows its engine says which.
 
+The ``grammar_backend`` key beside them: the grammar backend the engine runs,
+as its server arguments resolve it, so the Rust servicer refuses a constraint
+that backend cannot enforce before the engine (every kind under ``none``, a kind
+the backend does not compile, a JSON-schema feature xgrammar drops), the same
+refusal the vLLM path gives.
+
+The ``structural_tag_vocabulary`` key beside them: ``older`` when the xgrammar
+installed beside the engine predates the ``optional``, ``plus``, ``star`` and
+``token`` structural-tag nodes (0.1.33 is the first release with them) and so
+refuses a tag that carries one at compile time; the Router spells such a
+worker's structural tags without ``optional``, ``plus`` and ``star``, the same
+language (a ``token`` node stays as derived, so a table that writes single-token
+markers still meets the older compiler's refusal). Read off the distribution's
+metadata once, at start-up, never by importing xgrammar.
+
 Engine-free at import: the readers take the parsed server arguments. The vLLM
 servicers read the same facts off their engine's structured-outputs config
 (``smg_grpc_servicer.vllm.model_info``) into two fields of their own proto; the
@@ -18,6 +33,8 @@ Router reads their other labels.
 
 from __future__ import annotations
 
+import importlib.metadata
+import re
 from typing import Any
 
 # The `server_args` keys (SGLang, TokenSpeed) and the `GetServerInfo` fields
@@ -32,22 +49,54 @@ CONSTRAINED_DECODING_START_KEY = "constrained_decoding_start"
 CONSTRAINED_DECODING_AFTER_REASONING = "after_reasoning"
 CONSTRAINED_DECODING_FIRST_TOKEN = "first_token"
 
+# The `server_args` key (SGLang, TokenSpeed) the Rust servicer reads the
+# engine's grammar backend from: the engine's own argument name, carrying the
+# value the engine resolved rather than the raw argument.
+GRAMMAR_BACKEND_KEY = "grammar_backend"
+# The engines' spelling of no grammar backend at all.
+GRAMMAR_BACKEND_NONE = "none"
+# What SGLang runs when `--grammar-backend` is not given.
+SGLANG_DEFAULT_GRAMMAR_BACKEND = "xgrammar"
+
+# The `server_args` key (SGLang, TokenSpeed) and the `GetServerInfo` field
+# (vLLM, TensorRT-LLM) naming the vocabulary of structural-tag nodes the
+# engine's grammar compiler takes, and its one value: `older` for an xgrammar
+# that predates the `optional`, `plus`, `star` and `token` nodes and refuses a
+# tag that carries one (the Router's older spelling leaves out `optional`,
+# `plus` and `star`; a `token` node stays as derived). Absent for a current
+# xgrammar, so the Router sends the tags as its tables build them.
+STRUCTURAL_TAG_VOCABULARY_KEY = "structural_tag_vocabulary"
+STRUCTURAL_TAG_VOCABULARY_OLDER = "older"
+# The first xgrammar release whose structural tags take every node the Router
+# writes (its 0.1.33 added the optional, plus, star and token-level formats).
+XGRAMMAR_CURRENT_VOCABULARY_SINCE = (0, 1, 33)
+# The resolved grammar backends xgrammar's vocabulary applies to: xgrammar by
+# name, vLLM's `auto` (xgrammar for a structural tag), and a backend the
+# launcher could not resolve (the engines default to xgrammar where one runs).
+_XGRAMMAR_BACKENDS = ("xgrammar", "auto", "")
+
 # A server-args attribute that is not there at all, as opposed to one set to
 # None or "".
 _UNKNOWN = object()
 
 
-def _resolved_reasoning_parser(server_args: Any) -> Any:
-    """The reasoning parser the engine runs: the last value its argument
-    resolution declared for ``reasoning_parser`` (SGLang keeps
-    ``--reasoning-parser auto`` as typed and records what its template
-    detection resolved it to, a name or None, in ``_resolved_overrides``, last
-    writer wins, which is how its own serving view reads it), else the raw
-    argument; ``_UNKNOWN`` when the server arguments have no such field."""
+def _resolved_argument(server_args: Any, name: str) -> Any:
+    """The value the engine runs for argument ``name``: the last value its
+    argument resolution declared for it (SGLang keeps an argument as typed and
+    records what its resolution hooks decided, ``--reasoning-parser auto`` to a
+    name or None by template detection, an unset ``--grammar-backend`` to the
+    default, in ``_resolved_overrides``, last writer wins, which is how its own
+    serving view reads them), else the raw argument; ``_UNKNOWN`` when the
+    server arguments have no such field."""
     for _source, declared in reversed(getattr(server_args, "_resolved_overrides", None) or ()):
-        if "reasoning_parser" in declared:
-            return declared["reasoning_parser"]
-    return getattr(server_args, "reasoning_parser", _UNKNOWN)
+        if name in declared:
+            return declared[name]
+    return getattr(server_args, name, _UNKNOWN)
+
+
+def _resolved_reasoning_parser(server_args: Any) -> Any:
+    """The reasoning parser the engine runs (:func:`_resolved_argument`)."""
+    return _resolved_argument(server_args, "reasoning_parser")
 
 
 def engine_reasoning_parser(server_args: Any) -> str:
@@ -92,6 +141,56 @@ def tokenspeed_constrained_decoding_start() -> str:
     return CONSTRAINED_DECODING_FIRST_TOKEN
 
 
+def sglang_grammar_backend(server_args: Any) -> str:
+    """The grammar backend SGLang's scheduler runs, as its server arguments
+    resolve it: ``none`` without the scheduler's tokenizer
+    (``--skip-tokenizer-init``), since its grammar manager builds no backend
+    then whatever the flag says; else ``--grammar-backend`` as the engine
+    resolved it (``xgrammar`` when it was not given, the engine's default,
+    which its resolution hook declares and older releases set in place); ""
+    when the server arguments have no such field at all (say nothing: the
+    servicer then takes the engine's default)."""
+    if getattr(server_args, "skip_tokenizer_init", False):
+        return GRAMMAR_BACKEND_NONE
+    backend = _resolved_argument(server_args, "grammar_backend")
+    if backend is _UNKNOWN:
+        return ""
+    return str(backend or SGLANG_DEFAULT_GRAMMAR_BACKEND)
+
+
+def tokenspeed_grammar_backend(server_args: Any) -> str:
+    """The grammar backend TokenSpeed's scheduler runs, as its server arguments
+    resolve it: ``--grammar-backend`` when given (``xgrammar`` or ``none``);
+    when it was not given the engine starts from ``none`` and flips the
+    checkpoints it defaults otherwise to ``xgrammar`` once it has read the
+    checkpoint, so an unset flag reads as the resolved default when the engine
+    has read it, and as "" (unknown: say nothing, the servicer then judges
+    nothing ahead of the engine) when it has not, or when its own post-init
+    has not run yet (the raw argument is then None); "" too when the server
+    arguments have no such field."""
+    backend = getattr(server_args, "grammar_backend", _UNKNOWN)
+    if backend is _UNKNOWN or backend is None:
+        return ""
+    backend = str(backend)
+    if backend == GRAMMAR_BACKEND_NONE and getattr(server_args, "_grammar_backend_unset", False):
+        beam_checkpoint = getattr(server_args, "_beam_checkpoint", None)
+        if beam_checkpoint is None:
+            return ""
+        return "xgrammar" if beam_checkpoint else GRAMMAR_BACKEND_NONE
+    return backend
+
+
+def grammar_backend_entry(args_dict: dict[str, Any], backend: str) -> None:
+    """Write the resolved ``backend`` under :data:`GRAMMAR_BACKEND_KEY` in the
+    ``server_args`` the servicer reports, in place of the raw argument (None
+    before the engine resolves it, or a default the engine flips later); an
+    empty ``backend`` (nothing known) leaves no key, so the servicer judges
+    nothing ahead of the engine."""
+    args_dict.pop(GRAMMAR_BACKEND_KEY, None)
+    if backend:
+        args_dict[GRAMMAR_BACKEND_KEY] = backend
+
+
 def grammar_start_labels(server_args: Any, start: str) -> dict[str, str]:
     """The two labels as ``server_args`` entries, for the servicers that carry
     their labels there: the parser when the engine runs one, the start when the
@@ -103,3 +202,53 @@ def grammar_start_labels(server_args: Any, start: str) -> dict[str, str]:
     if start:
         labels[CONSTRAINED_DECODING_START_KEY] = start
     return labels
+
+
+def installed_xgrammar_version() -> str:
+    """The version of the xgrammar distribution installed beside the engine
+    (the launchers run in the engine's own environment), from its metadata,
+    without importing it; "" when none is installed."""
+    try:
+        return importlib.metadata.version("xgrammar")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+def _release_numbers(version: str) -> tuple[int, int, int] | None:
+    """The leading ``major.minor.patch`` of a version string (``0.1.32``,
+    ``0.2.7``; ``0.1.33rc1`` and ``0.1.33.dev2`` read as ``(0, 1, 33)``, a
+    build of that release); None when it starts with nothing of the kind."""
+    match = re.match(r"\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", version or "")
+    if match is None:
+        return None
+    major, minor, patch = (int(part) if part else 0 for part in match.groups())
+    return major, minor, patch
+
+
+def structural_tag_vocabulary(grammar_backend: str, xgrammar_version: str | None = None) -> str:
+    """The ``structural_tag_vocabulary`` label for an engine whose grammar
+    backend resolves to ``grammar_backend``: ``older`` when that backend runs
+    xgrammar (:data:`_XGRAMMAR_BACKENDS`) and the installed xgrammar
+    (``xgrammar_version``; the distribution's metadata when not given)
+    predates :data:`XGRAMMAR_CURRENT_VOCABULARY_SINCE`; "" for a current one,
+    no xgrammar at all, a version that does not parse, and a backend with a
+    vocabulary of its own or none (``llguidance``, ``outlines``, ``none``), so
+    nothing is said and the Router keeps the current spelling."""
+    if str(grammar_backend or "").strip().lower() not in _XGRAMMAR_BACKENDS:
+        return ""
+    version = installed_xgrammar_version() if xgrammar_version is None else xgrammar_version
+    numbers = _release_numbers(version)
+    if numbers is None or numbers >= XGRAMMAR_CURRENT_VOCABULARY_SINCE:
+        return ""
+    return STRUCTURAL_TAG_VOCABULARY_OLDER
+
+
+def structural_tag_vocabulary_entry(args_dict: dict[str, Any], grammar_backend: str) -> None:
+    """Write the ``structural_tag_vocabulary`` label into the ``server_args``
+    the servicer reports (:func:`structural_tag_vocabulary` for the engine's
+    resolved ``grammar_backend``); an empty verdict leaves no key, as the
+    Router would drop it."""
+    args_dict.pop(STRUCTURAL_TAG_VOCABULARY_KEY, None)
+    vocabulary = structural_tag_vocabulary(grammar_backend)
+    if vocabulary:
+        args_dict[STRUCTURAL_TAG_VOCABULARY_KEY] = vocabulary

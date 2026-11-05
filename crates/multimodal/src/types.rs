@@ -14,7 +14,7 @@ use crate::{
     audio::DecodedAudio,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
-    vision::execution,
+    vision::{execution, transforms::resize_bicubic_pil},
 };
 
 /// Supported multimodal modalities.
@@ -39,7 +39,7 @@ impl fmt::Display for Modality {
 }
 
 /// Detail level passed by OpenAI style APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageDetail {
     #[default]
@@ -198,6 +198,9 @@ pub struct ImageFrame {
     /// than from bytes it decodes: a later policy applies to those pixels,
     /// as there is nothing to decode again.
     from_pixels: bool,
+    /// Decode directly to the M3 source-policy dimensions in `size`.
+    minimax_resize: bool,
+    minimax_sglang_resize: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -225,7 +228,7 @@ pub struct VideoClip {
     pub frames: Vec<DynamicImage>,
     pub rgb_video: Option<DecodedRgbVideo>,
     /// Effective frame rate after connector-side sampling and frame-count clamps.
-    pub sample_fps: f32,
+    pub sample_fps: f64,
     /// Source fps and sampled frame indices; `None` when the decoder could not recover them.
     pub sampling: Option<VideoSamplingInfo>,
     pub raw_bytes: bytes::Bytes,
@@ -233,7 +236,7 @@ pub struct VideoClip {
     /// Blake3 hex-digest of raw_bytes, computed at decode time.
     pub hash: String,
     /// The long-side cap the caller asked for (MiniMax `max_long_side_pixel`);
-    /// the frames were already scaled to it when set.
+    /// decoding applies it except for native SGLang MiniMax, which defers to Pillow.
     pub max_long_side_pixel: Option<u32>,
 }
 
@@ -326,7 +329,7 @@ impl VideoClip {
         raw_bytes: bytes::Bytes,
         source: VideoSource,
         hash: String,
-        sample_fps: f32,
+        sample_fps: f64,
     ) -> Self {
         Self {
             frames,
@@ -354,7 +357,7 @@ impl VideoClip {
         raw_bytes: bytes::Bytes,
         source: VideoSource,
         hash: String,
-        sample_fps: f32,
+        sample_fps: f64,
     ) -> Self {
         Self {
             frames: Vec::new(),
@@ -391,7 +394,7 @@ impl VideoClip {
         self.rgb_video.as_ref()
     }
 
-    pub fn sample_fps(&self) -> f32 {
+    pub fn sample_fps(&self) -> f64 {
         self.sample_fps
     }
 
@@ -466,6 +469,8 @@ impl ImageFrame {
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: true,
+            minimax_resize: false,
+            minimax_sglang_resize: false,
         }
     }
 
@@ -489,18 +494,39 @@ impl ImageFrame {
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: false,
+            minimax_resize: false,
+            minimax_sglang_resize: false,
         }
+    }
+
+    /// Mark an encoded frame for one direct resize to its planned dimensions.
+    pub(crate) fn with_minimax_resize(mut self) -> Self {
+        self.minimax_resize = true;
+        self
+    }
+
+    /// Select Pillow's byte-exact image resize for SGLang's source geometry.
+    pub(crate) fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
+        self
     }
 
     /// The decoded pixels, decoding on the first call. A body its header did
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
         self.decoded.get_or_try_init(|| {
-            decode_image_bytes(
+            let image = decode_image_bytes(
                 &self.raw_bytes,
                 self.max_long_side_pixel,
                 self.transparency(),
-            )
+            )?;
+            Ok(if self.minimax_sglang_resize {
+                resize_bicubic_pil(&image, self.size.width, self.size.height)
+            } else if self.minimax_resize {
+                crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
+            } else {
+                image
+            })
         })
     }
 

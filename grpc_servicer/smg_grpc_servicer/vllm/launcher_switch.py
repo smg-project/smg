@@ -53,13 +53,14 @@ import functools
 import importlib
 import importlib.abc
 import importlib.metadata
+import logging
 import re
 import sys
 import types
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
+from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV, attach_vllm_logging, settle_logging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,37 +130,71 @@ def supported_launchers() -> str:
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 def with_servicer_switch(
     serve_grpc: Callable[..., Awaitable[Any]],
 ) -> Callable[..., Awaitable[Any]]:
     """``serve_grpc`` behind the flag: Rust takes the process (and its exit
-    code), Python runs the launcher's own coroutine."""
+    code); Python runs the launcher's own coroutine, on a namespace with the
+    KV-events default applied."""
     if getattr(serve_grpc, _SWITCH_MARK, False):
         return serve_grpc
 
     @functools.wraps(serve_grpc)
     async def serve_grpc_with_switch(args: Any, *rest: Any, **kwargs: Any) -> Any:
-        from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+        # The launcher configured logging between its argument parse and this
+        # call (vLLM 0.31; the releases before it at import): what the plugin's
+        # parse step logged (the capture-cap decision) comes out now, through
+        # vLLM's handlers, ahead of everything the launch logs from here.
+        attach_vllm_logging()
+        from smg_grpc_servicer.rust_lifecycle import (
+            ServicerConfigError,
+            announce_kv_events_default,
+            announce_servicer_impl,
+            configuration_exit,
+        )
         from smg_grpc_servicer.vllm.rust import (
+            KV_EVENTS_ENV,
+            SERVICER_IMPL_ENV,
             configure_logging,
+            default_kv_events_config,
             require_python_media_mode,
-            resolve_servicer_impl,
             serve_rust,
+            servicer_impl_source,
         )
 
         try:
-            if resolve_servicer_impl(args) == "rust":
+            impl, origin = servicer_impl_source(args)
+            announce_servicer_impl(impl, origin, SERVICER_IMPL_ENV, logger)
+            if impl == "rust":
                 raise SystemExit(await serve_rust(args))
             # The Python servicer's media mode is known here, from the flags
             # and the environment: one it cannot serve is refused now, before
             # the launcher's own coroutine builds the engine and loads the
             # model (the servicer's own refusal would come after that load).
             require_python_media_mode(args)
+            # The Python servicer gets the Rust path's KV-events default too:
+            # a namespace without --kv-events-config has vLLM's ZMQ publisher
+            # on, at a port found free on this host, before the launcher
+            # builds the engine from it, so SubscribeKvEvents relays the
+            # events a cache-aware router routes by (the rule, the opt-out
+            # and the log line of `RustLauncher.serve`); a host with no free
+            # block of ports is refused here as on the Rust path.
+            if default_kv_events_config(args) is not None:
+                configure_logging()
+                announce_kv_events_default("vLLM", KV_EVENTS_ENV, logger)
         except ServicerConfigError as error:
             # A knob the servicer cannot use: one named ERROR line and exit
             # code 2, not the launcher's traceback.
             configure_logging()
             raise configuration_exit(error) from None
+        # The launcher's own coroutine goes on with the logging it has: a hold
+        # nothing released by now (no handler anywhere) ends here, so the
+        # package's warnings and errors reach stderr as they do without it.
+        # (The Rust path's configure_logging ended it above.)
+        settle_logging()
         return await serve_grpc(args, *rest, **kwargs)
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)
@@ -424,9 +459,10 @@ def refusal_line(hook: LauncherHook) -> str:
     else:
         found = f"it has no gRPC launcher module under {' or '.join(LAUNCHER_MODULES)}"
     return (
-        f"--servicer-impl rust ({SERVICER_IMPL_ENV}=rust) refused: the servicer switch cannot "
+        f"the Rust servicer (the default; --servicer-impl rust / {SERVICER_IMPL_ENV}=rust) "
+        "refused: the servicer switch cannot "
         f"bind on the installed {installed}: {found}; {supported_launchers()}; {way_out}, or "
-        f"select --servicer-impl python (or unset {SERVICER_IMPL_ENV}) for the Python servicer"
+        f"select --servicer-impl python ({SERVICER_IMPL_ENV}=python) for the deprecated Python servicer"
     )
 
 

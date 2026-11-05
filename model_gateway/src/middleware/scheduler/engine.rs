@@ -829,7 +829,7 @@ impl SchedulerPermit {
     }
 
     /// Mark the first response byte. Called by the edge's body wrapper (the
-    /// [`Permit`] below) on the first data frame. Returns `false` if the
+    /// `Permit` below) on the first data frame. Returns `false` if the
     /// scheduler already won the preemption CAS — the body wrapper treats
     /// that as "preempted, end the stream." The TTFT value is `admitted_at`
     /// elapsed in millis, clamped by the handle to `[1, u64::MAX - 1]`.
@@ -978,9 +978,7 @@ mod tests {
     /// reserved-vs-capacity guard) and an override on one class's
     /// queue_size + queue_timeout.
     fn settings_with(class: Class, queue_size: u32, queue_timeout_secs: u64) -> SchedulerSettings {
-        use std::collections::HashMap as StdMap;
-
-        let mut classes = StdMap::new();
+        let mut classes = HashMap::new();
         for c in Class::ALL {
             let mut cfg = ClassConfig::default_for(c);
             cfg.reserved_floor = 0;
@@ -993,7 +991,7 @@ mod tests {
         }
         let yaml = PrioritySchedulerYaml {
             classes,
-            tenant_policies: StdMap::new(),
+            tenant_policies: HashMap::new(),
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
     }
@@ -1248,8 +1246,7 @@ mod tests {
         // No slot release ever fires. The dispatcher's periodic tick
         // must wake on its own, observe that the Bulk head has aged
         // past its starvation_threshold, and admit via the override.
-        use std::collections::HashMap as StdMap;
-        let mut classes = StdMap::new();
+        let mut classes = HashMap::new();
         for c in Class::ALL {
             let mut cfg = ClassConfig::default_for(c);
             cfg.reserved_floor = 0;
@@ -1268,7 +1265,7 @@ mod tests {
         }
         let yaml = PrioritySchedulerYaml {
             classes,
-            tenant_policies: StdMap::new(),
+            tenant_policies: HashMap::new(),
         };
         let settings =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -1292,8 +1289,7 @@ mod tests {
         // Bulk starvation_threshold=0s (anything older than 0 wins), with
         // capacity entirely reserved by Interactive — without the
         // override Bulk could never advance.
-        use std::collections::HashMap as StdMap;
-        let mut classes = StdMap::new();
+        let mut classes = HashMap::new();
         for c in Class::ALL {
             let mut cfg = ClassConfig::default_for(c);
             cfg.reserved_floor = 0;
@@ -1312,7 +1308,7 @@ mod tests {
         }
         let yaml = PrioritySchedulerYaml {
             classes,
-            tenant_policies: StdMap::new(),
+            tenant_policies: HashMap::new(),
         };
         let settings =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -1724,8 +1720,7 @@ mod tests {
     /// short queue timeout (so declined-preempt enqueues resolve fast),
     /// can_preempt left at defaults (System/Interactive true, others false).
     fn preempt_settings() -> SchedulerSettings {
-        use std::collections::HashMap as StdMap;
-        let mut classes = StdMap::new();
+        let mut classes = HashMap::new();
         for c in Class::ALL {
             let mut cfg = ClassConfig::default_for(c);
             cfg.reserved_floor = 0;
@@ -1736,7 +1731,7 @@ mod tests {
         }
         let yaml = PrioritySchedulerYaml {
             classes,
-            tenant_policies: StdMap::new(),
+            tenant_policies: HashMap::new(),
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
     }

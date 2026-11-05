@@ -1,7 +1,8 @@
 //! Preparation stage for the chat + generate pipeline
 //!
 //! Dispatches to ChatPreparationStage or GeneratePreparationStage based on
-//! request type.
+//! request type, through their inherent futures: the stage call boxes once
+//! (this stage's `async_trait` future), not once more for the inner stage.
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -40,8 +41,8 @@ impl ChatGeneratePreparationStage {
 impl PipelineStage for ChatGeneratePreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         match &ctx.input.request_type {
-            RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
-            RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Chat(_) => self.chat_stage.prepare(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.prepare(ctx).await,
             request_type => {
                 error!(
                     function = "ChatGeneratePreparationStage::execute",

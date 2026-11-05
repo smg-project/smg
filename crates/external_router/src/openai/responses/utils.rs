@@ -422,14 +422,12 @@ mod tests {
         responses::{FunctionTool, McpTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use serde_json::json;
-    use smg_mcp::{
-        BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig,
-        McpToolSession, McpTransport, Tool, ToolEntry,
-    };
+    use smg_mcp::{BuiltinToolType, Tool};
 
     use super::{
         patch_response_with_request_metadata, restore_original_tools, rewrite_streaming_block,
     };
+    use crate::openai::mcp::test_support;
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -444,47 +442,23 @@ mod tests {
         Tool::new(name.to_string(), "internal", schema)
     }
 
-    #[tokio::test]
-    async fn restore_original_tools_strips_injected_internal_tool_when_request_had_no_tools() {
-        let original_body = ResponsesRequest {
+    /// The request the tests start from: one text input and, unless a test
+    /// adds them, no tools of its own.
+    fn hello_request() -> ResponsesRequest {
+        ResponsesRequest {
             model: "gpt-5.4".to_string(),
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_original_tools_strips_injected_internal_tool_when_request_had_no_tools() {
+        let original_body = hello_request();
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "tools": [{
                 "type": "function",
@@ -507,45 +481,11 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_strips_injected_internal_nested_function_tool_shape() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "tools": [{
                 "type": "function",
@@ -568,45 +508,11 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_strips_internal_mcp_output_items() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -639,45 +545,11 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_strips_internal_function_tool_call_items() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -706,45 +578,11 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_strips_internal_mcp_approval_request_items() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -772,39 +610,9 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_strips_internal_mcp_items_by_server_label_when_name_unknown() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator = test_support::internal_orchestrator(None).await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -837,45 +645,13 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_keeps_builtin_output_items_visible() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("brave_web_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![test_tool("brave_web_search")],
+        )
+        .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -924,45 +700,13 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_keeps_builtin_passthrough_mcp_call_visible() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("brave_web_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![test_tool("brave_web_search")],
+        )
+        .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -999,51 +743,16 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_keeps_builtin_passthrough_mcp_call_visible_with_mixed_tools() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+        let original_body = hello_request();
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![
                 test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
                 test_tool("internal_non_builtin_tool"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+            ],
+        )
+        .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -1077,8 +786,6 @@ mod tests {
     #[tokio::test]
     async fn restore_original_tools_keeps_user_function_call_on_name_collision() {
         let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
             tools: Some(vec![
                 ResponseTool::Function(FunctionTool {
                     function: Function {
@@ -1106,42 +813,12 @@ mod tests {
                     defer_loading: None,
                 }),
             ]),
-            ..Default::default()
+            ..hello_request()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("internal_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let orchestrator =
+            test_support::internal_orchestrator_serving(None, vec![test_tool("internal_search")])
+                .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -1181,45 +858,13 @@ mod tests {
 
     #[tokio::test]
     async fn restore_original_tools_hides_builtin_list_tools_keeps_passthrough_call() {
-        let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
-            ..Default::default()
-        };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                test_tool("brave_web_search"),
-            ));
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
-            "test-request",
-        );
+        let original_body = hello_request();
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![test_tool("brave_web_search")],
+        )
+        .await;
+        let session = test_support::internal_session(&orchestrator);
         let mut response = serde_json::json!({
             "output": [
                 {
@@ -1271,12 +916,10 @@ mod tests {
     #[test]
     fn patch_response_flattens_object_conversation_ref() {
         let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
             conversation: Some(ConversationRef::Object {
                 id: "conv_abc".to_string(),
             }),
-            ..Default::default()
+            ..hello_request()
         };
         let mut response = json!({});
         patch_response_with_request_metadata(&mut response, &original_body, None);
@@ -1301,12 +944,10 @@ mod tests {
     #[test]
     fn rewrite_streaming_block_flattens_object_conversation_ref() {
         let original_body = ResponsesRequest {
-            model: "gpt-5.4".to_string(),
-            input: ResponseInput::Text("hello".to_string()),
             conversation: Some(ConversationRef::Object {
                 id: "conv_xyz".to_string(),
             }),
-            ..Default::default()
+            ..hello_request()
         };
 
         // Minimal response.created SSE block with a `response` object to patch.

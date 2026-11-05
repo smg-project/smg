@@ -436,6 +436,7 @@ fn spelled(written: &Written) -> String {
             Segment::Slot(Slot::Name) => "{name}".to_owned(),
             Segment::Slot(Slot::Key) => "{key}".to_owned(),
             Segment::Slot(Slot::Value) => "{value}".to_owned(),
+            Segment::Index => "{index}".to_owned(),
         })
         .collect()
 }
@@ -459,7 +460,7 @@ struct Learner<'a, R> {
 struct Reading {
     case: Case,
     output: String,
-    events: Vec<(Range<usize>, Event)>,
+    events: Vec<(Range<usize>, Event<'static>)>,
 }
 
 /// What a reading says, as the Chat API's message holds it: the thought, the content, and each
@@ -756,7 +757,7 @@ impl<R: Fn(Case) -> Option<String>> Learner<'_, R> {
         }
         let mut events = Vec::new();
         let mut at = 0;
-        for event in out.drain() {
+        for event in out.into_owned().drain() {
             let length = bytes_of(&event).len();
             events.push((at..at + length, event));
             at += length;
@@ -1199,7 +1200,7 @@ fn call_layout(turn: &Calls) -> Result<Layout, NoLayout> {
 }
 
 /// The bytes of the output an event accounts for.
-fn bytes_of(event: &Event) -> &str {
+fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
         Event::Content(text) | Event::Reasoning(text) => &text.text,
         Event::Dropped { text, .. }
@@ -1404,6 +1405,8 @@ fn fill(written: &Written, name: &str) -> String {
         .map(|segment| match segment {
             Segment::Lit(text) => &**text,
             Segment::Slot(_) => name,
+            // A learned layout places no index: a rendering's digits are read as text.
+            Segment::Index => "0",
         })
         .collect()
 }
@@ -1443,6 +1446,7 @@ fn write_calls(output: &str, layout: &Layout, calls: &[Call]) -> String {
                     Segment::Slot(Slot::Key) => &output[param.key.clone()],
                     Segment::Slot(Slot::Value) => &output[param.value.clone()],
                     Segment::Slot(Slot::Name) => written.name.as_str(),
+                    Segment::Index => "0",
                 });
             }
         }
@@ -1492,7 +1496,7 @@ fn unnamed(layout: &Layout) -> Result<(), NoLayout> {
             .iter()
             .filter_map(|segment| match segment {
                 Segment::Lit(text) => Some(&**text),
-                Segment::Slot(_) => None,
+                Segment::Slot(_) | Segment::Index => None,
             })
             .collect::<Vec<_>>()
             .join("\u{0}")

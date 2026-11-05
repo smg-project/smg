@@ -1,5 +1,6 @@
-"""smg's vLLM general plugin: ``--servicer-impl`` and the ``--mm-*`` flags on
-vLLM's gRPC server parsers, defined by this package.
+"""smg's vLLM general plugin: ``--servicer-impl``, the ``--metrics-*`` flags
+and the ``--mm-*`` flags on vLLM's gRPC server parsers, defined by this
+package.
 
 vLLM loads ``vllm.general_plugins`` entry points while it builds the engine
 CLI (``AsyncEngineArgs.add_cli_args``), for plugins that extend the parser.
@@ -39,8 +40,8 @@ import sys
 from typing import Any
 
 # Loaded in every vLLM process: nothing heavier than the package init here.
-from smg_grpc_servicer import servicer_impl_flag
-from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
+from smg_grpc_servicer import metrics_flag, servicer_impl_flag
+from smg_grpc_servicer.vllm import METRICS_HOST_ENV, METRICS_PORT_ENV, SERVICER_IMPL_ENV
 from smg_grpc_servicer.vllm.launcher_switch import (
     LAUNCHER_MODULES,
     SUPPORTED_VLLM_RELEASES,
@@ -60,14 +61,29 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
         parser,
         applies=serves_grpc,
         help=(
-            "Which implementation serves the gRPC contract under --grpc: the Python "
-            "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
-            f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs "
+            "Which implementation serves the gRPC contract under --grpc: the Rust "
+            "servicer (default; smg.servicer.VllmGrpcServer, with the engine headless) or "
+            f"the deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust. "
+            "The Rust one needs "
             "a launcher the switch binds (`vllm serve <model> --grpc`, or `python -m` on the "
             f"launcher module; vLLM {SUPPORTED_VLLM_RELEASES} checked) or one that carries "
             "the check in its own source; any other launcher is refused at this parse, "
             "before the engine is built."
         ),
+    )
+
+
+def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    Prometheus endpoint) to a parser that serves gRPC and lacks them; returns
+    whether they were added."""
+    if not serves_grpc(parser):
+        return False
+    return metrics_flag.add_metrics_arguments(
+        parser,
+        port_env=METRICS_PORT_ENV,
+        host_env=METRICS_HOST_ENV,
+        server_class="smg.servicer.VllmGrpcServer",
     )
 
 
@@ -152,7 +168,11 @@ def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | N
     nothing."""
     if not serves_grpc(parser) or getattr(parsed, "grpc", None) is False:
         return None
-    from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+    from smg_grpc_servicer.rust_lifecycle import (
+        ServicerConfigError,
+        check_metrics_port_needs_rust,
+        configuration_exit,
+    )
     from smg_grpc_servicer.vllm.launcher_switch import require_launcher_hook
     from smg_grpc_servicer.vllm.rust import configure_logging, resolve_servicer_impl
 
@@ -160,6 +180,9 @@ def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | N
         impl = resolve_servicer_impl(parsed)
         if impl == "rust":
             require_launcher_hook()
+        # A metrics port under the Python servicer is a port nobody serves:
+        # refused here, with the other configuration errors.
+        check_metrics_port_needs_rust(impl, parsed, METRICS_PORT_ENV)
     except ServicerConfigError as error:
         configure_logging()
         raise configuration_exit(error) from None
@@ -188,6 +211,7 @@ def register() -> None:
         # building the parser, so it is there for `--help` and for the
         # subcommand parse `vllm serve` dispatches to.
         add_servicer_impl_argument(self)
+        add_metrics_arguments(self)
         add_mm_arguments_to_grpc_parser(self)
         parsed, extras = original(self, args, namespace)
         impl = getattr(parsed, "servicer_impl", None)

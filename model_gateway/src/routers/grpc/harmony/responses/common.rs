@@ -11,14 +11,14 @@ use openai_protocol::{
     },
 };
 use serde_json::to_string;
-use smg_mcp::McpToolSession;
+use smg_mcp::{McpServerBinding, McpToolSession};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::execution::ToolResult;
+use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    grpc::common::responses::utils::resolve_function_identity,
+    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
 };
 
 /// Record of a single MCP tool call execution
@@ -55,6 +55,31 @@ impl McpCallTracking {
     pub fn total_calls(&self) -> usize {
         self.tool_calls.len()
     }
+}
+
+/// The request's MCP session, opened once for the loop; the session's MCP
+/// tools join the request's tool list, so the model sees them beside the
+/// user's own.
+pub(super) fn open_mcp_session<'a>(
+    ctx: &'a ResponsesContext,
+    mcp_servers: Vec<McpServerBinding>,
+    request: &mut ResponsesRequest,
+) -> McpToolSession<'a> {
+    let session_request_id = format!("resp_{}", Uuid::now_v7());
+    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    let mcp_tools = session.mcp_tools();
+    if !mcp_tools.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
+        let mut all_tools = request.tools.take().unwrap_or_default();
+        all_tools.extend(mcp_response_tools);
+        request.tools = Some(all_tools);
+        debug!(
+            mcp_tool_count = mcp_tools.len(),
+            total_tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            "MCP client available - added static MCP tools to Harmony Responses request"
+        );
+    }
+    session
 }
 
 /// Build next request with tool results appended to history

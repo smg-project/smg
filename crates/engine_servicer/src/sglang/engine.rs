@@ -2,68 +2,39 @@
 //! is already listening. Failures gate health and surface as the last error;
 //! nothing here retries, the lifecycle owner restarts the pair.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use engine_zmq_adapter::{connect_with_eos, EosTokenIds, Handshake};
-use engine_zmq_client::StartupBudget;
 use openai_protocol::worker::RuntimeType;
-use tracing::{error, info};
 
 use super::State;
-use crate::{record_error, SharedError};
+use crate::engine_link::{self, ConnectInputs, PeerWords};
 
-/// The handshake's silence bound (`startup_timeout`) counts from the latest
-/// sign of life: a handshake message, or the lifecycle owner's report that
-/// the scheduler process is alive (`State::engine::liveness`); the ceiling
-/// bounds the whole start regardless.
-pub(super) async fn connect_engine(
-    state: Arc<State>,
-    ipc_base_url: String,
-    handshake_address: String,
-    engine_count: usize,
-    startup_timeout: Duration,
-    startup_ceiling: Option<Duration>,
-    last_error: SharedError,
-) {
-    // The scheduler stops at EOS itself; the ids only inform the adapter.
-    let eos = if state.model.eos_token_ids.is_empty() {
-        EosTokenIds::default()
-    } else {
-        EosTokenIds::from_ids(&state.model.eos_token_ids)
-    };
-    match connect_with_eos(
-        &ipc_base_url,
+/// This wire's connect ([`engine_link::connect_engine`] with its words): the
+/// connected scheduler takes the structured-outputs support the launcher's
+/// arguments say, the note that it truncates long prompts and the note that
+/// it is a prefill side placing a disaggregated request by its room, when
+/// they say so. The start-up and silence bounds are the link's.
+pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
+    engine_link::connect_engine(
+        &state.shared.engine,
         state.model.model_path.clone(),
+        &state.model.eos_token_ids,
         RuntimeType::Sglang,
-        Handshake::TcpOrIpc(&handshake_address),
-        engine_count,
-        eos,
-        StartupBudget {
-            silence: startup_timeout,
-            ceiling: startup_ceiling,
-            liveness: Some(state.engine.liveness.clone()),
+        PeerWords {
+            peer: "SGLang scheduler",
+            party: "scheduler",
+        },
+        inputs,
+        |client| {
+            client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
+            if super::truncates_long_prompts(&state.model) {
+                client.note_engine_truncates_long_prompts();
+            }
+            if super::places_by_rendezvous_room(&state.model) {
+                client.note_engine_places_by_rendezvous_room();
+            }
+            Ok(())
         },
     )
-    .await
-    {
-        Ok(client) => {
-            info!(
-                handshake = %handshake_address,
-                engines = engine_count,
-                "SGLang scheduler connected"
-            );
-            let _ = state.engine.client.set(client);
-        }
-        Err(connect_error) => {
-            let ceiling = startup_ceiling
-                .map_or_else(|| "none".to_string(), |ceiling| format!("{ceiling:?}"));
-            let message = format!(
-                "SGLang scheduler connection failed: {connect_error} (startup bounds: \
-                 {startup_timeout:?} without a sign of life from the scheduler, ceiling {ceiling})"
-            );
-            error!(%message);
-            state.engine.fail(message.clone());
-            record_error(&last_error, message);
-        }
-    }
+    .await;
 }

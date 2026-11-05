@@ -3,12 +3,14 @@
 The one place the suites turn a stream into the pieces they assert on: a chat
 completion's text, its tool calls assembled from their deltas and its finish
 reason; a Responses stream's events and the response its ``response.completed``
-event carries.
+event carries; a chat completion's raw SSE lines, for the way a stream ended
+(its finish reason, the gateway's error frame, the closing ``[DONE]``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import json
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,6 +81,62 @@ def collect_streamed_chat(stream: Iterable[Any]) -> StreamedChat:
         tool_call_deltas=deltas,
         finish_reason=finish_reason,
     )
+
+
+@dataclass
+class SseChatEnd:
+    """How a chat completion's raw SSE stream ended.
+
+    Read off the ``data:`` lines, so a stream the gateway failed after its
+    headers is seen the way a client sees it: the chunks before the failure,
+    then one frame carrying an ``error`` object (its ``type`` and ``code``
+    name the failure), then ``[DONE]``.
+    """
+
+    chunks: int = 0
+    """Frames with choices, in order of arrival."""
+    finish_reason: str | None = None
+    """The last finish reason any choice reported."""
+    error: dict[str, Any] | None = None
+    """The error frame's body, when the stream failed."""
+    done: bool = False
+    """Whether ``[DONE]`` closed the stream."""
+
+
+def read_sse_chat(
+    lines: Iterable[str], *, on_first_chunk: Callable[[], None] | None = None
+) -> SseChatEnd:
+    """Read a chat completion's SSE lines to their end; ``on_first_chunk`` runs
+    once, at the first frame with choices. Lines that are not ``data:``
+    (event names, comments, blanks) and frames that are not JSON are
+    passed over."""
+    end = SseChatEnd()
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload == "[DONE]":
+            end.done = True
+            break
+        try:
+            frame = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(frame, dict):
+            continue
+        if isinstance(frame.get("error"), dict):
+            end.error = frame["error"]
+            continue
+        choices = frame.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue  # a usage-only frame carries no choice
+        end.chunks += 1
+        if end.chunks == 1 and on_first_chunk is not None:
+            on_first_chunk()
+        for choice in choices:
+            if isinstance(choice, dict) and choice.get("finish_reason"):
+                end.finish_reason = choice["finish_reason"]
+    return end
 
 
 @dataclass

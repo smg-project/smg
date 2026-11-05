@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use llm_multimodal::{
-    registry::modality_limit_override, EncoderInputFormat, MediaContentPart, MediaPartOrder,
-    Modality, ModelMetadata,
+    registry::modality_limit_override, EncoderInputFormat, FetchSourceKind, MediaContentPart,
+    MediaPartOrder, Modality, ModelMetadata,
 };
 use llm_tokenizer::{traits::PromptEncoding, TokenizerTrait};
 use openai_protocol::worker::MmProcessingMode;
@@ -58,6 +58,32 @@ impl MediaPlan {
             plan.parts.push(part);
         }
         plan
+    }
+
+    /// The plan's items of `modality` per source (`url`, `data_url`,
+    /// `inline`): what the request carries, before any limit is applied.
+    pub(crate) fn source_counts(&self, modality: Modality) -> [(&'static str, usize); 3] {
+        let mut counts = [
+            (FetchSourceKind::Url.as_str(), 0),
+            (FetchSourceKind::DataUrl.as_str(), 0),
+            (FetchSourceKind::InlineBytes.as_str(), 0),
+        ];
+        for part in &self.parts {
+            let (of, source) = match part {
+                MediaContentPart::ImageUrl { url, .. } => (Modality::Image, url_source(url)),
+                MediaContentPart::ImageData { .. } => (Modality::Image, 2),
+                MediaContentPart::ImageEmbeds { .. } => (Modality::ImageEmbeds, 2),
+                MediaContentPart::AudioUrl { url, .. } => (Modality::Audio, url_source(url)),
+                MediaContentPart::AudioData { .. } => (Modality::Audio, 2),
+                MediaContentPart::VideoUrl { url, .. } => (Modality::Video, url_source(url)),
+                MediaContentPart::VideoData { .. } => (Modality::Video, 2),
+                MediaContentPart::Text { .. } => continue,
+            };
+            if of == modality {
+                counts[source].1 += 1;
+            }
+        }
+        counts
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -191,6 +217,39 @@ pub(crate) async fn prepare_placeholder_tokens(
     engine_limits: &HashMap<Modality, EngineItemLimit>,
     reads_format: impl Fn(EncoderInputFormat) -> bool,
 ) -> Result<PlaceholderTokens> {
+    prepare_placeholder_tokens_with_env(
+        plan,
+        model_id,
+        tokenizer,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        engine_limits,
+        reads_format,
+        modality_limit_override,
+    )
+    .await
+}
+
+/// `prepare_placeholder_tokens` with the deployment-wide limit override (the
+/// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
+/// passes `|_| None` and holds the spec default under test whatever the shell
+/// it runs in exports.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input of the one lookup"
+)]
+async fn prepare_placeholder_tokens_with_env(
+    plan: &MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+    engine_limits: &HashMap<Modality, EngineItemLimit>,
+    reads_format: impl Fn(EncoderInputFormat) -> bool,
+    env_override: impl Fn(Modality) -> Option<usize>,
+) -> Result<PlaceholderTokens> {
     anyhow::ensure!(!plan.is_empty(), "multimodal media plan is empty");
     let model_config = components
         .config_registry
@@ -224,7 +283,7 @@ pub(crate) async fn prepare_placeholder_tokens(
         &spec_limits,
         engine_limits,
         &components.modality_limit_overrides,
-        modality_limit_override,
+        env_override,
     );
     check_item_counts(plan, &limits).map_err(|error| anyhow::anyhow!("{error}"))?;
     let requested = plan
@@ -263,8 +322,10 @@ pub(crate) async fn prepare_placeholder_tokens(
 }
 
 /// Resolve the media-part ordering for a model from the same registry that owns
-/// its placeholder/prompt logic. Falls back to vLLM-compatible media-first when
-/// the model matches no spec.
+/// its placeholder/prompt logic: where media goes relative to text when the
+/// template takes one string per message (a template that takes parts places
+/// them itself, in the request's order). Falls back to the engine's media-first
+/// placement when the model matches no spec.
 pub(crate) async fn resolve_media_part_order(
     model_id: &str,
     tokenizer: &dyn TokenizerTrait,
@@ -349,6 +410,13 @@ pub(crate) fn validate_rendered_media_anchors(
     Ok(())
 }
 
+/// The source index of a URL part in [`MediaPlan::source_counts`], read as
+/// the tracker reads the URL at the fetch: a `data:` URL is 1, any other URL
+/// 0.
+fn url_source(url: &str) -> usize {
+    usize::from(FetchSourceKind::of_url(url) == FetchSourceKind::DataUrl)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -389,11 +457,11 @@ mod tests {
         .unwrap();
         components.config_registry.insert(
             "tok".to_string(),
-            Arc::new(MultimodalModelConfig {
-                config: serde_json::json!({"model_type": "llava", "image_token_index": 32000}),
-                preprocessor_config: PreProcessorConfig::default(),
-                video_preprocessor_config: None,
-            }),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({"model_type": "llava", "image_token_index": 32000}),
+                PreProcessorConfig::default(),
+                None,
+            )),
         );
         let tokenizer = MockTokenizer::new();
         let plan = image_urls(2);
@@ -404,7 +472,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
             },
         )]);
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -413,6 +481,7 @@ mod tests {
             "unused",
             &engine,
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
@@ -426,7 +495,7 @@ mod tests {
         // Without an engine limit the plan passes the count check and reaches
         // the placeholder resolution (which the mock tokenizer, lacking the
         // token, then refuses).
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -435,11 +504,86 @@ mod tests {
             "unused",
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
         .to_string();
         assert!(!error.contains("limit of"), "{error}");
+    }
+
+    /// A spec that declares a modality without a count of its own leaves the
+    /// bound to the engine's advertised limit and the router's knobs: with
+    /// neither, a request carrying more images than another family's copied
+    /// default goes through; the flag and the engine's limit still refuse it,
+    /// each naming itself.
+    #[tokio::test]
+    async fn a_spec_without_a_count_of_its_own_leaves_the_bound_to_the_engine_and_the_knobs() {
+        let registry = Arc::new(MultimodalConfigRegistry::new());
+        registry.insert(
+            "tok".to_string(),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({"model_type": "kimi_k3", "media_placeholder_token_id": 163605}),
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        let tokenizer = MockTokenizer::new().with_tokens(&[("<|media_pad|>", 163605)]);
+        let plan = image_urls(11);
+        let prepare = |image_limit, engine: HashMap<Modality, EngineItemLimit>| {
+            let components = MultimodalComponents::new(
+                registry.clone(),
+                image_limit,
+                None,
+                &MultimodalSettings::default(),
+            )
+            .unwrap();
+            let plan = &plan;
+            let tokenizer = &tokenizer;
+            async move {
+                prepare_placeholder_tokens_with_env(
+                    plan,
+                    "org/kimi-k3",
+                    tokenizer,
+                    &components,
+                    "tok",
+                    "unused",
+                    &engine,
+                    |_| true,
+                    |_| None,
+                )
+                .await
+            }
+        };
+
+        let placeholders = prepare(None, HashMap::new())
+            .await
+            .expect("no engine limit and no knob: the spec sets no count of its own");
+        assert_eq!(placeholders.get(Modality::Image), Some("<|media_pad|>"));
+
+        let error = prepare(Some(10), HashMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("11 image items")
+                && error.contains("limit of 10")
+                && error.contains("(--mm-per-request-image-limit)"),
+            "{error}"
+        );
+
+        let engine = HashMap::from([(
+            Modality::Image,
+            EngineItemLimit {
+                limit: 8,
+                runtime: RuntimeType::Vllm,
+            },
+        )]);
+        let error = prepare(None, engine).await.unwrap_err().to_string();
+        assert!(
+            error.contains("limit of 8") && error.contains("the engine's"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -623,7 +767,7 @@ mod tests {
             let plan = &plan;
             let tokenizer = &tokenizer;
             async move {
-                prepare_placeholder_tokens(
+                prepare_placeholder_tokens_with_env(
                     plan,
                     "m",
                     tokenizer,
@@ -632,6 +776,7 @@ mod tests {
                     source,
                     &HashMap::new(),
                     |format| fleet_reads_format(&fleet(runtime), "m", format),
+                    |_| None,
                 )
                 .await
             }
@@ -684,7 +829,7 @@ mod tests {
         }]);
 
         for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
-            let placeholders = prepare_placeholder_tokens(
+            let placeholders = prepare_placeholder_tokens_with_env(
                 &plan,
                 "m6",
                 &tokenizer,
@@ -693,6 +838,7 @@ mod tests {
                 source,
                 &HashMap::new(),
                 |_| true,
+                |_| None,
             )
             .await
             .unwrap_or_else(|error| panic!("{mode:?} placement: {error:#}"));
@@ -705,7 +851,7 @@ mod tests {
                 .expect("no anchors of the router's own to verify");
         }
 
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "m6",
             &tokenizer,
@@ -714,6 +860,7 @@ mod tests {
             source,
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .expect_err("the router cannot process media it has no spec for");

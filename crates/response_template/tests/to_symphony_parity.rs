@@ -126,15 +126,9 @@ fn check_tokens(
 ) {
     let boundaries = token_boundaries(text);
     let tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
-    let mut parser = Engine::new(format.clone(), declared.clone());
-    let mut out = Events::new();
-    if !prompt.is_empty() {
-        let input = Input::Prompt {
-            token_ids: &[],
-            text: prompt,
-        };
-        parser.feed(input, &mut out).unwrap();
-    }
+    // Each delta's spans are built first: a delta's events borrow it for as long as the buffer
+    // they are read into lives, here the whole output.
+    let mut deltas: Vec<(usize, usize, Vec<TokenSpan>)> = Vec::new();
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
@@ -148,14 +142,26 @@ fn check_tokens(
                     continued: start < from,
                 })
                 .collect();
-            let delta = Input::Delta {
-                token_ids: &[],
-                text: &text[from..cut],
-                spans: &spans,
-            };
-            parser.feed(delta, &mut out).unwrap();
+            deltas.push((from, cut, spans));
             from = cut;
         }
+    }
+    let mut parser = Engine::new(format.clone(), declared.clone());
+    let mut out = Events::new();
+    if !prompt.is_empty() {
+        let input = Input::Prompt {
+            token_ids: &[],
+            text: prompt,
+        };
+        parser.feed(input, &mut out).unwrap();
+    }
+    for (from, cut, spans) in &deltas {
+        let delta = Input::Delta {
+            token_ids: &[],
+            text: &text[*from..*cut],
+            spans,
+        };
+        parser.feed(delta, &mut out).unwrap();
     }
     let end = Input::End {
         finish: EngineFinish::Stop,

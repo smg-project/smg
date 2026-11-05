@@ -252,7 +252,7 @@ fn tokens<'a>(text: &'a str, terminals: &[String]) -> Vec<&'a str> {
 /// The events `slice` produces through `table` read in token pieces: the stream an adapter
 /// renders, the prompt's own events first (a prompt that opens the thought starts the stream
 /// with its reasoning event, which the adapters render before any delta).
-fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
+fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event<'static>> {
     let terminals = terminals(table);
     let mut engine = Engine::new(table.format(), declared.clone());
     let mut out = Events::new();
@@ -266,7 +266,7 @@ fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
             &mut out,
         )
         .expect("prompt");
-    events.extend(out.drain());
+    events.extend(out.drain().into_iter().map(Event::into_owned));
     for piece in tokens(&slice.output, &terminals) {
         engine
             .feed(
@@ -278,7 +278,7 @@ fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
                 &mut out,
             )
             .expect("delta");
-        events.extend(out.drain());
+        events.extend(out.drain().into_iter().map(Event::into_owned));
     }
     engine
         .feed(
@@ -288,7 +288,7 @@ fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
             &mut out,
         )
         .expect("end");
-    events.extend(out.drain());
+    events.extend(out.drain().into_iter().map(Event::into_owned));
     events
 }
 
@@ -356,7 +356,7 @@ fn engine(table: Table, prompt: &str, declared: &Declared) -> Engine {
 
 /// Feeds `pieces` and the end of the stream; the events drained after every piece, as a stream's
 /// reader drains them.
-fn read(engine: &mut Engine, pieces: &[&str], out: &mut Events) {
+fn read<'d>(engine: &mut Engine, pieces: &[&'d str], out: &mut Events<'d>) {
     for piece in pieces {
         engine
             .feed(

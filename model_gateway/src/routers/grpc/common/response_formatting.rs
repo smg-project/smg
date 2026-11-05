@@ -4,9 +4,7 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use std::collections::HashMap;
-
-use openai_protocol::common::Usage;
+use openai_protocol::{common::Usage, generate::GenerateResponse};
 
 use crate::{
     rate_limit::UsageSettlement,
@@ -54,6 +52,37 @@ impl TokenCounts {
             reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
             spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
             spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+        }
+    }
+
+    /// The counters of the generate answers of one request, one per choice,
+    /// as [`Self::of`] takes them from the frames: the shared prompt's count
+    /// and cache hit once, the greatest any choice reports (the choice that
+    /// prefilled the shared prefix may report fewer hits than its siblings),
+    /// the choices' own completion and reasoning counts summed. A generate
+    /// answer carries no speculative counts.
+    pub(crate) fn of_generated(responses: &[GenerateResponse]) -> Self {
+        Self {
+            prompt: responses
+                .iter()
+                .map(|r| r.meta_info.prompt_tokens)
+                .max()
+                .unwrap_or(0),
+            completion: responses
+                .iter()
+                .map(|r| r.meta_info.completion_tokens)
+                .sum(),
+            cached: responses
+                .iter()
+                .map(|r| r.meta_info.cached_tokens)
+                .max()
+                .unwrap_or(0),
+            reasoning: responses
+                .iter()
+                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
+                .sum(),
+            spec_accepted: 0,
+            spec_drafted: 0,
         }
     }
 
@@ -138,18 +167,41 @@ pub(crate) fn effective_weight_version<'a>(
 /// - cumulative streams send the count in the Complete message, and the
 ///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
-    tokens: HashMap<u32, u32>,
-    /// The running count a cumulative stream reported in its latest chunk:
-    /// how far it had come, for a stream that ends before its Complete.
-    reported: HashMap<u32, u32>,
+    /// One entry per choice index, grown as the indices come (the engines
+    /// send them dense from zero): the count known for the choice, and the
+    /// running count a cumulative stream reported in its latest chunk (how
+    /// far it had come, for a stream that ends before its Complete).
+    choices: Vec<TrackedChoice>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct TrackedChoice {
+    tokens: u32,
+    reported: u32,
+}
+
+/// Choice indices past this many are a malformed engine message, not a
+/// vector to grow: their counts are dropped.
+const MAX_TRACKED_CHOICES: usize = 4096;
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
-            reported: HashMap::new(),
+            choices: Vec::new(),
         }
+    }
+
+    /// The entry of choice `index`, made when first seen; `None` for an
+    /// index past [`MAX_TRACKED_CHOICES`].
+    fn choice(&mut self, index: u32) -> Option<&mut TrackedChoice> {
+        let index = index as usize;
+        if index >= MAX_TRACKED_CHOICES {
+            return None;
+        }
+        if self.choices.len() <= index {
+            self.choices.resize(index + 1, TrackedChoice::default());
+        }
+        self.choices.get_mut(index)
     }
 
     /// Record tokens from a streaming chunk.
@@ -157,11 +209,13 @@ impl CompletionTokenTracker {
     /// report it in Complete instead, so a chunk of theirs only notes the
     /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
+        let Some(choice) = self.choice(chunk.index()) else {
+            return;
+        };
         if chunk.chunk_semantics().is_delta() {
-            *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+            choice.tokens += chunk.token_ids().len() as u32;
         } else {
-            self.reported
-                .insert(chunk.index(), chunk.completion_tokens());
+            choice.reported = chunk.completion_tokens();
         }
     }
 
@@ -169,18 +223,32 @@ impl CompletionTokenTracker {
     /// Delta streams keep the count accumulated from their chunks; cumulative
     /// streams take the value from Complete.
     pub fn record_complete(&mut self, complete: &ProtoGenerateComplete) {
-        let index = complete.index();
-        if complete.chunk_semantics().is_delta() {
-            // Keep accumulated count; ensure entry exists
-            self.tokens.entry(index).or_insert(0);
-        } else {
-            self.tokens.insert(index, complete.completion_tokens());
+        let Some(choice) = self.choice(complete.index()) else {
+            return;
+        };
+        if !complete.chunk_semantics().is_delta() {
+            choice.tokens = complete.completion_tokens();
+        }
+    }
+
+    /// Settle a choice the gateway's own stop ended, as its Complete would
+    /// have: a delta stream keeps the count it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported. The choice
+    /// is counted through the step in which the stop matched, as the engine's
+    /// own server counts a stopped request. An engine that ends the choice on
+    /// that same step still sends its Complete, recorded as usual (the same
+    /// step, in the engine's own count); the Complete of a choice the engine
+    /// generated past the stop carries the tail's count, and the stream does
+    /// not pass it on.
+    pub fn record_local_stop(&mut self, index: u32) {
+        if let Some(choice) = self.choice(index) {
+            choice.tokens = choice.tokens.max(choice.reported);
         }
     }
 
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
-        self.tokens.values().sum()
+        self.choices.iter().map(|choice| choice.tokens).sum()
     }
 
     /// Completion tokens delivered so far across all indices: the count
@@ -188,12 +256,10 @@ impl CompletionTokenTracker {
     /// stream last reported. How far a stream that ends before its Complete
     /// had come.
     pub fn delivered(&self) -> u32 {
-        let mut per_index = self.reported.clone();
-        for (index, tokens) in &self.tokens {
-            let known = per_index.entry(*index).or_insert(0);
-            *known = (*known).max(*tokens);
-        }
-        per_index.values().sum()
+        self.choices
+            .iter()
+            .map(|choice| choice.tokens.max(choice.reported))
+            .sum()
     }
 }
 
@@ -429,5 +495,53 @@ mod tests {
             "default",
             "an empty registration label is unset"
         );
+    }
+
+    /// A choice the gateway's own stop ended is settled as its Complete would
+    /// have settled it: a delta stream keeps what it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported; the count is
+    /// through the step the stop matched in, never the engine's tail.
+    #[test]
+    fn a_local_stop_settles_the_count_the_stream_had_reached() {
+        // Cumulative stream: the running count of the latest chunk.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no settled count before the stop");
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (41, 41));
+
+        // Delta stream: the accumulated chunks.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+
+        // A choice that stopped before any chunk settled at zero.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_local_stop(2);
+        assert_eq!((tracker.total(), tracker.delivered()), (0, 0));
+
+        // The Complete of an engine that ended the choice on the stop's step
+        // is recorded as usual: the engine's own count of that step.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        tracker.record_local_stop(0);
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!(tracker.total(), 42, "the engine's own count of the step");
     }
 }

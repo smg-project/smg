@@ -9,7 +9,10 @@
 //! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use openai_protocol::{
-    chat::{ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatStreamChoice},
+    chat::{
+        ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice,
+        ChatStreamChoiceRef,
+    },
     common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
 };
 
@@ -19,14 +22,21 @@ use crate::event::{Event, FinishReason};
 /// The stream choice one event produces for the choice at `choice`, if it produces one. The
 /// choice carries a copy of the text it takes from the event; [`into_delta`] takes the event and
 /// its text.
-pub fn delta(choice: u32, event: &Event) -> Option<ChatStreamChoice> {
+pub fn delta(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
+    delta_without_role(choice, event).map(with_role)
+}
+
+/// [`delta`] without the assistant role on the delta (see [`into_delta_without_role`]).
+pub fn delta_without_role(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
     match event {
-        Event::Content(text) | Event::Malformed { text, .. } => content(choice, text.text.clone()),
-        Event::Reasoning(text) => reasoning(choice, text.text.clone()),
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            content(choice, text.text.to_string())
+        }
+        Event::Reasoning(text) => reasoning(choice, text.text.to_string()),
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, *index, id.clone(), name.clone())),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.clone()),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.to_string()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, reason, *tool_calls)),
@@ -39,14 +49,22 @@ pub fn delta(choice: u32, event: &Event) -> Option<ChatStreamChoice> {
 
 /// [`delta`] over an event the caller gives up: the choice takes the event's text in place of a
 /// copy, which a stream that renders every delta once need not make.
-pub fn into_delta(choice: u32, event: Event) -> Option<ChatStreamChoice> {
+pub fn into_delta(choice: u32, event: Event<'_>) -> Option<ChatStreamChoice> {
+    into_delta_without_role(choice, event).map(with_role)
+}
+
+/// [`into_delta`] without the assistant role on the delta, for a stream whose opening chunk
+/// carried the role and whose later deltas do not repeat it (the public API's shape).
+pub fn into_delta_without_role(choice: u32, event: Event<'_>) -> Option<ChatStreamChoice> {
     match event {
-        Event::Content(text) | Event::Malformed { text, .. } => content(choice, text.text),
-        Event::Reasoning(text) => reasoning(choice, text.text),
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            content(choice, text.text.into_owned())
+        }
+        Event::Reasoning(text) => reasoning(choice, text.text.into_owned()),
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, index, id, name)),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json.into_owned()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, &reason, tool_calls)),
@@ -57,6 +75,42 @@ pub fn into_delta(choice: u32, event: Event) -> Option<ChatStreamChoice> {
     }
 }
 
+/// [`into_delta_without_role`] with the choice borrowing the event's text where the event borrows
+/// it (a [`ChatStreamChoiceRef`], the same bytes on the wire): a stream that writes each delta once
+/// makes no copy of its text. A tool call's start, its arguments and the finish are owned either
+/// way and come through [`into_delta_without_role`].
+pub fn into_delta_ref(choice: u32, event: Event<'_>) -> Option<ChatStreamChoiceRef<'_>> {
+    match event {
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            (!text.text.is_empty()).then(|| ChatStreamChoiceRef {
+                index: choice,
+                delta: ChatMessageDeltaRef {
+                    role: None,
+                    content: Some(text.text),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+                matched_stop: None,
+            })
+        }
+        Event::Reasoning(text) => (!text.text.is_empty()).then(|| ChatStreamChoiceRef {
+            index: choice,
+            delta: ChatMessageDeltaRef {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning_content: Some(text.text),
+            },
+            logprobs: None,
+            finish_reason: None,
+            matched_stop: None,
+        }),
+        event => into_delta_without_role(choice, event).map(Into::into),
+    }
+}
+
 /// A content delta; none for text that is empty.
 fn content(choice: u32, text: String) -> Option<ChatStreamChoice> {
     (!text.is_empty()).then(|| {
@@ -64,7 +118,7 @@ fn content(choice: u32, text: String) -> Option<ChatStreamChoice> {
             choice,
             ChatMessageDelta {
                 content: Some(text),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -77,7 +131,7 @@ fn reasoning(choice: u32, text: String) -> Option<ChatStreamChoice> {
             choice,
             ChatMessageDelta {
                 reasoning_content: Some(text),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -97,7 +151,7 @@ fn call_start(choice: u32, index: u32, id: String, name: String) -> ChatStreamCh
                     arguments: None,
                 }),
             }]),
-            ..assistant()
+            ..bare()
         },
     )
 }
@@ -117,7 +171,7 @@ fn arguments(choice: u32, index: u32, json: String) -> Option<ChatStreamChoice> 
                         arguments: Some(json),
                     }),
                 }]),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -151,9 +205,9 @@ fn unfinished(choice: u32, delta: ChatMessageDelta) -> ChatStreamChoice {
 }
 
 /// The stream choices a sequence of events produces, in order.
-pub fn deltas<'a>(
+pub fn deltas<'a, 'd: 'a>(
     choice: u32,
-    events: impl IntoIterator<Item = &'a Event>,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
 ) -> Vec<ChatStreamChoice> {
     events
         .into_iter()
@@ -169,7 +223,10 @@ pub fn deltas<'a>(
 /// `Finish` event, so a sequence without one gives a message that is not finished. Argument
 /// fragments for a call that never started cannot occur under the `Event` contract; should one
 /// arrive, its text joins the content so that no byte is lost.
-pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> ChatChoice {
+pub fn message<'a, 'd: 'a>(
+    choice: u32,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
+) -> ChatChoice {
     let folded = fold(events);
     let calls: Vec<ToolCall> = folded
         .calls
@@ -215,43 +272,26 @@ fn finish_reason(reason: &FinishReason, tool_calls: u32) -> String {
     .to_string()
 }
 
-/// An assistant delta with nothing in it yet.
-fn assistant() -> ChatMessageDelta {
+/// A delta with nothing in it yet and no role: the role goes on with
+/// [`with_role`] where a caller wants it on every delta, and stays off where
+/// the stream's opening chunk carried it (one allocation per delta saved,
+/// measured 2026-10-21: 128 per 128-delta stream).
+fn bare() -> ChatMessageDelta {
     ChatMessageDelta {
-        role: Some("assistant".to_string()),
+        role: None,
         content: None,
         tool_calls: None,
         reasoning_content: None,
     }
 }
 
-/// The byte ranges of the output that are the message's content, from the events' sources in
-/// order (every byte of the output lands in one event), adjacent runs joined. Malformed text is
-/// content, as [`message`] writes it; a logprobs filter keeps the tokens in these ranges. The
-/// events must be the parser's own, whole; the one-call-only rule keeps the bytes of the calls it
-/// drops as dropped text, so the ranges hold under it
-/// ([`first_call_only`](crate::event::first_call_only)).
-pub fn content_spans(events: &[Event]) -> Vec<(usize, usize)> {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    for event in events {
-        let (bytes, content) = match event {
-            Event::Content(text) | Event::Malformed { text, .. } => (text.text.len(), true),
-            Event::Reasoning(text) | Event::Dropped { text, .. } => (text.text.len(), false),
-            Event::ToolCallStart { source, .. }
-            | Event::ToolCallArguments { source, .. }
-            | Event::ToolCallEnd { source, .. } => (source.text.len(), false),
-            Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => (0, false),
-        };
-        if content && bytes > 0 {
-            match spans.last_mut() {
-                Some((_, end)) if *end == at => *end = at + bytes,
-                _ => spans.push((at, at + bytes)),
-            }
-        }
-        at += bytes;
+/// `choice` with the assistant role on its delta, as the deltas always had it;
+/// the finishing choice keeps its empty delta.
+fn with_role(mut choice: ChatStreamChoice) -> ChatStreamChoice {
+    if choice.finish_reason.is_none() {
+        choice.delta.role = Some("assistant".to_string());
     }
-    spans
+    choice
 }
 
 #[cfg(test)]
@@ -260,7 +300,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        event::{first_call_only, DropReason, MalformedReason, Text},
+        event::{DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
@@ -270,34 +310,8 @@ mod tests {
         serde_json::to_value(choice.expect("a choice")).expect("serializable")
     }
 
-    #[test]
-    fn content_spans_join_content_and_malformed_runs_and_skip_the_rest() {
-        let events = [
-            Event::Content(Text::uncounted("Sure. ")),
-            Event::Malformed {
-                text: Text::uncounted("{bad"),
-                why: MalformedReason::InvalidArguments,
-            },
-            Event::Reasoning(Text::uncounted("think")),
-            Event::ToolCallStart {
-                index: 0,
-                id: "call_0".to_string(),
-                name: "f".to_string(),
-                source: Text::uncounted("<call>"),
-            },
-            Event::Content(Text::uncounted("done")),
-            Event::Finish {
-                reason: FinishReason::Stop,
-                tool_calls: 1,
-                reasoning_tokens: 0,
-            },
-        ];
-        assert_eq!(content_spans(&events), [(0, 10), (21, 25)]);
-        assert!(content_spans(&[]).is_empty());
-    }
-
     /// One event of every kind, with text where the kind carries it.
-    fn one_of_each() -> Vec<Event> {
+    fn one_of_each() -> Vec<Event<'static>> {
         vec![
             Event::Content(Text::uncounted("Hello")),
             Event::Content(Text::uncounted("")),
@@ -312,12 +326,12 @@ mod tests {
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: "{\"q\":".to_string(),
+                json: "{\"q\":".into(),
                 source: Text::uncounted("{\"q\":"),
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: String::new(),
+                json: "".into(),
                 source: Text::uncounted(""),
             },
             Event::ToolCallEnd {
@@ -348,6 +362,32 @@ mod tests {
             let owned = into_delta(3, event.clone())
                 .map(|choice| serde_json::to_value(choice).expect("wire"));
             assert_eq!(borrowed, owned, "{event:?}");
+        }
+    }
+
+    /// The `_without_role` forms are the forms with the role, minus the role: for every event the
+    /// same choice or none, the role on the delta exactly where the forms with it put one (every
+    /// delta but the finishing choice's, which keeps its empty delta).
+    #[test]
+    fn a_delta_without_the_role_is_the_delta_minus_its_role() {
+        let json = |choice: &ChatStreamChoice| serde_json::to_value(choice).expect("wire");
+        for event in one_of_each() {
+            let with = into_delta(3, event.clone());
+            let without = into_delta_without_role(3, event.clone());
+            assert_eq!(with.is_some(), without.is_some(), "{event:?}");
+            if let (Some(with), Some(without)) = (&with, &without) {
+                let expected_role = with.finish_reason.is_none().then_some("assistant");
+                assert_eq!(with.delta.role.as_deref(), expected_role, "{event:?}");
+                assert_eq!(without.delta.role, None, "{event:?}");
+                let mut stripped = with.clone();
+                stripped.delta.role = None;
+                assert_eq!(json(&stripped), json(without), "{event:?}");
+            }
+            assert_eq!(
+                delta_without_role(3, &event).map(|choice| json(&choice)),
+                without.as_ref().map(json),
+                "the borrowing form without the role: {event:?}"
+            );
         }
     }
 
@@ -499,7 +539,7 @@ mod tests {
             Event::Reasoning(Text::uncounted("")),
             Event::ToolCallArguments {
                 index: 0,
-                json: String::new(),
+                json: "".into(),
                 source: Text::default(),
             },
         ];
@@ -508,7 +548,7 @@ mod tests {
         }
     }
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -517,19 +557,67 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.into(),
+            json: json.to_owned().into(),
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,
             reasoning_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn the_borrowed_delta_serializes_as_the_owned_one_and_borrows_the_text() {
+        let events = || {
+            [
+                Event::Content(Text::uncounted("Hello")),
+                Event::Reasoning(Text::uncounted("because")),
+                Event::Content(Text::uncounted("")),
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    source: Text::uncounted(""),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"q\":1}".into(),
+                    source: Text::uncounted(""),
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::uncounted(""),
+                },
+                finish(FinishReason::Stop, 1),
+            ]
+        };
+        for (owned, borrowed) in events().into_iter().zip(events()) {
+            let owned = into_delta_without_role(2, owned);
+            let borrowed = into_delta_ref(2, borrowed);
+            assert_eq!(owned.is_some(), borrowed.is_some());
+            let (Some(owned), Some(borrowed)) = (owned, borrowed) else {
+                continue;
+            };
+            assert_eq!(
+                serde_json::to_string(&borrowed).unwrap(),
+                serde_json::to_string(&owned).unwrap()
+            );
+            for text in [&borrowed.delta.content, &borrowed.delta.reasoning_content]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    matches!(text, std::borrow::Cow::Borrowed(_)),
+                    "{text:?} was copied"
+                );
+            }
         }
     }
 
@@ -710,7 +798,7 @@ mod tests {
 
     /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
     /// reads each request.
-    fn parsed(output: &str) -> Vec<Event> {
+    fn parsed(output: &str) -> Vec<Event<'static>> {
         let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         engine
@@ -731,7 +819,7 @@ mod tests {
                 &mut out,
             )
             .expect("the end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Two calls of Qwen3's syntax in one output.
@@ -739,37 +827,6 @@ mod tests {
         "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
         "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
     );
-
-    /// The content ranges under one call only, against the whole output's: the rule turns the
-    /// calls it drops into dropped text, so the ranges after a dropped call are where the
-    /// content is. Content after a dropped second call.
-    #[test]
-    fn content_spans_hold_after_a_call_the_one_call_only_rule_dropped() {
-        let output = format!("Checking.\n{TWO_CALLS}\nDone.");
-        let whole = parsed(&output);
-        let mut one = whole.clone();
-        first_call_only(&mut one);
-        let spans = content_spans(&one);
-        assert_eq!(spans, content_spans(&whole), "{one:?}");
-        let kept: Vec<&str> = spans.iter().map(|&(from, to)| &output[from..to]).collect();
-        assert_eq!(kept, ["Checking.\n", "\nDone."]);
-        assert_eq!(one.len(), whole.len(), "one event per event: {one:?}");
-    }
-
-    /// Malformed text after a dropped second call (a third call the output cuts before its
-    /// header: its opener is wrapper text the table drops, its body malformed text): the text is
-    /// content, at its own offsets.
-    #[test]
-    fn content_spans_hold_for_malformed_text_after_a_call_the_one_call_only_rule_dropped() {
-        let output = format!("{TWO_CALLS}\n<tool_call>\n{{\"name\": \"get_time\"");
-        let whole = parsed(&output);
-        let mut one = whole.clone();
-        first_call_only(&mut one);
-        let spans = content_spans(&one);
-        assert_eq!(spans, content_spans(&whole), "{one:?}");
-        let kept: Vec<&str> = spans.iter().map(|&(from, to)| &output[from..to]).collect();
-        assert_eq!(kept, ["\n{\"name\": \"get_time\""]);
-    }
 
     #[test]
     fn two_turns_of_two_calls_carry_four_distinct_ids_the_deltas_and_the_message_agree_on() {

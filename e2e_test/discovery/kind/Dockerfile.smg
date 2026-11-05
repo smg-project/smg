@@ -1,0 +1,9 @@
+# Wraps the workspace smg binary (built on the runner) for in-cluster runs.
+# Base must glibc-match the build host (ubuntu-24.04); build context is
+# target/debug. openssl: smg links the system libssl (non-vendored).
+FROM ubuntu:24.04
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY smg /usr/local/bin/smg
+ENTRYPOINT ["/usr/local/bin/smg"]

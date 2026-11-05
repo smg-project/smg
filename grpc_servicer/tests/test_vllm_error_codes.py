@@ -146,6 +146,8 @@ def test_engine_generate_error_is_classified_by_its_cause(split_hierarchy, cause
         (HTTPStatus.NOT_FOUND, grpc.StatusCode.NOT_FOUND),
         (HTTPStatus.TOO_MANY_REQUESTS, grpc.StatusCode.RESOURCE_EXHAUSTED),
         (HTTPStatus.SERVICE_UNAVAILABLE, grpc.StatusCode.UNAVAILABLE),
+        (HTTPStatus.REQUEST_TIMEOUT, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (HTTPStatus.GATEWAY_TIMEOUT, grpc.StatusCode.DEADLINE_EXCEEDED),
         (HTTPStatus.INTERNAL_SERVER_ERROR, grpc.StatusCode.INTERNAL),
         (HTTPStatus.IM_A_TEAPOT, grpc.StatusCode.INTERNAL),
     ],
@@ -174,6 +176,7 @@ def test_release_hierarchy_without_vllm_client_error_still_maps_validation_to_in
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 async def test_generate_aborts_with_invalid_argument_for_vllm_validation_error():
     pytest.importorskip("vllm")
     from smg_grpc_proto import vllm_engine_pb2

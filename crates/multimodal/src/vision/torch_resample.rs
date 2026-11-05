@@ -401,75 +401,10 @@ mod neon {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The computation this module replaces: per sample, the taps summed in
-    /// `i64` from the kernel's own tap vectors, width first then height.
-    fn reference(data: &[u8], in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Vec<u8> {
-        fn clip(kernel: &FixedKernel, v: i64) -> u8 {
-            (v >> kernel.precision).clamp(0, 255) as u8
-        }
-        let mut mid = data.to_vec();
-        let mut width = in_w;
-        if in_w != out_w {
-            let k = FixedKernel::new(
-                in_w,
-                out_w,
-                PilResizeFilter::Bicubic,
-                KernelQuantization::TorchUint8,
-            );
-            let half = 1_i64 << (k.precision - 1);
-            let mut out = vec![0u8; in_h * out_w * 3];
-            for y in 0..in_h {
-                for xx in 0..out_w {
-                    let (x0, n) = k.bounds[xx];
-                    for c in 0..3 {
-                        let mut s = half;
-                        for x in 0..n {
-                            s += i64::from(data[(y * in_w + x0 + x) * 3 + c]) * k.taps[xx][x];
-                        }
-                        out[(y * out_w + xx) * 3 + c] = clip(&k, s);
-                    }
-                }
-            }
-            mid = out;
-            width = out_w;
-        }
-        if in_h == out_h {
-            return mid;
-        }
-        let k = FixedKernel::new(
-            in_h,
-            out_h,
-            PilResizeFilter::Bicubic,
-            KernelQuantization::TorchUint8,
-        );
-        let half = 1_i64 << (k.precision - 1);
-        let mut out = vec![0u8; out_h * width * 3];
-        for yy in 0..out_h {
-            let (y0, n) = k.bounds[yy];
-            for x in 0..width * 3 {
-                let mut s = half;
-                for y in 0..n {
-                    s += i64::from(mid[(y0 + y) * width * 3 + x]) * k.taps[yy][y];
-                }
-                out[yy * width * 3 + x] = clip(&k, s);
-            }
-        }
-        out
-    }
-
-    fn gradient(w: usize, h: usize, seed: usize) -> Vec<u8> {
-        let mut data = vec![0u8; w * h * 3];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 3;
-                data[i] = ((seed + x * 7 + y * 3) % 256) as u8;
-                data[i + 1] = ((seed + x * 5 + y * 11) % 256) as u8;
-                data[i + 2] = ((seed + x + y * 2) % 256) as u8;
-            }
-        }
-        data
-    }
+    use crate::{
+        test_support::{assert_same_bytes, gradient_rgb},
+        vision::transforms::per_sample_reference,
+    };
 
     /// Up- and downscales, extreme aspect ratios, identity axes, widths that
     /// leave vector tails (rows not a multiple of 16 bytes, pixel counts not
@@ -493,25 +428,22 @@ mod tests {
             (1296, 972, 1280, 960),
         ];
         for (seed, &(in_w, in_h, out_w, out_h)) in cases.iter().enumerate() {
-            let data = gradient(in_w, in_h, seed * 13);
+            let data = gradient_rgb(in_w, in_h, seed * 13);
             let actual = resize_rgb(&data, in_w, in_h, out_w, out_h, PilResizeFilter::Bicubic);
-            let expected = reference(&data, in_w, in_h, out_w, out_h);
-            assert_eq!(
-                actual.len(),
-                out_w * out_h * 3,
-                "{in_w}x{in_h} -> {out_w}x{out_h}"
+            let expected = per_sample_reference(
+                &data,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                PilResizeFilter::Bicubic,
+                KernelQuantization::TorchUint8,
             );
-            if actual != expected {
-                let first = actual
-                    .iter()
-                    .zip(&expected)
-                    .position(|(a, b)| a != b)
-                    .unwrap_or(0);
-                panic!(
-                    "{in_w}x{in_h} -> {out_w}x{out_h}: first difference at byte {first}: {} vs {}",
-                    actual[first], expected[first]
-                );
-            }
+            assert_same_bytes(
+                &actual,
+                &expected,
+                &format!("{in_w}x{in_h} -> {out_w}x{out_h}"),
+            );
         }
     }
 
@@ -519,7 +451,7 @@ mod tests {
     /// answered (the infallible entry point keeps that contract).
     #[test]
     fn a_zero_sized_target_is_empty() {
-        let data = gradient(9, 4, 2);
+        let data = gradient_rgb(9, 4, 2);
         assert!(resize_rgb(&data, 9, 4, 0, 4, PilResizeFilter::Bicubic).is_empty());
         assert!(resize_rgb(&data, 9, 4, 9, 0, PilResizeFilter::Bicubic).is_empty());
         assert!(resize_rgb(&data, 9, 4, 0, 0, PilResizeFilter::Bicubic).is_empty());
@@ -528,7 +460,7 @@ mod tests {
     /// The identity (no change on either axis) is a plain copy.
     #[test]
     fn an_unchanged_size_copies_the_bytes() {
-        let data = gradient(9, 4, 1);
+        let data = gradient_rgb(9, 4, 1);
         assert_eq!(
             resize_rgb(&data, 9, 4, 9, 4, PilResizeFilter::Bicubic),
             data

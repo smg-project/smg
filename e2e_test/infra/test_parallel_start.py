@@ -16,7 +16,7 @@ def launch(monkeypatch):
     monkeypatch.setattr(worker_module, "get_gpu_offset", lambda: 0)
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
     monkeypatch.setattr(worker_module, "detect_ib_device", lambda: None)
-    monkeypatch.setattr(worker_module, "get_open_port", lambda: next(ports))
+    monkeypatch.setattr(worker_module, "get_engine_port", lambda: next(ports))
     monkeypatch.setattr(worker_module, "LAUNCH_STAGGER_DELAY", 0)
     monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
 
@@ -108,6 +108,20 @@ def test_later_workers_get_the_full_load_budget_after_staggering(launch, monkeyp
     workers = worker_module.start_workers("model", engine="vllm", count=4, timeout=300)
     assert len(workers) == 4
     assert clock[0] == 425
+
+
+def test_every_port_the_engine_binds_comes_from_the_engines_reservation(launch, monkeypatch):
+    """The worker's port, a prefill's bootstrap port and a disaggregated
+    TokenSpeed worker's dist-init port are bound by the engine after its model
+    load: all three come from the reservation below the kernel's ephemeral
+    range, not from a ``bind(0)`` number any process can be handed meanwhile."""
+    monkeypatch.setattr(
+        worker_module, "get_open_port", lambda *a, **k: pytest.fail("bind(0) port for an engine")
+    )
+    (worker,) = worker_module.start_workers(
+        "model", engine="tokenspeed", worker_type=WorkerType.PREFILL, wait_ready=False
+    )
+    assert (worker.port, worker.bootstrap_port, worker.dist_init_port) == (20000, 20001, 20002)
 
 
 def test_spawn_only_leaves_readiness_to_the_caller(launch):

@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc};
 use super::{Class, SchedulerSettings};
 use crate::tenant::TenantKey;
 
-/// Per-tenant policy. The single field today is [`max_class`]; future
+/// Per-tenant policy. The single field today is [`Self::max_class`]; future
 /// non-breaking additions: `weight: u32`, `slot_quota: Option<usize>`,
 /// `rps_cap: Option<u32>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

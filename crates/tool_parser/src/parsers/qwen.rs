@@ -21,7 +21,7 @@ use crate::{
 /// - Each individual call is separated by `\n`
 /// - Function Call Object: JSON object with "name" and "arguments" fields
 ///
-/// Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
+/// Reference: <https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default>
 pub struct QwenParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,

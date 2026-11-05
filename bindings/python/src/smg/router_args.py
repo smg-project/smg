@@ -45,20 +45,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
-
-
-def _parse_kv_index(value: str) -> str:
-    """The deprecated --kv-index value, as the Rust CLI reads it: any case, trimmed;
-    the removed positional index is refused with the reason (the choices refuse
-    the rest)."""
-    normalized = value.strip().lower()
-    if normalized == "positional":
-        raise argparse.ArgumentTypeError(
-            "the positional KV index was removed (kv-index 2.0.0): the chain index is the"
-            " only KV index, drop --kv-index"
-        )
-    return normalized
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -306,8 +293,12 @@ class RouterArgs:
     assignment_mode: str | None = None
     backend: str = "sglang"
     balance_abs_threshold: int = 64
+    # The spill gate's price of a held prefix, in tokens per request (0: unpriced)
+    balance_prefix_margin_tokens: int = 0
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
+    # Credit a pick on a holder with the prompt it still has to prefill
+    balance_uncached_credit: bool = False
     block_size: int = 16
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     bucket_adjust_interval_secs: int = 5
@@ -329,10 +320,21 @@ class RouterArgs:
     # mTLS for worker communication: the client certificate and key (with ca_cert_paths)
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    # Consul discovery (discovery_provider="consul"): Consul's HTTP API address
+    # (None = CONSUL_HTTP_ADDR, else 127.0.0.1:8500), the datacenter
+    # (None = the agent's own), and the service whose passing instances are the
+    # workers. The ACL token and TLS settings come from Consul's environment
+    # variables only.
+    consul_address: str | None = None
+    consul_datacenter: str | None = None
+    consul_service: str | None = None
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
+    decode_expected_workers: int | None = None
+    decode_min_ready_percent: int | None = None
+    decode_min_ready_workers: int | None = None
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     decode_urls: list[str] = dataclasses.field(default_factory=list)
@@ -343,14 +345,19 @@ class RouterArgs:
     disable_retries: bool = False
     # Disable automatic tokenizer loading at startup and worker registration
     disable_tokenizer_autoload: bool = False
-    # File discovery (discovery_provider="file"): how often the JSON manifest is
-    # reread besides on every change (None = 30s), and the manifest's path.
+    # The selected provider's periodic pass (None = 30s): Kubernetes, file and
+    # Consul discovery apply a change as it happens and retry on it, Slurm
+    # discovery polls on it; and the file provider's manifest path.
     discovery_check_interval_secs: int | None = None
     discovery_file: str | None = None
     # The worker discovery provider. service_discovery=True is the legacy
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
     dp_aware: bool = False
+    # Choose a data-parallel rank per request from the ranks' reported token
+    # loads: the HTTP prefill-decode router, for an engine registered as one
+    # worker. Under dp_aware the ranks are workers and the policy's pick among
+    # them is the rank choice, so this chooses nothing there (warned at start-up)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
@@ -374,6 +381,9 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 60
+    # Seconds a request to a gRPC worker may take from its dispatch to its last
+    # message; 0 (the default) arms no deadline
+    grpc_request_timeout_secs: int = 0
     # HTTP edge: seconds to receive a complete request head
     header_read_timeout_secs: int = 30
     # Health checks (disable_health_check switches them off)
@@ -412,13 +422,8 @@ class RouterArgs:
     jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
-    # Deprecated: the chain index is the only KV index behind cache-aware
-    # routing, so "chain" is the one value and changes nothing; unset by
-    # default so that only a launch line that still passes it is warned
-    kv_index: str | None = None
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
-    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
@@ -458,6 +463,8 @@ class RouterArgs:
     # media itself (every redirect hop included); None allows any host the
     # address policy passes
     mm_allowed_media_domains: list[str] | None = None
+    # Image/audio download budget in milliseconds; None uses SMG_MM_FETCH_TIMEOUT_MS, then 10000
+    mm_fetch_timeout_ms: int | None = None
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
     # Pixel cache budget (MiB) for router-side preprocessed media; None falls
@@ -472,6 +479,8 @@ class RouterArgs:
     # loaded: prefer (the pure-Rust fallback decoder, behind one warning) |
     # require (start-up fails); None falls back to SMG_MM_TURBOJPEG, then prefer
     mm_turbojpeg: str | None = None
+    # Video download budget in milliseconds; None uses SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000
+    mm_video_fetch_timeout_ms: int | None = None
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     model_id_from: str | None = None
     model_path: str | None = None
@@ -490,10 +499,10 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
-    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
-    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
-    # X-SMG-Parser header overrides it
-    parser: str = "legacy"
+    # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
+    # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
+    # request's X-SMG-Parser header overrides it
+    parser: str = "symphony"
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
@@ -509,7 +518,10 @@ class RouterArgs:
     postgres_op_timeout_secs: int = 5
     postgres_pool_max: int = 16
     power_of_two_load_metric: str = "expected_wait"
+    prefill_expected_workers: int | None = None
     prefill_max_inflight_requests_per_worker: int = -1
+    prefill_min_ready_percent: int | None = None
+    prefill_min_ready_workers: int | None = None
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
@@ -547,12 +559,14 @@ class RouterArgs:
     redis_pool_max: int = 16
     redis_retention_days: int = 30
     redis_url: str | None = None
-    # None = follow service_discovery: recovery works by removal + discovery
-    # re-registration, so it defaults on exactly when discovery can complete
-    # the loop (resolved by the Rust core).
+    # None = follow discovery: with a provider, remove only the workers it
+    # discovered, which it re-registers; True removes any failed local worker,
+    # False none (resolved by the Rust core).
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
-    # Request timeout in seconds
+    # Request timeout in seconds: the read of the body overall, and each
+    # request to an HTTP worker, or over a ZMQ worker's link, from its dispatch
+    # to its last message (a gRPC worker's bound is grpc_request_timeout_secs)
     request_timeout_secs: int = 1800
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
@@ -586,6 +600,20 @@ class RouterArgs:
     service_discovery_port: int = 80
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
+    shutdown_settle_secs: int | None = None
+    # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
+    # discovered, the encode and prefill bootstrap port, the job names whose
+    # nodes are each worker type, the partition, the port of every node's
+    # server, and the user (None = the one the router runs as)
+    slurm_account: str | None = None
+    slurm_bootstrap_port: int | None = None
+    slurm_decode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_encode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_partition: str | None = None
+    slurm_port: int | None = None
+    slurm_prefill_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_user: str | None = None
     # Seconds of upstream silence after which an open SSE stream carries a
     # keep-alive frame; 0 sends none
     sse_keepalive_secs: int = 15
@@ -626,7 +654,9 @@ class RouterArgs:
     # thresholds off (--disable-worker-overload-protection)
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
-    # instead of routing it to the least-loaded one
+    # instead of routing it to the least-loaded one (or, for a cache-aware
+    # prefill pool of a prefill/decode pair or a regular request that
+    # consistent_hashing places by its routing key, by its policy)
     worker_overload_shed: bool = False
     # Absolute per-worker overload thresholds (token usage, waiting requests), as
     # the Rust CLI defaults them; None switches one signal off
@@ -652,6 +682,9 @@ class RouterArgs:
     worker_wedge_secs: int = 3
     # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
     zmq_engine_count: int | None = None
+    # Seconds any one stage of a ZMQ engine's startup handshake may stay silent;
+    # it alone covers the engine's init between its HELLO and its READY
+    zmq_startup_timeout_secs: int = 3600
 
     @staticmethod
     def add_cli_args(
@@ -687,6 +720,13 @@ class RouterArgs:
         )
         file_discovery_group = parser.add_argument_group(
             "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
+        slurm_discovery_group = parser.add_argument_group(
+            "Service Discovery (Slurm)", "Workers on the nodes of running Slurm jobs"
+        )
+        consul_discovery_group = parser.add_argument_group(
+            "Service Discovery (Consul)",
+            "Workers that are the passing instances of a Consul service",
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -844,6 +884,27 @@ class RouterArgs:
             default=RouterArgs.admin_host,
             help="Bind host of the admin listener (needs --admin-port). Defaults to --host.",
         )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.worker_startup_timeout_secs,
+            help=(
+                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
+                " Large models can take significant time to load into GPU memory."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-delay",
+            type=int,
+            default=RouterArgs.worker_startup_delay,
+            help="Grace period in seconds before the first worker startup check (default: 0)",
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-check-interval",
+            type=int,
+            default=RouterArgs.worker_startup_check_interval,
+            help="Interval in seconds between checks for worker startup",
+        )
 
         # Routing policy configuration
         routing_group.add_argument(
@@ -934,8 +995,11 @@ class RouterArgs:
             type=float,
             default=RouterArgs.least_load_default_throughput,
             help=(
-                "Fallback generation throughput (tokens/s) for least_load when a"
-                " backend reports no live throughput"
+                "Input throughput (tokens/s) for least_load prefill workers; fallback"
+                " output throughput for other workers when no candidate reports a live"
+                " rate."
+                " Shared across roles; separate prefill/decode values require"
+                " constructing RouterConfig programmatically in Rust."
             ),
         )
         routing_group.add_argument(
@@ -945,16 +1009,6 @@ class RouterArgs:
             help=(
                 "Mean prefill tokens for least_load's in-flight estimate when a"
                 " request's token count is unknown at routing"
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}least-load-max-waiting-requests",
-            type=int,
-            default=RouterArgs.least_load_max_waiting_requests,
-            help=(
-                "Per-worker waiting-queue cap for least_load: skip workers whose"
-                " reported waiting requests (plus dispatches since their last"
-                " poll) have reached this count; 0 disables"
             ),
         )
         routing_group.add_argument(
@@ -985,9 +1039,11 @@ class RouterArgs:
             help=(
                 "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
                 " when its load exceeds the healthy-fleet mean by this many requests AND by the"
-                " relative threshold. The margin is capped at the in-flight count's natural swing"
-                " at the pool's current mean (two standard deviations, never under four unless"
-                " this value is lower), so a small pool can spill at all. With the bucket policy"
+                " relative threshold. The margin is this value capped at the larger of the"
+                " in-flight count's natural swing at the pool's current mean (two standard"
+                " deviations, never under four unless this value is lower) and the held prefix's"
+                " price (--balance-prefix-margin-tokens, unpriced by default), so a small pool can"
+                " spill at all. With the bucket policy"
                 " the pair keeps its own rule: balancing when (max_load - min_load) exceeds this"
                 " value and max_load exceeds min_load times the relative threshold."
             ),
@@ -1001,6 +1057,38 @@ class RouterArgs:
                 "Spill gate, relative part: a matched worker is skipped when its load exceeds"
                 " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
                 " Finite, at least 1.0."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-prefix-margin-tokens",
+            type=int,
+            default=RouterArgs.balance_prefix_margin_tokens,
+            help=(
+                "Spill gate, price of a held prefix in tokens per request (0, the default,"
+                " leaves held prefixes unpriced): a matched worker's absolute margin is at least"
+                " the tokens of the request's prefix it holds over this value, rounded up, up to"
+                " the absolute threshold. A spill gives the prefix up and the other worker"
+                " prefills it again, so a priced deep prefix (a long conversation's follow-up)"
+                " keeps its holder through a skew that moves a shallow one. Suits prefill pools"
+                " serving long multi-turn sessions, e.g. 1024 (the mean prefill a queued request"
+                " is priced at). Trade-offs: a deep holder sheds only past the absolute"
+                " threshold; a long prefix many sessions share replicates later; the price counts"
+                " the holder's whole match even when the spill target holds part of it; without"
+                " KV events the held length is the approximate tree's routing history, not"
+                " confirmed engine residency. Decode picks are never priced."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-uncached-credit",
+            action="store_true",
+            help=(
+                "Credit a cache-aware pick on a worker holding the request's prefix with the"
+                " prompt it still has to prefill (its token count less the held tokens, never"
+                " under the mean prefill nor over the whole prompt) instead of the whole prompt,"
+                " in the expected-wait estimate later picks read, so a hit on a long cached"
+                " conversation does not steer the next miss away from that worker as if it were"
+                " the whole context's work. Misses, spills and decode picks keep the whole"
+                " prompt. Off by default."
             ),
         )
         routing_group.add_argument(
@@ -1037,7 +1125,12 @@ class RouterArgs:
                 " overloaded and left out of routing while another worker is"
                 " under the thresholds; when every worker is over them the"
                 " request goes to the least-loaded one (see"
-                " --worker-overload-shed). The signal is the queued (waiting)"
+                " --worker-overload-shed). Unless --worker-overload-shed is"
+                " set, a cache-aware prefill pool of a prefill/decode pair is"
+                " not steered by the thresholds: its spill gate balances it;"
+                " nor is a regular request that consistent_hashing places by"
+                " its routing key, which stays on its ring owner."
+                " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
                 " unconditionally. Defaults to 8."
@@ -1089,21 +1182,12 @@ class RouterArgs:
             help=(
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
-                " use is overloaded, instead of routing it to the least-loaded one;"
-                " also sheds a worker that crossed a threshold between selection"
+                " use is overloaded, instead of routing it to the least-loaded one"
+                " (or, for a cache-aware prefill pool or a regular request that"
+                " consistent_hashing places by its routing key, by its policy);"
+                " also sheds"
+                " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}kv-index",
-            type=_parse_kv_index,
-            choices=["chain"],
-            default=RouterArgs.kv_index,
-            help=(
-                "Deprecated: the chain index is the only KV index behind cache-aware"
-                " routing, so 'chain' is the one value and changes nothing; the flag"
-                " goes in a later release. 'positional' names the index that was"
-                " removed and is refused."
             ),
         )
         routing_group.add_argument(
@@ -1335,8 +1419,10 @@ class RouterArgs:
                 " regardless (bounded by max-payload-size); other eligible"
                 " requests buffer up to this many bytes when router retries"
                 " are enabled and otherwise stream to the worker verbatim,"
-                " forfeiting router-level retries. 0 never buffers for"
-                " retries"
+                " forfeiting router-level retries; a streamed request reaches"
+                " the worker as the client sent it: JSON validation defers to"
+                " the worker, and the provider profile's request normalization"
+                " is skipped. 0 never buffers for retries"
             ),
         )
         routing_group.add_argument(
@@ -1404,7 +1490,13 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
             action="store_true",
-            help="Enable minimum tokens scheduler for data parallel group",
+            help=(
+                "Choose a data-parallel rank per request from the ranks' reported token"
+                " loads: the HTTP prefill-decode router, for an engine registered as one"
+                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
+                " pick among them is the rank choice, so this flag chooses nothing there"
+                " (warned at start-up)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}enable-igw",
@@ -1489,27 +1581,6 @@ class RouterArgs:
                 "Maximum time in seconds a request may wait for Prefill admission."
                 " Defaults to 60 when Prefill admission is enabled."
             ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-timeout-secs",
-            type=int,
-            default=RouterArgs.worker_startup_timeout_secs,
-            help=(
-                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
-                " Large models can take significant time to load into GPU memory."
-            ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-delay",
-            type=int,
-            default=RouterArgs.worker_startup_delay,
-            help="Grace period in seconds before the first worker startup check (default: 0)",
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-check-interval",
-            type=int,
-            default=RouterArgs.worker_startup_check_interval,
-            help="Interval in seconds between checks for worker startup",
         )
         parser.add_argument(
             f"--{prefix}job-queue-capacity",
@@ -1651,6 +1722,24 @@ class RouterArgs:
             ),
         )
         parser.add_argument(
+            f"--{prefix}mm-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_fetch_timeout_ms,
+            help=(
+                "Image/audio download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_FETCH_TIMEOUT_MS, then 10000."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-video-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_video_fetch_timeout_ms,
+            help=(
+                "Video download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000."
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}mm-turbojpeg",
             type=str.lower,
             choices=["prefer", "require"],
@@ -1761,9 +1850,92 @@ class RouterArgs:
             type=int,
             default=None,
             help=(
-                "Seconds between periodic rereads of the --discovery-file manifest,"
-                " which is also reread as soon as it changes (default: 30)"
+                "Seconds between periodic discovery passes. Kubernetes, file and"
+                " Consul discovery apply a change as it happens and use the pass to"
+                " retry and to catch what went unreported; Slurm discovery polls at"
+                " this interval (default: 30)"
             ),
+        )
+        for role, workers in [
+            ("", "regular"),
+            ("encode-", "encode"),
+            ("prefill-", "prefill"),
+            ("decode-", "decode"),
+        ]:
+            slurm_discovery_group.add_argument(
+                f"--{prefix}slurm-{role}job-name",
+                type=str,
+                action="append",
+                default=None,
+                help=(
+                    f"Slurm job name whose nodes are {workers} workers, for"
+                    " --discovery-provider slurm. Can be specified multiple times"
+                ),
+            )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-port",
+            type=int,
+            default=None,
+            help=(
+                "Port of the inference server on every node of a discovered job"
+                " (required with --discovery-provider slurm)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-bootstrap-port",
+            type=int,
+            default=None,
+            help="Bootstrap port of the Slurm-discovered encode and prefill workers",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-user",
+            type=str,
+            default=None,
+            help=(
+                "Discover this Slurm user's jobs, by name or uid"
+                " (default: the user the router runs as)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-account",
+            type=str,
+            default=None,
+            help="Discover only jobs charged to this Slurm account",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-partition",
+            type=str,
+            default=None,
+            help="Discover only jobs in this Slurm partition",
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-service",
+            type=str,
+            default=None,
+            help=(
+                "Consul service whose instances with passing health checks are the"
+                " workers (required with --discovery-provider consul). Each"
+                " instance's smg_* service metadata configures its worker"
+            ),
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-address",
+            type=str,
+            default=None,
+            help=(
+                "Consul's HTTP API address (default: CONSUL_HTTP_ADDR, else"
+                " 127.0.0.1:8500; HTTPS for one with no scheme when CONSUL_HTTP_SSL is"
+                " true). The ACL token and TLS settings come from"
+                " Consul's environment variables: CONSUL_HTTP_TOKEN or"
+                " CONSUL_HTTP_TOKEN_FILE, CONSUL_CACERT, CONSUL_CLIENT_CERT and"
+                " CONSUL_CLIENT_KEY"
+            ),
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-datacenter",
+            type=str,
+            default=None,
+            help="Consul datacenter to read (default: the Consul agent's own)",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1928,7 +2100,34 @@ class RouterArgs:
             f"--{prefix}request-timeout-secs",
             type=int,
             default=RouterArgs.request_timeout_secs,
-            help="Request timeout in seconds",
+            help=(
+                "Request timeout in seconds: the read of the body overall, and "
+                "each attempt at an HTTP worker from its dispatch to its last "
+                "message (504 call_upstream_timeout past it, the request's "
+                "answer; a worker's own pool timeout_secs takes this value's "
+                "place, on an HTTP worker and on a ZMQ worker's link, whose "
+                "streams carry the same bound). A request to a gRPC worker is "
+                "bounded by --grpc-request-timeout-secs instead"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}grpc-request-timeout-secs",
+            type=int,
+            default=RouterArgs.grpc_request_timeout_secs,
+            help=(
+                "Seconds a request to a gRPC worker may take from its dispatch "
+                "to its last message (504 call_upstream_timeout past it, the "
+                "request's answer; the call to the worker is dropped, which "
+                "cancels the request on the worker). 0 arms no deadline (the "
+                "default): the bound is opt-in"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}shutdown-settle-secs",
+            type=int,
+            default=RouterArgs.shutdown_settle_secs,
+            help="Keep accepting connections after readiness fails; defaults to 5 seconds "
+            "and is capped at half the shutdown grace period",
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
@@ -2095,7 +2294,11 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
-            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+            help=(
+                "Cap on the distinct tenants the scheduler's clamp and unknown-priority "
+                "counters keep as tenant series of their own (the first N seen; the remainder "
+                'bucket under tenant="other").'
+            ),
         )
 
         # Tenant rate limit configuration
@@ -2190,6 +2393,46 @@ class RouterArgs:
 
         # Health check configuration
         health_group.add_argument(
+            f"--{prefix}decode-expected-workers",
+            type=_positive_int,
+            default=None,
+            help="Desired decode fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected decode workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-workers",
+            type=_positive_int,
+            default=None,
+            help="Minimum healthy decode workers required (default 1)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-expected-workers",
+            type=_positive_int,
+            default=None,
+            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected prefill workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-workers",
+            type=_positive_int,
+            default=None,
+            help="Minimum healthy prefill workers required (default 1)",
+        )
+        health_group.add_argument(
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
@@ -2242,10 +2485,12 @@ class RouterArgs:
             help=(
                 "Let workers recover after prolonged failure: unhealthy workers"
                 " are removed so service discovery re-registers and re-probes"
-                " them once their engine returns. Defaults to the"
-                " service-discovery setting (recovery-by-removal needs"
-                " discovery to re-add the worker); use the --no- form to keep"
-                " it off under discovery"
+                " them once their engine returns. Unset, it follows discovery:"
+                " with a discovery provider it removes only the workers that"
+                " provider discovered, while static and API-added workers,"
+                " which nothing would re-add, recover in place. Pass it to"
+                " remove every failed local worker, or the --no- form to"
+                " remove none"
             ),
         )
         health_group.add_argument(
@@ -2301,8 +2546,9 @@ class RouterArgs:
             type=str,
             default=RouterArgs.parser,
             choices=["legacy", "symphony"],
-            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
-            "parsers (legacy, the default) or Symphony. With Symphony, a model's worker labels decide, "
+            help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
+            "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
+            "worker labels decide, "
             "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
             "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
             "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
@@ -2381,11 +2627,12 @@ class RouterArgs:
             f"--{prefix}runtime",
             type=str,
             default=RouterArgs.backend,
-            choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
+            choices=["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"],
             help=(
                 "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
                 "workers' engine and pins the wire protocol (it cannot be auto-detected): "
-                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers. "
+                "openai, anthropic and gemini select that provider's route"
             ),
         )
         backend_group.add_argument(
@@ -2393,9 +2640,24 @@ class RouterArgs:
             type=int,
             default=RouterArgs.zmq_engine_count,
             help=(
-                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
-                "grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM and TokenSpeed; default: 1)"
+                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
+                "a grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM and TokenSpeed; default: as many as the first "
+                "engine to dial declares, one for an engine that declares none)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.zmq_startup_timeout_secs,
+            help=(
+                "Seconds any one stage of a ZMQ engine's startup handshake (its HELLO, "
+                "its READY, its input registration) may stay silent before the router "
+                "gives the handshake up and binds again. The router did not launch the "
+                "engine and sees nothing from it beside the wire, so this alone must "
+                "cover the engine's whole init between its HELLO and its READY; an "
+                "engine says HELLO once and READY once, so a bound shorter than its "
+                "init strands it (default: 3600)"
             ),
         )
         backend_group.add_argument(

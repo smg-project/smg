@@ -13,7 +13,7 @@ use super::Class;
 /// Tracks a single admitted request from admission until its response body
 /// finishes draining (or the scheduler preempts it).
 ///
-/// The central race resolver is [`first_byte_at`]: it encodes three states
+/// The central race resolver is `first_byte_at`: it encodes three states
 /// in one `AtomicU64`, using a sentinel for "preempted" so that the
 /// admission side and the body-wrapping side can resolve their race with a
 /// single compare-and-swap each.
@@ -87,7 +87,7 @@ impl InflightHandle {
     }
 
     /// Fire the scheduler-owned cancel token. Called only after a
-    /// successful [`try_mark_preempted`], so a handler is never asked to
+    /// successful [`Self::try_mark_preempted`], so a handler is never asked to
     /// unwind a request that has already started streaming output.
     pub fn cancel(&self) {
         self.cancel.cancel();

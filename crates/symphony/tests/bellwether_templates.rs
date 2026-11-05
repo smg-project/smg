@@ -1534,6 +1534,7 @@ fn every_layout_here_fits_its_table() {
 
 /// The tags of `format` for the probe's tools: a forced call, a named function (one call, at
 /// least one), one call at most, and a JSON answer; with `reasoning_open` as the prompt leaves it.
+/// Each passes the rule the engines' structural-tag parsers hold a tag to (`Grammar::check`).
 #[expect(
     clippy::expect_used,
     reason = "a table with no tag for a mode fails the test that asks for it"
@@ -1543,18 +1544,23 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
     let options = |at_least_one, one_call| Options {
         at_least_one,
         reasoning_open,
+        thought_closed: false,
         one_call,
         start: GrammarStart::Unknown,
     };
     let tag = |options| format.grammar_for(&tools, options).expect("a tag");
-    [
+    let grammars = [
         tag(options(true, false)),
         tag(options(true, true)),
         tag(options(false, true)),
         format
             .answer_grammar(&json!({"type": "object"}), reasoning_open)
             .expect("an answer tag"),
-    ]
+    ];
+    for grammar in &grammars {
+        grammar.check().expect("a tag the engines take");
+    }
+    grammars
 }
 
 #[test]
@@ -1633,7 +1639,26 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
     // the call's marker, so a second call cannot pass as text.
     assert_eq!(one.payload()["format"]["type"], "triggered_tags");
     assert!(!accepts(&one, QWEN3_5_CALLS_THINKING), "one call");
-    assert!(accepts(&answer, QWEN3_5_ANSWER_THINKING));
+    // With the thought open and no word from the engine on where its grammar starts, the answer
+    // is the schema alone, applied where the engine starts it: an engine that gates the grammar
+    // behind its reasoning parser applies it after the model's own close. One that starts at the
+    // first token is told so and gets the thought, closed by its own marker, before the schema;
+    // the template's blank line after the close is the whitespace the engine's JSON grammar
+    // admits before a value, which this walker reads with no space at the value's edges.
+    assert!(accepts(&answer, "{\"probe\": 1}"));
+    assert!(
+        !accepts(&answer, QWEN3_5_ANSWER_THINKING),
+        "the schema alone"
+    );
+    let led = format
+        .answer_grammar_for(&json!({"type": "object"}), true, GrammarStart::FirstToken)
+        .expect("an answer tag");
+    led.check().expect("a tag the engines take");
+    assert!(accepts(&led, "\n</think>{\"probe\": 1}"));
+    assert!(
+        !accepts(&led, "{\"probe\": 1}"),
+        "the thought's close first"
+    );
     let thought = format!("Probe thought.{QWEN3_5_CALLS_THINKING}");
     assert!(accepts(&required, &thought), "the thought before its close");
     // With thinking off, the prompt closed the thought: the calls start at once.

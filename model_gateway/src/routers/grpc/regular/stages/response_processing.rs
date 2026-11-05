@@ -1,7 +1,9 @@
 //! Response processing stage for the chat + generate pipeline
 //!
 //! Dispatches to ChatResponseProcessingStage or GenerateResponseProcessingStage
-//! based on the response spec.
+//! based on the response spec, through their inherent futures: the stage call
+//! boxes once (this stage's `async_trait` future), not once more for the inner
+//! stage.
 
 use std::sync::Arc;
 
@@ -50,8 +52,8 @@ impl ProcessStage for ChatGenerateResponseProcessingStage {
     ) -> Result<Option<Response>, Response> {
         // Dispatch on the spec: the only request-derived signal post-build.
         match spec {
-            ResponseSpec::Chat(_) => self.chat_stage.process(ctx, spec).await,
-            ResponseSpec::Generate(_) => self.generate_stage.process(ctx, spec).await,
+            ResponseSpec::Chat(_) => self.chat_stage.process_result(ctx, spec).await,
+            ResponseSpec::Generate(_) => self.generate_stage.process_result(ctx, spec).await,
             _ => {
                 error!(
                     function = "ChatGenerateResponseProcessingStage::process",

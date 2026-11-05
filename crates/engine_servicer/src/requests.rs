@@ -1,20 +1,25 @@
 //! In-flight request registry: the cancellation handles of the `Abort` RPC
 //! and of shutdown, keyed by request id. Engine-neutral; every servicer
-//! registers its streams here. A cancellation names its cause
-//! ([`CancelReason`]), so a stream can end a caller's abort as a completion
-//! and a shutdown under an open request as the failure it is.
+//! registers its streams here, so the registry is also the admission gate:
+//! a drain closes it, and a readiness hold (the lifecycle owner's planned
+//! warm-up before SERVING) closes it to every request but the warm-up's own.
+//! A cancellation names its cause ([`CancelReason`]), so a stream can end a
+//! caller's abort as a completion and a shutdown under an open request as
+//! the failure it is.
 
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
 
-use futures::stream::{SelectAll, Stream};
+use futures::stream::Stream;
 use tokio::sync::oneshot;
 use tonic::Status;
+
+use crate::stream::Choices;
 
 /// Why a registered request's stream is being cancelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,12 +42,53 @@ pub(crate) enum CancelReason {
 pub(crate) const SHUTDOWN_MESSAGE: &str =
     "servicer shutting down: the engine went away before the request completed";
 
+/// The request-id prefix of the lifecycle owner's own requests: its planned
+/// warm-up names them `smg-warmup-<nonce>-<n>` (the Python servicer package's
+/// `warmup.py` builds them; its tests pin the form) and sends them over the
+/// servicer's own port, from the process that holds readiness. While
+/// readiness is held, these are the only requests admitted; anything else
+/// the gateway forwards in that window would share the engine's steps with
+/// the warm-up's.
+pub(crate) const WARMUP_REQUEST_ID_PREFIX: &str = "smg-warmup-";
+
+/// Whether `request_id` has the exact form of a warm-up request: the prefix,
+/// the `nonce` the servicer was constructed with and a `-` when it has one,
+/// the request's ordinal and nothing else. The gateway derives a request's
+/// id from a caller's `x-request-id` with a suffix of its own, so that path
+/// cannot take this form; a body `rid` outside PD is forwarded as sent and
+/// can spell the bare form, which is why the lifecycle owner draws a nonce
+/// per process and hands it to the servicer and to its warm-up alone.
+pub(crate) fn is_warmup_request_id(request_id: &str, nonce: Option<&str>) -> bool {
+    let Some(rest) = request_id.strip_prefix(WARMUP_REQUEST_ID_PREFIX) else {
+        return false;
+    };
+    let ordinal = match nonce {
+        Some(nonce) => match rest
+            .strip_prefix(nonce)
+            .and_then(|rest| rest.strip_prefix('-'))
+        {
+            Some(ordinal) => ordinal,
+            None => return false,
+        },
+        None => rest,
+    };
+    !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Registered in-flight requests. The generation disambiguates an id reused
 /// after an abort from the stream that registered it.
 #[derive(Default)]
 pub(crate) struct RequestRegistry {
     entries: Mutex<HashMap<String, (u64, oneshot::Sender<CancelReason>)>>,
     generation: AtomicU64,
+    draining: AtomicBool,
+    /// Readiness held for the planned warm-up: admission is the warm-up's
+    /// own requests only.
+    warming: AtomicBool,
+    /// The mark the warm-up's own request ids carry
+    /// (`ServicerConfig::warmup_nonce`); `None` admits the bare form.
+    warmup_nonce: Option<String>,
+    active: AtomicUsize,
 }
 
 /// Keeps a request's registry entry for the stream's lifetime; dropping it
@@ -55,7 +101,9 @@ pub(crate) struct Registration {
 }
 
 impl Drop for Registration {
+    /// Release this lifetime independently of the cancellation-map entry.
     fn drop(&mut self) {
+        self.registry.active.fetch_sub(1, Ordering::AcqRel);
         if let Ok(mut entries) = self.registry.entries.lock() {
             if entries
                 .get(&self.request_id)
@@ -68,6 +116,15 @@ impl Drop for Registration {
 }
 
 impl RequestRegistry {
+    /// An empty registry whose readiness hold admits the warm-up ids that
+    /// carry `warmup_nonce` (the bare `smg-warmup-<n>` under `None`).
+    pub(crate) fn with_warmup_nonce(warmup_nonce: Option<String>) -> Self {
+        Self {
+            warmup_nonce,
+            ..Self::default()
+        }
+    }
+
     /// Register `request_id` before its engine submit, so an `Abort` landing
     /// in the gap finds the entry. A live duplicate is refused: the id is the
     /// Router's cancellation handle, and the engine would refuse it too.
@@ -86,7 +143,16 @@ impl RequestRegistry {
                 "request {request_id} is already in flight"
             )));
         }
+        if self.draining.load(Ordering::Acquire) {
+            return Err(Status::unavailable("servicer is draining"));
+        }
+        if self.warming.load(Ordering::Acquire)
+            && !is_warmup_request_id(request_id, self.warmup_nonce.as_deref())
+        {
+            return Err(Status::unavailable("servicer is warming up"));
+        }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
+        self.active.fetch_add(1, Ordering::AcqRel);
         drop(entries);
         Ok((
             Registration {
@@ -96,6 +162,34 @@ impl RequestRegistry {
             },
             cancel_rx,
         ))
+    }
+
+    /// Serialize admission with the drain boundary. Once closed, a zero
+    /// active count cannot race with a newly admitted request.
+    pub(crate) fn set_accepting(&self, accepting: bool) {
+        let _entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.draining.store(!accepting, Ordering::Release);
+    }
+
+    /// Whether admission is open: no drain has closed it.
+    pub(crate) fn is_accepting(&self) -> bool {
+        !self.draining.load(Ordering::Acquire)
+    }
+
+    /// Serialize admission with the warm-up boundary: while readiness is
+    /// held (`true`), only the lifecycle owner's own requests (the planned
+    /// warm-up's, by their id) are admitted, so nothing else reaches the
+    /// engine beside the warm-up's steps; released (`false`), every request
+    /// is admitted again.
+    pub(crate) fn set_warming(&self, warming: bool) {
+        let _entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.warming.store(warming, Ordering::Release);
+    }
+
+    /// Count request lifetimes, including aborted streams still unwinding.
+    /// The cancellation map alone loses those entries before their cleanup.
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 
     /// Fire the cancellation of every given id that is live, as the caller's
@@ -157,7 +251,7 @@ pub(crate) trait HeldTerminal {
 /// engine side). Taking the terminals first is the point: a request the
 /// engine had finished on the tick before the shutdown keeps its completion.
 pub(crate) fn settle_shutdown<C: HeldTerminal + Stream + Unpin>(
-    choices: &mut SelectAll<C>,
+    choices: &mut Choices<C>,
 ) -> (VecDeque<C::Response>, bool) {
     let finished = choices
         .iter_mut()
@@ -176,6 +270,119 @@ mod tests {
     };
 
     use super::*;
+
+    /// Aborting removes the handle, but only dropping the guard finishes a request.
+    #[test]
+    fn drain_closes_admission_and_counts_aborted_lifetimes() {
+        let registry = Arc::new(RequestRegistry::default());
+        let (first, _cancel) = registry.register("first").unwrap();
+        assert_eq!(registry.active(), 1);
+        registry.abort(&["first".to_string()]).unwrap();
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.active(), 1);
+        let (second, _cancel) = registry.register("first").unwrap();
+        registry.set_accepting(false);
+        assert!(
+            matches!(registry.register("late"), Err(e) if e.code() == tonic::Code::Unavailable)
+        );
+        drop(first);
+        assert_eq!(registry.active(), 1);
+        assert_eq!(registry.len(), 1);
+        registry.cancel_all().unwrap();
+        assert_eq!(registry.active(), 1);
+        drop(second);
+        assert_eq!(registry.active(), 0);
+        registry.set_accepting(true);
+        assert!(registry.register("resumed").is_ok());
+    }
+
+    /// While readiness is held for the planned warm-up, the warm-up's own
+    /// requests are admitted and every other id is refused as not serving;
+    /// the drain refuses the warm-up's own as well; the release admits all.
+    #[test]
+    fn a_readiness_hold_admits_only_the_warm_ups_own_requests() {
+        let registry = Arc::new(RequestRegistry::default());
+        registry.set_warming(true);
+        assert!(registry.is_accepting(), "a hold is not a drain");
+        let refused = registry
+            .register("chatcmpl-1")
+            .err()
+            .expect("a foreign request is refused");
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_eq!(refused.message(), "servicer is warming up");
+        assert_eq!(registry.active(), 0, "a refused request has no lifetime");
+        let (own, _cancel) = registry
+            .register(&format!("{WARMUP_REQUEST_ID_PREFIX}7"))
+            .expect("the warm-up's own request passes");
+        assert_eq!(registry.active(), 1);
+        drop(own);
+        // The prefix alone is not the form: a caller's id the gateway stamped
+        // with its own suffix, or the bare prefix, is a foreign request.
+        for crafted in [
+            "smg-warmup-x-01a16586-c52f-76e8-bb8f-9f407fd9f836",
+            "smg-warmup-1-01a16586-c52f-76e8-bb8f-9f407fd9f836",
+            "smg-warmup-",
+            "SMG-WARMUP-1",
+        ] {
+            let refused = registry
+                .register(crafted)
+                .err()
+                .expect("an id that only starts with the prefix is refused");
+            assert_eq!(refused.message(), "servicer is warming up", "{crafted}");
+        }
+
+        registry.set_accepting(false);
+        let drained = registry
+            .register(&format!("{WARMUP_REQUEST_ID_PREFIX}8"))
+            .err()
+            .expect("a drain closes admission to the warm-up as well");
+        assert_eq!(drained.message(), "servicer is draining");
+        registry.set_accepting(true);
+
+        registry.set_warming(false);
+        let (late, _cancel) = registry
+            .register("chatcmpl-1")
+            .expect("the release admits every request");
+        drop(late);
+        assert_eq!(registry.active(), 0);
+    }
+
+    /// A registry constructed with the lifecycle owner's nonce admits, while
+    /// readiness is held, the ids that carry it and nothing else: the bare
+    /// form a client's own `rid` can spell is refused, as are a wrong nonce,
+    /// a missing ordinal and a suffix after it; the release admits all.
+    #[test]
+    fn a_readiness_hold_admits_only_the_ids_that_carry_the_warm_ups_nonce() {
+        let registry = Arc::new(RequestRegistry::with_warmup_nonce(Some(
+            "c0ffee42".to_string(),
+        )));
+        registry.set_warming(true);
+        let (own, _cancel) = registry
+            .register("smg-warmup-c0ffee42-7")
+            .expect("the warm-up's own request carries the nonce");
+        drop(own);
+        for crafted in [
+            "smg-warmup-7",
+            "smg-warmup-c0ffee43-7",
+            "smg-warmup-c0ffee42-",
+            "smg-warmup-c0ffee42-7-8",
+            "smg-warmup-c0ffee427",
+            "smg-warmup--7",
+            "chatcmpl-smg-warmup-c0ffee42-7",
+        ] {
+            let refused = registry
+                .register(crafted)
+                .err()
+                .expect("an id without the exact nonce form is refused");
+            assert_eq!(refused.message(), "servicer is warming up", "{crafted}");
+        }
+        assert_eq!(registry.active(), 0);
+        registry.set_warming(false);
+        let (late, _cancel) = registry
+            .register("smg-warmup-7")
+            .expect("the release admits every request, the bare form too");
+        drop(late);
+    }
 
     /// A choice as the shutdown sees it, in the shape of the servicers' own:
     /// a `Complete` queued for the next poll, an engine stream that may hold
@@ -249,8 +456,8 @@ mod tests {
         }
     }
 
-    fn choices(items: Vec<Choice>) -> SelectAll<Choice> {
-        let mut all = SelectAll::new();
+    fn choices(items: Vec<Choice>) -> Choices<Choice> {
+        let mut all = Choices::new();
         for item in items {
             all.push(item);
         }
@@ -263,7 +470,7 @@ mod tests {
         let (finished, cut) = settle_shutdown(&mut all);
         assert_eq!(finished, ["length"]);
         assert!(cut, "the choice still open is what the shutdown cuts");
-        assert!(all.is_empty(), "the choices are dropped afterwards");
+        assert_eq!(all.iter().count(), 0, "the choices are dropped afterwards");
     }
 
     #[test]

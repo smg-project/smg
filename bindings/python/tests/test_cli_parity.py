@@ -1,12 +1,13 @@
 """The launcher's options are the Rust CLI's flags, pinned against the CLI's source.
 
-``RouterArgs.add_cli_args`` mirrors ``struct CliArgs`` in ``model_gateway/src/main.rs``:
-one option per flag, the same spelling and the same second spellings (plus
-``--prefill`` and ``--encode``, which the CLI reads ahead of clap). These tests read
-the clap struct from the source tree, so a flag added on one side without the
-other fails here instead of at a launch line; on an installed wheel without the
-source they skip. The exception lists below carry the reason for every divergence
-left, and an entry that no longer holds fails too, so the lists cannot rot.
+``RouterArgs.add_cli_args`` mirrors ``struct CliArgs`` in ``model_gateway/src/main.rs``
+and the modules of its ``cli/`` directory: one option per flag, the same spelling and
+the same second spellings (plus ``--prefill`` and ``--encode``, which the CLI reads
+ahead of clap). These tests read the clap struct and the pre-clap flags from the
+source tree, so a flag added on one side without the other fails here instead of at
+a launch line; on an installed wheel without the source they skip. The exception
+lists below carry the reason for every divergence left, and an entry that no longer
+holds fails too, so the lists cannot rot.
 """
 
 from __future__ import annotations
@@ -20,12 +21,19 @@ import pytest
 from smg.router_args import RouterArgs
 
 MAIN_RS = Path(__file__).resolve().parents[3] / "model_gateway" / "src" / "main.rs"
+# The binary's command line leaves main.rs block by block for the modules of this
+# directory; the reader sees them all as one text.
+CLI_DIR = MAIN_RS.with_name("cli")
+
+
+def cli_source() -> str:
+    """``main.rs`` followed by every module of its ``cli/`` directory."""
+    return "\n".join([MAIN_RS.read_text(), *(p.read_text() for p in sorted(CLI_DIR.glob("*.rs")))])
+
 
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--kv-indexer-max-entries": "deprecated and ignored by the CLI; the launcher never had it",
-    "--kv-indexer-ttl-secs": "deprecated and ignored by the CLI; the launcher never had it",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -261,10 +269,10 @@ def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Acti
 def rust() -> RustCli:
     if not MAIN_RS.exists():
         pytest.skip("the Rust CLI's source is not in this checkout")
-    text = MAIN_RS.read_text()
+    text = cli_source()
     cli = parse_rust_cli(text)
     assert cli.attributes == arg_attributes(text), (
-        f"{MAIN_RS}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
+        f"{MAIN_RS} and {CLI_DIR}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
         " struct CliArgs; a group it flattens is declared in a shape parse_rust_cli does not"
         " follow (or the rest belong to a struct outside the launch CLI: teach the reader)"
     )
@@ -346,3 +354,23 @@ def test_every_option_has_its_router_prefixed_spelling():
         if expected not in prefixed and option not in prefixed:
             missing.append(option)
     assert not missing, f"options without a --router- spelling: {missing}"
+
+
+def test_the_launcher_backend_choices_are_the_cli_backends(launcher):
+    """``--backend`` takes the same names on both sides, in the CLI's order, so a
+    provider route the binary runs can be chosen from Python and the chart."""
+    enum = MAIN_RS.read_text().split("pub enum Backend {", 1)[1].split("}", 1)[0]
+    assert launcher["--backend"].choices == re.findall(r'#\[value\(name = "([a-z]+)"\)\]', enum)
+
+
+@pytest.mark.parametrize("use_router_prefix", [False, True])
+@pytest.mark.parametrize("settle", [None, 0, 5, 30, 120])
+def test_shutdown_settle_option(use_router_prefix, settle):
+    """Both launcher spellings preserve an omitted window and explicit zero or seconds."""
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
+    prefix = "router-" if use_router_prefix else ""
+    flags = [] if settle is None else [f"--{prefix}shutdown-settle-secs", str(settle)]
+    args = RouterArgs.from_cli_args(parser.parse_args(flags), use_router_prefix=use_router_prefix)
+    assert args.shutdown_settle_secs == settle
+    assert args.shutdown_grace_period_secs == 180

@@ -35,13 +35,14 @@ use crate::{
 };
 
 /// Prefix reserved for discovery provenance. Only this module writes labels
-/// under it; a provider's compatibility labels may not.
+/// under it; a provider's compatibility labels may not, and neither may the
+/// worker API (`WorkerService` refuses them).
 pub const DISCOVERY_LABEL_PREFIX: &str = "smg.ai/discovery-";
 /// Which provider owns the worker: `kubernetes`, `file`, `slurm` or `consul`.
 pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// The provider's stable identity for the worker instance.
 pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
-/// BLAKE3 fingerprint of the [`DiscoveredWorker`] it was registered from. A
+/// BLAKE3 fingerprint of the `DiscoveredWorker` it was registered from. A
 /// change to it updates the worker in place.
 pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
 
@@ -146,8 +147,11 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
             let endpoint = match Endpoint::parse_with_rank(worker.url()) {
                 Ok((endpoint, _)) => endpoint,
                 Err(e) => {
+                    // The address the parser refused reads as its marker, so the
+                    // id says which worker was skipped.
                     warn!(
-                        worker_url = %worker.url(),
+                        worker_id = %worker_id.as_str(),
+                        worker_url = %worker.redacted_url(),
                         error = %e,
                         "Skipping discovery-owned worker with an unparsable address"
                     );
@@ -1005,7 +1009,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),

@@ -18,17 +18,14 @@ from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 
 
 def running_window(server_args: Any) -> int:
-    """The scheduler's configured admission window, or 0 when unknown.
+    """The per-rank scheduler admission window, or 0 when unknown.
 
-    ``GetLoadReqOutput`` carries no admission bound, so the window has to come
-    from the server args. TokenSpeed spells it ``max_num_seqs``; the protobuf
-    field is the one SGLang fills with the same number, so a frontend reads a
-    single name across both engines. It matters most on a disaggregated decode
-    worker: that window is exactly the bound its prefill peer's bootstrap
-    deadline is racing, and a frontend that cannot see it cannot pace its
-    dispatch.
+    TokenSpeed splits the global ``max_num_seqs`` across attention-DP ranks,
+    rounding down. Load records describe one rank, so their window must use
+    the same units as their running and waiting request counts.
     """
-    return EngineConfigView(server_args).server_args.running_window
+    args = EngineConfigView(server_args).server_args
+    return args.running_window // (args.attention_dp_size or 1)
 
 
 def convert_load_to_protobuf(

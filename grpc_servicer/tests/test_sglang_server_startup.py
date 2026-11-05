@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 from pathlib import Path
@@ -17,6 +18,13 @@ def _module(name, **attrs):
     for attr, value in attrs.items():
         setattr(module, attr, value)
     return module
+
+
+@pytest.fixture(autouse=True)
+def python_servicer(monkeypatch):
+    """These tests drive the Python servicer's start-up: since the Rust servicer
+    became the default, the Python one is an explicit choice."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
 
 
 @pytest.fixture
@@ -278,6 +286,75 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
     assert params.n == 1
     assert params.max_new_tokens == 8
     channel.close.assert_called_once()
+
+
+def test_the_planned_warm_up_stays_off_on_a_disaggregation_role(monkeypatch, server_mod, caplog):
+    """This servicer's own warm-up request carried the stand-in bootstrap
+    already; the planned pass on a prefill or decode leg is the Rust
+    launcher's, so the planner is never asked here, and a single engine still
+    plans."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
+    )
+    never = Mock(side_effect=AssertionError("the planner must not be asked on a leg"))
+    monkeypatch.setattr(server_mod, "warmup_inputs", never)
+    for mode in ("prefill", "decode"):
+        leg = SimpleNamespace(disaggregation_mode=mode)
+        assert server_mod._planned_warmup(leg, SimpleNamespace(), channel=None) is None
+    never.assert_not_called()
+    assert any(
+        "Planned warm-up: none on a disaggregation role on this servicer" in r.getMessage()
+        for r in caplog.records
+    )
+    asked = Mock(return_value=None)
+    monkeypatch.setattr(server_mod, "warmup_inputs", asked)
+    single = SimpleNamespace(disaggregation_mode="null")
+    assert server_mod._planned_warmup(single, SimpleNamespace(), channel=None) is None
+    asked.assert_called_once()
+
+
+def test_a_failed_planned_warm_up_never_ends_the_server(monkeypatch, server_mod, caplog):
+    """The planned pass is an optimisation: when it raises past its own
+    guards, the first warm-up request still counts and the process stays up
+    (the outer guard of the warm-up would otherwise kill the process tree)."""
+    caplog.set_level(logging.ERROR)
+    complete = Mock()
+    complete.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = pb.GetModelInfoResponse(is_generation=True)
+    stub.Generate.return_value = [complete]
+    channel = Mock()
+    killed = Mock()
+
+    monkeypatch.setattr(
+        server_mod.grpc, "insecure_channel", Mock(return_value=channel), raising=False
+    )
+    monkeypatch.setattr(server_mod, "sglang_scheduler_pb2", pb)
+    monkeypatch.setattr(
+        server_mod,
+        "sglang_scheduler_pb2_grpc",
+        SimpleNamespace(SglangSchedulerStub=lambda _channel: stub),
+    )
+    monkeypatch.setattr(
+        server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
+    )
+    monkeypatch.setattr(server_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(server_mod, "kill_process_tree", killed)
+
+    def broken(_server_args, _facts):
+        raise AttributeError("no such argument on this engine release")
+
+    monkeypatch.setattr(server_mod, "warmup_inputs", broken)
+
+    server_args = SimpleNamespace(host="127.0.0.1", port=30000, disaggregation_mode="null")
+    assert server_mod._execute_grpc_server_warmup(server_args) is True
+    killed.assert_not_called()
+    channel.close.assert_called_once()
+    assert any(
+        "The planned warm-up failed; the server serves without it" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def _serving_server(monkeypatch, server_mod, events, *, scheduler_exited):
@@ -625,7 +702,136 @@ def test_request_tracing_initializes_after_the_runtime_context_is_published(
 
     monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     with pytest.raises(RuntimeError, match="stop here"):
         asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
     assert events == ["publish:tokenizer", "tracing", "launch"]
+
+
+def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
+    monkeypatch, server_mod, caplog
+):
+    """A launcher without --kv-events-config left SGLang publishing nothing
+    under the Python servicer, while the Rust path turned the publisher on by
+    itself: `serve_grpc` applies the same default to the server args before
+    the schedulers and the servicer are built from them, with the same opt-out
+    and the same log line."""
+    from smg_grpc_servicer.sglang import rust as sglang_rust
+
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
+    monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
+
+    def serve(configure):
+        """One start with every collaborator stood in for; what the scheduler
+        launch and the server args ended up with."""
+        events = []
+        server_args = _serving_server(monkeypatch, server_mod, events, scheduler_exited=False)
+        configure(server_args)
+        launch = server_mod._launch_scheduler_with_request_manager
+        seen = {}
+
+        async def recording_launch(**kwargs):
+            seen["launched_with"] = getattr(kwargs["server_args"], "kv_events_config", None)
+            return await launch(**kwargs)
+
+        monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", recording_launch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert asyncio.run(server_mod.serve_grpc(server_args, model_info={})) is None
+        assert server_mod.SGLangSchedulerServicer.call_args.kwargs["server_args"] is server_args
+        return seen["launched_with"], getattr(server_args, "kv_events_config", None)
+
+    # Nothing given: the schedulers start with the publisher on, at a free
+    # port of this host rather than SGLang's fixed default, the servicer reads
+    # the same server args, and the operator reads why.
+    launched_with, applied = serve(lambda args: None)
+    assert launched_with == applied
+    config = json.loads(applied)
+    assert config == {"publisher": "zmq", "endpoint": config["endpoint"]}
+    assert config["endpoint"].startswith("tcp://*:") and config["endpoint"] != "tcp://*:5557"
+    assert (
+        "KV event publishing enabled: no --kv-events-config was given, so SGLang's ZMQ "
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {sglang_rust.KV_EVENTS_ENV}=0 to leave it off"
+    ) in caplog.text
+    # The opt-out: the server args reach the schedulers as parsed, and nothing is said.
+    monkeypatch.setenv(sglang_rust.KV_EVENTS_ENV, "0")
+    assert serve(lambda args: None) == (None, None)
+    assert "KV event publishing" not in caplog.text
+    # An explicit configuration is kept as given, off included.
+    monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV)
+    given = '{"publisher": "null"}'
+    assert serve(lambda args: setattr(args, "kv_events_config", given)) == (given, given)
+    assert "KV event publishing" not in caplog.text
+
+
+def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_too(
+    monkeypatch, server_mod, caplog
+):
+    """The default's endpoint is a port found free on the host; a host with no
+    free block of them is a configuration error, and the Python path answers
+    it as the Rust path does: one ERROR line naming the knob and exit code 2,
+    before any scheduler starts, not a traceback."""
+    from smg_grpc_servicer import rust_lifecycle
+    from smg_grpc_servicer.sglang import rust as sglang_rust
+
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
+    monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
+    refusal = "no block of 1 consecutive free ports for the KV event publishers"
+
+    def no_block(ranks=1):
+        raise rust_lifecycle.ServicerConfigError(
+            f"{refusal} after 64 draws; pass --kv-events-config with an endpoint"
+        )
+
+    monkeypatch.setattr(rust_lifecycle, "free_kv_events_endpoint", no_block)
+    server_args = _serving_server(monkeypatch, server_mod, [], scheduler_exited=False)
+    launched = Mock()
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launched)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args, model_info={}))
+    assert raised.value.code == 2
+    assert refusal in caplog.text and "--kv-events-config" in caplog.text
+    launched.assert_not_called()
+
+
+def test_the_sidecar_note_on_the_rust_servicer_names_metrics_and_warns_when_asked_for(
+    monkeypatch, server_mod, caplog
+):
+    """On the Rust servicer SGLang's HTTP sidecar never starts, so its /metrics,
+    admin and profiling endpoints stay off: a note on every launch that hands
+    the request-manager callback, naming the Rust servicer's own metrics
+    endpoint and the Python servicer as the way to keep the sidecar; a WARNING
+    when the launch asked for the sidecar's metrics (--enable-metrics), which
+    nothing serves then."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "rust")
+
+    async def rust_served(_server_args):
+        return 0
+
+    monkeypatch.setattr(server_mod, "serve_rust", rust_served)
+
+    def launch(enable_metrics):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(SystemExit) as raised:
+                asyncio.run(
+                    server_mod.serve_grpc(
+                        SimpleNamespace(disaggregation_mode="null", enable_metrics=enable_metrics),
+                        on_request_manager_ready=lambda _manager: None,
+                    )
+                )
+        assert raised.value.code == 0
+        return [r for r in caplog.records if "HTTP sidecar" in r.getMessage()]
+
+    (note,) = launch(False)
+    assert note.levelno == logging.INFO
+    assert "(its /metrics, admin and profiling endpoints stay off)" in note.getMessage()
+    assert "--metrics-port / SMG_SGLANG_SERVICER_METRICS_PORT" in note.getMessage()
+    assert "(--servicer-impl python / SMG_SGLANG_SERVICER_IMPL=python) keeps the sidecar" in (
+        note.getMessage()
+    )
+    (warning,) = launch(True)
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage() == note.getMessage()

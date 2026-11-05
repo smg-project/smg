@@ -3,9 +3,11 @@
 //! Its own test binary: the logging subscriber is installed once per process,
 //! and this test needs it writing JSON lines to a directory it can read back.
 
-mod common;
-
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use axum::{body::Body, extract::Request, http::StatusCode};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
@@ -17,6 +19,7 @@ use smg::{
     routers::RouterFactory,
     workflow::Job,
 };
+use smg_test_harness as common;
 use tower::ServiceExt;
 
 /// The trace id the caller chose; the gateway must log and echo this one.
@@ -160,9 +163,12 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
     drop(response);
     mock_worker.stop().await;
 
-    // The request log lines carry the same id as a span field.
+    // The request log lines carry the same id as a span field. They reach
+    // the file on the writer thread's own time: `close_logging` waits for
+    // its flush a bounded moment, which a loaded host exceeds, so the read
+    // waits for the lines it asserts on instead of reading once.
     logging::close_logging();
-    let lines = request_log_lines(&log_dir);
+    let lines = request_log_lines_once_written(&log_dir, 2).await;
     fs::remove_dir_all(&log_dir).expect("remove log dir");
     assert!(
         lines
@@ -197,7 +203,7 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
     clippy::expect_used,
     reason = "test helper; a missing log file fails the test"
 )]
-fn request_log_lines(log_dir: &PathBuf) -> Vec<Value> {
+fn request_log_lines(log_dir: &Path) -> Vec<Value> {
     let mut lines = Vec::new();
     for entry in fs::read_dir(log_dir).expect("read log dir") {
         let path = entry.expect("dir entry").path();
@@ -211,4 +217,31 @@ fn request_log_lines(log_dir: &PathBuf) -> Vec<Value> {
         );
     }
     lines
+}
+
+/// How long the request log is given to hold the lines the test asserts on.
+/// The writer thread writes them on its own schedule: `close_logging` waits
+/// for it a bounded moment, which a loaded host exceeds (a file write the
+/// kernel is throttling, a thread left unscheduled), and the lines land
+/// after it has returned.
+const LOG_LINES_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The JSON lines on the `smg::request` / `smg::response` targets, read once
+/// the log holds the end lines of `requests` requests, or whatever it holds
+/// when [`LOG_LINES_DEADLINE`] passes (the assertions then name what is
+/// missing). The writer writes whole lines in the order they were logged, so
+/// a request's end line vouches for every line logged before it.
+async fn request_log_lines_once_written(log_dir: &Path, requests: usize) -> Vec<Value> {
+    let deadline = Instant::now() + LOG_LINES_DEADLINE;
+    loop {
+        let lines = request_log_lines(log_dir);
+        let ended = lines
+            .iter()
+            .filter(|line| line["message"] == "finished processing request")
+            .count();
+        if ended >= requests || Instant::now() >= deadline {
+            return lines;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

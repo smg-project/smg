@@ -8,13 +8,13 @@
 //! ```
 //!
 //! The table has one state, an arguments state the output starts in, and the pythonic assembler
-//! reads the turn bare ([`pythonic::Assembler::bare`](crate::pythonic::Assembler::bare)): the list
+//! reads the turn bare (`pythonic::Assembler::bare`): the list
 //! as it arrives where the turn starts with one; content otherwise, and a list after the content
 //! once it is whole, well formed and made of calls to the request's tools, since code holds
 //! `[name(` of its own; the template's wrapping after the list. The
 //! template writes every value as `"%s"` of it, so the quotes carry no type and a quoted value
 //! reads by the type the request's tool declares for the parameter
-//! ([`Dialect::LLAMA4`](crate::pythonic::Dialect::LLAMA4)). The model's `<|python_start|>` and
+//! (`Dialect::LLAMA4`). The model's `<|python_start|>` and
 //! `<|python_end|>`, which it may write around its text or the list, are dropped wherever they
 //! stand. A turn opens with `<|header_start|>assistant<|header_end|>`, so the prompt's replay
 //! starts there. Recorded as `llama-4-scout-17b-16e-instruct` and
@@ -44,10 +44,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
+        testing::{bytes, calls, content, finish},
         Declared,
     };
 
@@ -102,11 +104,11 @@ mod tests {
         ])
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_until(prompt, pieces, EngineFinish::Stop)
     }
 
-    fn run_until(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run_until(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = Engine::new(llama4(), tools());
         let mut out = Events::new();
         parser
@@ -131,46 +133,7 @@ mod tests {
                 .expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
-    }
-
-    /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        out.into_owned().drain()
     }
 
     /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
@@ -178,37 +141,23 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     /// A turn as the checkpoint's chat template renders it, and the message it rendered.
@@ -218,10 +167,12 @@ mod tests {
         calls: &'static [(&'static str, &'static str)],
     }
 
-    /// The turns bellwether's common set records for `llama-4-scout-17b-16e-instruct`, less the
-    /// nested one (its template writes a quote inside a quoted value without escaping it, which
-    /// no reader can take back; `docs/tables.md`): one call, a call with no arguments, three calls,
-    /// a call after content, non-ASCII values with a list, and content alone; then the probes.
+    /// The turns bellwether's common set records for `llama-4-scout-17b-16e-instruct`: one call, a
+    /// call with no arguments, three calls, a call after content, non-ASCII values with a list,
+    /// the nested one (a quote inside a quoted value, which the template writes without escaping
+    /// it and the table reads since the quotes inside pair up, and a value that ends in a
+    /// backslash; `docs/tables.md`), a value that ends in a backslash (`dir C:\`, as the recorded
+    /// benchmark sets write it) alone and after content, and content alone; then the probes.
     const TURNS: &[Turn] = &[
         Turn {
             output: "[get_weather(city=\"Paris\")]",
@@ -254,6 +205,24 @@ mod tests {
                 "save_note",
                 "{\"title\": \"計画\", \"body\": \"今日は晴れ 🌤️ — très bien\", \"tags\": [\"日本語\"]}",
             )],
+        },
+        Turn {
+            output: "[save_note(title=\"Plan\", body=\"Line one\nLine two with \"quotes\" and a backslash \\\", tags=\"['a', 'b']\", meta=\"{'nested': {'deep': [1, 2.5, True, None]}}\")]",
+            content: "",
+            calls: &[(
+                "save_note",
+                "{\"title\": \"Plan\", \"body\": \"Line one\\nLine two with \\\"quotes\\\" and a backslash \\\\\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}",
+            )],
+        },
+        Turn {
+            output: "[get_weather(city=\"dir C:\\\", unit=\"N/A\")]",
+            content: "",
+            calls: &[("get_weather", "{\"city\": \"dir C:\\\\\", \"unit\": \"N/A\"}")],
+        },
+        Turn {
+            output: "Listing.[get_weather(city=\"dir C:\\\")]",
+            content: "Listing.",
+            calls: &[("get_weather", "{\"city\": \"dir C:\\\\\"}")],
         },
         Turn {
             output: "Hello!",
@@ -426,27 +395,134 @@ mod tests {
     }
 
     #[test]
-    fn text_after_the_list_is_wrapping_or_malformed_and_a_cut_call_stays_cut() {
+    fn text_after_the_list_is_the_models_prose_and_a_cut_call_stays_cut() {
+        // Once text follows the list, every byte after the `]` is the model's prose, the
+        // whitespace before its first word included; whitespace alone is the template's wrapping.
         let events = run(PROMPT, &["[get_weather(city=\"Paris\")]\n\nDone."]);
         assert_eq!(calls(&events).len(), 1);
         assert_eq!(content(&events), "");
-        assert_eq!(malformed(&events), "Done.");
-        assert!(dropped(&events).contains(&"\n\n"));
+        assert_eq!(malformed(&events), "\n\nDone.");
+        assert_eq!(dropped(&events), ["[", "]"]);
+        let events = run(PROMPT, &["[get_weather(city=\"Paris\")]\n\n"]);
+        assert_eq!(malformed(&events), "");
+        assert_eq!(dropped(&events), ["[", "]", "\n\n"]);
         let events = run_until(PROMPT, &["[get_weather(city=\"Par"], EngineFinish::Length);
         assert_eq!(content(&events), "");
-        // A value is held until its extent is known, so a cut one comes back as the unterminated
-        // region's text and the call ends with nothing of its own.
-        assert_eq!(calls(&events), [("get_weather".to_string(), String::new())]);
+        // A value is held until its extent is known; cut by the token limit it is the call's own
+        // fragment, the open string as written, and the one word of no bytes before the call's
+        // end says that the arguments are no whole value.
+        assert_eq!(
+            calls(&events),
+            [("get_weather".to_string(), r#"{"city": "Par"#.to_string())]
+        );
+        assert_eq!(malformed(&events), "");
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
-                if text.text == "city=\"Par"
+                if text.text.is_empty()
         )));
         assert_eq!(finish(&events), (FinishReason::Length, 1));
         // A bracket the end cut before any call is content, as it would have been.
         let events = run_until(PROMPT, &["[get_wea"], EngineFinish::Length);
         assert_eq!(content(&events), "[get_wea");
         assert!(calls(&events).is_empty());
+    }
+
+    /// A call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+    /// call's length: inside the first value's quotes, inside a second quoted value, after a
+    /// key's `=` and inside a key. The call's arguments are the prefix as the model wrote it,
+    /// the cut member's key and its open string included; nothing of the call reaches a chat
+    /// client as content; the one word before the call's end says that the arguments are no
+    /// whole value; and the finish is the engine's `length`, whole, a character at a time and
+    /// at every two-way cut.
+    #[test]
+    fn a_call_the_token_limit_cut_keeps_its_bytes_as_its_arguments_and_nothing_as_content() {
+        use crate::testing::the_same_at_every_cut;
+        for (output, arguments) in [
+            ("[get_weather(city=\"Par", r#"{"city": "Par"#),
+            (
+                "[get_weather(city=\"Paris\", days=\"3",
+                r#"{"city": "Paris", "days": "3"#,
+            ),
+            (
+                "[get_weather(city=\"Paris\", days=",
+                r#"{"city": "Paris", "days": "#,
+            ),
+            ("[get_weather(city=\"Paris\", da", r#"{"city": "Paris""#),
+        ] {
+            let read = |pieces: &[&str]| run_until(PROMPT, pieces, EngineFinish::Length);
+            let said = the_same_at_every_cut(read, output);
+            assert_eq!(
+                said.calls,
+                vec![("get_weather".to_string(), arguments.to_string())],
+                "{output:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{output:?}");
+            assert_eq!(said.content, "", "{output:?}");
+            let events = read(&[output]);
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert_eq!(
+                malformed(&events),
+                "",
+                "nothing of the call is content: {events:?}"
+            );
+            assert!(
+                matches!(
+                    &events[events.len() - 3..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. },
+                        Event::Finish { .. },
+                    ] if text.text.is_empty() && source.text.is_empty()
+                ),
+                "{output:?}: {events:?}"
+            );
+        }
+    }
+
+    /// The model explains which call it would make, the list inside the sentence: the chat
+    /// message's content and the stream's content deltas are the model's prose, byte for byte,
+    /// the whitespace between the words after the list included, whole and at every cut alike;
+    /// the list is the call.
+    #[test]
+    fn prose_after_a_list_written_mid_sentence_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "I can look that up. For example, [get_weather(city=\"Honolulu\")] would give you ",
+            "the current weather in Honolulu."
+        );
+        let prose =
+            "I can look that up. For example,  would give you the current weather in Honolulu.";
+        let content = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(PROMPT, &[output]);
+        let message = chat::message(0, &whole).message;
+        assert_eq!(message.content.as_deref(), Some(prose));
+        let calls = message.tool_calls.expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(r#"{"city": "Honolulu"}"#)
+        );
+        assert_eq!(streamed(&whole), prose);
+        assert_eq!(dropped(&whole), ["[", "]"]);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run(PROMPT, &[&output[..cut], &output[cut..]]);
+            assert_eq!(content(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run(PROMPT, &pieces);
+        assert_eq!(content(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

@@ -29,11 +29,11 @@ mod tests {
         event::{Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::calls,
+        testing::{calls, finish},
         Declared,
     };
 
-    fn run(pieces: &[&str], declared: Declared) -> Vec<Event> {
+    fn run(pieces: &[&str], declared: Declared) -> Vec<Event<'static>> {
         let mut parser = Engine::new(forced(), declared);
         let mut out = Events::new();
         parser
@@ -65,19 +65,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
-    }
-
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
+        out.into_owned().drain()
     }
 
     #[test]

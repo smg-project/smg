@@ -20,7 +20,6 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    shape::{Layout, Message},
     tagged::{Placement, Spelling},
 };
 
@@ -41,15 +40,7 @@ pub fn seed_oss() -> Format {
         .transition("calls", "call_open", "calls")
         .calls(CallSyntax::Tagged(Spelling::Python, Placement::Direct))
         .opens_turn("<seed:bos>assistant")
-        .with_layout(Layout {
-            thought: Some(Message {
-                before: "".into(),
-                after: "\n".into(),
-                stops: false,
-                close: Some("</seed:think>".into()),
-            }),
-            ..Layout::default()
-        })
+        .with_layout(super::thought_layout("</seed:think>", "\n"))
 }
 
 #[cfg(test)]
@@ -63,7 +54,7 @@ mod tests {
         ids::CallIds,
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{calls, content, drive, reasoning},
+        testing::{content, drive, reasoning, said, Said},
         Declared,
     };
 
@@ -100,7 +91,7 @@ mod tests {
                 &mut out,
             )
             .expect("delta");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[0],
             Event::Content(Text::uncounted("It opens a thought."))
@@ -130,7 +121,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[..3],
             [
@@ -145,7 +136,7 @@ mod tests {
         let arguments: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();
@@ -159,7 +150,7 @@ mod tests {
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -233,11 +224,11 @@ mod tests {
                         &mut out,
                     )
                     .expect("end");
-                let events = out.drain();
+                let events = out.into_owned().drain();
                 let arguments: String = events
                     .iter()
                     .filter_map(|event| match event {
-                        Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                        Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                         _ => None,
                     })
                     .collect();
@@ -314,6 +305,8 @@ mod tests {
         content: String,
         reasoning: String,
         malformed: Vec<(String, MalformedReason)>,
+        /// The bytes refused as a malformed call's, joined.
+        refused: String,
         finish: Option<(FinishReason, u32)>,
     }
 
@@ -324,6 +317,7 @@ mod tests {
         let events = drive(&mut parser, "", pieces);
         let mut calls: Vec<(u32, String, String, String)> = Vec::new();
         let mut malformed: Vec<(String, MalformedReason)> = Vec::new();
+        let mut refused = String::new();
         let mut finish = None;
         for event in &events {
             match event {
@@ -337,8 +331,12 @@ mod tests {
                 // splits its report, not what is reported.
                 Event::Malformed { text, why } => match malformed.last_mut() {
                     Some((joined, last)) if last == why => joined.push_str(&text.text),
-                    _ => malformed.push((text.text.clone(), *why)),
+                    _ => malformed.push((text.text.to_string(), *why)),
                 },
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => refused.push_str(&text.text),
                 Event::Finish {
                     reason, tool_calls, ..
                 } => finish = Some((reason.clone(), *tool_calls)),
@@ -350,6 +348,7 @@ mod tests {
             content: content(&events),
             reasoning: reasoning(&events),
             malformed,
+            refused,
             finish,
         }
     }
@@ -429,6 +428,7 @@ mod tests {
                     content: String::new(),
                     reasoning: String::new(),
                     malformed: vec![],
+                    refused: String::new(),
                     finish: Some((FinishReason::Stop, 3)),
                 },
             ),
@@ -450,6 +450,7 @@ mod tests {
                     content: "Sure.\n".to_string(),
                     reasoning: "plan".to_string(),
                     malformed: vec![],
+                    refused: String::new(),
                     finish: Some((FinishReason::Stop, 2)),
                 },
             ),
@@ -462,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn text_between_a_regions_blocks_is_reported_and_the_calls_around_it_are_read() {
+    fn text_between_a_regions_blocks_is_refused_and_the_calls_around_it_are_read() {
         const BETWEEN: &str = concat!(
             "<seed:tool_call>\n<function=european_history_get_monarchs>\n",
             "<parameter=country>France</parameter>\n</function>\nthen\n",
@@ -484,7 +485,8 @@ mod tests {
             ],
             content: String::new(),
             reasoning: String::new(),
-            malformed: vec![("then".to_string(), MalformedReason::TextBetweenCalls)],
+            malformed: vec![(String::new(), MalformedReason::TextBetweenCalls)],
+            refused: "then".to_string(),
             finish: Some((FinishReason::Stop, 2)),
         };
         for pieces in cuts(BETWEEN) {
@@ -579,7 +581,7 @@ mod tests {
     }
 
     /// The events of `output` after the turn's opener, fed in `pieces`, with the forecast tool.
-    fn read_forecast(pieces: &[&str]) -> Vec<Event> {
+    fn read_forecast(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(seed_oss(), forecast_tools());
         let mut out = Events::new();
         parser
@@ -611,35 +613,11 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
-    }
-
-    /// What the reader said of an output: the calls, the finish, the content and the reasoning.
-    #[derive(Debug, PartialEq)]
-    struct Said {
-        calls: Vec<(String, String)>,
-        finish: Option<(FinishReason, u32)>,
-        content: String,
-        reasoning: String,
-    }
-
-    fn said(events: &[Event]) -> Said {
-        let finish = events.iter().find_map(|event| match event {
-            Event::Finish {
-                reason, tool_calls, ..
-            } => Some((reason.clone(), *tool_calls)),
-            _ => None,
-        });
-        Said {
-            calls: calls(events),
-            finish,
-            content: content(events),
-            reasoning: reasoning(events),
-        }
+        out.into_owned().drain()
     }
 
     /// `output` read whole and at every two-way cut says the same.
-    fn the_same_at_every_cut(output: &str) -> Vec<Event> {
+    fn the_same_at_every_cut(output: &str) -> Vec<Event<'static>> {
         let whole = read_forecast(&[output]);
         let expected = said(&whole);
         for cut in 1..output.len() {

@@ -34,6 +34,31 @@ fn mel_to_hz(mel: f64) -> f64 {
     }
 }
 
+/// Per filter of `filters` (`n_mels` rows of `fft_bins` weights), the half-open
+/// bin range `[first, last)` outside which its weight is zero. A filter is a
+/// triangle over the bins, so its weight is one contiguous band and a bin
+/// carries weight in at most two filters; the band is read off the weights
+/// rather than assumed, and an all-zero filter gets an empty one. A product
+/// over the band is the product over the row, bit for bit, when every power
+/// is finite: a zero weight adds nothing to a finite value.
+pub(super) fn mel_bands(filters: &[f32], n_mels: usize, fft_bins: usize) -> Vec<(usize, usize)> {
+    (0..n_mels)
+        .map(|mel| {
+            let row = &filters[mel * fft_bins..(mel + 1) * fft_bins];
+            match row.iter().position(|weight| *weight != 0.0) {
+                Some(first) => {
+                    let last = row
+                        .iter()
+                        .rposition(|weight| *weight != 0.0)
+                        .map_or(first, |index| index + 1);
+                    (first, last)
+                }
+                None => (0, 0),
+            }
+        })
+        .collect()
+}
+
 /// Build a Slaney-normalized mel filter bank.
 pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     let fft_bins = n_fft / 2 + 1;
@@ -127,22 +152,39 @@ pub(super) fn bandlimited_resample(
         TransformError::ShapeError(format!("failed to allocate resampled audio: {error}"))
     })?;
 
-    for block in 0..samples.len().div_ceil(orig_freq) {
+    // The convolution reads `width` samples before the signal and up to a
+    // kernel beyond its end, where it previously contributed nothing: a tap
+    // whose index fell outside the input was skipped. Materialising those
+    // zeros once turns the inner loop into a flat dot product over two slices,
+    // with no bounds test per tap. The result is unchanged bit for bit --
+    // `0.0f32.mul_add(coefficient, acc)` is `acc` exactly for the finite
+    // coefficients this kernel holds, and the accumulator starts at `+0.0`, so
+    // no signed-zero difference arises either.
+    // The last block starts at most `orig_freq - 1` samples before the input's end, so the
+    // last window ends before `len + kernel_len` of the padded input.
+    let blocks = samples.len().div_ceil(orig_freq);
+    let padded_len = samples.len().checked_add(kernel_len).ok_or_else(|| {
+        TransformError::ShapeError("padded resample input size overflow".to_string())
+    })?;
+    let mut padded: Vec<f32> = Vec::new();
+    padded.try_reserve_exact(padded_len).map_err(|error| {
+        TransformError::ShapeError(format!("failed to allocate padded resample input: {error}"))
+    })?;
+    padded.resize(width, 0.0);
+    padded.extend_from_slice(samples);
+    padded.resize(padded_len, 0.0);
+
+    'blocks: for block in 0..blocks {
         let input_start = block * orig_freq;
+        let window = &padded[input_start..input_start + kernel_len];
         for phase in 0..new_freq {
             if output.len() == target_len {
-                return Ok(output);
+                break 'blocks;
             }
             let kernel = &kernels[phase * kernel_len..(phase + 1) * kernel_len];
             let mut value = 0.0_f32;
-            for (kernel_index, &coefficient) in kernel.iter().enumerate() {
-                let padded_index = input_start + kernel_index;
-                if padded_index >= width {
-                    let sample_index = padded_index - width;
-                    if let Some(&sample) = samples.get(sample_index) {
-                        value = sample.mul_add(coefficient, value);
-                    }
-                }
+            for (&coefficient, &sample) in kernel.iter().zip(window) {
+                value = sample.mul_add(coefficient, value);
             }
             output.push(value);
         }

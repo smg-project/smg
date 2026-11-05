@@ -42,14 +42,14 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
-        testing::{arguments_of, bytes, calls, content, drive, reasoning},
+        testing::{arguments_of, bytes, calls, content, drive, finish, reasoning},
         Declared,
     };
 
     /// The generation prompt's tail: the assistant header, and nothing more.
     const PROMPT: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(llama_nemotron(), Declared::default()),
             prompt,
@@ -57,41 +57,27 @@ mod tests {
         )
     }
 
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     #[test]

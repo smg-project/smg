@@ -66,12 +66,20 @@ The whole-JSON promise breaks under three names, so that an allowance is exact: 
 (a call ended with no arguments fragment at all), `tolerated-json` (arguments whose shape closed,
 or one scalar token, but which JSON refuses: a value left out, a trailing comma, an escape JSON
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
-committed prefix of a value that never closed). `json-prefix` holds until a call's
-`Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being JSON;
-from there `verbatim-after-break` asks that every fragment be the model's bytes as written. A name
-is a shape, from any reader on every target, not a reader's own. The nightly workflow allows the shapes of the classes reported and
-not yet fixed, named in `symphony-fuzz.yml`; a name leaves the list with its fix, and a new
-reader's breach of an allowed shape surfaces then.
+committed prefix of a value that never closed). Every fragment is judged by the crate's own judge
+of a JSON prefix (`json::Prefix`, the one the readers hold their fragments to), which refuses at the
+first byte a strict reader refuses and from the backslash of an escape no continuation completes:
+a refusal the partial parser shares is `json-prefix`, and one it tolerates (the shapes above, the
+short `\u` included) is `tolerated-json` at the fragment that brings it, as it would be at the
+call's end, so that an allowance means one thing at a cut and at a close. `json-prefix` holds until
+a call's `Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being
+JSON; from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
+`pythonic-cut-call-closed` is a pythonic call that ended without its own `)` and had its object
+closed for it (one that said nothing and left it open is a breach of the whole-JSON names, so no
+event carries two names). A name is a shape, from any reader on every target, not a reader's own.
+The nightly workflow allows the shapes of the classes reported and not yet fixed, named in
+`symphony-fuzz.yml`; a name leaves the list with its fix, and a new reader's breach of an allowed
+shape surfaces then.
 
 One target by hand, with libFuzzer's own options after `--`:
 
@@ -133,6 +141,6 @@ check saw. In fork mode the message is in the job's own log; replaying the artif
    as a Rust string literal and the cuts are enough to replay it; attach the minimized bytes when
    the literal is unwieldy), the invariant that failed and the check's message. Nothing else from
    the machine that ran it. A crash is a parser defect: the fix adds the output to the subject's
-   outputs in `tests/contract.rs`, where the contract test then replays it under every chunking.
+   outputs in `tests/parser/contract.rs`, where the contract test then replays it under every chunking.
 
 A case that is no breach but a wrong check is fixed in `src/lib.rs`, with the case as a unit test.

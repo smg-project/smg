@@ -2,6 +2,11 @@
 //!
 //! Tests for retry behavior: exponential backoff, max retries, and retry-on-failure scenarios.
 
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use axum::{
     body::Body,
     extract::Request,
@@ -11,7 +16,10 @@ use serde_json::json;
 use smg::config::{RetryConfig, RouterConfig};
 use tower::ServiceExt;
 
-use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
+use crate::common::{
+    mock_worker::{set_request_recorder, RequestRecorder},
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
+};
 
 #[cfg(test)]
 mod retry_tests {
@@ -155,6 +163,67 @@ mod retry_tests {
             "the failing worker's own 500 is returned, got {}",
             resp.status()
         );
+
+        ctx.shutdown().await;
+    }
+
+    /// A worker that does not answer within the request timeout is not
+    /// retried: the client gets the 504 `call_upstream_timeout` once, after
+    /// one timeout, and the request runs on one worker once (the other
+    /// worker never sees it).
+    #[tokio::test]
+    async fn a_request_timeout_is_not_replayed_on_another_worker() {
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 20,
+            ..Default::default()
+        };
+        let mut config = TestRouterConfig::round_robin_with_retry(3304, retry_config);
+        config.request_timeout_secs = 1;
+        let recorders = [RequestRecorder::new(), RequestRecorder::new()];
+        set_request_recorder(19207, Arc::clone(&recorders[0]));
+        set_request_recorder(19208, Arc::clone(&recorders[1]));
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::slow(19207, 3000),
+                TestWorkerConfig::slow(19208, 3000),
+            ],
+        )
+        .await;
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "slow"}],
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let started = Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            resp.headers()
+                .get("x-smg-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("call_upstream_timeout")
+        );
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "one timeout, not retries x timeout: {elapsed:?}"
+        );
+        let attempts: usize = recorders.iter().map(|r| r.bodies().len()).sum();
+        assert_eq!(attempts, 1, "the request ran on one worker, once");
 
         ctx.shutdown().await;
     }

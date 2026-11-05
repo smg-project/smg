@@ -318,7 +318,7 @@ pub struct PoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::McpTransport;
+    use crate::core::config::{test_support::sse_server_with_headers, McpTransport};
 
     // Helper to create test server config
     fn create_test_config(url: &str) -> McpServerConfig {
@@ -445,34 +445,8 @@ mod tests {
         let mut headers2 = HashMap::new();
         headers2.insert("X-API-Key".to_string(), "key-2".to_string());
 
-        let config1 = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000".to_string(),
-                token: None,
-                headers: headers1,
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
-        let config2 = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:3000".to_string(),
-                token: None,
-                headers: headers2,
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
+        let config1 = sse_server_with_headers("test", "http://localhost:3000", headers1);
+        let config2 = sse_server_with_headers("test", "http://localhost:3000", headers2);
 
         let key1 = PoolKey::from_config(&config1, None);
         let key2 = PoolKey::from_config(&config2, None);

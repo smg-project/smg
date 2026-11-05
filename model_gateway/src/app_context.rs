@@ -15,7 +15,7 @@ use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     config::{ParserChoice, RouterConfig},
@@ -36,8 +36,9 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
-        WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
+        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
+        liveness, rl_adapter, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache,
+        WorkerMonitor, WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -154,7 +155,7 @@ pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
 /// overloaded router sheds instead of queueing without bound: every parked
 /// request holds its body and its encoding until it is served, so growth
 /// without a bound only ends at the memory limit.
-pub(crate) fn default_max_concurrent_requests() -> usize {
+fn default_max_concurrent_requests() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
 }
@@ -530,11 +531,7 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(
-            &worker_registry,
-            &worker_client_cache,
-            &router_config,
-        );
+        let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
 
         Ok(AppContext {
             gateway_auth,
@@ -622,7 +619,7 @@ impl AppContextBuilder {
             .with_mcp_orchestrator(&router_config)
             .await?
             .with_wasm_manager(&router_config)
-            .with_kv_event_monitor(&router_config)
+            .with_kv_event_monitor()
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -683,11 +680,19 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::http_client::client_builder()
+            let mut client_builder = crate::clients::http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
-                .connect_timeout(Duration::from_secs(10))
+                // Below the request timeout, as the worker clients keep it
+                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // external host fails as a connect timeout, not as the
+                // request's own (except under a 1 s request timeout, where the
+                // two timers race).
+                .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
+                    DEFAULT_CONNECT_TIMEOUT_SECS,
+                    timeout_secs,
+                )))
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)));
             // Force rustls backend when TLS is configured
@@ -909,73 +914,34 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create KV event monitor for event-driven cache-aware routing.
+    /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// The monitor is created when ANY serving policy is cache_aware — the
-    /// global default or a PD/EPD role override (a non-cache-aware global with
-    /// a cache-aware decode policy still needs event-driven indexers) —
-    /// regardless of connection mode. The monitor itself is cheap (empty
-    /// DashMaps) and stays dormant until workers are added. The
-    /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so
-    /// HTTP workers are never subscribed.
-    fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
-        use crate::config::types::{PolicyConfig, RoutingMode};
-
-        let role_is_cache_aware =
-            |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
-            || match &config.mode {
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
-                RoutingMode::EncodePrefillDecode {
-                    encode_policy,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    role_is_cache_aware(encode_policy)
-                        || role_is_cache_aware(prefill_policy)
-                        || role_is_cache_aware(decode_policy)
-                }
-                _ => false,
-            };
-
-        if config.kv_index.is_some() {
-            warn!(
-                "--kv-index is deprecated: the chain index is the only KV index; the flag goes \
-                 in a later release"
-            );
+    /// Every gateway has one, whatever its policies: a worker under a
+    /// cache-aware policy streams its KV events into the model's index, every
+    /// other gRPC worker streams its load records alone, so load-aware
+    /// routing prices a worker by a record at the engine's cadence rather
+    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
+    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// is cheap (empty maps) and stays dormant until workers are added; a
+    /// model without an events subscription has no index and no index
+    /// gauges.
+    fn with_kv_event_monitor(mut self) -> Self {
+        let monitor = Arc::new(KvEventMonitor::new());
+        debug!("Created KV event monitor for the workers' KV-event and load streams");
+        // The load records on the streams are polls of the worker.
+        if let Some(worker_monitor) = &self.worker_monitor {
+            monitor.set_load_sink(worker_monitor);
         }
-        if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::new());
-            debug!("Created KV event monitor for event-driven cache-aware routing");
-            // The load records on the event streams are polls of the worker.
-            if let Some(worker_monitor) = &self.worker_monitor {
-                monitor.set_load_sink(worker_monitor);
-            }
-            if config.kv_indexer_ttl_secs.is_some_and(|ttl| ttl > 0)
-                || config.kv_indexer_max_entries.is_some_and(|max| max > 0)
-            {
-                warn!(
-                    "--kv-indexer-ttl-secs and --kv-indexer-max-entries are ignored: the chain \
-                     index has no prune, it holds what the engines report and shrinks with \
-                     their removals"
-                );
-            }
-            monitor.start_stats_task();
+        monitor.start_stats_task();
 
-            // Inject monitor into PolicyRegistry — propagates to default_policy
-            // and any other existing cache-aware policies.
-            if let Some(ref registry) = self.policy_registry {
-                registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-            }
-
-            self.kv_event_monitor = Some(monitor);
+        // Inject monitor into PolicyRegistry — propagates to default_policy
+        // and any cache-aware policy created later from a worker's policy
+        // label.
+        if let Some(ref registry) = self.policy_registry {
+            registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
         }
 
+        self.kv_event_monitor = Some(monitor);
         self
     }
 
@@ -1120,11 +1086,13 @@ mod tests {
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 
-    #[tokio::test]
-    async fn unset_rate_limit_defaults_to_no_refill() {
+    /// The admission bucket of a ten-request cap under
+    /// `rate_limit_tokens_per_second` hands out its ten tokens and refills
+    /// none over 150 ms; a returned token is handed out again.
+    async fn ten_tokens_and_no_refill(rate_limit_tokens_per_second: Option<i32>) {
         let config = RouterConfig {
             max_concurrent_requests: 10,
-            rate_limit_tokens_per_second: None,
+            rate_limit_tokens_per_second,
             ..RouterConfig::default()
         };
         let bucket = AppContextBuilder::new()
@@ -1133,13 +1101,18 @@ mod tests {
             .expect("rate limiter should be enabled");
 
         assert!(bucket.try_acquire(10.0).is_ok());
-        // The old fallback refilled at max_concurrent_requests per second,
+        // An earlier fallback refilled at max_concurrent_requests per second,
         // which would restore a token during this wait.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(bucket.try_acquire(1.0).is_err());
 
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unset_rate_limit_defaults_to_no_refill() {
+        ten_tokens_and_no_refill(None).await;
     }
 
     /// With no explicit cap the admission bucket still exists, sized by the
@@ -1183,24 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_zero_rate_limit_disables_refill() {
-        let config = RouterConfig {
-            max_concurrent_requests: 10,
-            rate_limit_tokens_per_second: Some(0),
-            ..RouterConfig::default()
-        };
-        let bucket = AppContextBuilder::new()
-            .maybe_rate_limiter(&config)
-            .rate_limiter
-            .expect("rate limiter should be enabled");
-
-        assert!(bucket.try_acquire(10.0).is_ok());
-        // The previous fallback used max_concurrent_requests as the refill
-        // rate, which would add more than one token during this wait.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(bucket.try_acquire(1.0).is_err());
-
-        bucket.return_tokens_sync(1.0);
-        assert!(bucket.try_acquire(1.0).is_ok());
+        ten_tokens_and_no_refill(Some(0)).await;
     }
 
     fn config_with_policy(policy: PolicyConfig) -> RouterConfig {
@@ -1210,14 +1166,13 @@ mod tests {
         }
     }
 
-    /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
-    /// This run of the builder needs no storage or network, so it exercises the
-    /// real gating path rather than the predicate in isolation.
+    /// Whether `with_kv_event_monitor` creates the monitor under `policy`.
+    /// This run of the builder needs no storage or network.
     fn kv_monitor_created_for(policy: PolicyConfig) -> bool {
         let config = config_with_policy(policy);
         AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
+            .with_kv_event_monitor()
             .kv_event_monitor
             .is_some()
     }
@@ -1245,6 +1200,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1266,85 +1223,43 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
-    /// The #1794-relevant guarantee: passthrough never starts the KV-event
-    /// monitor, so single-backend gateways skip the `SubscribeKvEvents` overhead.
+    /// Every policy gets the monitor: a cache-aware one for its indexes, any
+    /// other for the load stream of its gRPC workers, which the policies'
+    /// load feed reads in place of the poll.
     #[test]
-    fn test_passthrough_does_not_create_kv_event_monitor() {
-        assert!(!kv_monitor_created_for(PolicyConfig::Passthrough));
-        // Other non-cache-aware policies are likewise skipped.
-        assert!(!kv_monitor_created_for(PolicyConfig::RoundRobin));
-        // Control: cache-aware still creates the monitor.
-        assert!(kv_monitor_created_for(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
+    fn every_policy_creates_the_kv_event_monitor() {
+        assert!(kv_monitor_created_for(PolicyConfig::Passthrough));
+        assert!(kv_monitor_created_for(PolicyConfig::RoundRobin));
+        assert!(kv_monitor_created_for(PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
         }));
+        assert!(kv_monitor_created_for(PolicyConfig::cache_aware(
+            0.5, 32, 1.1, 30, 1000
+        )));
     }
 
-    /// A cache-aware PD/EPD role policy needs the monitor even when the
-    /// global policy is not cache-aware.
+    /// The monitor reaches a cache-aware policy created later from a
+    /// worker's policy label under a non-cache-aware default: its model's
+    /// workers get the event-driven index rather than the approximate tree.
     #[test]
-    fn test_cache_aware_role_policy_creates_kv_event_monitor() {
-        use crate::config::types::RoutingMode;
+    fn a_cache_aware_policy_from_a_worker_label_gets_the_kv_event_monitor() {
+        use crate::policies::CacheAwarePolicy;
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-        };
-
-        let mut config = config_with_policy(PolicyConfig::Random);
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: Some(cache_aware.clone()),
-        };
-        let created = AppContextBuilder::new()
+        let config = config_with_policy(PolicyConfig::Random);
+        let builder = AppContextBuilder::new()
             .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
-            .kv_event_monitor
-            .is_some();
-        assert!(created, "cache-aware decode policy must create the monitor");
-
-        // Non-cache-aware role policies still skip it.
-        let mut config = config_with_policy(PolicyConfig::Random);
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: Some(PolicyConfig::RoundRobin),
-            decode_policy: None,
-        };
-        let created = AppContextBuilder::new()
-            .with_policy_registry(&config)
-            .with_kv_event_monitor(&config)
-            .kv_event_monitor
-            .is_some();
-        assert!(!created);
+            .with_kv_event_monitor();
+        assert!(builder.kv_event_monitor.is_some());
+        let registry = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set");
+        let policy = registry.on_worker_added("affine", Some("cache_aware"));
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .expect("the label's policy is cache-aware");
+        assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
     #[test]
@@ -1366,8 +1281,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+    #[tokio::test]
+    async fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(
@@ -1544,5 +1459,87 @@ mod effective_max_concurrent_requests_tests {
             Some(default_max_concurrent_requests())
         );
         assert_eq!(effective_max_concurrent_requests(7), Some(7));
+    }
+}
+
+/// The test fixture shared by the modules that drive a workflow step or a
+/// discovery pass against an `AppContext` built by hand.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use super::{AppContext, ToolParserFactory};
+    use crate::{
+        config::RouterConfig,
+        middleware::{AuthConfig, TokenBucket},
+        observability::inflight_tracker::InFlightRequestTracker,
+        routers::{
+            common::{openai_bridge, realtime::RealtimeRegistry},
+            grpc::multimodal::MultimodalConfigRegistry,
+        },
+        worker::{WorkerRegistry, WorkerService},
+    };
+
+    /// An `AppContext` over `router_config` and `worker_registry`: in-memory
+    /// storage, a generous rate limiter, no gateway, worker monitor or WASM
+    /// manager, the policy registry the configuration's policy and routing-key
+    /// override select, the given tool parsers (a parser override is validated
+    /// against them when they are given), and an uninitialized worker job
+    /// queue: submitted jobs are accepted and queued but never processed, so a
+    /// test observes what a step or a pass submits without spawning workflow
+    /// background tasks.
+    pub(crate) fn app_context_for_tests(
+        router_config: RouterConfig,
+        worker_registry: Arc<WorkerRegistry>,
+        tool_parser_factory: Option<ToolParserFactory>,
+    ) -> Arc<AppContext> {
+        let job_queue = Arc::new(std::sync::OnceLock::new());
+
+        Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
+            client: crate::clients::http_client(),
+            router_config: router_config.clone(),
+            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
+            rate_limit_manager: None,
+            worker_registry: Arc::clone(&worker_registry),
+            prefill_admission: None,
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
+                router_config.policy.clone(),
+                router_config.routing_key_override.clone(),
+            )),
+            reasoning_parser_factory: None,
+            tool_parser_factory,
+            gateway: None,
+            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            conversation_item_storage: Arc::new(
+                smg_data_connector::MemoryConversationItemStorage::new(),
+            ),
+            worker_monitor: None,
+            configured_reasoning_parser: None,
+            configured_tool_parser: None,
+            worker_job_queue: Arc::clone(&job_queue),
+            workflow_engines: Arc::new(std::sync::OnceLock::new()),
+            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
+            mcp_format_registry: openai_bridge::FormatRegistry::new(),
+            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
+            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            tokenizer_load_failures: Arc::default(),
+            wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
+            worker_service: Arc::new(WorkerService::new(
+                worker_registry,
+                job_queue,
+                router_config,
+            )),
+            inflight_tracker: InFlightRequestTracker::new(),
+            kv_event_monitor: None,
+            rl: None,
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+        })
     }
 }

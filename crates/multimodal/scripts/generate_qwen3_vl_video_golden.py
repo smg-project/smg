@@ -6,7 +6,7 @@ preprocessor values, so nothing is downloaded. The clip is decoded with OpenCV,
 sampled the way the media connector samples it (2 frames per second, at least 4
 and at most 768, spread evenly from the first frame to the last), and run
 through the processor with frame sampling off. The Rust integration test
-``tests/qwen3_vl_video_golden.rs`` compares its own output's shapes, grid and
+``tests/video/qwen3_vl_video_golden.rs`` compares its own output's shapes, grid and
 token count against the JSON this writes; the frame pixels themselves are not
 part of the golden.
 

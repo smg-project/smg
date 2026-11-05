@@ -30,10 +30,30 @@ if [ -n "$LAST_LOG" ]; then
     echo "$SEP"
 fi
 
-# List all log files with sizes
+# A worker relaunched on its port keeps the previous engine's log as
+# worker-<name>.log.<n>; an engine that died before the relaunch left its
+# trace there, not in the live file, so show each one's tail.
+shopt -s nullglob
+ROTATED=("$LOG_DIR"/worker-*.log.[0-9]*)
+shopt -u nullglob
+for ROTATED_LOG in "${ROTATED[@]}"; do
+    TOTAL=$(wc -l < "$ROTATED_LOG")
+    SHOW=$(( TOTAL < 60 ? TOTAL : 60 ))
+    echo ""
+    echo "$SEP"
+    echo "Previous engine's log: $(basename "$ROTATED_LOG") (last $SHOW of $TOTAL lines)"
+    echo "$DASH"
+    tail -60 "$ROTATED_LOG"
+    echo "$SEP"
+done
+
+# List all log files with sizes, the rotated ones included
+shopt -s nullglob
+ALL_LOGS=("$LOG_DIR"/*.log "$LOG_DIR"/*.log.[0-9]*)
+shopt -u nullglob
 echo ""
 echo "$SEP"
 echo "All worker logs in artifact: $ARTIFACT"
 echo "$DASH"
-ls -lhS "$LOG_DIR"/*.log 2>/dev/null || echo "  (none)"
+if [ "${#ALL_LOGS[@]}" -gt 0 ]; then ls -lhS "${ALL_LOGS[@]}"; else echo "  (none)"; fi
 echo "$SEP"

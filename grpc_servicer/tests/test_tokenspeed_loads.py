@@ -10,6 +10,7 @@ Run with: pytest grpc_servicer/tests/test_tokenspeed_loads.py
 """
 
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,31 @@ def loads_mod():
     return module
 
 
+@dataclass
+class AttentionMapping:
+    dp_size: int
+
+
+@dataclass
+class Mapping:
+    attn: AttentionMapping
+
+
+@dataclass
+class ServerArgs:
+    max_num_seqs: int
+    mapping: Mapping
+
+
 class TestRunningWindow:
+    @pytest.mark.parametrize(
+        ("dp_size", "total", "expected"),
+        [(1, 1024, 1024), (16, 1024, 64), (16, 1031, 64), (16, 0, 0)],
+    )
+    def test_window_is_the_local_scheduler_capacity(self, loads_mod, dp_size, total, expected):
+        args = ServerArgs(max_num_seqs=total, mapping=Mapping(attn=AttentionMapping(dp_size)))
+        assert loads_mod.running_window(args) == expected
+
     def test_max_num_seqs_is_the_window(self, loads_mod):
         assert loads_mod.running_window(SimpleNamespace(max_num_seqs=16)) == 16
 

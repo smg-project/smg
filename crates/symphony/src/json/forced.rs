@@ -57,7 +57,7 @@ impl Assembler {
 
     /// Append the next bytes and push the events they complete; the number of bytes taken: every
     /// byte up to the value's end, and none after it.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) -> usize {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         if self.unnamed {
             unnamed(bytes, out);
             return bytes.len();
@@ -115,13 +115,13 @@ impl Assembler {
 /// Bytes with no forced function to name a call for them: reported, not read.
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
-        text: Text::uncounted(bytes),
+        text: Text::uncounted(bytes.to_owned()),
         why: MalformedReason::NoForcedFunction,
     });
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out)
     }
 
@@ -139,11 +139,11 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::names;
+    use crate::testing::{arguments, names};
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
-    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
         let mut taken = 0;
@@ -151,17 +151,7 @@ mod tests {
             taken += assembler.feed(piece, declared, &mut out);
         }
         assembler.finish(&mut out);
-        (out.drain(), taken)
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
+        (out.into_owned().drain(), taken)
     }
 
     fn ends(events: &[Event]) -> usize {
@@ -222,7 +212,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::NoForcedFunction,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();

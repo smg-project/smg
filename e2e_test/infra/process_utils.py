@@ -10,10 +10,16 @@ import signal
 import socket
 import subprocess
 import time
+from typing import TYPE_CHECKING
 
 import requests
 
 from .constants import DEFAULT_HOST
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .worker import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +79,12 @@ def reserve_port(port: int) -> None:
 
 
 _LOW_PORT_FLOOR = 20000
+# Kubernetes keeps 30000-32767 for its node ports. A runner that shares its
+# node's network namespace binds one without an error, yet the node's service
+# proxy answers every connection to it, on the loopback address too: an engine
+# listened on such a port, its own warm-up client was refused, and the harness
+# waited out the whole start-up bound before it respawned the engine elsewhere.
+_NODE_PORT_RANGE = range(30000, 32768)
 
 
 def _ephemeral_port_floor() -> int:
@@ -85,15 +97,17 @@ def _ephemeral_port_floor() -> int:
 
 
 def get_open_port_block(count: int, max_attempts: int = 50) -> int:
-    """Reserve ``count`` consecutive free ports below the kernel's ephemeral range; return the first.
+    """Reserve ``count`` consecutive free ports below the kernel's ephemeral
+    range and below the node-port range; return the first.
 
     For ports an engine binds long after they are chosen (MoRI-IO's listeners
     bind once the engine has loaded its model), one per rank from a base. The
     kernel gives ports in its ephemeral range to any process on the host, so
-    one picked there can be taken before its owner binds it. Release each of
-    the ports with release_port().
+    one picked there can be taken before its owner binds it; a node port binds
+    but is never reached (``_NODE_PORT_RANGE``), whichever branch drew it.
+    Release each of the ports with release_port().
     """
-    ceiling = _ephemeral_port_floor()
+    ceiling = min(_ephemeral_port_floor(), _NODE_PORT_RANGE.start)
     for _ in range(max_attempts):
         if ceiling - _LOW_PORT_FLOOR > count:
             base = random.randrange(_LOW_PORT_FLOOR, ceiling - count)
@@ -102,12 +116,32 @@ def get_open_port_block(count: int, max_attempts: int = 50) -> int:
             release_port(base)
         block = range(base, base + count)
         # MoRI-IO's listeners bind every address, so check every address.
-        if all(p < 65536 and p not in _reserved_ports and port_is_free(p, "") for p in block):
+        if all(
+            p < 65536
+            and p not in _NODE_PORT_RANGE
+            and p not in _reserved_ports
+            and port_is_free(p, "")
+            for p in block
+        ):
             _reserved_ports.update(block)
             return base
     raise RuntimeError(
         f"Failed to find {count} consecutive free ports after {max_attempts} attempts"
     )
+
+
+def get_engine_port() -> int:
+    """Reserve a port an engine binds long after the harness chose it.
+
+    An engine listens last: it loads its model first, so its ports sit chosen
+    and unbound for a minute or more. A number from :func:`get_open_port` is
+    one the kernel's ephemeral range gave out, and every ``bind(0)`` and
+    outgoing connection on the host draws from that range: a stranger's HTTP
+    server sat on a decode worker's port by the time the engine bound it.
+    The engines' ports come from below that range instead, as the MoRI-IO
+    ports do. Release with :func:`release_port`.
+    """
+    return get_open_port_block(1)
 
 
 def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
@@ -165,6 +199,32 @@ def kill_process_tree(pid: int, sig: int = signal.SIGTERM) -> None:
         logger.warning("Failed to kill process tree for PID %d: %s", pid, e)
 
 
+def _live_processes(proc_root: str) -> list[tuple[int, int, int]]:
+    """``(pid, ppid, pgrp)`` of every process under ``proc_root`` that is not a
+    zombie awaiting reaping."""
+    live: list[tuple[int, int, int]] = []
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        try:
+            with open(
+                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
+            ) as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
+        # parentheses, so split after the last closing parenthesis.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 3 or fields[0] == "Z":
+            continue
+        try:
+            live.append((int(name), int(fields[1]), int(fields[2])))
+        except ValueError:
+            continue
+    return live
+
+
 def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]:
     """PIDs still running in ``pgid``, ignoring zombies that await reaping.
 
@@ -180,26 +240,20 @@ def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]
         except PermissionError:
             pass
         return [pgid]
-    members: list[int] = []
-    for name in os.listdir(proc_root):
-        if not name.isdigit():
-            continue
-        try:
-            with open(
-                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
-            ) as f:
-                stat = f.read()
-        except OSError:
-            continue
-        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
-        # parentheses, so split after the last closing parenthesis.
-        fields = stat.rpartition(")")[2].split()
-        if len(fields) < 3:
-            continue
-        state, pgrp = fields[0], fields[2]
-        if state != "Z" and pgrp == str(pgid):
-            members.append(int(name))
-    return members
+    return [pid for pid, _ppid, pgrp in _live_processes(proc_root) if pgrp == pgid]
+
+
+def live_child_processes(pid: int, proc_root: str = "/proc") -> list[int]:
+    """PIDs of the live direct children of ``pid``, ignoring zombies.
+
+    For a worker's launcher those are the engine's own processes (vLLM's
+    EngineCore, SGLang's scheduler and detokenizer, TokenSpeed's ranks), not
+    the workers those spawn in turn. Reads ``proc_root`` (``/proc`` on Linux);
+    empty where it cannot be read.
+    """
+    if not os.path.isdir(proc_root):
+        return []
+    return [child for child, ppid, _pgrp in _live_processes(proc_root) if ppid == pid]
 
 
 def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) -> list[int]:
@@ -490,6 +544,7 @@ def wait_for_workers_ready(
     api_key: str | None = None,
     process: subprocess.Popen | None = None,
     expected_urls: list[str] | None = None,
+    workers: Sequence[Worker] | None = None,
 ) -> None:
     """Wait for all workers to connect and for the router to become ready.
 
@@ -504,6 +559,10 @@ def wait_for_workers_ready(
             still missing at the deadline are named in the error (a
             data-parallel worker counts as registered once any of its ranks
             is).
+        workers: The workers behind those URLs, when the caller launched them;
+            a worker's exit ends the wait at once with its death report. An
+            engine that dials the router in loads its model inside this wait,
+            so its death would otherwise run the wait to its bound.
     """
     start = time.perf_counter()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -514,17 +573,19 @@ def wait_for_workers_ready(
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
             _raise_if_exited(process, "Router", router_url, start)
+            for worker in workers or ():
+                worker.raise_if_exited()
             try:
                 resp = session.get(f"{router_url}/workers", headers=headers, timeout=5)
                 if resp.status_code == 200:
                     data = resp.json()
-                    workers = data.get("workers", [])
-                    connected_workers = data.get("total", len(workers))
+                    listed = data.get("workers", [])
+                    connected_workers = data.get("total", len(listed))
                     # A data-parallel worker registers each rank as
                     # "<base>@<rank>" with the base URL in dp_base_url.
                     registered_urls = [
                         w.get("dp_base_url") or w["url"]
-                        for w in workers
+                        for w in listed
                         if isinstance(w, dict) and "url" in w
                     ]
                     if connected_workers >= expected_workers:

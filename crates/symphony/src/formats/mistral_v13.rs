@@ -11,8 +11,9 @@
 //! `ministral-3-14b-instruct-2512-bf16`, whose templates have no thought.
 //!
 //! The table is named after the tokenizer version that brought `[ARGS]`, and apart from the
-//! gateway's older `mistral` parser, which reads 7B v0.3's list: an operator naming `mistral` keeps
-//! that parser under `--parser symphony`, and the registry picks this table for the groups above.
+//! [`mistral`](super::mistral()) table, which reads 7B v0.3's list, the gateway's older `mistral`
+//! parser's format: an operator naming `mistral` reads with that table under `--parser symphony`,
+//! and the registry picks this one for the groups above.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -34,7 +35,10 @@ pub fn mistral_v13() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "call_open", "call")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::NamedArguments(ARGS))
+        .calls(CallSyntax::NamedArguments {
+            marker: ARGS,
+            between_calls: "",
+        })
         .opens_turn("[/INST]")
 }
 
@@ -44,33 +48,19 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
-        testing::{calls, content, drive, reasoning},
+        testing::{calls, content, drive, finish, reasoning},
         Declared,
     };
 
     /// The generation prompt's tail: the user turn's close, and nothing more.
     const PROMPT: &str = "[/INST]";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(mistral_v13(), Declared::default()),
             prompt,
             &[output],
         )
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,

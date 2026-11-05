@@ -21,29 +21,35 @@
 //! refusal before the first token) is classed the same way, so the worker
 //! is charged for it, in the worker-error family, exactly when it would be
 //! for the same status after the first token (see
-//! [`UpstreamClass::account_dispatch_failure`]).
+//! [`UpstreamClass::account_dispatch_failure`]). A worker's report that the
+//! engine could not continue the request under its constraint is the
+//! request's outcome, counted under its own `error_type`, charged to no
+//! worker, and the event names it by the `code` the HTTP answer carries.
+//! A reading that panicked in the gateway, caught at the request's boundary
+//! (`utils::isolation`), is the request's own failure: an `internal_error`
+//! event under `reader_panicked`, charged to no worker, counted under the
+//! table that read the output ([`Panicked::record`]).
 
 use std::{fmt, sync::Arc};
 
 use axum::http::StatusCode;
+use smg_grpc_client::is_constraint_failure;
 use tracing::{error, warn};
 
 use super::{
-    chat_utils::{send_error_sse, SseSender},
+    chat_utils::{send_error_sse_with_code, SseSender},
+    isolation::{Panicked, READER_PANICKED_CODE},
     metrics::error_type_from_status,
-    pd_bootstrap::account_pd_side_failure,
-    tonic_ext::TonicStatusExt,
+    pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous},
+    tonic_ext::{is_the_engines_own_report, TonicStatusExt, CONSTRAINT_FAILED_CODE},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
-        grpc::{
-            context::{DispatchMetadata, WorkerSelection},
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
-        },
+        grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
+    worker::{basic::WorkerTypeExt, endpoint::Endpoint, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -80,6 +86,9 @@ pub(crate) struct UpstreamClass {
     pub(crate) http: StatusCode,
     /// The `error_type` label the status counts under.
     pub(crate) error_type: &'static str,
+    /// The `reason` label the status counts under: the cause behind the
+    /// class (see [`TonicStatusExt::error_reason`]).
+    pub(crate) reason: &'static str,
     /// What the worker's circuit breaker samples for the status; `None` for
     /// a failure that says nothing about the worker (the request's media).
     pub(crate) breaker_sample: Option<u16>,
@@ -95,14 +104,24 @@ impl UpstreamClass {
     /// gateway before the first token as after it.
     pub(crate) fn of(status: &tonic::Status) -> Self {
         let http = status.http_status();
-        let error_type = if is_the_engines_own_report(status) {
+        let error_type = if is_constraint_failure(status) {
+            metrics_labels::ERROR_CONSTRAINT
+        } else if is_the_engines_own_report(status) {
             metrics_labels::ERROR_ENGINE
+        } else if status.media_fault().is_some() {
+            // The request's media failed, on whichever side of the fetch: the
+            // router counts it as the request's error (the reference is the
+            // request's input) and never as the worker's, whatever status
+            // tells the client to do about it (a 400 to fix the reference, a
+            // 502 to try the host again later).
+            metrics_labels::ERROR_VALIDATION
         } else {
             error_type_from_status(http)
         };
         Self {
             http,
             error_type,
+            reason: status.error_reason(),
             breaker_sample: status.breaker_status(),
         }
     }
@@ -183,13 +202,6 @@ impl UpstreamClass {
     }
 }
 
-/// Whether `status` is the engine's own report that the request failed (its
-/// `Complete` had finish reason `error`; the ZMQ lane's adapters end their
-/// streams with the same words), as opposed to a failed call to the worker.
-fn is_the_engines_own_report(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::Internal && status.message() == ENGINE_ERROR_MESSAGE
-}
-
 /// Why a streaming response ended before its final chunk.
 #[derive(Debug)]
 pub(crate) enum StreamFailure {
@@ -198,14 +210,21 @@ pub(crate) enum StreamFailure {
     /// engine answered a status after its first chunk, or it finished the
     /// request with an error of its own (`finish_reason == "error"`, the KV
     /// handoff of a decode side that failed). `completion_tokens` is how far
-    /// the response had come; `stream` says which worker's stream it was.
+    /// the response had come; `stream` says which worker's stream it was;
+    /// `rendezvous` is the pair's bootstrap port when the gateway probed it
+    /// behind the failure and found it dead (see [`StreamSource::explain`]).
     Upstream {
         status: tonic::Status,
         completion_tokens: u32,
         stream: UpstreamStream,
+        rendezvous: Option<DeadRendezvous>,
     },
     /// The gateway's own processing failed.
     Internal(String),
+    /// The gateway's reading of the response panicked, caught at the
+    /// request's boundary (`utils::isolation`): the request's failure, not
+    /// the task's.
+    Panicked(Panicked),
 }
 
 impl StreamFailure {
@@ -215,6 +234,7 @@ impl StreamFailure {
             status,
             completion_tokens,
             stream: UpstreamStream::Answer,
+            rendezvous: None,
         }
     }
 
@@ -224,6 +244,7 @@ impl StreamFailure {
             status,
             completion_tokens: 0,
             stream: UpstreamStream::Prefill,
+            rendezvous: None,
         }
     }
 
@@ -232,7 +253,7 @@ impl StreamFailure {
     pub(crate) fn class(&self) -> Option<UpstreamClass> {
         match self {
             Self::Upstream { status, .. } => Some(UpstreamClass::of(status)),
-            Self::Internal(_) => None,
+            Self::Internal(_) | Self::Panicked(_) => None,
         }
     }
 
@@ -253,6 +274,27 @@ impl StreamFailure {
             class.client_type(MESSAGES_API_ERROR_TYPE)
         })
     }
+
+    /// The `code` of the SSE error event that ends the response, when the
+    /// failure has one of its own: `constraint_failed` for a worker's report
+    /// that the engine could not continue the request under its constraint,
+    /// `reader_panicked` for a reading that panicked; each the code the HTTP
+    /// answer to the same failure carries. `None` otherwise.
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Upstream { status, .. } if is_constraint_failure(status) => {
+                Some(CONSTRAINT_FAILED_CODE)
+            }
+            Self::Panicked(_) => Some(READER_PANICKED_CODE),
+            Self::Upstream { .. } | Self::Internal(_) => None,
+        }
+    }
+}
+
+impl From<Panicked> for StreamFailure {
+    fn from(panicked: Panicked) -> Self {
+        Self::Panicked(panicked)
+    }
 }
 
 impl From<String> for StreamFailure {
@@ -269,20 +311,29 @@ impl From<&str> for StreamFailure {
 
 impl fmt::Display for StreamFailure {
     /// The `message` of the SSE error event; an upstream failure keeps the
-    /// wording clients have been reading.
+    /// wording clients have been reading, with the dead rendezvous port the
+    /// gateway found behind it, when it did, after the engine's report.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Upstream {
                 status,
                 stream: UpstreamStream::Answer,
+                rendezvous,
                 ..
-            } => write!(f, "Stream error: {}", status.message()),
+            } => {
+                write!(f, "Stream error: {}", status.message())?;
+                match rendezvous {
+                    Some(rendezvous) => write!(f, "; {rendezvous}"),
+                    None => Ok(()),
+                }
+            }
             Self::Upstream {
                 status,
                 stream: UpstreamStream::Prefill,
                 ..
             } => write!(f, "Prefill stream error: {}", status.message()),
             Self::Internal(message) => f.write_str(message),
+            Self::Panicked(panicked) => write!(f, "{panicked}"),
         }
     }
 }
@@ -336,6 +387,30 @@ impl StreamSource {
         self
     }
 
+    /// `failure` explained, when the gateway can explain it: the decode side
+    /// of a disaggregated pair the engine failed before its first token, with
+    /// no reason of its own, is read against the pair's bootstrap port,
+    /// probed now (see [`dead_rendezvous_of`]). The failure with the dead
+    /// port on it; `None` for any other failure, or a port that accepted.
+    pub(crate) async fn explain(&self, failure: &StreamFailure) -> Option<StreamFailure> {
+        let StreamFailure::Upstream {
+            status,
+            completion_tokens: 0,
+            stream: UpstreamStream::Answer,
+            rendezvous: None,
+        } = failure
+        else {
+            return None;
+        };
+        let rendezvous = dead_rendezvous_of(self.prefill.as_ref(), status).await?;
+        Some(StreamFailure::Upstream {
+            status: status.clone(),
+            completion_tokens: 0,
+            stream: UpstreamStream::Answer,
+            rendezvous: Some(rendezvous),
+        })
+    }
+
     /// Log and count `failure`. A status the engine answered after the
     /// response began is accounted, on the side whose stream it was, as a
     /// failed dispatch of the same status is (see [`UpstreamClass`]): the
@@ -343,13 +418,21 @@ impl StreamSource {
     /// worker-error family counts it only when it is the worker's failure,
     /// the router-error family counts every one, all under one `error_type`;
     /// and one WARN names the worker, its side, the request, the class and how
-    /// far the response had come. A failure of the gateway's own processing
-    /// leaves the worker's record alone.
+    /// far the response had come (and the pair's dead bootstrap port, when
+    /// the failure was explained by one). A failure of the gateway's own
+    /// processing leaves the worker's record alone; a reading that panicked
+    /// is recorded as the isolation records it ([`Panicked::record`]): the
+    /// table's outcome and one ERROR line naming the request.
     pub(crate) fn account(&self, failure: &StreamFailure) {
+        if let StreamFailure::Panicked(panicked) = failure {
+            panicked.record(&self.request_id, &self.model);
+            return;
+        }
         let StreamFailure::Upstream {
             status,
             completion_tokens,
             stream,
+            rendezvous,
         } = failure
         else {
             return;
@@ -359,17 +442,39 @@ impl StreamSource {
             UpstreamStream::Prefill => (self.prefill.as_ref(), metrics_labels::WORKER_PREFILL),
         };
         let class = UpstreamClass::of(status);
-        warn!(
-            request_id = %self.request_id,
-            worker = worker.map_or("none", |worker| worker.url()),
-            worker_type,
-            completion_tokens,
-            grpc_code = ?status.code(),
-            http_status = class.http.as_u16(),
-            error_type = class.error_type,
-            "Stream ended by the engine before completion: {}",
-            status.message()
-        );
+        let worker_url = worker.map_or("none", |worker| worker.url());
+        match rendezvous {
+            Some(DeadRendezvous(port)) => warn!(
+                request_id = %self.request_id,
+                worker = %Endpoint::redacted_str(worker_url),
+                worker_type,
+                completion_tokens,
+                grpc_code = ?status.code(),
+                http_status = class.http.as_u16(),
+                error_type = class.error_type,
+                reason = class.reason,
+                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.redacted_url()),
+                bootstrap_host = port.host.as_str(),
+                bootstrap_port = port.port,
+                bootstrap_port_source = port.source.label(),
+                probe_error = %port.error,
+                "Stream ended by the engine before completion, and the prefill side's bootstrap \
+                 port did not accept a connection: the sides could not rendezvous: {}",
+                status.message()
+            ),
+            None => warn!(
+                request_id = %self.request_id,
+                worker = %Endpoint::redacted_str(worker_url),
+                worker_type,
+                completion_tokens,
+                grpc_code = ?status.code(),
+                http_status = class.http.as_u16(),
+                error_type = class.error_type,
+                reason = class.reason,
+                "Stream ended by the engine before completion: {}",
+                status.message()
+            ),
+        }
         if let (Some(worker), Some(sample)) = (worker, class.breaker_sample) {
             worker.record_outcome(sample);
         }
@@ -395,6 +500,7 @@ impl StreamSource {
             &self.model,
             self.endpoint,
             class.error_type,
+            class.reason,
         );
     }
 }
@@ -402,12 +508,17 @@ impl StreamSource {
 /// End a failed streaming response: the accounting, then the SSE error event
 /// typed for the failure (the caller's `[DONE]` follows). A client that has
 /// already gone is told nothing, and a failure of the gateway's own processing
-/// is logged only when there was a client to fail.
+/// is logged only when there was a client to fail. A decode side the engine
+/// failed without a reason is first read against the pair's bootstrap port
+/// (see [`StreamSource::explain`]), so the line, the counts and the event
+/// name the dead rendezvous when there is one.
 pub(crate) async fn send_stream_failure(
     tx: &SseSender,
     failure: &StreamFailure,
     source: &StreamSource,
 ) {
+    let explained = source.explain(failure).await;
+    let failure = explained.as_ref().unwrap_or(failure);
     source.account(failure);
     if tx.is_closed() {
         return;
@@ -418,18 +529,25 @@ pub(crate) async fn send_stream_failure(
             "Streaming response failed in the gateway: {message}"
         );
     }
-    send_error_sse(tx, failure, failure.error_type()).await;
+    send_error_sse_with_code(tx, failure, failure.error_type(), failure.code()).await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::WorkerType;
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode,
+    use crate::{
+        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        test_support::RefusedAddress,
+        worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            test_support::no_health_check,
+            BasicWorkerBuilder, ConnectionMode,
+        },
     };
 
     fn dispatch() -> DispatchMetadata {
@@ -450,10 +568,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -518,6 +633,18 @@ mod tests {
         .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.ends_with(" 1"), "{line}");
         label(line, "error_type")
+    }
+
+    /// The `reason` of the one `smg_router_request_errors_total` sample of
+    /// the chat endpoint.
+    fn router_error_reason(rendered: &str) -> &str {
+        let line = sample(
+            rendered,
+            "smg_router_request_errors_total",
+            &["router_type=\"grpc\"", "endpoint=\"chat\""],
+        )
+        .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        label(line, "reason")
     }
 
     /// The value of the label `name` on a rendered sample line.
@@ -619,6 +746,7 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), Some("backend_error"));
         assert_eq!(router_error_type(&rendered), "backend_error");
+        assert_eq!(router_error_reason(&rendered), "transport_disconnect");
     }
 
     /// A stream that ended with an HTTP/2 fault (the connection to the
@@ -637,6 +765,7 @@ mod tests {
             (class.http, class.error_type, class.breaker_sample),
             (StatusCode::BAD_GATEWAY, "backend_error", Some(502))
         );
+        assert_eq!(class.reason, "transport_disconnect");
         assert!(class.is_worker_failure());
         assert_eq!(class.client_type("stream_error"), "stream_error");
     }
@@ -644,16 +773,29 @@ mod tests {
     #[test]
     fn a_failure_of_the_requests_media_takes_no_breaker_sample() {
         // A worker that predates the media-fault trailer reports the media
-        // host's failure on UNAVAILABLE, in the connector's words. It is
-        // answered as the request's own input (a 400), so the router counts
-        // it as the request's error, and the worker's breaker never sees it.
+        // host's failure on UNAVAILABLE, in the connector's words. The client
+        // is answered for the host (a 502, so it knows to retry), but the
+        // router counts it as the request's error (the reference is the
+        // request's input), not the worker's: no breaker sample, no
+        // worker-failure class, and the router-error family keeps the
+        // request's label.
         let status = tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
         );
-        assert_eq!(UpstreamClass::of(&status).breaker_sample, None);
+        let class = UpstreamClass::of(&status);
+        assert_eq!(
+            (class.http, class.error_type, class.breaker_sample),
+            (StatusCode::BAD_GATEWAY, "validation_error", None)
+        );
+        assert!(!class.is_worker_failure());
+        let failure = StreamFailure::upstream(status.clone(), 7);
+        assert_eq!(failure.error_type(), "server_error");
         let (worker, handle) = account_on_a_fresh_worker(status);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-        assert_eq!(router_error_type(&handle.render()), "validation_error");
+        let rendered = handle.render();
+        assert_eq!(worker_error_type(&rendered), None, "{rendered}");
+        assert_eq!(router_error_type(&rendered), "validation_error");
+        assert_eq!(router_error_reason(&rendered), "media_fault");
     }
 
     #[test]
@@ -671,6 +813,7 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), None, "{rendered}");
         assert_eq!(router_error_type(&rendered), "validation_error");
+        assert_eq!(router_error_reason(&rendered), "invalid_request");
     }
 
     #[test]
@@ -685,13 +828,20 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), Some("timeout"));
         assert_eq!(router_error_type(&rendered), "timeout");
+        assert_eq!(router_error_reason(&rendered), "deadline");
     }
 
     #[test]
     fn an_unavailable_or_internal_status_after_the_first_chunk_is_a_backend_error() {
-        for status in [
-            tonic::Status::unavailable("connection reset"),
-            tonic::Status::internal("h2 protocol error: connection reset"),
+        for (status, reason) in [
+            (
+                tonic::Status::unavailable("connection reset"),
+                "engine_unavailable",
+            ),
+            (
+                tonic::Status::internal("h2 protocol error: connection reset"),
+                "engine_internal",
+            ),
         ] {
             assert_eq!(
                 StreamFailure::upstream(status.clone(), 7).error_type(),
@@ -701,7 +851,10 @@ mod tests {
             assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
             let rendered = handle.render();
             assert_eq!(worker_error_type(&rendered), Some("backend_error"));
+            // One class; the reason tells the worker's own UNAVAILABLE from
+            // its INTERNAL.
             assert_eq!(router_error_type(&rendered), "backend_error");
+            assert_eq!(router_error_reason(&rendered), reason);
         }
     }
 
@@ -719,6 +872,7 @@ mod tests {
         // The router counts the rate-limit error the client read, not an
         // internal error.
         assert_eq!(router_error_type(&rendered), "rate_limit_error");
+        assert_eq!(router_error_reason(&rendered), "overloaded");
     }
 
     #[test]
@@ -838,6 +992,170 @@ mod tests {
             !handle
                 .render()
                 .contains("smg_pd_rendezvous_failures_total{"),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// A prefill side on the loopback host whose partners are handed `port`,
+    /// its breaker opening on the first failure like [`worker`]'s.
+    fn prefill_on(port: u16) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(port))
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// The source of a disaggregated chat answer whose prefill side is
+    /// `prefill`, with the decode side it is read from.
+    fn pd_source_with(prefill: Arc<dyn Worker>) -> (StreamSource, Arc<dyn Worker>) {
+        let decode = worker();
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode: Arc::clone(&decode),
+            runtime_type: Default::default(),
+        };
+        let source =
+            StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT)
+                .with_backend(metrics_labels::BACKEND_PD);
+        (source, decode)
+    }
+
+    /// The engine's own report, before the first token.
+    fn reasonless_before_the_first_token() -> StreamFailure {
+        StreamFailure::upstream(tonic::Status::internal(ENGINE_ERROR_MESSAGE), 0)
+    }
+
+    /// A decode side the engine failed before its first token, with no reason
+    /// of its own, behind a prefill side whose bootstrap port nothing listens
+    /// on: the failure is explained by the dead port, the client's message
+    /// names it after the engine's report, the class stays the engine's
+    /// error (the decode worker's breaker and error family, the router
+    /// family), and the rendezvous family counts it under the request phase
+    /// on the prefill side.
+    #[tokio::test]
+    async fn a_decode_leg_failed_before_its_first_token_is_explained_by_the_dead_bootstrap_port() {
+        let refused = RefusedAddress::reserve();
+        let (source, decode) = pd_source_with(prefill_on(refused.port()));
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let explained = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            source.explain(&reasonless_before_the_first_token()).await
+        }
+        .expect("the dead port explains the failure");
+        assert!(
+            matches!(
+                &explained,
+                StreamFailure::Upstream {
+                    stream: UpstreamStream::Answer,
+                    completion_tokens: 0,
+                    rendezvous: Some(_),
+                    ..
+                }
+            ),
+            "{explained:?}"
+        );
+        let message = explained.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "Stream error: {ENGINE_ERROR_MESSAGE}; the prefill side's bootstrap port did not \
+                 accept a connection ("
+            )) && message.ends_with("), so the sides could not rendezvous"),
+            "{message}"
+        );
+        assert_eq!(explained.error_type(), "stream_error");
+        assert_eq!(explained.messages_error_type(), "api_error");
+
+        metrics::with_local_recorder(&recorder, || source.account(&explained));
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Open);
+        let rendered = handle.render();
+        assert!(
+            sample(
+                &rendered,
+                "smg_pd_rendezvous_failures_total",
+                &["leg=\"prefill\"", "phase=\"request\""]
+            )
+            .is_some_and(|line| line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            sample(
+                &rendered,
+                "smg_worker_errors_total",
+                &["worker_type=\"decode\"", "error_type=\"engine_error\""]
+            )
+            .is_some_and(|line| line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            sample(
+                &rendered,
+                "smg_router_request_errors_total",
+                &["backend_type=\"pd\"", "error_type=\"engine_error\""]
+            )
+            .is_some_and(|line| line.ends_with(" 1")),
+            "{rendered}"
+        );
+    }
+
+    /// Nothing explains a failure that is not a reasonless report of the
+    /// decode side before its first token: a port that accepts, a side past
+    /// its first token, the prefill side's own failure, a status with the
+    /// engine's words, a single worker. Each keeps its message, and the
+    /// rendezvous family counts no request phase.
+    #[tokio::test]
+    async fn any_other_failure_is_left_as_it_is() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("address").port();
+        let (live_source, _) = pd_source_with(prefill_on(live));
+        let refused = RefusedAddress::reserve();
+        let (dead_source, _) = pd_source_with(prefill_on(refused.port()));
+        let single = WorkerSelection::Single { worker: worker() };
+        let single_source =
+            StreamSource::new(Some(&single), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let explained = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            [
+                live_source
+                    .explain(&reasonless_before_the_first_token())
+                    .await,
+                dead_source
+                    .explain(&StreamFailure::upstream(
+                        tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+                        3,
+                    ))
+                    .await,
+                dead_source
+                    .explain(&StreamFailure::prefill(tonic::Status::internal(
+                        ENGINE_ERROR_MESSAGE,
+                    )))
+                    .await,
+                dead_source
+                    .explain(&StreamFailure::upstream(
+                        tonic::Status::internal(
+                            "Decode handshake failed for request rank=0 req.rid='r2' \
+                             req.bootstrap_room=42",
+                        ),
+                        0,
+                    ))
+                    .await,
+                dead_source.explain(&cut()).await,
+                single_source
+                    .explain(&reasonless_before_the_first_token())
+                    .await,
+            ]
+        };
+        assert!(explained.iter().all(Option::is_none), "{explained:?}");
+        assert!(
+            !handle.render().contains("phase=\"request\""),
             "{}",
             handle.render()
         );
@@ -1070,5 +1388,48 @@ mod tests {
         .unwrap_or_else(|| panic!("counted under the worker's labels:\n{rendered}"));
         assert_eq!(label(line, "error_type"), "engine_error");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A reading that panicked is the gateway's own failure: an
+    /// `internal_error` event under `reader_panicked`, the worker uncharged,
+    /// the output counted under the table that read it.
+    #[test]
+    fn a_reading_that_panicked_is_an_internal_error_under_its_code_and_charges_no_worker() {
+        let panicked: Result<(), _> =
+            super::super::isolation::isolated_sync(|| panic!("the reader slipped"));
+        let failure = StreamFailure::from(panicked.expect_err("the panic").read_by(Some("qwen3")));
+        assert_eq!(failure.error_type(), INTERNAL_ERROR_TYPE);
+        assert_eq!(failure.messages_error_type(), MESSAGES_API_ERROR_TYPE);
+        assert_eq!(failure.code(), Some(READER_PANICKED_CODE));
+        // The client's text names the failure; the message is the log line's.
+        assert_eq!(
+            failure.to_string(),
+            "the gateway's reader of the response panicked"
+        );
+        assert!(failure.class().is_none());
+        // Accounted: the table's outcome, nothing of the worker's record.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = worker();
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let source =
+            StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        metrics::with_local_recorder(&recorder, || source.account(&failure));
+        let rendered = handle.render();
+        let outputs = sample(
+            &rendered,
+            "smg_symphony_outputs_total",
+            &["table=\"qwen3\"", "outcome=\"panicked\""],
+        )
+        .unwrap_or_else(|| panic!("the table's outcome:\n{rendered}"));
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(worker_error_type(&rendered).is_none(), "{rendered}");
+        assert!(
+            sample(&rendered, "smg_router_request_errors_total", &[]).is_none(),
+            "{rendered}"
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
     }
 }

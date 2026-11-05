@@ -33,34 +33,14 @@ pub fn ling() -> Format {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
-    use serde_json::json as value;
-
     use super::*;
     use crate::{
         engine::Engine,
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, drive},
-        Declared,
+        testing::{bytes, drive, weather_declared},
     };
-
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
 
     const PROMPT: &str = "<think>\n";
     const OUTPUT: &str = concat!(
@@ -69,8 +49,12 @@ mod tests {
         "</tool_call>\n<tool_call>get_weather\n</tool_call>"
     );
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        drive(&mut Engine::new(ling(), declared()), prompt, &[output])
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(ling(), weather_declared()),
+            prompt,
+            &[output],
+        )
     }
 
     fn arguments(events: &[Event]) -> Vec<(String, String)> {
@@ -103,14 +87,14 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -139,7 +123,7 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -153,7 +137,7 @@ mod tests {
             if !OUTPUT.is_char_boundary(cut) {
                 continue;
             }
-            let mut parser = Engine::new(ling(), declared());
+            let mut parser = Engine::new(ling(), weather_declared());
             let mut out = Events::new();
             parser
                 .feed(

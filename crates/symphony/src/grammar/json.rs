@@ -1,12 +1,12 @@
 //! The JSON family's spellings: a call as the call markers around one JSON object (`json`),
-//! xLAM's and Llama Nemotron's lists of such objects, Inkling's named JSON and Mistral's named
-//! arguments. Each builder writes the tag the family's assembler reads back, the tool's schema as
+//! xLAM's and Llama Nemotron's lists of such objects, Inkling's named JSON, and the named
+//! arguments of Mistral and of DeepSeek V3 and V3.1. Each builder writes the tag the family's assembler reads back, the tool's schema as
 //! the arguments' grammar.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{CallMarkers, Count, Grammar, Tag};
+use super::{calls, CallMarkers, Count, Grammar, Tag, WayIn};
 use crate::format::{Emits, Format, Whitespace};
 
 /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -74,18 +74,60 @@ pub(super) fn named_calls(
     Some(count.triggered(vec![marker.to_string()], tags))
 }
 
-/// Mistral's named arguments: the call's opener triggers a tag per tool, the opener, the
-/// tool's name and the marker as its `begin`, the arguments the tool's schema accepts as its
-/// content, and nothing as its `end`, since the template writes no closing marker: the object
-/// the schema accepts ends the tag, and the next opener or the end of the turn follows. The
-/// opener is the terminal of the row from the turn's own state into the arguments state;
-/// `None` for a table without one.
+/// The named-arguments syntax's two texts, as the table declares them
+/// ([`CallSyntax::NamedArguments`](crate::format::CallSyntax::NamedArguments)).
+pub(super) struct NamedArguments<'a> {
+    /// Between the tool's name and the arguments object.
+    pub(super) marker: &'a str,
+    /// Between two calls of a block.
+    pub(super) between_calls: &'a str,
+}
+
+/// The named-arguments syntax: the call's opener, the tool's name and the marker begin a call,
+/// and the arguments the tool's schema accepts follow. Where the call has a close of its own, the
+/// close ends it, and the calls sit between the block's ways in and its close when the table has a
+/// block (DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>` inside
+/// `<｜tool▁calls▁begin｜>` … `<｜tool▁calls▁end｜>`; DeepSeek V3's fenced call in the same
+/// block), as the tagged syntaxes' calls do ([`calls::in_block`]), with what the template writes
+/// between two calls before every call after the first (V3's newline). Without one (Mistral's
+/// `[TOOL_CALLS]NAME[ARGS]{…}`), the opener triggers a tag per tool whose `end` is nothing, since
+/// the template writes no closing marker: the object the schema accepts ends the tag, and the next
+/// opener or the end of the turn follows. That opener is the terminal of the row from the turn's
+/// own state into the arguments state; `None` for a table without one.
 pub(super) fn named_arguments_calls(
     format: &Format,
-    marker: &str,
+    syntax: NamedArguments<'_>,
+    markers: Option<&CallMarkers<'_>>,
+    ways_in: &[WayIn<'_>],
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Option<Grammar> {
+    let marker = syntax.marker;
+    let arguments = |tool: &Tool| Grammar::JsonSchema {
+        schema: tool.function.parameters.clone(),
+        style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
+    };
+    if let Some(markers) = markers {
+        let calls = tools
+            .iter()
+            .map(|tool| {
+                (
+                    format!("{}{}{marker}", markers.call_open, tool.function.name),
+                    arguments(tool),
+                    markers.call_close.to_string(),
+                )
+            })
+            .collect();
+        return Some(calls::in_block(
+            markers,
+            ways_in,
+            calls,
+            count,
+            |one_call| count.calls_between(one_call, syntax.between_calls),
+        ));
+    }
     let (_, open, _) = format
         .transitions()
         .find(|&(source, _, target)| source == 0 && format.emits(target) == Emits::Arguments)?;
@@ -95,12 +137,7 @@ pub(super) fn named_arguments_calls(
         .map(|tool| {
             Tag::new(
                 format!("{open}{}{marker}", tool.function.name),
-                Grammar::JsonSchema {
-                    schema: tool.function.parameters.clone(),
-                    style: None,
-                    excludes: Vec::new(),
-                    whitespace: Whitespace::Free,
-                },
+                arguments(tool),
                 "",
             )
         })
@@ -112,6 +149,14 @@ pub(super) fn named_arguments_calls(
 /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`; with one
 /// call, that call alone, and after the `]` what the count writes after the last call.
 fn list(tools: &[&Tool], count: Count<'_>) -> Grammar {
+    let mut list = list_open(tools, count);
+    list.push(Grammar::ConstString(count.end("]")));
+    Grammar::Sequence(list)
+}
+
+/// The list without its close: `[` and the calls, as [`list`] writes them; the caller writes the
+/// `]`, in the list or as the end of the tag the list fills ([`list_tag`]).
+fn list_open(tools: &[&Tool], count: Count<'_>) -> Vec<Grammar> {
     let one_call = Grammar::Or(
         tools
             .iter()
@@ -137,8 +182,7 @@ fn list(tools: &[&Tool], count: Count<'_>) -> Grammar {
             one_call,
         ]))));
     }
-    list.push(Grammar::ConstString(count.end("]")));
-    Grammar::Sequence(list)
+    list
 }
 
 /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
@@ -167,16 +211,21 @@ pub(super) fn list_calls(tools: &[&Tool], count: Count<'_>) -> Grammar {
     }
 }
 
-/// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer.
+/// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer. A list
+/// with no closer, which the turn ends (the Mistral list), ends its tag with its own `]`: the
+/// engines' structural-tag parsers refuse a tag whose content may grow without bound (the further
+/// calls) behind an empty end, since nothing would tell them where the tag stops
+/// ([`Grammar::check`]).
 pub(super) fn list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
     // The tag's end carries the end of the turn, so the list inside it writes none.
     let inside = Count { last: "", ..count };
+    let (content, close) = if markers.call_close.is_empty() {
+        (Grammar::Sequence(list_open(tools, inside)), "]")
+    } else {
+        (list(tools, inside), markers.call_close)
+    };
     count.triggered(
         vec![markers.call_open.to_string()],
-        vec![Tag::new(
-            markers.call_open,
-            list(tools, inside),
-            markers.call_close,
-        )],
+        vec![Tag::new(markers.call_open, content, close)],
     )
 }

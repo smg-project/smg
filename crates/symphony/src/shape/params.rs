@@ -187,7 +187,7 @@ impl Params {
         let close = if self.written == 0 { "{}" } else { "}" };
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: close.to_string(),
+            json: close.to_string().into(),
             source: Text::default(),
         });
     }
@@ -297,7 +297,7 @@ impl Params {
         let again = self.keys.iter().any(|written| written == key);
         if again && self.values.reader().duplicates() == Duplicates::First {
             out.push(Event::Malformed {
-                text: Text::uncounted(parameter),
+                text: Text::uncounted(parameter.to_owned()),
                 why: MalformedReason::KeyWrittenTwice,
             });
             return;
@@ -314,8 +314,8 @@ impl Params {
         member.push_str(&self.values.reader().read(self.parser, value, schema));
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: member,
-            source: Text::uncounted(parameter),
+            json: member.into(),
+            source: Text::uncounted(parameter.to_owned()),
         });
         self.written += 1;
     }
@@ -326,7 +326,7 @@ impl Params {
             return;
         }
         out.push(Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         });
         self.dropped += text.len();

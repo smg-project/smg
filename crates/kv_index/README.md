@@ -179,7 +179,9 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   prompt longer than any it has answered, as an engine meeting a new shape may build a kernel for
   it first: that grace arms no veto and lifts none), re-admits a worker on its first contact with a closed
   circuit breaker, and never touches the health status. A veto steers, it never refuses: when every
-  candidate is vetoed, the request goes to the least-loaded ready worker among them.
+  candidate is vetoed, the request goes to the least-loaded ready worker among them (a cache-aware
+  prefill pool of a prefill/decode pair, or a regular request that `consistent_hashing` places by
+  its routing key, is not steered by the overload thresholds unless `--worker-overload-shed` is set).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
@@ -190,15 +192,15 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   event-driven requests are hashed under their cache namespace.
 - **Protection by default.** Worker overload protection is on as steering: a worker at or above
   `--worker-overload-waiting-requests` or `--worker-overload-token-usage` is left out of selection
-  while another is under them, and a fleet uniformly over them is routed to its least-loaded worker;
+  while another is under them, and a fleet uniformly over them is routed to its least-loaded worker
+  (a cache-aware prefill pool of a prefill/decode pair is balanced by its spill gate instead,
+  and a regular request that `consistent_hashing` places by its routing key stays on its ring
+  owner, unless `--worker-overload-shed` is set);
   shedding stays opt-in (`--worker-overload-shed`).
 
 ## Flags and settings
 
-Gateway: `--kv-index chain` (deprecated: the chain index is the only KV index, so the flag takes
-`chain` only and goes in a later release; `positional` is refused), `--kv-indexer-ttl-secs`,
-`--kv-indexer-max-entries` (deprecated, accepted and ignored: the chain index has no prune);
-`--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
+Gateway: `--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
 `--worker-warmup-share` (0.25), `--worker-warmup-blocks` (1024), `--worker-warmup-thin-ratio`
 (0.5); `--worker-overload-protection` (on), `--disable-worker-overload-protection`,
 `--worker-overload-waiting-requests` (8), `--worker-overload-token-usage` (0.8),
@@ -213,6 +215,8 @@ Servicers: `SMG_KV_EVENT_HISTORY_BATCHES` (10,000), `SMG_KV_EVENT_HISTORY_BYTES`
 
 Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds{worker}`,
 `smg_kv_event_blocks_total{worker,op}`, `smg_kv_event_parentless_stores_total{worker}`,
+`smg_kv_event_sub_block_stores_total{worker}` (stores narrower than the worker's block of record,
+a hybrid engine's prefix entries at its hash granularity, left out of the index),
 `smg_kv_index_blocks{worker}`, `smg_kv_index_memberships` and `smg_kv_index_entries` per model,
 `smg_kv_index_runs_live`, `smg_kv_index_blocks_live`, `smg_kv_index_arena_bytes`,
 `smg_kv_index_arena_free_bytes`, `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`, `smg_kv_index_engine_conflicts`;

@@ -3,8 +3,8 @@
 Uses raw HTTP because the installed OpenAI SDK can predate Decisions. SGLang
 scores candidate labels during prefill, so successful responses have zero
 output usage. Run with E2E_ENGINE=sglang E2E_RUNTIME=sglang pytest
-e2e_test/router/test_decisions.py -v. Set E2E_SGLANG_SERVICER_IMPL=rust to
-exercise the Rust gRPC servicer; the default uses the Python servicer.
+e2e_test/router/test_decisions.py -v. E2E_SGLANG_SERVICER_IMPL=rust or =python
+names the gRPC servicer; unset follows the servicer package's default.
 """
 
 from __future__ import annotations

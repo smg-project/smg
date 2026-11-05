@@ -114,6 +114,19 @@ fn bench_decode(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("sequence_append_token_into", |b| {
+        b.iter_batched(
+            || (Sequence::new(dyn_tokenizer.clone()), String::new()),
+            |(mut seq, mut text)| {
+                for &id in &ids {
+                    seq.append_token_into(id, &mut text).expect("step");
+                }
+                text.len()
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.bench_function("generic_decode_step", |b| {
         b.iter_batched(
             || (Vec::new(), String::new(), 0usize),
@@ -133,10 +146,25 @@ fn bench_decode(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("stop_decoder_process_token", |b| {
-        let config = StopSequenceConfig::default()
+    // The gateway's decoder holds the vocabulary's end-of-sequence ids as
+    // hidden stop tokens beside the request's stop strings; the ids here
+    // never hit one, so every token takes the lookups' miss path. One config
+    // for both stop-decoder benches, so the appending form (the one the
+    // gateway calls) pays the same lookups as the owned one.
+    let eos_ids: Vec<u32> = if tokenizer.eos_token_ids().is_empty() {
+        tokenizer.token_to_id("<|im_end|>").into_iter().collect()
+    } else {
+        tokenizer.eos_token_ids().to_vec()
+    };
+    let stop_config = eos_ids.iter().fold(
+        StopSequenceConfig::default()
             .with_stop_sequence("<|im_end|>")
-            .with_stop_sequence("\n\nHuman:");
+            .with_stop_sequence("\n\nHuman:"),
+        |config, &id| config.with_stop_token(id),
+    );
+
+    group.bench_function("stop_decoder_process_token", |b| {
+        let config = stop_config.clone();
         b.iter_batched(
             || StopSequenceDecoder::new(dyn_tokenizer.clone(), config.clone(), false),
             |mut decoder| {
@@ -149,6 +177,25 @@ fn bench_decode(c: &mut Criterion) {
                     };
                 }
                 total
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("stop_decoder_process_token_into", |b| {
+        let config = stop_config.clone();
+        b.iter_batched(
+            || {
+                (
+                    StopSequenceDecoder::new(dyn_tokenizer.clone(), config.clone(), false),
+                    String::new(),
+                )
+            },
+            |(mut decoder, mut text)| {
+                for &id in &ids {
+                    decoder.process_token_into(id, &mut text).expect("token");
+                }
+                text.len()
             },
             BatchSize::SmallInput,
         );

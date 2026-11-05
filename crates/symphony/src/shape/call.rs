@@ -38,14 +38,16 @@
 //! Every byte lands in one event. The header's bytes are the start's source (dropped as wrapping
 //! when the arguments' object names the call, since its start carries that object's head); the
 //! arguments' bytes are their fragments' sources; the trailer and the closing terminal are the
-//! end's source. Whitespace after the arguments that is not the trailer is dropped as wrapping, and
-//! anything else there is `Malformed`, run by run, so that where the chunks were cut changes
+//! end's source. Whitespace after the arguments that is not the trailer is dropped as wrapping
+//! before the first run of other text and after the last; between two runs it is the model's and
+//! rides in the second run's `Malformed` event, so that where the chunks were cut changes
 //! nothing. A region the stream cut is ended with what arrived. Tagged parameters close as the
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
 //! the parameters that finished, and the text of one the cut left unfinished is dropped as
 //! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped. A value that never
-//! began, the cut or the region's close right after the header, is said to be none the same way a
+//! comes back as `Malformed` with `UnterminatedRegion`, the whitespace between its words kept and
+//! the runs before the first word and after the last dropped as wrapping. A value that never began,
+//! the cut or the region's close right after the header, is said to be none the same way a
 //! value cut short is, by a `Malformed` event of no bytes before the call's end
 //! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
 //! for its arguments.
@@ -54,7 +56,9 @@
 
 use super::params::Params;
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{
+        drop_carried, release_between, runs, DropReason, Event, Events, MalformedReason, Text,
+    },
     format::CallId,
     json::{self, arguments::Strings},
     shape::{
@@ -144,6 +148,12 @@ struct Value {
     tail: Option<Suffix<'static>>,
     /// Where the trailer starts in `after`, once a closing terminal was found to end it.
     trailer_at: Option<usize>,
+    /// Under a shape with no trailer, where text after the arguments is classified as it arrives:
+    /// the whitespace held since the last run of text, the model's if more text follows and the
+    /// template's spacing before the terminal otherwise ([`release_between`]).
+    carried: String,
+    /// Under a shape with no trailer: whether text after the arguments was released.
+    released: bool,
 }
 
 /// How the arguments are read.
@@ -291,7 +301,7 @@ impl Assembler {
         if let Arguments::Envelope { .. } = &shape.arguments {
             if !header.is_empty() {
                 out.push(Event::Dropped {
-                    text: Text::uncounted(header),
+                    text: Text::uncounted(header.to_owned()),
                     why: DropReason::Wrapper,
                 });
             }
@@ -330,7 +340,7 @@ impl Assembler {
             index: self.index,
             id,
             name: name.clone(),
-            source: Text::uncounted(header),
+            source: Text::uncounted(header.to_owned()),
         });
         let body = match &shape.arguments {
             Arguments::Params { tag, ends, values } => Body::Params(Box::new(Params::new(
@@ -358,7 +368,7 @@ impl Assembler {
     /// Append the next bytes of the call, after its start, and push the events they complete,
     /// a parameter's value typed by `declared`. Every byte is the call's until the engine closes
     /// the region.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         let shape = self.shape;
         let Stage::Body(body) = &mut self.stage else {
             return;
@@ -386,11 +396,13 @@ impl Assembler {
     }
 
     /// The region closed at `terminal` (empty for the stream's stop), which [`closes`] said it
-    /// does: the call ends. Bytes after a value or an object and before the trailer are dropped
-    /// where they are whitespace and malformed otherwise, and parameters still undecided are
-    /// decided as at the end of the call's text; the trailer and the terminal are the end's
-    /// source. Returns whether the terminal was taken so; when the arguments' own object named the
-    /// call, its close was the call's end, and the trailer and the terminal are the region's.
+    /// does: the call ends. Bytes after a value or an object and before the trailer are malformed
+    /// run by run, the whitespace before the first run and after the last dropped as the
+    /// template's and the whitespace between two runs kept as the model's, and parameters still
+    /// undecided are decided as at the end of the call's text; the trailer and the terminal are
+    /// the end's source. Returns whether the terminal was taken so; when the arguments' own
+    /// object named the call, its close was the call's end, and the trailer and the terminal are
+    /// the region's.
     ///
     /// [`closes`]: Self::closes
     pub fn close(mut self, terminal: &str, declared: &Declared, out: &mut Events) -> bool {
@@ -413,10 +425,11 @@ impl Assembler {
 
     /// The stream was cut inside the region: the call ends with what arrived. One JSON value or
     /// object is not closed for the client, and what was held after it comes back as `Malformed`
-    /// with `UnterminatedRegion`, its whitespace dropped; a value that never began is said to be
-    /// none before the end, as one cut short is. Tagged parameters close as at the end of the
-    /// text: those still undecided are decided there, the bytes no parameter took are dropped as
-    /// wrapping, and the arguments' object is closed.
+    /// with `UnterminatedRegion`, the whitespace around it dropped and the whitespace between its
+    /// words kept; a value that never began is said to be none before the end, as one cut short
+    /// is. Tagged parameters close as at the end of the text: those still undecided are decided
+    /// there, the bytes no parameter took are dropped as wrapping, and the arguments' object is
+    /// closed.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -474,15 +487,17 @@ impl Value {
             after: String::new(),
             tail: None,
             trailer_at: None,
+            carried: String::new(),
+            released: false,
         }
     }
 
-    fn feed(
+    fn feed<'d>(
         &mut self,
         shape: &'static CallShape,
         (values, declared): (&Values, &Declared),
-        bytes: &str,
-        out: &mut Events,
+        bytes: &'d str,
+        out: &mut Events<'d>,
     ) {
         let mut rest = bytes;
         let handed_back;
@@ -495,14 +510,15 @@ impl Value {
                 declared,
                 name: &self.name,
             };
+            // The reader takes the delta's own bytes, so a fragment within them borrows them.
             let taken = match &mut self.reader {
-                JsonReader::Json(arguments) => arguments.feed(rest, &typing, out),
-                JsonReader::Envelope(assembler) => assembler.feed(rest, out),
+                JsonReader::Json(arguments) => arguments.feed(bytes, &typing, out),
+                JsonReader::Envelope(assembler) => assembler.feed(bytes, out),
             };
-            if let Some(last) = rest[..taken].chars().next_back() {
+            if let Some(last) = bytes[..taken].chars().next_back() {
                 self.before = Some(last);
             }
-            rest = &rest[taken..];
+            rest = &bytes[taken..];
             if !self.reader.over() {
                 return;
             }
@@ -516,7 +532,7 @@ impl Value {
             }
         }
         if shape.trailer.0.is_empty() {
-            wrapping(rest, self.reader.surplus(), out);
+            self.surplus(rest, out);
             return;
         }
         let tail = self.tail.get_or_insert_with(|| {
@@ -544,6 +560,34 @@ impl Value {
         at.is_some()
     }
 
+    /// Text after the arguments under a shape with no trailer, as it arrives: whitespace before
+    /// the first run of text is the template's and is dropped; a run is malformed with the
+    /// reader's reason, with the whitespace held since the last run in front of it, the model's
+    /// between two pieces of its text ([`release_between`]); the whitespace after a run is held,
+    /// the next run's when one follows and the template's spacing before the terminal otherwise,
+    /// which the close or the stream's end drops. The same wherever the chunks were cut.
+    fn surplus(&mut self, text: &str, out: &mut Events) {
+        let why = self.reader.surplus();
+        for (run, space) in runs(text) {
+            if !space {
+                release_between(
+                    &mut self.carried,
+                    &mut self.released,
+                    run.to_owned().into(),
+                    why,
+                    out,
+                );
+            } else if self.released {
+                self.carried.push_str(run);
+            } else {
+                out.push(Event::Dropped {
+                    text: Text::uncounted(run.to_owned()),
+                    why: DropReason::Wrapper,
+                });
+            }
+        }
+    }
+
     /// The region closed: the bytes after the arguments and before the trailer are classified,
     /// and the trailer is returned for the call's end; or, for an object that named the call and
     /// ended it at its close, the trailer is the region's wrapping and nothing is returned.
@@ -552,6 +596,7 @@ impl Value {
             reader,
             after,
             trailer_at,
+            carried,
             ..
         } = self;
         let at = trailer_at.unwrap_or(after.len());
@@ -567,11 +612,12 @@ impl Value {
                 true
             }
         };
+        drop_carried(carried, out);
         wrapping(between, surplus, out);
         if enveloped {
             if !trailer.is_empty() {
                 out.push(Event::Dropped {
-                    text: Text::uncounted(trailer),
+                    text: Text::uncounted(trailer.to_owned()),
                     why: DropReason::Wrapper,
                 });
             }
@@ -584,36 +630,42 @@ impl Value {
     /// the caller's to push, unless the arguments' object ended the call. Returns whether the
     /// caller ends it.
     fn finish(self, out: &mut Events) -> bool {
-        match self.reader {
+        let Self {
+            reader,
+            after,
+            carried,
+            ..
+        } = self;
+        let ends = match reader {
             JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
-                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 true
             }
             JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
-                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 false
             }
-        }
+        };
+        drop_carried(carried, out);
+        wrapping(&after, MalformedReason::UnterminatedRegion, out);
+        ends
     }
 }
 
-/// Bytes after a call's arguments that are no part of the call: each run of whitespace dropped as
-/// wrapping, each run of anything else `Malformed` for `why`. Classifying run by run keeps the
-/// result the same wherever the chunks were cut.
+/// Bytes after a call's arguments that are no part of the call, classified whole: whitespace
+/// before the first run of text and after the last is the template's wrapping, dropped; each run
+/// of anything else is `Malformed` for `why`, with the whitespace between it and the run before it
+/// in front of it, which is the model's ([`release_between`]).
 fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
+    let (mut carried, mut released) = (String::new(), false);
     for (run, space) in runs(text) {
-        let run = Text::uncounted(run);
-        out.push(if space {
-            Event::Dropped {
-                text: run,
-                why: DropReason::Wrapper,
-            }
+        if space {
+            carried.push_str(run);
         } else {
-            Event::Malformed { text: run, why }
-        });
+            release_between(&mut carried, &mut released, run.to_owned().into(), why, out);
+        }
     }
+    drop_carried(carried, out);
 }
 
 #[cfg(test)]
@@ -712,8 +764,8 @@ mod tests {
     }
 
     /// Events with adjacent text of one kind joined, so that chunkings compare by what they say.
-    fn joined(events: Vec<Event>) -> Vec<Event> {
-        let mut out: Vec<Event> = Vec::new();
+    fn joined(events: Vec<Event<'static>>) -> Vec<Event<'static>> {
+        let mut out: Vec<Event<'static>> = Vec::new();
         for event in events {
             match (out.last_mut(), event) {
                 (
@@ -722,14 +774,14 @@ mod tests {
                         text: more,
                         why: again,
                     },
-                ) if *why == again => text.text.push_str(&more.text),
+                ) if *why == again => text.text.to_mut().push_str(&more.text),
                 (
                     Some(Event::Malformed { text, why }),
                     Event::Malformed {
                         text: more,
                         why: again,
                     },
-                ) if *why == again => text.text.push_str(&more.text),
+                ) if *why == again => text.text.to_mut().push_str(&more.text),
                 (
                     Some(Event::ToolCallArguments {
                         index,
@@ -742,12 +794,12 @@ mod tests {
                         source: bytes,
                     },
                 ) if *index == other => {
-                    json.push_str(&more);
-                    source.text.push_str(&bytes.text);
+                    json.to_mut().push_str(&more);
+                    source.text.to_mut().push_str(&bytes.text);
                 }
                 (Some(Event::Content(text)), Event::Content(more))
                 | (Some(Event::Reasoning(text)), Event::Reasoning(more)) => {
-                    text.text.push_str(&more.text);
+                    text.text.to_mut().push_str(&more.text);
                 }
                 (_, event) => out.push(event),
             }
@@ -757,7 +809,12 @@ mod tests {
 
     /// The events of `output` after `prompt`, the same whole, cut once at every place and a
     /// character at a time, every byte accounted for.
-    fn run_after(format: &Format, prompt: &str, output: &str, finish: EngineFinish) -> Vec<Event> {
+    fn run_after(
+        format: &Format,
+        prompt: &str,
+        output: &str,
+        finish: EngineFinish,
+    ) -> Vec<Event<'static>> {
         run_declared(format, &Declared::default(), prompt, output, finish)
     }
 
@@ -768,7 +825,7 @@ mod tests {
         prompt: &str,
         output: &str,
         finish: EngineFinish,
-    ) -> Vec<Event> {
+    ) -> Vec<Event<'static>> {
         let starts: Vec<usize> = output.char_indices().map(|(at, _)| at).skip(1).collect();
         let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
         plans.extend(starts.iter().map(|&cut| vec![cut]));
@@ -808,7 +865,7 @@ mod tests {
                 )
                 .expect("the end");
             assert_eq!(out.text(), output, "every byte, cut at {cuts:?}");
-            joined(out.drain())
+            joined(out.into_owned().drain())
         });
         let whole = runs.next().expect("the whole output is one plan");
         for (events, cuts) in runs.zip(plans.iter().skip(1)) {
@@ -817,17 +874,17 @@ mod tests {
         whole
     }
 
-    fn run(format: &Format, output: &str) -> Vec<Event> {
+    fn run(format: &Format, output: &str) -> Vec<Event<'static>> {
         run_after(format, "", output, EngineFinish::Stop)
     }
 
-    fn content(text: &str) -> Event {
-        Event::Content(Text::uncounted(text))
+    fn content(text: &str) -> Event<'static> {
+        Event::Content(Text::uncounted(text.to_owned()))
     }
 
-    fn wrapper(text: &str) -> Event {
+    fn wrapper(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -836,31 +893,31 @@ mod tests {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
 
-    fn start(name: &str, source: &str) -> Event {
+    fn start(name: &str, source: &str) -> Event<'static> {
         Event::ToolCallStart {
             index: 0,
             id: ids().id(0),
             name: name.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn arguments(json: &str) -> Event {
+    fn arguments(json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
-            source: Text::uncounted(json),
+            json: json.to_string().into(),
+            source: Text::uncounted(json.to_owned()),
         }
     }
 
-    fn end(source: &str) -> Event {
+    fn end(source: &str) -> Event<'static> {
         Event::ToolCallEnd {
             index: 0,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn finish(calls: u32) -> Event {
+    fn finish(calls: u32) -> Event<'static> {
         Event::Finish {
             reason: crate::event::FinishReason::Stop,
             tool_calls: calls,
@@ -1132,6 +1189,26 @@ mod tests {
                 finish(1),
             ]
         );
+        // Words between the arguments and the trailer keep the model's whitespace between them;
+        // the whitespace before the first and after the last is the template's.
+        assert_eq!(
+            run(&format, "<c><n=f>{\"a\": 1} x y </f>\n</c>Done."),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                arguments("{\"a\": 1}"),
+                wrapper(" "),
+                Event::Malformed {
+                    text: Text::uncounted("x y"),
+                    why: MalformedReason::TextAfterTheArguments,
+                },
+                wrapper(" "),
+                end("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "the whitespace between two words after the arguments is the model's"
+        );
         let events = run_after(
             &format,
             "",
@@ -1284,7 +1361,7 @@ mod tests {
         let shown: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -1516,18 +1593,18 @@ mod tests {
         vec![ends_at([lit("</k>")], [])]
     }
 
-    fn member(json: &str, source: &str) -> Event {
+    fn member(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
-            source: Text::uncounted(source),
+            json: json.to_string().into(),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn closed() -> Event {
+    fn closed() -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: "}".to_string(),
+            json: "}".into(),
             source: Text::default(),
         }
     }
@@ -1983,7 +2060,7 @@ mod tests {
             events[2],
             Event::ToolCallArguments {
                 index: 0,
-                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".to_string(),
+                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".into(),
                 source: Text::uncounted(
                     "{\"n\": \"5\", \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}"
                 ),
@@ -2002,7 +2079,7 @@ mod tests {
             [
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "{\"n\": 5, ".to_string(),
+                    json: "{\"n\": 5, ".into(),
                     source: Text::uncounted("{\"n\": \"5\", "),
                 },
                 Event::Malformed {
@@ -2011,7 +2088,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "x}".to_string(),
+                    json: "x}".into(),
                     source: Text::uncounted("x}"),
                 },
             ],
@@ -2118,11 +2195,13 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 Event::Content(text) | Event::Dropped { text, .. } => {
-                    Some((text.text, text.tokens))
+                    Some((text.text.into_owned(), text.tokens))
                 }
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => Some((source.text, source.tokens)),
+                | Event::ToolCallEnd { source, .. } => {
+                    Some((source.text.into_owned(), source.tokens))
+                }
                 _ => None,
             })
             .collect();

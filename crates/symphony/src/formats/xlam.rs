@@ -1,6 +1,6 @@
 //! xLAM: the whole output is a JSON list of calls, `[{"name": …, "arguments": {…}}, …]`, or
 //! content, with no marker either way. The table has one state, an arguments state the output
-//! starts in, and the list assembler ([`json::list`](crate::json::list)) decides at the first byte
+//! starts in, and the list assembler (`json::list`) decides at the first byte
 //! that is not whitespace. Recorded as `llama-xlam-2-8b-fc-r` (Salesforce/Llama-xLAM-2-8b-fc-r).
 
 use crate::format::{CallSyntax, Emits, Format};
@@ -23,7 +23,7 @@ mod tests {
         Declared,
     };
 
-    fn run(output: &str) -> Vec<Event> {
+    fn run(output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(xlam(), Declared::default());
         let mut out = Events::new();
         parser
@@ -53,7 +53,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,
@@ -65,7 +65,7 @@ mod tests {
         let arguments: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

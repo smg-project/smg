@@ -113,13 +113,13 @@ fn seeded_plans(chars: &[usize]) -> Vec<Vec<usize>> {
 }
 
 /// The output bytes `event` accounts for.
-pub fn bytes_of(event: &Event) -> &str {
+pub fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::Content(t) | Event::Reasoning(t) => &t.text,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => &text.text,
         Event::ToolCallStart { source, .. }
         | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        | Event::ToolCallEnd { source, .. } => &source.text,
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }
@@ -150,7 +150,7 @@ pub fn replay(
     cuts: &[usize],
     finish: &EngineFinish,
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     replay_after(parser, "", text, cuts, finish, empty_between)
 }
 
@@ -163,7 +163,7 @@ pub fn replay_after(
     cuts: &[usize],
     finish: &EngineFinish,
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     let mut out = Events::new();
     parser.feed(
         Input::Prompt {
@@ -191,5 +191,5 @@ pub fn replay_after(
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok(out.into_owned().drain())
 }

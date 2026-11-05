@@ -6,6 +6,9 @@
 // reference's `expect`/`panic`/`hex`/`thiserror-ext`/`enum-as-inner` are
 // replaced with std/error-handled equivalents to satisfy `clippy -D warnings`.
 
+//! The ZMQ transport: the sockets the frontend binds, the handshake that admits each engine, the
+//! sends to one engine and the output loop that reads them all.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -13,12 +16,13 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::channel::mpsc::Receiver as SocketEvents;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     util::PeerIdentity,
-    PullSocket, RouterSendHalf, RouterSocket, ZmqError, ZmqMessage,
+    PullSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
 };
 
 use crate::{
@@ -132,6 +136,10 @@ pub struct ConnectedTransport {
     pub engines: Vec<ConnectedEngine>,
     /// The sending half of the shared input ROUTER socket.
     pub input_send: RouterSendHalf,
+    /// Reports asynchronous disconnects after local send admission.
+    pub input_events: SocketEvents<SocketEvent>,
+    /// Drives read-side disconnect detection after the registration handshake.
+    pub input_recv: RouterRecvHalf,
     /// The shared output PULL socket for receiving all engines' responses.
     pub output_socket: PullSocket,
 }
@@ -154,6 +162,30 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
     }
 }
 
+/// How many engines a handshake awaits on its sockets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineCount {
+    /// This many, as the caller was told.
+    Exactly(usize),
+    /// As many as the first engine to speak declares in its HELLO (or READY)
+    /// `engine_count`: an attention-DP group says its size, so a frontend
+    /// that was not told the count awaits the whole group. An engine that
+    /// declares none dials alone.
+    Declared,
+}
+
+impl From<usize> for EngineCount {
+    fn from(count: usize) -> Self {
+        Self::Exactly(count)
+    }
+}
+
+/// The count a handshake message settles: a declared `engine_count`, or one
+/// engine for an engine that declares none.
+fn declared_count(message: &ReadyMessage) -> usize {
+    message.engine_count.unwrap_or(1).max(1)
+}
+
 /// Connect to one or more engines through the startup handshake protocol,
 /// returning the shared data-plane transport plus the registered engines.
 ///
@@ -161,23 +193,31 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
 /// socket, drives HELLO -> INIT -> READY per engine, and finally waits for each
 /// engine to register (its `EngineCoreReadyResponse`) on the input socket.
 ///
-/// `startup` bounds the waits: a plain [`std::time::Duration`] is a
-/// per-message timeout; a [`StartupBudget`] lets signs of life from outside
-/// the wire extend the silence bound, under a ceiling.
+/// `engine_count` is how many engines to await ([`EngineCount`]; a plain
+/// count is [`EngineCount::Exactly`]). `startup` bounds the waits: a plain
+/// [`std::time::Duration`] is a per-message timeout; a [`StartupBudget`] lets
+/// signs of life from outside the wire extend the silence bound, under a
+/// ceiling.
 pub async fn connect_handshake(
     handshake_address: &str,
-    engine_count: usize,
+    engine_count: impl Into<EngineCount>,
     local_input_address: &str,
     local_output_address: &str,
     startup: impl Into<StartupBudget>,
 ) -> Result<ConnectedTransport> {
-    if engine_count == 0 {
-        return Err(unexpected_handshake("expected engine_count >= 1"));
-    }
+    // Settled up front when the caller says it, else by the first engine to
+    // speak.
+    let mut expected = match engine_count.into() {
+        EngineCount::Exactly(0) => {
+            return Err(unexpected_handshake("expected engine_count >= 1"));
+        }
+        EngineCount::Exactly(count) => Some(count),
+        EngineCount::Declared => None,
+    };
     let clock = StartupClock::new(startup);
 
     info!(
-        engine_count,
+        engine_count = ?expected,
         handshake_address, "waiting for engines to connect"
     );
 
@@ -185,6 +225,7 @@ pub async fn connect_handshake(
     //    same data-plane addresses during handshake.
     let (input_address, mut input_socket, output_address, output_socket) =
         bind_local_sockets(local_input_address, local_output_address).await?;
+    let input_events = input_socket.monitor();
     info!(%input_address, %output_address, "bound local transport sockets");
 
     // 2. Bind the shared handshake socket. All engines connect here with their
@@ -199,41 +240,107 @@ pub async fn connect_handshake(
     //    HELLO is answered with INIT while engines are still missing and
     //    refused once all are known, and a READY marks its engine whenever
     //    it arrives.
-    while engines.len() < engine_count || engines.values().any(|state| !state.is_ready_received()) {
-        let awaiting_hello = engines.len() < engine_count;
+    //
+    //    An engine says HELLO once when it starts and READY once when its
+    //    init is done, and repeats neither; the frontend that answered its
+    //    HELLO need not be the one that hears its READY, when the frontend
+    //    restarted or bound again while the engine was loading. So a READY
+    //    from an engine no HELLO of this handshake introduced is taken as
+    //    that engine's (the INIT it holds names these same addresses), and a
+    //    second HELLO from an engine still between INIT and READY is a
+    //    restarted engine process, greeted again. Either way the engine
+    //    registers on the input socket once ready, as every engine does.
+    while expected.is_none_or(|count| engines.len() < count)
+        || engines.values().any(|state| !state.is_ready_received())
+    {
+        let awaiting_hello = expected.is_none_or(|count| engines.len() < count);
         let stage = if awaiting_hello { "HELLO" } else { "READY" };
         let message = clock.wait(stage, handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
+        let declared = declared_count(&handshake_message);
+        let engine_count = match expected {
+            Some(count) => {
+                if handshake_message.engine_count.is_some() && declared != count {
+                    warn!(
+                        ?engine_id,
+                        declared,
+                        expected = count,
+                        "engine declares a group of a different size than this handshake awaits"
+                    );
+                }
+                count
+            }
+            None => {
+                info!(
+                    ?engine_id,
+                    engine_count = declared,
+                    "awaiting the engine group it declares"
+                );
+                *expected.insert(declared)
+            }
+        };
         match handshake_message.status.as_deref() {
-            Some("HELLO") if awaiting_hello => {
-                if engines.contains_key(&engine_id) {
+            Some("HELLO") => match engines.get(&engine_id) {
+                None if awaiting_hello => {
+                    debug!(?engine_id, "received HELLO from engine");
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                    )
+                    .await?;
+                    engines.insert(engine_id, EngineStartupState::HelloReceived);
+                }
+                None => {
                     return Err(unexpected_handshake(format!(
-                        "duplicate engine id {engine_id:?} during startup handshake"
+                        "duplicate HELLO for engine id {engine_id:?} after INIT phase: every one \
+                         of the {engine_count} expected engine(s) is known"
                     )));
                 }
-                debug!(?engine_id, "received HELLO from engine");
-                send_init_message(
-                    &mut handshake_socket,
-                    &engine_id,
-                    &input_address,
-                    &output_address,
-                )
-                .await?;
-                engines.insert(engine_id, EngineStartupState::HelloReceived);
-            }
-            Some("HELLO") => {
-                return Err(unexpected_handshake(format!(
-                    "duplicate HELLO for engine id {engine_id:?} after INIT phase"
-                )));
-            }
+                Some(EngineStartupState::HelloReceived) => {
+                    info!(
+                        ?engine_id,
+                        "received a second HELLO from an engine between INIT and READY: its \
+                         process restarted while it was loading; greeting it again"
+                    );
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                    )
+                    .await?;
+                }
+                Some(EngineStartupState::ReadyReceived) => {
+                    return Err(unexpected_handshake(format!(
+                        "duplicate HELLO for engine id {engine_id:?} after its READY"
+                    )));
+                }
+            },
             Some("READY") => match engines.get_mut(&engine_id) {
                 Some(state) if !state.is_ready_received() => {
                     debug!(?engine_id, "received READY from engine");
                     *state = EngineStartupState::ReadyReceived;
                 }
-                _ => {
+                Some(_) => {
                     return Err(unexpected_handshake(format!(
-                        "READY for unexpected or duplicate engine id {engine_id:?}"
+                        "duplicate READY for engine id {engine_id:?}"
+                    )));
+                }
+                None if awaiting_hello => {
+                    warn!(
+                        ?engine_id,
+                        "received READY from an engine this handshake never greeted: an earlier \
+                         handshake of this frontend answered its HELLO with these same addresses \
+                         while it was loading; taking it as ready"
+                    );
+                    engines.insert(engine_id, EngineStartupState::ReadyReceived);
+                }
+                None => {
+                    return Err(unexpected_handshake(format!(
+                        "READY for unexpected engine id {engine_id:?}: every one of the \
+                         {engine_count} expected engine(s) is known"
                     )));
                 }
             },
@@ -250,13 +357,15 @@ pub async fn connect_handshake(
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
 
-    let (input_send, _) = input_socket.split();
+    let (input_send, input_recv) = input_socket.split();
 
     Ok(ConnectedTransport {
         input_address,
         output_address,
         engines,
         input_send,
+        input_events,
+        input_recv,
         output_socket,
     })
 }
@@ -377,6 +486,26 @@ async fn wait_for_input_registrations(
         .collect()
 }
 
+/// Check every connected engine's declared positional layouts against the
+/// prefixes `P`'s encoders fill ([`EngineProtocol::check_layouts`]), once,
+/// before the first request goes out: a mismatch fails the connection with
+/// the engine, the struct and the field named, rather than failing each
+/// request that engine cannot decode.
+pub fn check_engine_layouts<P: EngineProtocol>(transport: &ConnectedTransport) -> Result<()> {
+    for engine in &transport.engines {
+        if let Err(error) = P::check_layouts(&engine.ready_response) {
+            let engine_id = &engine.engine_id;
+            return Err(match error {
+                Error::WireLayoutMismatch { message } => Error::WireLayoutMismatch {
+                    message: format!("engine {engine_id:?}: {message}"),
+                },
+                other => other,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Send an encoded request to one engine over the shared input ROUTER socket.
 /// Frames: `[engine_id, request_type, payload, aux..]`.
 pub async fn send_message(
@@ -408,6 +537,7 @@ pub async fn send_message(
 pub async fn run_output_loop<P: EngineProtocol>(
     mut output_socket: PullSocket,
     tx: mpsc::Sender<Result<EngineBatch<P::Output>>>,
+    layout: P::Layout,
 ) {
     loop {
         let message = match output_socket.recv().await {
@@ -430,7 +560,7 @@ pub async fn run_output_loop<P: EngineProtocol>(
             return;
         }
 
-        let decoded = match P::decode_batch(&frames) {
+        let decoded = match P::decode_batch(&frames, &layout) {
             Ok(decoded) => Ok(decoded),
             Err(error) => {
                 // Keep the loop running so a single bad message doesn't drop the
@@ -454,7 +584,9 @@ mod tests {
     use super::*;
     use crate::{
         codec::encode_msgpack,
-        mock_engine::{connect_to_frontend, default_ready_response, hello, IpcNamespace},
+        mock_engine::{
+            connect_to_frontend, default_ready_response, hello, hello_in_group, IpcNamespace,
+        },
         protocol::vllm::{
             output::{
                 EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
@@ -546,7 +678,7 @@ mod tests {
             clippy::disallowed_methods,
             reason = "test output loop torn down when the test ends"
         )]
-        let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(output_socket, out_tx));
+        let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(output_socket, out_tx, ()));
 
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
@@ -604,6 +736,7 @@ mod tests {
         let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(
             transport.output_socket,
             out_tx,
+            (),
         ));
 
         engine
@@ -665,6 +798,99 @@ mod tests {
         );
     }
 
+    /// A handshake not told its engine count awaits the group the first
+    /// engine's HELLO declares: both ranks of a declared group of two are
+    /// connected, whichever dials first.
+    #[tokio::test]
+    async fn a_handshake_given_no_count_awaits_the_group_the_engines_declare() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let rank = |index: u32| {
+            let handshake = handshake.clone();
+            async move {
+                hello_in_group(&handshake, EngineId::from_engine_index(index), Some(2))
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            }
+        };
+        let (transport, first, second) = tokio::join!(
+            connect_handshake(&handshake, EngineCount::Declared, &input, &output, TIMEOUT),
+            rank(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                rank(0).await
+            },
+        );
+        let transport = transport.expect("frontend handshake");
+        first.expect("first mock engine");
+        second.expect("second mock engine");
+        assert_eq!(transport.engines.len(), 2);
+    }
+
+    /// A rank that declares a different group size than the handshake
+    /// awaits (the size the first rank declared, or the caller's count) is
+    /// warned about, not refused: the size already settled stands and the
+    /// handshake completes with that many ranks.
+    #[tokio::test]
+    async fn a_rank_declaring_another_group_size_is_warned_about_and_the_handshake_proceeds() {
+        for count in [EngineCount::Declared, EngineCount::Exactly(2)] {
+            let ns = IpcNamespace::new().unwrap();
+            let (handshake, input, output) = (
+                ns.handshake_endpoint(),
+                ns.input_endpoint(),
+                ns.output_endpoint(),
+            );
+            // The first rank to speak settles the size at two; the second
+            // declares three, dialing only once the first holds its INIT (the
+            // frontend answers INIT per HELLO), so the order never depends on
+            // timing. Both READYs then run together.
+            let ranks = async {
+                let first =
+                    hello_in_group(&handshake, EngineId::from_engine_index(0), Some(2)).await?;
+                let second =
+                    hello_in_group(&handshake, EngineId::from_engine_index(1), Some(3)).await?;
+                tokio::try_join!(
+                    first.ready(default_ready_response()),
+                    second.ready(default_ready_response())
+                )
+            };
+            let (transport, engines) = tokio::join!(
+                connect_handshake(&handshake, count, &input, &output, TIMEOUT),
+                ranks,
+            );
+            let transport = transport.expect("frontend handshake");
+            engines.expect("both mock engines");
+            assert_eq!(transport.engines.len(), 2, "{count:?}");
+        }
+    }
+
+    /// An engine that declares no group dials alone: a handshake not told its
+    /// count connects it by itself, as a handshake told one does.
+    #[tokio::test]
+    async fn an_engine_that_declares_no_group_is_awaited_alone() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, EngineCount::Declared, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        engine.expect("mock engine");
+        assert_eq!(transport.expect("frontend handshake").engines.len(), 1);
+    }
+
     /// Once every expected engine has said HELLO, a further HELLO is refused
     /// with the "after INIT phase" error.
     #[tokio::test]
@@ -696,6 +922,104 @@ mod tests {
         assert!(
             message.contains("duplicate HELLO") && message.contains("after INIT phase"),
             "{message}"
+        );
+    }
+
+    /// An engine says HELLO once, so a second HELLO from an engine between
+    /// INIT and READY is a restarted engine process: it is greeted again and
+    /// connects, where refusing it would leave the new process waiting for
+    /// an INIT that never comes.
+    #[tokio::test]
+    async fn a_second_hello_from_an_engine_still_initialising_is_greeted_again() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let engine = async {
+            // The first process says HELLO, holds its INIT and dies loading;
+            // the frontend hears nothing of that.
+            let first = hello(&handshake, EngineId::from_engine_index(0))
+                .await
+                .expect("first HELLO");
+            // Its replacement says HELLO under the same identity, is greeted
+            // again, loads, and says READY.
+            let second = hello(&handshake, EngineId::from_engine_index(0))
+                .await
+                .expect("second HELLO");
+            let connected = second.ready(default_ready_response()).await;
+            drop(first);
+            connected
+        };
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            engine
+        );
+        let transport = transport.expect("frontend handshake");
+        engine.expect("restarted mock engine");
+        assert_eq!(transport.engines.len(), 1);
+        assert_eq!(
+            transport.engines[0].engine_id,
+            EngineId::from_engine_index(0)
+        );
+    }
+
+    /// The frontend that answered an engine's HELLO need not be the one that
+    /// hears its READY: when the frontend gave up its wait (or restarted) and
+    /// bound again while the engine was loading, the engine's one READY and
+    /// one input registration reach a handshake that never greeted it. They
+    /// are taken as that engine's: the INIT it holds names these same
+    /// addresses, and an engine says HELLO once, so waiting for another
+    /// would strand it for good.
+    #[tokio::test]
+    async fn a_ready_from_an_engine_an_earlier_handshake_greeted_completes_the_handshake() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        // The first handshake greets the engine and gives up its READY wait
+        // while the engine is still loading.
+        let (gave_up, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, Duration::from_millis(300)),
+            hello(&handshake, EngineId::from_engine_index(0)),
+        );
+        let Err(error) = gave_up else {
+            panic!("the first handshake must give up its READY wait");
+        };
+        assert!(
+            matches!(error, Error::HandshakeTimeout { stage: "READY", .. }),
+            "{error}"
+        );
+        let engine = engine.expect("HELLO/INIT with the first handshake");
+        // The dropped listeners' socket files go on their own tasks; a real
+        // frontend binds again a health probe later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The frontend binds again; the engine's handshake socket reconnects,
+        // and its READY, then its registration, arrive at the new handshake.
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            async {
+                engine
+                    .redial(&handshake)
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            },
+        );
+        let transport = transport.expect("the second handshake takes the engine");
+        engine.expect("mock engine connected");
+        assert_eq!(transport.engines.len(), 1);
+        assert_eq!(
+            transport.engines[0].engine_id,
+            EngineId::from_engine_index(0)
+        );
+        assert_eq!(
+            transport.engines[0].ready_response.vllm_version,
+            "test-vllm-version"
         );
     }
 }

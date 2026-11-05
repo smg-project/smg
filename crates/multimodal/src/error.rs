@@ -35,6 +35,16 @@ pub enum TransformError {
 
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
+    #[error("{modality} has {pixels} pixels after resizing, exceeding max_total_pixels={limit}")]
+    PixelBudgetExceeded {
+        modality: &'static str,
+        pixels: u64,
+        limit: u64,
+    },
+    #[error("image max_long_side_pixel must be positive, got {value}")]
+    InvalidImageLongSideCap { value: u32 },
+    #[error("SGLang MiniMax max_long_side_pixel must be a multiple of 28 within 112..=3584, got {value}")]
+    InvalidSglangLongSideCap { value: u32 },
     #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
     InvalidMaxLongSidePixel { value: u32, factor: u32 },
     #[error("fps must be between {min} and {max}, got {value}")]
@@ -162,9 +172,9 @@ pub enum MediaFault {
     Client,
     /// The media host's, for now: a fetch that ran out of its budget, a 5xx
     /// answer, a transfer that broke while the body arrived. Answered as the
-    /// request's own is ([`Self::Client`], a 400): an origin that does not
-    /// deliver is the request's input, which the reference APIs answer a
-    /// 4xx for; the fault stays told apart for the logs.
+    /// host's trouble (a 502 under the media's code, where the request's own
+    /// is a 400), so a client can tell what to retry from what to fix; it
+    /// says as little about the process that fetched as [`Self::Client`].
     Transient,
     /// This process's: a decode task that panicked or was cancelled, a
     /// scratch file or a decoder process that failed on this side (a
@@ -192,7 +202,7 @@ pub enum MediaErrorCode {
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
     /// audio clip's samples), or the image decoder's own limits. A bound on
-    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_FRAMES`) is
+    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
     /// not one: a clip over it is a fetch failure.
     TooLarge,
 }
@@ -220,10 +230,13 @@ impl MediaConnectorError {
     /// client can tell what to shrink from what to re-host.
     pub fn code(&self) -> MediaErrorCode {
         match self {
-            Self::PayloadTooLarge { .. }
+            Self::PixelBudgetExceeded { .. }
+            | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
-            Self::InvalidMaxLongSidePixel { .. }
+            Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
+            | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
             | Self::UnsupportedScheme(_)
@@ -260,7 +273,9 @@ impl MediaConnectorError {
             Self::Blocking(_) | Self::DecodeIo(_) | Self::DecoderUnavailable(_) => {
                 MediaFault::Internal
             }
-            Self::InvalidMaxLongSidePixel { .. }
+            Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
+            | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
             | Self::UnsupportedScheme(_)
@@ -274,6 +289,7 @@ impl MediaConnectorError {
             | Self::Io(_)
             | Self::Base64Decode(_)
             | Self::DataUrl(_)
+            | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
             | Self::Image(_)

@@ -27,8 +27,12 @@ use smg_auth as auth;
 
 mod servicer;
 use servicer::{
-    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyTrtllmGrpcServer,
+    PyVllmGrpcServer,
 };
+
+mod tokenizer;
+use tokenizer::PyTokenizer;
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
@@ -58,6 +62,36 @@ pub enum BackendType {
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
+    /// TensorRT-LLM engine, as the CLI's `--backend trtllm`: routing behaves
+    /// like the default and no wire is pinned (its servicer speaks gRPC).
+    Trtllm,
+    /// The Gemini provider route (`RoutingMode::Gemini`), as the CLI's
+    /// `--backend gemini`.
+    Gemini,
+}
+
+impl BackendType {
+    /// The routing mode of a provider backend, with the URLs it is given: a
+    /// provider backend is a mode of its own and wins over the disaggregation
+    /// flags, as the CLI's `--backend` does. `None` for an engine backend,
+    /// whose mode those flags select.
+    fn provider_mode(&self, worker_urls: &[String]) -> Option<config::RoutingMode> {
+        use config::RoutingMode;
+
+        let mode = match self {
+            Self::Openai => RoutingMode::OpenAI {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Anthropic => RoutingMode::Anthropic {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Gemini => RoutingMode::Gemini {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Sglang | Self::Vllm | Self::Tokenspeed | Self::Trtllm => return None,
+        };
+        Some(mode)
+    }
 }
 
 #[pyclass(eq, from_py_object)]
@@ -165,7 +199,7 @@ impl PyJwtConfig {
 }
 
 impl PyJwtConfig {
-    pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
+    pub fn to_auth_jwt_config(&self) -> config::ConfigResult<auth::JwtConfig> {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
         config.role_claim.clone_from(&self.role_claim);
 
@@ -174,16 +208,30 @@ impl PyJwtConfig {
             config = config.with_jwks_uri(uri);
         }
 
-        // Add role mappings
+        // A gateway role that is neither admin nor user is refused, as the
+        // CLI refuses it: mapped to user in silence, the operator who meant
+        // admin is locked out of the admin routes with nothing to read. An
+        // empty IdP role is refused with it, as the CLI refuses `=admin`: no
+        // claim ever matches it.
         for (idp_role, gateway_role) in &self.role_mapping {
-            let role = match gateway_role.to_lowercase().as_str() {
-                "admin" => auth::Role::Admin,
-                _ => auth::Role::User,
-            };
+            if idp_role.is_empty() {
+                return Err(config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("={gateway_role}"),
+                    "the IdP role must not be empty",
+                ));
+            }
+            let role: auth::Role = gateway_role.parse().map_err(|_: String| {
+                config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("{idp_role}={gateway_role}"),
+                    "the gateway role must be 'admin' or 'user'",
+                )
+            })?;
             config = config.with_role_mapping(idp_role, role);
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -216,16 +264,22 @@ impl PyControlPlaneAuthConfig {
 }
 
 impl PyControlPlaneAuthConfig {
-    pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
-        auth::ControlPlaneAuthConfig {
-            jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
+    pub fn to_auth_control_plane_config(
+        &self,
+    ) -> config::ConfigResult<auth::ControlPlaneAuthConfig> {
+        Ok(auth::ControlPlaneAuthConfig {
+            jwt: self
+                .jwt
+                .as_ref()
+                .map(|j| j.to_auth_jwt_config())
+                .transpose()?,
             api_keys: self
                 .api_keys
                 .iter()
                 .map(|k| k.to_auth_api_key_entry())
                 .collect(),
             audit_enabled: self.audit_enabled,
-        }
+        })
     }
 }
 
@@ -440,8 +494,10 @@ struct Router {
     assignment_mode: Option<String>,
     backend: BackendType,
     balance_abs_threshold: usize,
+    balance_prefix_margin_tokens: u32,
     balance_rel_threshold: f32,
     balance_token_usage_threshold: f32,
+    balance_uncached_credit: bool,
     block_size: usize,
     bootstrap_port_annotation: String,
     bucket_adjust_interval_secs: usize,
@@ -459,6 +515,9 @@ struct Router {
     client_key_path: Option<String>,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
+    decode_expected_workers: Option<usize>,
+    decode_min_ready_percent: Option<u8>,
+    decode_min_ready_workers: Option<usize>,
     decode_policy: Option<PolicyType>,
     decode_selector: HashMap<String, String>,
     decode_urls: Option<Vec<String>>,
@@ -470,6 +529,9 @@ struct Router {
     /// The `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// The interval of `service_discovery=True` Kubernetes discovery
+    /// (`None`: the default every provider has, 30s).
+    discovery_check_interval_secs: Option<u64>,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
     drain_settle_secs: u64,
@@ -484,6 +546,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
     health_check_endpoint: String,
     health_check_interval_secs: u64,
@@ -501,10 +564,8 @@ struct Router {
     job_queue_concurrency: usize,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
-    kv_index: Option<String>,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
-    least_load_max_waiting_requests: u32,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
     log_dir: Option<String>,
@@ -531,11 +592,13 @@ struct Router {
     mesh_tls_key: Option<String>,
     mm_allow_private_media_hosts: bool,
     mm_allowed_media_domains: Option<Vec<String>>,
+    mm_fetch_timeout_ms: Option<u64>,
     mm_per_request_image_limit: Option<usize>,
     mm_pixel_cache_mb: Option<usize>,
     mm_pixel_rdma: bool,
     mm_processing: Option<String>,
     mm_turbojpeg: Option<String>,
+    mm_video_fetch_timeout_ms: Option<u64>,
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
@@ -546,14 +609,17 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
-    /// `legacy` or `symphony`: which parser reads a chat completion's output.
+    /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
+    prefill_expected_workers: Option<usize>,
     prefill_max_inflight_requests_per_worker: i32,
+    prefill_min_ready_percent: Option<u8>,
+    prefill_min_ready_workers: Option<usize>,
     prefill_policy: Option<PolicyType>,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -601,6 +667,7 @@ struct Router {
     service_discovery_namespace: Option<String>,
     service_discovery_port: u16,
     shutdown_grace_period_secs: u64,
+    shutdown_settle_secs: Option<u64>,
     sse_keepalive_secs: u64,
     storage_context_headers: HashMap<String, String>,
     storage_hook_wasm_path: Option<String>,
@@ -641,6 +708,9 @@ struct Router {
     worker_wedge_secs: u64,
     /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
     zmq_engine_count: Option<usize>,
+    /// Seconds any one stage of a ZMQ engine's startup handshake may stay
+    /// silent; it alone covers the engine's init between HELLO and READY.
+    zmq_startup_timeout_secs: u64,
     // Derived from the URL lists; not a parameter.
     connection_mode: worker::ConnectionMode,
 }
@@ -774,6 +844,29 @@ impl Router {
         }
     }
 
+    /// Build optional per-role readiness thresholds from Python arguments.
+    fn pd_readiness_config(&self) -> Option<config::PdReadinessConfig> {
+        let configured = self.prefill_expected_workers.is_some()
+            || self.prefill_min_ready_workers.is_some()
+            || self.prefill_min_ready_percent.is_some()
+            || self.decode_min_ready_workers.is_some()
+            || self.decode_expected_workers.is_some()
+            || self.decode_min_ready_percent.is_some();
+        configured.then(|| config::PdReadinessConfig {
+            prefill: config::ReadinessRoleConfig {
+                expected_workers: self.prefill_expected_workers,
+                min_healthy_workers: self.prefill_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.prefill_min_ready_percent,
+            },
+            decode: config::ReadinessRoleConfig {
+                expected_workers: self.decode_expected_workers,
+                min_healthy_workers: self.decode_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.decode_min_ready_percent,
+            },
+        })
+    }
+
+    /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
@@ -869,6 +962,8 @@ impl Router {
                     selection_policy: (self.selection_policy != policies::cost::DEFAULT_POLICY)
                         .then(|| self.selection_policy.clone()),
                     selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
+                    balance_prefix_margin_tokens: self.balance_prefix_margin_tokens,
+                    balance_uncached_credit: self.balance_uncached_credit,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_metric: power_of_two_load_metric,
@@ -877,7 +972,6 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
-                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -902,14 +996,8 @@ impl Router {
 
         // IGW does not override backend or disaggregated modes; IGW-only keeps
         // the Python binding's existing empty startup-worker behavior.
-        let mode = if matches!(self.backend, BackendType::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, BackendType::Anthropic) {
-            RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
-            }
+        let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
+            provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
                 encode_urls: self.encode_urls.clone().unwrap_or_default(),
@@ -962,7 +1050,9 @@ impl Router {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
-                check_interval_secs: 60,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(config::DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
                 selector: self.selector.clone(),
                 encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -978,7 +1068,6 @@ impl Router {
         } else {
             self.discovery.clone()
         };
-        let has_discovery = discovery.is_some();
 
         // The metrics listener `start` creates: its port when unset is the
         // exporter's default, so the validator's port checks (the admin,
@@ -1059,7 +1148,7 @@ impl Router {
         // additionally pins the startup workers' runtime: the shared EngineCore
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed. HTTP/gRPC keep auto-detection (None). Mirrors
-        // `to_router_config` in model_gateway/src/main.rs.
+        // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
                 match self.backend {
@@ -1081,13 +1170,16 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .pd_readiness(self.pd_readiness_config())
             .admin_port(self.admin_port)
             .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .grpc_request_timeout_secs(self.grpc_request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -1107,8 +1199,6 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
-            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1145,12 +1235,9 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                // Explicit setting wins; otherwise recovery-by-removal follows
-                // service discovery, which is what re-adds a removed worker.
-                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
-                    has_discovery,
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
@@ -1228,6 +1315,8 @@ impl Router {
             .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .mm_turbojpeg(mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1280,8 +1369,10 @@ impl Router {
         assignment_mode = None,
         backend = BackendType::Sglang,
         balance_abs_threshold = 64,
+        balance_prefix_margin_tokens = 0,
         balance_rel_threshold = 1.5,
         balance_token_usage_threshold = 1.0,
+        balance_uncached_credit = false,
         block_size = 16,
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         bucket_adjust_interval_secs = 5,
@@ -1299,6 +1390,9 @@ impl Router {
         client_key_path = None,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
+        decode_expected_workers = None,
+        decode_min_ready_percent = None,
+        decode_min_ready_workers = None,
         decode_policy = None,
         decode_selector = HashMap::new(),
         decode_urls = None,
@@ -1308,6 +1402,7 @@ impl Router {
         disable_retries = false,
         disable_tokenizer_autoload = false,
         discovery = None,
+        discovery_check_interval_secs = None,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
         drain_settle_secs = 5,
@@ -1322,6 +1417,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
         health_check_interval_secs = 60,
@@ -1339,10 +1435,8 @@ impl Router {
         job_queue_concurrency = 200,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        kv_index = None,
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
-        least_load_max_waiting_requests = 0,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
         log_dir = None,
@@ -1367,11 +1461,13 @@ impl Router {
         mesh_tls_key = None,
         mm_allow_private_media_hosts = false,
         mm_allowed_media_domains = None,
+        mm_fetch_timeout_ms = None,
         mm_per_request_image_limit = None,
         mm_pixel_cache_mb = None,
         mm_pixel_rdma = false,
         mm_processing = None,
         mm_turbojpeg = None,
+        mm_video_fetch_timeout_ms = None,
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
@@ -1382,13 +1478,16 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
-        parser = String::from("legacy"),
+        parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
+        prefill_expected_workers = None,
         prefill_max_inflight_requests_per_worker = -1,
+        prefill_min_ready_percent = None,
+        prefill_min_ready_workers = None,
         prefill_policy = None,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1436,6 +1535,7 @@ impl Router {
         service_discovery_namespace = None,
         service_discovery_port = 80,
         shutdown_grace_period_secs = 180,
+        shutdown_settle_secs = None,
         sse_keepalive_secs = 15,
         storage_context_headers = HashMap::new(),
         storage_hook_wasm_path = None,
@@ -1473,8 +1573,10 @@ impl Router {
         worker_warmup_thin_ratio = 0.5,
         worker_wedge_secs = 3,
         zmq_engine_count = None,
+        zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
+    /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1488,8 +1590,10 @@ impl Router {
         assignment_mode: Option<String>,
         backend: BackendType,
         balance_abs_threshold: usize,
+        balance_prefix_margin_tokens: u32,
         balance_rel_threshold: f32,
         balance_token_usage_threshold: f32,
+        balance_uncached_credit: bool,
         block_size: usize,
         bootstrap_port_annotation: String,
         bucket_adjust_interval_secs: usize,
@@ -1507,6 +1611,9 @@ impl Router {
         client_key_path: Option<String>,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
+        decode_expected_workers: Option<usize>,
+        decode_min_ready_percent: Option<u8>,
+        decode_min_ready_workers: Option<usize>,
         decode_policy: Option<PolicyType>,
         decode_selector: HashMap<String, String>,
         decode_urls: Option<Vec<String>>,
@@ -1516,6 +1623,7 @@ impl Router {
         disable_retries: bool,
         disable_tokenizer_autoload: bool,
         discovery: Option<Bound<'_, PyAny>>,
+        discovery_check_interval_secs: Option<u64>,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,
         drain_settle_secs: u64,
@@ -1530,6 +1638,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
         health_check_endpoint: String,
         health_check_interval_secs: u64,
@@ -1547,10 +1656,8 @@ impl Router {
         job_queue_concurrency: usize,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
-        kv_index: Option<String>,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
-        least_load_max_waiting_requests: u32,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
         log_dir: Option<String>,
@@ -1575,11 +1682,13 @@ impl Router {
         mesh_tls_key: Option<String>,
         mm_allow_private_media_hosts: bool,
         mm_allowed_media_domains: Option<Vec<String>>,
+        mm_fetch_timeout_ms: Option<u64>,
         mm_per_request_image_limit: Option<usize>,
         mm_pixel_cache_mb: Option<usize>,
         mm_pixel_rdma: bool,
         mm_processing: Option<String>,
         mm_turbojpeg: Option<String>,
+        mm_video_fetch_timeout_ms: Option<u64>,
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
@@ -1596,7 +1705,10 @@ impl Router {
         pd_pairing_mode: String,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
+        prefill_expected_workers: Option<usize>,
         prefill_max_inflight_requests_per_worker: i32,
+        prefill_min_ready_percent: Option<u8>,
+        prefill_min_ready_workers: Option<usize>,
         prefill_policy: Option<PolicyType>,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -1644,6 +1756,7 @@ impl Router {
         service_discovery_namespace: Option<String>,
         service_discovery_port: u16,
         shutdown_grace_period_secs: u64,
+        shutdown_settle_secs: Option<u64>,
         sse_keepalive_secs: u64,
         storage_context_headers: HashMap<String, String>,
         storage_hook_wasm_path: Option<String>,
@@ -1681,11 +1794,19 @@ impl Router {
         worker_warmup_thin_ratio: f32,
         worker_wedge_secs: u64,
         zmq_engine_count: Option<usize>,
+        zmq_startup_timeout_secs: u64,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        // A `discovery` mapping carries its own `check_interval_secs`.
+        if discovery_check_interval_secs.is_some() && !service_discovery {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "discovery_check_interval_secs applies to service_discovery=True; \
+                 a discovery mapping takes check_interval_secs",
             ));
         }
         let discovery = discovery
@@ -1726,8 +1847,10 @@ impl Router {
             assignment_mode,
             backend,
             balance_abs_threshold,
+            balance_prefix_margin_tokens,
             balance_rel_threshold,
             balance_token_usage_threshold,
+            balance_uncached_credit,
             block_size,
             bootstrap_port_annotation,
             bucket_adjust_interval_secs,
@@ -1745,6 +1868,9 @@ impl Router {
             client_key_path,
             control_plane_auth,
             cors_allowed_origins,
+            decode_expected_workers,
+            decode_min_ready_percent,
+            decode_min_ready_workers,
             decode_policy,
             decode_selector,
             decode_urls,
@@ -1754,6 +1880,7 @@ impl Router {
             disable_retries,
             disable_tokenizer_autoload,
             discovery,
+            discovery_check_interval_secs,
             dp_aware,
             dp_minimum_tokens_scheduler,
             drain_settle_secs,
@@ -1768,6 +1895,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grpc_request_timeout_secs,
             header_read_timeout_secs,
             health_check_endpoint,
             health_check_interval_secs,
@@ -1785,10 +1913,8 @@ impl Router {
             job_queue_concurrency,
             kv_connector_annotation,
             kv_engine_id_annotation,
-            kv_index,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
-            least_load_max_waiting_requests,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
             log_dir,
@@ -1813,11 +1939,13 @@ impl Router {
             mesh_tls_key,
             mm_allow_private_media_hosts,
             mm_allowed_media_domains,
+            mm_fetch_timeout_ms,
             mm_per_request_image_limit,
             mm_pixel_cache_mb,
             mm_pixel_rdma,
             mm_processing,
             mm_turbojpeg,
+            mm_video_fetch_timeout_ms,
             model_aliases,
             model_id_from,
             model_path,
@@ -1834,7 +1962,10 @@ impl Router {
             pd_pairing_mode,
             postgres_config,
             power_of_two_load_metric,
+            prefill_expected_workers,
             prefill_max_inflight_requests_per_worker,
+            prefill_min_ready_percent,
+            prefill_min_ready_workers,
             prefill_policy,
             prefill_queue_size,
             prefill_queue_timeout_secs,
@@ -1882,6 +2013,7 @@ impl Router {
             service_discovery_namespace,
             service_discovery_port,
             shutdown_grace_period_secs,
+            shutdown_settle_secs,
             sse_keepalive_secs,
             storage_context_headers,
             storage_hook_wasm_path,
@@ -1919,19 +2051,27 @@ impl Router {
             worker_warmup_thin_ratio,
             worker_wedge_secs,
             zmq_engine_count,
+            zmq_startup_timeout_secs,
             connection_mode,
         })
     }
 
+    /// Run the gateway with the configured propagation window and shared shutdown deadline.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        if let Some(buckets) = &self.prometheus_duration_buckets {
+            PrometheusConfig::validate_duration_buckets(buckets).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        }
+
+        // Validated once, by the builder's `build()` inside `to_router_config`;
+        // `startup` validates once more for a library caller that never went
+        // through the builder.
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
-        })?;
-
-        router_config.validate().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
         })?;
 
         let service_discovery_config = router_config
@@ -1950,7 +2090,7 @@ impl Router {
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .and_then(mesh_discovery::MeshDiscoveryConfig::from_discovery);
+            .and_then(mesh::discovery::MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
@@ -1972,8 +2112,9 @@ impl Router {
             .transpose()?;
 
         // The runtime's default size unless a thread count is given (the
-        // validation above refused 0), as the CLI's `serve` builds it.
-        let runtime = match self.runtime_worker_threads {
+        // validation above refused 0), read from the validated config as the
+        // CLI's `serve` reads it.
+        let runtime = match router_config.runtime_worker_threads {
             Some(threads) => tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(threads)
                 .enable_all()
@@ -1986,25 +2127,25 @@ impl Router {
         py.detach(|| {
             runtime.block_on(async move {
             Box::pin(server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                health_check_port: self.health_check_port,
-                runtime_worker_threads: self.runtime_worker_threads,
                 router_config,
-                max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
                 mesh_discovery_config,
                 prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()
-                    .map(|c| c.to_auth_control_plane_config()),
+                    .map(|c| c.to_auth_control_plane_config())
+                    .transpose()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Configuration error: {e}"
+                        ))
+                    })?,
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
                         use rand::{distr::Alphanumeric, RngExt};
@@ -2024,7 +2165,7 @@ impl Router {
                             })
                         })
                         .transpose()?;
-                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
                     // for Pods with no usable annotation.
@@ -2148,7 +2289,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The process-level TLS crypto provider, installed once when the module
     // is imported: every HTTP client a binding builds takes it, whether or
     // not a router is started in this process.
-    tls::install_crypto_provider();
+    clients::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
@@ -2164,6 +2305,8 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVllmGrpcServer>()?;
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<PyTrtllmGrpcServer>()?;
+    m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
@@ -2171,4 +2314,45 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
+}
+
+// `cargo test -p smg-python --lib` runs these without an interpreter: the
+// tests reach pure-Rust code only, so the linker drops the module's Python
+// references with the code nothing here calls (the crate's features change
+// nothing about that: pyo3's `extension-module` is on either way).
+#[cfg(test)]
+mod tests {
+    use config::RoutingMode;
+
+    use super::*;
+
+    #[test]
+    fn a_provider_backend_is_its_routing_mode_and_an_engine_backend_is_none() {
+        let urls = vec!["https://provider.example".to_string()];
+        let provider = |backend: BackendType| backend.provider_mode(&urls);
+
+        assert!(matches!(
+            provider(BackendType::Openai),
+            Some(RoutingMode::OpenAI { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Anthropic),
+            Some(RoutingMode::Anthropic { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Gemini),
+            Some(RoutingMode::Gemini { worker_urls }) if worker_urls == urls
+        ));
+        for engine in [
+            BackendType::Sglang,
+            BackendType::Vllm,
+            BackendType::Tokenspeed,
+            BackendType::Trtllm,
+        ] {
+            assert!(
+                engine.provider_mode(&urls).is_none(),
+                "{engine:?} is an engine backend: the disaggregation flags select its mode"
+            );
+        }
+    }
 }

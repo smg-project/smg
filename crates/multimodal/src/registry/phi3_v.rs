@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{Phi3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Phi3VisionSpec;
@@ -41,6 +44,23 @@ impl ModelProcessorSpec for Phi3VisionSpec {
             ("pixel_values".to_string(), FieldLayout::Batched),
             ("image_sizes".to_string(), FieldLayout::Batched),
         ])
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(
+                Phi3VisionProcessor::new().with_normalization_of(preprocessor_config),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

@@ -7,11 +7,12 @@
 //! one event, including bytes that were dropped or could not be parsed, so nothing disappears
 //! silently.
 //!
-//! This crate replaces the separate tool-call and reasoning parser crates over time. Until the
-//! gateway is switched over, it is developed and verified on its own: it changes nothing outside
-//! `crates/symphony/`, and its formats are proven against recorded fixtures before they are wired
-//! in. The design and the delivery plan live with the maintainers; the short version is in this
-//! crate's `README.md`.
+//! This crate replaced the separate tool-call and reasoning parser crates on the gateway's request
+//! path: the gateway reads a model's output through it by default, and the older readers stay
+//! behind `--parser legacy` (or a request's `X-SMG-Parser: legacy`) and read the models no table
+//! reads yet. Its formats are proven against recorded fixtures before they are wired in. The
+//! design and the delivery plan live with the maintainers; the short version is in this crate's
+//! `README.md`.
 //!
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
@@ -21,7 +22,7 @@
 //! table: the tables in [`formats`] are the families recorded so far, [`formats::for_model`] picks
 //! the one for a model id, and more follow. The crate's surface is this root: the modules it
 //! declares public and the names it re-exports, which the gateway, the bindings and the tests
-//! build on (`tests/surface.rs` pins the list). The assemblers, the scanner and the token ledger
+//! build on (`tests/parser/surface.rs` pins the list). The assemblers, the scanner and the token ledger
 //! are the engine's own.
 
 #![forbid(unsafe_code)]

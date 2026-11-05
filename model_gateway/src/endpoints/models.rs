@@ -1,10 +1,17 @@
 //! `GET /v1/models` and `GET /v1/models/{id}`: the gateway's model inventory.
 //!
-//! Self-hosted models are read from the worker registry. A caller presenting
-//! its own provider credential (bring your own key) is answered from the
-//! external upstreams instead, but never when that credential is one of the
-//! gateway's own keys: a tenant-scoped key must not be forwarded to a third
-//! party as if it were the caller's.
+//! Self-hosted models are read from the worker registry; every alias of a
+//! self-hosted model is listed as an entry of its own (the same model under
+//! the alias name), so every name a client may send is one it can discover.
+//! A caller presenting its own provider credential (bring your own key) is
+//! answered from the external upstreams of the API family it speaks instead:
+//! a credential presented with the Messages API's headers reaches the
+//! Anthropic upstreams alone, one presented the OpenAI way the
+//! OpenAI-compatible ones (the providers each family's router takes, a
+//! worker's provider judged as admission judges it: declared, else read from
+//! its address), and never another family's provider. And never when that
+//! credential is one of the gateway's own keys: a tenant-scoped key must not
+//! be forwarded to a third party as if it were the caller's.
 //!
 //! The list and the single model come in the shape of the API family the
 //! caller speaks: a request carrying the `anthropic-version` header gets the
@@ -21,13 +28,14 @@ use axum::{
 use futures::future::select_all;
 use openai_protocol::{messages, model_card::ModelCard, models::ListModelsResponse};
 use serde_json::Value;
+use smg_external_router::{known, ExternalRouterSpec};
 use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
     middleware::{into_messages_envelope, AuthConfig},
-    routers::{common::header_utils::apply_provider_headers, error},
-    worker::{ProviderType, RuntimeType, WorkerRegistry},
+    routers::{common::header_utils::apply_provider_headers, error, provider_support},
+    worker::{endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
 };
 
 /// The API family a models request speaks, read from its headers.
@@ -45,6 +53,18 @@ impl ModelShape {
             Self::Anthropic
         } else {
             Self::OpenAi
+        }
+    }
+
+    /// The external router of the caller's API family, whose providers are
+    /// the only upstreams a credential presented in this family may reach:
+    /// the scope the routers define for their workers, which worker selection
+    /// applies to a serving request's credential when a miss refreshes the
+    /// external workers' models.
+    fn router(self) -> ExternalRouterSpec {
+        match self {
+            Self::OpenAi => known::OPENAI,
+            Self::Anthropic => known::ANTHROPIC,
         }
     }
 
@@ -132,10 +152,11 @@ pub(crate) async fn list_models_with(
         }
     }
 
-    // A foreign token is tried against the external upstreams first (bring
-    // your own key). On total failure fall through to the registry.
+    // A foreign token is tried against the external upstreams of the caller's
+    // API family first (bring your own key). On total failure fall through to
+    // the registry.
     if let Some(ref token) = bearer_token {
-        let upstream_cards = fetch_upstream_models(registry, client, token).await;
+        let upstream_cards = fetch_upstream_models(registry, client, token, shape.router()).await;
         if !upstream_cards.is_empty() {
             return shape.list(upstream_cards);
         }
@@ -207,6 +228,33 @@ fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
         .collect()
 }
 
+/// The self-hosted inventory as the list presents it: every card, then one
+/// entry per alias (the same card under the alias name), so every name a
+/// client may send is one it can discover. An alias is listed under the
+/// model the registry resolves it to, and nowhere else: a name that is a
+/// registered model's id, a contested alias's losing declaration or the
+/// reserved wildcard name is never shown as an alias routing does not honour.
+fn listed_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
+    let mut cards = self_hosted_cards(registry);
+    let aliased: Vec<ModelCard> = cards
+        .iter()
+        .flat_map(|card| {
+            card.aliases
+                .iter()
+                .filter(|alias| {
+                    registry.resolve_model_alias(alias).as_deref() == Some(card.id.as_str())
+                })
+                .map(|alias| ModelCard {
+                    id: alias.clone(),
+                    aliases: Vec::new(),
+                    ..card.clone()
+                })
+        })
+        .collect();
+    cards.extend(aliased);
+    cards
+}
+
 /// The self-hosted inventory as a list in the caller's shape, or the 503 of
 /// an empty one in the caller's error envelope.
 async fn registry_models_response(
@@ -214,7 +262,7 @@ async fn registry_models_response(
     shape: ModelShape,
     request_id: String,
 ) -> Response {
-    let cards = self_hosted_cards(registry);
+    let cards = listed_cards(registry);
     if cards.is_empty() {
         shape.no_models(request_id).await
     } else {
@@ -222,17 +270,21 @@ async fn registry_models_response(
     }
 }
 
-/// Fan out to all healthy external upstreams concurrently with the caller's
-/// bearer token and return the first successful model inventory. Returns an
-/// empty vec on total failure.
+/// Fan out to the healthy external upstreams of the caller's API family (the
+/// providers `router` takes) concurrently with the caller's bearer token and
+/// return the first successful model inventory. An upstream of another family
+/// is not asked: a credential presented in one family's API never reaches
+/// another family's provider. Returns an empty vec on total failure.
 async fn fetch_upstream_models(
     registry: &WorkerRegistry,
     client: &reqwest::Client,
     bearer_token: &str,
+    router: ExternalRouterSpec,
 ) -> Vec<ModelCard> {
     let unique_urls: Vec<_> = registry
         .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
         .iter()
+        .filter(|w| router.takes(provider_support::provider_of(&w.metadata().spec).as_ref()))
         .map(|w| w.url().to_string())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -279,19 +331,21 @@ async fn fetch_models_from(
     auth: Option<HeaderValue>,
 ) -> Vec<ModelCard> {
     let url = format!("{base_url}/v1/models");
+    // The address as the lines below write it: a userinfo in it masked.
+    let shown = Endpoint::redacted_str(&url);
     let req = apply_provider_headers(client.get(&url), &url, auth.as_ref());
 
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            debug!("Failed to reach upstream {url}: {e}");
+            debug!("Failed to reach upstream {shown}: {e}");
             return Vec::new();
         }
     };
 
     if !resp.status().is_success() {
         debug!(
-            "Upstream {url} returned {} for model discovery",
+            "Upstream {shown} returned {} for model discovery",
             resp.status()
         );
         return Vec::new();
@@ -300,7 +354,7 @@ async fn fetch_models_from(
     match resp.json::<Value>().await {
         Ok(json) => ListModelsResponse::parse_upstream(&json, ProviderType::from_url(&url)),
         Err(e) => {
-            warn!("Failed to parse upstream models from {url}: {e}");
+            warn!("Failed to parse upstream models from {shown}: {e}");
             Vec::new()
         }
     }
@@ -310,16 +364,16 @@ async fn fetch_models_from(
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use axum::http::{Request, StatusCode};
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::WorkerSpec;
 
     use super::*;
     use crate::{
         config::types::TenantApiKeyEntry,
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
 
     /// An inventory with no model in it answers the gateway's JSON error
@@ -386,10 +440,7 @@ mod tests {
             BasicWorkerBuilder::new(format!("http://{addr}"))
                 .worker_type(WorkerType::Regular)
                 .runtime_type(RuntimeType::External)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(external_worker);
@@ -399,15 +450,12 @@ mod tests {
             BasicWorkerBuilder::new("http://internal.invalid:8000")
                 .worker_type(WorkerType::Regular)
                 .models(vec![ModelCard::new("internal-model")])
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(internal_worker);
 
-        let client = crate::http_client::client();
+        let client = crate::clients::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),
             &[TenantApiKeyEntry {
@@ -457,20 +505,139 @@ mod tests {
         );
     }
 
+    /// A stub provider at a loopback address: it records the credential
+    /// headers of every request it gets and answers a one-model catalogue
+    /// named after `label`.
+    #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
+    async fn recording_provider(label: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_app = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let seen = seen_by_app.clone();
+                async move {
+                    let credentials: Vec<String> = ["authorization", "x-api-key"]
+                        .iter()
+                        .filter_map(|name| {
+                            headers
+                                .get(*name)
+                                .and_then(|value| value.to_str().ok())
+                                .map(|value| format!("{name}={value}"))
+                        })
+                        .collect();
+                    seen.lock().unwrap().push(credentials.join(" "));
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": format!("{label}-model"), "object": "model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An external worker built from the spec a registration would carry.
+    fn external_worker(spec: Value) -> Arc<dyn Worker> {
+        let spec: WorkerSpec = serde_json::from_value(spec).unwrap();
+        Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// A caller's own credential reaches the providers of the API family the
+    /// caller speaks and no other: an OpenAI-style bearer goes to the
+    /// OpenAI-compatible upstreams, a Messages-style key to the Anthropic
+    /// ones, so a key for one provider is never presented to another family's
+    /// provider by the listing, and each caller is listed its own family's
+    /// catalogue.
+    #[tokio::test]
+    async fn a_callers_credential_reaches_the_providers_of_its_api_family_alone() {
+        let (unnamed_url, seen_by_unnamed) = recording_provider("open").await;
+        let (anthropic_url, seen_by_anthropic) = recording_provider("claude").await;
+        let registry = WorkerRegistry::new();
+        // An address naming no provider: the OpenAI-compatible router's
+        // fallback, as an OpenAI-compatible endpoint registers.
+        registry.register(external_worker(serde_json::json!({
+            "url": unnamed_url,
+            "runtime_type": "external",
+        })));
+        registry.register(external_worker(serde_json::json!({
+            "url": anthropic_url,
+            "runtime_type": "external",
+            "provider": "anthropic",
+        })));
+        let client = crate::clients::http_client();
+        let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
+
+        let mut openai_style = HeaderMap::new();
+        openai_style.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer key-for-one-provider"),
+        );
+        let listed = json_body(
+            list_models_with(&registry, &client, &gateway_auth, &openai_style, rid()).await,
+        )
+        .await;
+        assert_eq!(listed_ids(&listed), ["open-model"], "{listed}");
+        assert_eq!(
+            *seen_by_unnamed.lock().unwrap(),
+            ["authorization=Bearer key-for-one-provider"],
+            "the OpenAI-compatible upstream is asked with the caller's credential"
+        );
+        assert!(
+            seen_by_anthropic.lock().unwrap().is_empty(),
+            "an OpenAI-style credential reached the Anthropic upstream: {:?}",
+            seen_by_anthropic.lock().unwrap()
+        );
+
+        let mut messages_style = HeaderMap::new();
+        messages_style.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        messages_style.insert(
+            "x-api-key",
+            HeaderValue::from_static("key-for-one-provider"),
+        );
+        let listed = json_body(
+            list_models_with(&registry, &client, &gateway_auth, &messages_style, rid()).await,
+        )
+        .await;
+        assert_eq!(listed_ids(&listed), ["claude-model"], "{listed}");
+        assert_eq!(
+            *seen_by_anthropic.lock().unwrap(),
+            ["authorization=Bearer key-for-one-provider"],
+            "the Anthropic upstream is asked with the caller's credential"
+        );
+        assert_eq!(
+            seen_by_unnamed.lock().unwrap().len(),
+            1,
+            "a Messages-style credential reached the OpenAI-compatible upstream: {:?}",
+            seen_by_unnamed.lock().unwrap()
+        );
+    }
+
     fn registry_with(cards: Vec<ModelCard>) -> WorkerRegistry {
         let registry = WorkerRegistry::new();
+        register_worker(&registry, "http://internal.invalid:8000", cards);
+        registry
+    }
+
+    /// Register a self-hosted worker at `url` serving `cards`.
+    fn register_worker(registry: &WorkerRegistry, url: &str, cards: Vec<ModelCard>) {
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://internal.invalid:8000")
+            BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .models(cards)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(worker);
-        registry
     }
 
     /// A request id for the tests that do not read it back.
@@ -494,7 +661,7 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        let client = crate::http_client::client();
+        let client = crate::clients::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let openai = json_body(
@@ -602,6 +769,114 @@ mod tests {
         assert_eq!(body["request_id"], "req_models_1", "{body}");
         assert!(body["error"].get("code").is_none(), "{body}");
         assert!(body["error"].get("param").is_none(), "{body}");
+    }
+
+    /// Every alias of a self-hosted model is listed as an entry of its own,
+    /// after the models' own ids, with its model's `owned_by`, `created` and
+    /// display name, in either shape of the list: a name a client may send
+    /// is a name it can discover. A model without aliases lists as before.
+    #[tokio::test]
+    async fn every_alias_is_listed_as_an_entry_of_its_own() {
+        let mut aliased = ModelCard::new("m1");
+        aliased.display_name = Some("Model One".to_owned());
+        aliased.aliases = vec!["alias-1a".to_owned(), "alias-1b".to_owned()];
+        let registry = registry_with(vec![aliased, ModelCard::new("m2")]);
+
+        let openai =
+            json_body(registry_models_response(&registry, ModelShape::OpenAi, rid()).await).await;
+        assert_eq!(
+            listed_ids(&openai),
+            ["m1", "m2", "alias-1a", "alias-1b"],
+            "{openai}"
+        );
+        assert_eq!(
+            openai["data"][2],
+            serde_json::json!({
+                "id": "alias-1a",
+                "object": "model",
+                "created": 0,
+                "owned_by": "self_hosted"
+            }),
+            "{openai}"
+        );
+
+        let anthropic =
+            json_body(registry_models_response(&registry, ModelShape::Anthropic, rid()).await)
+                .await;
+        assert_eq!(
+            listed_ids(&anthropic),
+            ["m1", "m2", "alias-1a", "alias-1b"],
+            "{anthropic}"
+        );
+        assert_eq!(anthropic["data"][1]["display_name"], "m2", "{anthropic}");
+        assert_eq!(
+            anthropic["data"][3]["display_name"], "Model One",
+            "{anthropic}"
+        );
+        assert_eq!(anthropic["first_id"], "m1", "{anthropic}");
+        assert_eq!(anthropic["last_id"], "alias-1b", "{anthropic}");
+    }
+
+    /// An alias two workers' cards declare is listed once, under the card
+    /// the registry resolves it to (the first registered keeps it), whatever
+    /// order the workers come back in: the entry describes the model routing
+    /// sends the name to.
+    #[tokio::test]
+    async fn a_contested_alias_is_listed_under_the_card_the_registry_resolves_it_to() {
+        let registry = WorkerRegistry::new();
+        let mut first = ModelCard::new("org/first");
+        first.display_name = Some("First".to_owned());
+        first.aliases = vec!["shared".to_owned()];
+        register_worker(&registry, "http://first.invalid:8000", vec![first]);
+        let mut second = ModelCard::new("org/second");
+        second.display_name = Some("Second".to_owned());
+        second.aliases = vec!["shared".to_owned()];
+        register_worker(&registry, "http://second.invalid:8000", vec![second]);
+        assert_eq!(
+            registry.resolve_model_alias("shared").as_deref(),
+            Some("org/first")
+        );
+
+        let body =
+            json_body(registry_models_response(&registry, ModelShape::Anthropic, rid()).await)
+                .await;
+        let shared: Vec<&Value> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["id"] == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1, "{body}");
+        assert_eq!(shared[0]["display_name"], "First", "{body}");
+    }
+
+    /// A name is listed once: a model's own id is never re-listed as another
+    /// card's alias, and an alias two cards declare makes one entry.
+    #[tokio::test]
+    async fn a_name_is_listed_once_and_a_models_own_id_wins() {
+        let mut first = ModelCard::new("org/first");
+        first.aliases = vec!["org/second".to_owned(), "shared".to_owned()];
+        let mut third = ModelCard::new("org/third");
+        third.aliases = vec!["shared".to_owned()];
+        let registry = registry_with(vec![first, ModelCard::new("org/second"), third]);
+
+        let body =
+            json_body(registry_models_response(&registry, ModelShape::OpenAi, rid()).await).await;
+        assert_eq!(
+            listed_ids(&body),
+            ["org/first", "org/second", "org/third", "shared"],
+            "{body}"
+        );
+    }
+
+    /// The ids of a list body, in order.
+    fn listed_ids(body: &Value) -> Vec<&str> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect()
     }
 
     /// A canonical id that is also another card's alias names its own card:

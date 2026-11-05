@@ -2,6 +2,9 @@
 // Apache-2.0 reference `vllm-engine-core-client` (vllm-project/vllm,
 // rust/src/engine-core-client/src/error.rs). See crate root for provenance.
 
+//! The crate's `Error` variants (encode, decode, transport, a dead engine, the handshake's
+//! deadlines) and its `Result` alias.
+
 use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
@@ -45,6 +48,11 @@ pub enum Error {
     InputRegistrationTimeout { timeout: Duration },
     #[error("unexpected startup handshake message: {message}")]
     UnexpectedHandshakeMessage { message: String },
+    /// The field order the engine declared for a positional struct at its
+    /// handshake differs from the prefix this client encodes for it: no
+    /// request goes out to be refused one by one.
+    #[error("wire layout mismatch: {message}")]
+    WireLayoutMismatch { message: String },
     #[error("unsupported field `{field}` in {context}")]
     UnsupportedField {
         context: &'static str,

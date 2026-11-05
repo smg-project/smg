@@ -46,13 +46,14 @@ use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
 use super::{
-    provider::{DiscoveredWorker, DiscoveryKind},
-    reconciler::{self, DesiredState},
+    provider::{DiscoveredWorker, DiscoveryKind, Roles},
+    reconciler::DesiredState,
+    snapshot::{LastGood, SnapshotError},
 };
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::metrics_labels,
     worker::{endpoint::Endpoint, EndpointKey},
 };
 
@@ -83,56 +84,6 @@ impl FileProviderConfig {
             check_interval,
             roles,
         })
-    }
-}
-
-/// The worker types a routing mode accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Roles {
-    Regular,
-    PrefillDecode,
-    EncodePrefillDecode,
-}
-
-impl Roles {
-    fn of(mode: &RoutingMode) -> Option<Self> {
-        match mode {
-            RoutingMode::Regular { .. } => Some(Self::Regular),
-            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
-            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
-            RoutingMode::OpenAI { .. }
-            | RoutingMode::Anthropic { .. }
-            | RoutingMode::Gemini { .. } => None,
-        }
-    }
-
-    fn allows(self, worker_type: WorkerType) -> bool {
-        matches!(
-            (self, worker_type),
-            (Self::Regular, WorkerType::Regular)
-                | (
-                    Self::PrefillDecode,
-                    WorkerType::Prefill | WorkerType::Decode
-                )
-                | (
-                    Self::EncodePrefillDecode,
-                    WorkerType::Encode | WorkerType::Prefill | WorkerType::Decode
-                )
-        )
-    }
-
-    /// The type of a record that names none. Regular routing has only one; a
-    /// disaggregated record must say which pool it joins.
-    fn default_type(self) -> Option<WorkerType> {
-        (self == Self::Regular).then_some(WorkerType::Regular)
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Regular => "regular",
-            Self::PrefillDecode => "prefill-decode",
-            Self::EncodePrefillDecode => "encode-prefill-decode",
-        }
     }
 }
 
@@ -186,6 +137,11 @@ impl ManifestWorker {
                 .ok_or_else(|| format!("worker_type is required in {} routing", roles.name()))?,
         };
 
+        // Port 0 is no port, as static configuration and Kubernetes
+        // annotations already refuse it.
+        if self.bootstrap_port == Some(0) {
+            return Err("bootstrap_port must be between 1 and 65535".to_string());
+        }
         if self.bootstrap_port.is_some()
             && !matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
         {
@@ -234,9 +190,20 @@ fn parse_manifest(bytes: &[u8], roles: Roles) -> Result<Vec<DiscoveredWorker>, S
             .into_worker(roles)
             .map_err(|reason| format!("workers[{index}]: {reason}"))?;
         if !ids.insert(worker.discovery_id.clone()) {
+            // The default id is the address with its userinfo masked, so two
+            // id-less entries at one address that differ only in their
+            // credentials (different keys) collide here on an id nobody
+            // wrote: say so. The same entry twice is a plain duplicate.
+            let defaulted = worker.discovery_id == worker.endpoint.redacted()
+                && !endpoints.contains_key(&worker.endpoint.key());
             return Err(format!(
-                "workers[{index}]: duplicate id '{}'",
-                worker.discovery_id
+                "workers[{index}]: duplicate id '{}'{}",
+                worker.discovery_id,
+                if defaulted {
+                    " (the default id, the address with its userinfo masked; set an explicit id)"
+                } else {
+                    ""
+                }
             ));
         }
         if let Some(other) = endpoints.insert(worker.endpoint.key(), worker.discovery_id.clone()) {
@@ -266,7 +233,7 @@ enum ManifestError {
     Invalid { path: String, reason: String },
 }
 
-impl ManifestError {
+impl SnapshotError for ManifestError {
     fn metric_reason(&self) -> &'static str {
         match self {
             Self::Unreadable { .. } => metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
@@ -445,7 +412,7 @@ struct FileDiscovery {
     /// Held for as long as the loop runs: dropping it stops the watch.
     watch: Option<ManifestWatch>,
     warned: bool,
-    last_good: Option<DesiredState>,
+    last_good: LastGood,
 }
 
 /// The loop's timers, held across passes: the tick, and the retry of a watch
@@ -471,6 +438,11 @@ impl Timers {
 impl FileDiscovery {
     fn new(config: FileProviderConfig, app_context: Arc<AppContext>) -> Self {
         let (wake, woken) = mpsc::channel(1);
+        let last_good = LastGood::new(
+            DiscoveryKind::File,
+            format!("Discovery manifest {}", config.path.display()),
+            "manifest",
+        );
         Self {
             config,
             app_context,
@@ -478,7 +450,7 @@ impl FileDiscovery {
             woken,
             watch: None,
             warned: false,
-            last_good: None,
+            last_good,
         }
     }
 
@@ -498,10 +470,9 @@ impl FileDiscovery {
         self.rewatch_if_lost(timers);
         let started_at = time::Instant::now();
         self.reread().await;
-        if let Some(desired) = &self.last_good {
-            reconciler::reconcile(desired, DiscoveryKind::File, &self.app_context, started_at)
-                .await;
-        }
+        self.last_good
+            .reconcile(&self.app_context, started_at)
+            .await;
     }
 
     /// Wait for what causes the next pass: the tick, a burst of change events
@@ -574,29 +545,7 @@ impl FileDiscovery {
     /// reported and leaves the snapshot in place, so a half-written or broken
     /// file never removes a worker.
     async fn reread(&mut self) {
-        match read_manifest(&self.config).await {
-            Ok(desired) => {
-                if self.last_good.as_ref() != Some(&desired) {
-                    info!(
-                        "Discovery manifest {} lists {} worker(s)",
-                        self.config.path.display(),
-                        desired.workers.len()
-                    );
-                }
-                self.last_good = Some(desired);
-            }
-            Err(error) => {
-                Metrics::record_discovery_snapshot_error(
-                    DiscoveryKind::File.metric_label(),
-                    error.metric_reason(),
-                );
-                if self.last_good.is_some() {
-                    warn!("{error}; keeping the last good manifest");
-                } else {
-                    warn!("{error}; no workers discovered yet");
-                }
-            }
-        }
+        self.last_good.update(read_manifest(&self.config).await);
     }
 }
 
@@ -675,7 +624,8 @@ mod tests {
     }
 
     /// Without an id the endpoint names the instance, rendered with any
-    /// password masked: the id is written to a label.
+    /// userinfo masked: the id is written to a label. Two entries at one
+    /// address that differ only in their credentials need explicit ids.
     #[test]
     fn a_missing_id_defaults_to_the_redacted_endpoint() {
         let workers = parse(
@@ -683,7 +633,7 @@ mod tests {
             Roles::Regular,
         )
         .unwrap();
-        assert_eq!(workers[0].discovery_id, "http://admin:***@10.0.0.11:8000");
+        assert_eq!(workers[0].discovery_id, "http://***@10.0.0.11:8000");
     }
 
     #[test]
@@ -696,7 +646,7 @@ mod tests {
     /// the problem.
     #[test]
     fn malformed_manifests_are_rejected_with_the_reason() {
-        let cases: [(&str, String, Roles, &str); 15] = [
+        let cases: [(&str, String, Roles, &str); 18] = [
             ("bad JSON", "{".to_string(), Roles::Regular, "EOF"),
             (
                 "missing version",
@@ -747,6 +697,14 @@ mod tests {
                 "worker_type is required in prefill-decode routing",
             ),
             (
+                "bootstrap port 0",
+                manifest(
+                    r#"{"url": "10.0.0.11:8000", "worker_type": "prefill", "bootstrap_port": 0}"#,
+                ),
+                Roles::PrefillDecode,
+                "bootstrap_port must be between 1 and 65535",
+            ),
+            (
                 "bootstrap port on a decode worker",
                 manifest(
                     r#"{"url": "10.0.0.11:8000", "worker_type": "decode", "bootstrap_port": 8998}"#,
@@ -781,6 +739,21 @@ mod tests {
                 "workers[1]: duplicate id 'a'",
             ),
             (
+                "the same id-less entry twice",
+                manifest(r#"{"url": "10.0.0.11:8000"}, {"url": "10.0.0.11:8000"}"#),
+                Roles::Regular,
+                "workers[1]: duplicate id '10.0.0.11:8000'",
+            ),
+            (
+                "two id-less entries at one address that differ only in their credentials",
+                manifest(
+                    r#"{"url": "http://alice:x@10.0.0.11:8000"}, {"url": "http://bob:y@10.0.0.11:8000"}"#,
+                ),
+                Roles::Regular,
+                "workers[1]: duplicate id 'http://***@10.0.0.11:8000' (the default id, the address \
+                 with its userinfo masked; set an explicit id)",
+            ),
+            (
                 "two spellings of one endpoint",
                 manifest(
                     r#"{"id": "a", "url": "10.0.0.11:8000"}, {"id": "b", "url": "http://10.0.0.11:8000"}"#,
@@ -796,6 +769,15 @@ mod tests {
                 "{case}: expected '{expected}' in '{reason}'"
             );
         }
+        // Exact: the plain duplicate carries no default-id hint (the table's
+        // `contains` would accept the hint's longer message as well).
+        assert_eq!(
+            parse_err(
+                &manifest(r#"{"url": "10.0.0.11:8000"}, {"url": "10.0.0.11:8000"}"#),
+                Roles::Regular,
+            ),
+            "workers[1]: duplicate id '10.0.0.11:8000'",
+        );
     }
 
     #[test]
@@ -1045,7 +1027,7 @@ mod tests {
     /// The endpoints of the last good snapshot, `None` before the first good
     /// read.
     fn listed(discovery: &FileDiscovery) -> Option<Vec<String>> {
-        discovery.last_good.as_ref().map(|desired| {
+        discovery.last_good.desired().map(|desired| {
             desired
                 .workers
                 .values()

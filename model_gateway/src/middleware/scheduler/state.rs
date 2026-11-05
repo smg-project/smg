@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use smg_external_router::metrics::BoundedLabels;
 use tracing::{error, info};
 
 use super::{
@@ -28,12 +29,19 @@ pub struct SchedulerState {
     /// it as a concurrency limiter (that would double-limit). `None` =
     /// no RPS limit.
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    /// The `tenant` label of the clamp and unknown-priority counters, bounded
+    /// by the settings' `tenant_metric_top_n`: the first tenant keys up to the
+    /// cap keep a series of their own, every later one counts under `other`,
+    /// so a client population cannot grow the series set or the process's
+    /// interner (the keys are client-chosen: a trusted header's value, an
+    /// address).
+    pub tenant_labels: BoundedLabels,
 }
 
 /// Which admission path the protected routes use. Chosen once at startup.
 #[derive(Clone)]
 pub enum AdmissionMode {
-    /// Legacy `concurrency_limit_middleware` (default; zero behavior change).
+    /// Legacy concurrency limit layer (default; zero behavior change).
     Legacy,
     /// Priority scheduler enabled.
     Priority(Arc<SchedulerState>),
@@ -124,6 +132,7 @@ impl AdmissionMode {
             scheduler,
             resolver,
             rate_limiter,
+            tenant_labels: BoundedLabels::new(settings.tenant_metric_top_n as usize),
         })))
     }
 }

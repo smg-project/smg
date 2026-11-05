@@ -118,7 +118,7 @@ pub struct L0Cache {
 }
 
 impl L0Cache {
-    /// A cache of at most `max_entries` entries and [`DEFAULT_MAX_BYTES`].
+    /// A cache of at most `max_entries` entries and `DEFAULT_MAX_BYTES`.
     pub fn new(max_entries: usize) -> Self {
         Self::with_limits(max_entries, DEFAULT_MAX_BYTES)
     }
@@ -297,13 +297,10 @@ impl L0Cache {
     }
 
     /// Insert an encoding into the cache. Only the ids are kept. The request
-    /// path uses [`L0Cache::lookup`] and [`L0Cache::fill`], which hash the
+    /// path uses `L0Cache::lookup` and `L0Cache::fill`, which hash the
     /// text once between them.
     pub fn insert(&self, key: String, add_special_tokens: bool, value: Encoding) {
-        let ids = match value {
-            Encoding::Plain(ids) => ids,
-            other => other.token_ids().to_vec(),
-        };
+        let ids = value.into_token_ids();
         let miss = L0Miss {
             hash: self.key(&key, add_special_tokens),
             add_special_tokens,

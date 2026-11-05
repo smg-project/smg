@@ -36,9 +36,56 @@ pub struct TrackerOutput {
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FetchKey {
     modality: Modality,
-    settings: String,
+    settings: FetchSettings,
     kind: u8,
     len: usize,
+}
+
+/// The settings a fetch runs under, the part of its key that is not the
+/// payload: two parts share a fetch exactly when these are equal. A `Copy`
+/// value compared field by field; the request's settings are one value, so
+/// every part of a request carries the same key without building it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FetchSettings {
+    Image {
+        config: ImageFetchConfig,
+        minimax_cap: Option<u32>,
+        sglang: bool,
+    },
+    Video {
+        min_frames: usize,
+        max_frames: usize,
+        /// The sampling rate's bits: two rates are the same setting exactly
+        /// when they are the same number (the rate is finite and positive by
+        /// the time it is a setting).
+        sample_fps_bits: u64,
+        max_long_side_pixel: Option<u32>,
+        sampling: FrameSampling,
+        sglang: bool,
+    },
+    Audio,
+}
+
+impl FetchSettings {
+    fn video(cfg: &VideoFetchConfig, sglang: bool) -> Self {
+        // Exhaustive: a field added to the video config must find its place
+        // in the key, or this stops compiling.
+        let VideoFetchConfig {
+            min_frames,
+            max_frames,
+            sample_fps,
+            max_long_side_pixel,
+            sampling,
+        } = *cfg;
+        Self::Video {
+            min_frames,
+            max_frames,
+            sample_fps_bits: sample_fps.to_bits(),
+            max_long_side_pixel,
+            sampling,
+            sglang,
+        }
+    }
 }
 
 /// How many distinct payloads of one `FetchKey` a new part is compared
@@ -69,32 +116,167 @@ struct Hashed {
     slot: usize,
 }
 
+/// Where a fetched item's bytes come from, for a [`FetchReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchSourceKind {
+    /// A URL fetched over the network.
+    Url,
+    /// A `data:` URL carried in the request.
+    DataUrl,
+    /// Bytes carried in the request.
+    InlineBytes,
+    /// A file of the host.
+    File,
+}
+
+impl FetchSourceKind {
+    fn of(source: &FetchSource) -> Self {
+        match source {
+            FetchSource::Url(_) => Self::Url,
+            FetchSource::DataUrl(_) => Self::DataUrl,
+            FetchSource::InlineBytes(_) => Self::InlineBytes,
+            FetchSource::File(_) => Self::File,
+        }
+    }
+
+    /// The kind a URL part of a request is fetched as: a `data:` URL (the
+    /// tracker's rule: the scheme, however spelled) or a URL fetched over the
+    /// network.
+    #[must_use]
+    pub fn of_url(url: &str) -> Self {
+        if is_data_url(url, "data:") {
+            Self::DataUrl
+        } else {
+            Self::Url
+        }
+    }
+
+    /// The label value: `url`, `data_url`, `inline` or `file`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::DataUrl => "data_url",
+            Self::InlineBytes => "inline",
+            Self::File => "file",
+        }
+    }
+}
+
+/// How a fetch ended, for a [`FetchReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// Fetched and decoded.
+    Ok,
+    /// The payload, or what it decodes to, is over a size limit.
+    TooLarge,
+    /// The caller's fault: a URL that cannot be fetched, bytes that do not
+    /// decode, a host the policy refuses.
+    ClientFault,
+    /// Not the caller's fault: a fetch that timed out, a host that failed,
+    /// a decoder this process lacks.
+    HostFault,
+}
+
+impl FetchOutcome {
+    fn of(result: &MultiModalResult<TrackedMedia>) -> Self {
+        match result {
+            Ok(_) => Self::Ok,
+            Err(MultiModalError::Media(error)) => {
+                if error.code() == crate::error::MediaErrorCode::TooLarge {
+                    Self::TooLarge
+                } else if error.fault() == crate::error::MediaFault::Client {
+                    Self::ClientFault
+                } else {
+                    Self::HostFault
+                }
+            }
+            Err(_) => Self::ClientFault,
+        }
+    }
+
+    /// The label value: `ok`, `too_large`, `client_fault` or `host_fault`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::TooLarge => "too_large",
+            Self::ClientFault => "client_fault",
+            Self::HostFault => "host_fault",
+        }
+    }
+}
+
+/// One fetch, as the tracker reports it when the fetch ends: the modality,
+/// where the bytes came from, how it ended, how long the fetch and decode
+/// took, and the bytes it brought in (none when it failed). A part that
+/// repeats another part of the same request is not a fetch and is not
+/// reported.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchReport {
+    pub modality: Modality,
+    pub source: FetchSourceKind,
+    pub outcome: FetchOutcome,
+    pub duration: std::time::Duration,
+    pub bytes: usize,
+}
+
+/// A fetch observer: called once per fetch as it ends, on the fetch's own
+/// task, with the label the tracker was given (a request's model, say).
+pub type FetchObserver = fn(label: &str, report: &FetchReport);
+
+/// The bytes a fetched item brought in.
+fn fetched_bytes(media: &TrackedMedia) -> usize {
+    match media {
+        TrackedMedia::Image(frame) => frame.raw_bytes.len(),
+        TrackedMedia::Video(clip) => clip.raw_bytes.len(),
+        TrackedMedia::Audio(clip) => clip.raw_bytes.len(),
+        TrackedMedia::Embeddings => 0,
+    }
+}
+
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
+    /// Where every fetch is reported, under the label, when set.
+    fetch_observer: Option<(Arc<str>, FetchObserver)>,
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
     first_slot: HashMap<FetchKey, Bucket>,
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
-    default_video_sample_fps: Option<f32>,
+    default_video_sample_fps: Option<f64>,
     video_frame_sampling: FrameSampling,
     /// The policy the fetched image frames decode an alpha channel under (see
     /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
+    minimax_image_resize: bool,
+    minimax_sglang_resize: bool,
+    drain_on_error: bool,
 }
 
 impl AsyncMultiModalTracker {
     pub fn new(media_connector: Arc<MediaConnector>) -> Self {
         Self {
             media_connector,
+            fetch_observer: None,
             pending: HashMap::new(),
             uuids: HashMap::new(),
             first_slot: HashMap::new(),
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
+            minimax_image_resize: false,
+            minimax_sglang_resize: false,
+            drain_on_error: false,
         }
+    }
+
+    /// Keep worker admission until sibling fetches finish, including blocking decode.
+    /// Disabled by default to preserve the router's fail-fast error response.
+    pub fn with_drain_on_error(mut self, enabled: bool) -> Self {
+        self.drain_on_error = enabled;
+        self
     }
 
     /// Decode the request's image frames under `policy` (the destination
@@ -104,9 +286,29 @@ impl AsyncMultiModalTracker {
         self
     }
 
+    /// Plan M3 image geometry from source headers and resize once at lazy decode.
+    /// Video fetching and other model families retain their existing policy.
+    pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
+        self.minimax_image_resize = enabled;
+        self
+    }
+
+    /// Select SGLang's MiniMax image geometry and Pillow resize kernel.
+    pub fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
+        self
+    }
+
+    /// Report every fetch to `observer` under `label` (see [`FetchReport`]).
+    #[must_use]
+    pub fn with_fetch_observer(mut self, label: Arc<str>, observer: FetchObserver) -> Self {
+        self.fetch_observer = Some((label, observer));
+        self
+    }
+
     /// Sample videos that name no `fps` at this rate (the model's reference
     /// default) instead of the connector default.
-    pub fn with_default_video_sample_fps(mut self, fps: Option<f32>) -> Self {
+    pub fn with_default_video_sample_fps(mut self, fps: Option<f64>) -> Self {
         self.default_video_sample_fps = fps;
         self
     }
@@ -181,24 +383,40 @@ impl AsyncMultiModalTracker {
         Ok(())
     }
 
+    /// Collect fetched media, optionally draining siblings before returning an error.
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
+        let mut first_error = None;
         for (modality, slots) in self.pending.drain() {
             let mut items: Vec<TrackedMedia> = Vec::with_capacity(slots.len());
             for slot in slots {
                 let media = match slot {
-                    Slot::Fetch(task) => task.await??,
+                    Slot::Fetch(task) => task
+                        .await
+                        .map_err(MultiModalError::from)
+                        .and_then(|media| media),
                     Slot::SameAs(first) => items.get(first).cloned().ok_or_else(|| {
                         MultiModalError::Validation(format!(
                             "{modality} slot refers to a slot that was never fetched"
                         ))
-                    })?,
+                    }),
                 };
-                items.push(media);
+                match media {
+                    Ok(media) => items.push(media),
+                    Err(error) => {
+                        if !self.drain_on_error {
+                            return Err(error);
+                        }
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
             data.insert(modality, items);
         }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(TrackerOutput {
             data,
             uuids: self.uuids,
@@ -210,7 +428,7 @@ impl AsyncMultiModalTracker {
     fn same_media_as(
         &mut self,
         modality: Modality,
-        settings: String,
+        settings: FetchSettings,
         source: &Arc<FetchSource>,
     ) -> Option<usize> {
         let next = self.pending.entry(modality).or_default().len();
@@ -260,18 +478,39 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
+        let sglang = self.minimax_sglang_resize;
+        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
+            max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
+        );
         let config = ImageFetchConfig {
             detail,
-            max_long_side_pixel,
+            max_long_side_pixel: if minimax_cap.is_some() {
+                None
+            } else {
+                max_long_side_pixel
+            },
             transparency: self.image_transparency,
         };
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}"),
+            FetchSettings::Image {
+                config,
+                minimax_cap,
+                sglang,
+            },
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
+                let frame = if let Some(cap) = minimax_cap {
+                    if sglang {
+                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                    } else {
+                        crate::minimax_resize::image(frame, cap)?
+                    }
+                } else {
+                    frame
+                };
                 Ok(TrackedMedia::Image(frame))
             },
         );
@@ -284,19 +523,36 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let cfg = video_fetch_config(
+        let mut cfg = video_fetch_config(
             fps,
             max_long_side_pixel,
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
+        let sglang = self.minimax_sglang_resize;
+        let key = FetchSettings::video(&cfg, sglang);
+        if sglang {
+            // Native MiniMax applies Pillow once, after source-resolution decode.
+            cfg.max_long_side_pixel = None;
+        }
         self.enqueue(
             Modality::Video,
             uuid,
-            format!("{cfg:?}"),
+            key,
             source,
             move |connector, source| async move {
-                let clip = connector.fetch_video_from(&source, cfg).await?;
+                let mut clip = connector.fetch_video_from(&source, cfg).await?;
+                if sglang {
+                    let clip = Arc::make_mut(&mut clip);
+                    clip.max_long_side_pixel = max_long_side_pixel;
+                    // Decode hashed source bytes and sampling without a resize cap.
+                    // Domain-separate Pillow pixels and include the deferred cap.
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(b"minimax-sglang-video-pillow-day0");
+                    hash.update(clip.hash.as_bytes());
+                    hash.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
+                    clip.hash = hash.finalize().to_hex().to_string();
+                }
                 Ok(TrackedMedia::Video(clip))
             },
         );
@@ -307,7 +563,7 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Audio,
             uuid,
-            String::new(),
+            FetchSettings::Audio,
             source,
             |connector, source| async move {
                 let clip = connector.fetch_audio_from(&source).await?;
@@ -323,7 +579,7 @@ impl AsyncMultiModalTracker {
         &mut self,
         modality: Modality,
         uuid: Option<String>,
-        settings: String,
+        settings: FetchSettings,
         source: MediaSource,
         fetch: F,
     ) where
@@ -336,11 +592,34 @@ impl AsyncMultiModalTracker {
         let slot = match self.same_media_as(modality, settings, &source) {
             Some(first) => Slot::SameAs(first),
             None => {
+                let connector = Arc::clone(&self.media_connector);
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
                 )]
-                let handle = tokio::spawn(fetch(Arc::clone(&self.media_connector), source));
+                let handle = match &self.fetch_observer {
+                    None => tokio::spawn(fetch(connector, source)),
+                    Some((label, observer)) => {
+                        let (label, observer) = (Arc::clone(label), *observer);
+                        let kind = FetchSourceKind::of(&source);
+                        let fetching = fetch(connector, source);
+                        tokio::spawn(async move {
+                            let started = std::time::Instant::now();
+                            let result = fetching.await;
+                            observer(
+                                &label,
+                                &FetchReport {
+                                    modality,
+                                    source: kind,
+                                    outcome: FetchOutcome::of(&result),
+                                    duration: started.elapsed(),
+                                    bytes: result.as_ref().map_or(0, fetched_bytes),
+                                },
+                            );
+                            result
+                        })
+                    }
+                };
                 Slot::Fetch(handle)
             }
         };
@@ -354,13 +633,18 @@ impl AsyncMultiModalTracker {
 // invalid data:// authorities retain URL parsing. Connector validation still
 // receives the original input unchanged.
 fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
-    if url.starts_with(canonical_data_prefix) {
-        return MediaSource::DataUrl(url);
+    if is_data_url(&url, canonical_data_prefix) {
+        MediaSource::DataUrl(url)
+    } else {
+        MediaSource::Url(url)
     }
-    match url::Url::parse(&url) {
-        Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-        _ => MediaSource::Url(url),
-    }
+}
+
+/// Whether `url` is a `data:` URL: the canonical prefix, or the scheme as the
+/// URL parser reads it (any spelling of its case).
+fn is_data_url(url: &str, canonical_data_prefix: &str) -> bool {
+    url.starts_with(canonical_data_prefix)
+        || url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "data")
 }
 
 /// The fetch settings for one video: the request's `fps` when given (and
@@ -369,7 +653,7 @@ fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
 fn video_fetch_config(
     fps: Option<f64>,
     max_long_side_pixel: Option<u32>,
-    default_sample_fps: Option<f32>,
+    default_sample_fps: Option<f64>,
     sampling: FrameSampling,
 ) -> MultiModalResult<VideoFetchConfig> {
     let mut cfg = VideoFetchConfig {
@@ -377,11 +661,10 @@ fn video_fetch_config(
         ..VideoFetchConfig::default()
     };
     match fps {
-        Some(fps) => cfg.sample_fps = validate_sample_fps(fps)? as f32,
+        Some(fps) => cfg.sample_fps = validate_sample_fps(fps)?,
         None => {
             if let Some(default) = default_sample_fps {
-                validate_sample_fps(f64::from(default))?;
-                cfg.sample_fps = default;
+                cfg.sample_fps = validate_sample_fps(default)?;
             }
         }
     }
@@ -435,6 +718,7 @@ fn validate_video_long_side_cap(value: u32) -> MultiModalResult<()> {
 #[cfg(test)]
 mod video_param_tests {
     use super::*;
+    use crate::media::sampled_frame_indices;
 
     #[test]
     fn a_request_fps_wins_then_the_model_default_then_the_connector_default() {
@@ -458,12 +742,28 @@ mod video_param_tests {
         // right up to the edge of it: nothing reaches sampling unchecked just
         // because the model named it rather than the caller.
         assert!(video_fetch_config(Some(100.0), None, Some(1.0), FrameSampling::Even).is_err());
-        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(
                 video_fetch_config(None, None, Some(bad_default), FrameSampling::Even).is_err(),
                 "{bad_default}"
             );
         }
+    }
+
+    /// The rate a request names, and the model's own default, reach the picks
+    /// as the doubles they are: 0.3 frames a second over 20 frames at 3 fps
+    /// picks the reference's `[0, 11]`, not the `[0, 10]` of the rate narrowed
+    /// to binary32 on the way.
+    #[test]
+    fn the_rate_reaches_the_picks_as_the_double_it_is() {
+        let sampling = FrameSampling::UpToThenRate {
+            max_frames: 32,
+            rate_max_frames: 2048,
+        };
+        let requested = video_fetch_config(Some(0.3), None, Some(2.0), sampling).unwrap();
+        assert_eq!(sampled_frame_indices(20, 3.0, requested), [0, 11]);
+        let model_default = video_fetch_config(None, None, Some(0.3), sampling).unwrap();
+        assert_eq!(sampled_frame_indices(20, 3.0, model_default), [0, 11]);
     }
 
     #[test]
@@ -549,6 +849,15 @@ mod repeat_tests {
         }
     }
 
+    /// The settings an image part carries under the default configuration.
+    fn image_settings() -> FetchSettings {
+        FetchSettings::Image {
+            config: ImageFetchConfig::default(),
+            minimax_cap: None,
+            sglang: false,
+        }
+    }
+
     fn tracker() -> AsyncMultiModalTracker {
         let connector = MediaConnector::new(
             crate::test_support::http_client_builder(),
@@ -556,6 +865,205 @@ mod repeat_tests {
         )
         .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
+    }
+
+    /// Workers drain failed siblings; default router processing still returns errors promptly.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test waits for both fetch tasks via finalize and a completion channel"
+    )]
+    async fn failed_fetch_obeys_drain_policy() {
+        use tokio::sync::oneshot;
+        for drain in [false, true] {
+            for panic in [false, true] {
+                let mut tracker = tracker().with_drain_on_error(drain);
+                let (release, wait) = oneshot::channel();
+                let (finished, done) = oneshot::channel();
+                tracker.pending.insert(
+                    Modality::Video,
+                    vec![
+                        Slot::Fetch(tokio::spawn(async move {
+                            assert!(!panic, "fetch panic");
+                            Err(MultiModalError::Validation("first fetch failed".into()))
+                        })),
+                        Slot::Fetch(tokio::spawn(async move {
+                            wait.await.unwrap();
+                            finished.send(()).unwrap();
+                            Err(MultiModalError::Validation("sibling finished".into()))
+                        })),
+                    ],
+                );
+                let finalize = tracker.finalize();
+                tokio::pin!(finalize);
+                let error = if drain {
+                    assert!(tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        &mut finalize
+                    )
+                    .await
+                    .is_err());
+                    release.send(()).unwrap();
+                    finalize.await.unwrap_err()
+                } else {
+                    let error =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), &mut finalize)
+                            .await
+                            .unwrap()
+                            .unwrap_err();
+                    release.send(()).unwrap();
+                    error
+                };
+                done.await.unwrap();
+                let error = error.to_string();
+                assert!(
+                    error.contains(if panic {
+                        "fetch panic"
+                    } else {
+                        "first fetch failed"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    /// The plan side classifies a URL part as the fetch will: the scheme as
+    /// the URL parser reads it, whatever its case, is a data URL.
+    #[test]
+    fn of_url_reads_the_scheme_as_the_fetch_does() {
+        assert_eq!(
+            FetchSourceKind::of_url("data:image/png;base64,AAAA"),
+            FetchSourceKind::DataUrl
+        );
+        assert_eq!(
+            FetchSourceKind::of_url("DATA:image/png;base64,AAAA"),
+            FetchSourceKind::DataUrl
+        );
+        assert_eq!(
+            FetchSourceKind::of_url("https://example.test/a.png"),
+            FetchSourceKind::Url
+        );
+        assert_eq!(FetchSourceKind::of_url("not a url"), FetchSourceKind::Url);
+    }
+
+    /// Every fetch is reported once, with its outcome and its bytes, under
+    /// the tracker's label; a part that repeats another is not a fetch.
+    #[tokio::test]
+    async fn the_fetch_observer_sees_each_fetch_once() {
+        static REPORTS: std::sync::Mutex<Vec<(String, FetchReport)>> =
+            std::sync::Mutex::new(Vec::new());
+        fn observe(label: &str, report: &FetchReport) {
+            REPORTS
+                .lock()
+                .expect("reports")
+                .push((label.to_string(), *report));
+        }
+        let mut tracker = tracker().with_fetch_observer(Arc::from("m"), observe);
+        tracker.push_part(image_part(None)).expect("a part");
+        tracker
+            .push_part(image_part(None))
+            .expect("the same part again: no fetch of its own");
+        tracker
+            .push_part(MediaContentPart::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            })
+            .expect("a part whose bytes do not decode");
+        tracker
+            .finalize()
+            .await
+            .expect_err("the undecodable part fails the request");
+        let reports = REPORTS.lock().expect("reports").clone();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports.iter().all(|(label, _)| label == "m"));
+        let fetched = reports
+            .iter()
+            .find(|(_, report)| report.outcome == FetchOutcome::Ok)
+            .expect("the decoded fetch");
+        assert_eq!(fetched.1.modality, Modality::Image);
+        assert_eq!(fetched.1.source, FetchSourceKind::DataUrl);
+        assert!(fetched.1.bytes > 0, "{:?}", fetched.1);
+        let failed = reports
+            .iter()
+            .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
+            .expect("the failed fetch");
+        assert_eq!(failed.1.bytes, 0, "{:?}", failed.1);
+    }
+
+    /// Only native SGLang defers the cap to its Pillow processor; vLLM still
+    /// receives decoder-scaled frames. Explicit caps survive both paths.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; run explicitly for MiniMax validation"]
+    async fn minimax_video_cap_is_deferred_only_for_sglang() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=8",
+                "-t",
+                "1",
+                "-filter_threads",
+                "1",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(path).unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for sglang in [false, true] {
+            for cap in [None, Some(168), Some(224)] {
+                let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+                tracker
+                    .push_part(MediaContentPart::VideoUrl {
+                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                        uuid: None,
+                        fps: Some(1.0),
+                        max_long_side_pixel: cap,
+                    })
+                    .unwrap();
+                let output = tracker.finalize().await.unwrap();
+                let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
+                    panic!("video expected");
+                };
+                assert_eq!(clip.max_long_side_pixel(), cap);
+                assert!(
+                    identities.insert(clip.hash.clone()),
+                    "runtime and cap identify different pixels"
+                );
+                if !sglang {
+                    assert_eq!(
+                        clip.hash,
+                        crate::hasher::hash_video_with_sampling(
+                            &bytes,
+                            1.0,
+                            cap,
+                            FrameSampling::default()
+                        )
+                    );
+                }
+                let frame = &clip.rgb_video().unwrap().frames[0];
+                let expected = if sglang {
+                    (320, 240)
+                } else {
+                    cap.map_or((320, 240), |cap| (cap, cap * 3 / 4))
+                };
+                assert_eq!((frame.width, frame.height), expected);
+            }
+        }
     }
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {
@@ -653,34 +1161,74 @@ mod repeat_tests {
         let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
         // Same length and kind, different bytes: never merged.
         let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
+        let one = FetchSettings::video(&VideoFetchConfig::default(), false);
+        let two = FetchSettings::video(
+            &VideoFetchConfig {
+                sample_fps: 1.0,
+                ..VideoFetchConfig::default()
+            },
+            false,
+        );
 
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, two, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Image, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+    }
+
+    /// The settings key says what the formatted text said: equal settings are
+    /// one key, a difference in any field (the rate included) another.
+    #[test]
+    fn fetch_settings_differ_exactly_where_the_settings_do() {
+        let base = VideoFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            None
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&VideoFetchConfig::default(), false)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&base, true)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "two".into(), &clip),
-            None
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(
+                &VideoFetchConfig {
+                    sample_fps: base.sample_fps + 0.5,
+                    ..base
+                },
+                false
+            )
         );
+        let image = ImageFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Image, "one".into(), &clip),
-            None
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig::default(),
+                minimax_cap: None,
+                sglang: false
+            }
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            None
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            Some(0)
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig {
+                    detail: ImageDetail::High,
+                    ..image
+                },
+                minimax_cap: None,
+                sglang: false
+            }
         );
     }
 
@@ -708,7 +1256,7 @@ mod repeat_tests {
             .collect();
         for source in &sources {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 None,
                 "every distinct payload fetches"
             );
@@ -723,7 +1271,7 @@ mod repeat_tests {
         // Every repeat, in either region of the bucket, finds its first slot.
         for (slot, source) in sources.iter().enumerate().rev() {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 Some(slot)
             );
         }
@@ -748,7 +1296,7 @@ mod repeat_tests {
         // A lone payload of another length is neither compared nor hashed.
         let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
         assert_eq!(
-            tracker.same_media_as(Modality::Image, String::new(), &lone),
+            tracker.same_media_as(Modality::Image, image_settings(), &lone),
             None
         );
         let lone_bucket = tracker

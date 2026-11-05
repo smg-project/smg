@@ -1,5 +1,5 @@
 //! The table a model's response template compiles into, which the parser name `hf` selects
-//! ([`super::TEMPLATE`]).
+//! ([`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)).
 //!
 //! A tokenizer's `tokenizer_config.json` may carry a `response_template`, transformers' description
 //! of how the model's output splits into a thought, content and tool calls. `smg-response-template`
@@ -8,8 +8,9 @@
 //! tags need a layout, how the model's chat template writes a turn: it is learned by rendering the
 //! compiler's probe conversation through the tokenizer's chat template ([`layout::learn`]); a
 //! template whose renderings give no layout still parses, and a forced call or a JSON answer then
-//! has no tag ([`super::constraint`]). The vocabulary's added tokens, as the tokenizer lists them,
-//! are the markers the tags write as tokens ([`Format::marker_tokens`]).
+//! has no tag ([`constraint_for`](super::constraint::constraint_for)). The vocabulary's added
+//! tokens, as the tokenizer lists them, are the markers the tags write as tokens
+//! ([`Format::marker_tokens`]).
 //!
 //! A table is compiled once per model and tokenizer: a tokenizer registered anew under the model
 //! compiles again. What stops a compile is kept with the model and logged once, and is the reason
@@ -177,7 +178,8 @@ fn compile(model: &str, tokenizer: &dyn Tokenizer) -> Result<Format, String> {
 /// writes the same one in every rendering.
 fn render(tokenizer: &dyn Tokenizer, case: Case) -> Option<String> {
     let mut messages = case.messages();
-    if tokenizer.chat_template_content_format() == ChatTemplateContentFormat::OpenAI {
+    if tokenizer.chat_template_content_format_for_request(true) == ChatTemplateContentFormat::OpenAI
+    {
         for message in messages.as_array_mut()? {
             if let Some(text) = message.get("content").and_then(Value::as_str) {
                 let part = json!([{"type": "text", "text": text}]);

@@ -1960,7 +1960,8 @@ mod tests {
 
     use super::*;
     use crate::core::config::{
-        ArgMappingConfig, ResponseFormatConfig, Tool as McpTool, ToolConfig,
+        test_support::sse_server, ArgMappingConfig, ResponseFormatConfig, Tool as McpTool,
+        ToolConfig,
     };
 
     fn create_test_tool(name: &str) -> McpTool {
@@ -2269,18 +2270,8 @@ mod tests {
         );
 
         let config = McpServerConfig {
-            name: "web-search".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:8080/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
             tools: Some(tools),
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
+            ..sse_server("web-search", "http://localhost:8080/sse")
         };
 
         orchestrator.apply_tool_configs(&config);
@@ -2430,46 +2421,17 @@ mod tests {
 
     #[test]
     fn test_find_builtin_server_web_search() {
-        use std::collections::HashMap;
-
-        use crate::approval::{audit::AuditLog, policy::PolicyEngine};
-
         // Create config with a server configured for web_search_preview
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "brave".to_string(),
-                transport: McpTransport::Sse {
-                    url: "https://mcp.brave.com/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: false,
+                ..sse_server("brave", "https://mcp.brave.com/sse")
             }],
             ..Default::default()
         };
 
-        let (refresh_tx, _) = mpsc::channel(10);
-        let audit_log = Arc::new(AuditLog::new());
-        let policy_engine = Arc::new(PolicyEngine::new(Arc::clone(&audit_log)));
-        let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
-
-        let orchestrator = McpOrchestrator {
-            static_servers: Arc::new(DashMap::new()),
-            tool_inventory: Arc::new(ToolInventory::new()),
-            approval_manager,
-            connection_pool: Arc::new(McpConnectionPool::new()),
-            metrics: Arc::new(McpMetrics::new()),
-            refresh_tx,
-            active_executions: Arc::new(AtomicUsize::new(0)),
-            shutdown_token: CancellationToken::new(),
-            reconnection_locks: DashMap::new(),
-            config,
-        };
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
 
         // Should find the brave server for web_search_preview
         let result = orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
@@ -2486,13 +2448,6 @@ mod tests {
 
     #[test]
     fn test_find_builtin_server_with_custom_response_format() {
-        use std::collections::HashMap;
-
-        use crate::{
-            approval::{audit::AuditLog, policy::PolicyEngine},
-            core::config::{ResponseFormatConfig, ToolConfig},
-        };
-
         // Create config with custom response_format for the tool
         let mut tools = HashMap::new();
         tools.insert(
@@ -2506,39 +2461,15 @@ mod tests {
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "custom-search".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
                 tools: Some(tools),
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("my_search".to_string()),
-                internal: false,
+                ..sse_server("custom-search", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
 
-        let (refresh_tx, _) = mpsc::channel(10);
-        let audit_log = Arc::new(AuditLog::new());
-        let policy_engine = Arc::new(PolicyEngine::new(Arc::clone(&audit_log)));
-        let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
-
-        let orchestrator = McpOrchestrator {
-            static_servers: Arc::new(DashMap::new()),
-            tool_inventory: Arc::new(ToolInventory::new()),
-            approval_manager,
-            connection_pool: Arc::new(McpConnectionPool::new()),
-            metrics: Arc::new(McpMetrics::new()),
-            refresh_tx,
-            active_executions: Arc::new(AtomicUsize::new(0)),
-            shutdown_token: CancellationToken::new(),
-            reconnection_locks: DashMap::new(),
-            config,
-        };
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
 
         let result = orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
         assert!(result.is_some());

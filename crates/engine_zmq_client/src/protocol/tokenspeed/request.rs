@@ -1,31 +1,48 @@
-// TokenSpeed tokenized generate request — the native `TokenizedGenerateReqInput`
-// from `io_struct.py`, a tagged `msgspec.Struct(array_like=True)`: on the wire
-// it is a positional msgpack array with the class-name tag string as element 0.
-// **Field order is the wire contract** — do not reorder.
+//! TokenSpeed tokenized generate request — the native `TokenizedGenerateReqInput`
+//! from `io_struct.py`, a tagged `msgspec.Struct(array_like=True)`: on the wire
+//! it is a positional msgpack array with the class-name tag string as element 0.
+//! **Field order is the wire contract** — do not reorder.
 
 use bytes::Bytes;
 use serde::{
-    de::{SeqAccess, Visitor},
+    de::{IgnoredAny, SeqAccess, Visitor},
     ser::SerializeTuple,
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-use crate::protocol::{
-    positional::{drain_trailing, expect_tag, next_field},
-    tokenspeed::{multimodal::TokenSpeedWireMmInputs, sampling::SamplingParams},
+use crate::{
+    codec::tensor::{TensorFields, WireArrayData},
+    protocol::{
+        positional::{drain_trailing, expect_tag, next_field},
+        tokenspeed::{
+            multimodal::{TokenSpeedWireMmInputs, TokenSpeedWireMmItem},
+            sampling::SamplingParams,
+        },
+    },
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
 pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 
 /// Request types are single-byte protocol constants sent as a raw ZMQ frame
-/// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`),
-/// so the receiver can dispatch without decoding first.
+/// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`/
+/// `REQ_TYPE_CONTROL`/`REQ_TYPE_ENCODE`), so the receiver can dispatch without
+/// decoding first. The wire's full set: add 0, abort 1, control 2 (the
+/// scheduler's control call), encode 3 (a disaggregated encode worker's
+/// request). A disaggregated encode worker takes [`Encode`](Self::Encode)
+/// alone, as its handshake lists
+/// ([`EngineCoreReadyResponse::request_types`](crate::protocol::handshake::EngineCoreReadyResponse::request_types)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenSpeedRequestType {
     Add = 0,
     Abort = 1,
+    /// A control call for a scheduler of the control-wire revision:
+    /// `(call_id, method, args)`, answered by a `ControlReplySlim` under the
+    /// same call id on the output socket. Sent only to a scheduler whose
+    /// handshake declared that reply.
+    Control = 2,
+    Encode = 3,
 }
 
 impl TokenSpeedRequestType {
@@ -37,6 +54,8 @@ impl TokenSpeedRequestType {
         match value {
             0 => Some(Self::Add),
             1 => Some(Self::Abort),
+            2 => Some(Self::Control),
+            3 => Some(Self::Encode),
             _ => None,
         }
     }
@@ -46,7 +65,58 @@ impl TokenSpeedRequestType {
         Bytes::from_static(match self {
             Self::Add => b"\x00",
             Self::Abort => b"\x01",
+            Self::Control => b"\x02",
+            Self::Encode => b"\x03",
         })
+    }
+}
+
+/// The msgspec tag for [`TokenSpeedEncodeRequest`] (element 0 on the wire).
+pub const ENCODE_REQUEST_TAG: &str = "EncodeRequest";
+
+/// An encode worker's request: the engine's `EncodeRequest`
+/// (`runtime/epd/encode_worker.py`), a tagged positional struct on the same
+/// base as the generate request, so the wire is the tag, the base's two
+/// unset fields (`rid`, `http_worker_ipc`), then its own five in declaration
+/// order. `bootstrap_host`/`port` are the encode worker's own rendezvous (it
+/// hosts the transfer the prefill side pulls from), `bootstrap_room` the
+/// request's room; the items are the generate request's multimodal items
+/// with their features set (the worker runs the tower on them). Nothing
+/// answers it: the embedding reaches the prefill peer over the transfer
+/// engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenSpeedEncodeRequest {
+    pub request_id: String,
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+    pub items: Vec<TokenSpeedWireMmItem>,
+}
+
+impl TensorFields for TokenSpeedEncodeRequest {
+    /// The items' features and model-specific tensors, in item order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.items.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.items.for_each_tensor_mut(visit);
+    }
+}
+
+impl Serialize for TokenSpeedEncodeRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const NIL: Option<()> = None;
+        let mut tuple = serializer.serialize_tuple(8)?;
+        tuple.serialize_element(ENCODE_REQUEST_TAG)?;
+        tuple.serialize_element(&NIL)?; // rid
+        tuple.serialize_element(&NIL)?; // http_worker_ipc
+        tuple.serialize_element(&self.request_id)?;
+        tuple.serialize_element(&self.bootstrap_host)?;
+        tuple.serialize_element(&self.bootstrap_port)?;
+        tuple.serialize_element(&self.bootstrap_room)?;
+        tuple.serialize_element(&self.items)?;
+        tuple.end()
     }
 }
 
@@ -93,6 +163,24 @@ pub struct TokenizedGenerateReqInput {
     /// bypasses the engine's `InputProcessor`, which does that rewriting on
     /// other paths.
     pub multimodal_inputs: Option<TokenSpeedWireMmInputs>,
+    /// The prefill/decode rendezvous of a disaggregated request (wire indices
+    /// 16-18): the prefill side's bootstrap server and the room both sides
+    /// meet in, as the gateway hands them to each side. All `None` on an
+    /// aggregated request. The host is `None` for an empty string, the port
+    /// and the room ride as given (0 kept): the Python servicer's rule.
+    pub bootstrap_host: Option<String>,
+    pub bootstrap_port: Option<i32>,
+    pub bootstrap_room: Option<i64>,
+    /// The engine index this request goes out on (the connector's identity
+    /// of that engine): the attention data-parallel rank the sender decided
+    /// (a disaggregated request by its room's residue, the engine's own
+    /// dispatch rule; an aggregated one by its pin), already mapped through
+    /// `RankIndices`, the order the engines declared at their handshake. Not
+    /// a wire field (a scheduler rank reads no such slot of its own request)
+    /// and not the proto's `data_parallel_rank`: a rank written here unmapped
+    /// selects the wrong engine wherever the handshake order differs from
+    /// the rank order.
+    pub data_parallel_rank: Option<u32>,
 }
 
 impl Default for TokenizedGenerateReqInput {
@@ -112,7 +200,22 @@ impl Default for TokenizedGenerateReqInput {
             stream: false,
             input_ids_unpadded: None,
             multimodal_inputs: None,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            data_parallel_rank: None,
         }
+    }
+}
+
+impl TensorFields for TokenizedGenerateReqInput {
+    /// The multimodal payload's tensors; a text request has none.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.multimodal_inputs.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.multimodal_inputs.for_each_tensor_mut(visit);
     }
 }
 
@@ -120,12 +223,17 @@ impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
         // Text requests keep the historical 11-element prefix. Multimodal
-        // requests must reach wire index 22 (`multimodal_inputs`), emitting
-        // the engine's declared defaults for the unmodeled fields between
-        // `stream` (10) and `input_ids_unpadded` (21); msgspec fills fields
-        // after the last emitted element from defaults either way.
-        let multimodal = self.multimodal_inputs.is_some() || self.input_ids_unpadded.is_some();
-        let mut tuple = serializer.serialize_tuple(if multimodal { 23 } else { 11 })?;
+        // and disaggregated requests reach wire index 22 (`multimodal_inputs`),
+        // emitting the engine's declared defaults for the unmodeled fields
+        // between `stream` (10) and `input_ids_unpadded` (21) and the
+        // rendezvous in its slots (16-18); msgspec fills fields after the
+        // last emitted element from defaults either way.
+        let extended = self.multimodal_inputs.is_some()
+            || self.input_ids_unpadded.is_some()
+            || self.bootstrap_host.is_some()
+            || self.bootstrap_port.is_some()
+            || self.bootstrap_room.is_some();
+        let mut tuple = serializer.serialize_tuple(if extended { 23 } else { 11 })?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&self.http_worker_ipc)?;
@@ -137,15 +245,15 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.top_logprobs_num)?;
         tuple.serialize_element(&self.token_ids_logprob)?;
         tuple.serialize_element(&self.stream)?;
-        if multimodal {
+        if extended {
             tuple.serialize_element(&NIL)?; // input_embeds
             tuple.serialize_element(&NIL)?; // session_params
             tuple.serialize_element(&NIL)?; // custom_logit_processor
             tuple.serialize_element(&false)?; // return_hidden_states
             tuple.serialize_element(&0.0f64)?; // created_time
-            tuple.serialize_element(&NIL)?; // bootstrap_host
-            tuple.serialize_element(&NIL)?; // bootstrap_port
-            tuple.serialize_element(&NIL)?; // bootstrap_room
+            tuple.serialize_element(&self.bootstrap_host)?;
+            tuple.serialize_element(&self.bootstrap_port)?;
+            tuple.serialize_element(&self.bootstrap_room)?;
             tuple.serialize_element(&NIL)?; // input_multi_ids
             tuple.serialize_element(&NIL)?; // input_extra_infos
             tuple.serialize_element(&self.input_ids_unpadded)?;
@@ -168,7 +276,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 expect_tag(&mut seq, TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
-                let request = TokenizedGenerateReqInput {
+                let mut request = TokenizedGenerateReqInput {
                     rid: next_field(&mut seq, "rid")?,
                     http_worker_ipc: next_field(&mut seq, "http_worker_ipc")?,
                     input_text: next_field(&mut seq, "input_text")?,
@@ -179,11 +287,27 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     top_logprobs_num: next_field(&mut seq, "top_logprobs_num")?,
                     token_ids_logprob: next_field(&mut seq, "token_ids_logprob")?,
                     stream: next_field(&mut seq, "stream")?,
-                    // Send-only fields: the decoder models the text prefix and
-                    // drains everything after `stream`.
+                    // Send-only fields: the decoder models the text prefix,
+                    // reads the rendezvous slots when the array reaches them,
+                    // and drains the rest.
                     input_ids_unpadded: None,
                     multimodal_inputs: None,
+                    bootstrap_host: None,
+                    bootstrap_port: None,
+                    bootstrap_room: None,
+                    data_parallel_rank: None,
                 };
+                // Indices 11-15 (`input_embeds` .. `created_time`), then the
+                // rendezvous at 16-18; a short (text) array ends before them.
+                let mut skipped = 0;
+                while skipped < 5 && seq.next_element::<IgnoredAny>()?.is_some() {
+                    skipped += 1;
+                }
+                if skipped == 5 {
+                    request.bootstrap_host = seq.next_element::<Option<String>>()?.flatten();
+                    request.bootstrap_port = seq.next_element::<Option<i32>>()?.flatten();
+                    request.bootstrap_room = seq.next_element::<Option<i64>>()?.flatten();
+                }
                 drain_trailing(&mut seq)?;
                 Ok(request)
             }
@@ -249,11 +373,16 @@ mod tests {
 
     #[test]
     fn request_type_frames_roundtrip() {
-        for ty in [TokenSpeedRequestType::Add, TokenSpeedRequestType::Abort] {
+        for ty in [
+            TokenSpeedRequestType::Add,
+            TokenSpeedRequestType::Abort,
+            TokenSpeedRequestType::Encode,
+        ] {
             assert_eq!(TokenSpeedRequestType::from_frame(&ty.to_frame()), Some(ty));
         }
         assert_eq!(TokenSpeedRequestType::Add.to_frame().as_ref(), b"\x00");
         assert_eq!(TokenSpeedRequestType::Abort.to_frame().as_ref(), b"\x01");
+        assert_eq!(TokenSpeedRequestType::Encode.to_frame().as_ref(), b"\x03");
         assert_eq!(TokenSpeedRequestType::from_frame(b"\x09"), None);
         assert_eq!(TokenSpeedRequestType::from_frame(b""), None);
     }
@@ -354,11 +483,17 @@ mod tests {
                 hash: 0xDEAD_BEEF,
                 pad_value: pad,
                 offsets: vec![(1, 3)],
-                feature: WireTensor::from_raw("bfloat16", vec![3, 2], (0u8..12).collect()),
+                feature: Some(WireTensor::from_raw(
+                    "bfloat16",
+                    vec![3, 2],
+                    (0u8..12).collect(),
+                )),
                 model_specific_data,
+                encode_handshake: None,
             }],
             im_token_id: Some(9),
             video_token_id: None,
+            ..Default::default()
         });
 
         let encoded = encode_msgpack(&request).unwrap();
@@ -405,6 +540,76 @@ mod tests {
         assert_eq!(decoded.multimodal_inputs, None);
     }
 
+    /// A disaggregated request reaches wire index 22 like a multimodal one,
+    /// with the rendezvous in the engine's own slots (`bootstrap_host` 16,
+    /// `bootstrap_port` 17, `bootstrap_room` 18) and the engine's defaults
+    /// around them; the decoder reads the three back, and a text request
+    /// still keeps the 11-element prefix.
+    #[test]
+    fn a_disaggregated_request_emits_its_rendezvous_in_the_engines_slots() {
+        let mut request = vector_request();
+        request.rid = "pd-1".to_string();
+        request.bootstrap_host = Some("10.0.0.7".to_string());
+        request.bootstrap_port = Some(8998);
+        request.bootstrap_room = Some(6_148_914_691_236_517_205);
+        request.data_parallel_rank = Some(1);
+        let encoded = encode_msgpack(&request).unwrap();
+
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 23);
+        assert_eq!(array[16], Value::from("10.0.0.7"));
+        assert_eq!(array[17], Value::from(8998));
+        assert_eq!(array[18], Value::from(6_148_914_691_236_517_205i64));
+        for nil_index in [11usize, 12, 13, 19, 20, 21, 22] {
+            assert_eq!(array[nil_index], Value::Nil, "index {nil_index}");
+        }
+        assert_eq!(array[14], Value::from(false)); // return_hidden_states
+        assert_eq!(array[15], Value::from(0.0f64)); // created_time
+
+        // The rendezvous decodes back; the placement is the sender's alone.
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded.bootstrap_host.as_deref(), Some("10.0.0.7"));
+        assert_eq!(decoded.bootstrap_port, Some(8998));
+        assert_eq!(decoded.bootstrap_room, Some(6_148_914_691_236_517_205));
+        assert_eq!(decoded.data_parallel_rank, None);
+        assert_eq!(decoded.input_ids, request.input_ids);
+
+        // The Python servicer's rule: a missing host is nil, a zero port or
+        // room is kept.
+        let mut zeroes = vector_request();
+        zeroes.bootstrap_port = Some(0);
+        zeroes.bootstrap_room = Some(0);
+        let encoded = encode_msgpack(&zeroes).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 23);
+        assert_eq!(array[16], Value::Nil);
+        assert_eq!(array[17], Value::from(0));
+        assert_eq!(array[18], Value::from(0i64));
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            (
+                decoded.bootstrap_host,
+                decoded.bootstrap_port,
+                decoded.bootstrap_room
+            ),
+            (None, Some(0), Some(0))
+        );
+
+        // A text request keeps the short prefix and decodes with no rendezvous.
+        let short = encode_msgpack(&vector_request()).unwrap();
+        let Value::Array(array) = decode_value(&short).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 11);
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&short).unwrap();
+        assert_eq!(decoded.bootstrap_room, None);
+        assert_eq!(decoded, vector_request());
+    }
+
     #[test]
     fn decode_rejects_wrong_tag() {
         let mut request_bytes = python_request_bytes();
@@ -434,5 +639,96 @@ mod tests {
             error.to_string().contains("missing positional field"),
             "{error}"
         );
+    }
+
+    fn encode_item(feature_bytes: usize) -> TokenSpeedWireMmItem {
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::tokenspeed::multimodal::{mm_pad_value, TokenSpeedWireModality},
+        };
+
+        let mut model_specific_data = std::collections::BTreeMap::new();
+        model_specific_data.insert(
+            "vit_grid".to_string(),
+            WireTensor::from_raw(
+                "uint32",
+                vec![1, 3],
+                vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            ),
+        );
+        TokenSpeedWireMmItem {
+            modality: TokenSpeedWireModality::Image,
+            hash: 0xDEAD_BEEF,
+            pad_value: mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
+            offsets: vec![(1, 3)],
+            feature: Some(WireTensor::from_raw(
+                "bfloat16",
+                vec![feature_bytes / 2, 1],
+                (0..feature_bytes).map(|i| i as u8).collect(),
+            )),
+            model_specific_data,
+            encode_handshake: None,
+        }
+    }
+
+    /// The engine's `EncodeRequest` is a tagged positional struct on the
+    /// generate request's base: the tag, the base's two unset fields, then
+    /// request id, rendezvous host, port and room, then the items (the
+    /// prefix the engine's own wire test pins as
+    /// `["EncodeRequest", None, None, "e1", "h", 1, 7]`).
+    #[test]
+    fn encode_request_emits_the_engines_tagged_tuple() {
+        let request = TokenSpeedEncodeRequest {
+            request_id: "e1".to_string(),
+            bootstrap_host: "h".to_string(),
+            bootstrap_port: 1,
+            bootstrap_room: 7,
+            items: vec![encode_item(12)],
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 8);
+        assert_eq!(array[0], Value::from(ENCODE_REQUEST_TAG));
+        assert_eq!(array[1], Value::Nil); // rid
+        assert_eq!(array[2], Value::Nil); // http_worker_ipc
+        assert_eq!(array[3], Value::from("e1"));
+        assert_eq!(array[4], Value::from("h"));
+        assert_eq!(array[5], Value::from(1));
+        assert_eq!(array[6], Value::from(7));
+        let Value::Array(items) = &array[7] else {
+            panic!("expected the items array");
+        };
+        assert_eq!(items.len(), 1);
+        // One multimodal item is the generate request's 10-slot item.
+        assert!(matches!(&items[0], Value::Array(item) if item.len() == 10));
+    }
+
+    /// An item's feature at the auxiliary bar leaves the payload as a frame,
+    /// as a generate request's multimodal tensors do; a smaller one stays
+    /// inline.
+    #[test]
+    fn encode_request_rides_a_large_feature_as_an_auxiliary_frame() {
+        use crate::codec::tensor::{encode_with_aux_frames, TENSOR_AUX_MIN_BYTES};
+
+        let small = TokenSpeedEncodeRequest {
+            request_id: "e1".to_string(),
+            bootstrap_host: "h".to_string(),
+            bootstrap_port: 1,
+            bootstrap_room: 7,
+            items: vec![encode_item(12)],
+        };
+        let (_, frames) = encode_with_aux_frames(&small).unwrap();
+        assert!(frames.is_empty());
+
+        let large = TokenSpeedEncodeRequest {
+            items: vec![encode_item(TENSOR_AUX_MIN_BYTES)],
+            ..small
+        };
+        let (payload, frames) = encode_with_aux_frames(&large).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), TENSOR_AUX_MIN_BYTES);
+        assert!(payload.len() < TENSOR_AUX_MIN_BYTES);
     }
 }

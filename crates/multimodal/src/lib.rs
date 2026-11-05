@@ -5,9 +5,11 @@ pub mod error;
 mod fetch_policy;
 pub use fetch_policy::effective_allowed_domains;
 pub mod hasher;
+#[cfg(feature = "hf-hub")]
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;
+pub mod minimax_resize;
 mod mp4_metadata;
 #[cfg(feature = "opencv-video")]
 mod opencv_buffer;
@@ -36,7 +38,10 @@ pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
     ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
-pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
+pub use tracker::{
+    AsyncMultiModalTracker, FetchObserver, FetchOutcome, FetchReport, FetchSourceKind,
+    TrackerOutput,
+};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
@@ -46,14 +51,17 @@ pub use types::{
 // Re-export vision processing components
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};
 pub use vision::{
-    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionProcessorRegistry,
+    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VideoClipOptions,
+    VisionPreProcessor, VisionPreprocessingContext,
 };
 
 /// Support for this crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use image::{DynamicImage, Rgb, RgbImage};
     use rustls::crypto::ring;
+
+    use crate::vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs};
 
     /// The HTTP client builder for the tests' media connectors. The library
     /// takes its client's builder from the caller; the tests make it here,
@@ -66,5 +74,65 @@ pub(crate) mod test_support {
     pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
         let _ = ring::default_provider().install_default();
         reqwest::Client::builder()
+    }
+
+    /// A solid image of the given size and colour: what the vision tests
+    /// build their inputs with.
+    pub(crate) fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
+        DynamicImage::from(RgbImage::from_pixel(width, height, color))
+    }
+
+    /// `w` by `h` RGB bytes that vary with the position and `seed`: the
+    /// resamplers' parity inputs.
+    pub(crate) fn gradient_rgb(w: usize, h: usize, seed: usize) -> Vec<u8> {
+        let mut data = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                data[i] = ((seed + x * 7 + y * 3) % 256) as u8;
+                data[i + 1] = ((seed + x * 5 + y * 11) % 256) as u8;
+                data[i + 2] = ((seed + x + y * 2) % 256) as u8;
+            }
+        }
+        data
+    }
+
+    /// `actual` is `expected` byte for byte; otherwise the test fails naming
+    /// `what`, the first differing byte and the two values there.
+    pub(crate) fn assert_same_bytes(actual: &[u8], expected: &[u8], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        if let Some(first) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+            panic!(
+                "{what}: first difference at byte {first}: {} vs {}",
+                actual[first], expected[first]
+            );
+        }
+    }
+
+    /// The assertions the processors' two-image tests share: both images
+    /// present, a 2-D encoder input, a grid of two rows of (T, H, W) and a
+    /// per-image patch count that sums to the encoder input's rows.
+    pub(crate) fn assert_two_image_batch(result: &PreprocessedEncoderInputs) {
+        assert_eq!(result.item_sizes.len(), 2);
+        assert_eq!(result.feature_token_counts.len(), 2);
+        assert_eq!(result.encoder_input.ndim(), 2);
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("image_grid_thw")
+        {
+            assert_eq!(shape, &[2, 3]);
+            assert_eq!(data.len(), 6);
+        } else {
+            panic!("Expected image_grid_thw to be IntTensor");
+        }
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("patches_per_image")
+        {
+            assert_eq!(shape, &[2]);
+            assert_eq!(data.len(), 2);
+            let total: i64 = data.iter().sum();
+            assert_eq!(total as usize, result.encoder_input.shape()[0]);
+        } else {
+            panic!("Expected patches_per_image to be IntTensor");
+        }
     }
 }

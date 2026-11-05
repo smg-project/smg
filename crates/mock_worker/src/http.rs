@@ -36,14 +36,21 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     config::Config,
-    drain::InFlight,
+    drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
+    script::{self, Answer},
 };
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 struct AppState {
     cfg: Arc<Config>,
+    /// The worker's name in the process (`http:<port>`): what the admin API
+    /// and the script store address it by.
+    name: String,
     engine: Option<Engine>,
+    /// The requests this worker is serving: what its load report counts as
+    /// running when no engine simulation runs.
+    in_flight: WorkerInFlight,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -78,12 +85,40 @@ pub async fn serve_until(
             return;
         }
     };
+    serve_with_listener_until(cfg, listener, shutdown).await;
+}
+
+/// Serve on an already-bound listener until the process exits. Callers that
+/// need a free port bind port 0 and read it back instead of picking one and
+/// binding it later.
+pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    serve_with_listener_until(cfg, listener, pending()).await;
+}
+
+/// [`serve_with_listener`] with the shutdown of [`serve_until`].
+pub async fn serve_with_listener_until(
+    cfg: Arc<Config>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("http worker {port} cannot load script: {e}");
+        return;
+    }
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
+    let name = format!("http:{port}");
+    script::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("http:{port}"), true));
-    let state = Arc::new(AppState { cfg, engine });
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+    let state = Arc::new(AppState {
+        cfg,
+        name,
+        engine,
+        in_flight: WorkerInFlight::default(),
+    });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
     // response on a pooled keep-alive connection and distorts ITL/CPU numbers.
@@ -139,20 +174,27 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
             "utilization": s.token_usage,
             "max_running_requests": s.max_running_requests,
         }),
-        None => json!({
-            "dp_rank": 0,
-            "num_running_reqs": 0,
-            "num_waiting_reqs": 0,
-            "num_waiting_uncached_tokens": 0,
-            "num_total_reqs": 0,
-            "num_used_tokens": 0,
-            "max_total_num_tokens": 1_000_000,
-            "token_usage": 0.0,
-            "gen_throughput": 0.0,
-            "cache_hit_rate": 0.0,
-            "utilization": 0.0,
-            "max_running_requests": 0,
-        }),
+        None => {
+            // Without an engine simulation the work in flight is the canned
+            // and scripted answers whose responses are still open on this
+            // worker (not the process's other workers): the running count a
+            // load poll asks about, and nothing waits.
+            let running = state.in_flight.get();
+            json!({
+                "dp_rank": 0,
+                "num_running_reqs": running,
+                "num_waiting_reqs": 0,
+                "num_waiting_uncached_tokens": 0,
+                "num_total_reqs": running,
+                "num_used_tokens": 0,
+                "max_total_num_tokens": 1_000_000,
+                "token_usage": 0.0,
+                "gen_throughput": 0.0,
+                "cache_hit_rate": 0.0,
+                "utilization": 0.0,
+                "max_running_requests": 0,
+            })
+        }
     };
     Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] })).into_response()
 }
@@ -177,13 +219,57 @@ async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
     // In flight from here until the response is complete or its stream is
-    // done, so a shutdown knows what it waits for.
-    let in_flight = InFlight::enter();
-    let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+    // done, so a shutdown knows what it waits for and this worker's load
+    // report counts it.
+    let in_flight = InFlight::enter_on(&state.in_flight);
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let stream_requested = parsed
-        .as_ref()
-        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        .get("stream")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The prompt as this wire knows it: its text, and synthetic ids, one per
+    // whitespace word, the realistic engine's prompt and the script's key
+    // alike. The canned path does without them until something is scripted.
+    let prompt_text = if script::active() || state.engine.is_some() {
+        extract_prompt_text(&parsed)
+    } else {
+        String::new()
+    };
+    let prompt_ids = synth_token_ids(&prompt_text);
+
+    // A scripted answer, ahead of either engine mode: the worker's queue, the
+    // prompt's text or its key decides ([`crate::script`]).
+    // One scripted answer per choice the request samples (`n`).
+    match script::take_per_choice(
+        &state.name,
+        &prompt_ids,
+        Some(&prompt_text),
+        extract_n(&parsed),
+    ) {
+        Ok(Some(answers)) => {
+            // The request's limit ends each answer as it would an engine's.
+            let limit = extract_max_tokens(&parsed);
+            let answers = answers
+                .into_iter()
+                .map(|answer| answer.cut_to(limit))
+                .collect();
+            return scripted_response(
+                endpoint,
+                &state.cfg,
+                &parsed,
+                answers,
+                prompt_ids.len(),
+                stream_requested,
+                in_flight,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        // A precondition the script does not meet (the gRPC wire's
+        // `FAILED_PRECONDITION`): a status the gateway does not retry, so the
+        // reason reaches the test instead of a retry's canned choice.
+        Err(why) => return (StatusCode::PRECONDITION_FAILED, why).into_response(),
+    }
 
     // Realistic mode: drive the engine simulator.
     if let Some(engine) = &state.engine {
@@ -211,8 +297,6 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
                 .after_tokens
                 .map(|after| (after, status, engine.cut_counter()))
         });
-        let parsed = parsed.unwrap_or(Value::Null);
-        let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));
         let prompt_tokens = prompt_ids.len() as u32;
         let max_new = extract_max_tokens(&parsed).unwrap_or(state.cfg.output_tokens);
         let request_id = next_request_id();
@@ -285,6 +369,330 @@ fn stream_chat(
     events.push(Ok(Event::default().data(final_frame.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
     Sse::new(in_flight.until_done(stream::iter(events)))
+}
+
+// ── Scripted responses ──────────────────────────────────────────────────────
+
+/// Whether the request asked for logprobs: chat's `logprobs: true`, a
+/// completion's `logprobs: <n>` (`0` included: the sampled token's logprob
+/// with no alternatives, as the engines read it).
+fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
+    match (endpoint, request.get("logprobs")) {
+        (Endpoint::Chat, Some(value)) => value.as_bool().unwrap_or(false),
+        (Endpoint::Completions, Some(value)) => value.as_u64().is_some(),
+        (_, None) => false,
+    }
+}
+
+/// How many top alternatives the request asked for per token: chat's
+/// `top_logprobs`, a completion's `logprobs: <n>` (the sampled token counts
+/// as one of them).
+fn wants_top(endpoint: Endpoint, request: &Value) -> usize {
+    let key = match endpoint {
+        Endpoint::Chat => "top_logprobs",
+        Endpoint::Completions => "logprobs",
+    };
+    request
+        .get(key)
+        .and_then(Value::as_u64)
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// The usage of a request's scripted answers: the prompt once, every
+/// choice's completion, as an engine reports a request that samples `n` times.
+fn scripted_usage(answers: &[Answer], prompt_len: usize) -> Value {
+    let first = answers.first();
+    let prompt_tokens = first.map_or(0, |answer| answer.prompt_tokens(prompt_len));
+    let completion_tokens: u32 = answers.iter().map(Answer::completion_tokens).sum();
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": first.map_or(0, |answer| answer.cached_tokens) },
+    })
+}
+
+/// The logprobs of some text pieces in the endpoint's shape: chat's
+/// `content` entries, a completion's parallel `tokens` and `token_logprobs`,
+/// with the answer's `top` alternatives per piece where the request asked for
+/// them (chat's entry list, a completion's piece-to-logprob map).
+fn scripted_logprobs(
+    endpoint: Endpoint,
+    answer: &Answer,
+    pieces: &[String],
+    logprobs: &[f32],
+    top: usize,
+) -> Value {
+    let mut alternatives = answer.top_pieces(pieces, logprobs, top).into_iter();
+    match endpoint {
+        Endpoint::Chat => json!({
+            "content": pieces.iter().zip(logprobs).map(|(piece, logprob)| json!({
+                "token": piece,
+                "logprob": logprob,
+                "bytes": Value::Null,
+                "top_logprobs": alternatives.next().unwrap_or_default().into_iter().map(|(token, logprob)| json!({
+                    "token": token,
+                    "logprob": logprob,
+                    "bytes": Value::Null,
+                })).collect::<Vec<Value>>(),
+            })).collect::<Vec<Value>>(),
+        }),
+        Endpoint::Completions => json!({
+            "tokens": pieces,
+            "token_logprobs": logprobs,
+            "top_logprobs": pieces.iter().map(|_| {
+                alternatives
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(token, logprob)| (token, json!(logprob)))
+                    .collect::<serde_json::Map<String, Value>>()
+            }).collect::<Vec<serde_json::Map<String, Value>>>(),
+            "text_offset": [],
+        }),
+    }
+}
+
+/// The scripted answer in the endpoint's shape: one JSON body after the
+/// answer's pauses, or an SSE stream of one frame per cut of the text, the
+/// finish frame, the usage chunk when the request asked for it in its
+/// stream (a chunk of its own with no choices, as the engines send it) and
+/// `[DONE]`, with the pause before every frame but the first. The finish
+/// carries `matched_stop` when the answer names one.
+async fn scripted_response(
+    endpoint: Endpoint,
+    cfg: &Config,
+    request: &Value,
+    answers: Vec<Answer>,
+    prompt_len: usize,
+    stream: bool,
+    in_flight: InFlight,
+) -> Response {
+    let want_logprobs = wants_logprobs(endpoint, request);
+    let top = if want_logprobs {
+        wants_top(endpoint, request)
+    } else {
+        0
+    };
+    let usage = scripted_usage(&answers, prompt_len);
+    let model = cfg.model_id.clone();
+    if stream {
+        let include_usage = request
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let usage = include_usage.then_some(usage);
+        return Sse::new(in_flight.until_done(scripted_frames(
+            endpoint,
+            model,
+            answers,
+            want_logprobs,
+            top,
+            usage,
+        )))
+        .into_response();
+    }
+    // The pauses the choices' frames would take one after the other, as one wait.
+    let pauses: std::time::Duration = answers
+        .iter()
+        .map(|answer| {
+            answer.delay
+                * u32::try_from(answer.text_frames().len().saturating_sub(1)).unwrap_or(u32::MAX)
+        })
+        .sum();
+    if !pauses.is_zero() {
+        tokio::time::sleep(pauses).await;
+    }
+    let choices: Vec<Value> = answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            let text = answer.text();
+            let mut choice = match endpoint {
+                Endpoint::Chat => json!({
+                    "index": index,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": answer.finish_reason,
+                }),
+                Endpoint::Completions => json!({
+                    "index": index,
+                    "text": text,
+                    "finish_reason": answer.finish_reason,
+                }),
+            };
+            if let Some(stop) = &answer.matched_stop {
+                choice["matched_stop"] = stop.to_json();
+            }
+            if let (true, Some(pieces), Some(logprobs)) =
+                (want_logprobs, &answer.output_text, &answer.logprobs)
+            {
+                if pieces.len() == logprobs.len() {
+                    choice["logprobs"] = scripted_logprobs(endpoint, answer, pieces, logprobs, top);
+                }
+            }
+            choice
+        })
+        .collect();
+    let body = match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "choices": choices,
+            "usage": usage,
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": choices,
+            "usage": usage,
+        }),
+    };
+    Json(body).into_response()
+}
+
+/// The frames of a scripted stream, choice by choice in order: each choice's
+/// text frames and its finish frame, then the usage chunk when asked for,
+/// then `[DONE]`.
+fn scripted_frames(
+    endpoint: Endpoint,
+    model: String,
+    answers: Vec<Answer>,
+    want_logprobs: bool,
+    top: usize,
+    usage: Option<Value>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct Choice {
+        index: usize,
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        started: bool,
+    }
+    struct Scripted {
+        endpoint: Endpoint,
+        model: String,
+        choices: std::collections::VecDeque<Choice>,
+        want_logprobs: bool,
+        top: usize,
+        usage: Option<Value>,
+        ended: bool,
+    }
+    let choices = answers
+        .into_iter()
+        .enumerate()
+        .map(|(index, answer)| Choice {
+            index,
+            frames: answer.text_frames().into(),
+            answer,
+            started: false,
+        })
+        .collect();
+    let init = Scripted {
+        endpoint,
+        model,
+        choices,
+        want_logprobs,
+        top,
+        usage,
+        ended: false,
+    };
+    stream::unfold(init, |mut st| async move {
+        if st.ended {
+            return None;
+        }
+        if st
+            .choices
+            .front()
+            .is_some_and(|choice| choice.frames.is_empty())
+        {
+            // Every frame of the choice went out: its finish frame, then the
+            // next choice from its first frame.
+            let choice = st.choices.pop_front()?;
+            let mut finish = match st.endpoint {
+                Endpoint::Chat => json!({
+                    "index": choice.index, "delta": {}, "finish_reason": choice.answer.finish_reason
+                }),
+                Endpoint::Completions => json!({
+                    "index": choice.index, "text": "", "finish_reason": choice.answer.finish_reason
+                }),
+            };
+            if let Some(stop) = &choice.answer.matched_stop {
+                finish["matched_stop"] = stop.to_json();
+            }
+            let frame = scripted_chunk(st.endpoint, &st.model, finish);
+            return Some((Ok(Event::default().data(frame.to_string())), st));
+        }
+        let Some(choice) = st.choices.front_mut() else {
+            // Every choice finished. The usage rides in a chunk of its own
+            // after the finish frames, with no choices, as the engines send
+            // it; then the end.
+            if let Some(usage) = st.usage.take() {
+                let mut chunk = scripted_chunk(st.endpoint, &st.model, Value::Null);
+                chunk["choices"] = json!([]);
+                chunk["usage"] = usage;
+                return Some((Ok(Event::default().data(chunk.to_string())), st));
+            }
+            st.ended = true;
+            return Some((Ok(Event::default().data("[DONE]")), st));
+        };
+        let frame = choice.frames.pop_front()?;
+        if choice.started && !choice.answer.delay.is_zero() {
+            tokio::time::sleep(choice.answer.delay).await;
+        }
+        let text = frame.text();
+        let mut delta = match st.endpoint {
+            // The first delta of a choice names the role, as an engine's does.
+            Endpoint::Chat if !choice.started => json!({
+                "index": choice.index,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": Value::Null,
+            }),
+            Endpoint::Chat => json!({
+                "index": choice.index, "delta": {"content": text}, "finish_reason": Value::Null
+            }),
+            Endpoint::Completions => json!({
+                "index": choice.index, "text": text, "finish_reason": Value::Null
+            }),
+        };
+        if st.want_logprobs
+            && !frame.logprobs.is_empty()
+            && frame.logprobs.len() == frame.pieces.len()
+        {
+            delta["logprobs"] = scripted_logprobs(
+                st.endpoint,
+                &choice.answer,
+                &frame.pieces,
+                &frame.logprobs,
+                st.top,
+            );
+        }
+        choice.started = true;
+        let frame = scripted_chunk(st.endpoint, &st.model, delta);
+        Some((Ok(Event::default().data(frame.to_string())), st))
+    })
+}
+
+/// One streamed frame of the endpoint's shape around `choice`.
+fn scripted_chunk(endpoint: Endpoint, model: &str, choice: Value) -> Value {
+    match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+        }),
+    }
 }
 
 // ── Realistic responses ─────────────────────────────────────────────────────
@@ -494,27 +902,51 @@ fn final_chunk(endpoint: Endpoint, model: &str) -> Value {
 
 // ── HTTP prompt helpers ──────────────────────────────────────────────────────
 
-/// Extract prompt text from a chat/completions/generate body.
+/// Extract prompt text from a chat/completions/generate body: the messages'
+/// content (a string, or the `text` of its parts), else the prompt (a
+/// string, or an array of them), joined by spaces.
 fn extract_prompt_text(v: &Value) -> String {
     if let Some(messages) = v.get("messages").and_then(Value::as_array) {
         return messages
             .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .filter_map(|m| m.get("content"))
+            .flat_map(texts_of)
             .collect::<Vec<_>>()
             .join(" ");
     }
     for key in ["prompt", "text", "inputs"] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            return s.to_string();
+        if let Some(value) = v.get(key) {
+            let texts = texts_of(value);
+            if !texts.is_empty() {
+                return texts.join(" ");
+            }
         }
     }
     String::new()
 }
 
+/// The texts of a content value: the string itself, or the `text` fields of
+/// an array's parts (`{"type": "text", "text": ...}`) and its plain strings.
+fn texts_of(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Approximate a prompt's token ids from its text: one id per whitespace word,
 /// each a stable hash of the word. Identical leading words yield identical
-/// leading ids, so shared prefixes still produce cache hits.
-fn synth_token_ids(text: &str) -> Vec<u32> {
+/// leading ids, so shared prefixes still produce cache hits. These are also
+/// the ids an HTTP worker's script key is computed over
+/// ([`crate::script::script_key`]).
+pub fn synth_token_ids(text: &str) -> Vec<u32> {
     text.split_whitespace().map(hash_word).collect()
 }
 
@@ -527,8 +959,18 @@ fn hash_word(w: &str) -> u32 {
     h % 30_000
 }
 
+/// The choices a request samples: its `n`, one when absent or zero.
+fn extract_n(v: &Value) -> usize {
+    v.get("n")
+        .and_then(Value::as_u64)
+        .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        .max(1)
+}
+
 fn extract_max_tokens(v: &Value) -> Option<u32> {
-    for key in ["max_tokens", "max_new_tokens"] {
+    // The chat API's current name first, then the one it deprecates and the
+    // engines' native one.
+    for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
         if let Some(n) = v.get(key).and_then(Value::as_u64) {
             return Some(n as u32);
         }
@@ -547,6 +989,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_prompt_text_is_read_from_string_content_text_parts_and_prompt_arrays() {
+        use serde_json::json;
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [{"role": "user", "content": "say apricot"}]})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "say"},
+                    {"type": "image_url", "image_url": {"url": "data:,"}},
+                    {"type": "text", "text": "apricot"},
+                ]},
+            ]})),
+            "be brief say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": "say apricot"})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": ["say", "apricot"]})),
+            "say apricot"
+        );
+        assert_eq!(extract_prompt_text(&json!({"prompt": [1, 2, 3]})), "");
+    }
+
     fn token() -> engine::GenEvent {
         engine::GenEvent::Token {
             token_id: 7,
@@ -562,6 +1033,19 @@ mod tests {
             completion_tokens: tokens,
             cached_tokens: 0,
         }
+    }
+
+    #[test]
+    fn the_request_limit_is_read_under_each_of_its_names() {
+        for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
+            assert_eq!(extract_max_tokens(&json!({ key: 7 })), Some(7), "{key}");
+        }
+        assert_eq!(extract_max_tokens(&json!({ "stream": true })), None);
+        assert_eq!(
+            extract_max_tokens(&json!({ "max_completion_tokens": 3, "max_tokens": 9 })),
+            Some(3),
+            "the current name wins over the deprecated one"
+        );
     }
 
     #[tokio::test]

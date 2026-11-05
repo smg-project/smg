@@ -21,7 +21,7 @@
 //! probe) sit outside it: they forward the caller's header as they did and
 //! add no credential of their own, since there "no header" means anonymous.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -41,9 +41,12 @@ use crate::{
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
 };
 
+/// The configured keys by hash. Built once and read-only after: the map
+/// is shared, so the clone axum takes of the middleware's state on every
+/// request is a reference count, whatever the number of keys.
 #[derive(Clone)]
 pub struct AuthConfig {
-    keys: HashMap<[u8; 32], TenantKey>,
+    keys: Arc<HashMap<[u8; 32], TenantKey>>,
 }
 
 impl AuthConfig {
@@ -73,7 +76,9 @@ impl AuthConfig {
             );
         }
 
-        Self { keys }
+        Self {
+            keys: Arc::new(keys),
+        }
     }
 
     /// Whether any key is configured. Empty means [`auth_middleware`]

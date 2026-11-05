@@ -16,10 +16,14 @@
 //! as `(frames * h * w, 3 * p * p)` rows with `video_grid_thw` `(frames, h, w)`;
 //! the engine pairs frames into tubelets of `h * w / 4` tokens each.
 //!
-//! The engine also scales a request's images down to share `4 * (max_model_len -
-//! prompt_len - 4)` patches. This port does not: each image gets the
-//! per-image maximum, so a request whose images overflow the engine's context
-//! is refused where the engine would shrink them.
+//! The engine's tiler scales a request's images down to share `4 *
+//! (max_model_len - text_prompt_length - 4)` patches. This port plans the same
+//! grids when the caller passes `max_model_len - text_prompt_length` as the
+//! call's [`token_budget`](VisionPreprocessingContext::token_budget); which
+//! text length to subtract is the caller's choice. Without a budget, each
+//! image gets the per-image maximum. A budget too small for every image's
+//! minimum still gives each its minimum, as the engine does, and the
+//! request's length check refuses the prompt.
 
 use std::borrow::Cow;
 
@@ -31,8 +35,10 @@ use crate::{
     encoder_inputs::ModelSpecificValue,
     types::RgbFrameRef,
     vision::{
-        preprocessor_config::PreProcessorConfig,
-        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        processor::{
+            PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+            VisionPreprocessingContext,
+        },
         transforms::{resize_bicubic_torch_aa_f32, rgb_bytes, TransformError},
     },
 };
@@ -47,6 +53,12 @@ const VIDEO_TARGET_PATCHES: usize = 1024;
 pub(crate) const VIDEO_TEMPORAL_PATCH_SIZE: usize = 2;
 /// The 2x2 pixel shuffle needs an even patch grid.
 const GRID_DIVISOR: usize = 2;
+/// Tokens the engine keeps back from a request's image budget
+/// (`max_num_tokens_available`).
+const BUDGET_RESERVED_TOKENS: usize = 4;
+/// Rounds the engine's `compute_params` takes to fit a request's images in
+/// their budget before it gives up.
+const MAX_BUDGET_ROUNDS: usize = 10;
 
 /// Embeddings of a `rows x cols` patch grid after the 2x2 pixel shuffle.
 pub(crate) fn grid_tokens(rows: usize, cols: usize) -> usize {
@@ -123,7 +135,14 @@ impl NemotronOmniProcessor {
     /// `process_media` plans it at the per-image maximum; `None` for a strip so
     /// thin it rounds to no patches, which the engine fails on too.
     pub fn plan_grid(width: u32, height: u32) -> Option<(usize, usize)> {
-        let budget = MAX_NUM_PATCHES;
+        Self::plan_grid_within(width, height, MAX_NUM_PATCHES)
+    }
+
+    /// [`plan_grid`](Self::plan_grid) within `budget` patches, the engine's
+    /// `num_tokens_available` for the image. The minimum is enforced only
+    /// above it: an image whose budget is the minimum keeps the grid the
+    /// budget scales it to, however small.
+    fn plan_grid_within(width: u32, height: u32, budget: usize) -> Option<(usize, usize)> {
         let p = PATCH_SIZE as f64;
         let closest_h = (f64::from(height) / p + 0.5).round_ties_even() as usize;
         let closest_w = (f64::from(width) / p + 0.5).round_ties_even() as usize;
@@ -135,7 +154,7 @@ impl NemotronOmniProcessor {
         if rows * cols == 0 {
             return None;
         }
-        if rows * cols < MIN_NUM_PATCHES {
+        if budget > MIN_NUM_PATCHES && rows * cols < MIN_NUM_PATCHES {
             let up = (MIN_NUM_PATCHES as f64 / (rows * cols) as f64).sqrt();
             rows = (up * rows as f64).ceil() as usize;
             cols = (up * cols as f64).ceil() as usize;
@@ -157,6 +176,61 @@ impl NemotronOmniProcessor {
             };
         }
         Some((rows, cols))
+    }
+
+    /// The grids of one call's images, as the engine's `compute_params` plans
+    /// them: without a token budget, each at the per-image maximum; with one,
+    /// sharing `4 * (token_budget - 4)` patches, each image's share shrunk in
+    /// proportion to its patches until the grids fit. A budget below every
+    /// image's minimum is raised to it.
+    fn plan_grids(
+        sizes: &[(u32, u32)],
+        token_budget: Option<usize>,
+    ) -> Result<Vec<(usize, usize)>, TransformError> {
+        let grid = |&(width, height): &(u32, u32), budget| {
+            Self::plan_grid_within(width, height, budget).ok_or_else(|| {
+                TransformError::ShapeError(format!(
+                    "a {width}x{height} image is too thin for Nemotron-H Omni's patch grid"
+                ))
+            })
+        };
+        let Some(token_budget) = token_budget else {
+            return sizes
+                .iter()
+                .map(|size| grid(size, MAX_NUM_PATCHES))
+                .collect();
+        };
+        let available = token_budget
+            .saturating_sub(BUDGET_RESERVED_TOKENS)
+            .saturating_mul(GRID_DIVISOR * GRID_DIVISOR)
+            .max(MIN_NUM_PATCHES * sizes.len());
+        let mut budgets = vec![available.clamp(MIN_NUM_PATCHES, MAX_NUM_PATCHES); sizes.len()];
+        for _ in 0..MAX_BUDGET_ROUNDS {
+            let grids = sizes
+                .iter()
+                .zip(&budgets)
+                .map(|(size, &budget)| grid(size, budget))
+                .collect::<Result<Vec<_>, _>>()?;
+            let used: usize = grids.iter().map(|(rows, cols)| rows * cols).sum();
+            if used <= available {
+                return Ok(grids);
+            }
+            let scale = available as f64 / used as f64;
+            let scaled: Vec<usize> = grids
+                .iter()
+                .map(|(rows, cols)| (((rows * cols) as f64 * scale) as usize).max(MIN_NUM_PATCHES))
+                .collect();
+            // Shares that no longer shrink are stuck at the minimum.
+            budgets = if scaled.iter().zip(&budgets).any(|(new, old)| new < old) {
+                scaled
+            } else {
+                vec![MIN_NUM_PATCHES; sizes.len()]
+            };
+        }
+        Err(TransformError::ShapeError(format!(
+            "Nemotron-H Omni's images did not fit a {token_budget}-token budget in \
+             {MAX_BUDGET_ROUNDS} rounds"
+        )))
     }
 
     /// The `(rows, cols)` grid of a video's frames, as the engine's
@@ -283,6 +357,7 @@ impl NemotronOmniProcessor {
 }
 
 impl VisionPreProcessor for NemotronOmniProcessor {
+    /// Only without a token budget, which the call's images share.
     fn supports_per_image_preprocessing(&self) -> bool {
         true
     }
@@ -295,32 +370,37 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         CLIP_STD
     }
 
+    fn preprocess(
+        &self,
+        images: &[&DynamicImage],
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_with_context(images, &VisionPreprocessingContext::default())
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "per-image patch arrays are standard-layout and the concatenation is sized by construction"
     )]
-    fn preprocess(
+    fn preprocess_with_context(
         &self,
-        images: &[DynamicImage],
-        _config: &PreProcessorConfig,
+        images: &[&DynamicImage],
+        context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
+        let sizes: Vec<_> = images
+            .iter()
+            .map(|image| (image.width(), image.height()))
+            .collect();
+        let planned = Self::plan_grids(&sizes, context.token_budget)?;
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
         let mut encoder_input = Vec::new();
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 2);
         let mut patches_per_image = Vec::with_capacity(images.len());
-        for image in images {
-            let (rows, cols) = Self::plan_grid(image.width(), image.height()).ok_or_else(|| {
-                TransformError::ShapeError(format!(
-                    "a {}x{} image is too thin for Nemotron-H Omni's patch grid",
-                    image.width(),
-                    image.height()
-                ))
-            })?;
+        for (image, (rows, cols)) in images.iter().zip(planned) {
             let (width, height, raw) = Self::rgb_on_white(image);
             encoder_input.extend(Self::patches(
                 &raw,
@@ -356,7 +436,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        _config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
         let refs: Vec<_> = rgb
@@ -373,17 +453,12 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        _config: &PreProcessorConfig,
+        _clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         Self::video_patches(frames)
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        _config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let (rows, cols) = Self::plan_grid(width, height).ok_or_else(|| {
             TransformError::ShapeError(format!(
                 "a {width}x{height} image is too thin for Nemotron-H Omni's patch grid"
@@ -419,10 +494,76 @@ mod tests {
         // The count refuses what the grid planner refuses, as the
         // preprocessing does.
         let error = NemotronOmniProcessor::new()
-            .calculate_num_tokens(300_000, 8, &PreProcessorConfig::default())
+            .calculate_num_tokens(300_000, 8)
             .unwrap_err()
             .to_string();
         assert!(error.contains("too thin"), "{error}");
+    }
+
+    /// Grids the engine's `compute_params` gives these images when
+    /// `max_model_len - prompt_len` is the token budget.
+    #[test]
+    fn plans_the_reference_grids_under_a_token_budget() {
+        let plan = |budget, sizes: &[(u32, u32)]| {
+            NemotronOmniProcessor::plan_grids(sizes, budget).unwrap()
+        };
+        let pair = [(1920, 1080), (640, 480)];
+        // Without a budget, or with one the images fit, each image gets the
+        // per-image maximum.
+        assert_eq!(plan(None, &pair), [(68, 120), (30, 40)]);
+        assert_eq!(plan(Some(3004), &pair), [(68, 120), (30, 40)]);
+        // One image scaled down to fit.
+        assert_eq!(plan(Some(1504), &[(1920, 1080)]), [(58, 102)]);
+        // The tiler keeps 4 tokens back: 304 tokens leave 300 for a 30x40 grid,
+        // 303 do not.
+        assert_eq!(plan(Some(304), &[(640, 480)]), [(30, 40)]);
+        assert_eq!(plan(Some(303), &[(640, 480)]), [(30, 38)]);
+        // Images over a shared budget shrink in proportion to their patches.
+        assert_eq!(
+            plan(Some(3004), &[(1920, 1080), (1920, 1080)]),
+            [(58, 102), (58, 102)]
+        );
+        // A small image whose share falls to the minimum keeps its own grid,
+        // below the minimum, rather than being raised to it.
+        assert_eq!(
+            plan(Some(4004), &[(4000, 3000), (224, 224), (1280, 720)]),
+            [(94, 124), (14, 14), (42, 76)]
+        );
+        // A budget below the minimum: each image still gets the minimum share.
+        assert_eq!(plan(Some(0), &[(640, 480)]), [(28, 36)]);
+        assert_eq!(plan(Some(100), &pair), [(24, 42), (28, 36)]);
+    }
+
+    /// The budget reaches the engine's inputs: fewer patches and tokens per
+    /// image, and a budget below the minimum is served at the minimum rather
+    /// than refused.
+    #[test]
+    fn a_token_budget_shrinks_the_images_it_cannot_fit() {
+        let owned = vec![DynamicImage::new_rgb8(640, 480); 2];
+        let images: Vec<&DynamicImage> = owned.iter().collect();
+        let preprocess = |images: &[&DynamicImage], token_budget| {
+            NemotronOmniProcessor::new()
+                .preprocess_with_context(images, &VisionPreprocessingContext { token_budget })
+                .unwrap()
+        };
+        let grids = |out: &PreprocessedEncoderInputs| match out.model_specific.get("image_grid_hw")
+        {
+            Some(ModelSpecificValue::IntTensor { data, .. }) => data.clone(),
+            other => panic!("image_grid_hw: {other:?}"),
+        };
+
+        let unbudgeted = preprocess(&images, None);
+        assert_eq!(unbudgeted.feature_token_counts, [300, 300]);
+        assert_eq!(grids(&unbudgeted), [30, 40, 30, 40]);
+
+        let budgeted = preprocess(&images, Some(560));
+        assert_eq!(budgeted.feature_token_counts, [266, 266]);
+        assert_eq!(grids(&budgeted), [28, 38, 28, 38]);
+        assert_eq!(budgeted.encoder_input.shape()[0], 2 * 28 * 38);
+
+        let exhausted = preprocess(&images[..1], Some(0));
+        assert_eq!(exhausted.feature_token_counts, [252]);
+        assert_eq!(grids(&exhausted), [28, 36]);
     }
 
     /// Frame grids the engine's `_compute_aspect_preserving_size` gives these sizes.

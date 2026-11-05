@@ -272,7 +272,7 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty),
             max_new_tokens: request.max_output_tokens,
-            stop: vec![],               // Does not pass through request.stop yet
+            stop: stop_strings(request.stop.as_ref()),
             stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
@@ -530,6 +530,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             token_usage: load.token_usage,
             active_token_usage: load.active_token_usage,
             gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
@@ -580,6 +581,28 @@ mod connect_tests {
         let result = TokenSpeedSchedulerClient::connect(&refused.url).await;
         assert!(result.is_err(), "a refused dial fails the connect");
     }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        // The list form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::Array(vec![
+                "STOP".to_string(),
+                "\n\n".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let params =
+            TokenSpeedSchedulerClient::build_sampling_params_from_responses(&request, None)
+                .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP", "\n\n"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -604,6 +627,7 @@ mod load_conversion_tests {
                 token_usage: 0.5,
                 active_token_usage: Some(0.25),
                 gen_throughput: 105.25,
+                prefill_throughput: None,
                 cache_hit_rate: 0.75,
                 utilization: 0.5,
                 memory: Some(tokenspeed_proto::MemoryMetrics {

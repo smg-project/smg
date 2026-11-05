@@ -3,17 +3,21 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use openai_protocol::worker::{WorkerModels, WorkerStatus};
+use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+#[cfg(test)]
+use super::create_worker::labels_for_rank;
 use super::create_worker::{
-    model_card_for_labels, validate_parser_overrides, warn_on_conflicting_parser_overrides,
+    model_card_for_labels, report_for_rank, validate_parser_overrides,
+    warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
-        BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
+        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
+        BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };
@@ -33,6 +37,28 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
+        // A label refresh replaces what discovery read before with what the
+        // engine reports now (an operator's own labels keep their values) and
+        // rebuilds a worker only when that changes something; an API update
+        // merges the request's labels into the existing ones.
+        let refresh = context.data.refresh_discovered_labels;
+        // The engine's KV transfer metadata travels in its report under label
+        // names and is never a label (registration takes it out the same way,
+        // `create_worker::take_kv_transfer_metadata`): out of the report before
+        // any merge, applied to the worker's dedicated fields below.
+        let (fresh_engine_labels, fresh_kv) = match context.data.fresh_engine_labels.clone() {
+            Some(mut fresh) => {
+                let kv = EngineKvMetadata::take(&mut fresh);
+                (Some(fresh), kv)
+            }
+            None => (None, EngineKvMetadata::default()),
+        };
+        let snapshot = context.data.snapshot.clone();
+        if refresh && fresh_engine_labels.is_none() {
+            debug!("No engine labels were re-read; nothing to update");
+            context.data.updated_workers = Some(Vec::new());
+            return Ok(StepResult::Skip);
+        }
         let app_context = context
             .data
             .app_context
@@ -67,32 +93,72 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             .iter()
             .map(|worker| {
                 let existing = &worker.metadata().spec.labels;
-                // A window set here is the worker's only window, as at
-                // registration (see `create_worker::merge_labels`).
-                let updated_labels = match request.labels {
-                    Some(ref new_labels) => merge_labels(existing, new_labels),
-                    None => existing.clone(),
+                let updated_labels = if let (true, Some(fresh)) =
+                    (refresh, fresh_engine_labels.as_ref())
+                {
+                    let labels = refreshed_labels(
+                        existing,
+                        &worker.metadata().discovered_labels,
+                        &fresh_in_rank_space(worker, fresh),
+                    );
+                    // An engine that reports a `constrained_decoding` naming no
+                    // policy is refused as at registration: the job fails with
+                    // the reason and the worker keeps the labels it had.
+                    super::create_worker::validate_constrained_decoding_label(
+                        &labels,
+                        worker.url(),
+                        "update_worker_properties",
+                    )?;
+                    labels
+                } else {
+                    // A window set here is the worker's only window, as at
+                    // registration (see `create_worker::merge_labels`).
+                    let updated_labels = match request.labels {
+                        Some(ref new_labels) => {
+                            // The admin check refused labels for a discovered
+                            // worker when the request arrived, but a provider
+                            // can register the URL between then and this job
+                            // (its upsert queued first): held again against
+                            // the worker the update would change.
+                            if let Some(provider) = existing.get(DISCOVERY_PROVIDER_LABEL) {
+                                return Err(WorkflowError::StepFailed {
+                                    step_id: StepId::new("update_worker_properties"),
+                                    message: format!(
+                                        "worker {} is owned by the '{provider}' discovery provider \
+                                         since this update was accepted; its labels come from its \
+                                         discovery source",
+                                        worker.url()
+                                    ),
+                                });
+                            }
+                            merge_labels(existing, new_labels)
+                        }
+                        None => existing.clone(),
+                    };
+                    // A `constrained_decoding` label sent in the update must name a
+                    // policy, as at registration (`create_worker`): a typo would
+                    // otherwise read as `requested` from here on.
+                    super::create_worker::validate_constrained_decoding_label(
+                        &updated_labels,
+                        worker.url(),
+                        "update_worker_properties",
+                    )?;
+                    if updated_labels.len() > existing.len()
+                        && updated_labels.len() > MAX_WORKER_LABELS
+                    {
+                        return Err(WorkflowError::StepFailed {
+                            step_id: StepId::new("update_worker_properties"),
+                            message: format!(
+                                "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
+                                updated_labels.len(),
+                                worker.url(),
+                                existing.len(),
+                                updated_labels.len() - existing.len()
+                            ),
+                        });
+                    }
+                    updated_labels
                 };
-                // A `constrained_decoding` label sent in the update must name a
-                // policy, as at registration (`create_worker`): a typo would
-                // otherwise read as `requested` from here on.
-                super::create_worker::validate_constrained_decoding_label(
-                    &updated_labels,
-                    worker.url(),
-                    "update_worker_properties",
-                )?;
-                if updated_labels.len() > existing.len() && updated_labels.len() > MAX_WORKER_LABELS {
-                    return Err(WorkflowError::StepFailed {
-                        step_id: StepId::new("update_worker_properties"),
-                        message: format!(
-                            "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
-                            updated_labels.len(),
-                            worker.url(),
-                            existing.len(),
-                            updated_labels.len() - existing.len()
-                        ),
-                    });
-                }
                 let (models, card_fields) =
                     models_for_labels(worker.as_ref(), existing, &updated_labels);
                 // A parser override the labels now name is checked as at
@@ -125,8 +191,26 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (worker, (updated_labels, models, card_fields)) in workers_to_update.iter().zip(merged)
+        for (index, (worker, (updated_labels, models, card_fields))) in
+            workers_to_update.iter().zip(merged).enumerate()
         {
+            if refresh {
+                // The engine's id is the worker's live id from here, rebuilt
+                // or not (a rebuilt worker shares the cell): the id a handoff
+                // must target is the one the engine reports, as the recovery
+                // re-read holds.
+                fresh_kv.apply_engine_id(worker);
+            }
+            if refresh
+                && updated_labels == worker.metadata().spec.labels
+                && !fresh_kv.fills_a_field_of(&worker.metadata().spec)
+            {
+                debug!(
+                    worker_url = %worker.url(),
+                    "Engine labels unchanged; the worker is kept as it is"
+                );
+                continue;
+            }
             if !card_fields.is_empty() {
                 info!(
                     worker_url = %worker.url(),
@@ -134,6 +218,36 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     "The worker's model card follows its labels"
                 );
             }
+            // A key an update sets is the operator's from then on, whatever
+            // value it carries: it leaves the discovered set, so a later
+            // refresh keeps it even when the engine reports another value.
+            let discovered_labels = match (refresh, fresh_engine_labels.as_ref()) {
+                // A refresh records the engine's report minus the keys the
+                // operator owns (a value that differs from the recorded report,
+                // or a key the report never had), so ownership survives the
+                // rebuilds between an operator's setting and the engine's next
+                // change of that value.
+                (true, Some(fresh)) => {
+                    let before = &worker.metadata().discovered_labels;
+                    let current = &worker.metadata().spec.labels;
+                    fresh_in_rank_space(worker, fresh)
+                        .into_iter()
+                        .filter(|(key, _)| {
+                            !current.contains_key(key) || before.get(key) == current.get(key)
+                        })
+                        .collect()
+                }
+                (false, _) => {
+                    let mut discovered_labels = (*worker.metadata().discovered_labels).clone();
+                    if let Some(labels) = &request.labels {
+                        for key in labels.keys() {
+                            discovered_labels.remove(key);
+                        }
+                    }
+                    discovered_labels
+                }
+                _ => (*worker.metadata().discovered_labels).clone(),
+            };
             // Resolve priority and cost: use update value if specified, otherwise keep existing
             let updated_priority = request.priority.unwrap_or_else(|| worker.priority());
             let updated_cost = request.cost.unwrap_or_else(|| worker.cost());
@@ -181,6 +295,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .http2(worker.http2())
                 .labels(updated_labels)
                 .models(models)
+                .discovered_labels(discovered_labels)
                 .health_config(updated_health_config.clone())
                 .health_endpoint(&health_endpoint)
                 .resilience(worker.resilience().clone())
@@ -193,9 +308,25 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .overload_defaults(OverloadThresholds::from_gateway_config(
                     &app_context.router_config,
                 ))
+                // The ZMQ handshake bound is the router config's, set at registration;
+                // the rebuilt worker keeps the live value rather than the builder's
+                // default, so the bound an operator set stays in force across an update.
+                .zmq_startup_timeout(worker.metadata().zmq_startup_timeout)
                 .status(next_status);
             if let Some(config) = circuit_breaker_config {
                 builder = builder.circuit_breaker_config(config);
+            }
+            // The ZMQ link's request bound, resolved at registration (the
+            // worker's own pool timeout, else the router's), is kept across the
+            // rebuild as the handshake bound is.
+            if let Some(timeout) = worker.metadata().zmq_request_timeout {
+                builder = builder.zmq_request_timeout(timeout);
+            }
+            if refresh {
+                // A connector or role the operator configured none of follows
+                // the engine's report; a configured one stands, as at
+                // registration.
+                builder = fresh_kv.fill_fields(builder, &worker.metadata().spec);
             }
 
             // Adopt the old worker's client only if it was materialized: a
@@ -222,10 +353,43 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
-            // Replace the worker in the registry (overwrite-then-diff)
-            let worker_id = app_context
-                .worker_registry
-                .register_or_replace(new_worker.clone());
+            // Replace the worker in the registry (overwrite-then-diff),
+            // against the id and revision the find step captured: a worker
+            // updated or replaced meanwhile (a provider registering its
+            // address included) fails the guard and is left as it is, and one
+            // removed (or removed and registered again at the same address,
+            // under a new id) is neither brought back nor touched. A refresh
+            // is dropped, and the next transition into service refreshes
+            // again; an update fails, rather than overwrite the newer
+            // registration with a rebuild of the one it found.
+            let worker_id = match snapshot.as_ref().and_then(|entries| entries.get(index)) {
+                Some((id, expected))
+                    if app_context.worker_registry.replace_claiming_local(
+                        id,
+                        new_worker.clone(),
+                        *expected,
+                    ) =>
+                {
+                    id.clone()
+                }
+                _ if refresh => {
+                    debug!(
+                        worker_url = %worker.url(),
+                        "Worker changed or left during the label refresh; not rebuilt"
+                    );
+                    continue;
+                }
+                _ => {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("update_worker_properties"),
+                        message: format!(
+                            "worker {} was replaced or removed since this update found it, so \
+                             the update was dropped",
+                            worker.url()
+                        ),
+                    });
+                }
+            };
 
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
@@ -279,869 +443,131 @@ fn models_for_labels(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, time::Duration};
+/// The engine's KV transfer metadata, which its report carries under label
+/// names (`kv_connector`, `kv_role`, `kv_engine_id`) and the worker holds in
+/// dedicated fields, as at registration (`create_worker::take_kv_transfer_metadata`).
+#[derive(Debug, Default)]
+struct EngineKvMetadata {
+    connector: Option<String>,
+    role: Option<String>,
+    engine_id: Option<String>,
+}
 
-    use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response},
-        EngineId,
-    };
-    use openai_protocol::{
-        model_card::ModelCard,
-        model_type::ModelType,
-        worker::{
-            HealthCheckConfig, HealthCheckUpdate, OverloadUpdate, WorkerSpec, WorkerType,
-            WorkerUpdateRequest,
-        },
-    };
-    use tracing_test::traced_test;
-    use wfaas::WorkflowInstanceId;
-
-    use super::*;
-    use crate::{
-        app_context::AppContext,
-        middleware::AuthConfig,
-        routers::{
-            common::kv_transfer::{connector_mode_for_worker, KvConnectorMode},
-            grpc::{
-                backend_client::BackendClient,
-                zmq_client::{EosTokenIds, ZmqEngineClient},
-            },
-        },
-        worker::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            BasicWorker, ConnectionMode, RuntimeType,
-        },
-    };
-
-    fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
-        make_app_context_with(workers, None)
+impl EngineKvMetadata {
+    /// Takes the three keys out of the report; an empty value is none.
+    fn take(report: &mut HashMap<String, String>) -> Self {
+        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        Self {
+            connector: take("kv_connector"),
+            role: take("kv_role"),
+            engine_id: take("kv_engine_id"),
+        }
     }
 
-    /// With the tool parsers the gateway reads with, when given: a parser
-    /// override is validated against them.
-    fn make_app_context_with(
-        workers: &[Arc<dyn Worker>],
-        tool_parser_factory: Option<tool_parser::ParserFactory>,
-    ) -> Arc<AppContext> {
-        use crate::{
-            config::RouterConfig,
-            middleware::TokenBucket,
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::{
-                common::{openai_bridge, realtime::RealtimeRegistry},
-                grpc::multimodal::MultimodalConfigRegistry,
-            },
-            worker::{WorkerRegistry, WorkerService},
+    /// Whether a rebuild would set a field the operator left unset.
+    fn fills_a_field_of(&self, spec: &WorkerSpec) -> bool {
+        (self.connector.is_some() && spec.kv_connector.is_none())
+            || (self.role.is_some() && spec.kv_role.is_none())
+    }
+
+    /// The fields the operator left unset, from the engine's report.
+    fn fill_fields(
+        &self,
+        mut builder: BasicWorkerBuilder,
+        spec: &WorkerSpec,
+    ) -> BasicWorkerBuilder {
+        if let (Some(connector), None) = (&self.connector, &spec.kv_connector) {
+            builder = builder.kv_connector(connector);
+        }
+        if let (Some(role), None) = (&self.role, &spec.kv_role) {
+            builder = builder.kv_role(role);
+        }
+        builder
+    }
+
+    /// A reported engine id is the worker's live id, confirmed by this read.
+    fn apply_engine_id(&self, worker: &Arc<dyn Worker>) {
+        let Some(engine_id) = &self.engine_id else {
+            return;
         };
-
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
-        let registry = Arc::new(WorkerRegistry::new());
-        for w in workers {
-            registry.register(Arc::clone(w)).unwrap();
-        }
-        let job_queue = Arc::new(std::sync::OnceLock::new());
-
-        Arc::new(AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: crate::http_client::client(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: Arc::clone(&registry),
-            prefill_admission: None,
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: Arc::clone(&job_queue),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            tokenizer_load_failures: Arc::default(),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
-    }
-
-    fn make_context(
-        app_context: Arc<AppContext>,
-        worker: Arc<dyn Worker>,
-        labels: HashMap<String, String>,
-    ) -> WorkflowContext<WorkerUpdateWorkflowData> {
-        let data = WorkerUpdateWorkflowData {
-            config: WorkerUpdateRequest {
-                priority: None,
-                cost: None,
-                labels: Some(labels),
-                api_key: None,
-                health: None,
-            },
-            worker_url: worker.url().to_string(),
-            app_context: Some(app_context),
-            workers_to_update: Some(vec![worker]),
-            updated_workers: None,
-        };
-        WorkflowContext::new(WorkflowInstanceId::new(), data)
-    }
-
-    /// A `constrained_decoding` label sent in an update must name a policy,
-    /// as at registration: a typo is refused where the labels are merged,
-    /// and a policy goes through.
-    #[tokio::test]
-    async fn a_constrained_decoding_label_update_must_name_a_policy() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w:8000")
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut typo = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("constrained_decoding".to_string(), "sometimes".to_string())]),
-        );
-        let err = UpdateWorkerPropertiesStep
-            .execute(&mut typo)
-            .await
-            .expect_err("a label that names no policy");
-        assert!(err.to_string().contains("'requested' or 'always'"), "{err}");
-        let mut always = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("constrained_decoding".to_string(), "always".to_string())]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut always)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
-    }
-
-    /// The cap is held where the labels are merged, not only at the admin
-    /// check: a worker already at the cap refuses an update with a new key
-    /// (updates queued together each passed the early check), while one that
-    /// rewrites keys the worker has goes through.
-    #[tokio::test]
-    async fn the_label_cap_holds_over_the_labels_the_step_merges() {
-        let mut builder = BasicWorkerBuilder::new("http://full:8000").status(WorkerStatus::Ready);
-        for i in 0..MAX_WORKER_LABELS {
-            builder = builder.label(format!("k{i}"), "v");
-        }
-        let worker: Arc<dyn Worker> = Arc::new(builder.build());
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut over = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("k_new".to_string(), "v".to_string())]),
-        );
-        let err = UpdateWorkerPropertiesStep
-            .execute(&mut over)
-            .await
-            .expect_err("a 129th label at merge time");
-        assert!(err.to_string().contains("129 labels on worker"), "{err}");
-        let mut rewrite = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("k0".to_string(), "w".to_string())]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut rewrite)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
-    }
-
-    #[tokio::test]
-    async fn pd_update_preserves_connector_and_pair_descriptor() {
-        for (connector, mode, protocol, transport, pair_key, expected_mode) in [
-            (
-                "MooncakeConnector",
-                ConnectionMode::Http,
-                None,
-                "mooncake",
-                "vllm/mooncake/page=16",
-                KvConnectorMode::Mooncake {
-                    host: "prefill".to_string(),
-                    port: 9123,
-                    engine_id: Some("engine-1_dp1".to_string()),
-                },
-            ),
-            (
-                "NixlConnector",
-                ConnectionMode::Grpc,
-                Some("cluster-blue"),
-                "nixl",
-                "cluster-blue",
-                KvConnectorMode::Nixl,
-            ),
-        ] {
-            let mut spec = WorkerSpec::new("http://prefill:8000");
-            spec.worker_type = WorkerType::Prefill;
-            spec.runtime_type = RuntimeType::Vllm;
-            spec.connection_mode = mode;
-            spec.kv_connector = Some(connector.to_string());
-            spec.kv_role = Some("kv_producer".to_string());
-            spec.kv_engine_id = Some("engine-1".to_string());
-            spec.bootstrap_port = Some(9123);
-            spec.pairing_protocol = protocol.map(str::to_string);
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::from_spec(spec)
-                    .dp_config(1, 2)
-                    .label("block_size", "16")
-                    .label("tier", "silver")
-                    .label("max_num_seqs", "256")
-                    .priority(2)
-                    .cost(1.5)
-                    .health_config(HealthCheckConfig {
-                        timeout_secs: 3,
-                        check_interval_secs: 11,
-                        ..Default::default()
-                    })
-                    .status(WorkerStatus::Ready)
-                    .build(),
-            );
-            let app_ctx = make_app_context(std::slice::from_ref(&worker));
-            let mut ctx = make_context(
-                Arc::clone(&app_ctx),
-                Arc::clone(&worker),
-                HashMap::from([
-                    ("tier".to_string(), "gold".to_string()),
-                    // A window set by the update is the worker's only window:
-                    // the discovered one under the other name goes.
-                    ("max_running_requests".to_string(), "512".to_string()),
-                ]),
-            );
-            ctx.data.config.priority = Some(9);
-            ctx.data.config.health = Some(HealthCheckUpdate {
-                timeout_secs: Some(7),
-                ..Default::default()
-            });
-
-            assert_eq!(
-                UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-                StepResult::Success
-            );
-
-            let updated = app_ctx
-                .worker_registry
-                .get_by_url("http://prefill:8000@1")
-                .expect("worker stays registered");
-            assert!(Arc::ptr_eq(
-                &updated,
-                &ctx.data.updated_workers.as_ref().unwrap()[0]
-            ));
-            assert_eq!(updated.base_url(), "http://prefill:8000");
-            assert_eq!(updated.url(), "http://prefill:8000@1");
-            assert_eq!(updated.dp_rank(), Some(1));
-            assert_eq!(updated.dp_size(), Some(2));
-            assert_eq!(
-                updated.metadata().spec.kv_role.as_deref(),
-                Some("kv_producer")
-            );
-            assert_eq!(connector_mode_for_worker(updated.as_ref()), expected_mode);
-            assert_eq!(updated.pd_pairing().transport(), Some(transport));
-            assert_eq!(updated.pd_pairing().explicit(), protocol);
-            assert_eq!(updated.pd_pairing().key(), pair_key);
-            assert_eq!(updated.metadata().spec.labels["tier"], "gold");
-            assert_eq!(updated.metadata().spec.labels["block_size"], "16");
-            assert_eq!(
-                updated.metadata().spec.labels["max_running_requests"],
-                "512"
-            );
-            assert_eq!(updated.metadata().spec.labels.get("max_num_seqs"), None);
-            assert_eq!(updated.max_running_requests(), Some(512));
-            assert_eq!(updated.priority(), 9);
-            assert_eq!(updated.cost(), 1.5);
-            assert_eq!(updated.metadata().health_config.timeout_secs, 7);
-            assert_eq!(updated.metadata().health_config.check_interval_secs, 11);
-            assert_eq!(updated.status(), WorkerStatus::Ready);
-        }
-    }
-
-    /// A PATCH rebuilds the worker. The breaker it was registered with
-    /// (gateway defaults plus overrides) and the breaker's live state must
-    /// come through; a rebuild on the built-in defaults would silently
-    /// re-arm a worker the breaker had taken out of rotation.
-    #[tokio::test]
-    async fn update_keeps_the_circuit_breaker_config_and_state() {
-        let config = CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            timeout_duration: Duration::from_secs(7),
-            window_duration: Duration::from_secs(9),
-        };
-        assert_ne!(config, CircuitBreakerConfig::default());
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://worker:8000")
-                .worker_type(WorkerType::Regular)
-                .circuit_breaker_config(config.clone())
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        worker.record_circuit_breaker_outcome(false);
-        worker.record_circuit_breaker_outcome(false);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
-
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
-        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-
-        let updated = &ctx.data.updated_workers.as_ref().unwrap()[0];
-        let basic = updated.as_any().downcast_ref::<BasicWorker>().unwrap();
-        assert_eq!(basic.circuit_breaker_config(), config);
-        assert_eq!(updated.circuit_breaker_state(), CircuitState::Open);
-    }
-
-    #[tokio::test]
-    async fn pd_update_retains_live_kv_engine_state() {
-        for current_id in [Some("engine-current"), None] {
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new("grpc://prefill:8000")
-                    .worker_type(WorkerType::Prefill)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .runtime_type(RuntimeType::Vllm)
-                    .kv_connector("MooncakeConnector")
-                    .kv_engine_id("engine-initial")
-                    .bootstrap_port(Some(9123))
-                    .status(WorkerStatus::Ready)
-                    .build(),
-            );
-            worker.refresh_kv_engine_id(current_id.map(str::to_string));
-            worker.set_kv_engine_id_confirmed(false);
-            let app_ctx = make_app_context(std::slice::from_ref(&worker));
-            let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
-
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-
-            let updated = &ctx.data.updated_workers.as_ref().unwrap()[0];
-            assert_eq!(updated.kv_engine_id().as_deref(), current_id);
-            assert!(!updated.kv_engine_id_confirmed());
-
-            // A probe that began before the update still holds the old worker.
-            worker.refresh_kv_engine_id(Some("engine-late".to_string()));
-            worker.set_kv_engine_id_confirmed(true);
-            assert_eq!(updated.kv_engine_id().as_deref(), Some("engine-late"));
-            assert!(updated.kv_engine_id_confirmed());
-            assert_eq!(
-                connector_mode_for_worker(updated.as_ref()),
-                KvConnectorMode::Mooncake {
-                    host: "prefill".to_string(),
-                    port: 9123,
-                    engine_id: Some("engine-late".to_string()),
-                }
+        let previous = worker.kv_engine_id();
+        if worker.refresh_kv_engine_id(Some(engine_id.clone())) {
+            info!(
+                worker_url = %worker.url(),
+                ?previous,
+                engine_id,
+                "The worker's KV engine id follows its engine's report"
             );
         }
-    }
-
-    /// A label-only PATCH must not disturb a ZMQ worker's transport: the engine
-    /// handshakes once at its own startup, so losing the connected client (or
-    /// the addresses and engine count that define the sockets) would black-hole
-    /// every request until the engine group is restarted.
-    #[tokio::test]
-    async fn zmq_update_preserves_transport_state_and_the_live_client() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let _engine = engine.expect("mock engine");
-        let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
-
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(ep("ts0.ipc"))
-                .connection_mode(ConnectionMode::Zmq)
-                .runtime_type(RuntimeType::Vllm)
-                .zmq_handshake_address(handshake.clone())
-                .zmq_engine_group(2)
-                .health_config(HealthCheckConfig::default())
-                .overload(OverloadUpdate {
-                    waiting_requests: Some(8),
-                    token_usage: None,
-                })
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let old = worker
-            .as_any()
-            .downcast_ref::<BasicWorker>()
-            .expect("BasicWorker");
-        old.backend_client
-            .load_full()
-            .set(Arc::clone(&client))
-            .ok()
-            .expect("cell empty");
-
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("tier".to_string(), "gold".to_string())]),
-        );
-
-        let result = UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-        assert_eq!(result, StepResult::Success);
-
-        let updated = ctx.data.updated_workers.as_ref().expect("updated workers");
-        assert_eq!(updated.len(), 1);
-        let new = updated[0]
-            .as_any()
-            .downcast_ref::<BasicWorker>()
-            .expect("BasicWorker");
-
-        assert_eq!(
-            new.metadata().spec.labels.get("tier"),
-            Some(&"gold".to_string())
-        );
-        assert_eq!(
-            new.metadata().spec.zmq_handshake_address.as_deref(),
-            Some(handshake.as_str())
-        );
-        assert_eq!(new.metadata().zmq_engine_count(), 2);
-        // The overload block survives a metadata-only update, and so does the
-        // effective threshold resolved from it.
-        assert_eq!(new.metadata().spec.overload.waiting_requests, Some(8));
-        assert_eq!(new.metadata().overload.waiting_requests, Some(8));
-        assert!(
-            new.connect_signal_tx.is_some(),
-            "ZMQ promotion stays event-driven after an update"
-        );
-
-        let adopted = new
-            .backend_client
-            .load_full()
-            .get()
-            .cloned()
-            .expect("replacement must inherit the connected client");
-        assert!(Arc::ptr_eq(&adopted, &client));
-        assert_eq!(new.status(), WorkerStatus::Ready);
-
-        // Neither side of a ZMQ replacement may materialize an HTTP client
-        // it will never use.
-        assert!(old.http_client.cell_is_empty());
-        assert!(new.http_client.cell_is_empty());
-    }
-
-    /// An HTTP worker's replacement must adopt the same shared client — a
-    /// fresh client would silently detach it from the worker-client cache
-    /// entry the old worker was keeping alive.
-    #[tokio::test]
-    async fn http_update_adopts_the_materialized_shared_client() {
-        let client = Arc::new(crate::http_client::client());
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w:8080")
-                .http_client(Arc::clone(&client))
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
-
-        let result = UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-        assert_eq!(result, StepResult::Success);
-
-        let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
-        let adopted = updated
-            .http_client_handle_if_initialized()
-            .expect("materialized client is adopted");
-        assert!(Arc::ptr_eq(&adopted, &client));
-    }
-
-    /// The adopted client speaks one HTTP version; the replacement must keep
-    /// describing it correctly.
-    #[tokio::test]
-    async fn http_update_preserves_http2() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w:8080")
-                .http_client(Arc::new(crate::http_client::client()))
-                .http2(true)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
-
-        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-
-        let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
-        assert!(updated.http2());
-    }
-
-    /// A worker over the cap through the labels discovered at registration
-    /// still takes an update that adds no key: a priority alone, or a rewrite
-    /// of keys it has; one that would add a key is refused.
-    #[tokio::test]
-    async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
-        let mut builder = BasicWorkerBuilder::new("http://over:8000").status(WorkerStatus::Ready);
-        for i in 0..MAX_WORKER_LABELS + 20 {
-            builder = builder.label(format!("k{i}"), "v");
-        }
-        let worker: Arc<dyn Worker> = Arc::new(builder.build());
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
-        priority.data.config.labels = None;
-        priority.data.config.priority = Some(7);
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut priority)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
-        let mut rewrite = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("k3".to_string(), "w".to_string())]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut rewrite)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
-        let mut adds = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            HashMap::from([("k_new".to_string(), "v".to_string())]),
-        );
-        let err = UpdateWorkerPropertiesStep
-            .execute(&mut adds)
-            .await
-            .expect_err("a new key on a worker over the cap");
-        assert!(
-            err.to_string().contains("149 labels on worker") && err.to_string().contains("1 new"),
-            "{err}"
-        );
-    }
-
-    /// Every rank is checked before any is replaced: when the second of two
-    /// ranks refuses the merge, the first keeps its labels too.
-    #[tokio::test]
-    async fn a_refused_rank_leaves_no_partial_update_behind() {
-        let first: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://rank:8000@0")
-                .status(WorkerStatus::Ready)
-                .label("k0", "v")
-                .build(),
-        );
-        let mut builder = BasicWorkerBuilder::new("http://rank:8000@1").status(WorkerStatus::Ready);
-        for i in 0..MAX_WORKER_LABELS {
-            builder = builder.label(format!("k{i}"), "v");
-        }
-        let second: Arc<dyn Worker> = Arc::new(builder.build());
-        let app_ctx = make_app_context(&[Arc::clone(&first), Arc::clone(&second)]);
-        let data = WorkerUpdateWorkflowData {
-            config: WorkerUpdateRequest {
-                priority: None,
-                cost: None,
-                labels: Some(HashMap::from([("k_new".to_string(), "v".to_string())])),
-                api_key: None,
-                health: None,
-            },
-            worker_url: "http://rank:8000".to_string(),
-            app_context: Some(Arc::clone(&app_ctx)),
-            workers_to_update: Some(vec![Arc::clone(&first), Arc::clone(&second)]),
-            updated_workers: None,
-        };
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
-        let err = UpdateWorkerPropertiesStep
-            .execute(&mut context)
-            .await
-            .expect_err("the second rank refuses the merge");
-        assert!(err.to_string().contains("http://rank:8000@1"), "{err}");
-        let kept = app_ctx
-            .worker_registry
-            .get_by_url("http://rank:8000@0")
-            .expect("the first rank is still registered");
-        assert!(
-            !kept.metadata().spec.labels.contains_key("k_new"),
-            "the first rank was not updated before the second was checked"
-        );
-    }
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    }
-
-    /// A worker as registration builds it: its card derived from the spec and
-    /// the labels, the labels on the worker.
-    fn registered(spec: WorkerSpec, labels: HashMap<String, String>) -> Arc<dyn Worker> {
-        use super::super::create_worker::{build_model_card, resolve_model_id};
-        let model_id = resolve_model_id(&spec, &labels).to_string();
-        let card = build_model_card(&model_id, &spec, &labels, &HashMap::new());
-        Arc::new(
-            BasicWorkerBuilder::from_spec(spec)
-                .model(card)
-                .labels(labels)
-                .status(WorkerStatus::Ready)
-                .build(),
-        )
-    }
-
-    /// The card registration derived from the labels follows a label update:
-    /// the context window, the model type and architectures, the tokenizer
-    /// path and the vision flag, so request validation and routing see what
-    /// the worker's labels show. The card's id is the worker's identity in
-    /// the registry and stays.
-    #[tokio::test]
-    async fn the_model_card_follows_a_label_update() {
-        let worker = registered(
-            WorkerSpec::new("http://w:8000"),
-            labels(&[
-                ("served_model_name", "m"),
-                ("max_model_len", "4096"),
-                ("model_type", "llama"),
-                ("architectures", r#"["LlamaForCausalLM"]"#),
-            ]),
-        );
-        assert_eq!(worker.context_length("m"), Some(4096), "as registered");
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            labels(&[
-                ("served_model_name", "other"),
-                ("max_model_len", "8192"),
-                ("model_type", "qwen3"),
-                ("architectures", r#"["Qwen3ForCausalLM"]"#),
-                ("supports_vision", "true"),
-                ("tokenizer_path", "/models/m"),
-            ]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
-
-        let updated = app_ctx
-            .worker_registry
-            .get_by_url("http://w:8000")
-            .expect("worker stays registered");
-        assert_eq!(
-            updated.context_length("m"),
-            Some(8192),
-            "the context window follows the label"
-        );
-        let card = updated.models().remove(0);
-        assert_eq!(card.id, "m", "the id stays");
-        assert_eq!(card.hf_model_type.as_deref(), Some("qwen3"));
-        assert_eq!(card.architectures, ["Qwen3ForCausalLM"]);
-        assert_eq!(card.tokenizer_path.as_deref(), Some("/models/m"));
-        assert!(card.model_type.supports_vision());
-        assert_eq!(updated.metadata().spec.labels["max_model_len"], "8192");
-        assert_eq!(app_ctx.worker_registry.get_by_model("m").len(), 1);
-    }
-
-    /// A value the operator set by hand stands: a card with its own context
-    /// window keeps it when the label changes; the labels show the engine's
-    /// value all the same.
-    #[tokio::test]
-    async fn a_card_value_set_by_hand_stands_over_a_label_update() {
-        let mut spec = WorkerSpec::new("http://w:8000");
-        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m").with_context_length(2048)));
-        let worker = registered(spec, labels(&[("max_model_len", "4096")]));
-        assert_eq!(worker.context_length("m"), Some(2048), "as registered");
-        let app_ctx = make_app_context(std::slice::from_ref(&worker));
-        let mut ctx = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            labels(&[("max_model_len", "8192")]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
-
-        let updated = app_ctx
-            .worker_registry
-            .get_by_url("http://w:8000")
-            .expect("worker stays registered");
-        assert_eq!(updated.context_length("m"), Some(2048), "set by hand");
-        assert_eq!(updated.metadata().spec.labels["max_model_len"], "8192");
-    }
-
-    /// A parser override a label update names must be one the gateway reads
-    /// with, as at registration: an unknown name is refused and the worker is
-    /// left as it was; a known one reaches the card.
-    #[tokio::test]
-    async fn a_parser_override_from_a_label_update_must_be_known() {
-        let worker = registered(
-            WorkerSpec::new("http://w:8000"),
-            labels(&[("served_model_name", "m")]),
-        );
-        let app_ctx = make_app_context_with(
-            std::slice::from_ref(&worker),
-            Some(tool_parser::ParserFactory::default()),
-        );
-        let mut unknown = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            labels(&[("tool_parser", "definitely-not-a-parser")]),
-        );
-        let err = UpdateWorkerPropertiesStep
-            .execute(&mut unknown)
-            .await
-            .expect_err("an unknown parser override");
-        assert!(err.to_string().contains("definitely-not-a-parser"), "{err}");
-        let kept = app_ctx
-            .worker_registry
-            .get_by_url("http://w:8000")
-            .expect("worker stays registered");
-        assert!(Arc::ptr_eq(&kept, &worker), "the worker was left as it was");
-
-        let mut known = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            labels(&[("tool_parser", "json")]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut known)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
-        let updated = app_ctx
-            .worker_registry
-            .get_by_url("http://w:8000")
-            .expect("worker stays registered");
-        assert_eq!(
-            updated.models().remove(0).tool_parser.as_deref(),
-            Some("json")
-        );
-    }
-
-    /// An external worker's cards come from the provider's model list, not
-    /// from labels: a label update leaves them as they are, whether the
-    /// worker serves one model or several.
-    #[tokio::test]
-    async fn an_external_workers_cards_are_left_as_they_are() {
-        for cards in [
-            vec![ModelCard::new("a")],
-            vec![ModelCard::new("a"), ModelCard::new("b")],
-        ] {
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new("https://api.example.com/v1")
-                    .runtime_type(RuntimeType::External)
-                    .models(cards.clone())
-                    .status(WorkerStatus::Ready)
-                    .build(),
-            );
-            let app_ctx = make_app_context(std::slice::from_ref(&worker));
-            let mut ctx = make_context(
-                Arc::clone(&app_ctx),
-                Arc::clone(&worker),
-                labels(&[
-                    ("is_embedding", "true"),
-                    ("model_type", "chat"),
-                    ("max_model_len", "8192"),
-                ]),
-            );
-            assert_eq!(
-                UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-                StepResult::Success
-            );
-
-            let updated = app_ctx
-                .worker_registry
-                .get_by_url("https://api.example.com/v1")
-                .expect("worker stays registered");
-            assert_eq!(updated.models().len(), cards.len());
-            for card in updated.models() {
-                assert_eq!(card.model_type, ModelType::LLM, "{}", card.id);
-                assert_eq!(card.hf_model_type, None, "{}", card.id);
-                assert_eq!(card.context_length, None, "{}", card.id);
-            }
-            assert_eq!(updated.metadata().spec.labels["max_model_len"], "8192");
-        }
-    }
-
-    /// A parser override a label update brings in is checked against the
-    /// other workers of the model, as at registration: the warning names the
-    /// peer whose override differs, not the worker itself, whose old card is
-    /// still registered while the new one is checked.
-    #[tokio::test]
-    #[traced_test]
-    async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
-        let peer = registered(
-            WorkerSpec::new("http://peer:8000"),
-            labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
-        );
-        let worker = registered(
-            WorkerSpec::new("http://w:8000"),
-            labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
-        );
-        let app_ctx = make_app_context_with(
-            &[Arc::clone(&peer), Arc::clone(&worker)],
-            Some(tool_parser::ParserFactory::default()),
-        );
-        let mut ctx = make_context(
-            Arc::clone(&app_ctx),
-            Arc::clone(&worker),
-            labels(&[("tool_parser", "pythonic")]),
-        );
-        assert_eq!(
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
-        assert!(logs_contain("conflicting parser overrides"));
-        assert!(logs_contain("existing_worker=\"http://peer:8000\""));
-        assert!(!logs_contain("existing_worker=\"http://w:8000\""));
-        let updated = app_ctx
-            .worker_registry
-            .get_by_url("http://w:8000")
-            .expect("worker stays registered");
-        assert_eq!(
-            updated.models().remove(0).tool_parser.as_deref(),
-            Some("pythonic")
-        );
+        worker.set_kv_engine_id_confirmed(true);
     }
 }
+
+/// The engine's fresh report in the worker's rank space. The width comes
+/// from the labels the worker's own share was sized with: a DP label the
+/// operator set (its value differs from what discovery recorded, or
+/// discovery never read it) over the engine's report, so the record and the
+/// worker's labels agree on the share whichever side names the width.
+fn fresh_in_rank_space(
+    worker: &Arc<dyn Worker>,
+    fresh: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let current = &worker.metadata().spec.labels;
+    let before = &worker.metadata().discovered_labels;
+    let mut width_source = fresh.clone();
+    for key in DP_WIDTH_LABELS {
+        if let Some(value) = current.get(key) {
+            if before.get(key) != Some(value) {
+                width_source.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    report_for_rank(fresh, worker.dp_rank().zip(worker.dp_size()), &width_source)
+}
+
+/// The labels a worker carries once its engine reports `fresh`: every label
+/// whose value came from discovery (`discovered_before`, still unchanged
+/// since) follows the engine, disappearing when the engine no longer reports
+/// it; a label the operator set or overrode (its value differs from what
+/// discovery read, or discovery never read it) keeps its value; a key the
+/// engine reports for the first time is added unless the operator already
+/// set it. The result then passes through the merge registration and a
+/// label update make (`merge_labels`, the operator's labels on top): a
+/// running window the operator set by hand stays the worker's only window,
+/// so the engine's figure under the other window name, which the reader
+/// would prefer, is not added beside it.
+pub(crate) fn refreshed_labels(
+    current: &HashMap<String, String>,
+    discovered_before: &HashMap<String, String>,
+    fresh: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut labels = current.clone();
+    for (key, before) in discovered_before {
+        if current.get(key) != Some(before) {
+            // The operator overrode (or removed) it: theirs stands.
+            continue;
+        }
+        match fresh.get(key) {
+            Some(now) => {
+                labels.insert(key.clone(), now.clone());
+            }
+            None => {
+                labels.remove(key);
+            }
+        }
+    }
+    for (key, now) in fresh {
+        if !discovered_before.contains_key(key) && !current.contains_key(key) {
+            labels.insert(key.clone(), now.clone());
+        }
+    }
+    let by_hand: HashMap<String, String> = current
+        .iter()
+        .filter(|(key, value)| discovered_before.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    merge_labels(&labels, &by_hand)
+}
+
+#[cfg(test)]
+mod tests;

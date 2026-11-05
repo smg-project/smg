@@ -10,7 +10,9 @@
 //! - how one call is written ([`CallLayout`]): the text before the call's terminal, the header,
 //!   a parameter with its tag, value and end, the text around the parameters, the trailer, and the
 //!   terminal that closes the call, each a [`Written`] text with the places where the tool's name,
-//!   the key and the value stand;
+//!   the key and the value stand, and where the call's index stands for a template that numbers
+//!   its calls ([`Segment::Index`]); a call whose arguments are one JSON value has no parameter,
+//!   and its tag writes the tool's schema where the value stands;
 //! - what comes between two calls and after the last;
 //! - how a value that is not a string is spelled ([`Spellings`]);
 //! - what a thought and an answer are written with around the table's terminals, and the terminal
@@ -20,10 +22,11 @@
 //! conversation, read back through the table) and gives it to the table
 //! ([`Format::with_layout`]). Parsing does not read it. [`Layout::check`] says whether it fits the
 //! table: the header, a parameter and the trailer as written match the shape's patterns, capturing
-//! the name, the key and the value where the layout puts them, and the terminals it names close
-//! what it says they close. The structural tags of a shaped call are written from the layout
-//! ([`Format::grammar_for`]), and a table's thought and answer as it writes them; a shaped call
-//! whose table has no layout that fits has no tag.
+//! the name, the key and the value where the layout puts them (the header and the trailer alone
+//! where the arguments are one JSON value, which takes no parameter and no text around it), and
+//! the terminals it names close what it says they close. The structural tags of a shaped call are
+//! written from the layout ([`Format::grammar_for`]), and a table's thought and answer as it writes
+//! them; a shaped call whose table has no layout that fits has no tag.
 //!
 //! [`Format::with_layout`]: crate::Format::with_layout
 //! [`Format::grammar_for`]: crate::Format::grammar_for
@@ -45,7 +48,18 @@ pub enum Segment {
     Lit(Box<str>),
     /// The place of the tool's name, a parameter's key or its value.
     Slot(Slot),
+    /// The place of the call's index: the number a template gives each call of a turn, counted
+    /// as the model counts it (Kimi K2's `functions.NAME:N`), which no request knows ahead. A tag
+    /// writes any run of digits there; where a text is written out, it reads `0`.
+    Index,
 }
+
+/// The index as a written-out text reads it: the first call's.
+const INDEX_SAMPLE: &str = "0";
+/// A second index the check reads the header with: two digits, since the tag writes any run of
+/// digits where the index stands, and a pattern that reads one digit alone would pass the first
+/// sample and not the tag's output.
+const INDEX_SAMPLE_LONG: &str = "10";
 
 impl Written {
     /// A text with no place in it.
@@ -64,8 +78,17 @@ impl Written {
             .count()
     }
 
+    /// How many places for the call's index the text has.
+    fn indexes(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|segment| **segment == Segment::Index)
+            .count()
+    }
+
     /// The text with `name` and `key` written in their places, cut where the value stands: what
-    /// comes before the value, and what comes after it (empty when the text has no value).
+    /// comes before the value, and what comes after it (empty when the text has no value). The
+    /// call's index reads `0`.
     pub(crate) fn around_the_value(&self, name: &str, key: &str) -> (String, String) {
         let (mut before, mut after) = (String::new(), String::new());
         let mut out = &mut before;
@@ -75,20 +98,47 @@ impl Written {
                 Segment::Slot(Slot::Name) => out.push_str(name),
                 Segment::Slot(Slot::Key) => out.push_str(key),
                 Segment::Slot(Slot::Value) => out = &mut after,
+                Segment::Index => out.push_str(INDEX_SAMPLE),
+            }
+        }
+        (before, after)
+    }
+
+    /// The text with `name` written in its place, cut where the call's index stands: what comes
+    /// before the index, and what comes after it, or `None` when the text has no index.
+    pub(crate) fn around_the_index(&self, name: &str) -> (String, Option<String>) {
+        let (mut before, mut after) = (String::new(), None);
+        for segment in &*self.0 {
+            let out = after.as_mut().unwrap_or(&mut before);
+            match segment {
+                Segment::Lit(text) => out.push_str(text),
+                Segment::Slot(Slot::Name) => out.push_str(name),
+                Segment::Slot(Slot::Key | Slot::Value) => {}
+                Segment::Index => after = Some(String::new()),
             }
         }
         (before, after)
     }
 
     /// The text with `name`, `key` and `value` written in their places, and where each stands in
-    /// it, by its slot.
-    fn filled(&self, name: &str, key: &str, value: &str) -> (String, [Option<(usize, usize)>; 3]) {
+    /// it, by its slot; the call's index reads `index`.
+    fn filled(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+        index: &str,
+    ) -> (String, [Option<(usize, usize)>; 3]) {
         let mut text = String::new();
         let mut spans = [None; 3];
         for segment in &*self.0 {
             let (slot, written) = match segment {
                 Segment::Lit(lit) => {
                     text.push_str(lit);
+                    continue;
+                }
+                Segment::Index => {
+                    text.push_str(index);
                     continue;
                 }
                 Segment::Slot(slot) => match slot {
@@ -218,10 +268,16 @@ pub struct Layout {
 /// Why a layout does not fit a table.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LayoutError {
-    /// The table's calls are not given as data, or their arguments are not tagged parameters,
-    /// the one way of writing them a layout has places for.
-    #[error("the table's calls are not tagged parameters given as data")]
+    /// The table's calls are not given as data, or their arguments are neither tagged parameters
+    /// nor one JSON value, the two ways of writing them a layout knows.
+    #[error("the table's calls are not tagged parameters or a JSON value given as data")]
     Calls,
+    /// A layout that writes a parameter, or text around the parameters, for arguments that are
+    /// one JSON value, which the tag writes as the tool's schema alone after the header.
+    #[error(
+        "the table's arguments are one JSON value, which takes no parameter and no text around it"
+    )]
+    JsonArguments,
     /// A text with places other than the ones its part holds once each.
     #[error("the {0} as written has places its part does not hold")]
     Places(&'static str),
@@ -279,38 +335,59 @@ fn fits(found: &Match, length: usize, spans: &[Option<(usize, usize)>; 3], slots
 }
 
 impl Layout {
-    /// Whether the layout fits `format`, a table whose calls are tagged parameters given as data
-    /// ([`CallSyntax::Shaped`]): its texts hold the places their parts hold (the lead and the
-    /// header the name, where the header captures it; a parameter its key and its value, once
-    /// each), the header, a parameter and the trailer as written match the shape's patterns where
-    /// the layout puts the places, with the text that follows each in a call; the text around the
-    /// parameters holds no literal a parameter begins with; the call's close is a terminal with a
-    /// row out of the call's state, or, for none, the table's stop row closes the call; and the
-    /// table has a thought and an answer where the layout writes them, the stop ending the answer
-    /// only where a stop token closes it, and a close the layout names for either a terminal with
-    /// a row out of its state.
+    /// Whether the layout fits `format`, a table whose calls are given as data
+    /// ([`CallSyntax::Shaped`]) with tagged parameters or one JSON value for their arguments: its
+    /// texts hold the places their parts hold (the lead and the header the name, where the header
+    /// captures it, and the header alone the call's index, at most once; a parameter its key and
+    /// its value, once each, and none at all for a JSON value, which takes no text around it
+    /// either), the header, a parameter and the trailer as written match the shape's patterns
+    /// where the layout puts the places, with the text that follows each in a call; the text
+    /// around the parameters holds no literal a parameter begins with; the call's close is a
+    /// terminal with a row out of the call's state, or, for none, the table's stop row closes the
+    /// call; and the table has a thought and an answer where the layout writes them, the stop
+    /// ending the answer only where a stop token closes it, and a close the layout names for
+    /// either a terminal with a row out of its state.
     pub fn check(&self, format: &Format) -> Result<(), LayoutError> {
         let Some(CallSyntax::Shaped(shape)) = format.call_syntax() else {
             return Err(LayoutError::Calls);
         };
-        let Arguments::Params { tag, .. } = &shape.arguments else {
-            return Err(LayoutError::Calls);
+        let tag = match &shape.arguments {
+            Arguments::Params { tag, .. } => Some(tag),
+            Arguments::Json(_) => None,
+            Arguments::Envelope { .. } => return Err(LayoutError::Calls),
         };
         let call = &self.call;
         let header_names = matches!(shape.name, NameSource::Header);
         let names = |written: &Written| written.places(Slot::Key) + written.places(Slot::Value);
-        if names(&call.lead) > 0 || call.lead.places(Slot::Name) > 1 {
+        if names(&call.lead) > 0 || call.lead.places(Slot::Name) > 1 || call.lead.indexes() > 0 {
             return Err(LayoutError::Places("lead"));
         }
-        if names(&call.header) > 0 || call.header.places(Slot::Name) != usize::from(header_names) {
+        if names(&call.header) > 0
+            || call.header.places(Slot::Name) != usize::from(header_names)
+            || call.header.indexes() > 1
+        {
             return Err(LayoutError::Places("header"));
         }
         let parameter = &call.parameter;
-        if parameter.places(Slot::Name) > 0
-            || parameter.places(Slot::Key) != 1
-            || parameter.places(Slot::Value) != 1
-        {
-            return Err(LayoutError::Places("parameter"));
+        match tag {
+            Some(_) => {
+                if parameter.places(Slot::Name) > 0
+                    || parameter.places(Slot::Key) != 1
+                    || parameter.places(Slot::Value) != 1
+                    || parameter.indexes() > 0
+                {
+                    return Err(LayoutError::Places("parameter"));
+                }
+            }
+            None => {
+                if !parameter.0.is_empty()
+                    || !call.before.is_empty()
+                    || !call.between.is_empty()
+                    || !call.after.is_empty()
+                {
+                    return Err(LayoutError::JsonArguments);
+                }
+            }
         }
         let name = captured(&shape.header, Slot::Name)
             .map_or_else(|| "f".to_string(), |(class, min)| sample(class, min));
@@ -318,13 +395,25 @@ impl Layout {
             NameSource::Literal(literal) => literal.to_string(),
             _ => name,
         };
-        let key = captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m));
         let terminal = call_terminal(format).unwrap_or_default();
         if self.header_for(shape, terminal, &name).is_none() {
             return Err(LayoutError::Unmatched("header"));
         }
-        if self.parameter_for(shape, &key).is_none() {
-            return Err(LayoutError::Unmatched("parameter"));
+        // The tag writes any run of digits where the index stands: the header has to read a
+        // longer index back as well, not the first call's alone.
+        if call.header.indexes() == 1
+            && self
+                .header_written(shape, terminal, &name, INDEX_SAMPLE_LONG)
+                .is_none()
+        {
+            return Err(LayoutError::Unmatched("header"));
+        }
+        if let Some(tag) = tag {
+            let key =
+                captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m));
+            if self.parameter_for(shape, &key).is_none() {
+                return Err(LayoutError::Unmatched("parameter"));
+            }
         }
         if shape.trailer.0.is_empty() != call.trailer.is_empty() {
             return Err(LayoutError::Unmatched("trailer"));
@@ -336,7 +425,7 @@ impl Layout {
                 return Err(LayoutError::Unmatched("trailer"));
             }
         }
-        if let Some(Atom::Lit(trigger)) = tag.0.first() {
+        if let Some(Atom::Lit(trigger)) = tag.and_then(|tag| tag.0.first()) {
             for (part, text) in [
                 ("before", &call.before),
                 ("between", &call.between),
@@ -353,13 +442,25 @@ impl Layout {
     /// The header as written for a call to `name` after `terminal`, if the shape's header reads it
     /// back as a call to that tool, with the call's text after it as a stream reads it: the header
     /// captures exactly the name where the layout puts it, or, for a name the template writes,
-    /// `name` is that one. `None` for a name the header's class does not hold, or one longer than
-    /// the most a header holds undecided.
+    /// `name` is that one; the call's index, where the header has its place, reads `0`. `None`
+    /// for a name the header's class does not hold, or one longer than the most a header holds
+    /// undecided.
     pub(crate) fn header_for(
         &self,
         shape: &CallShape,
         terminal: &str,
         name: &str,
+    ) -> Option<String> {
+        self.header_written(shape, terminal, name, INDEX_SAMPLE)
+    }
+
+    /// [`Self::header_for`] with the call's index written as `index`.
+    fn header_written(
+        &self,
+        shape: &CallShape,
+        terminal: &str,
+        name: &str,
+        index: &str,
     ) -> Option<String> {
         let header_names = match &shape.name {
             NameSource::Header => true,
@@ -367,7 +468,7 @@ impl Layout {
             NameSource::Literal(_) | NameSource::Body => return None,
         };
         let call = &self.call;
-        let (header, spans) = call.header.filled(name, "", "");
+        let (header, spans) = call.header.filled(name, "", "", index);
         let follows = format!("{header}{}{}", call.before, self.sample_parameters(shape));
         let mut matcher = Matcher::new(
             &shape.header,
@@ -390,7 +491,7 @@ impl Layout {
         let call = &self.call;
         let value =
             captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m));
-        let (written, spans) = call.parameter.filled("", key, &value);
+        let (written, spans) = call.parameter.filled("", key, &value, INDEX_SAMPLE);
         let rest = format!(
             "{written}{}{written}{}{}",
             call.between, call.after, call.trailer
@@ -403,7 +504,8 @@ impl Layout {
     }
 
     /// Two parameters as written, with samples for the key and the value, and what follows the
-    /// last: the call's text after the header, as a header's match reads on into it.
+    /// last: the call's text after the header, as a header's match reads on into it. For
+    /// arguments that are one JSON value, an empty object and the trailer.
     fn sample_parameters(&self, shape: &CallShape) -> String {
         let call = &self.call;
         let (key, value) = match &shape.arguments {
@@ -411,9 +513,10 @@ impl Layout {
                 captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m)),
                 captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m)),
             ),
-            _ => ("k".to_string(), "v".to_string()),
+            Arguments::Json(_) => return format!("{{}}{}", call.trailer),
+            Arguments::Envelope { .. } => ("k".to_string(), "v".to_string()),
         };
-        let (written, _) = call.parameter.filled("", &key, &value);
+        let (written, _) = call.parameter.filled("", &key, &value, INDEX_SAMPLE);
         format!(
             "{written}{}{written}{}{}",
             call.between, call.after, call.trailer
@@ -791,12 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn only_tagged_parameters_given_as_data_have_a_layout() {
-        let json = CallShape {
-            arguments: Arguments::Json(Dialect::default()),
-            ..shape(Pattern::default())
-        };
-        assert_eq!(layout().check(&table(json)), Err(LayoutError::Calls));
+    fn only_calls_given_as_data_have_a_layout() {
         let plain = Format::new("plain")
             .terminal("open", "<c")
             .state("outside", Emits::Content)
@@ -804,5 +902,168 @@ mod tests {
             .transition("outside", "open", "call")
             .calls(CallSyntax::Json);
         assert_eq!(layout().check(&plain), Err(LayoutError::Calls));
+    }
+
+    /// The layout of a call whose arguments are one JSON value: the header alone, no parameter and
+    /// nothing around the value.
+    fn json_layout() -> Layout {
+        Layout {
+            call: CallLayout {
+                lead: Written::default(),
+                header: written([text(" n=\""), Segment::Slot(Slot::Name), text("\">")]),
+                before: "".into(),
+                parameter: Written::default(),
+                between: "".into(),
+                after: "".into(),
+                trailer: "".into(),
+                close: Some("</c>".into()),
+            },
+            between_calls: Some("".into()),
+            after_calls: "".into(),
+            values: Spellings::default(),
+            thought: Some(Message::default()),
+            answer: None,
+        }
+    }
+
+    #[test]
+    fn arguments_that_are_one_json_value_take_the_header_alone() {
+        let json = CallShape {
+            arguments: Arguments::Json(Dialect::default()),
+            ..shape(Pattern::default())
+        };
+        let format = table(json);
+        assert_eq!(json_layout().check(&format), Ok(()));
+        // The tagged layout writes a parameter and text around it, which a JSON value has no
+        // place for; so does any one of the four parts alone.
+        assert_eq!(layout().check(&format), Err(LayoutError::JsonArguments));
+        for part in 0..4 {
+            let mut laid = json_layout();
+            match part {
+                0 => laid.call.parameter = written([text("<p ")]),
+                1 => laid.call.before = "\n".into(),
+                2 => laid.call.between = "\n".into(),
+                _ => laid.call.after = "\n".into(),
+            }
+            assert_eq!(
+                laid.check(&format),
+                Err(LayoutError::JsonArguments),
+                "{part}"
+            );
+        }
+        // The header still has to read back, with the JSON value after it.
+        let mut unread = json_layout();
+        unread.call.header = written([text(" m=\""), Segment::Slot(Slot::Name), text("\">")]);
+        assert_eq!(unread.check(&format), Err(LayoutError::Unmatched("header")));
+        // A JSON layout does not fit tagged parameters: the parameter's places are missing.
+        assert_eq!(
+            json_layout().check(&table(shape(Pattern::default()))),
+            Err(LayoutError::Places("parameter"))
+        );
+    }
+
+    /// A shape whose header numbers the call, `f.NAME:N>`, the arguments one JSON value.
+    fn numbered() -> CallShape {
+        CallShape {
+            header: Pattern(
+                [
+                    lit("f."),
+                    run(none_of(":"), 1, true, Some(Slot::Name)),
+                    lit(":"),
+                    run(Class::new([('0', '9')], false), 1, true, None),
+                    lit(">"),
+                ]
+                .into(),
+            ),
+            arguments: Arguments::Json(Dialect::default()),
+            ..shape(Pattern::default())
+        }
+    }
+
+    #[test]
+    fn the_calls_index_has_a_place_in_the_header_alone_and_reads_zero_written_out() {
+        let format = table(numbered());
+        let mut laid = json_layout();
+        laid.call.header = written([
+            text("f."),
+            Segment::Slot(Slot::Name),
+            text(":"),
+            Segment::Index,
+            text(">"),
+        ]);
+        assert_eq!(laid.check(&format), Ok(()));
+        // Written out, the index is the first call's; cut at the index, the header is its two
+        // halves with the name in place.
+        assert_eq!(
+            laid.header_for(&numbered(), "<c", "lookup").as_deref(),
+            Some("f.lookup:0>")
+        );
+        assert_eq!(
+            laid.call.header.around_the_index("lookup"),
+            ("f.lookup:".to_string(), Some(">".to_string()))
+        );
+        assert_eq!(
+            json_layout().call.header.around_the_index("lookup"),
+            (" n=\"lookup\">".to_string(), None)
+        );
+        // A header pattern that reads one digit alone passes the first call's `0` and not the
+        // longer index the tag lets the model write: the layout does not fit it.
+        let one_digit = CallShape {
+            header: Pattern(
+                [
+                    lit("f."),
+                    run(none_of(":"), 1, true, Some(Slot::Name)),
+                    lit(":"),
+                    Atom::Run {
+                        class: Class::new([('0', '9')], false),
+                        min: 1,
+                        max: Some(1),
+                        greedy: true,
+                        capture: None,
+                    },
+                    lit(">"),
+                ]
+                .into(),
+            ),
+            ..numbered()
+        };
+        assert_eq!(
+            laid.check(&table(one_digit)),
+            Err(LayoutError::Unmatched("header"))
+        );
+        // Without the place the header does not read back (the pattern wants the digits).
+        let mut unnumbered = json_layout();
+        unnumbered.call.header = written([text("f."), Segment::Slot(Slot::Name), text(">")]);
+        assert_eq!(
+            unnumbered.check(&format),
+            Err(LayoutError::Unmatched("header"))
+        );
+        // One place at most, and in the header only.
+        let mut twice = laid.clone();
+        twice.call.header = written([
+            text("f."),
+            Segment::Slot(Slot::Name),
+            text(":"),
+            Segment::Index,
+            Segment::Index,
+            text(">"),
+        ]);
+        assert_eq!(twice.check(&format), Err(LayoutError::Places("header")));
+        let mut led = laid.clone();
+        led.call.lead = written([Segment::Index, text("\n")]);
+        assert_eq!(led.check(&format), Err(LayoutError::Places("lead")));
+        let mut tagged = layout();
+        tagged.call.parameter = written([
+            text("<p "),
+            Segment::Slot(Slot::Key),
+            Segment::Index,
+            text(">"),
+            Segment::Slot(Slot::Value),
+            text("</p>"),
+        ]);
+        assert_eq!(
+            tagged.check(&table(shape(Pattern::default()))),
+            Err(LayoutError::Places("parameter"))
+        );
     }
 }

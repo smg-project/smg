@@ -8,7 +8,7 @@ use std::{any::type_name, fmt, io::Cursor, marker::PhantomData};
 
 use rmpv::Value;
 use serde::{
-    de::{value::SeqAccessDeserializer, IgnoredAny, SeqAccess, Visitor},
+    de::{value::SeqAccessDeserializer, DeserializeSeed, IgnoredAny, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 
@@ -83,19 +83,35 @@ where
     })
 }
 
+fn decode_value_preview(bytes: &[u8]) -> String {
+    match decode_value(bytes) {
+        Ok(value) => format!("{value}"),
+        Err(error) => format!("<value decode failed: {error}>"),
+    }
+}
+
+/// Decode a msgpack payload with a [`DeserializeSeed`]: a decoder that needs
+/// a fact known only at run time (the positions an engine declared for the
+/// optional columns of its output batch), with the diagnostics of
+/// [`decode_msgpack`].
+pub fn decode_msgpack_seed<'de, S>(bytes: &'de [u8], seed: S) -> Result<S::Value>
+where
+    S: DeserializeSeed<'de>,
+{
+    let mut deserializer = rmp_serde::Deserializer::from_read_ref(bytes);
+    seed.deserialize(&mut deserializer)
+        .map_err(|error| Error::Decode {
+            target_type: type_name::<S::Value>(),
+            message: format!("{error}; value fallback: {}", decode_value_preview(bytes)),
+        })
+}
+
 /// Decode a msgpack payload into a strongly typed value, attaching a dynamic
 /// value preview to decode failures for diagnostics.
 pub fn decode_msgpack<T>(bytes: &[u8]) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    fn decode_value_preview(bytes: &[u8]) -> String {
-        match decode_value(bytes) {
-            Ok(value) => format!("{value}"),
-            Err(error) => format!("<value decode failed: {error}>"),
-        }
-    }
-
     rmp_serde::from_slice(bytes).map_err(|error| Error::Decode {
         target_type: type_name::<T>(),
         message: format!("{error}; value fallback: {}", decode_value_preview(bytes)),

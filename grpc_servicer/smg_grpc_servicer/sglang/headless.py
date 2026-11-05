@@ -105,6 +105,7 @@ def run(server_args: Any, handshake_address: str, engine_index: int = 0) -> int:
     from sglang.srt.server_args import PortArgs
     from sglang.srt.utils import configure_logger, kill_process_tree
 
+    from smg_grpc_servicer.sglang.rust import start_bootstrap_server
     from smg_grpc_servicer.sglang.scheduler_launcher import terminate_scheduler_processes
 
     configure_logger(server_args)
@@ -115,6 +116,9 @@ def run(server_args: Any, handshake_address: str, engine_index: int = 0) -> int:
     # This process fills the tokenizer manager's role for argument resolution
     # only; the ranks publish their own records when they start.
     publish(server_args, role="tokenizer")
+    # A prefill side's bootstrap server, before the ranks that register with
+    # it (as the in-process launch starts it); held for this process's life.
+    _bootstrap_server = start_bootstrap_server(server_args)
     port_args = PortArgs.init_new(server_args)
 
     stop = threading.Event()

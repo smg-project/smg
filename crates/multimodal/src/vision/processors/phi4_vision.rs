@@ -453,18 +453,11 @@ impl VisionPreProcessor for Phi4VisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
-        config: &PreProcessorConfig,
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-
-        let processor = if config.dynamic_hd.is_some() || config.image_mean.is_some() {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        };
 
         let mut all_outputs = Vec::new();
         let mut all_masks = Vec::new();
@@ -472,7 +465,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         let mut feature_token_counts = Vec::new();
 
         for image in images {
-            let (output, mask, size, tokens) = processor.process_single_image(image);
+            let (output, mask, size, tokens) = self.process_single_image(image);
             all_outputs.push(output);
             all_masks.push(mask);
             item_sizes.push(size);
@@ -548,29 +541,23 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<usize, TransformError> {
-        let processor = Self::from_preprocessor_config(config);
-        let base_res = processor.base_resolution as f64;
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        let base_res = self.base_resolution as f64;
 
         let w_crop_num = (width as f64 / base_res).ceil() as usize;
         let h_crop_num = (height as f64 / base_res).ceil() as usize;
 
-        let (target_w_crops, target_h_crops) = if w_crop_num * h_crop_num > processor.dynamic_hd {
+        let (target_w_crops, target_h_crops) = if w_crop_num * h_crop_num > self.dynamic_hd {
             let aspect_ratio = width as f64 / height as f64;
-            let target_ratios = processor.compute_target_ratios(1, processor.dynamic_hd);
-            processor.find_closest_aspect_ratio(aspect_ratio, &target_ratios, width, height)
+            let target_ratios = self.compute_target_ratios(1, self.dynamic_hd);
+            self.find_closest_aspect_ratio(aspect_ratio, &target_ratios, width, height)
         } else {
             (w_crop_num, h_crop_num)
         };
 
         // Approximate token count (without actual mask)
         // Full mask would have target_w_crops * target_h_crops * (mask_res/2)^2 tokens
-        let half_res = processor.mask_resolution / 2;
+        let half_res = self.mask_resolution / 2;
         let mask_area = target_h_crops * target_w_crops * half_res * half_res;
         let mask_col0 = target_h_crops * half_res;
 
@@ -581,9 +568,8 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         "phi4-vision"
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // For Phi4, the size depends on the input image
-        let _ = config;
         None
     }
 }
@@ -591,10 +577,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::test_support::create_test_image;
 
     #[test]
     fn test_phi4_vision_processor_default() {
@@ -668,10 +651,9 @@ mod tests {
     #[test]
     fn test_preprocess_square_image() {
         let processor = Phi4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert!(result.feature_token_counts[0] > 256); // At least global tokens
@@ -684,10 +666,9 @@ mod tests {
     #[test]
     fn test_preprocess_wide_image() {
         let processor = Phi4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let image = create_test_image(1000, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         // Wide image should have more crops in width direction
@@ -697,14 +678,15 @@ mod tests {
     #[test]
     fn test_preprocess_multiple_images() {
         let processor = Phi4VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
-        let images = vec![
+        let images = [
             create_test_image(500, 500, Rgb([100, 100, 100])),
             create_test_image(800, 400, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);
@@ -743,7 +725,7 @@ mod tests {
     #[test]
     fn an_empty_batch_is_refused_as_empty_batch() {
         let processor = Phi4VisionProcessor::new();
-        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

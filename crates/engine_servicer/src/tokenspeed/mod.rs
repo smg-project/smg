@@ -6,6 +6,7 @@
 //! launching the headless scheduler and driving this server through the
 //! binding.
 
+mod encode;
 mod engine;
 mod generate;
 mod info;
@@ -13,31 +14,37 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
-    },
-    time::{Duration, Instant, SystemTime},
-};
+use std::{sync::Arc, time::Duration};
 
-use engine_zmq_adapter::ZmqEngineClient;
-use futures::FutureExt;
+use engine_zmq_adapter::{
+    EncodeRendezvous, GridTensors, MropeLayout, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
+};
+use engine_zmq_client::{protocol::handshake::REQUEST_KIND_ENCODE, ConnectedEngine};
 use llm_tokenizer::traits::Tokenizer;
-use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
-use tokio::net::TcpListener;
-use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
-use tonic::{transport::Server, Status};
-use tonic_health::pb::health_server::HealthServer;
-use tracing::{info, warn};
+use smg_grpc_client::{
+    tokenspeed_encoder_proto::token_speed_encoder_server::TokenSpeedEncoderServer,
+    tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer,
+};
+use tonic::service::Routes;
 
 use crate::{
-    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerConfig, ServicerError, Shutdown,
+    engine_link::{EngineLink, TokenizerSlot},
+    kv_events::KvEventRelay,
+    metrics::{Identity, ServicerMetrics},
+    servicer::{self, Shared, WireState},
+    ServicerConfig, ServicerError,
 };
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
+/// The encoder service's name, which health reports in the encode role (the
+/// gRPC servicer's primary service there).
+pub const ENCODER_SERVICE_NAME: &str = "tokenspeed.grpc.encoder.TokenSpeedEncoder";
+/// The `wire` label of this servicer's metrics.
+const WIRE: &str = "tokenspeed";
+/// What `HealthCheck`'s message says of a serving engine on this wire.
+const HEALTHY: &str = "healthy";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -63,10 +70,20 @@ pub struct TokenSpeedModelInfo {
     pub supported_modalities: Vec<i32>,
     /// Whether the language model's rotary positions are MRoPE (the text rope
     /// config carries an `mrope_section`), which the launcher reads off the
-    /// checkpoint: a multimodal item's grid tensors then feed positions this
-    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
-    /// grid through; `None` (a launcher that does not say) refuses as before.
+    /// checkpoint: a multimodal item's grid tensors then feed a position
+    /// table the adapter computes for the families whose rule it has (from
+    /// `architectures` / `model_type` and the three layout facts below) and
+    /// refuses for the rest; `Some(false)` lets a patch-layout grid through;
+    /// `None` (a launcher that does not say) refuses as before.
     pub mrope_positions: Option<bool>,
+    /// The vision tower's spatial merge size (`vision_config.spatial_merge_size`),
+    /// one of the position rule's inputs; `None` when the checkpoint has none.
+    pub spatial_merge_size: Option<u32>,
+    /// The checkpoint's image placeholder token id (`image_token_id`), which
+    /// the position rule checks each image span against.
+    pub image_token_id: Option<u32>,
+    /// The checkpoint's video placeholder token id (`video_token_id`).
+    pub video_token_id: Option<u32>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -98,6 +115,160 @@ pub struct TokenSpeedModelInfo {
     pub kv_events_topic: String,
 }
 
+impl TokenSpeedModelInfo {
+    /// What a multimodal item's grid tensors are for this model
+    /// ([`GridTensors`]): the position rule's layout facts travel together,
+    /// so a launcher that shipped only some of them ships none.
+    pub(super) fn grid_tensors(&self) -> GridTensors {
+        let layout = match (
+            self.spatial_merge_size,
+            self.image_token_id,
+            self.video_token_id,
+        ) {
+            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                Some(MropeLayout {
+                    spatial_merge_size,
+                    image_token_id,
+                    video_token_id,
+                })
+            }
+            _ => None,
+        };
+        GridTensors::for_model(
+            &self.architectures,
+            &self.model_type,
+            self.mrope_positions,
+            layout,
+        )
+    }
+}
+
+/// What the scheduler enforces of a structured request, read off the
+/// launcher's `server_args`: the `grammar_backend` the launcher resolved
+/// (TokenSpeed's `--grammar-backend`, `xgrammar` or `none`: `none` unless
+/// set, `xgrammar` for the checkpoints the engine defaults so). `none`
+/// enforces nothing: the scheduler refuses such a request at admission with
+/// a 400 that reaches the caller as INTERNAL with `BARE_ENGINE_ABORT` from
+/// an engine that declares no status columns, or as INVALID_ARGUMENT with
+/// the engine's reason from one that does; refusing before the scheduler
+/// gives the caller's error on either. `xgrammar` compiles all four kinds, a JSON
+/// schema with the features it lacks dropped. A launcher that wrote no
+/// backend could not tell (a checkpoint default not resolved yet, or an
+/// older launcher), and a name this servicer does not know is not one the
+/// engine starts with: nothing is judged ahead of the engine then. The
+/// adapter refuses a constraint outside this before the scheduler, as on
+/// every wire.
+pub(super) fn structured_outputs_support(model: &TokenSpeedModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputsBackendConfig::{Other, Pinned};
+
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let backend = args
+        .get("grammar_backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match backend {
+        "none" => StructuredOutputsSupport::DISABLED,
+        "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
+        _ => Other.into(),
+    }
+}
+
+/// The encode role's rendezvous, read off the launch's server args
+/// (`disaggregation_mode == "encode"`, `--disaggregation-bootstrap-port`,
+/// and `encode_bootstrap_host`, the worker's own address as the launcher
+/// adds it, the way the gRPC servicer's encoder fills it); `None` for the
+/// other roles. An encode launch without the host or the port is refused
+/// before anything starts.
+pub(super) fn encode_role(
+    model: &TokenSpeedModelInfo,
+) -> Result<Option<EncodeRendezvous>, ServicerError> {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    if args
+        .get("disaggregation_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("encode")
+    {
+        return Ok(None);
+    }
+    let bootstrap_host = args
+        .get("encode_bootstrap_host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty() && !is_unspecified_address(host))
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs encode_bootstrap_host in the server args: the worker's \
+                 own address, one the prefill side can reach, which the launcher adds (it read \
+                 none, or an unspecified one)"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+    let bootstrap_port = args
+        .get("disaggregation_bootstrap_port")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|port| i32::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs disaggregation_bootstrap_port in the server args"
+                    .to_string(),
+            )
+        })?;
+    Ok(Some(EncodeRendezvous {
+        bootstrap_host,
+        bootstrap_port,
+    }))
+}
+
+/// An address no peer can dial (`0.0.0.0`, `::`): a launch's `--host`, never
+/// a rendezvous.
+fn is_unspecified_address(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+/// The role this servicer was launched for against what the engines'
+/// handshakes list: the encode role needs every engine to list the encode
+/// request (an engine before the wire carried it lists none and cannot take
+/// the role: the Python servicer serves it there); any other role refuses an
+/// engine that lists encode alone (a disaggregated encode worker dialled a
+/// servicer launched for a language role).
+pub(super) fn check_role_against_wire(
+    encode_role: bool,
+    engines: &[ConnectedEngine],
+) -> Result<(), String> {
+    let lists_encode = |engine: &ConnectedEngine| {
+        engine
+            .ready_response
+            .lists_request_kind(REQUEST_KIND_ENCODE)
+    };
+    if encode_role {
+        if let Some(engine) = engines.iter().find(|engine| !lists_encode(engine)) {
+            return Err(format!(
+                "the encode role needs the engine's encode request on the msgpack wire, which \
+                 this engine's handshake does not list (request_types {:?}): a TokenSpeed that \
+                 serves it, or the Python servicer (--servicer-impl python), serves this worker",
+                engine.ready_response.request_types
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(engine) = engines
+        .iter()
+        .find(|engine| lists_encode(engine) && !engine.ready_response.takes_generate())
+    {
+        return Err(format!(
+            "the engine's handshake lists the encode request alone (a disaggregated encode \
+             worker; request_types {:?}), but this servicer was launched for another role: \
+             launch it with --disaggregation-mode encode",
+            engine.ready_response.request_types
+        ));
+    }
+    Ok(())
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TokenSpeedServicerConfig {
@@ -113,86 +284,58 @@ pub struct TokenSpeedServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-struct LoadFromState(std::sync::Weak<State>);
-
-impl crate::kv_events::LoadSource for LoadFromState {
-    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let state = self.0.upgrade()?;
-        let response = info::loads(&state, dp_rank).ok()?;
+impl crate::kv_events::RankLoads for State {
+    fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let response = info::loads(self, dp_rank).ok()?;
         let load = response.loads.first()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::loads`), so every rank's record reports it.
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
-        record.engine_silence_ms = state.engine.output_silence_ms();
-        record.engine_reports_steps = state.engine.reports_steps();
-        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         Some(record)
+    }
+
+    fn engine_link(&self) -> &EngineLink {
+        &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
 pub(super) struct State {
     pub(super) model: TokenSpeedModelInfo,
-    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
-    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
-    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
-    /// The local tokenizer directory the servicer loaded (`GetTokenizer`
-    /// bundles it); `None` when none resolved.
-    pub(super) tokenizer_dir: Option<String>,
-    pub(super) engine: EngineLink,
+    /// What every servicer's state shares: the engine link, the admitted
+    /// requests, the KV-event relay, the metrics and the serving switch.
+    pub(super) shared: Shared,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
-    pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
-    pub(super) registry: Arc<RequestRegistry>,
-    /// Cleared by the lifecycle owner to drain: health flips to NOT_SERVING
-    /// while in-flight streams finish.
-    pub(super) serving: AtomicBool,
-    pub(super) started: Instant,
-    pub(super) started_at: SystemTime,
+    pub(super) tokenizer: TokenizerSlot,
+    /// The disaggregated encode role's rendezvous when this servicer runs it
+    /// (`--disaggregation-mode encode`): the encoder service is mounted,
+    /// `Generate` refused, and the engine's handshake must list the encode
+    /// request.
+    pub(super) encode_role: Option<EncodeRendezvous>,
+}
+
+impl WireState for State {
+    fn shared(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 impl State {
-    pub(super) fn engine(&self) -> Result<&ZmqEngineClient, Status> {
-        if let Some(client) = self.engine.client.get() {
-            return Ok(client);
-        }
-        Err(match self.engine.error() {
-            Some(error) => Status::unavailable(format!("engine connection failed: {error}")),
-            None => Status::unavailable("engine is still connecting"),
-        })
-    }
-
     pub(super) fn tokenizer(&self) -> Option<&Arc<dyn Tokenizer>> {
         self.tokenizer.get().and_then(Option::as_ref)
-    }
-
-    /// SERVING only once the engine link is up and alive and the lifecycle
-    /// owner has not started draining.
-    pub(super) fn is_serving(&self) -> bool {
-        self.serving.load(Ordering::Acquire)
-            && self
-                .engine
-                .client
-                .get()
-                .is_some_and(ZmqEngineClient::is_alive)
-    }
-
-    pub(super) fn health_message(&self) -> &'static str {
-        if !self.serving.load(Ordering::Acquire) {
-            return "Draining";
-        }
-        match (self.engine.client.get(), self.engine.error()) {
-            (Some(client), _) if client.is_alive() => "healthy",
-            (Some(_), _) => "Engine is not alive",
-            (None, Some(_)) => "Engine connection failed",
-            (None, None) => "Engine is starting",
-        }
     }
 }
 
 /// A running Rust TokenSpeed servicer. `start` returns once the gRPC
 /// listener is bound; the engines connect in the background and gate health.
 pub struct TokenSpeedServicerServer {
-    thread: ServerThread,
+    server: servicer::Server,
     state: Arc<State>,
 }
 
@@ -223,126 +366,92 @@ impl TokenSpeedServicerServer {
         }
         // One publisher per data-parallel rank: the launcher's width (the
         // handshake's figure, which may differ, is not known yet).
-        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+        let kv_relay = KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
             u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
+        let metrics = ServicerMetrics::new(
+            &Identity {
+                model: config.model.served_model_name.clone(),
+                wire: WIRE,
+                ranks: config.servicer.engine_count,
+                max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
+                matches_string_stops: true,
+                // Media reach this wire as the router's preprocessed tensors: the
+                // router-side families are their measurement.
+                processes_media: false,
+            },
+            config.servicer.metrics_bind_address.is_some(),
+        )?;
+        let encode_role = encode_role(&config.model)?;
         let state = Arc::new(State {
-            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
-            kv_relay,
-            engine: EngineLink::default(),
-            tokenizer: OnceLock::new(),
-            registry: Arc::new(RequestRegistry::default()),
-            serving: AtomicBool::new(true),
-            started: Instant::now(),
-            started_at: SystemTime::now(),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
+            tokenizer: TokenizerSlot::new(),
+            encode_role,
         });
-        if let Some(relay) = &state.kv_relay {
-            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
-        }
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
-        let service = service::TokenSpeedService {
+        let scheduler = TokenSpeedSchedulerServer::new(service::TokenSpeedService {
             state: Arc::clone(&state),
+        })
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
+        // The encode role mounts the encoder service next to the scheduler's
+        // discovery surface and reports health under the encoder's name, as
+        // the gRPC servicer does.
+        let (routes, service_name) = match &state.encode_role {
+            Some(rendezvous) => (
+                Routes::new(scheduler).add_service(
+                    TokenSpeedEncoderServer::new(encode::TokenSpeedEncodeService {
+                        state: Arc::clone(&state),
+                        rendezvous: rendezvous.clone(),
+                    })
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX),
+                ),
+                ENCODER_SERVICE_NAME,
+            ),
+            None => (Routes::new(scheduler), SERVICE_NAME),
         };
-        let health_state = Arc::clone(&state);
-        let health = HealthReporter::new(
-            &["", SERVICE_NAME],
-            Arc::new(move || health_state.is_serving()),
-        );
         let connect_state = Arc::clone(&state);
-        let kv_relay = state.kv_relay.clone();
-        let ServicerConfig {
-            bind_address,
-            ipc_base_url,
-            handshake_address,
-            engine_count,
-            tokenizer_dir,
-            engine_startup_timeout,
-            engine_startup_ceiling,
-        } = config.servicer;
-        let thread = ServerThread::start(
+        let server = servicer::Server::start(
             "smg-tokenspeed-servicer",
-            &bind_address,
-            move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
-                // The KV-event relay follows the publisher from the start,
-                // before any gateway asks, so its history and live-block
-                // record cover the engine's whole life.
-                if let Some(relay) = &kv_relay {
-                    relay.start_at_boot();
-                }
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
-                )]
-                let _connect = tokio::spawn(engine::connect_engine(
-                    connect_state,
-                    ipc_base_url,
-                    handshake_address,
-                    engine_count,
-                    engine_startup_timeout,
-                    engine_startup_ceiling,
-                    tokenizer_dir,
-                    last_error,
-                ));
-                info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "TokenSpeed gRPC servicer listening");
-                // Graceful first: stop accepting, let open streams finish;
-                // the drain grace bounds a client holding an idle connection.
-                let graceful = Server::builder()
-                    // Router-preprocessed media arrives as multi-megabyte
-                    // inline tensors; size the HTTP/2 windows for them.
-                    .initial_stream_window_size(Some(16 * 1024 * 1024))
-                    .initial_connection_window_size(Some(64 * 1024 * 1024))
-                    .max_frame_size(Some(1024 * 1024))
-                    .add_service(
-                        TokenSpeedSchedulerServer::new(service)
-                            .max_decoding_message_size(usize::MAX)
-                            .max_encoding_message_size(usize::MAX),
-                    )
-                    .add_service(HealthServer::new(health))
-                    .serve_with_incoming_shutdown(
-                        TcpListenerStream::new(listener).map(|conn| {
-                            if let Ok(stream) = &conn {
-                                if let Err(error) = stream.set_nodelay(true) {
-                                    warn!(%error, "could not set TCP_NODELAY on an accepted connection");
-                                }
-                            }
-                            conn
-                        }),
-                        shutdown.clone().map(|_| ()),
-                    );
-                let forced = async move {
-                    let grace = shutdown.await;
-                    tokio::time::sleep(grace).await;
-                };
-                tokio::select! {
-                    result = graceful => result.map_err(|error| error.to_string()),
-                    () = forced => {
-                        warn!("gRPC servicer closed its remaining connections after the drain grace");
-                        Ok(())
-                    }
-                }
-            },
+            config.servicer,
+            service_name,
+            "TokenSpeed",
+            &state,
+            routes,
+            move |inputs| engine::connect_engine(connect_state, inputs),
         )?;
-        Ok(Self { thread, state })
+        Ok(Self { server, state })
     }
 
     /// The bound `ip:port`.
     pub fn address(&self) -> String {
-        self.thread.address().to_string()
+        self.server.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when none was asked for.
+    pub fn metrics_address(&self) -> Option<String> {
+        self.server.metrics_address()
     }
 
     pub fn running(&self) -> bool {
-        self.thread.running()
+        self.server.running()
     }
 
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
-        self.state.engine.client.get().is_some()
+        self.state.shared.engine_ready()
     }
 
     /// Report a sign of life from the scheduler process while the handshake
@@ -352,27 +461,49 @@ impl TokenSpeedServicerServer {
     /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
     /// connected.
     pub fn note_engine_alive(&self) {
-        if !self.engine_ready() {
-            self.state.engine.liveness.touch();
-        }
+        self.state.shared.note_engine_alive();
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {
-        self.thread.last_error()
+        self.server.last_error()
     }
 
     /// Announce SERVING (`true`) or drain (`false`): health flips at once,
-    /// in-flight streams keep running until `stop`.
+    /// new admission closes while in-flight streams keep running until `stop`.
     pub fn set_serving(&self, serving: bool) {
-        self.state.serving.store(serving, Ordering::Release);
+        self.state.shared.set_serving(serving);
+    }
+
+    /// Hold (`false`) or release (`true`) readiness alone: health flips as
+    /// with `set_serving`, admission stays open to the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
+    /// nothing else, so the warm-up's steps share the engine with no client
+    /// request. `set_serving(false)` is the drain switch and closes admission
+    /// as well.
+    pub fn set_ready(&self, ready: bool) {
+        self.state.shared.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the scheduler's
+    /// publishers, or there is none to wait for (events off, a relay told to
+    /// start lazily, one that gave up). The lifecycle owner holds its planned
+    /// warm-up until then, so the warm-up's batches start the relay's
+    /// history and a gateway that subscribes later gets the scheduler's whole
+    /// life.
+    pub fn kv_relay_subscribed(&self) -> bool {
+        self.state.shared.kv_relay_subscribed()
+    }
+
+    /// Admitted requests still preprocessing, streaming, or unwinding an abort.
+    pub fn active_requests(&self) -> usize {
+        self.state.shared.registry.active()
     }
 
     /// Signal shutdown and wait up to `timeout` for the server thread;
     /// in-flight streams are cancelled with it (which aborts their engine
     /// requests).
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
-        self.set_serving(false);
-        self.state.registry.cancel_all()?;
-        self.thread.stop(timeout)
+        self.server.stop(&self.state.shared, timeout)
     }
 }

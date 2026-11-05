@@ -2,7 +2,7 @@
 //! `</tool_call>` as its name and keyed arguments (`<arg_key>`, `<arg_value>`), typed by the
 //! request's tools, with nothing between the tags. Everything else is content; what a call block
 //! holds that the syntax cannot read (a tag out of its place, prose or Python where the name goes)
-//! is never content: refused and counted ([`keyed`]). The prompt opens
+//! is never content: refused and counted (`keyed`). The prompt opens
 //! the thought (`<|assistant|><think>`, whatever the request says: the template has no thinking
 //! switch, only `clear_thinking` for the history), so an empty thought writes `</think>` at once;
 //! a turn opens with `<|assistant|>`, so the prompt's replay starts there. The template strips the
@@ -42,8 +42,12 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        input::EngineFinish,
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, dropped, reasoning,
+            the_same_at_every_cut,
+        },
         Declared,
     };
 
@@ -130,11 +134,11 @@ mod tests {
         "</tool_call>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(declared(), prompt, pieces)
     }
 
-    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(glm(), declared), prompt, pieces)
     }
 
@@ -150,13 +154,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn dropped(text: &str) -> Event {
-        Event::Dropped {
-            text: Text::uncounted(text),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
@@ -265,7 +262,12 @@ mod tests {
     fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
         let output =
             "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat";
-        let events = run(PROMPT, &[output]);
+        let events = drive_to(
+            &mut Engine::new(glm(), declared()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
         assert_eq!(bytes(&events), output);
         // The declared string streamed as it arrived and stays open: the client sees the cut.
         assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "lat"#);
@@ -277,6 +279,53 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there is no cut: the string and the object close, and
+        // one `Malformed { OpenAtTheStop }` event says the stop closed them.
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(bytes(&stopped), output);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"drink_id": "lat"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // The same call cut inside its object value, which the assembler holds for its close:
+        // the member leaves as written, the cut member's key and bytes included, nothing of the
+        // call is a failed call's bytes, and the finish is `length`; whole, one character at a
+        // time and at every two-way cut.
+        let output = concat!(
+            "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>latte",
+            "</arg_value><arg_key>new_preferences</arg_key><arg_value>{\"size\": \"large\", \"temp"
+        );
+        let cut = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(cut, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        let events = cut(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
+        );
     }
 
     #[test]
@@ -423,6 +472,174 @@ mod tests {
         }
     }
 
+    /// The tools of the recorded pythonic cases: a string, an array with an object.
+    fn stock_tools() -> Declared {
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        let schema =
+            |properties: serde_json::Value| value!({"type": "object", "properties": properties});
+        Declared::of(&[
+            tool(
+                "get_stock_info",
+                schema(value!({"company": {"type": "string"}})),
+            ),
+            tool(
+                "todo",
+                schema(
+                    value!({"type": {"type": "string"}, "items": {"type": "array"}, "when": {"type": "object"}}),
+                ),
+            ),
+            tool(
+                "searchHotels",
+                schema(value!({"location": {"type": "string"}})),
+            ),
+        ])
+    }
+
+    /// A call written as Python inside the block's markers, right after the thought, as the
+    /// recorded cells show it: whole with one string, whole with nested arguments, and twice
+    /// with the second block cut by the end of the stream. None names a call: the block's bytes
+    /// are refused whole (the text where the name goes, then the marker that ended it, as the
+    /// call's own bytes; the opener that led into the block is the table's row), behind events
+    /// of no bytes, the first of them saying that text stands where the name should be; nothing
+    /// of the block is content, so the content is empty, and what an answer of nothing else
+    /// shows a client is the reader's decision. The same call in the template's own form is the
+    /// call, typed by the tool. Every chunking says the same.
+    #[test]
+    fn a_call_written_as_python_inside_the_tag_is_refused_whole_and_the_tagged_form_reads() {
+        struct Case {
+            output: &'static str,
+            refused: &'static str,
+        }
+        let cases = [
+            Case {
+                output: "</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>",
+                refused: "get_stock_info(company=\"Apple\")</tool_call>",
+            },
+            Case {
+                output: concat!(
+                    "</think><tool_call>todo(type=\"add\", items=[{\"title\": \"Buy milk\", ",
+                    "\"tags\": [\"home\", \"food\"]}], when={\"day\": 1, \"hour\": 9})</tool_call>"
+                ),
+                refused: concat!(
+                    "todo(type=\"add\", items=[{\"title\": \"Buy milk\", ",
+                    "\"tags\": [\"home\", \"food\"]}], when={\"day\": 1, \"hour\": 9})</tool_call>"
+                ),
+            },
+            Case {
+                output: concat!(
+                    "</think><tool_call>searchHotels(location=\"San Diego\")",
+                    "<tool_call>searchHotels(location=\"San Diego\")"
+                ),
+                refused: concat!(
+                    "searchHotels(location=\"San Diego\")",
+                    "<tool_call>searchHotels(location=\"San Diego\")"
+                ),
+            },
+        ];
+        for case in &cases {
+            for pieces in plans(case.output) {
+                let events = run_with(stock_tools(), PROMPT, &pieces);
+                let place = || format!("{:?} in {} pieces", &case.output[..40], pieces.len());
+                assert_eq!(bytes(&events), case.output, "{}", place());
+                assert_eq!(content(&events), "", "{}", place());
+                assert!(calls_of(&events).is_empty(), "{}", place());
+                let malformed = malformed(&events);
+                assert!(
+                    malformed.iter().all(|(_, text)| text.is_empty()),
+                    "{}: {malformed:?}",
+                    place()
+                );
+                assert_eq!(
+                    malformed.first().map(|(why, _)| *why),
+                    Some(MalformedReason::TextWhereTheNameShouldBe),
+                    "{}",
+                    place()
+                );
+                assert_eq!(refused(&events), case.refused, "{}", place());
+                assert!(
+                    matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                    "{}",
+                    place()
+                );
+            }
+        }
+        // The template's own form of the first case: the call, with the string the tool
+        // declares, and nothing refused.
+        let output = concat!(
+            "</think><tool_call>get_stock_info<arg_key>company</arg_key>",
+            "<arg_value>Apple</arg_value></tool_call>"
+        );
+        for pieces in plans(output) {
+            let events = run_with(stock_tools(), PROMPT, &pieces);
+            assert_eq!(bytes(&events), output, "{} pieces", pieces.len());
+            assert_eq!(
+                calls_of(&events),
+                [("get_stock_info".to_string(), value!({"company": "Apple"}))],
+                "{} pieces",
+                pieces.len()
+            );
+            assert_eq!(content(&events), "", "{} pieces", pieces.len());
+            assert!(malformed(&events).is_empty(), "{} pieces", pieces.len());
+            assert_eq!(refused(&events), "", "{} pieces", pieces.len());
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{} pieces",
+                pieces.len()
+            );
+        }
+    }
+
+    /// A call written as Python inside the block's markers after the answer's text (the recorded
+    /// shape: a sentence, then the block): the text is content, and the block is refused whole as
+    /// when it stands alone (the text where the name goes, then the marker that ended it), behind
+    /// events of no bytes, the first saying that text stands where the name should be; the
+    /// content ends where the text does, and what a client sees of the block is the reader's
+    /// decision. Every chunking says the same.
+    #[test]
+    fn a_call_written_as_python_after_the_text_is_refused_whole_and_the_text_is_content() {
+        let output =
+            "</think>Let me check.<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+        for pieces in plans(output) {
+            let events = run_with(stock_tools(), PROMPT, &pieces);
+            let place = || format!("{} pieces", pieces.len());
+            assert_eq!(bytes(&events), output, "{}", place());
+            assert_eq!(content(&events), "Let me check.", "{}", place());
+            assert!(calls_of(&events).is_empty(), "{}", place());
+            let malformed = malformed(&events);
+            assert!(
+                malformed.iter().all(|(_, text)| text.is_empty()),
+                "{}: {malformed:?}",
+                place()
+            );
+            assert_eq!(
+                malformed.first().map(|(why, _)| *why),
+                Some(MalformedReason::TextWhereTheNameShouldBe),
+                "{}",
+                place()
+            );
+            assert_eq!(
+                refused(&events),
+                "get_stock_info(company=\"Apple\")</tool_call>",
+                "{}",
+                place()
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                "{}",
+                place()
+            );
+        }
+    }
+
     /// A recorded output: one well-formed call whose last value close the model wrote twice.
     const RECORDED_STRAY_CLOSE: &str = concat!(
         "The user wants to perform a t-test between two datasets:\n- Dataset A: [12, 24, 36]\n",
@@ -511,7 +728,7 @@ mod tests {
                 ),
             ),
             tool(
-                "get_president_and_vp",
+                "get_president_and_vp_for_year",
                 schema(value!({"year": {"type": "integer"}, "position": {"type": "string"}})),
             ),
             tool(
@@ -553,18 +770,18 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::MalformedCall,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
     /// The malformed events, as (reason, text).
-    fn malformed(events: &[Event]) -> Vec<(MalformedReason, &str)> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<(MalformedReason, &'a str)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((*why, text.text.as_str())),
+                Event::Malformed { text, why } => Some((*why, &*text.text)),
                 _ => None,
             })
             .collect()

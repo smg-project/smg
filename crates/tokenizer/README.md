@@ -61,8 +61,9 @@ as of `tokenizer/src/*`.
   `HuggingFaceTokenizer::tokenizers_pipeline()` (the same post-processor) or with the flag off.
 - Supports optional chat templates: either auto-discovered next to the tokenizer via
   `tokenizer_config.json` or overridable with an explicit template path.
-- Exposes `apply_chat_template` which renders a minijinja template given JSON message payloads and
-  template parameters.
+- Exposes `apply_chat_template` for JSON message payloads and template parameters.
+- GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
+  the template matches the current official one. Any other template keeps MiniJinja.
 
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).
@@ -226,7 +227,7 @@ The gateway exports process-lifetime totals across tokenizer instances on `/metr
 | `smg_tokenizer_cache_evictions_total` | `layer=l0` or `l1` | Entries actually removed for capacity, excluding clear, drop and replacement |
 | `smg_tokenizer_cache_reused_bytes_total` | `layer=l0` or `l1` | UTF-8 input bytes served by hits: whole input for L0, matched prefix for L1 |
 | `smg_tokenizer_encode_path_loads_total` | `path=v1`, `native` or `tokenizers` | Hugging Face tokenizers loaded, by the encode path chosen at load (see `encode_path.rs`); a tokenizer loaded twice counts twice |
-| `smg_tokenizer_encode_fallbacks_total` | `reason=not_nfc` or `piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
+| `smg_tokenizer_encode_fallbacks_total` | `reason=piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
 
 Labels are fixed; no model IDs or prompt text are retained. L0 hits bypass L1,
 so each layer's hit ratio uses its own lookup count. Disabled layers have no

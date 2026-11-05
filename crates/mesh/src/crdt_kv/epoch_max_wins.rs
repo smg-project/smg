@@ -75,7 +75,7 @@ pub(super) enum ValueWinner {
 }
 
 /// Encode `(epoch, count)` to the 16-byte application payload. `rl:` CRDT
-/// inserts normalize this payload into a [`RateLimitShard`] state before
+/// inserts normalize this payload into a `RateLimitShard` state before
 /// storing it.
 #[must_use]
 pub fn encode(epoch: u64, count: i64) -> [u8; EPOCH_MAX_WINS_ENCODED_LEN] {

@@ -35,14 +35,15 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
     default_host,
+    effective_parser,
     effective_startup_timeout,
     get_connection_mode_override,
     get_mm_processing,
     get_parser,
     get_runtime,
-    get_sglang_servicer_impl,
+    get_servicer_impl,
+    get_servicer_impl_setting,
     get_startup_timeout,
-    get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
     host_port,
     is_mlx,
@@ -80,7 +81,7 @@ from .process_utils import (
     wait_for_workers_ready,
 )
 from .run_eval import run_eval
-from .worker import Worker, start_workers, stop_workers
+from .worker import Worker, start_workers, stop_workers, worker_startup_timeout
 from .worker_pool import WorkerPool, cleanup_pool, get_pool
 
 __all__ = [
@@ -131,9 +132,10 @@ __all__ = [
     "get_connection_mode_override",
     "get_mm_processing",
     "get_parser",
+    "effective_parser",
     "assert_mm_processing",
-    "get_sglang_servicer_impl",
-    "get_tokenspeed_servicer_impl",
+    "get_servicer_impl",
+    "get_servicer_impl_setting",
     "get_zmq_engine_count",
     "is_vllm",
     "is_sglang",
@@ -155,6 +157,7 @@ __all__ = [
     "Worker",
     "start_workers",
     "stop_workers",
+    "worker_startup_timeout",
     # Session-scoped worker cache
     "WorkerPool",
     "get_pool",

@@ -63,14 +63,21 @@ fn model_matches(model: &str, markers: &[&str]) -> bool {
     })
 }
 
+/// Whether `model` is served as a model of the series `markers` name: by a
+/// name that carries its contract (an opaque alias of a served model of the
+/// series belongs to it), else by its own name.
+fn is_series(model: &str, markers: &[&str]) -> bool {
+    super::served_under(model, |name| model_matches(name, markers))
+}
+
 /// The GLM-5.3 series (`GLM-5.3`, `glm-5.3-flash`, `glm5.3-air`), whose
 /// thinking rules were recorded and are documented as its own.
 fn is_glm53(model: &str) -> bool {
-    model_matches(model, &GLM53_MARKERS)
+    is_series(model, &GLM53_MARKERS)
 }
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    if model_matches(&req.model, &DEFAULTS_MARKERS) {
+    if is_series(&req.model, &DEFAULTS_MARKERS) {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }
@@ -497,5 +504,66 @@ mod tests {
             "messages": [{"role": "root", "content": "x"}, {"role": "user", "content": "hi"}]
         }));
         assert_eq!(validate(&req), Err("invalid_role".into()));
+    }
+
+    #[test]
+    fn a_registered_alias_of_a_glm53_model_takes_its_rules() {
+        // The series is read from the names the served model is served
+        // under, not from the name as sent: an opaque alias of a GLM-5.3
+        // model gets its sampling defaults, its thinking rule and its effort
+        // set. Names unique to this test: the alias table is process-wide.
+        const ALIAS: &str = "chat-under-an-opaque-alias-of-glm53";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+        assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::Zai);
+
+        let mut req = request(json!({"model": ALIAS}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.temperature, Some(DEFAULT_TEMPERATURE));
+        assert_eq!(req.top_p, Some(DEFAULT_TOP_P));
+
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "thinking": {"type": "disabled"}})
+            )),
+            Err("thinking_disabled_not_supported".into())
+        );
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "reasoning_effort": "medium"})
+            )),
+            Err("reasoning_effort_not_allowed".into())
+        );
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "reasoning_effort": "high"})
+            )),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn another_vendors_name_for_a_glm53_model_takes_its_rules() {
+        // A Kimi-named alias of a GLM-5.3 model takes the z.ai profile from
+        // the model it reaches, and the series with it: its own name carries
+        // no contract here.
+        const ALIAS: &str = "kimi-k2-name-of-a-glm53-model";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+        assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::Zai);
+
+        let mut req = request(json!({"model": ALIAS}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.temperature, Some(DEFAULT_TEMPERATURE));
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "thinking": {"type": "disabled"}})
+            )),
+            Err("thinking_disabled_not_supported".into())
+        );
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "reasoning_effort": "medium"})
+            )),
+            Err("reasoning_effort_not_allowed".into())
+        );
     }
 }

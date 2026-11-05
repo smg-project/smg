@@ -5,6 +5,10 @@
 
 use std::{
     collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -36,8 +40,12 @@ use tonic_health::pb::{
 
 use super::*;
 use crate::{
-    testing::{servicer_config, Bounded},
-    ServicerError,
+    testing::{
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
+        Bounded,
+    },
+    EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeRelease, EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
 };
 
 fn model_info() -> SglangModelInfo {
@@ -67,6 +75,8 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
     SglangServicerConfig {
         servicer: servicer_config(dir, handshake),
         model,
+        encode_dispatcher: None,
+        media_processor: None,
     }
 }
 
@@ -76,15 +86,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
 /// the other test's servicer and wait forever for its INIT.
 fn handshake_address(dir: &std::path::Path) -> String {
     format!("ipc://{}", dir.join("handshake").display())
-}
-
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -108,34 +109,76 @@ async fn grpc_channel(address: impl std::fmt::Display) -> Channel {
         .expect("grpc client")
 }
 
-/// A bound servicer, a handshaken mock scheduler, and a gRPC client.
+/// A bound servicer, a handshaken mock scheduler (rank 0; the further ranks
+/// of a data-parallel group in `more_ranks`, from index 1), and a gRPC
+/// client.
 struct Harness {
     server: SglangServicerServer,
     engine_in: MockEngineInput,
     engine_out: MockEngineOutput,
+    more_ranks: Vec<(MockEngineInput, MockEngineOutput)>,
     client: SglangSchedulerClient<Channel>,
     _dir: tempfile::TempDir,
 }
 
 async fn harness(model: SglangModelInfo) -> Harness {
+    harness_with(model, |_| {}).await
+}
+
+/// [`harness`] with the servicer's config adjusted before it starts (a
+/// metrics listener, an encode dispatcher, the rank count): as many mock
+/// schedulers handshake as the config expects, in index order.
+async fn harness_with(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+) -> Harness {
+    harness_with_media_reuse(model, configure, false).await
+}
+
+/// Create a connected fake scheduler with explicit media reuse settings for control-stream tests.
+async fn harness_with_media_reuse(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+    reuse: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = SglangServicerServer::start(config(dir.path(), &handshake, model))
-        .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock scheduler handshake");
+    let mut config = config(dir.path(), &handshake, model);
+    configure(&mut config);
+    let ranks = u32::try_from(config.servicer.engine_count).expect("a small rank count");
+    let server = if reuse {
+        SglangServicerServer::start_with_media_options(
+            config,
+            Some(engine_zmq_adapter::SglangCpuMmHasher::new(
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
+            true,
+        )
+    } else {
+        SglangServicerServer::start(config)
+    }
+    .expect("servicer starts");
+    let mut engines = Vec::new();
+    for index in 0..ranks {
+        engines.push(
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(index),
+                default_ready_response(),
+            )
+            .await
+            .expect("mock scheduler handshake"),
+        );
+    }
     wait_until(|| server.engine_ready()).await;
     let client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
+    let mut ranks = engines.into_iter().map(|engine| engine.split());
+    let (engine_in, engine_out) = ranks.next().expect("rank 0");
     Harness {
         server,
         engine_in,
         engine_out,
+        more_ranks: ranks.collect(),
         client,
         _dir: dir,
     }
@@ -439,6 +482,51 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         status(health.check(check.clone()).await.unwrap().into_inner()),
         ServingStatus::Serving as i32
     );
+    // Readiness held alone (the lifecycle owner's planned warm-up): health
+    // answers NOT_SERVING with its own message while admission stays open to
+    // the warm-up's own requests only, then the release restores SERVING and
+    // admits every request; the drain below closes admission.
+    server.set_ready(false);
+    let held = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!held.healthy);
+    assert_eq!(held.message, "Warming up");
+    let refused = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .err()
+        .expect("a request that is not the warm-up's is refused while readiness is held");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "servicer is warming up");
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("smg-warmup-1")
+        .expect("the warm-up's own request is admitted while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .expect("the release admits every request");
+    drop(admitted);
+    assert!(
+        client
+            .health_check(sg::HealthCheckRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .healthy
+    );
+
     server.set_serving(false);
     assert_eq!(
         status(health.check(check).await.unwrap().into_inner()),
@@ -450,7 +538,64 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         .unwrap()
         .into_inner();
     assert_eq!(draining.message, "Draining");
+    assert!(
+        server.state.shared.registry.register("late").is_err(),
+        "the drain closes admission"
+    );
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Readiness held for the lifecycle owner's planned warm-up: a request that
+/// is not the warm-up's own is refused as not serving before anything of it
+/// reaches the engine (the engine's next admission is the warm-up's), the
+/// warm-up's own request is served, and the release admits the other again.
+#[tokio::test]
+async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held() {
+    let mut h = harness(model_info()).await;
+    h.server.set_ready(false);
+    let status = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect_err("readiness held: not the warm-up's request");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "servicer is warming up");
+    assert_eq!(h.server.active_requests(), 0);
+
+    let mut own = h
+        .client
+        .generate(generate_request("smg-warmup-1", true, Vec::new()))
+        .await
+        .expect("the warm-up's own request is admitted")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.rid, "smg-warmup-1",
+        "the engine's first admission is the warm-up's"
+    );
+    send(
+        &mut h.engine_out,
+        &batch("smg-warmup-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while own.message().bounded().await.unwrap().is_some() {}
+
+    h.server.set_ready(true);
+    let mut late = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect("the release admits every request")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.rid, "chatcmpl-1");
+    send(
+        &mut h.engine_out,
+        &batch("chatcmpl-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while late.message().bounded().await.unwrap().is_some() {}
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// Streaming: one chunk per scheduler step, then the scheduler's own
@@ -465,6 +610,15 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
         .expect("generate")
         .into_inner();
 
+    assert_eq!(h.server.active_requests(), 1);
+    h.server.set_serving(false);
+    let status = h
+        .client
+        .generate(generate_request("late", true, Vec::new()))
+        .await
+        .expect_err("draining");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(h.server.active_requests(), 1);
     let request = recv_add(&mut h.engine_in).await;
     assert_eq!(request.rid, "r1");
     assert_eq!(request.input_ids, vec![1, 2, 3]);
@@ -495,6 +649,339 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     assert_eq!(done.completion_tokens, 2);
     assert_eq!(done.index, 0);
     assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A prefill/decode request's rendezvous reaches the scheduler in its own
+/// slots, as the Python servicer forwards it (an empty host and a zero port
+/// unset, the room kept as given, 0 included); a plain request writes none;
+/// the response path is the same either way.
+#[tokio::test]
+async fn a_disaggregated_request_carries_its_bootstrap_to_the_scheduler() {
+    let mut h = harness(model_info()).await;
+    let mut request = generate_request("pd1", false, Vec::new());
+    request.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: 41,
+    });
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.rid, "pd1");
+    assert_eq!(add.bootstrap_host.as_deref(), Some("10.0.0.7"));
+    assert_eq!(add.bootstrap_port, Some(8998));
+    assert_eq!(add.bootstrap_room, Some(41));
+    // A prefill side answers its one token and finishes on length once the
+    // KV is handed over; the servicer relays it as any completion.
+    send(
+        &mut h.engine_out,
+        &batch("pd1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // The fake-transfer probe: a host, no port, room 0 (kept).
+    let mut probe = generate_request("probe", false, Vec::new());
+    probe.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "2.2.2.2".to_string(),
+        bootstrap_port: 0,
+        bootstrap_room: 0,
+    });
+    let mut stream = h
+        .client
+        .generate(probe)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.bootstrap_host.as_deref(), Some("2.2.2.2"));
+    assert_eq!((add.bootstrap_port, add.bootstrap_room), (None, Some(0)));
+    send(
+        &mut h.engine_out,
+        &batch("probe", vec![11], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.bootstrap_host, add.bootstrap_port, add.bootstrap_room),
+        (None, None, None)
+    );
+    send(
+        &mut h.engine_out,
+        &batch("plain", vec![12], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A request the Router pins to a data-parallel rank reaches that rank's
+/// scheduler, with the rank in the request's own `routed_dp_rank` slot, the
+/// way the engine's data-parallel controller dispatches a pinned request for
+/// its frontend; a pin past the connected ranks is the caller's error, in
+/// the frontend's words, and reaches no scheduler.
+#[tokio::test]
+async fn a_pinned_request_reaches_its_data_parallel_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+
+    let mut request = generate_request("dp1", false, Vec::new());
+    request.data_parallel_rank = Some(1);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(add.rid, "dp1");
+    assert_eq!(add.routed_dp_rank, Some(1));
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("dp1", vec![10], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut request = generate_request("dp0", false, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!((add.rid.as_str(), add.routed_dp_rank), ("dp0", Some(0)));
+    send(
+        &mut h.engine_out,
+        &batch("dp0", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut request = generate_request("dp2", false, Vec::new());
+    request.data_parallel_rank = Some(2);
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("a pin past the connected ranks is refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "routed_dp_rank=2 out of range [0, 2)");
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_scheduler_idle(&mut rank1_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A disaggregated request for the test: the Router's pin and the room both
+/// sides meet in.
+fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.data_parallel_rank = Some(pin);
+    request.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "10.0.0.1".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: room,
+    });
+    request
+}
+
+/// On the prefill side of a disaggregated pair (the launcher's
+/// `disaggregation_mode`) the room places the request: a request whose
+/// Router pin names rank 0 but whose room's residue over two ranks is 1
+/// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
+/// with one warning line naming the request, and a second such request on
+/// the connection with no warning; a request whose pin agrees logs nothing.
+#[tokio::test]
+async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
+    let logs = captured_logs();
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+
+    // Room 7 over two ranks is rank 1; the pin says 0 and yields.
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room7", 7, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room7", Some(1), Some(7))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room7", vec![10], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![10])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let lines = logs.lines_containing("room7");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
+        "{}",
+        lines[0]
+    );
+
+    // Room 9 is rank 1 again and the pin still says 0: the connection's
+    // second yield, logged below WARN (the capture reads WARN and above).
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room9", 9, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room9", Some(1), Some(9))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room9", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(
+        logs.lines_containing("room9").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("room9")
+    );
+
+    // Room 8 is rank 0; the pin agrees: nothing logged.
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room8", 8, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room8", Some(0), Some(8))
+    );
+    send(
+        &mut h.engine_out,
+        &batch("room8", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(logs.lines_containing("room8").is_empty());
+    assert_scheduler_idle(&mut rank1_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The decode side of a disaggregated pair places a request by its pin, as
+/// an aggregated engine does: its own placement is free, the KV is looked
+/// for on the prefill rank the room names. A room whose residue is rank 0
+/// does not move a request pinned to rank 1.
+#[tokio::test]
+async fn a_decode_sides_request_runs_on_its_pinned_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    model.server_args_json =
+        r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"decode"}"#.to_string();
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("decode8", 8, 1))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("decode8", Some(1), Some(8))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("decode8", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -852,15 +1339,14 @@ async fn a_scheduler_refusal_is_the_callers_error() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A model that takes multimodal input is advertised without vision until
-/// this servicer carries media to the scheduler (the wire refuses
-/// `mm_inputs`): `GetModelInfo.supports_vision` is false whatever the
-/// launcher reported, and `GetServerInfo.server_args` carries the same
-/// `false` on purpose, where the Router reads a non-vLLM servicer's verdict
-/// (a proto3 `false` in `GetModelInfo` is no verdict there). The Router then
-/// refuses image and video input at its gate instead of after fetching it.
+/// A model that takes multimodal input is advertised as the launcher reports
+/// it (`GetModelInfo.supports_vision`, SGLang's own verdict for the launch),
+/// and `GetServerInfo.server_args` stays the launcher's: no verdict of the
+/// servicer's own there (the Python servicer writes none either), so the
+/// gateway's media pipeline preprocesses for the worker and the wire carries
+/// the tensors.
 #[tokio::test]
-async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried() {
+async fn a_multimodal_model_is_advertised_with_the_launchers_vision_verdict() {
     let mut vision = model_info();
     vision.model_type = "qwen3_vl".to_string();
     vision.architectures = vec!["Qwen3VLForConditionalGeneration".to_string()];
@@ -872,10 +1358,7 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        !info.supports_vision,
-        "no media reaches the scheduler over this wire yet"
-    );
+    assert!(info.supports_vision, "the launcher's verdict, as reported");
     let server = h
         .client
         .get_server_info(sg::GetServerInfoRequest {})
@@ -883,10 +1366,9 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .unwrap()
         .into_inner();
     let args = server.server_args.expect("server_args");
-    assert_eq!(
-        args.fields["supports_vision"].kind,
-        Some(Kind::BoolValue(false)),
-        "the servicer's own verdict, where the Router reads it"
+    assert!(
+        !args.fields.contains_key("supports_vision"),
+        "no verdict of the servicer's own in server_args"
     );
     assert_eq!(
         args.fields["tp_size"].kind,
@@ -895,7 +1377,7 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
-    // A text model reads the same: no vision served, whatever the field says.
+    // A text model reads as the launcher reported it too.
     let mut h = harness(model_info()).await;
     let info = h
         .client
@@ -905,6 +1387,389 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .into_inner();
     assert!(!info.supports_vision);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The request's preprocessed media reaches the scheduler as its own
+/// processor output: one image item with the pixel tensor as its feature,
+/// the model-specific tensors beside it, the placeholder ranges as inclusive
+/// offsets and the image token id; every choice of an `n > 1` fan-out
+/// carries it (shared bytes).
+#[tokio::test]
+async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut vision = model_info();
+    vision.supports_vision = true;
+    let mut h = harness(vision).await;
+    let pixels: Vec<u8> = (0..8)
+        .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+        .collect();
+    let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut request = generate_request("mm", true, Vec::new());
+    request.tokenized = Some(sg::TokenizedInput {
+        original_text: String::new(),
+        input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
+    });
+    request.sampling_params.as_mut().unwrap().n = 2;
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        modalities: vec!["image".to_string()],
+        pixel_values: Some(sg::TensorData {
+            data: pixels.clone().into(),
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+        }),
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            sg::TensorData {
+                data: grid.clone().into(),
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        im_token_id: Some(7),
+        mm_placeholders: vec![sg::PlaceholderRange {
+            offset: 1,
+            length: 3,
+        }],
+        ..Default::default()
+    }));
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let mut rids = Vec::new();
+    for _ in 0..2 {
+        let engine_request = recv_add(&mut h.engine_in).await;
+        let media = engine_request
+            .mm_inputs
+            .as_ref()
+            .expect("the processor output on every choice");
+        assert_eq!(media.im_token_id, Some(7));
+        assert_eq!(media.mm_items.len(), 1);
+        let item = &media.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Image);
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        let feature = item.feature.as_ref().expect("the pixel tensor");
+        assert_eq!(
+            (feature.dtype.as_str(), feature.shape.as_slice()),
+            ("float32", &[2, 4][..])
+        );
+        assert_eq!(
+            feature.data.as_raw_view().expect("inline bytes").as_ref(),
+            pixels.as_slice()
+        );
+        let grid_tensor = &item.model_specific_data["image_grid_thw"];
+        assert_eq!(
+            (grid_tensor.dtype.as_str(), grid_tensor.shape.as_slice()),
+            ("int64", &[1, 3][..])
+        );
+        assert_eq!(
+            grid_tensor
+                .data
+                .as_raw_view()
+                .expect("inline bytes")
+                .as_ref(),
+            grid.as_slice()
+        );
+        assert_eq!(engine_request.input_ids, vec![1, 7, 7, 7, 2, 3, 4, 5, 6]);
+        rids.push(engine_request.rid);
+    }
+    rids.sort();
+    assert_eq!(rids, vec!["mm-0".to_string(), "mm-1".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+const ENCODERS: [&str; 2] = ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"];
+const UNEXPANDED_PROMPT: &str = "<|vision_start|><|image_pad|><|vision_end|>What is this?";
+const IMAGE_REFERENCE: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+/// How a scripted dispatcher answers every call.
+enum DispatchAnswer {
+    /// Two encoders registered, the one image assigned to the first: the
+    /// engine's frontend with encoders behind it.
+    Encoders,
+    /// No encoder registered: the frontend leaves the request alone.
+    NoEncoder,
+    /// The dispatch itself fails before anything went out.
+    Failure(&'static str),
+}
+
+/// The lifecycle owner's dispatcher, scripted: records every call and the
+/// sink it was handed, counts its releases.
+struct ScriptedDispatcher {
+    answer: DispatchAnswer,
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+    sinks: Mutex<Vec<EncodeDispatchErrorSink>>,
+    released: Arc<AtomicUsize>,
+}
+
+impl ScriptedDispatcher {
+    fn new(answer: DispatchAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            calls: Mutex::default(),
+            sinks: Mutex::default(),
+            released: Arc::default(),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn released(&self) -> usize {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    /// The sink handed over with the call for `rid`.
+    fn sink_for(&self, rid: &str) -> EncodeDispatchErrorSink {
+        let calls = self.calls.lock().unwrap();
+        let index = calls
+            .iter()
+            .position(|(called, _)| called == rid)
+            .expect("a dispatched rid");
+        Arc::clone(&self.sinks.lock().unwrap()[index])
+    }
+
+    /// The servicer's config with this dispatcher and `ranks` scheduler ranks.
+    fn configure(self: &Arc<Self>, ranks: usize) -> impl FnOnce(&mut SglangServicerConfig) {
+        let dispatcher: Arc<dyn SglangEncodeDispatcher> = Arc::<Self>::clone(self);
+        move |config| {
+            config.encode_dispatcher = Some(dispatcher);
+            config.servicer.engine_count = ranks;
+        }
+    }
+}
+
+impl SglangEncodeDispatcher for ScriptedDispatcher {
+    fn dispatch(
+        &self,
+        request: EncodeDispatchRequest,
+    ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request.rid, request.image_urls));
+        self.sinks.lock().unwrap().push(request.on_error);
+        let released = Arc::clone(&self.released);
+        // Built only where the dispatch answers: the guard runs on drop, and a
+        // failed dispatch hands out no release.
+        let sent = move || {
+            EncodeRelease::new(
+                Box::new(move || {
+                    Box::pin(async move {
+                        released.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+                tokio::runtime::Handle::current(),
+            )
+        };
+        let answer = match &self.answer {
+            DispatchAnswer::Failure(message) => Err((*message).to_string()),
+            DispatchAnswer::Encoders => Ok(EncodeDispatchOutcome {
+                need_wait_for_mm_inputs: true,
+                num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
+                encoder_urls: Some(ENCODERS.iter().map(ToString::to_string).collect()),
+                sent: Some(sent()),
+            }),
+            DispatchAnswer::NoEncoder => Ok(EncodeDispatchOutcome {
+                need_wait_for_mm_inputs: false,
+                num_items_assigned: None,
+                encoder_urls: None,
+                sent: Some(sent()),
+            }),
+        };
+        Box::pin(std::future::ready(answer))
+    }
+}
+
+/// A vision model served by `ranks` scheduler ranks.
+fn vision_model(ranks: i32) -> SglangModelInfo {
+    let mut model = model_info();
+    model.supports_vision = true;
+    model.data_parallel_size = ranks;
+    model
+}
+
+/// A request naming one image by reference beside its unexpanded prompt,
+/// `n` choices: what reaches a language-side worker.
+fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.tokenized = Some(sg::TokenizedInput {
+        original_text: UNEXPANDED_PROMPT.to_string(),
+        input_ids: vec![1, 7, 7, 7, 2],
+    });
+    request.sampling_params.as_mut().unwrap().n = n;
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        modalities: vec!["image".to_string()],
+        image_urls: vec![IMAGE_REFERENCE.to_string()],
+        ..Default::default()
+    }));
+    request
+}
+
+/// On a language-side worker a request's image references go to the
+/// encoders before the request goes to its scheduler rank, one dispatch per
+/// choice under the choice's own id; the scheduler's request carries the
+/// unexpanded prompt and the three slots the dispatch set, and no processor
+/// output. A failure the dispatcher reports once the request is out reaches
+/// the rank that holds the request, after it, as the scheduler's own notice;
+/// the other rank sees nothing.
+#[tokio::test]
+async fn a_language_side_request_is_dispatched_to_the_encoders_before_its_rank() {
+    let dispatcher = ScriptedDispatcher::new(DispatchAnswer::Encoders);
+    let mut h = harness_with(vision_model(2), dispatcher.configure(2)).await;
+    let mut stream = h
+        .client
+        .generate(media_reference_request("epd", 2))
+        .await
+        .expect("generate")
+        .into_inner();
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+    // The two choices spread over the two idle ranks (the connector reserves
+    // its choice): one scheduler request on each.
+    let mut rid_by_rank = BTreeMap::new();
+    for (rank, engine) in [(0u32, &mut h.engine_in), (1, &mut rank1_in)] {
+        let add = recv_add(engine).await;
+        assert_eq!(add.need_wait_for_mm_inputs, Some(true), "{}", add.rid);
+        assert_eq!(
+            add.num_items_assigned,
+            Some(BTreeMap::from([(1, vec![1, 0])]))
+        );
+        assert_eq!(
+            add.encoder_urls,
+            Some(ENCODERS.iter().map(ToString::to_string).collect())
+        );
+        assert_eq!(add.input_text.as_deref(), Some(UNEXPANDED_PROMPT));
+        assert_eq!(add.input_ids, vec![1, 7, 7, 7, 2]);
+        assert!(
+            add.mm_inputs.is_none(),
+            "no processor output on the language side"
+        );
+        rid_by_rank.insert(rank, add.rid);
+    }
+    let mut rids: Vec<String> = rid_by_rank.values().cloned().collect();
+    rids.sort();
+    assert_eq!(rids, ["epd-0", "epd-1"]);
+    let calls = dispatcher.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for (rid, urls) in &calls {
+        assert!(rids.contains(rid), "{rid}");
+        assert_eq!(urls, &[IMAGE_REFERENCE.to_string()]);
+    }
+    // Released once each request was on the wire.
+    wait_until(|| dispatcher.released() == 2).await;
+
+    // The encoder behind rank 1's request fails: the notice follows the
+    // request on rank 1 (the bytes the wire test pins); rank 0 sees nothing.
+    let failing = rid_by_rank[&1].clone();
+    let error = EncoderDispatchErrorReq {
+        rid: failing.clone(),
+        error_msg: format!("Encode failed for request {failing}: boom"),
+        error_code: 502,
+    };
+    dispatcher.sink_for(&failing)(error.clone());
+    let frames = rank1_in.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let notice: EncoderDispatchErrorReq = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert_eq!(notice, error);
+    assert_scheduler_idle(&mut h.engine_in).await;
+
+    // Both ranks finish their request; the caller gets its two completions.
+    for (rank, engine_out) in [(0u32, &mut h.engine_out), (1, &mut rank1_out)] {
+        send(
+            engine_out,
+            &batch(&rid_by_rank[&rank], vec![10], 1, Some("stop"), None),
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+    }
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Media references a worker cannot have encoded are refused before the
+/// scheduler, by name: on a worker with no encode dispatch (not a
+/// language-side worker), on a language-side worker whose dispatch finds no
+/// encoder registered (the dispatcher is released even so), and when the
+/// dispatch itself fails; a failure reported for a request that never went
+/// out reaches no rank. The refused id is free again: a text request under
+/// it reaches the scheduler.
+#[tokio::test]
+async fn media_references_a_worker_cannot_encode_are_refused_before_the_scheduler() {
+    let mut h = harness(vision_model(1)).await;
+    let status = h
+        .client
+        .generate(media_reference_request("refs", 1))
+        .await
+        .expect_err("no encode dispatch on this worker");
+    assert_eq!(
+        status.code(),
+        Code::FailedPrecondition,
+        "{}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("runs no encode dispatch"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    for (answer, code, needle) in [
+        (
+            DispatchAnswer::NoEncoder,
+            Code::FailedPrecondition,
+            "no encoder is registered with this language-only worker",
+        ),
+        (
+            DispatchAnswer::Failure("the encoder list is empty"),
+            Code::Internal,
+            "encode dispatch failed: the encoder list is empty",
+        ),
+    ] {
+        let releases = usize::from(matches!(answer, DispatchAnswer::NoEncoder));
+        let dispatcher = ScriptedDispatcher::new(answer);
+        let mut h = harness_with(vision_model(1), dispatcher.configure(1)).await;
+        let status = h
+            .client
+            .generate(media_reference_request("refs", 1))
+            .await
+            .expect_err("refused before the scheduler");
+        assert_eq!(status.code(), code, "{}", status.message());
+        assert!(status.message().contains(needle), "{}", status.message());
+        assert_eq!(
+            dispatcher.calls(),
+            vec![("refs".to_string(), vec![IMAGE_REFERENCE.to_string()])]
+        );
+        assert_eq!(dispatcher.released(), releases);
+        // A failure reported now is for a request no rank holds: dropped.
+        dispatcher.sink_for("refs")(EncoderDispatchErrorReq {
+            rid: "refs".to_string(),
+            error_msg: "late".to_string(),
+            error_code: 500,
+        });
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _stream = h
+            .client
+            .generate(generate_request("refs", true, Vec::new()))
+            .await
+            .expect("the id is free again")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "refs");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }
 
 /// Model and server info come from the launcher's facts plus the handshake's
@@ -1262,6 +2127,187 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Hidden states ride the appended slim column as the rows each tick adds:
+/// each chunk carries them flattened (the prefill block on the first, a decode
+/// step's rows on each later one); the `Complete` one entry per position a
+/// forward ran on (the prompt positions the prefill computed, then each
+/// generated token fed back; the last sampled token has none), the final
+/// layer, the positions absolute (a prefix the radix cache served has no
+/// rows: the anchor comes from the scheduler's counters); a request that did
+/// not ask carries none.
+#[tokio::test]
+async fn hidden_states_pass_through_as_tick_rows_and_positions() {
+    let mut model = model_info();
+    model.server_args_json = r#"{"return_hidden_states_mode":"full"}"#.to_string();
+    let mut h = harness(model).await;
+    let request = sg::GenerateRequest {
+        return_hidden_states: true,
+        ..generate_request("h1", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    let sent = recv_add(&mut h.engine_in).await;
+    assert!(sent.return_hidden_states);
+    // The prefill block: one row per prompt position (three), hidden size 2.
+    // The first token is sampled from the last of them, so the prefill's tick
+    // carries no row of its own.
+    let mut rows = vec![vec![0.5, -0.5], vec![0.25, 0.75], vec![1.0, 0.0]];
+    let first = BatchTokenIDSlimOutput {
+        output_hidden_states: vec![Some(rows.clone())],
+        ..batch("h1", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk1.hidden_states, vec![0.5, -0.5, 0.25, 0.75, 1.0, 0.0]);
+    // The decode step that samples the second token fed the first one back:
+    // its row, the only one this tick adds, and the request's last
+    // (prompt + generated - 1 = 4).
+    rows.push(vec![3.0, 4.0]);
+    let last = BatchTokenIDSlimOutput {
+        output_hidden_states: vec![Some(vec![vec![3.0, 4.0]])],
+        ..batch("h1", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk2.hidden_states, vec![3.0, 4.0], "the tick's row only");
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.output_ids, vec![10, 11]);
+    assert_eq!(done.all_hidden_states.len(), rows.len());
+    for (position, (entry, row)) in done.all_hidden_states.iter().zip(&rows).enumerate() {
+        assert_eq!(entry.values, *row);
+        assert_eq!(entry.layer, -1, "the final hidden layer");
+        assert_eq!(entry.position, i32::try_from(position).unwrap());
+    }
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // A prefix the radix cache served has no rows: the prefill block holds the
+    // computed positions only, and the positions stay absolute, anchored from
+    // the scheduler's counters (a prompt of five, three of them cached, two
+    // generated: rows at 3, 4 and 5).
+    let request = sg::GenerateRequest {
+        return_hidden_states: true,
+        ..generate_request("h2", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    recv_add(&mut h.engine_in).await;
+    let first = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![5.0, 5.5], vec![6.0, 6.5]])],
+        ..batch("h2", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk1.hidden_states, vec![5.0, 5.5, 6.0, 6.5]);
+    let last = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![7.0, 7.5]])],
+        ..batch("h2", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk2.hidden_states, vec![7.0, 7.5]);
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        done.all_hidden_states
+            .iter()
+            .map(|entry| entry.position)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert_eq!(done.all_hidden_states[2].values, vec![7.0, 7.5]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // Without the flag nothing is asked and nothing rides the responses.
+    let mut stream = h
+        .client
+        .generate(generate_request("h2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!recv_add(&mut h.engine_in).await.return_hidden_states);
+    send(
+        &mut h.engine_out,
+        &batch("h2", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert!(chunk1.hidden_states.is_empty());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(done.all_hidden_states.is_empty());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `return_hidden_states` is kept to the scheduler's launch-time cap ahead of
+/// the scheduler, with the engine frontend's own words: refused under
+/// `--return-hidden-states-mode last` or none, forwarded under `full` (the
+/// earlier `--enable-return-hidden-states` included) and when the launcher's
+/// server args name no cap at all.
+#[tokio::test]
+async fn hidden_states_are_kept_to_the_schedulers_launch_time_cap() {
+    for (args, words) in [
+        (
+            r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":false}"#,
+            "exceeds the server maximum `last`",
+        ),
+        (
+            // The engine's order: `last` wins over the legacy flag it sets itself.
+            r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":true}"#,
+            "exceeds the server maximum `last`",
+        ),
+        (
+            r#"{"return_hidden_states_mode":null,"enable_return_hidden_states":false}"#,
+            "not configured to return hidden states",
+        ),
+    ] {
+        let mut model = model_info();
+        model.server_args_json = args.to_string();
+        let mut h = harness(model).await;
+        let request = sg::GenerateRequest {
+            return_hidden_states: true,
+            ..generate_request("c1", false, Vec::new())
+        };
+        let refused = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(
+            refused.message().contains(words)
+                && refused
+                    .message()
+                    .contains("`--return-hidden-states-mode full`"),
+            "{}",
+            refused.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+    for args in [
+        r#"{"return_hidden_states_mode":"full","enable_return_hidden_states":false}"#,
+        r#"{"return_hidden_states_mode":null,"enable_return_hidden_states":true}"#,
+        r#"{"tp_size":1}"#,
+    ] {
+        let mut model = model_info();
+        model.server_args_json = args.to_string();
+        let mut h = harness(model).await;
+        let request = sg::GenerateRequest {
+            return_hidden_states: true,
+            ..generate_request("c2", false, Vec::new())
+        };
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        assert!(
+            recv_add(&mut h.engine_in).await.return_hidden_states,
+            "{args}"
+        );
+        send(
+            &mut h.engine_out,
+            &batch("c2", vec![10], 1, Some("stop"), None),
+        )
+        .await;
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.output_ids, vec![10]);
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
 /// With a publisher configured, `SubscribeKvEvents` relays it: the call
 /// resolves before any event, batches arrive under the publisher's sequence
 /// numbers, and stopping the servicer closes the subscription.
@@ -1336,57 +2382,21 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
 /// history, and the first subscription gets them as the engine's whole state.
 #[tokio::test]
 async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
-    use zeromq::{prelude::*, PubSocket};
+    use crate::testing::{bound_publisher, relay_takes_the_first_two_batches};
 
-    use crate::kv_events::golden;
-
-    let mut publisher = PubSocket::new();
-    let port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
+    let (mut publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model).await;
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // The SUB connect is asynchronous: publish sequence 0 until the relay,
-    // with no subscriber of its own yet, has taken it (repeats are duplicates).
-    let batch1 = golden::bytes(golden::BATCH1);
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 0, &batch1))
-            .await
-            .expect("publish");
-        if relay.counts().relayed >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        relay.counts().relayed,
-        1,
-        "the relay took sequence 0 before any gateway subscribed"
-    );
-    publisher
-        .send(golden::frame(b"kv", 1, &golden::bytes(golden::BATCH2)))
-        .await
-        .expect("publish");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(relay.counts().relayed, 2);
+    relay_takes_the_first_two_batches(&mut publisher, &relay).await;
 
     // The first gateway gets both from the history: the engine's whole state.
     let mut stream = h
@@ -1414,92 +2424,23 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    use crate::kv_events::golden;
-
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model).await;
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -1556,6 +2497,11 @@ async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
     config.servicer.engine_startup_timeout = Duration::from_millis(300);
     let server = SglangServicerServer::start(config).expect("servicer starts");
     wait_until(|| matches!(server.last_error(), Ok(Some(_)))).await;
+    let error = server.last_error().unwrap().unwrap();
+    assert!(
+        error.starts_with("SGLang scheduler connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     assert!(server.running());
     let mut client = SglangSchedulerClient::connect(format!("http://{}", server.address()))
@@ -1743,7 +2689,12 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     assert_eq!(done.output_ids, vec![10]);
     // The shutdown lands between the completion and the poll that ends the
     // stream: `cancel_all` is what `stop()` fires first.
-    h.server.state.registry.cancel_all().expect("cancel_all");
+    h.server
+        .state
+        .shared
+        .registry
+        .cancel_all()
+        .expect("cancel_all");
     assert!(
         stream.next().bounded().await.is_none(),
         "a clean end after the completion, not a status"
@@ -1772,6 +2723,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publishers");
@@ -1829,5 +2781,1205 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
         .expect("a batch");
     assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler release whose sampling struct moved a field inside the prefix
+/// this servicer fills: the link fails at the handshake with the struct and
+/// the field named, before any request is sent to be refused one by one.
+#[tokio::test]
+async fn a_scheduler_whose_request_layout_moved_fails_the_link_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let server = SglangServicerServer::start(config(dir.path(), &handshake, model_info()))
+        .expect("servicer starts");
+    let mut moved = default_ready_response();
+    moved.positional_layouts.insert(
+        "SamplingParams".to_string(),
+        ["max_new_tokens", "stop", "watermark", "stop_token_ids"]
+            .map(str::to_string)
+            .to_vec(),
+    );
+    // The mock scheduler registers; the servicer refuses the link right after
+    // and drops the transport under the mock, whose connect may then fail.
+    let scheduler = tokio::time::timeout(
+        MOCK_DEADLINE,
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), moved),
+    );
+    let failed = wait_until(|| matches!(server.last_error(), Ok(Some(_))));
+    let (_scheduler, ()) = tokio::join!(scheduler, failed);
+    let error = server.last_error().unwrap().unwrap();
+    assert!(
+        error.contains(
+            "wire layout mismatch: engine EngineId(0000): `SamplingParams` field 2 is \
+             `stop_token_ids` on this side and `watermark` on the engine's"
+        ),
+        "{error}"
+    );
+    assert!(!server.engine_ready());
+    let mut client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let health = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!health.healthy);
+    assert_eq!(health.message, "Engine connection failed");
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// What the scheduler enforces of a structured request, as the launcher's
+/// `server_args` say: the grammar backend it resolved, the kinds that
+/// backend compiles, and no backend at all without a tokenizer.
+#[test]
+fn structured_outputs_support_follows_the_launcher_args() {
+    use engine_zmq_adapter::{
+        ConstraintKinds, StructuredOutputBackend,
+        StructuredOutputsBackendConfig::{Other, Pinned},
+        StructuredOutputsSupport,
+    };
+    let support = |server_args_json: &str| {
+        structured_outputs_support(&SglangModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        support(r#"{"grammar_backend":"xgrammar"}"#),
+        Pinned(StructuredOutputBackend::Xgrammar).into()
+    );
+    assert_eq!(
+        support(r#"{"grammar_backend":"llguidance"}"#),
+        Pinned(StructuredOutputBackend::Guidance).into()
+    );
+    assert_eq!(
+        support(r#"{"grammar_backend":"outlines"}"#),
+        StructuredOutputsSupport::new(
+            Pinned(StructuredOutputBackend::Outlines),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: false,
+                structural_tag: false,
+            },
+        )
+    );
+    assert_eq!(
+        support(r#"{"grammar_backend":"none"}"#),
+        StructuredOutputsSupport::DISABLED
+    );
+    // Without its tokenizer the scheduler builds no grammar backend, whatever
+    // the flag says.
+    assert_eq!(
+        support(r#"{"grammar_backend":"xgrammar","skip_tokenizer_init":true}"#),
+        StructuredOutputsSupport::DISABLED
+    );
+    // A plugin backend of the scheduler's is not judged here.
+    assert_eq!(support(r#"{"grammar_backend":"my_backend"}"#), Other.into());
+    // A launcher that wrote no backend: the engine's default.
+    assert_eq!(
+        support(r#"{"model_path":"org/model"}"#),
+        StructuredOutputsSupport::default()
+    );
+    assert_eq!(support(""), StructuredOutputsSupport::default());
+}
+
+/// A constraint the scheduler's grammar backend cannot enforce is refused
+/// before the scheduler, as the caller's error, on this wire as on the
+/// others: every kind under `--grammar-backend none` (the scheduler would
+/// admit the request and abort it), a kind outside the backend's set, and a
+/// schema with a feature xgrammar drops; what the backend compiles reaches
+/// the scheduler with its constraint, and an unconstrained request is served
+/// as before.
+#[tokio::test]
+async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_scheduler() {
+    use sg::sampling_params::Constraint;
+
+    let with_backend = |server_args_json: &str| SglangModelInfo {
+        server_args_json: server_args_json.to_string(),
+        ..model_info()
+    };
+    let constrained = |id: &str, constraint: Constraint| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint = Some(constraint);
+        request
+    };
+    const SCHEMA: &str = r#"{"type":"object","properties":{"city":{"type":"string"}}}"#;
+    let schema = || Constraint::JsonSchema(SCHEMA.to_string());
+    let regex = || Constraint::Regex("[0-9]+".to_string());
+    let ebnf = || Constraint::EbnfGrammar("root ::= \"a\"".to_string());
+
+    // No backend: every kind is refused up front; nothing reaches the
+    // scheduler but the unconstrained request.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"none"}"#)).await;
+        for (id, constraint) in [
+            ("n1", schema()),
+            ("n2", regex()),
+            ("n3", ebnf()),
+            (
+                "n4",
+                Constraint::StructuralTag(r#"{"format":{}}"#.to_string()),
+            ),
+        ] {
+            let status = h
+                .client
+                .generate(constrained(id, constraint))
+                .await
+                .expect_err("refused");
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("grammar backend disabled (`none`)"),
+                "{id}: {}",
+                status.message()
+            );
+        }
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _stream = h
+            .client
+            .generate(generate_request("n5", false, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "n5");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // xgrammar: a schema and a regex reach the scheduler with their
+    // constraint; a schema with a feature xgrammar drops is refused.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"xgrammar"}"#)).await;
+        let _schema_stream = h
+            .client
+            .generate(constrained("x1", schema()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.json_schema.as_deref(), Some(SCHEMA));
+        let _regex_stream = h
+            .client
+            .generate(constrained("x2", regex()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.regex.as_deref(), Some("[0-9]+"));
+        let status = h
+            .client
+            .generate(constrained(
+                "x3",
+                Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
+            ))
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("`multipleOf` at its root")
+                && status.message().contains("not supported by xgrammar"),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // outlines compiles JSON schemas and regular expressions only.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"outlines"}"#)).await;
+        let status = h
+            .client
+            .generate(constrained("o1", ebnf()))
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains(
+                "`outlines`, the structured-output backend this engine runs, compiles JSON \
+                 schemas and regular expressions only"
+            ),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _regex_stream = h
+            .client
+            .generate(constrained("o2", regex()))
+            .await
+            .expect("generate")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "o2");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
+/// A prompt that fills the scheduler's context window, or an empty one, is
+/// refused before the scheduler sees it, with both lengths named; the
+/// refusal releases the registration, so the same id then serves a healthy
+/// request.
+#[tokio::test]
+async fn a_prompt_the_window_cannot_hold_is_refused_before_the_scheduler() {
+    let mut h = harness(model_info()).await;
+    for (input_ids, max_new_tokens) in [
+        (vec![7; 1_049_692], Some(16_384)),
+        (vec![7; 1_048_576], None),
+        (Vec::new(), Some(8)),
+    ] {
+        let mut request = generate_request("window", true, Vec::new());
+        request
+            .tokenized
+            .as_mut()
+            .unwrap()
+            .input_ids
+            .clone_from(&input_ids);
+        request.sampling_params.as_mut().unwrap().max_new_tokens = max_new_tokens;
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("the prompt leaves no room for output");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        if input_ids.is_empty() {
+            assert!(status.message().contains("empty"), "{}", status.message());
+        } else {
+            assert!(
+                status.message().contains(&input_ids.len().to_string()),
+                "{}",
+                status.message()
+            );
+            assert!(status.message().contains("1048576"), "{}", status.message());
+        }
+    }
+    let mut request = generate_request("window", true, Vec::new());
+    request.tokenized = None;
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("no tokenized input");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert!(h.server.engine_ready());
+    // Reusing the refused id proves the registration was released, and a
+    // healthy request still reaches the scheduler.
+    let _stream = h
+        .client
+        .generate(generate_request("window", true, Vec::new()))
+        .await
+        .expect("healthy request after refusal")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.rid, "window");
+    assert_eq!(accepted.input_ids, vec![1, 2, 3]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler started with `--allow-auto-truncate` cuts a long prompt down
+/// to its own bound instead of aborting the request: its servicer leaves the
+/// upper bound to it, so the window-filling prompt reaches the scheduler
+/// whole, while an empty prompt is still refused before it.
+#[tokio::test]
+async fn a_scheduler_started_to_truncate_keeps_the_upper_bound_to_itself() {
+    let mut model = model_info();
+    let args = model.server_args_json.replace(
+        "\"tp_size\":2",
+        "\"tp_size\":2,\"allow_auto_truncate\":true",
+    );
+    assert_ne!(
+        args, model.server_args_json,
+        "the flag was added to the launcher's arguments"
+    );
+    model.server_args_json = args;
+    let mut h = harness(model).await;
+    let mut request = generate_request("long", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![7; 1_049_692];
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("left to the scheduler's own bound")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.rid, "long");
+    assert_eq!(accepted.input_ids.len(), 1_049_692);
+    let mut empty = generate_request("empty", true, Vec::new());
+    empty.tokenized.as_mut().unwrap().input_ids.clear();
+    let status = h
+        .client
+        .generate(empty)
+        .await
+        .expect_err("an empty prompt is refused whatever the scheduler truncates");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The configured engine-silence bound and prefill allowance reach the
+/// scheduler's link: with a 300 ms window and one token per second allowed
+/// for the prompt pending prefill (three tokens: three seconds), a scheduler
+/// that reads a request and never answers is given up on at the window plus
+/// the allowance, well under the crate's five-minute default, and the stream
+/// ends with the engine's death.
+#[tokio::test]
+async fn the_configured_silence_bound_and_prefill_allowance_reach_the_scheduler_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let window = Duration::from_millis(300);
+    let allowance = Duration::from_secs(3);
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_silence_timeout = window;
+    config.servicer.engine_prefill_tokens_per_sec = 1;
+    let server = SglangServicerServer::start(config).unwrap();
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    let mut client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let (mut engine_in, _engine_out) = engine.split();
+    let started = Instant::now();
+    let mut stream = client
+        .generate(generate_request("r-silent", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut engine_in).await.input_ids, vec![1, 2, 3]);
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a scheduler silent past the window and the allowance is dead");
+    assert!(
+        status
+            .message()
+            .contains("engine core reported fatal failure"),
+        "{}",
+        status.message()
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= window + allowance && elapsed < Duration::from_secs(15),
+        "given up on at the window plus the prompt's allowance, not before or much after: {elapsed:?}"
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Metrics: the `/metrics` listener and the families the request path records.
+// ---------------------------------------------------------------------------
+
+/// A bound servicer with its metrics listener on an ephemeral port, a
+/// handshaken mock scheduler and a gRPC client.
+async fn metrics_harness(model: SglangModelInfo) -> Harness {
+    harness_with(model, |config| {
+        config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    })
+    .await
+}
+
+/// One scrape of the servicer's metrics listener.
+fn scrape(server: &SglangServicerServer) -> String {
+    let address = server
+        .metrics_address()
+        .expect("a metrics listener")
+        .parse()
+        .expect("a socket address");
+    let (status, body) = http_get(address, "/metrics");
+    assert_eq!(status, 200);
+    body
+}
+
+/// The value of the sample of `name` whose labels contain `labels`.
+fn sample(body: &str, name: &str, labels: &str) -> f64 {
+    let prefix = format!("{name}{{");
+    body.lines()
+        .find(|line| {
+            line.starts_with(&prefix) && labels.split(',').all(|label| line.contains(label))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no sample {name}{{{labels}}} in:\n{body}"))
+}
+
+/// The exposition after the scripted sequence of
+/// `the_scrape_pins_the_families_after_a_scripted_sequence`: every family,
+/// type, label set and value, the histogram buckets aside (their edges are
+/// pinned apart) and the clock-dependent values replaced by `<v>`. This
+/// wire has no string-stop family: the scheduler matches stop strings.
+const GOLDEN_SCRAPE: &str = r#"
+# HELP smg_servicer_e2e_request_latency_seconds Seconds from a request's arrival at the servicer to the end of its stream.
+# HELP smg_servicer_generation_tokens_total Generated tokens streamed to callers.
+# HELP smg_servicer_inter_token_latency_seconds Seconds between consecutive output chunks of a choice, per token when a chunk carries several (servicer clock; sampled above a pending-observation bound).
+# HELP smg_servicer_metrics_dropped_total Observations the pressure sampler dropped, by family.
+# HELP smg_servicer_metrics_scrape_seconds How long the last scrape took to render.
+# HELP smg_servicer_metrics_scrapes_total Scrapes answered, by HTTP status code.
+# HELP smg_servicer_prompt_tokens_cached_total Prompt tokens the engine served from its prefix cache.
+# HELP smg_servicer_prompt_tokens_total Prompt tokens as the engine reported them at each request's first output.
+# HELP smg_servicer_request_errors_total Requests that failed with a gRPC status, by code.
+# HELP smg_servicer_request_generation_tokens Generated tokens per request.
+# HELP smg_servicer_request_params_max_tokens The max_tokens parameter of requests that set it.
+# HELP smg_servicer_request_params_n The n parameter of requests.
+# HELP smg_servicer_request_prompt_tokens Prompt tokens per request.
+# HELP smg_servicer_request_time_per_output_token_seconds Mean seconds per generated token after the first, per request (servicer clock).
+# HELP smg_servicer_requests_active Admitted requests still preprocessing, streaming, or unwinding an abort.
+# HELP smg_servicer_requests_refused_total Requests refused before they reached the engine, by reason.
+# HELP smg_servicer_requests_total Requests whose stream ended, by how they ended; a fan-out (n > 1) is one request with the reason of its last choice to end, an abort winning.
+# HELP smg_servicer_start_time_seconds When the servicer started, in seconds since the Unix epoch.
+# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held, admitting the warm-up's own requests only), draining (admission closed) or engine_down.
+# HELP smg_servicer_time_to_first_token_seconds Seconds from a request's arrival at the servicer to its first output.
+# TYPE smg_servicer_e2e_request_latency_seconds histogram
+# TYPE smg_servicer_generation_tokens_total counter
+# TYPE smg_servicer_inter_token_latency_seconds histogram
+# TYPE smg_servicer_metrics_dropped_total counter
+# TYPE smg_servicer_metrics_scrape_seconds gauge
+# TYPE smg_servicer_metrics_scrapes_total counter
+# TYPE smg_servicer_prompt_tokens_cached_total counter
+# TYPE smg_servicer_prompt_tokens_total counter
+# TYPE smg_servicer_request_errors_total counter
+# TYPE smg_servicer_request_generation_tokens histogram
+# TYPE smg_servicer_request_params_max_tokens histogram
+# TYPE smg_servicer_request_params_n histogram
+# TYPE smg_servicer_request_prompt_tokens histogram
+# TYPE smg_servicer_request_time_per_output_token_seconds histogram
+# TYPE smg_servicer_requests_active gauge
+# TYPE smg_servicer_requests_refused_total counter
+# TYPE smg_servicer_requests_total counter
+# TYPE smg_servicer_start_time_seconds gauge
+# TYPE smg_servicer_state gauge
+# TYPE smg_servicer_time_to_first_token_seconds histogram
+smg_servicer_e2e_request_latency_seconds_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_e2e_request_latency_seconds_sum{model="served",wire="sglang",rank="0"} <v>
+smg_servicer_generation_tokens_total{model="served",wire="sglang",rank="0"} 8
+smg_servicer_inter_token_latency_seconds_count{model="served",wire="sglang",rank="0"} 2
+smg_servicer_inter_token_latency_seconds_sum{model="served",wire="sglang",rank="0"} <v>
+smg_servicer_metrics_dropped_total{model="served",wire="sglang",family="inter_token_latency"} 0
+smg_servicer_metrics_scrape_seconds{model="served",wire="sglang"} <v>
+smg_servicer_metrics_scrapes_total{model="served",wire="sglang",code="200"} 0
+smg_servicer_metrics_scrapes_total{model="served",wire="sglang",code="500"} 0
+smg_servicer_prompt_tokens_cached_total{model="served",wire="sglang",rank="0"} 1
+smg_servicer_prompt_tokens_total{model="served",wire="sglang",rank="0"} 15
+smg_servicer_request_errors_total{model="served",wire="sglang",code="unavailable"} 1
+smg_servicer_request_generation_tokens_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_request_generation_tokens_sum{model="served",wire="sglang",rank="0"} 8
+smg_servicer_request_params_max_tokens_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_request_params_max_tokens_sum{model="served",wire="sglang",rank="0"} 40
+smg_servicer_request_params_n_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_request_params_n_sum{model="served",wire="sglang",rank="0"} 5
+smg_servicer_request_prompt_tokens_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_request_prompt_tokens_sum{model="served",wire="sglang",rank="0"} 15
+smg_servicer_request_time_per_output_token_seconds_count{model="served",wire="sglang",rank="0"} 2
+smg_servicer_request_time_per_output_token_seconds_sum{model="served",wire="sglang",rank="0"} <v>
+smg_servicer_requests_active{model="served",wire="sglang"} 0
+smg_servicer_requests_refused_total{model="served",wire="sglang",reason="draining"} 0
+smg_servicer_requests_refused_total{model="served",wire="sglang",reason="duplicate_id"} 1
+smg_servicer_requests_refused_total{model="served",wire="sglang",reason="invalid_argument"} 0
+smg_servicer_requests_refused_total{model="served",wire="sglang",reason="media"} 0
+smg_servicer_requests_total{model="served",wire="sglang",rank="0",finish_reason="abort"} 1
+smg_servicer_requests_total{model="served",wire="sglang",rank="0",finish_reason="cut"} 1
+smg_servicer_requests_total{model="served",wire="sglang",rank="0",finish_reason="error"} 0
+smg_servicer_requests_total{model="served",wire="sglang",rank="0",finish_reason="length"} 1
+smg_servicer_requests_total{model="served",wire="sglang",rank="0",finish_reason="stop"} 2
+smg_servicer_start_time_seconds{model="served",wire="sglang"} <v>
+smg_servicer_state{model="served",wire="sglang",state="draining"} 1
+smg_servicer_state{model="served",wire="sglang",state="engine_down"} 0
+smg_servicer_state{model="served",wire="sglang",state="serving"} 0
+smg_servicer_state{model="served",wire="sglang",state="starting"} 0
+smg_servicer_state{model="served",wire="sglang",state="warming_up"} 0
+smg_servicer_time_to_first_token_seconds_count{model="served",wire="sglang",rank="0"} 5
+smg_servicer_time_to_first_token_seconds_sum{model="served",wire="sglang",rank="0"} <v>
+"#;
+
+/// One streamed request (three chunks, the scheduler's stop), one
+/// non-streamed (the budget), one the caller aborts, one duplicate id
+/// refused, one a shutdown cuts: the scrape's families, types, label sets
+/// and values are exactly these.
+#[tokio::test]
+async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
+    let mut h = metrics_harness(model_info()).await;
+    // Streamed: three single-token steps, the scheduler's stop on the last;
+    // the first step reports one cached prompt token.
+    let mut s1 = h
+        .client
+        .generate(generate_request("s1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut first = batch("s1", vec![10], 1, None, None);
+    first.cached_tokens = vec![1];
+    send(&mut h.engine_out, &first).await;
+    send(&mut h.engine_out, &batch("s1", vec![11], 2, None, None)).await;
+    send(
+        &mut h.engine_out,
+        &batch("s1", vec![12], 3, Some("stop"), None),
+    )
+    .await;
+    for _ in 0..3 {
+        chunk(s1.message().bounded().await.unwrap().unwrap());
+    }
+    assert_eq!(
+        complete(s1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(s1.message().bounded().await.unwrap().is_none());
+    // Non-streamed: one two-token step that ends on the budget.
+    let mut n1 = h
+        .client
+        .generate(generate_request("n1", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("n1", vec![20, 21], 2, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(n1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(n1.message().bounded().await.unwrap().is_none());
+    // The caller's abort after the first step.
+    let mut a1 = h
+        .client
+        .generate(generate_request("a1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("a1", vec![30], 1, None, None)).await;
+    chunk(a1.message().bounded().await.unwrap().unwrap());
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "a1".to_string(),
+            reason: "client left".to_string(),
+        })
+        .await
+        .expect("abort");
+    assert_eq!(
+        complete(a1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "abort"
+    );
+    assert!(a1.message().bounded().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["a1".to_string()]);
+    // A duplicate id refused while the first is in flight; the first then
+    // ends on the scheduler's stop.
+    let mut d1 = h
+        .client
+        .generate(generate_request("d1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let duplicate = h
+        .client
+        .generate(generate_request("d1", true, Vec::new()))
+        .await
+        .expect_err("a live id is refused");
+    assert_eq!(duplicate.code(), Code::AlreadyExists);
+    send(
+        &mut h.engine_out,
+        &batch("d1", vec![40], 1, Some("stop"), None),
+    )
+    .await;
+    chunk(d1.message().bounded().await.unwrap().unwrap());
+    complete(d1.message().bounded().await.unwrap().unwrap());
+    assert!(d1.message().bounded().await.unwrap().is_none());
+    // A shutdown cuts a request still open: the drain announced, every
+    // registered cancellation fired, the stream ends with the status.
+    let mut c1 = h
+        .client
+        .generate(generate_request("c1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("c1", vec![50], 1, None, None)).await;
+    chunk(c1.message().bounded().await.unwrap().unwrap());
+    h.server.set_serving(false);
+    h.server.state.shared.registry.cancel_all().unwrap();
+    let cut = c1.message().bounded().await.expect_err("a cut is a status");
+    assert_eq!(cut.code(), Code::Unavailable);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["c1".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+
+    let body = scrape(&h.server);
+    assert_bucket_edges(&body, 4096);
+    assert_golden(&body, GOLDEN_SCRAPE);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The in-flight gauge reads the registry at scrape: one while a stream is
+/// open, zero once the caller dropped it (which counts as the caller's
+/// abort).
+#[tokio::test]
+async fn the_active_gauge_falls_when_the_stream_drops() {
+    let mut h = metrics_harness(model_info()).await;
+    let stream = h
+        .client
+        .generate(generate_request("g1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(&body, "smg_servicer_requests_active", "wire=\"sglang\""),
+        1.0
+    );
+    drop(stream);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["g1".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(&body, "smg_servicer_requests_active", "wire=\"sglang\""),
+        0.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"abort\""
+        ),
+        1.0
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The listener is bound before the scheduler connects, so a scrape during
+/// its start answers `starting`; once it is up, `serving`.
+#[tokio::test]
+async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"starting\""),
+        1.0
+    );
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"serving\""),
+        1.0
+    );
+    drop(engine);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two connected schedulers whose handshakes each say a data-parallel size
+/// of one: the zero-filled `GetLoads` before the first snapshot names the
+/// ranks the servicer serves (one per connected scheduler), as the pinned
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
+#[tokio::test]
+async fn the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+struct NativeVideoProcessor;
+
+impl SglangMediaProcessor for NativeVideoProcessor {
+    /// Advertise the deterministic processor contract used by this test fixture.
+    fn identity_key(&self) -> Option<&str> {
+        Some("test-processor")
+    }
+
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        mut request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(async move {
+            let refs = request.mm_inputs.take().unwrap();
+            assert_eq!(refs.video_urls, ["data:video/mp4;base64,AA=="]);
+            assert!(refs.pixel_values.is_none());
+            assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
+            request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                modalities: vec!["video".into()],
+                pixel_values: Some(sg::TensorData {
+                    data: vec![0; 32].into(),
+                    shape: vec![2, 4],
+                    dtype: "float32".into(),
+                }),
+                model_specific_tensors: [(
+                    "video_grid_thw".into(),
+                    sg::TensorData {
+                        data: [1i64, 2, 2]
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        shape: vec![1, 3],
+                        dtype: "int64".into(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                im_token_id: Some(7),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                ..Default::default()
+            }));
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+/// References must expand tokens before their video tensors reach the scheduler.
+async fn native_video_refs_expand_before_scheduler_dispatch() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(NativeVideoProcessor));
+    })
+    .await;
+    let info = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.server_args.unwrap().fields["mm_processor"].kind,
+        Some(Kind::StringValue("smg".into()))
+    );
+    let mut request = generate_request("native-video", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    let _stream = h.client.generate(request).await.unwrap().into_inner();
+    let received = recv_add(&mut h.engine_in).await;
+    assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
+    let mm = received.mm_inputs.unwrap();
+    assert_eq!(mm.mm_items[0].modality, SglangWireModality::Video);
+    assert_eq!(mm.mm_items[0].offsets, Some(vec![(1, 3)]));
+    assert!(mm.mm_items[0]
+        .model_specific_data
+        .contains_key("video_grid_thw"));
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+struct PendingMediaProcessor;
+
+impl SglangMediaProcessor for PendingMediaProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        _request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+/// Aborting preprocessing unregisters the request without sending scheduler work.
+async fn abort_during_native_media_processing_never_submits_to_scheduler() {
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(PendingMediaProcessor));
+    })
+    .await;
+    let mut request = generate_request("pending-media", true, Vec::new());
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        image_urls: vec!["https://example.test/image.png".into()],
+        ..Default::default()
+    }));
+    let mut client = h.client.clone();
+    #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
+    let pending = tokio::spawn(async move { client.generate(request).await });
+    wait_until(|| h.server.active_requests() == 1).await;
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "pending-media".into(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = pending.bounded().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Cancelled);
+    wait_until(|| h.server.active_requests() == 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Keep engine hash opt-outs authoritative and reject out-of-range concurrency.
+fn cpu_mm_hash_configuration_preserves_engine_opt_outs() {
+    use super::mm_hash_threads;
+    assert_eq!(mm_hash_threads(Some("0"), true, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(Some("16"), true, "0", "0").unwrap(), 16);
+    for (gpu, skip) in [("64", "0"), ("0", "1"), ("unknown", "0"), ("0", "true")] {
+        assert_eq!(mm_hash_threads(Some("16"), true, gpu, skip).unwrap(), 0);
+    }
+    for invalid in ["-1", "33", "x"] {
+        assert!(mm_hash_threads(Some(invalid), true, "0", "0").is_err());
+    }
+}
+
+#[tokio::test]
+/// Verify early metadata delivery and Decode reuse or original-reference fallback.
+async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
+    use smg_grpc_client::sglang_media_identity as contract;
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"prefill"}"#.into();
+    let mut p = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut original = generate_request("reuse-video", true, Vec::new());
+    original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    original.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".into(),
+        bootstrap_port: 8998,
+        bootstrap_room: 1,
+    });
+    let mut prefill = original.clone();
+    prefill.return_media_identity = true;
+    let mut stream = p.client.generate(prefill).await.unwrap().into_inner();
+    let prefill_wire = recv_add(&mut p.engine_in).await;
+    // No engine output or KV readiness has been supplied: the control item
+    // must still arrive, otherwise real PD would deadlock here.
+    let early = tokio::time::timeout(Duration::from_secs(1), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(early.response.is_none());
+    let identity = early.media_identity.unwrap();
+    assert!(contract::validate(
+        &identity,
+        &original,
+        "v1:0.5.20:test-processor"
+    ));
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"decode"}"#.into();
+    let mut d = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut decode = original.clone();
+    decode.media_identity = Some(Box::new(identity.clone()));
+    let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
+    let wire = recv_add(&mut d.engine_in).await;
+    assert_eq!(wire.input_ids, prefill_wire.input_ids);
+    let pmm = prefill_wire.mm_inputs.unwrap();
+    let dmm = wire.mm_inputs.unwrap();
+    assert!(dmm.mm_items[0].feature.is_none());
+    assert!(pmm.mm_items[0].feature.is_some());
+    assert_eq!(dmm.mm_items[0].hash, pmm.mm_items[0].hash);
+    assert_eq!(dmm.mm_items[0].offsets, pmm.mm_items[0].offsets);
+    assert_eq!(
+        dmm.mm_items[0].model_specific_data,
+        pmm.mm_items[0].model_specific_data
+    );
+    let mut fallback_streams = Vec::new();
+    for case in 0..5 {
+        let mut req = original.clone();
+        req.request_id = format!("fallback-{case}");
+        let mut bad = identity.clone();
+        bad.request_digest = contract::request_digest(&req);
+        match case {
+            0 => bad.processor_key = "different-config".into(),
+            1 => bad.request_digest[0] ^= 1,
+            2 => bad.mm_inputs.as_mut().unwrap().mm_placeholders[0].length = u32::MAX,
+            3 => bad
+                .mm_inputs
+                .as_mut()
+                .unwrap()
+                .model_specific_tensors
+                .clear(),
+            _ => bad.version += 1,
+        }
+        req.media_identity = Some(Box::new(bad));
+        fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
+        let wire = recv_add(&mut d.engine_in).await;
+        assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);
+        assert!(
+            wire.mm_inputs.unwrap().mm_items[0].feature.is_some(),
+            "case {case} must process references"
+        );
+    }
+    p.server.stop(Duration::from_secs(5)).unwrap();
+    d.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Only complete supported processor contracts enable the default optimization.
+fn media_optimization_defaults_require_a_supported_identity() {
+    assert!(media_reuse_enabled(None, true).unwrap());
+    assert!(!media_reuse_enabled(None, false).unwrap());
+    assert!(!media_reuse_enabled(Some("0"), true).unwrap());
+    assert!(media_reuse_enabled(Some("1"), false).unwrap());
+    assert!(media_reuse_enabled(Some("auto"), true).is_err());
+    assert_eq!(mm_hash_threads(None, true, "0", "0").unwrap(), 16);
+    assert_eq!(mm_hash_threads(None, false, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 1000)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 1000))),
+    )
+    .await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 1000))),
+    )
+    .await;
+    chunk(third.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 1000))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

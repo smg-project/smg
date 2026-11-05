@@ -2,7 +2,11 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer, PromptEncoding};
+use llm_tokenizer::{
+    chat_template::ChatTemplateParams,
+    traits::{Encoding, Tokenizer},
+    PromptEncoding,
+};
 use openai_protocol::decisions::{DecisionResponse, DecisionsRequest};
 use serde_json::{json, Map, Value};
 
@@ -192,8 +196,15 @@ fn render_prompt(tokenizer: &Arc<dyn Tokenizer>, content: &str) -> Result<String
     if !matches!(rendered.encoding, PromptEncoding::FromText)
         || rendered.unbilled_prompt_tokens != 0
     {
+        // A renderer that prepared the encode itself: a template rendered by
+        // segments, or a control-token spelling inside the request text that
+        // the renderer keeps as text. Decisions encodes its prompt and the
+        // answer labels from the text, so it needs a text that encodes to
+        // the prompt's ids.
         return Err(
-            "Decisions requires a lossless text chat template, not a deferred prompt encoder"
+            "Decisions requires a prompt whose text encodes to its ids: this renderer \
+                    prepared a deferred encode (a template rendered by segments, or a \
+                    control-token spelling inside the request text)"
                 .into(),
         );
     }
@@ -293,7 +304,7 @@ fn suffixed_reasoning_markers(text: &str) -> impl Iterator<Item = (String, Strin
 async fn encode_ids(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Vec<u32>, String> {
     encode_blocking(tokenizer.clone(), text.to_owned(), false)
         .await
-        .map(|encoding| encoding.token_ids().to_vec())
+        .map(Encoding::into_token_ids)
         .map_err(|error| format!("Decisions tokenization failed: {error}"))
 }
 
@@ -567,7 +578,7 @@ mod tests {
     async fn rejects_deferred_encoders_before_label_scoring() {
         let tokenizer = Arc::new(MockTokenizer::new().with_deferred_chat_ids(vec![1]));
         let result = prepare_decisions(&request(), tokenizer, false).await;
-        assert!(result.err().unwrap().contains("encoder"));
+        assert!(result.err().unwrap().contains("deferred encode"));
     }
 
     #[tokio::test]

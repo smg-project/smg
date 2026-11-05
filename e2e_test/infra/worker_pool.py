@@ -64,6 +64,11 @@ class WorkerPool:
         self._gateway_key: tuple | None = None
         self._closed = False
 
+    def current_workers(self) -> list[Worker]:
+        """The cached regular workers as they stand (a snapshot; may be empty)."""
+        with self._lock:
+            return list(self._workers)
+
     def acquire(
         self,
         *,
@@ -211,11 +216,13 @@ class WorkerPool:
             gpus,
             tuple(extra_engine_args) if extra_engine_args else None,
         )
+        env = gateway_config.get("env")
         gateway_key = (
             model_path,
             gateway_config["policy"],
             gateway_config["timeout"],
             tuple(gateway_config["extra_args"]) if gateway_config["extra_args"] else None,
+            tuple(sorted(env.items())) if env else None,
             gateway_config.get("log_level"),
             gateway_config.get("log_dir"),
             log_dir,
@@ -247,11 +254,13 @@ class WorkerPool:
                 )
                 gateway.start(
                     worker_urls=[w.base_url for w in workers],
+                    workers=workers,
                     model_path=model_path,
                     backend=engine,
                     policy=gateway_config["policy"],
                     timeout=gateway_config["timeout"],
                     extra_args=gateway_config["extra_args"],
+                    env=env,
                     log_level=gateway_config.get("log_level"),
                     log_dir=gateway_config.get("log_dir"),
                 )

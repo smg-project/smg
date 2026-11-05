@@ -1,5 +1,5 @@
 ######################## FFMPEG IMAGE ########################
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS ffmpeg-image
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS ffmpeg-image
 
 # TODO: Add a scheduled updater for these source-built media dependencies.
 # Version and SHA256 must be updated together.
@@ -95,7 +95,7 @@ ENV LD_LIBRARY_PATH="${OPENCV_PREFIX}/lib:${FFMPEG_PREFIX}/lib"
 ENV PKG_CONFIG_PATH="${OPENCV_PREFIX}/lib/pkgconfig:${FFMPEG_PREFIX}/lib/pkgconfig"
 
 ######################## BASE IMAGE ##########################
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS base
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS base
 
 ARG PYTHON_VERSION=3.12
 

@@ -6,17 +6,32 @@
 //! per pair of markers as the template writes it and several in one as a model may write a
 //! parallel answer. Qwen 3.5 puts the
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
-//! [`Placement`](crate::tagged::Placement) says.
+//! [`Placement`] says.
+//!
+//! The table carries the one part of its chat template's layout the tags write: after the
+//! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
+//! first call (`</think>\n\n<tool_call>`), so a forced call written where the close left the
+//! engine begins with them, as the template writes it, and the call's marker is not the grammar's
+//! first text ([`Format::grammar_for`]). MiMo's template writes what follows right after the
+//! close, so the table under the direct placement carries none; the NVIDIA Nemotron 3 groups and
+//! Step 3.5 Flash, which read with the tagged table, write one newline there, which their entries
+//! in `groups.json` carry in the table's place (`after`). The thought the model opens and closes
+//! itself: a `<tool_call>` inside it is thought text, as the template reads it.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
-use crate::format::{CallSyntax, Emits, Format};
 #[cfg(test)]
-use crate::tagged::{Placement, Spelling};
+use crate::tagged::Spelling;
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::Placement,
+};
 
-/// The Qwen3 table, with the call syntax the checkpoint writes.
+/// The Qwen3 table, with the call syntax the checkpoint writes; under the direct placement
+/// (MiMo) without the thought layout, whose two newlines after the close that template does not
+/// write.
 pub fn qwen3(syntax: CallSyntax) -> Format {
-    Format::new("qwen3")
+    let format = Format::new("qwen3")
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("call_open", "<tool_call>")
@@ -30,7 +45,11 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
         .calls(syntax)
-        .opens_turn("<|im_start|>assistant")
+        .opens_turn("<|im_start|>assistant");
+    if matches!(syntax, CallSyntax::Tagged(_, Placement::Direct)) {
+        return format;
+    }
+    format.with_layout(super::thought_layout("</think>", "\n\n"))
 }
 
 #[cfg(test)]
@@ -40,7 +59,10 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, reasoning},
+        testing::{
+            a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
+            dropped, reasoning, the_same_at_every_cut, weather_declared, Said,
+        },
     };
 
     fn ids() -> CallIds {
@@ -52,6 +74,7 @@ mod tests {
         Engine::with_call_ids(Arc::new(format), declared, ids())
     }
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
@@ -69,28 +92,30 @@ mod tests {
         }
     }
 
-    fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Events with adjacent text of one kind joined and argument fragments joined per call, so two
     /// chunkings compare by what they said.
-    fn joined(events: Vec<Event>) -> Vec<Event> {
-        let mut out: Vec<Event> = Vec::new();
+    fn joined(events: Vec<Event<'static>>) -> Vec<Event<'static>> {
+        let mut out: Vec<Event<'static>> = Vec::new();
         for event in events {
             match (out.last_mut(), event) {
                 (Some(Event::Content(a)), Event::Content(b))
-                | (Some(Event::Reasoning(a)), Event::Reasoning(b)) => a.text.push_str(&b.text),
+                | (Some(Event::Reasoning(a)), Event::Reasoning(b)) => {
+                    a.text.to_mut().push_str(&b.text);
+                }
                 (
                     Some(Event::Dropped { text: a, why: wa }),
                     Event::Dropped { text: b, why: wb },
-                ) if *wa == wb => a.text.push_str(&b.text),
+                ) if *wa == wb => a.text.to_mut().push_str(&b.text),
                 (
                     Some(Event::ToolCallArguments {
                         index: i,
@@ -103,20 +128,13 @@ mod tests {
                         source: more_source,
                     },
                 ) if *i == j => {
-                    json.push_str(&more);
-                    source.text.push_str(&more_source.text);
+                    json.to_mut().push_str(&more);
+                    source.text.to_mut().push_str(&more_source.text);
                 }
                 (_, event) => out.push(event),
             }
         }
         out
-    }
-
-    fn dropped(text: &str) -> Event {
-        Event::Dropped {
-            text: Text::uncounted(text),
-            why: DropReason::Wrapper,
-        }
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,
@@ -292,14 +310,14 @@ mod tests {
 
     /// The content text of the events, in order.
     /// The whitespace the engine dropped as the template's spacing, event by event.
-    fn spacing(events: &[Event]) -> Vec<&str> {
+    fn spacing<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -308,7 +326,7 @@ mod tests {
     /// The content deltas a client of the stream receives when `pieces` arrive one by one after
     /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
     fn content_deltas(format: Format, prompt: &str, pieces: &[&str]) -> Vec<String> {
-        let mut parser = Engine::new(format, declared());
+        let mut parser = Engine::new(format, weather_declared());
         let mut out = Events::new();
         parser
             .feed(
@@ -471,7 +489,7 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some((text.text.clone(), text.tokens)),
+                } => Some((text.text.to_string(), text.tokens)),
                 _ => None,
             })
             .collect();
@@ -511,8 +529,20 @@ mod tests {
 
     #[test]
     fn a_closing_marker_with_nothing_open_is_content_and_a_fenced_marker_is_a_marker() {
+        // The close stays in the content where the model put it; the event of no bytes before it
+        // says the table read no frame there.
         let events = run(&["a</think>b"], EngineFinish::Stop);
-        assert_eq!(events[0], Event::Content(Text::uncounted("a</think>b")));
+        assert_eq!(
+            events[..3],
+            [
+                Event::Content(Text::uncounted("a")),
+                Event::Malformed {
+                    text: Text::uncounted(""),
+                    why: MalformedReason::MarkerOutOfPlace,
+                },
+                Event::Content(Text::uncounted("</think>b")),
+            ]
+        );
         let fenced = format!("The syntax is:\n```\n{CALL}\n```");
         let events = run(&[&fenced], EngineFinish::Stop);
         assert!(
@@ -590,8 +620,8 @@ mod tests {
             events
                 .iter()
                 .filter_map(|e| match e {
-                    Event::Dropped { text, .. } if dropped => Some(text.text.as_str()),
-                    Event::Malformed { text, .. } if !dropped => Some(text.text.as_str()),
+                    Event::Dropped { text, .. } if dropped => Some(&*text.text),
+                    Event::Malformed { text, .. } if !dropped => Some(&*text.text),
                     _ => None,
                 })
                 .collect()
@@ -714,13 +744,15 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => Some((t.text.clone(), t.tokens)),
+                Event::Content(t) | Event::Reasoning(t) => Some((t.text.to_string(), t.tokens)),
                 Event::Dropped { text, .. } | Event::Malformed { text, .. } => {
-                    Some((text.text.clone(), text.tokens))
+                    Some((text.text.to_string(), text.tokens))
                 }
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => Some((source.text.clone(), source.tokens)),
+                | Event::ToolCallEnd { source, .. } => {
+                    Some((source.text.to_string(), source.tokens))
+                }
                 _ => None,
             })
             .collect()
@@ -806,24 +838,29 @@ mod tests {
             ("</think>", &[(0, 8)]),
             ("", &[(0, 0)]),
         ];
+        let spans: Vec<Vec<TokenSpan>> = pieces
+            .iter()
+            .map(|(_, ranges)| {
+                ranges
+                    .iter()
+                    .map(|&(start, end)| TokenSpan {
+                        token_id: 0,
+                        start,
+                        end,
+                        continued: false,
+                    })
+                    .collect()
+            })
+            .collect();
         let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
-        for (text, ranges) in pieces {
-            let spans: Vec<TokenSpan> = ranges
-                .iter()
-                .map(|&(start, end)| TokenSpan {
-                    token_id: 0,
-                    start,
-                    end,
-                    continued: false,
-                })
-                .collect();
+        for ((text, _), spans) in pieces.iter().zip(&spans) {
             parser
                 .feed(
                     Input::Delta {
                         token_ids: &[],
                         text,
-                        spans: &spans,
+                        spans,
                     },
                     &mut out,
                 )
@@ -998,41 +1035,72 @@ mod tests {
         );
     }
 
-    /// A tool `get_weather` with a string `city` and an integer `days`.
-    fn declared() -> Declared {
-        use openai_protocol::common::{Function, Tool};
-        use serde_json::json as value;
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
-
     const TAGGED_CALL: &str = concat!(
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>",
         "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
     );
 
-    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        out.into_owned().drain()
+    }
+
+    /// A parameter written in XML-attribute style, `<parameter name="city">`, which the tagged
+    /// syntax has no tag for: the call is delivered with no arguments, and the model's lines are
+    /// refused, byte for byte, the whitespace between the words included, never the chat
+    /// message's content nor a delta, at every cut alike.
+    #[test]
+    fn an_xml_attribute_parameter_is_refused_never_content() {
+        let output = concat!(
+            "<tool_call>\n<function=get_weather>\n<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"days\">three or four days</parameter>\n</function>\n</tool_call>"
+        );
+        let lines = concat!(
+            "<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"days\">three or four days</parameter>"
+        );
+        let content = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect()
+        };
+        let whole = run_tagged(&[output], EngineFinish::Stop);
+        let message = chat::message(0, &whole).message;
+        assert_eq!(message.content, None);
+        let calls = message.tool_calls.expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments.as_deref(), Some("{}"));
+        assert_eq!(streamed(&whole), "");
+        assert_eq!(refused(&whole), lines);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run_tagged(&[&output[..cut], &output[cut..]], EngineFinish::Stop);
+            assert_eq!(content(&events), None, "cut at {cut}");
+            assert_eq!(streamed(&events), "", "cut at {cut}");
+            assert_eq!(refused(&events), lines, "cut at {cut}");
+        }
     }
 
     #[test]
@@ -1146,13 +1214,39 @@ mod tests {
                 ),
             ),
         ];
+        // Both functions declared: the engine announces a call to an undeclared one, and the
+        // subject here is the block's shape.
+        let two_tools = || {
+            use openai_protocol::common::{Function, Tool};
+            use serde_json::json as value;
+            let tool = |name: &str, parameters: serde_json::Value| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: name.to_string(),
+                    description: None,
+                    parameters,
+                    strict: None,
+                    extra: Default::default(),
+                },
+            };
+            Declared::of(&[
+                tool(
+                    "get_weather",
+                    value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
+                tool(
+                    "lookup",
+                    value!({"type": "object", "properties": {"id": {"type": "integer"}}}),
+                ),
+            ])
+        };
         for (placement, output) in shapes {
             let per_char: Vec<String> = output.chars().map(String::from).collect();
             let per_char: Vec<&str> = per_char.iter().map(String::as_str).collect();
             for pieces in [vec![output], per_char] {
                 let mut parser = engine(
                     qwen3(CallSyntax::Tagged(Spelling::Json, placement)),
-                    declared(),
+                    two_tools(),
                 );
                 let mut out = Events::new();
                 for piece in &pieces {
@@ -1203,22 +1297,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_block_its_marker_closes_inside_a_string_leaves_it_open_and_so_does_a_cut_stream() {
-        // The block's closing marker arrives before `</function>`, inside a string: nothing is
-        // closed for a value the model never finished, and one `Malformed` event of no bytes,
-        // under the engine's name for a block a marker closed, says so before the call's end.
+    fn a_tagged_block_its_marker_closes_inside_a_string_closes_it_there_and_a_cut_stream_does_not()
+    {
+        // The block's closing marker arrives before `</function>`, inside a string: the model
+        // ended the call, so the string is closed with the value's bytes whole, under one
+        // `Malformed { OpenAtTheMarker }` event of no bytes right before the closing quote, and
+        // the arguments read as JSON.
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
         let events = run_tagged(&[output], EngineFinish::Stop);
-        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
         assert_eq!(bytes(&events), output);
-        let ended = events
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .expect("the call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(
             matches!(
-                &events[ended - 1],
-                Event::Malformed { text, .. } if text.text.is_empty()
+                &events[at..at + 2],
+                [
+                    Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                    Event::ToolCallArguments { json, .. }
+                ] if text.text.is_empty() && json == "\""
             ),
             "{events:#?}"
         );
@@ -1274,10 +1373,10 @@ mod tests {
     }
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
-    fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
+    fn after_prompt(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         parser
@@ -1298,7 +1397,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -1355,7 +1454,7 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop, under the JSON
     /// syntax.
-    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event> {
+    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
@@ -1376,7 +1475,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -1642,5 +1741,175 @@ mod tests {
             ),
             Err(ParseError::Lifecycle(_))
         ));
+    }
+
+    /// The tool `get_weather` of [`weather_declared()`] and one without parameters, as a request lists
+    /// them.
+    fn weather_tools() -> Vec<openai_protocol::common::Tool> {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        vec![
+            tool(
+                "get_weather",
+                value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+            ),
+            tool("ping", value!({"type": "object", "properties": {}})),
+        ]
+    }
+
+    /// The two tables that carry the thought layout, each with a call as its syntax writes it.
+    fn tables_with_a_call() -> [(Format, &'static str); 2] {
+        [
+            (qwen3(CallSyntax::Json), CALL_WITH_DAYS),
+            (
+                qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+                TAGGED_CALL,
+            ),
+        ]
+    }
+
+    const CALL_WITH_DAYS: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+        {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+
+    /// The events of `pieces` after the turn's opener, read by `format` with the weather tool.
+    fn read_with(format: &Format, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(
+            &mut engine(format.clone(), weather_declared()),
+            "<|im_start|>assistant\n",
+            pieces,
+        )
+    }
+
+    #[test]
+    fn a_prompt_with_thinking_off_has_written_the_templates_two_newlines_itself() {
+        // A request with thinking switched off closes an empty thought in the prompt and writes
+        // the two newlines after it (`<think>\n\n</think>\n\n` at the prompt's end): the table
+        // reads that from the prompt, as the gateway does beside `reasoning_open`, and a forced
+        // call written from there is the calls at once on every start, the newlines not written a
+        // second time. The thinking-on prompt has written nothing, and MiMo's table carries no
+        // layout to have written.
+        use crate::testing::a_forced_tag_after_a_prompt_that_wrote_the_templates_text;
+        let tools = weather_tools();
+        let off = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        for format in [
+            qwen3(CallSyntax::Json),
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        ] {
+            a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
+                &format,
+                &tools,
+                off,
+                "<|im_start|>assistant\n",
+                "<tool_call>",
+            );
+        }
+        assert!(!qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)).thought_closed(off));
+    }
+
+    #[test]
+    fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_two_newlines() {
+        // The Qwen3 and Qwen 3.5 templates write two newlines after the thought's close before
+        // the content or the first call, and the table carries that part of its layout. Where the
+        // grammar starts after the close (after the gate of the engine's reasoning parser, with
+        // the prompt's thought closed or open; after the thought a free-text prefix or a tag of
+        // the thought wrote), the calls' tag begins with them, so the call's marker is not the
+        // grammar's first text: an engine that takes a marker the model rehearses inside its
+        // thought for the thought's end cannot start the forced call there once the marker cannot
+        // start the grammar. With the thought closed, at the first token or where the engine does
+        // not say, the calls at once, as before. MiMo's table, the direct placement, carries no
+        // layout: its template writes what follows right after the close.
+        use crate::grammar::{GrammarStart, Options};
+        let tools = weather_tools();
+        for format in [
+            qwen3(CallSyntax::Json),
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        ] {
+            a_forced_tag_begins_with_the_templates_text(
+                &format,
+                &tools,
+                "</think>",
+                "\n\n",
+                "<tool_call>",
+            );
+        }
+        let direct = qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct));
+        assert!(direct.layout().is_none());
+        let gated = direct
+            .grammar_for(
+                &tools[..1],
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    thought_closed: false,
+                    one_call: true,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(gated["format"]["type"], "triggered_tags", "{gated}");
+    }
+
+    #[test]
+    fn a_forced_call_written_after_the_thoughts_close_reads_as_the_call_with_the_rehearsal_as_thought(
+    ) {
+        // The tag's shape on an engine whose grammar starts after the thought's close: the thought
+        // with the call's format rehearsed inside it, its close, the template's two newlines and
+        // the call. The rehearsal is thought text, the newlines the template's, the call the call;
+        // whole, one character at a time and at every cut, under both syntaxes.
+        for (format, call) in tables_with_a_call() {
+            let rehearsed = format!("\nThe user wants the forecast. The format is {call}. So:\n");
+            let output = format!("<think>{rehearsed}</think>\n\n{call}");
+            assert_eq!(
+                the_same_at_every_cut(|pieces| read_with(&format, pieces), &output),
+                Said {
+                    calls: vec![(
+                        "get_weather".to_string(),
+                        "{\"city\": \"Paris\", \"days\": 3}".to_string()
+                    )],
+                    finish: Some((FinishReason::Stop, 1)),
+                    content: String::new(),
+                    reasoning: rehearsed,
+                },
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_marker_inside_the_thought_stays_thought_text() {
+        // An engine whose reasoning gate took the rehearsed marker for the thought's end and
+        // started a forced call there wrote the call inside the thought, the output ending there;
+        // the table reads it as the template does: thought text, no call, `stop`. The tag no
+        // longer lets such an engine start there (its first text after the close is the
+        // template's newlines, not the marker); the reading is pinned here, whole, one character
+        // at a time and at every cut, under both syntaxes.
+        for (format, call) in tables_with_a_call() {
+            let thought = format!("\nThe user wants the forecast. The format is {call}");
+            let output = format!("<think>{thought}");
+            assert_eq!(
+                the_same_at_every_cut(|pieces| read_with(&format, pieces), &output),
+                Said {
+                    calls: Vec::new(),
+                    finish: Some((FinishReason::Stop, 0)),
+                    content: String::new(),
+                    reasoning: thought,
+                },
+                "{call}"
+            );
+        }
     }
 }

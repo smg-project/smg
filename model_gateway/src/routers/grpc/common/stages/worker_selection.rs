@@ -10,6 +10,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use openai_protocol::profile::ProviderProfile;
 use tracing::{debug, error, warn};
 
 use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
@@ -345,13 +346,14 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
+        provider: Option<ProviderProfile>,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new(prep, &input.request_type)
+            ContextRequirements::new_for(prep, &input.request_type, provider)
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
@@ -489,6 +491,7 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
+            ctx.state.provider,
         );
         ctx.state.sticky_key = self
             .policy_registry
@@ -527,7 +530,7 @@ impl WorkerSelectionStage {
                 plan,
                 ctx.state.media_refs_pipeline,
             ) {
-                return Err(error::bad_request(err.code(), err.to_string()));
+                return Err(err.into_response());
             }
         }
 
@@ -598,8 +601,7 @@ impl WorkerSelectionStage {
                 // Encode workers never process references: refuse strict
                 // worker mode here rather than silently bypass the encode fleet.
                 if inputs.media_refs {
-                    let err = multimodal::MmRefsError::EncodeNotSupported;
-                    return Err(error::bad_request(err.code(), err.to_string()));
+                    return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
                 }
                 let encode_item_hashes = match encode_item_hashes(inputs.intermediate) {
                     Ok(hashes) => hashes,
@@ -1286,7 +1288,7 @@ impl WorkerSelectionStage {
                 .filter(|w| !media.media_refs || accepts_media_refs(w.as_ref()))
                 .collect();
             if capable.is_empty() {
-                return self.media_refs_shed(model_id);
+                return Self::media_refs_shed(model_id);
             }
             let capable: Vec<Arc<dyn Worker>> = capable
                 .into_iter()
@@ -1296,7 +1298,7 @@ impl WorkerSelectionStage {
                 return match media.pipeline {
                     PipelinePin::Only => Self::pipeline_worker_required(model_id),
                     PipelinePin::Never => Self::pipeline_takes_no_audio(model_id),
-                    PipelinePin::Any => self.media_refs_shed(model_id),
+                    PipelinePin::Any => Self::media_refs_shed(model_id),
                 };
             }
             match placement::failure_from(
@@ -1356,24 +1358,21 @@ impl WorkerSelectionStage {
         response
     }
 
-    /// Workers serve the model but none advertises worker-side multimodal
-    /// processing. Terminal: capability cannot change within a retry window.
-    fn media_refs_shed(&self, model_id: &str) -> Response {
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No worker advertising worker-side multimodal processing"
-        );
-        let mut response = error::service_unavailable(
-            "no_media_ref_capable_worker",
-            format!(
-                "model {model_id} has vLLM gRPC workers but none advertises mm_processor; set \
-                 SMG_VLLM_MM_PROCESSOR on the workers or SMG_MM_PROCESSING=router on the router"
-            ),
-        );
-        mark_non_retryable(&mut response);
-        response
+    /// Workers serve the model but none of the leg's workers processes media
+    /// references. Preparation answers this verdict for the pool as
+    /// registered (`multimodal::resolve_mm_processing`); here it is the
+    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// none of whose workers does. Terminal: capability cannot change within
+    /// a retry window. Its one rate-limited line is written by
+    /// [`Self::report_refusal`] at the stage's entry points, like the pool's
+    /// other refusals, not here.
+    fn media_refs_shed(model_id: &str) -> Response {
+        placement::no_media_ref_capable_worker(format!(
+            "no worker of model '{model_id}' processes media references (none advertises an \
+             mm_processor), so a request whose media is forwarded to the worker cannot be \
+             served: start the workers with worker-side media processing, or run the router \
+             with --mm-processing auto or router"
+        ))
     }
 
     /// Workers serve the model but none can take the request right now
@@ -1581,7 +1580,9 @@ impl WorkerSelectionStage {
 
     /// The verdict for one disaggregated role, judged from the pool it
     /// selected over *before* the `is_available()` filter. The roles are
-    /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
+    /// served over gRPC, or TokenSpeed's direct ZMQ, whose wire is the gRPC
+    /// pipeline's (see `RoutingPool::GrpcPrefill`), so a retry pins the
+    /// runtime alone;
     /// the regular role is judged by [`placement::single_failure`] instead.
     /// Failure path only.
     fn disaggregated_role_verdict(
@@ -1734,7 +1735,7 @@ impl WorkerSelectionStage {
                     .filter(|w| accepts_media_refs(w.as_ref()))
                     .collect();
                 if processing.is_empty() {
-                    return self.media_refs_shed(model_id);
+                    return Self::media_refs_shed(model_id);
                 }
                 if !processing
                     .iter()
@@ -1763,9 +1764,10 @@ impl WorkerSelectionStage {
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
         // Both pools derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools are strictly gRPC (a ZMQ worker would
-        // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
-        // the wildcard model maps to the global snapshot). The pools must
+        // that never coexisted. The pools hold the workers whose wire carries
+        // the PD bootstrap info (gRPC, and TokenSpeed's direct ZMQ, see
+        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
+        // snapshot). The pools must
         // share a runtime, the rendezvous being runtime-specific, and a retry
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
@@ -1898,11 +1900,14 @@ impl WorkerSelectionStage {
             ..
         } = inputs;
         // All three pools derive from ONE membership snapshot (see
-        // select_pd_pair). The pools are strictly gRPC — encode dispatch is
-        // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
-        // ZMQ wire carries no KV-transfer rendezvous for the prefill/decode
-        // pools; the wildcard model maps to the global snapshot. Availability
-        // stays a live per-request check.
+        // select_pd_pair). Each holds the workers whose wire carries its
+        // role's dispatch: the encode pool the gRPC encoder RPC's workers and
+        // TokenSpeed's direct-ZMQ encode servers, which take the encode request
+        // on their own lane (see `RoutingPool::GrpcEncode`; registration
+        // refuses the role to every other ZMQ runtime), the prefill/decode
+        // pools the workers whose wire carries the KV-transfer rendezvous (see
+        // `RoutingPool::GrpcPrefill`); the wildcard model maps to the global
+        // snapshot. Availability stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let all_encode = epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
@@ -1977,6 +1982,7 @@ impl WorkerSelectionStage {
             cache_namespace,
             hash_ring: hash_ring.clone(),
             role: WorkerRole::Prefill,
+            overload_lifted: false,
         };
         let prefill_idx = self
             .policy_registry
@@ -2118,6 +2124,7 @@ fn assign_encode_workers(
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 role: WorkerRole::Single,
+                overload_lifted: false,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();
@@ -2168,6 +2175,7 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
+        observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{
@@ -2723,24 +2731,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn select_pd_pair_ignores_zmq_workers() {
-        // The ZMQ wire carries no KV-transfer rendezvous, so ZMQ prefill/decode
-        // workers must never be paired even if they reach the registry.
-        let model_id = "test-model-zmq";
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        for (port, worker_type) in [(9000, WorkerType::Prefill), (9100, WorkerType::Decode)] {
-            worker_registry
+    /// Register a ZMQ prefill and a ZMQ decode worker of `runtime` for
+    /// `model_id`, under ports `port` and `port + 100`.
+    fn register_zmq_pd_workers(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        runtime: RuntimeType,
+        port: u16,
+    ) -> (String, String) {
+        let url = |port: u16| format!("ipc:///tmp/smg-zmq/{port}.ipc");
+        for (port, worker_type) in [
+            (port, WorkerType::Prefill),
+            (port + 100, WorkerType::Decode),
+        ] {
+            registry
                 .register(Arc::new(
-                    BasicWorkerBuilder::new(format!("ipc:///tmp/smg-zmq/{port}.ipc"))
+                    BasicWorkerBuilder::new(url(port))
                         .model(ModelCard::new(model_id))
                         .worker_type(worker_type)
                         .connection_mode(ConnectionMode::Zmq)
+                        .runtime_type(runtime)
                         .health_config(no_health_check())
                         .build(),
                 ))
                 .unwrap();
         }
+        (url(port), url(port + 100))
+    }
+
+    #[test]
+    fn select_pd_pair_ignores_zmq_workers() {
+        // Only TokenSpeed's ZMQ wire carries the KV-transfer rendezvous, so
+        // another runtime's ZMQ prefill/decode workers must never be paired
+        // even if they reach the registry.
+        let model_id = "test-model-zmq";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::Sglang, 9000);
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         policy_registry
@@ -2780,6 +2806,39 @@ mod tests {
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
+    }
+
+    /// TokenSpeed's direct-ZMQ engines carry the rendezvous on their generate
+    /// request, so a ZMQ prefill and a ZMQ decode engine of TokenSpeed pair.
+    #[test]
+    fn select_pd_pair_pairs_tokenspeed_zmq_engines() {
+        let model_id = "test-model-tokenspeed-zmq";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_url, decode_url) =
+            register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::TokenSpeed, 9200);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+
+        let (prefill, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                PairDemands::default(),
+            )
+            .expect("a TokenSpeed ZMQ PD pair should be selected");
+        assert_eq!(prefill.url(), prefill_url);
+        assert_eq!(decode.url(), decode_url);
     }
 
     /// gRPC selection honors the conversation header across fresh request IDs.
@@ -3654,23 +3713,9 @@ mod tests {
         }
         let stage = WorkerSelectionStage::new(
             worker_registry,
-            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 4096,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-            })),
+            Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+                0.5, 32, 1.1, 0, 4096,
+            ))),
             WorkerSelectionMode::Regular,
             None,
         );
@@ -5420,23 +5465,9 @@ mod tests {
             .unwrap();
         let stage = WorkerSelectionStage::new(
             Arc::clone(&registry),
-            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 4096,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-            })),
+            Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+                0.5, 32, 1.1, 0, 4096,
+            ))),
             WorkerSelectionMode::Regular,
             None,
         );
@@ -6196,16 +6227,13 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_for_a_drained_pool_is_marked_and_written_at_warn_within_the_allowance() {
         use openai_protocol::worker::WorkerStatus;
-        use tracing_subscriber::layer::SubscriberExt;
 
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let registry = Arc::new(WorkerRegistry::new());
         let down = worker("grpc://127.0.0.1:30010", WorkerType::Regular);
         down.set_status(WorkerStatus::NotReady);
@@ -6286,16 +6314,12 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_for_a_model_nobody_serves_is_marked_and_written_at_warn_within_the_allowance(
     ) {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let registry = Arc::new(WorkerRegistry::new());
         let stage = regular_stage(Arc::clone(&registry));
         let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();

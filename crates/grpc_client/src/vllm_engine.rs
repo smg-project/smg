@@ -88,7 +88,7 @@ impl VllmEngineClient {
         Ok(())
     }
 
-    crate::impl_flush_cache!();
+    crate::impl_admin_ops!();
     crate::impl_get_tokenizer!();
     crate::impl_subscribe_kv_events!();
 
@@ -215,6 +215,7 @@ impl VllmEngineClient {
             skip_special_tokens,
             spaces_between_special_tokens: true, // Default from Python SamplingParams
             ignore_eos: request.ignore_eos,
+            include_stop_str_in_output: request.no_stop_trim,
             n: request.n.unwrap_or(1),
             logprobs,
             // Proto seed is i32 (line 48 of generated vllm.grpc.engine.rs);
@@ -297,8 +298,8 @@ impl VllmEngineClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty,
             max_tokens,
-            stop: vec![], // Does not pass through request.stop yet (follow-up fix)
-            stop_token_ids: vec![], // Handled by Harmony stop tokens
+            stop: stop_strings(request.stop.as_ref()),
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
             ignore_eos: false,
@@ -506,10 +507,11 @@ impl VllmEngineClient {
             skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
             ignore_eos: plain.ignore_eos,
+            include_stop_str_in_output: plain.no_stop_trim,
             n: plain.n,
             // The proto seed is i32; the plain seed is u64. Fold the high half into
             // the low so distinct seeds stay distinct (a saturating cast would send
-            // every seed >= 2^31 to one value). no_stop_trim has no field in this proto.
+            // every seed >= 2^31 to one value).
             seed: plain
                 .sampling_seed
                 .map(|seed| ((seed ^ (seed >> 32)) as u32) as i32),
@@ -527,6 +529,7 @@ impl VllmEngineClient {
 // ---------------------------------------------------------------------------
 
 impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+    /// Preserve the rank's measured input capacity separately from generation rate.
     fn from(load: proto::SchedulerLoad) -> Self {
         Self {
             dp_rank: load.dp_rank,
@@ -538,6 +541,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
             gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
@@ -779,6 +783,29 @@ mod tests {
             VllmEngineClient::build_grpc_sampling_params_from_responses(&disabled, None)
                 .expect("build sampling params");
         assert_eq!(disabled_params.top_k, 0);
+    }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // The list form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(StringOrArray::Array(vec![
+                "STOP".to_string(),
+                "\n\n".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let params = VllmEngineClient::build_grpc_sampling_params_from_responses(&request, None)
+            .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP", "\n\n"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = VllmEngineClient::build_grpc_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
     }
 
     #[test]

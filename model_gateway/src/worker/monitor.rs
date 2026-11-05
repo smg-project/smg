@@ -166,12 +166,15 @@ impl WorkerLoadManager {
         }
     }
 
+    /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
+    /// Select and increment the least-loaded eligible rank. A virtual worker
+    /// can only select its pinned rank; missing telemetry returns `None`.
     pub fn select_and_increment_lowest_dp_load(
         &self,
         worker: &dyn Worker,
@@ -179,7 +182,14 @@ impl WorkerLoadManager {
     ) -> Option<isize> {
         let mut cached = self.dp_cached_loads.write();
         let loads = cached.get_mut(worker.url())?;
-        let (&dp_rank, _) = loads.iter().min_by_key(|&(rank, load)| (*load, *rank))?;
+        let (&dp_rank, _) = loads
+            .iter()
+            .filter(|(rank, _)| {
+                worker
+                    .dp_rank()
+                    .is_none_or(|pinned| **rank == pinned as isize)
+            })
+            .min_by_key(|&(rank, load)| (*load, *rank))?;
         if let Some(v) = loads.get_mut(&dp_rank) {
             *v += increment;
         }
@@ -198,6 +208,16 @@ impl WorkerLoadManager {
     /// caller only has a single `&str`.
     pub fn remove_worker(&self, url: &str) {
         self.dp_cached_loads.write().remove(url);
+    }
+
+    /// Invalidate only the virtual worker's rank after a successful poll omits it.
+    fn remove_rank(&self, url: &str, rank: usize) {
+        let Ok(rank) = isize::try_from(rank) else {
+            return;
+        };
+        if let Some(loads) = self.dp_cached_loads.write().get_mut(url) {
+            loads.remove(&rank);
+        }
     }
 
     /// Drop every cached DP load entry. Used by `WorkerMonitor` during
@@ -245,9 +265,11 @@ impl NativeLoadsPath {
         }
     }
 
-    /// Where to probe this route on `worker`.
+    /// Where to probe this route on `worker`: its engine's address (a
+    /// dp-aware rank worker's URL carries the router's `@rank` suffix, which
+    /// is no part of the host).
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
-        let base = worker.url();
+        let base = worker.base_url();
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
@@ -512,7 +534,7 @@ impl WorkerMonitor {
         let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
         let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
         info!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             overloaded = verdict,
             waiting_requests = waiting,
             kv_pressure,
@@ -532,6 +554,8 @@ impl WorkerMonitor {
     /// shared snapshot, which routing reads, in the next coalesced publish.
     /// The report's `sampled_at` is the receipt less the record's age and
     /// the one-way margin, what a policy releases its dispatch credit against.
+    /// Negative ranks and records for another virtual worker's rank are
+    /// ignored before updating freshness, liveness, metrics or routing state.
     pub fn apply_pushed_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -539,6 +563,13 @@ impl WorkerMonitor {
         record: &EngineLoad,
         received_at: Instant,
     ) {
+        if dp_rank < 0
+            || worker
+                .dp_rank()
+                .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+        {
+            return;
+        }
         let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url().to_string();
@@ -547,13 +578,13 @@ impl WorkerMonitor {
         worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
+        let mut pushed = self.pushed_ranks.lock();
         self.pushed_at
             .lock()
             .entry(url.clone())
             .or_default()
             .insert(dp_rank, received_at);
         let response = {
-            let mut pushed = self.pushed_ranks.lock();
             let ranks = pushed.entry(url.clone()).or_default();
             let previous = ranks.get(&dp_rank).cloned().unwrap_or_default();
             // What a poll would have put in the rank's entry, with the
@@ -600,8 +631,24 @@ impl WorkerMonitor {
         self.pending_pushed
             .lock()
             .insert(url, (Arc::clone(worker), response));
+        drop(pushed);
         self.start_pushed_flusher();
         self.pushed_notify.notify_one();
+    }
+
+    /// Whether `workers`, the members of one group, are to have live load
+    /// state: always by default; under `--disable-load-monitoring` only when
+    /// a load-aware or dp-rank policy, the engine-metrics export or overload
+    /// protection on a member needs it. The poll tick and the decision to
+    /// open a worker's load stream read the same answer.
+    pub(crate) fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
+        if !self.conditional_polling {
+            return true;
+        }
+        let routing_needs_load = self.policy_registry.needs_backend_loads()
+            || self.policy_registry.get_dp_rank_policy().is_some();
+        let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
+        routing_needs_load || self.engine_metrics || overload_needs_load
     }
 
     /// The poll decision for `url` at `now` from the receipt times of its
@@ -661,7 +708,7 @@ impl WorkerMonitor {
             return;
         }
         // Both tables held together so a record landing between the two
-        // reads is not undone; nothing else takes both at once.
+        // reads is not undone; pushes and retractions use the same lock order.
         let mut pushed = self.pushed_ranks.lock();
         let Some(ranks) = pushed.get_mut(url) else {
             return;
@@ -677,6 +724,34 @@ impl WorkerMonitor {
             }
             if let Some(slot) = ranks.get_mut(&entry.dp_rank) {
                 *slot = entry.clone();
+            }
+        }
+    }
+
+    /// Retract pre-poll pushed ranks after an authoritative empty response.
+    /// Records received since the poll began remain available for the next push.
+    fn retract_pushed_load(&self, url: &str, rank: Option<usize>, polled_at: Instant) {
+        let mut pushed = self.pushed_ranks.lock();
+        let mut receipts = self.pushed_at.lock();
+        let Some(times) = receipts.get_mut(url) else {
+            return;
+        };
+        times.retain(|&dp_rank, at| {
+            rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank)) || *at >= polled_at
+        });
+        if let Some(ranks) = pushed.get_mut(url) {
+            ranks.retain(|dp_rank, _| times.contains_key(dp_rank));
+        }
+        let mut pending = self.pending_pushed.lock();
+        if let Some((_, response)) = pending.get_mut(url) {
+            let response = Arc::make_mut(response);
+            response
+                .loads
+                .retain(|load| times.contains_key(&load.dp_rank));
+            response.dp_rank_count = i32::try_from(response.loads.len()).unwrap_or(i32::MAX);
+            response.aggregate = None;
+            if response.loads.is_empty() {
+                pending.remove(url);
             }
         }
     }
@@ -710,6 +785,7 @@ impl WorkerMonitor {
 
     /// Publish every pushed report that accumulated since the last flush.
     pub(crate) fn flush_pushed(&self) {
+        let _pushed = self.pushed_ranks.lock();
         let pending: Vec<PushedReport> = self
             .pending_pushed
             .lock()
@@ -973,9 +1049,13 @@ impl WorkerMonitor {
     }
 
     /// Apply every queued eviction in one snapshot rebuild, and sentinel the
-    /// `smg_engine_*` series of workers whose own entry was removed —
-    /// metrics-rs cannot delete series. A same-URL replacement that already
-    /// republished keeps its entry, and its series continues uninterrupted.
+    /// `smg_engine_*` series of workers whose own entry was removed. The
+    /// sentinel matters for a worker that stays registered (its status left
+    /// `Ready`, or a same-URL replacement has not published yet), whose series
+    /// would otherwise read its last load as live. For a removed worker it is
+    /// a no-op: the worker series store dropped the series with the
+    /// registration. A same-URL replacement that already republished keeps
+    /// its entry, and its series continues uninterrupted.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
             // A worker can serve multiple models (one load group per model),
@@ -1022,9 +1102,9 @@ impl WorkerMonitor {
     /// a worker, and `/v1/loads` on an engine. Which one a worker answered on
     /// is memoized, so the extra attempt costs one 404 per worker, once.
     ///
-    /// Every backend is normalized into a single-rank [`WorkerLoadResponse`]
-    /// whose `token_usage` field drives the load-aware policies. Returns
-    /// `None` on failure so the caller records the load as unavailable (`-1`).
+    /// Engine responses are scoped to the virtual worker's DP rank, if any.
+    /// Gateway fleet rollups retain their worker annotations. An empty response
+    /// means a successful poll omitted this rank; `None` means a failed poll.
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
@@ -1032,6 +1112,20 @@ impl WorkerMonitor {
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Option<WorkerLoadResponse> {
+        if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
+            liveness::on_contact(worker);
+            return Some(Self::scoped_native_load(path, load, worker.dp_rank()));
+        }
+        Self::fetch_http_gauges(worker).await
+    }
+
+    /// The whole answer of the first native load route that has one (an
+    /// engine's every rank, or a gateway's fleet rollup) with the route it
+    /// came from, before it is scoped to a worker. `None` is a failed poll.
+    async fn fetch_native_loads(
+        worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+    ) -> Option<(NativeLoadsPath, WorkerLoadResponse)> {
         // Only workers already `Ready` are polled, so a definitive "no such
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
         let known = native_loads_memo
@@ -1044,7 +1138,7 @@ impl WorkerMonitor {
             match Self::probe_native_loads(worker, path).await {
                 NativeLoads::Available(load) => {
                     memo.record_answered(path);
-                    response = Some(load);
+                    response = Some((path, load));
                     break;
                 }
                 NativeLoads::Absent => memo.record_absent(path),
@@ -1058,9 +1152,29 @@ impl WorkerMonitor {
                 store.insert(worker.url().to_string(), memo);
             }
         }
-        if response.is_some() {
-            liveness::on_contact(worker);
-            return response;
+        response
+    }
+
+    /// A native answer as one worker's report. An engine's is scoped to the
+    /// worker's DP rank, if any: a missing rank is unavailable, not a reason
+    /// to substitute the backend-wide Prometheus average. A gateway's fleet
+    /// rollup keeps its worker annotations.
+    fn scoped_native_load(
+        path: NativeLoadsPath,
+        load: WorkerLoadResponse,
+        dp_rank: Option<usize>,
+    ) -> WorkerLoadResponse {
+        match path {
+            NativeLoadsPath::Engine => load.for_dp_rank(dp_rank).unwrap_or_default(),
+            NativeLoadsPath::Gateway => load,
+        }
+    }
+
+    /// The backend-wide gauges of a worker with no native load route.
+    async fn fetch_http_gauges(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+        // Backend-wide gauges cannot be attributed to a virtual DP worker.
+        if worker.dp_rank().is_some() {
+            return None;
         }
 
         match worker.metadata().spec.runtime_type {
@@ -1098,10 +1212,26 @@ impl WorkerMonitor {
             return NativeLoads::Inconclusive;
         }
 
-        match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
-            // Our schema, no ranks reported yet — keep probing.
-            Ok(_) => NativeLoads::Inconclusive,
+        // WorkerLoadResponse defaults missing fields for compatibility. Native
+        // route discovery must require an explicit loads array so an unrelated
+        // JSON response is not mistaken for an authoritative empty snapshot.
+        #[derive(serde::Deserialize)]
+        struct NativeResponse {
+            loads: Vec<SchedulerLoadSnapshot>,
+            #[serde(flatten)]
+            response: WorkerLoadResponse,
+        }
+
+        match resp.json::<NativeResponse>().await {
+            // An empty native snapshot is still authoritative: no rank has
+            // telemetry yet. Do not turn it into an aggregate fallback.
+            Ok(NativeResponse {
+                loads,
+                mut response,
+            }) => {
+                response.loads = loads;
+                NativeLoads::Available(response)
+            }
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
             Err(_) => NativeLoads::Absent,
@@ -1113,7 +1243,7 @@ impl WorkerMonitor {
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -1139,7 +1269,7 @@ impl WorkerMonitor {
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -1196,17 +1326,29 @@ impl WorkerMonitor {
     }
 
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
-    /// engine's pushed scheduler stats). Returns `None` on missing client,
-    /// error, or empty `loads` array.
-    pub(crate) async fn fetch_backend_load(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    /// engine's pushed scheduler stats) for the workers of one engine: one
+    /// worker, or the rank workers of a data-parallel engine under
+    /// `--dp-aware` (one address, one answer naming every rank). The first
+    /// member asks; the outcome is every member's, as each one's own poll
+    /// would have had it: the whole answer (the caller scopes it to each
+    /// member's rank), the contact that ends an unreachable veto, a
+    /// transport failure. Returns `None` on no members, a missing client or
+    /// an error.
+    pub(crate) async fn fetch_backend_load(
+        members: &[Arc<dyn Worker>],
+    ) -> Option<WorkerLoadResponse> {
+        let worker = members.first()?;
         let backend_client = match worker.get_backend_client().await {
             Ok(Some(client)) => client,
             Ok(None) => {
-                debug!("No backend client for worker {}", worker.url());
+                debug!("No backend client for worker {}", worker.redacted_url());
                 return None;
             }
             Err(e) => {
-                debug!("Failed to get backend client for {}: {e}", worker.url());
+                debug!(
+                    "Failed to get backend client for {}: {e}",
+                    worker.redacted_url()
+                );
                 return None;
             }
         };
@@ -1216,29 +1358,78 @@ impl WorkerMonitor {
         // poll that times out is a slow worker, not a dead one: the keepalive
         // on the connection is what reports those.
         match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
-            Ok(Ok(load)) if !load.loads.is_empty() => {
-                liveness::on_contact(worker);
+            Ok(Ok(load)) => {
+                for member in members {
+                    liveness::on_contact(member);
+                }
                 Some(load)
             }
-            Ok(Ok(_)) => {
-                liveness::on_contact(worker);
-                None
-            }
             Ok(Err(e)) => {
-                debug!("backend GetLoads failed for {}: {e}", worker.url());
+                debug!("backend GetLoads failed for {}: {e}", worker.redacted_url());
                 if liveness::is_connection_code(e.code()) {
-                    liveness::on_contact_failed(worker, "load poll");
+                    for member in members {
+                        liveness::on_contact_failed(member, "load poll");
+                    }
                 }
                 None
             }
             Err(_) => {
                 debug!(
                     "backend GetLoads for {} did not answer within {LOAD_POLL_DEADLINE:?}",
-                    worker.url()
+                    worker.redacted_url()
                 );
                 None
             }
         }
+    }
+
+    /// One tick's fetch for the polled workers of one engine: one worker, or
+    /// the rank workers of a data-parallel engine under `--dp-aware`, which
+    /// share it. The engine answers once; each member's report is that
+    /// answer scoped to its own rank, as its own poll would have had it (a
+    /// rank the answer omits is an empty report).
+    async fn fetch_engine_loads(
+        members: Vec<Arc<dyn Worker>>,
+        connection_mode: ConnectionMode,
+        native_loads_memo: &DashMap<String, NativeLoadsMemo>,
+    ) -> Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)> {
+        let mut reports = Vec::with_capacity(members.len());
+        match connection_mode {
+            ConnectionMode::Http => {
+                if let [worker] = members.as_slice() {
+                    reports.push(Self::fetch_http_load(worker, Some(native_loads_memo)).await);
+                } else {
+                    match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
+                        Some((path, load)) => {
+                            for member in &members {
+                                liveness::on_contact(member);
+                                reports.push(Some(Self::scoped_native_load(
+                                    path,
+                                    load.clone(),
+                                    member.dp_rank(),
+                                )));
+                            }
+                        }
+                        None => {
+                            for member in &members {
+                                reports.push(Self::fetch_http_gauges(member).await);
+                            }
+                        }
+                    }
+                }
+            }
+            ConnectionMode::Grpc | ConnectionMode::Zmq => {
+                let answer = Self::fetch_backend_load(&members).await;
+                for member in &members {
+                    reports.push(
+                        answer
+                            .clone()
+                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
+                    );
+                }
+            }
+        }
+        members.into_iter().zip(reports).collect()
     }
 }
 
@@ -1277,6 +1468,32 @@ async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMon
         monitor.flush_pending_evictions();
         drop(monitor);
     }
+}
+
+/// The polled workers as the fetches of one tick: one per worker, except the
+/// rank workers of one data-parallel engine, which share one. Under
+/// `--dp-aware` an engine of N ranks is N workers at one address, and each
+/// one's poll asked the engine for the same answer (N `GetLoads`, or N reads
+/// of the native load route, per engine per tick) and kept its own rank of
+/// it. One member asks, the lowest rank, so the native-route memo of an
+/// engine is one worker's tick after tick; the answer is scoped to each.
+fn polled_engines(polled: &[Arc<dyn Worker>]) -> Vec<Vec<Arc<dyn Worker>>> {
+    let mut engines: Vec<Vec<Arc<dyn Worker>>> = Vec::with_capacity(polled.len());
+    let mut by_address: HashMap<&str, usize> = HashMap::new();
+    for worker in polled {
+        if worker.dp_rank().is_some() {
+            if let Some(&engine) = by_address.get(worker.base_url()) {
+                engines[engine].push(Arc::clone(worker));
+                continue;
+            }
+            by_address.insert(worker.base_url(), engines.len());
+        }
+        engines.push(vec![Arc::clone(worker)]);
+    }
+    for members in &mut engines {
+        members.sort_by_key(|worker| worker.dp_rank());
+    }
+    engines
 }
 
 /// Compute the set of `WorkerGroupKey`s a worker participates in.
@@ -1477,14 +1694,9 @@ async fn poll_group_once(
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    if monitor.conditional_polling {
-        let routing_needs_load = monitor.policy_registry.needs_backend_loads()
-            || monitor.policy_registry.get_dp_rank_policy().is_some();
-        let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
-        if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
-            debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
-            return;
-        }
+    if !monitor.loads_wanted(&workers) {
+        debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
+        return;
     }
 
     // A worker whose stream pushed a load record on every pushing rank
@@ -1505,26 +1717,22 @@ async fn poll_group_once(
         debug!("Every worker in group {group_key} pushed its load within {interval:?}; no poll");
         Vec::new()
     } else {
-        let futures: Vec<_> = polled
-            .iter()
-            .map(|worker| {
+        let futures: Vec<_> = polled_engines(&polled)
+            .into_iter()
+            .map(|members| {
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
-                let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
                 async move {
-                    let response = match connection_mode {
-                        ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
-                        }
-                        ConnectionMode::Grpc | ConnectionMode::Zmq => {
-                            WorkerMonitor::fetch_backend_load(&worker).await
-                        }
-                    };
-                    (worker, response)
+                    WorkerMonitor::fetch_engine_loads(members, connection_mode, &native_loads_memo)
+                        .await
                 }
             })
             .collect();
-        future::join_all(futures).await
+        future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     };
 
     let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
@@ -1536,8 +1744,24 @@ async fn poll_group_once(
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
         // signal, which clears the flag — absent means no opinion.
-        monitor.apply_overload_verdict(&worker, response.as_ref(), "poll");
+        monitor.apply_overload_verdict(
+            &worker,
+            response.as_ref().filter(|load| !load.loads.is_empty()),
+            "poll",
+        );
         if let Some(mut load) = response {
+            // A successful native poll can retract a rank. A failed poll
+            // leaves the last-known DP cache alone; an explicit omission must
+            // not keep that rank selectable or be published as an idle load.
+            if load.loads.is_empty() {
+                monitor.retract_pushed_load(&url, worker.dp_rank(), now);
+                if let Some(rank) = worker.dp_rank() {
+                    monitor.worker_load_manager.remove_rank(&url, rank);
+                } else {
+                    monitor.worker_load_manager.remove_worker(&url);
+                }
+                continue;
+            }
             load.sampled_at = Some(Instant::now());
             // A worker polled because a rank's records went quiet
             // (`fallback`) takes the poll's figures for the ranks that
@@ -1709,861 +1933,7 @@ mod worker_load_manager_tests {
 }
 
 #[cfg(test)]
-mod worker_monitor_tests {
-    use std::collections::HashMap;
-
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, WorkerStatus},
-    };
-
-    use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        observability::metrics::test_support::render_with_recorder,
-        policies::PolicyRegistry,
-        worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
-    };
-
-    fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Http)
-            .model(ModelCard::new(model))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        worker.set_status(WorkerStatus::Ready);
-        Arc::new(worker)
-    }
-
-    fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
-        let registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let monitor = Arc::new(WorkerMonitor::new(
-            registry.clone(),
-            policy_registry,
-            5,
-            false,
-            false,
-        ));
-        (registry, monitor)
-    }
-
-    /// A pushed record is a poll of its worker: the rank's entry is replaced
-    /// (other ranks kept), `sampled_at` is the receipt less the record's age
-    /// and the one-way margin, and the shared snapshot sees it at the next
-    /// coalesced publish.
-    #[tokio::test]
-    async fn a_pushed_load_record_becomes_the_workers_report_at_the_next_publish() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let received = Instant::now();
-        let record = EngineLoad {
-            running_requests: 7,
-            waiting_requests: 2,
-            waiting_uncached_tokens: Some(3_000),
-            token_usage: 0.4,
-            gen_throughput: 900.0,
-            max_running_requests: 64,
-            age_ms: 30,
-            sample: 1,
-            load_only: false,
-            ..Default::default()
-        };
-        monitor.apply_pushed_load(&worker, 0, &record, received);
-        assert_eq!(monitor.pending_pushed_len(), 1);
-        assert!(
-            monitor
-                .load_state
-                .snapshot()
-                .get("grpc://w1:9000")
-                .is_none(),
-            "not published until the window closes"
-        );
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        let report = snapshot.get("grpc://w1:9000").expect("published");
-        assert_eq!(report.version, "pushed");
-        assert_eq!(report.loads.len(), 1);
-        let rank0 = &report.loads[0];
-        assert_eq!(
-            (
-                rank0.dp_rank,
-                rank0.num_running_reqs,
-                rank0.num_waiting_reqs,
-                rank0.num_waiting_uncached_tokens,
-                rank0.num_total_reqs,
-                rank0.max_running_requests
-            ),
-            (0, 7, 2, 3_000, 9, 64)
-        );
-        assert!((rank0.token_usage - 0.4).abs() < f64::EPSILON);
-        assert!((rank0.gen_throughput - 900.0).abs() < f64::EPSILON);
-        let sampled_at = report.sampled_at.expect("sampled_at");
-        assert_eq!(
-            received.duration_since(sampled_at),
-            Duration::from_millis(30) + PUSHED_ONE_WAY_MARGIN
-        );
-        assert_eq!(monitor.pending_pushed_len(), 0);
-
-        // A second rank joins the report; a later record replaces only its rank.
-        monitor.apply_pushed_load(
-            &worker,
-            1,
-            &EngineLoad {
-                running_requests: 1,
-                waiting_uncached_tokens: None,
-                ..record.clone()
-            },
-            Instant::now(),
-        );
-        monitor.apply_pushed_load(
-            &worker,
-            0,
-            &EngineLoad {
-                running_requests: 8,
-                ..record.clone()
-            },
-            Instant::now(),
-        );
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        let report = snapshot.get("grpc://w1:9000").expect("published");
-        let ranks: Vec<(i32, i32, i32)> = report
-            .loads
-            .iter()
-            .map(|rank| {
-                (
-                    rank.dp_rank,
-                    rank.num_running_reqs,
-                    rank.num_waiting_uncached_tokens,
-                )
-            })
-            .collect();
-        assert_eq!(ranks, vec![(0, 8, 3_000), (1, 1, 0)]);
-        assert_eq!(report.dp_rank_count, 2);
-    }
-
-    /// A record for a worker the registry no longer holds as this incarnation
-    /// is dropped at publish by the fence, like a late poll.
-    #[tokio::test]
-    async fn a_pushed_record_from_a_replaced_worker_is_fenced_at_publish() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        registry.remove_by_url("grpc://w1:9000");
-        monitor.apply_pushed_load(&worker, 0, &EngineLoad::default(), Instant::now());
-        monitor.flush_pushed();
-        assert!(monitor
-            .load_state
-            .snapshot()
-            .get("grpc://w1:9000")
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn bootstrap_reconcile_starts_loops_for_existing_workers() {
-        let (registry, monitor) = build_monitor();
-        registry
-            .register(ready_worker("http://w1:8080", "llama-3"))
-            .unwrap();
-        registry
-            .register(ready_worker("http://w2:8080", "llama-3"))
-            .unwrap();
-        registry
-            .register(ready_worker("http://w3:8080", "gpt-4"))
-            .unwrap();
-
-        monitor.start_event_loop();
-
-        // Two model groups should now have polling loops.
-        let handles = monitor.group_handles.lock();
-        assert_eq!(handles.len(), 2);
-        let keys: Vec<&WorkerGroupKey> = handles.keys().collect();
-        assert!(keys.iter().any(|k| k.model_id == "llama-3"));
-        assert!(keys.iter().any(|k| k.model_id == "gpt-4"));
-    }
-
-    #[tokio::test]
-    async fn registered_event_starts_a_new_group() {
-        let (registry, monitor) = build_monitor();
-        monitor.start_event_loop();
-
-        // Registry was empty at bootstrap, so no groups yet.
-        assert!(monitor.group_handles.lock().is_empty());
-
-        registry
-            .register(ready_worker("http://w:8080", "llama-3"))
-            .unwrap();
-
-        // Give the event loop a moment to process the broadcast.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let handles = monitor.group_handles.lock();
-        assert_eq!(handles.len(), 1);
-        assert!(handles
-            .keys()
-            .any(|k| k.model_id == "llama-3" && k.worker_type == WorkerType::Regular));
-    }
-
-    #[tokio::test]
-    async fn removed_event_stops_empty_group() {
-        let (registry, monitor) = build_monitor();
-        let id = registry
-            .register(ready_worker("http://w:8080", "llama-3"))
-            .unwrap();
-        monitor.start_event_loop();
-        assert_eq!(monitor.group_handles.lock().len(), 1);
-
-        registry.remove(&id);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(monitor.group_handles.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn removed_event_evicts_cached_loads() {
-        // Regression test for the bug where a removed worker's last
-        // known load would persist forever in `load_tx` and the DP
-        // cache because the polling loop that pruned it had been
-        // stopped by the same removal.
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("http://w:8080", "llama-3");
-        let url = worker.url().to_string();
-        let id = registry.register(Arc::clone(&worker)).unwrap();
-        monitor.start_event_loop();
-
-        monitor.load_state.publish_group(
-            &[],
-            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
-        );
-        assert!(monitor.load_state.snapshot().contains(&url));
-        monitor
-            .native_loads_memo
-            .insert(url.clone(), NativeLoadsMemo::default());
-        let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
-        let mut inner = HashMap::new();
-        inner.insert(0, 5);
-        dp_loads.insert(url.clone(), inner);
-        monitor.worker_load_manager.update_dp_loads(&dp_loads);
-
-        registry.remove(&id);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // The event loop has queued the eviction; apply it deterministically
-        // instead of racing the debounced flusher.
-        monitor.flush_pending_evictions();
-
-        let snapshot = monitor.load_state.snapshot();
-        assert!(
-            !snapshot.contains(&url),
-            "the load snapshot must not retain entries for removed workers"
-        );
-        let cached = monitor.worker_load_manager.dp_cached_loads.read();
-        assert!(
-            !cached.contains_key(&url),
-            "DP cache must not retain entries for removed workers"
-        );
-        assert!(
-            !monitor.native_loads_memo.contains_key(&url),
-            "probe memo must not retain entries for removed workers"
-        );
-    }
-
-    #[tokio::test]
-    async fn stop_all_groups_clears_native_probe_memo() {
-        // A worker removed during a `RecvError::Lagged` window never
-        // fires an eviction, so the reset path must drop the memo too.
-        let (_registry, monitor) = build_monitor();
-        monitor
-            .native_loads_memo
-            .insert("http://w1:8080".to_string(), NativeLoadsMemo::default());
-
-        monitor.stop_all_groups();
-
-        assert!(monitor.native_loads_memo.is_empty());
-    }
-
-    #[tokio::test]
-    async fn stop_all_groups_clears_dp_cache() {
-        // Regression test for the bug where a `RecvError::Lagged`
-        // rebuild would leave stale DP cache entries because
-        // stop_all_groups only cleared the watch snapshot.
-        let (registry, monitor) = build_monitor();
-        registry
-            .register(ready_worker("http://w1:8080", "llama-3"))
-            .unwrap();
-
-        let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
-        let mut inner = HashMap::new();
-        inner.insert(0, 7);
-        dp_loads.insert("http://w1:8080".to_string(), inner);
-        monitor.worker_load_manager.update_dp_loads(&dp_loads);
-
-        monitor.stop_all_groups();
-
-        assert!(monitor.load_state.snapshot().is_empty());
-        assert!(monitor
-            .worker_load_manager
-            .dp_cached_loads
-            .read()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn status_changed_away_from_ready_evicts_worker() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("http://w:8080", "llama-3");
-        let url = worker.url().to_string();
-        let id = registry.register(Arc::clone(&worker)).unwrap();
-        monitor.start_event_loop();
-
-        // Seed the load snapshot + DP cache as if a poll had succeeded.
-        monitor.load_state.publish_group(
-            &[],
-            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
-        );
-        assert!(monitor.load_state.snapshot().contains(&url));
-        let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
-        let mut inner = HashMap::new();
-        inner.insert(0, 5);
-        dp_loads.insert(url.clone(), inner);
-        monitor.worker_load_manager.update_dp_loads(&dp_loads);
-
-        registry.transition_status(&id, WorkerStatus::NotReady);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // The event loop has queued the eviction; apply it deterministically
-        // instead of racing the debounced flusher.
-        monitor.flush_pending_evictions();
-
-        // Load snapshot entry pruned.
-        let snapshot = monitor.load_state.snapshot();
-        assert!(!snapshot.contains(&url));
-
-        // DP cache entry pruned.
-        let cached = monitor.worker_load_manager.dp_cached_loads.read();
-        assert!(!cached.contains_key(&url));
-    }
-
-    #[tokio::test]
-    async fn spawned_tasks_use_weak_references() {
-        // Regression test for the Arc cycle bug: the spawned event
-        // loop and the per-group polling loops must hold
-        // `Weak<WorkerMonitor>` rather than `Arc<WorkerMonitor>`. If
-        // they held strong references, the cycle through
-        // `event_task` / `group_handles` would keep the strong count
-        // pinned and `Drop` would never fire outside of full runtime
-        // shutdown.
-        let (registry, monitor) = build_monitor();
-        registry
-            .register(ready_worker("http://w:8080", "llama-3"))
-            .unwrap();
-        monitor.start_event_loop();
-
-        // Bootstrap should have started a polling loop for the
-        // worker's group, on top of the event task itself.
-        assert_eq!(monitor.group_handles.lock().len(), 1);
-
-        // After spawning, only the test's `Arc` should be strong:
-        // both the event task and the group loop downgraded to
-        // `Weak<Self>`.
-        assert_eq!(
-            Arc::strong_count(&monitor),
-            1,
-            "spawned tasks must not hold strong references to the monitor"
-        );
-        assert!(
-            Arc::weak_count(&monitor) >= 2,
-            "expected at least one Weak from the event task and one from the group loop"
-        );
-    }
-
-    fn pushed(running: u32) -> EngineLoad {
-        EngineLoad {
-            running_requests: running,
-            waiting_requests: 1,
-            token_usage: 0.2,
-            gen_throughput: 10.0,
-            max_running_requests: 32,
-            sample: 1,
-            ..Default::default()
-        }
-    }
-
-    /// A pushed record that carries the engine's own silence past the wedge
-    /// threshold vetoes the worker with nothing of this gateway's in flight
-    /// on it; the record that shows the engine producing again lifts it.
-    #[tokio::test]
-    async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let mut record = pushed(1);
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert!(worker.stall_reason().is_none(), "no silence reported");
-        record.engine_silence_ms = Some(5_000);
-        record.engine_reports_steps = Some(true);
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert_eq!(
-            worker.stall_reason(),
-            Some(super::super::worker::StallReason::Wedged)
-        );
-        assert!(!worker.is_healthy_and_eligible());
-        record.engine_silence_ms = None;
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert!(worker.stall_reason().is_none(), "the engine produces again");
-    }
-
-    /// The overload veto's edges are INFO lines with the report's figures:
-    /// a record at the waiting threshold sets it, the next under it clears
-    /// it, and a record that re-asserts the verdict the worker carries
-    /// writes nothing new.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn the_overload_vetos_edges_are_logged_with_their_figures() {
-        let (registry, monitor) = build_monitor();
-        let worker: Arc<dyn Worker> = {
-            let worker = BasicWorkerBuilder::new("grpc://w1:9000")
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Http)
-                .model(ModelCard::new("llama-3"))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .overload_defaults(OverloadThresholds {
-                    waiting_requests: Some(8),
-                    token_usage: Some(0.8),
-                })
-                .build();
-            worker.set_status(WorkerStatus::Ready);
-            Arc::new(worker)
-        };
-        registry.register(Arc::clone(&worker)).unwrap();
-        let mut record = pushed(1);
-        record.waiting_requests = 8;
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert!(worker.is_overloaded(), "eight waiting is the threshold");
-        assert!(logs_contain("Worker overload veto set"));
-        assert!(logs_contain("waiting_requests=8"));
-        assert!(logs_contain("pushed record"));
-        assert!(!logs_contain("Worker overload veto cleared"));
-        record.sample = 2;
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        logs_assert(|lines: &[&str]| {
-            let edges = lines
-                .iter()
-                .filter(|line| line.contains("Worker overload veto"))
-                .count();
-            if edges == 1 {
-                Ok(())
-            } else {
-                Err(format!("{edges} edge lines for one edge"))
-            }
-        });
-        record.waiting_requests = 0;
-        record.sample = 3;
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert!(!worker.is_overloaded(), "the queue drained");
-        assert!(logs_contain("Worker overload veto cleared"));
-    }
-
-    /// A worker's first pushed record may be a `load_only` one the servicer
-    /// sends before the engine's first batch (from the subscription on, to
-    /// a gateway that asks for them): with the engine's silence on it, it
-    /// vetoes the worker like any later record, so an engine frozen on the
-    /// first request it ever receives leaves routing within the threshold
-    /// rather than never.
-    #[tokio::test]
-    async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let record = EngineLoad {
-            engine_silence_ms: Some(5_000),
-            engine_reports_steps: Some(true),
-            prefill_pending_tokens: Some(47),
-            load_only: true,
-            sample: 1,
-            ..Default::default()
-        };
-        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-        assert_eq!(
-            worker.stall_reason(),
-            Some(super::super::worker::StallReason::Wedged)
-        );
-        assert!(!worker.is_healthy_and_eligible());
-    }
-
-    /// A record's telemetry feeds the `smg_engine_*` gauges, the PD gauges
-    /// included, as a poll's does; a core-only record after it (an event
-    /// batch between heartbeats) keeps the telemetry the worker last sent
-    /// and updates the core, so suppression blanks no gauge and `GET /loads`
-    /// shows the engine's sections between heartbeats.
-    #[tokio::test]
-    async fn a_pushed_records_telemetry_feeds_the_gauges_and_outlives_core_only_records() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let full = EngineLoad {
-            cache_hit_rate: Some(0.75),
-            num_used_tokens: Some(2_048),
-            max_total_num_tokens: Some(8_192),
-            memory: Some(smg_grpc_client::common_proto::EngineMemory {
-                weight_gb: 15.0,
-                kv_cache_gb: 40.0,
-                graph_gb: 1.5,
-                token_capacity: 8_192,
-            }),
-            disaggregation: Some(smg_grpc_client::common_proto::EngineDisaggregation {
-                mode: "prefill".to_string(),
-                prefill_prealloc_queue_reqs: 4,
-                prefill_inflight_queue_reqs: 5,
-                kv_transfer_latency_ms: 3.5,
-                ..Default::default()
-            }),
-            ..pushed(7)
-        };
-        let rendered = render_with_recorder(|| {
-            monitor.apply_pushed_load(&worker, 0, &full, Instant::now());
-        });
-        let gauge = |name: &str| {
-            rendered
-                .lines()
-                .find(|l| {
-                    l.starts_with(&format!("{name}{{")) && l.contains("worker=\"grpc://w1:9000\"")
-                })
-                .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
-                .unwrap_or_else(|| panic!("{name} missing:\n{rendered}"))
-        };
-        assert_eq!(gauge("smg_engine_cache_hit_rate"), "0.75");
-        assert_eq!(gauge("smg_engine_pd_kv_transfer_latency_ms"), "3.5");
-        assert_eq!(gauge("smg_engine_pd_prefill_queue_reqs"), "9");
-
-        monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        let rank0 = &snapshot.get("grpc://w1:9000").expect("published").loads[0];
-        assert_eq!(rank0.num_running_reqs, 8);
-        assert!((rank0.cache_hit_rate - 0.75).abs() < f64::EPSILON);
-        assert_eq!(rank0.max_total_num_tokens, 8_192);
-        assert_eq!(rank0.memory.as_ref().map(|m| m.token_capacity), Some(8_192));
-        assert_eq!(rank0.disagg_mode.as_deref(), Some("prefill"));
-        assert_eq!(rank0.prefill_queue_reqs, Some(9));
-    }
-
-    /// The poll decision reads the receipt of the worker's pushed records
-    /// against the tick interval: none on file polls as always, a record
-    /// within the interval on every pushing rank suppresses the poll, and a
-    /// rank whose newest record is older falls back to the poll; the
-    /// record's own age (its `sampled_at`) plays no part.
-    #[tokio::test]
-    async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let url = "grpc://w1:9000";
-        let interval = Duration::from_secs(10);
-        let t0 = Instant::now();
-        // An old servicer: no record, ever.
-        assert_eq!(monitor.poll_mode(url, t0, interval), PollMode::Poll);
-        // Heartbeats flowing: no poll while the newest record is younger
-        // than the interval.
-        monitor.apply_pushed_load(&worker, 0, &pushed(3), t0);
-        assert_eq!(
-            monitor.poll_mode(url, t0 + interval / 2, interval),
-            PollMode::Suppressed
-        );
-        // Heartbeats stopped: the poll is back within one interval.
-        assert_eq!(
-            monitor.poll_mode(url, t0 + interval, interval),
-            PollMode::Fallback
-        );
-        // A second rank pushes; the oldest pushing rank decides.
-        monitor.apply_pushed_load(&worker, 1, &pushed(4), t0 + interval);
-        assert_eq!(
-            monitor.poll_mode(url, t0 + interval + interval / 2, interval),
-            PollMode::Fallback
-        );
-        monitor.apply_pushed_load(&worker, 0, &pushed(5), t0 + interval + interval / 2);
-        assert_eq!(
-            monitor.poll_mode(url, t0 + interval + interval / 2, interval),
-            PollMode::Suppressed
-        );
-        // A stale sample in a fresh record is still a fresh record.
-        let late = t0 + 2 * interval;
-        monitor.apply_pushed_load(
-            &worker,
-            0,
-            &EngineLoad {
-                age_ms: 60_000,
-                ..pushed(6)
-            },
-            late,
-        );
-        monitor.apply_pushed_load(&worker, 1, &pushed(6), late);
-        assert_eq!(
-            monitor.poll_mode(url, late + Duration::from_millis(1), interval),
-            PollMode::Suppressed
-        );
-        // A worker that leaves takes its records with it.
-        monitor.evict_worker_loads(&worker);
-        assert_eq!(monitor.poll_mode(url, late, interval), PollMode::Poll);
-    }
-
-    /// Under data parallelism a quiet rank's record stops arriving while
-    /// the other rank's heartbeats keep the stream alive, and the tick
-    /// falls back to the poll for the worker. The poll's figure for the
-    /// quiet rank replaces its entry in the pushed report: a heartbeat
-    /// naming the busy rank no longer rebuilds the report from the quiet
-    /// rank's last pushed record, the rank follows the poll from then on,
-    /// a rank whose own record arrived since the poll began keeps it, and
-    /// the poll decision is unchanged (the worker stays polled until the
-    /// rank's records resume).
-    #[tokio::test]
-    async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_record() {
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let url = "grpc://w1:9000";
-        let interval = Duration::from_secs(10);
-        let t0 = Instant::now();
-        let record = |running: u32, hit_rate: f64| EngineLoad {
-            cache_hit_rate: Some(hit_rate),
-            ..pushed(running)
-        };
-        let poll = |rank1_hit_rate: f64| WorkerLoadResponse {
-            dp_rank_count: 2,
-            loads: vec![
-                SchedulerLoadSnapshot {
-                    dp_rank: 0,
-                    num_running_reqs: 2,
-                    cache_hit_rate: 0.9,
-                    ..Default::default()
-                },
-                SchedulerLoadSnapshot {
-                    dp_rank: 1,
-                    num_running_reqs: 8,
-                    cache_hit_rate: rank1_hit_rate,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let ranks_of = |report: &WorkerLoadResponse| -> Vec<(i32, i32, f64)> {
-            report
-                .loads
-                .iter()
-                .map(|rank| (rank.dp_rank, rank.num_running_reqs, rank.cache_hit_rate))
-                .collect()
-        };
-
-        // Both ranks push during the first passes; then rank 1's working
-        // set is cached and its records stop, while rank 0 keeps pushing.
-        monitor.apply_pushed_load(&worker, 0, &record(3, 0.5), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65), t0);
-        let polled_at = t0 + interval;
-        assert_eq!(
-            monitor.poll_mode(url, polled_at, interval),
-            PollMode::Fallback
-        );
-        // Rank 0 pushed while the poll was in flight: its own record is the
-        // newer; rank 1 pushed nothing since the poll began.
-        monitor.apply_pushed_load(
-            &worker,
-            0,
-            &record(4, 0.5),
-            polled_at + Duration::from_millis(1),
-        );
-        monitor.apply_polled_load(url, &poll(0.91), polled_at);
-        // The next heartbeat names rank 0 only: the report it rebuilds and
-        // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
-        let rendered = render_with_recorder(|| {
-            monitor.apply_pushed_load(
-                &worker,
-                0,
-                &record(5, 0.5),
-                polled_at + Duration::from_millis(2),
-            );
-        });
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        let report = snapshot.get(url).expect("published");
-        assert_eq!(report.version, "pushed");
-        assert_eq!(ranks_of(report), vec![(0, 5, 0.5), (1, 8, 0.91)]);
-        let rank1_hit_rate = rendered
-            .lines()
-            .find(|l| {
-                l.starts_with("smg_engine_cache_hit_rate{")
-                    && l.contains("worker=\"grpc://w1:9000\"")
-                    && l.contains("dp_rank=\"1\"")
-            })
-            .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
-            .unwrap_or_else(|| panic!("rank 1's hit rate gauge missing:\n{rendered}"));
-        assert_eq!(rank1_hit_rate, "0.91");
-
-        // The receipts are the stream's: rank 1 is still quiet, the worker
-        // stays polled, and each poll's figure replaces the last. A rank
-        // the stream never named (here a rank 2 the poll reports) stays
-        // out of the pushed report: nothing would refresh it once the
-        // pushing ranks are fresh again.
-        let next = polled_at + interval;
-        assert_eq!(monitor.poll_mode(url, next, interval), PollMode::Fallback);
-        let mut with_a_third_rank = poll(0.93);
-        with_a_third_rank.loads.push(SchedulerLoadSnapshot {
-            dp_rank: 2,
-            num_running_reqs: 1,
-            cache_hit_rate: 0.2,
-            ..Default::default()
-        });
-        with_a_third_rank.dp_rank_count = 3;
-        monitor.apply_polled_load(url, &with_a_third_rank, next);
-        monitor.apply_pushed_load(&worker, 0, &record(6, 0.5), next + Duration::from_millis(1));
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        assert_eq!(
-            ranks_of(snapshot.get(url).expect("published")),
-            vec![(0, 6, 0.5), (1, 8, 0.93)]
-        );
-        // A rollup keyed by downstream worker rather than by rank is
-        // ignored: its entries both say rank 0, and rank 0's slot keeps
-        // the record the stream pushed before the rollup was asked.
-        let rollup = WorkerLoadResponse {
-            dp_rank_count: 2,
-            loads: vec![
-                SchedulerLoadSnapshot {
-                    dp_rank: 0,
-                    num_running_reqs: 40,
-                    worker: Some("http://downstream-a:8000".to_string()),
-                    ..Default::default()
-                },
-                SchedulerLoadSnapshot {
-                    dp_rank: 0,
-                    num_running_reqs: 41,
-                    worker: Some("http://downstream-b:8000".to_string()),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        monitor.apply_polled_load(url, &rollup, next + Duration::from_millis(2));
-        let rank0 = monitor
-            .pushed_ranks
-            .lock()
-            .get(url)
-            .and_then(|ranks| ranks.get(&0).cloned())
-            .expect("rank 0 on file");
-        assert_eq!(
-            (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
-            (6, 0.5, None)
-        );
-        // Rank 1's own record, once it pushes again, is the newer figure
-        // and suppresses the poll again; the report it rebuilds carries
-        // rank 0 as the stream left it.
-        monitor.apply_pushed_load(&worker, 1, &record(7, 0.7), next + Duration::from_millis(3));
-        monitor.flush_pushed();
-        let snapshot = monitor.load_state.snapshot();
-        assert_eq!(
-            ranks_of(snapshot.get(url).expect("published")),
-            vec![(0, 6, 0.5), (1, 7, 0.7)]
-        );
-        assert_eq!(
-            monitor.poll_mode(url, next + Duration::from_millis(4), interval),
-            PollMode::Suppressed
-        );
-
-        // A worker with no pushed record on file has no report to merge
-        // into: the poll's report stands on its own and the worker is
-        // polled as always.
-        let other = ready_worker("grpc://w2:9000", "llama-3");
-        registry.register(Arc::clone(&other)).unwrap();
-        monitor.apply_polled_load("grpc://w2:9000", &poll(0.1), t0);
-        assert!(monitor.pushed_ranks.lock().get("grpc://w2:9000").is_none());
-        assert_eq!(
-            monitor.poll_mode("grpc://w2:9000", t0, interval),
-            PollMode::Poll
-        );
-    }
-
-    /// A tick does not poll a worker whose stream pushed within the
-    /// interval, leaves the pushed report in the shared snapshot, and
-    /// counts the skip; the record fed the `smg_engine_*` gauges on its
-    /// way in, so suppression blanks nothing. Once the records are older
-    /// than the interval the tick polls again (here a URL nobody serves:
-    /// the failed poll prunes the entry, as a failed poll always has).
-    #[test]
-    fn a_tick_skips_a_worker_whose_stream_pushed_within_the_interval() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (registry, monitor) = build_monitor();
-        let worker = ready_worker("grpc://w1:9000", "llama-3");
-        registry.register(Arc::clone(&worker)).unwrap();
-        let key = WorkerGroupKey {
-            model_id: "llama-3".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Http,
-        };
-        let interval = Duration::from_secs(10);
-        let t0 = Instant::now();
-        let rendered = render_with_recorder(|| {
-            runtime.block_on(async {
-                monitor.apply_pushed_load(&worker, 0, &pushed(7), t0);
-                monitor.flush_pushed();
-                poll_group_once(&monitor, &key, interval, t0 + interval / 2).await;
-            });
-        });
-        let snapshot = monitor.load_state.snapshot();
-        let report = snapshot
-            .get("grpc://w1:9000")
-            .expect("kept across the tick");
-        assert_eq!(report.version, "pushed");
-        assert_eq!(report.loads[0].num_running_reqs, 7);
-        let line = |name: &str, label: &str| {
-            rendered
-                .lines()
-                .find(|l| l.starts_with(&format!("{name}{{")) && l.contains(label))
-                .map(str::to_string)
-                .unwrap_or_else(|| panic!("{name} with {label} missing:\n{rendered}"))
-        };
-        assert!(
-            line("smg_engine_running_requests", "worker=\"grpc://w1:9000\"").ends_with(" 7"),
-            "{rendered}"
-        );
-        assert!(
-            line("smg_engine_load_polls_total", "mode=\"skipped_fresh_push\"").ends_with(" 1"),
-            "{rendered}"
-        );
-
-        let rendered = render_with_recorder(|| {
-            runtime.block_on(poll_group_once(&monitor, &key, interval, t0 + 2 * interval));
-        });
-        assert!(
-            monitor
-                .load_state
-                .snapshot()
-                .get("grpc://w1:9000")
-                .is_none(),
-            "the fallback poll of an unreachable worker prunes its entry"
-        );
-        assert!(
-            rendered
-                .lines()
-                .any(|l| l.starts_with("smg_engine_load_polls_total{")
-                    && l.contains("mode=\"fallback\"")
-                    && l.ends_with(" 1")),
-            "{rendered}"
-        );
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod prom_scrape_tests {
@@ -2779,6 +2149,14 @@ mod native_loads_tests {
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
 
+    const NATIVE_DP_BODY: &str = r#"{"dp_rank_count":2,"loads":[
+        {"dp_rank":0,"num_running_reqs":3,"token_usage":0.25},
+        {"dp_rank":1,"num_running_reqs":9,"token_usage":0.75}]}"#;
+
+    const GATEWAY_FLEET_BODY: &str = r#"{"dp_rank_count":2,"loads":[
+        {"worker":"http://engine-a","dp_rank":0,"num_running_reqs":3},
+        {"worker":"http://engine-b","dp_rank":0,"num_running_reqs":9}]}"#;
+
     struct Stub {
         url: String,
         /// `/v1/loads` hits.
@@ -2859,6 +2237,23 @@ mod native_loads_tests {
         vllm_worker_with_overload(url, OverloadUpdate::default())
     }
 
+    /// Build an HTTP virtual rank whose probes must use the base endpoint.
+    fn vllm_dp_worker(url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(rank, size)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
     /// Worker carrying a per-worker overload block — protection for it is
     /// enabled by the spec alone, with no gateway thresholds anywhere.
     fn vllm_worker_with_overload(url: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
@@ -2902,6 +2297,8 @@ mod native_loads_tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }
     }
 
@@ -3197,6 +2594,33 @@ mod native_loads_tests {
         .expect("cache_aware with overlap_decay must trigger load polling");
     }
 
+    /// The one predicate behind the poll tick and the load stream: wanted
+    /// by default; under `--disable-load-monitoring` only for a reason.
+    #[tokio::test]
+    async fn loads_wanted_follows_the_conditional_gate() {
+        let (_registry, by_default) = monitor_with(PolicyConfig::Random, false);
+        assert!(by_default.loads_wanted(&[vllm_worker("http://a:8000")]));
+        let (_registry, conditional) = monitor_with(PolicyConfig::Random, true);
+        assert!(!conditional.loads_wanted(&[vllm_worker("http://a:8000")]));
+        assert!(
+            conditional.loads_wanted(&[vllm_worker_with_overload(
+                "http://a:8000",
+                OverloadUpdate {
+                    waiting_requests: Some(1),
+                    ..Default::default()
+                }
+            )]),
+            "overload protection on a member wants the loads"
+        );
+        let (_registry, load_aware) = monitor_with(
+            PolicyConfig::PowerOfTwo {
+                load_metric: Default::default(),
+            },
+            true,
+        );
+        assert!(load_aware.loads_wanted(&[vllm_worker("http://a:8000")]));
+    }
+
     /// Load monitoring is on by default: a load-blind policy with no flags and
     /// no spec blocks still gets its workers polled from registration onward.
     #[tokio::test]
@@ -3252,6 +2676,87 @@ mod native_loads_tests {
         );
     }
 
+    /// The load probe of a dp-aware HTTP worker goes to its engine's address:
+    /// the `@rank` suffix of the worker's URL is the router's, not a host. The
+    /// test checks the address (one probe, the engine's native report read);
+    /// which entry of that report is the worker's rank is a separate question.
+    #[tokio::test]
+    async fn a_dp_aware_http_workers_probe_reaches_its_engine() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(stub.url.as_str())
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(1, 2)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        assert_eq!(worker.url(), format!("{}@1", stub.url));
+        let memo = DashMap::new();
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("the engine answers at its address");
+        assert_eq!(resp.loads[0].dp_rank, 1);
+        assert_eq!(resp.loads[0].num_running_reqs, 9);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    /// A backend-wide native response only updates the selected virtual rank.
+    async fn native_loads_are_projected_to_the_virtual_worker_rank() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let worker = vllm_dp_worker(&stub.url, 1, 2);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("rank 1 load response");
+
+        assert_eq!(resp.dp_rank_count, 1);
+        assert_eq!(resp.loads.len(), 1);
+        assert_eq!(resp.loads[0].dp_rank, 1);
+        assert_eq!(resp.loads[0].num_running_reqs, 9);
+    }
+
+    #[tokio::test]
+    /// Missing native telemetry must not fall back to backend-wide averages.
+    async fn missing_native_rank_never_uses_prometheus_average() {
+        for body in [NATIVE_BODY, r#"{"loads":[]}"#] {
+            let stub = spawn_engine(StatusCode::OK, body).await;
+            let worker = vllm_dp_worker(&stub.url, 1, 2);
+            let memo = DashMap::new();
+            for _ in 0..2 {
+                assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                    .await
+                    .expect("successful native poll")
+                    .loads
+                    .is_empty());
+            }
+            assert_eq!(stub.probes.load(Ordering::SeqCst), 2);
+            assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    /// Gateway rollups retain their independent downstream worker identities.
+    async fn gateway_fleet_loads_are_not_projected_as_engine_dp_ranks() {
+        let stub = spawn_gateway(GATEWAY_FLEET_BODY).await;
+        let worker = vllm_dp_worker(&stub.url, 1, 2);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("gateway fleet load response");
+
+        assert_eq!(resp.loads.len(), 2);
+        assert!(resp.loads.iter().all(|load| load.worker.is_some()));
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn absent_native_endpoint_falls_back_and_is_probed_once() {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
@@ -3303,20 +2808,29 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
+    /// Unrelated JSON and malformed load fields cannot suppress metrics fallback.
     async fn non_load_body_on_200_is_treated_as_absent() {
-        let stub = spawn_engine(StatusCode::OK, "<html>nope</html>").await;
-        let worker = vllm_worker(&stub.url);
-        let memo = DashMap::new();
+        for body in [
+            "<html>nope</html>",
+            "{}",
+            r#"{"status":"ok"}"#,
+            r#"{"loads":null}"#,
+        ] {
+            let stub = spawn_engine(StatusCode::OK, body).await;
+            let worker = vllm_worker(&stub.url);
+            let memo = DashMap::new();
 
-        WorkerMonitor::fetch_http_load(&worker, Some(&memo))
-            .await
-            .expect("metrics fallback");
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("metrics fallback");
 
-        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
-        assert!(hit.is_absent(NativeLoadsPath::Engine));
+            let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+            assert!(hit.is_absent(NativeLoadsPath::Engine));
+        }
     }
 
     #[tokio::test]
+    /// An empty native response stays unavailable while future polls retry it.
     async fn empty_loads_array_keeps_probing() {
         // Our schema, no ranks yet — the endpoint exists, so keep asking.
         let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
@@ -3324,9 +2838,11 @@ mod native_loads_tests {
         let memo = DashMap::new();
 
         for _ in 0..2 {
-            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
-                .expect("metrics fallback");
+                .expect("successful native poll")
+                .loads
+                .is_empty());
         }
 
         let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
@@ -3424,6 +2940,266 @@ mod native_loads_tests {
             stub.gateway_query.lock().clone(),
             Some("model=meta-llama%2FLlama-3.1-8B".to_string())
         );
+    }
+
+    /// An omitted virtual rank is evicted; another cached rank and failed polls survive.
+    #[tokio::test]
+    async fn successful_missing_rank_evicts_only_that_rank_from_the_dp_cache() {
+        for (status, body, missing) in [
+            (StatusCode::OK, NATIVE_BODY, true),
+            (StatusCode::OK, r#"{"loads":[]}"#, true),
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable", false),
+            (StatusCode::NOT_FOUND, "", false),
+        ] {
+            let stub = spawn_engine(status, body).await;
+            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+            let worker = vllm_dp_worker(&stub.url, 1, 2);
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            // Simulate a previously cached backend-wide snapshot under this URL.
+            monitor
+                .worker_load_manager
+                .update_dp_loads(&HashMap::from([(
+                    worker.url().to_string(),
+                    HashMap::from([(0, 100), (1, 200)]),
+                )]));
+            let key = WorkerGroupKey {
+                model_id: "a".to_string(),
+                worker_type: WorkerType::Regular,
+                connection_mode: ConnectionMode::Http,
+            };
+            poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+            let cached = monitor.worker_load_manager.dp_cached_loads.read();
+            let ranks = cached.get(worker.url()).expect("other cached rank remains");
+            assert_eq!(ranks.get(&0), Some(&100));
+            assert_eq!(ranks.get(&1), if missing { None } else { Some(&200) });
+            drop(cached);
+            assert!(monitor.load_state.snapshot().get(worker.url()).is_none());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .select_and_increment_lowest_dp_load(worker.as_ref(), 1),
+                if missing { None } else { Some(1) },
+            );
+        }
+    }
+
+    /// Empty polls retract old ranks without discarding concurrent stream records.
+    #[tokio::test]
+    async fn empty_poll_does_not_resurrect_stale_pushed_ranks() {
+        for fresh_offset in [None, Some(Duration::ZERO), Some(Duration::from_millis(1))] {
+            let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
+            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+            let worker = vllm_worker(&stub.url);
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            let interval = Duration::from_secs(10);
+            let t0 = Instant::now();
+            let polled_at = t0 + interval;
+            for rank in 0..2 {
+                monitor.apply_pushed_load(&worker, rank, &EngineLoad::default(), t0);
+            }
+            let absolute = WorkerLoadResponse {
+                loads: (0..2)
+                    .map(|dp_rank| SchedulerLoadSnapshot {
+                        dp_rank,
+                        num_used_tokens: 100,
+                        max_total_num_tokens: 1000,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            monitor.apply_polled_load(worker.url(), &absolute, t0 + Duration::from_secs(1));
+            if let Some(offset) = fresh_offset {
+                monitor.apply_pushed_load(&worker, 1, &EngineLoad::default(), polled_at + offset);
+            }
+            let key = WorkerGroupKey {
+                model_id: "a".to_string(),
+                worker_type: WorkerType::Regular,
+                connection_mode: ConnectionMode::Http,
+            };
+            poll_group_once(&monitor, &key, interval, polled_at).await;
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            if let Some(report) = snapshot.get(worker.url()) {
+                assert!(fresh_offset.is_some());
+                assert_eq!(report.loads.len(), 1);
+                assert_eq!(report.loads[0].dp_rank, 1);
+            }
+            assert_eq!(
+                monitor.pushed_at.lock()[worker.url()].contains_key(&1),
+                fresh_offset.is_some()
+            );
+            monitor.apply_pushed_load(
+                &worker,
+                0,
+                &EngineLoad::default(),
+                polled_at + Duration::from_secs(1),
+            );
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            let report = snapshot.get(worker.url()).unwrap();
+            assert_eq!(
+                report.loads.len(),
+                if fresh_offset.is_some() { 2 } else { 1 }
+            );
+            if fresh_offset.is_none() {
+                assert_eq!(report.loads[0].dp_rank, 0);
+                let cached = monitor.worker_load_manager.dp_cached_loads.read();
+                assert!(cached
+                    .get(worker.url())
+                    .is_none_or(|ranks| !ranks.contains_key(&1)));
+            }
+        }
+    }
+
+    /// Two HTTP rank workers of one engine share one read of its native load
+    /// route per tick, and each one's published report is its own rank's
+    /// entry of the engine's two-rank answer: the shared snapshot, the DP
+    /// token cache and the overload verdict read the rank.
+    #[tokio::test]
+    async fn the_rank_workers_of_one_http_engine_share_one_native_read() {
+        const TWO_RANKS: &str = r#"{"loads":[
+            {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":1,"num_used_tokens":300,"max_total_num_tokens":1000,"token_usage":0.3},
+            {"dp_rank":1,"num_running_reqs":9,"num_waiting_reqs":4,"num_used_tokens":900,"max_total_num_tokens":1000,"token_usage":0.9}]}"#;
+        let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let workers = [
+            vllm_dp_worker(&stub.url, 0, 2),
+            vllm_dp_worker(&stub.url, 1, 2),
+        ];
+        for worker in &workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        // A transport failure noted on each rank worker: the one read's
+        // contact must clear it on both.
+        for worker in &workers {
+            worker.note_transport_failure();
+        }
+        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+
+        let snapshot = monitor.load_state.snapshot();
+        for (worker, expected) in workers.iter().zip([(0, 3, 1, 300), (1, 9, 4, 900)]) {
+            assert!(
+                !worker.transport_failure_pending(),
+                "the contact is every member's: {}",
+                worker.url()
+            );
+            let report = snapshot.get(worker.url()).expect("published");
+            let ranks: Vec<(i32, i64, i64, i64)> = report
+                .loads
+                .iter()
+                .map(|rank| {
+                    (
+                        rank.dp_rank,
+                        i64::from(rank.num_running_reqs),
+                        i64::from(rank.num_waiting_reqs),
+                        i64::from(rank.num_used_tokens),
+                    )
+                })
+                .collect();
+            assert_eq!(ranks, vec![expected], "{}", worker.url());
+            assert_eq!(report.dp_rank_count, 1, "{}", worker.url());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .select_and_increment_lowest_dp_load(worker.as_ref(), 0),
+                Some(expected.0 as isize),
+                "{}",
+                worker.url()
+            );
+        }
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            1,
+            "one read of the engine's native route for its two rank workers"
+        );
+    }
+
+    /// The rank workers of one gRPC engine share one `GetLoads` per tick: the
+    /// engine answers once, and every rank worker gets its contact and its
+    /// own rank's part of the answer, as its own poll would have had it (the
+    /// canned engine names rank 0 only, so rank 1 has no report).
+    #[tokio::test]
+    async fn the_rank_workers_of_one_grpc_engine_share_one_poll() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = Arc::new(mock_worker::config::Config {
+            http_count: 0,
+            grpc_base_port: port,
+            grpc_count: 1,
+            model_id: "a".to_string(),
+            tokenizer_path: "a".to_string(),
+            gen_delay: Duration::ZERO,
+            output_tokens: 3,
+            realistic: false,
+            ..mock_worker::config::Config::default()
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test engine: the server task lives for the test process"
+        )]
+        let _engine = tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let rank_worker = |rank: usize| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .model(ModelCard::new("a"))
+                    .dp_config(rank, 2)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let workers = [rank_worker(0), rank_worker(1)];
+        for worker in &workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Grpc,
+        };
+        let polls_before = mock_worker::overrides::for_port(port).loads_polls();
+        // A transport failure noted on each rank worker: the one GetLoads'
+        // contact must clear it on both.
+        for worker in &workers {
+            worker.note_transport_failure();
+        }
+        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+        assert_eq!(
+            mock_worker::overrides::for_port(port).loads_polls() - polls_before,
+            1,
+            "one GetLoads for the engine's two rank workers"
+        );
+
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot
+            .get(workers[0].url())
+            .expect("the rank the answer names has its report");
+        assert_eq!((report.loads.len(), report.loads[0].dp_rank), (1, 0));
+        assert!(
+            snapshot.get(workers[1].url()).is_none(),
+            "a rank the answer does not name has no report, as its own poll would have had it"
+        );
+        for worker in &workers {
+            assert!(
+                !worker.transport_failure_pending(),
+                "the contact is every member's: {}",
+                worker.url()
+            );
+        }
     }
 
     /// The tick's fallback poll of a worker whose stream went quiet on one

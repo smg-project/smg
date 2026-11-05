@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import grpc
 import pytest
 
 pytest.importorskip("msgspec")
@@ -206,3 +207,103 @@ def test_the_engine_iterator_is_closed_before_its_request_table_is_checked(
 
     assert _kinds(responses) == expected
     assert servicer.async_llm.rid_to_state == {}
+
+
+class _Aborted(grpc.aio.AbortError):
+    """What grpc.aio's abort raises: the servicer lets it through untouched."""
+
+
+class _Context:
+    """A servicer context that records its one abort, as grpc.aio's raises."""
+
+    def __init__(self):
+        self.aborts = []
+
+    async def abort(self, code, details="", trailing_metadata=()):
+        self.aborts.append((code, details, tuple(trailing_metadata)))
+        raise _Aborted()
+
+
+def _abort_output(index: int, **reason):
+    return {
+        "index": index,
+        "output_ids": [],
+        "meta_info": {"finish_reason": {"type": "abort", **reason}, "completion_tokens": 0},
+    }
+
+
+def _constrained_request(stream: bool):
+    return tokenspeed_scheduler_pb2.GenerateRequest(
+        request_id="request-1",
+        stream=stream,
+        sampling_params=tokenspeed_scheduler_pb2.SamplingParams(json_schema='{"type":"object"}'),
+    )
+
+
+async def _aborted_with(servicer, request):
+    context = _Context()
+    try:
+        async for _ in servicer.Generate(request, context=context):
+            pass
+    except _Aborted:
+        pass
+    assert len(context.aborts) == 1, context.aborts
+    return context.aborts[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_abort_of_a_constrained_request_is_the_engines_own_abort(
+    tokenspeed_servicer_mod, stream
+):
+    # The engine has no abort code for its grammar: an abort of a constrained
+    # request with no status is a pause aborting every request in flight (the
+    # finish an RL driver resubmits on) or a capacity abort as often as
+    # anything else, so it keeps the status every request's abort has, and
+    # never the constraint-failure status (which only an engine's own
+    # attribution raises); a full queue keeps its own code.
+    servicer = _servicer(
+        tokenspeed_servicer_mod,
+        [_abort_output(0, message="Request aborted by the scheduler: paused", err_type=524)],
+        "rid",
+    )
+    code, details, trailer = asyncio.run(_aborted_with(servicer, _constrained_request(stream)))
+    assert code is grpc.StatusCode.INTERNAL
+    assert details == "Request aborted by the scheduler: paused"
+    assert trailer == ()
+
+    servicer = _servicer(
+        tokenspeed_servicer_mod, [_abort_output(0, message="busy", status_code=429)], "rid"
+    )
+    code, _, trailer = asyncio.run(_aborted_with(servicer, _constrained_request(stream)))
+    assert code is grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert trailer == ()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (400, grpc.StatusCode.INVALID_ARGUMENT),
+        (404, grpc.StatusCode.NOT_FOUND),
+        (408, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (429, grpc.StatusCode.RESOURCE_EXHAUSTED),
+        (500, grpc.StatusCode.INTERNAL),
+        (503, grpc.StatusCode.UNAVAILABLE),
+        (504, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (None, grpc.StatusCode.INTERNAL),
+    ],
+)
+@pytest.mark.parametrize("choice_list", [False, True], ids=["streamed", "choice-list"])
+def test_an_engine_abort_carries_the_status_its_http_code_means(
+    tokenspeed_servicer_mod, status_code, expected, choice_list
+):
+    # The engine's HTTP-style status goes through the table every engine
+    # servicer shares (the vLLM and SGLang servicers answer the same code for
+    # the same status), on the streamed path and on the choice-list path alike;
+    # the engine's message is the status message.
+    output = _abort_output(0, message="the engine refused the request", status_code=status_code)
+    outputs = [[output]] if choice_list else [output]
+    servicer = _servicer(tokenspeed_servicer_mod, outputs, "rid")
+    code, details, trailer = asyncio.run(_aborted_with(servicer, _request(not choice_list)))
+    assert code is expected
+    assert details == "the engine refused the request"
+    assert trailer == ()

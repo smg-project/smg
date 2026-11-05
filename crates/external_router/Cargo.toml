@@ -1,6 +1,6 @@
 [package]
 name = "smg-external-router"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Routers for third-party providers behind the SMG gateway, and the contract they are built on"
 license = "Apache-2.0"
@@ -30,7 +30,7 @@ workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }
-bytes = "1.12.0"
+bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures-util = "0.3"
@@ -64,3 +64,5 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+# The capture tests read the crate's own log lines through the tracing subscriber.
+tracing-test = "0.2"
