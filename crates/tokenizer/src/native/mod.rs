@@ -69,11 +69,13 @@ use unicode_normalization_alignments::UnicodeNormalization;
 
 mod chain;
 mod merge;
+mod nfc;
 mod pattern;
 mod short_pieces;
 mod unicode;
 
 use merge::MergeTable;
+use nfc::NfcQuick;
 use pattern::Pattern;
 use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
 
@@ -486,6 +488,9 @@ struct Template {
 /// The native encode path of one tokenizer; see the module documentation.
 pub(crate) struct NativeEncoder {
     normalizer: Normalizer,
+    /// The NFC quick check's tables, read when the normalizer is NFC: the
+    /// check every encode under it starts with (see [`Self::in_nfc`]).
+    nfc_quick: Option<NfcQuick>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -518,6 +523,7 @@ impl std::fmt::Debug for NativeEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeEncoder")
             .field("normalizer", &self.normalizer)
+            .field("nfc_quick", &self.nfc_quick.is_some())
             .field("stages", &self.stages.len())
             .field("seeded_pieces", &self.seed.len())
             .field("native_merge", &self.merges.is_some())
@@ -586,6 +592,7 @@ impl NativeEncoder {
         };
         let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
+            nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
@@ -1096,7 +1103,7 @@ impl NativeEncoder {
         // Text not in NFC under the NFC normalizer (by the library's tables,
         // as every NFC read here) is normalized gap by gap first; the units
         // then borrow from those gaps.
-        let gaps = (self.normalizer == Normalizer::Nfc && !is_nfc(text))
+        let gaps = (self.normalizer == Normalizer::Nfc && !self.in_nfc(text))
             .then(|| self.nfc_gaps(text, added));
         let units = match &gaps {
             Some(gaps) => self.units_of(gaps, parallel, added),
@@ -1136,6 +1143,16 @@ impl NativeEncoder {
         }
         ids.extend_from_slice(after);
         Ok(ids)
+    }
+
+    /// Whether `text` is in NFC by the library's tables: the quick check's
+    /// own tables first, the library's stretch-wise check where they cannot
+    /// tell (an encoder without the NFC normalizer never asks).
+    fn in_nfc(&self, text: &str) -> bool {
+        match &self.nfc_quick {
+            Some(quick) => quick.is_nfc(text),
+            None => is_nfc(text),
+        }
     }
 
     /// The input as the units its encode is made of: the added tokens
