@@ -73,14 +73,23 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<ts::AbortResponse>, Status> {
         let request = request.into_inner();
         // The choices of an `n > 1` request live under the one registration,
-        // so aborting the parent id ends every choice.
-        self.state
+        // so aborting the parent id ends every choice. An unknown or finished
+        // id is reported as the Python servicer reports it.
+        let found = self
+            .state
             .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: format!("aborted {}", request.request_id),
+        Ok(Response::new(if found > 0 {
+            ts::AbortResponse {
+                success: true,
+                message: format!("aborted {}", request.request_id),
+            }
+        } else {
+            ts::AbortResponse {
+                success: false,
+                message: format!("Request {} not found", request.request_id),
+            }
         }))
     }
 
