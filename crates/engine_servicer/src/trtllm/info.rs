@@ -6,7 +6,7 @@ use smg_grpc_client::trtllm_proto as trt;
 use tonic::Status;
 
 use super::{State, HEALTHY};
-use crate::load_report::rank_entries;
+use crate::{load_report::rank_entries, load_tracker::LoadEstimate};
 
 /// `HealthCheck`: `OK` only with the engine link up and no drain announced,
 /// else the shared message (the Python servicer's status is its message too).
@@ -122,11 +122,12 @@ fn world_of(tensor: i32, pipeline: i32, context: i32) -> i32 {
 }
 
 /// `GetLoads`: the per-rank load from the shims' load tails (the figures the
-/// pushed record carries) in the gRPC response shape: every connected rank,
-/// zero-filled before its first tail, with the window and the KV capacity
-/// the servicer knows; the rank the request names alone when it names one.
-/// No queued token-work, rate or capacity yet: the shim's wire carries no
-/// timings for them.
+/// pushed record carries) in the gRPC response shape, with the servicer's
+/// own bookkeeping ([`crate::load_tracker`]) for the queued token-work, the
+/// prefill and generation throughput and the hit rate the tail does not
+/// carry, each rank's own: every connected rank, zero-filled before its
+/// first tail, with the window and the KV capacity the servicer knows; the
+/// rank the request names alone when it names one.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let max_running_requests = state
@@ -134,7 +135,12 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoads
         .running_window(state.model.max_running_requests);
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
-    let entry = |dp_rank: i32, running: i32, waiting: i32, used_tokens: i32, usage: f64| {
+    let entry = |dp_rank: i32,
+                 running: i32,
+                 waiting: i32,
+                 used_tokens: i32,
+                 usage: f64,
+                 estimate: LoadEstimate| {
         trt::SchedulerLoad {
             dp_rank,
             num_running_reqs: running,
@@ -145,7 +151,10 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoads
             token_usage: usage,
             utilization: usage,
             max_running_requests,
-            ..Default::default()
+            num_waiting_uncached_tokens: estimate.queued_token_work,
+            gen_throughput: estimate.gen_throughput,
+            prefill_throughput: estimate.prefill_throughput,
+            cache_hit_rate: estimate.cache_hit_rate,
         }
     };
     let (loads, _) = rank_entries(
@@ -153,16 +162,29 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoads
         max_total_num_tokens,
         ranks,
         dp_rank,
-        |_, figures| {
+        |load, figures| {
             entry(
                 figures.dp_rank,
                 figures.running,
                 figures.waiting,
                 figures.used_tokens,
                 figures.usage,
+                state
+                    .shared
+                    .loads
+                    .estimate(load.dp_rank, load.num_waiting_reqs),
             )
         },
-        |dp_rank| entry(dp_rank, 0, 0, 0, 0.0),
+        |dp_rank| {
+            entry(
+                dp_rank,
+                0,
+                0,
+                0,
+                0.0,
+                state.shared.loads.estimate(dp_rank, i32::MAX),
+            )
+        },
     );
     Ok(trt::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
