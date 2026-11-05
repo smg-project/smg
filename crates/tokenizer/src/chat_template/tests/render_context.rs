@@ -176,10 +176,23 @@ fn a_short_render_after_a_long_one_gives_the_slack_back() {
         short.capacity()
     );
 
-    let near = "y".repeat(short.len() + RENDERED_SLACK);
+    // A render a little shorter than the hint keeps the buffer it started
+    // from: the long text sets the hint back to the cap, the near one fills
+    // most of it, and the guard leaves the capacity at the cap (a shrink on
+    // every render would leave it at the length).
+    processor
+        .apply_chat_template(&[user(&long)], ChatTemplateParams::default())
+        .unwrap();
+    let near = "y".repeat(RENDERED_LENGTH_CAP - 1_000);
     let rendered = processor
         .apply_chat_template(&[user(&near)], ChatTemplateParams::default())
         .unwrap();
     assert_eq!(rendered.len(), near.len());
-    assert!(rendered.capacity() >= rendered.len());
+    assert!(
+        rendered.capacity() >= RENDERED_LENGTH_CAP,
+        "a {}-byte render after a long one kept a capacity of {}, under the cap {}",
+        rendered.len(),
+        rendered.capacity(),
+        RENDERED_LENGTH_CAP
+    );
 }
