@@ -1810,9 +1810,19 @@ mod tests {
         }
     }
 
+    /// The code points the two cross-engine sweeps below check: every one of
+    /// the four planes that hold assigned scripts (0 to 3) and plane 14's
+    /// first block (tags and variation selectors), then a stride over the
+    /// unassigned and private planes. A script a Unicode version adds,
+    /// however small, lies inside the part swept whole.
+    fn code_points_swept() -> impl Iterator<Item = u32> + Clone {
+        (0u32..0x4_0000)
+            .chain(0xE_0000..0xE_1000)
+            .chain((0x4_0000..=0x10_FFFF).step_by(97))
+    }
+
     /// The `Han` property and a class with it taken out agree with the
-    /// engine character by character: the whole Basic Multilingual Plane,
-    /// every ideograph range above it, and a stride over the rest, for the
+    /// engine character by character over [`code_points_swept`], for the
     /// property alone, negated, taken out of the Kimi template's two letter
     /// classes, and taken out under an outer negation.
     #[test]
@@ -1825,13 +1835,7 @@ mod tests {
             r"[^\p{L}\p{N}&&[^\p{Han}]]",
             r"[a-z\p{M}&&[^\p{Han}\p{Lo}]]",
         ];
-        let codes = (0u32..0x1_0000)
-            .chain(
-                unicode::HAN
-                    .iter()
-                    .flat_map(|&(start, end)| start.max(0x1_0000)..=end),
-            )
-            .chain((0x1_0000..=0x10_FFFF).step_by(97));
+        let codes = code_points_swept();
         let mut buf = String::new();
         for pattern in patterns {
             let parsed = Pattern::parse(pattern).expect("parses");
@@ -1850,10 +1854,11 @@ mod tests {
     }
 
     /// The classes of the tiktoken templates the direct path reads, checked
-    /// code point by code point against the file's own encoder (a `CoreBPE`
+    /// over [`code_points_swept`] against the file's own encoder (a `CoreBPE`
     /// whose pattern is the class alone encodes a code point it matches and
     /// drops one it does not): the two engines' Unicode tables agree today,
-    /// and a version apart between them would show here.
+    /// and a version apart between them, a new script included, would show
+    /// here.
     #[test]
     fn the_tiktoken_template_classes_agree_with_the_files_own_encoder() {
         let ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
@@ -1867,13 +1872,7 @@ mod tests {
             r"[^\s\p{L}\p{N}]",
             r"\s",
         ];
-        let codes = (0u32..0x1_0000)
-            .chain(
-                unicode::HAN
-                    .iter()
-                    .flat_map(|&(start, end)| start.max(0x1_0000)..=end),
-            )
-            .chain((0x1_0000..=0x10_FFFF).step_by(97));
+        let codes = code_points_swept();
         let mut buf = String::new();
         for class in classes {
             let parsed = Pattern::parse(class).expect("parses");

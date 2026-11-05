@@ -377,8 +377,9 @@ impl TiktokenTokenizer {
         let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &config.added_tokens);
         let native = Self::native_encoder(&encoder, pattern, &config.added_tokens);
         let tokenizer = Arc::new(CoreBPE::new(encoder, special_tokens_encoder, pattern)?);
-        // Counted and announced once the file's own encoder has loaded too:
-        // a load that fails is a load of no path.
+        // Counted and announced once the file's own encoder has loaded too,
+        // the point the Hugging Face path counts at as well (before the chat
+        // template is read).
         if native.is_some() {
             encode_path::note_load(EncodePath::Native);
             tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
