@@ -90,7 +90,8 @@ impl ShortPieceKey {
 /// One slot: a stored key with its id count in the top four bits, and the
 /// ids inline, or the offset of the ids in the spill in `ids[0]` when there
 /// are more than [`INLINE_IDS`]. Key 0 is an empty slot: a stored key has a
-/// length.
+/// length. The ids past the count are zero; a hit copies all four and cuts
+/// the length back to the count, whatever they hold.
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 struct Entry {
@@ -188,10 +189,11 @@ impl ShortPieceTable {
                 let entry = &self.entries[slot];
                 if entry.key & KEY_MASK == key.0 {
                     let count = (entry.key >> COUNT_SHIFT) as usize;
-                    if count == 1 {
-                        out.push(entry.ids[0]);
-                    } else if count <= INLINE_IDS {
-                        out.extend_from_slice(&entry.ids[..count]);
+                    if count <= INLINE_IDS {
+                        // All four ids, then the length set to the count: a
+                        // fixed copy, where a copy of `count` ids is a call.
+                        out.extend_from_slice(&entry.ids);
+                        out.truncate(out.len() - (INLINE_IDS - count));
                     } else {
                         let start = entry.ids[0] as usize;
                         out.extend_from_slice(&self.spill[start..start + count]);
