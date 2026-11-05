@@ -30,7 +30,10 @@ Policy this adapter sets, where the events say more than Chat Completions can:
   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
   that chunk. The bytes a call syntax refuses as the model's failed call come as `Dropped {
   MalformedCall }` behind a `Malformed` event of no bytes (`docs/assemblers.md`), so they are
-  counted and never content.
+  counted and never content. A call inside which the attributed syntax refused such bytes gets
+  no close, so its `arguments` are a strict JSON prefix and no whole value, as a cut call's are:
+  a client that reads them as JSON is told the call failed, where it read a closed object with
+  the model's member missing before.
 - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
 
 ## Responses (`adapt::responses`)
@@ -68,9 +71,10 @@ call whose argument fragments never became a whole JSON value is `incomplete` ra
 whatever the response's state, left every item of a failed response `in_progress`, what had finished
 included, and marked a call `incomplete` only after `length`; here each status describes its item. A
 reasoning region ends at `ReasoningEnd`, or when content with substance or a call comes after it, in
-the fold as in the stream. A call with empty arguments is complete: the formats start a call only
-once its arguments value has begun or its object has closed, so a call without arguments is one the
-model closed.
+the fold as in the stream. A call with no argument fragment at all is `incomplete` too: every
+syntax writes `{}` for a call the model closed without arguments, so a call that ended with no
+fragment is one the parser did not read whole (cut right after its name, or a tagged call whose
+every pair the syntax refused, which gets no close; `docs/assemblers.md`).
 
 Policy this adapter sets, where the events say more than the Responses API can:
 
