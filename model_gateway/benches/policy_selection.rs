@@ -1,8 +1,9 @@
 //! Selection-policy stage cost: what one request pays inside `WorkerSelectionPolicy::select`
 //! for each policy, what the host pays to gather the inputs from a 128-worker overlap map
 //! before calling it, what one least-load decision pays over a fed pool (the expected-wait
-//! scorer that least_load, power_of_two and cache-aware share), and what one request pays
-//! inside the two ring policies over a ready pool with its ring.
+//! scorer that least_load, power_of_two and cache-aware share), what one request pays inside
+//! the two ring policies over a ready pool with its ring, and what one pick of the simple
+//! policies (power_of_two, random, round_robin, passthrough) pays over the same pool.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -17,8 +18,9 @@ use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PrefixHashConfig,
-        PrefixHashPolicy, SelectWorkerInfo,
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PassthroughPolicy,
+        PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+        SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
@@ -131,11 +133,10 @@ fn bench_gather_and_select(c: &mut Criterion) {
 
 /// A pool of `workers` ready regular workers (no health checker behind them), each with a
 /// published report (queued token-work, running requests, KV pressure, a live rate on three of
-/// four) and in-flight requests on the router, under a least-load policy whose tally has credited
-/// every worker once.
-fn fed_least_load(workers: usize) -> (LeastLoadPolicy, TestFeed, Vec<Arc<dyn Worker>>) {
-    let policy = LeastLoadPolicy::new();
-    let feed = TestFeed::attached_to(&policy);
+/// four) and in-flight requests on the router, fed to `policy`, which has picked from the pool
+/// often enough to know every worker.
+fn fed_pool(policy: &dyn LoadBalancingPolicy, workers: usize) -> (TestFeed, Vec<Arc<dyn Worker>>) {
+    let feed = TestFeed::attached_to(policy);
     let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
             Arc::new(
@@ -177,7 +178,7 @@ fn fed_least_load(workers: usize) -> (LeastLoadPolicy, TestFeed, Vec<Arc<dyn Wor
     for _ in 0..workers * 4 {
         black_box(policy.select_worker(&pool, &info));
     }
-    (policy, feed, pool)
+    (feed, pool)
 }
 
 /// One least-load decision over a fed pool: the eligibility walk, the expected-wait score of
@@ -187,7 +188,8 @@ fn bench_least_load_decision(c: &mut Criterion) {
     let mut group = c.benchmark_group("least_load/decision");
     let tokens: Vec<u32> = (0..1_024).collect();
     for workers in [8, 32, 128] {
-        let (policy, _feed, pool) = fed_least_load(workers);
+        let policy = LeastLoadPolicy::new();
+        let (_feed, pool) = fed_pool(&policy, workers);
         let info = SelectWorkerInfo {
             tokens: Some(&tokens),
             ..Default::default()
@@ -263,11 +265,40 @@ fn bench_ring_policies(c: &mut Criterion) {
     group.finish();
 }
 
+/// One pick of each simple policy over the fed pool with every worker eligible: power_of_two
+/// (its pair drawn, the pair scored), random, round_robin (its rotation keyed by the eligible
+/// set) and passthrough (the first eligible worker). The request carries 1,024 token ids.
+fn bench_simple_policy_pick(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simple_policies/pick");
+    let tokens: Vec<u32> = (0..1_024).collect();
+    for workers in [8, 32, 128] {
+        let policies: [(&str, Box<dyn LoadBalancingPolicy>); 4] = [
+            ("power_of_two", Box::new(PowerOfTwoPolicy::new())),
+            ("random", Box::new(RandomPolicy::new())),
+            ("round_robin", Box::new(RoundRobinPolicy::new())),
+            ("passthrough", Box::new(PassthroughPolicy::new())),
+        ];
+        for (name, policy) in &policies {
+            let (_feed, pool) = fed_pool(policy.as_ref(), workers);
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            };
+            group.throughput(Throughput::Elements(1));
+            group.bench_with_input(BenchmarkId::new(*name, workers), &workers, |b, _| {
+                b.iter(|| black_box(policy.select_worker(black_box(&pool), black_box(&info))));
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_select,
     bench_gather_and_select,
     bench_least_load_decision,
-    bench_ring_policies
+    bench_ring_policies,
+    bench_simple_policy_pick
 );
 criterion_main!(benches);

@@ -1,10 +1,13 @@
 //! Power-of-two choices load balancing policy
 
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use rand::RngExt;
 
-use super::{get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    draw_eligible, get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy,
+    SelectWorkerInfo,
+};
 use crate::{
     config::PowerOfTwoLoadMetric,
     worker::{load_state::LoadReceiver, Worker},
@@ -14,8 +17,14 @@ use crate::{
 /// and route to the one with the lower expected wait, scored exactly like
 /// [`LeastLoadPolicy`] — `(queued_tokens + in-flight credit) / throughput`
 /// plus the convex KV-pressure barrier. Least-load restricted to a random
-/// pair: near-least-load quality at O(1) load reads per pick, without the
-/// full-fleet scan.
+/// pair: near-least-load quality at a cost that does not grow with the pool.
+///
+/// A pick draws its pair by rejection over the pool (`draw_eligible`): the
+/// eligibility of the drawn workers alone is read, the pair's two loads are
+/// scored, and nothing is allocated. A pool too thin for the draw (fewer
+/// than two eligible workers, or most of them vetoed) is walked once instead,
+/// which lists the eligible workers. The `LeastRequests` metric reads every
+/// eligible worker's in-flight count by definition, so it walks every pick.
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Expected-wait scorer shared with least-load: the load feed, the
@@ -37,6 +46,16 @@ impl PowerOfTwoPolicy {
     }
 }
 
+/// The pair members with the fewest router in-flight requests: one of them,
+/// or both when they tie. Each count is read once.
+fn fewest_of_pair<'a>(workers: &[Arc<dyn Worker>], pair: &'a [usize; 2]) -> &'a [usize] {
+    match workers[pair[0]].load().cmp(&workers[pair[1]].load()) {
+        Ordering::Less => &pair[..1],
+        Ordering::Greater => &pair[1..],
+        Ordering::Equal => &pair[..],
+    }
+}
+
 /// The candidates with the fewest router in-flight requests. Each count is read
 /// once, so concurrent dispatches cannot empty the result.
 fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<usize> {
@@ -52,37 +71,51 @@ fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<us
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers, info);
-
-        if healthy.is_empty() {
-            return None;
-        }
-        if healthy.len() == 1 {
-            return Some(healthy[0]);
-        }
-
         if self.load_metric == PowerOfTwoLoadMetric::LeastRequests {
-            let fewest = fewest_in_flight(workers, &healthy);
-            return self
-                .scorer
-                .select_min_expected_wait(workers, &fewest, info, self.name());
+            let healthy = get_healthy_worker_indices(workers, info);
+            return match healthy.as_slice() {
+                [] => None,
+                [only] => Some(*only),
+                _ => {
+                    let fewest = fewest_in_flight(workers, &healthy);
+                    self.scorer
+                        .select_min_expected_wait(workers, &fewest, info, self.name())
+                }
+            };
         }
 
-        // Select two distinct workers - use offset to guarantee different
-        // selection in O(1).
-        let mut rng = rand::rng();
-        let idx1 = rng.random_range(0..healthy.len());
-        let idx2 = (idx1 + 1 + rng.random_range(0..healthy.len() - 1)) % healthy.len();
-        let pair = [healthy[idx1], healthy[idx2]];
+        let drawn = draw_eligible(workers, info, None).and_then(|first| {
+            draw_eligible(workers, info, Some(first)).map(|second| [first, second])
+        });
+        let pair = match drawn {
+            Some(pair) => pair,
+            // The draw gave up: fewer than two eligible workers, or most of
+            // the pool vetoed. Walk it once; a lone eligible worker is the
+            // pick, and the pair comes from the list with an offset that
+            // keeps the two apart.
+            None => {
+                let healthy = get_healthy_worker_indices(workers, info);
+                match healthy.as_slice() {
+                    [] => return None,
+                    [only] => return Some(*only),
+                    _ => {
+                        let mut rng = rand::rng();
+                        let idx1 = rng.random_range(0..healthy.len());
+                        let idx2 =
+                            (idx1 + 1 + rng.random_range(0..healthy.len() - 1)) % healthy.len();
+                        [healthy[idx1], healthy[idx2]]
+                    }
+                }
+            }
+        };
 
-        if self.load_metric == PowerOfTwoLoadMetric::Requests {
-            let fewest = fewest_in_flight(workers, &pair);
-            return self
-                .scorer
-                .select_min_expected_wait(workers, &fewest, info, self.name());
-        }
+        let candidates: &[usize] = if self.load_metric == PowerOfTwoLoadMetric::Requests {
+            fewest_of_pair(workers, &pair)
+        } else {
+            &pair
+        };
         self.scorer
-            .select_min_expected_wait(workers, &pair, info, self.name())
+            .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
     fn name(&self) -> &'static str {
@@ -392,5 +425,65 @@ mod tests {
                 Some(2)
             );
         }
+    }
+
+    /// Eight dark workers with nothing in flight, two of them not ready:
+    /// every pair ties on the scorer, so each eligible worker wins one pick
+    /// in six and a vetoed worker never. The draw is uniform over the
+    /// eligible workers, as the listed pair was.
+    #[test]
+    fn a_pick_draws_its_pair_uniformly_over_the_eligible_workers_and_never_a_vetoed_one() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
+        for vetoed in [2, 5] {
+            workers[vetoed].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        let mut wins = [0usize; 8];
+        for _ in 0..6_000 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .expect("six workers are eligible");
+            wins[idx] += 1;
+        }
+        assert_eq!(
+            wins[2] + wins[5],
+            0,
+            "a not-ready worker won a pick: {wins:?}"
+        );
+        for (idx, &count) in wins.iter().enumerate() {
+            if idx != 2 && idx != 5 {
+                assert!(
+                    (800..=1_200).contains(&count),
+                    "worker {idx} won {count} of 6,000 picks, one in six expected: {wins:?}"
+                );
+            }
+        }
+    }
+
+    /// A pool with one eligible worker picks it every time (the draw cannot
+    /// find a second and the walk finds the one); a pool with none picks
+    /// nothing.
+    #[test]
+    fn a_pool_with_one_eligible_worker_picks_it_and_a_vetoed_pool_picks_nothing() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
+        for vetoed in [0, 1, 3] {
+            workers[vetoed].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(2)
+            );
+        }
+        workers[2].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
     }
 }

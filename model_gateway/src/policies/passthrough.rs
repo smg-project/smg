@@ -7,7 +7,7 @@ use std::sync::{
 
 use tracing::warn;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// Passthrough selection policy for single-backend deployments.
@@ -45,7 +45,9 @@ impl LoadBalancingPolicy for PassthroughPolicy {
             );
         }
 
-        get_healthy_worker_indices(workers, info).first().copied()
+        workers
+            .iter()
+            .position(|worker| info.admits(worker.routing_state()))
     }
 
     fn name(&self) -> &'static str {

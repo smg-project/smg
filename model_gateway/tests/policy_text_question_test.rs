@@ -1,11 +1,13 @@
 //! Policy paths a request walks without allocating, pinned: the registry's
 //! question whether some policy wants the request's text (the answer is kept
-//! where a policy is added or removed), the least-load decision, which
+//! where a policy is added or removed); the least-load decision, which
 //! allocates its eligible list and nothing else once it has dispatched to a
-//! worker, and a request placed by a ring policy, which pays the ring's own
+//! worker; a request placed by a ring policy, which pays the ring's own
 //! lookup and the record of its branch metric and nothing besides (prefix
-//! hash also its eligible list and its boundary list). A separate executable,
-//! so it can declare the counting allocator the pins need.
+//! hash also its eligible list and its boundary list); and a power-of-two,
+//! random or passthrough pick, which allocates nothing at all over a pool the
+//! draw covers. A separate executable, so it can declare the counting
+//! allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -21,8 +23,9 @@ use openai_protocol::worker::HealthCheckConfig;
 use smg::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PolicyRegistry,
-        PrefixHashConfig, PrefixHashPolicy, SelectWorkerInfo,
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PassthroughPolicy,
+        PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+        SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
@@ -264,5 +267,75 @@ fn a_ring_policy_request_pays_the_ring_lookup_and_nothing_besides() {
         "prefix-hash requests allocated {prefix_allocations} times over {requests}; one ring \
          lookup ({ring_lookup}), the eligible list's two blocks, the boundary list and the \
          branch metric's record are the budget"
+    );
+}
+
+/// Eight ready regular workers with reports and in-flight requests, every
+/// one eligible, under a policy that has picked from the pool often enough to
+/// know every worker: a pick allocates nothing. Power-of-two draws its pair
+/// over the pool and credits the winner by a borrowed key; random draws its
+/// pick; passthrough takes the first eligible position.
+#[test]
+fn a_power_of_two_random_or_passthrough_pick_allocates_nothing() {
+    let policies: [(&str, Box<dyn LoadBalancingPolicy>); 3] = [
+        ("power_of_two", Box::new(PowerOfTwoPolicy::new())),
+        ("random", Box::new(RandomPolicy::new())),
+        ("passthrough", Box::new(PassthroughPolicy::new())),
+    ];
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let info = SelectWorkerInfo {
+        tokens: Some(&tokens),
+        ..Default::default()
+    };
+    let mut over_budget = Vec::new();
+    for (name, policy) in &policies {
+        let feed = TestFeed::attached_to(policy.as_ref());
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://worker-{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let reports = workers
+            .iter()
+            .enumerate()
+            .map(|(i, worker)| {
+                for _ in 0..i % 3 {
+                    worker.increment_load();
+                }
+                (
+                    worker.url().to_string(),
+                    one_rank_load(512 * i as i32, 0.1 * i as f64, 2_000.0 + 100.0 * i as f64),
+                )
+            })
+            .collect();
+        feed.publish(&reports);
+        for _ in 0..256 {
+            black_box(policy.select_worker(&workers, &info));
+        }
+        let picks = 1_000;
+        let mut allocations = 0;
+        for _ in 0..picks {
+            // A fresh report releases the last pick's credit, so the
+            // power-of-two tally holds at most one dispatch per worker.
+            feed.publish(&reports);
+            allocations += allocations_during(|| {
+                black_box(policy.select_worker(&workers, &info));
+            });
+        }
+        if allocations != 0 {
+            over_budget.push(format!("{name}: {allocations} over {picks} picks"));
+        }
+    }
+    assert!(
+        over_budget.is_empty(),
+        "picks allocated {over_budget:?}; nothing is the budget"
     );
 }
