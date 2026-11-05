@@ -11,7 +11,9 @@ use tokenizers::{
     Model,
 };
 
-use super::{super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS};
+use super::{
+    super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
+};
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
 fn alphabet_vocab() -> (Vocab, [char; 256]) {
@@ -191,6 +193,9 @@ fn pieces() -> Vec<Vec<u8>> {
     .map(|s| s.as_bytes().to_vec())
     .collect();
     for len in [
+        SHORT_PIECE_TINY - 1,
+        SHORT_PIECE_TINY,
+        SHORT_PIECE_TINY + 1,
         SHORT_PIECE_SMALL - 1,
         SHORT_PIECE_SMALL,
         SHORT_PIECE_SMALL + 1,
@@ -242,6 +247,22 @@ fn every_piece_merges_to_the_models_ids() {
     }
 }
 
+/// The pairs a tiktoken vocabulary's table holds: every cut of every token
+/// of two bytes or more whose two halves are tokens.
+fn split_pairs(ranks: &FxHashMap<Vec<u8>, u32>) -> usize {
+    ranks
+        .keys()
+        .filter(|token| token.len() >= 2)
+        .map(|token| {
+            (1..token.len())
+                .filter(|&cut| {
+                    ranks.contains_key(&token[..cut]) && ranks.contains_key(&token[cut..])
+                })
+                .count()
+        })
+        .sum()
+}
+
 /// A tiktoken vocabulary's table merges every piece as the file's own
 /// encoder does: the merges of `merges()` as ranks (bytes first and bytes
 /// last), the pieces of `pieces()`, and pieces that are tokens themselves
@@ -253,7 +274,8 @@ fn a_tiktoken_vocabulary_merges_as_its_own_encoder_does() {
         let ranks = ranks_of(&merges(), bytes_last);
         let table = MergeTable::from_ranks(&ranks).expect("a complete table");
         assert!(!table.ignore_merges);
-        assert_eq!(table.merges(), ranks.len());
+        // One entry per split of a token into two tokens.
+        assert_eq!(table.merges(), split_pairs(&ranks));
         let own = own_encoder(&ranks);
         let mut tokens: Vec<Vec<u8>> = ranks.keys().cloned().collect();
         tokens.sort();
@@ -446,8 +468,10 @@ fn the_leftmost_of_a_repeated_pair_merges_first() {
     let a = bpe.token_to_id("a").expect("a");
     assert_eq!(table_ids(&table, b"aaa"), vec![aa, a]);
     assert_eq!(table_ids(&table, b"aaaaa"), vec![aa, aa, a]);
-    // On both sizes of the stack arrays and on the heap.
+    // On the three sizes of the stack arrays and on the heap.
     for len in [
+        SHORT_PIECE_TINY,
+        SHORT_PIECE_TINY + 1,
         SHORT_PIECE_SMALL,
         SHORT_PIECE_SMALL + 1,
         SHORT_PIECE_SYMBOLS,
@@ -703,11 +727,51 @@ fn the_merges_read_are_the_models_merges_with_a_gap_in_the_ids_too() {
     }
 }
 
+/// The byte-pair grid answers as the bucket table does on a vocabulary
+/// that gives two byte characters one id: the model merges the pair by id
+/// for either byte, and so does the table's first round. (The merge's
+/// product is in the vocabulary under both spellings, on one id too: the
+/// model names a merge by either byte when it serializes its merges.)
 #[test]
-fn the_tables_bytes_are_the_grid_the_slots_and_the_ids() {
+fn two_byte_characters_on_one_id_merge_as_the_model_does() {
+    let (mut vocab, table) = alphabet_vocab();
+    let a = vocab["a"];
+    vocab.insert("b".to_owned(), a);
+    let ac = vocab.len() as u32;
+    vocab.insert("ac".to_owned(), ac);
+    vocab.insert("bc".to_owned(), ac);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("a".to_owned(), "c".to_owned())])
+        .build()
+        .expect("a byte-level BPE");
+    let merges = table_of(&bpe);
+    for piece in [&b"ac"[..], b"bc", b"abc", b"cb"] {
+        assert_eq!(
+            table_ids(&merges, piece),
+            model_ids(&bpe, &table, piece),
+            "{piece:?}"
+        );
+    }
+    assert_eq!(table_ids(&merges, b"bc"), [ac]);
+}
+
+/// The table is the byte-pair grid (256 x 256 words) and its entries: a
+/// power of two of buckets, one cache line of four sixteen-byte entries
+/// each, at a load of one half or less.
+#[test]
+fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
-    let grid = 512 * 512 * size_of::<u32>();
-    assert!(table.bytes() > grid, "{}", table.bytes());
-    assert!(table.bytes() < grid + 64 * 1024, "{}", table.bytes());
+    let merges = merges().len();
+    let grid = 256 * 256 * size_of::<u64>();
+    let entries = (table.bytes() - size_of::<MergeTable>() - grid) / 16;
+    assert!(entries.is_power_of_two(), "{entries} entries");
+    assert!(
+        entries >= 2 * merges,
+        "{entries} entries for {merges} merges"
+    );
+    assert!(
+        entries < 4 * merges + 8,
+        "{entries} entries for {merges} merges"
+    );
 }

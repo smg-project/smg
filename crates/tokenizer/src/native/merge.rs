@@ -9,12 +9,15 @@
 //! word spaces, the first requests of every thread). This table holds the
 //! same merges, read from the model's serialized form (its merge map is
 //! private; its serialization writes the merges in rank order, and only that
-//! field is taken, see `serialized`): a dense grid
-//! for the pairs of small ids, which carry most of a piece's first round of
-//! candidates, an open-addressed table for the rest, and the id each merge
-//! produces by rank. A piece of up to [`SHORT_PIECE_SYMBOLS`] symbols merges
-//! on stack arrays without an allocation; a longer one on a linked list with
-//! a heap of candidates, as the model does, minus the strings.
+//! field is taken, see `serialized`): a grid of the byte pairs' merges by
+//! the bytes themselves, which a piece's first round of candidates is made
+//! of, and an open-addressed table of every pair in buckets of one cache
+//! line, each entry a pair with its rank and the id the merge produces, so
+//! that the lookup of a pair reads one line and answers both (see
+//! [`Entry`]). A piece of up to [`SHORT_PIECE_SYMBOLS`]
+//! symbols merges on stack arrays without an allocation; a longer one on a
+//! linked list with a heap of candidates, as the model does, minus the
+//! strings.
 //!
 //! The ids are the model's own. The model's loop pops its heap by rank, then
 //! by position, and merges the popped pair unless its entry has expired:
@@ -51,17 +54,19 @@ use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS};
 
 mod serialized;
 
-/// Pairs whose two ids are both below this bound are read from the dense
-/// grid (1 MiB of ranks): the byte tokens and the earliest merges, which a
-/// piece's first round of candidates is made of.
-const GRID_SIDE: usize = 512;
+/// Entries of one bucket of the pair table: sixteen bytes each, so a bucket
+/// is one 64-byte cache line, read whole.
+const BUCKET: usize = 4;
 /// Pieces of up to this many symbols merge on stack arrays, a [`ShortMerge`]:
 /// a run of forty CJK ideographs, a word of a script without word spaces, a
-/// long identifier. A piece of up to [`SHORT_PIECE_SMALL`] symbols takes
-/// arrays of that size, so a word's set-up is a few stores.
+/// long identifier. A piece of up to [`SHORT_PIECE_TINY`] symbols, a word,
+/// takes arrays of that size, one of up to [`SHORT_PIECE_SMALL`] the next,
+/// so a word's set-up is a few stores.
 const SHORT_PIECE_SYMBOLS: usize = 128;
-/// The smaller arrays of a short merge.
+/// The middle arrays of a short merge.
 const SHORT_PIECE_SMALL: usize = 32;
+/// The smallest arrays of a short merge: a word.
+const SHORT_PIECE_TINY: usize = 16;
 /// Bits of a position in a short merge's key, `rank << SHORT_KEY_BITS |
 /// position`: an unsigned minimum over the keys is the least rank and,
 /// among its repeats, the leftmost position.
@@ -75,27 +80,98 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
-/// An empty slot of the open-addressed table; no pair of ids has this key.
+/// An empty entry of the pair table; no pair of ids has this key.
 const EMPTY_KEY: u64 = u64::MAX;
 /// No neighbour, in the linked list of a long piece.
 const NONE: u32 = u32::MAX;
+
+/// One merge as the table stores it, in one word: the rank in the high half
+/// and the id the merge produces in the low half, so that a pair's lookup
+/// answers both with the one load. [`Merge::NONE`] stands for a pair that is
+/// no merge; its rank reads [`NO_RANK`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Merge(u64);
+
+impl Merge {
+    const NONE: Self = Self(u64::MAX);
+
+    fn new(rank: u32, product: u32) -> Self {
+        Self(u64::from(rank) << 32 | u64::from(product))
+    }
+
+    #[inline(always)]
+    fn rank(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    #[inline(always)]
+    fn product(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+/// One entry of the pair table: the pair's key, `a << 32 | b` or
+/// [`EMPTY_KEY`], and its merge; sixteen bytes, [`BUCKET`] to a [`Bucket`].
+/// Before this layout the table kept the keys, the ranks and the products in
+/// three arrays and a dense grid of the small-id pairs in front of them: a
+/// lookup on a cold piece read the key, then the rank, then the product by
+/// rank, three lines each a memory latency apart, and the grid's branch
+/// mispredicted on every round that mixed byte pairs with the pairs of
+/// products (measured: the merge was a third of a cold encode, most of it
+/// those reads).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Entry {
+    key: u64,
+    merge: Merge,
+}
+
+impl Entry {
+    const EMPTY: Self = Self {
+        key: EMPTY_KEY,
+        merge: Merge::NONE,
+    };
+}
+
+/// One bucket of the pair table: [`BUCKET`] entries on one cache line, the
+/// alignment the type's own. A boxed slice of entries is aligned to an entry,
+/// so whether a bucket shared a line was the allocator's to decide, and one
+/// that hands large blocks back sixteen bytes past a line (the system
+/// allocator, under the tests and the crate's benches) had every bucket span
+/// two.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Bucket([Entry; BUCKET]);
+
+const _: () = assert!(size_of::<Entry>() == 16);
+const _: () = assert!(size_of::<Bucket>() == 64);
+
+impl Bucket {
+    const EMPTY: Self = Self([Entry::EMPTY; BUCKET]);
+}
 
 /// The merges of one byte-level BPE model; see the module documentation.
 pub(super) struct MergeTable {
     /// The id of each byte's token.
     byte_ids: [u32; 256],
-    /// `grid[a * GRID_SIDE + b]`: the rank of the pair `(a, b)`, or
-    /// [`NO_RANK`], for ids below [`GRID_SIDE`].
-    grid: Box<[u32]>,
-    /// The other pairs, open-addressed with linear probing: `keys[slot]` is
-    /// `a << 32 | b` or [`EMPTY_KEY`], `ranks[slot]` the pair's rank.
-    keys: Box<[u64]>,
-    ranks: Box<[u32]>,
-    /// Bits a key's hash is shifted right by to give its first slot; the
-    /// table holds `1 << (64 - shift)` slots.
+    /// `byte_grid[a * 256 + b]`: the merge of the pair of the byte tokens of
+    /// bytes `a` and `b`, by the bytes rather than the ids (the byte tokens
+    /// sit at any ids: the first 256, or 3 to 258, or 1000 to 1255 in the
+    /// vocabularies in use). The first round of every merge is byte pairs
+    /// alone, read here without a hash from 512 KiB that stays in the
+    /// second-level cache; the same pairs are in the bucket table too, which
+    /// the later rounds read for every pair.
+    byte_grid: Box<[Merge]>,
+    /// The pairs, open-addressed by bucket with linear probing over whole
+    /// buckets: a pair's key hashes to a bucket of [`BUCKET`] entries, and a
+    /// lookup reads the bucket whole (one compare per entry, no branch) and
+    /// goes on to the next bucket only when none matched and none was empty.
+    buckets: Box<[Bucket]>,
+    /// Bits a key's hash is shifted right by to give its first bucket; the
+    /// table holds `1 << (64 - shift)` buckets.
     shift: u32,
-    /// The id the merge of each rank produces.
-    new_ids: Box<[u32]>,
+    /// Merges the table holds.
+    merges: usize,
     /// The model's `ignore_merges`: a piece that is a token is that token,
     /// looked up before any merge (by the caller, in the model's vocabulary).
     pub(super) ignore_merges: bool,
@@ -142,7 +218,7 @@ impl MergeTable {
                 "more merges than a short merge's keys carry",
             ));
         }
-        let mut table = Self::with_capacity(merges.len(), merges.len(), bpe.ignore_merges);
+        let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
         table.byte_ids = byte_ids;
         let mut token = String::new();
         for (rank, (left, right)) in merges.iter().enumerate() {
@@ -162,9 +238,9 @@ impl MergeTable {
                     "merge {left:?} + {right:?} names a token outside the vocabulary"
                 )));
             };
-            table.new_ids[rank as usize] = new_id;
-            table.insert(a, b, rank);
+            table.insert(a, b, Merge::new(rank, new_id));
         }
+        table.fill_byte_grid();
         Ok(table)
     }
 
@@ -183,9 +259,8 @@ impl MergeTable {
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
         let ranks_end = ranks.values().max().map_or(0, |&rank| rank as usize + 1);
-        // The rank ids are a dense table (`new_ids`), bounded as the decode
-        // table of such a file is: ranks reaching far past the token count
-        // keep the file on its own encoder. The bound must also stay within
+        // A rank is a merge's rank and its product at once; it is bounded as
+        // the decode table of such a file is, and that bound stays within
         // what a short merge's key carries of a rank.
         const _: () = assert!(MAX_BYTE_LEVEL_TABLE_IDS <= MAX_RANKS);
         if ranks_end > MAX_BYTE_LEVEL_TABLE_IDS {
@@ -213,12 +288,12 @@ impl MergeTable {
                 )));
             }
         }
-        let mut table = Self::with_capacity(splits.len(), ranks_end, false);
+        let mut table = Self::with_capacity(splits.len(), false);
         table.byte_ids = byte_ids;
         for &(left, right, rank) in &splits {
-            table.new_ids[rank as usize] = rank;
-            table.insert(left, right, rank);
+            table.insert(left, right, Merge::new(rank, rank));
         }
+        table.fill_byte_grid();
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
             if token.len() < 2 {
@@ -235,79 +310,105 @@ impl MergeTable {
         Ok(table)
     }
 
-    /// An empty table sized for `pairs` merges over `ranks` ranks.
-    fn with_capacity(pairs: usize, ranks: usize, ignore_merges: bool) -> Self {
-        // The open-addressed part at a load of 0.6 at most, two slots at least
-        // (so that a probe always meets an empty slot).
-        let slots = (pairs * 5 / 3 + 1).next_power_of_two().max(2);
-        let shift = u64::BITS - slots.trailing_zeros();
+    /// An empty table sized for `merges` pairs.
+    fn with_capacity(merges: usize, ignore_merges: bool) -> Self {
+        // Buckets for a load of one half at most, two at least: a probe
+        // always meets an empty entry, and the shift that picks a bucket
+        // from a key's high bits stays below the key's width.
+        let buckets = merges.div_ceil(BUCKET / 2).next_power_of_two().max(2);
+        let shift = u64::BITS - buckets.trailing_zeros();
         Self {
             byte_ids: [0; 256],
-            grid: vec![NO_RANK; GRID_SIDE * GRID_SIDE].into_boxed_slice(),
-            keys: vec![EMPTY_KEY; slots].into_boxed_slice(),
-            ranks: vec![NO_RANK; slots].into_boxed_slice(),
+            byte_grid: vec![Merge::NONE; 256 * 256].into_boxed_slice(),
+            buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
             shift,
-            new_ids: vec![0; ranks].into_boxed_slice(),
+            merges,
             ignore_merges,
         }
     }
 
     /// Bytes the table holds, for the load log.
     pub(super) fn bytes(&self) -> usize {
-        size_of::<Self>()
-            + size_of_val(&*self.grid)
-            + size_of_val(&*self.keys)
-            + size_of_val(&*self.ranks)
-            + size_of_val(&*self.new_ids)
+        size_of::<Self>() + size_of_val(&*self.byte_grid) + size_of_val(&*self.buckets)
     }
 
-    /// Ranks the table holds (one per merge of a model; one per token of a
-    /// tiktoken vocabulary, whose splits share their token's rank).
+    /// Pairs the table was built from (one per merge of a model; one per
+    /// split of a token into two tokens of a tiktoken vocabulary, the splits
+    /// of one token sharing its rank).
     pub(super) fn merges(&self) -> usize {
-        self.new_ids.len()
+        self.merges
     }
 
-    #[inline]
-    fn first_slot(&self, key: u64) -> usize {
+    /// Fills the byte-pair grid from the bucket table once the pairs are in,
+    /// one lookup per pair of bytes: the grid then answers as the table does
+    /// for any vocabulary, one whose byte tokens share an id included (a map
+    /// from id back to byte filled one of the two bytes' rows), and a pair
+    /// recorded twice keeps the later merge in one place.
+    fn fill_byte_grid(&mut self) {
+        for a in 0..256 {
+            for b in 0..256 {
+                self.byte_grid[a * 256 + b] = self.merge_of(self.byte_ids[a], self.byte_ids[b]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn first_bucket(&self, key: u64) -> usize {
         // Fibonacci hashing: the pair's two ids spread over the high bits.
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
     }
 
-    /// Records `(a, b)` as the merge of `rank`; a pair recorded twice keeps
-    /// the later rank, as the model's merge map does.
-    fn insert(&mut self, a: u32, b: u32, rank: u32) {
-        if (a as usize) < GRID_SIDE && (b as usize) < GRID_SIDE {
-            self.grid[a as usize * GRID_SIDE + b as usize] = rank;
-            return;
-        }
-        let key = u64::from(a) << 32 | u64::from(b);
-        let mask = self.keys.len() - 1;
-        let mut slot = self.first_slot(key);
-        while self.keys[slot] != EMPTY_KEY && self.keys[slot] != key {
-            slot = (slot + 1) & mask;
-        }
-        self.keys[slot] = key;
-        self.ranks[slot] = rank;
+    /// The key of the pair `(a, b)` in the bucket table.
+    #[inline(always)]
+    fn pair_key(a: u32, b: u32) -> u64 {
+        u64::from(a) << 32 | u64::from(b)
     }
 
-    /// The rank of the pair `(a, b)`, [`NO_RANK`] when it is no merge.
-    #[inline]
-    fn rank_of(&self, a: u32, b: u32) -> u32 {
-        if (a as usize) < GRID_SIDE && (b as usize) < GRID_SIDE {
-            return self.grid[a as usize * GRID_SIDE + b as usize];
-        }
-        let key = u64::from(a) << 32 | u64::from(b);
-        let mask = self.keys.len() - 1;
-        let mut slot = self.first_slot(key);
+    /// The merge of the pair of the byte tokens of `a` and `b`.
+    #[inline(always)]
+    fn byte_pair(&self, a: u8, b: u8) -> Merge {
+        self.byte_grid[usize::from(a) * 256 + usize::from(b)]
+    }
+
+    /// Records `(a, b)` as `merge`; a pair recorded twice keeps the later
+    /// merge, as the model's merge map does.
+    fn insert(&mut self, a: u32, b: u32, merge: Merge) {
+        let key = Self::pair_key(a, b);
+        let mask = self.buckets.len() - 1;
+        let mut bucket = self.first_bucket(key);
         loop {
-            let found = self.keys[slot];
-            if found == key {
-                return self.ranks[slot];
+            for entry in &mut self.buckets[bucket].0 {
+                if entry.key == key || entry.key == EMPTY_KEY {
+                    *entry = Entry { key, merge };
+                    return;
+                }
             }
-            if found == EMPTY_KEY {
-                return NO_RANK;
+            bucket = (bucket + 1) & mask;
+        }
+    }
+
+    /// The merge of the pair `(a, b)`, [`Merge::NONE`] when it is none: the
+    /// bucket the key hashes to, read whole, and the buckets after it while
+    /// a bucket is full of other pairs.
+    #[inline]
+    fn merge_of(&self, a: u32, b: u32) -> Merge {
+        let key = Self::pair_key(a, b);
+        let buckets = &self.buckets;
+        let mask = buckets.len() - 1;
+        let mut bucket = self.first_bucket(key);
+        loop {
+            let mut found = Merge::NONE;
+            let mut empty = false;
+            for entry in &buckets[bucket].0 {
+                if entry.key == key {
+                    found = entry.merge;
+                }
+                empty |= entry.key == EMPTY_KEY;
             }
-            slot = (slot + 1) & mask;
+            if found != Merge::NONE || empty {
+                return found;
+            }
+            bucket = (bucket + 1) & mask;
         }
     }
 
@@ -325,22 +426,24 @@ impl MergeTable {
         if piece.is_empty() {
             return;
         }
-        let symbols = piece.iter().map(|&byte| self.byte_ids[usize::from(byte)]);
         if piece.len() <= SHORT_PIECE_SYMBOLS {
-            self.merge_short(symbols, piece.len(), ids);
+            self.merge_short(piece, ids);
         } else {
-            self.merge_long(symbols, ids);
+            self.merge_long(piece, ids);
         }
     }
 
-    /// The merge of a short piece, `n` initial symbols (`1..=SHORT_PIECE_SYMBOLS`),
-    /// as a [`ShortMerge`] on stack arrays, the smaller ones for a piece that
-    /// fits them.
-    fn merge_short(&self, symbols: impl Iterator<Item = u32>, n: usize, ids: &mut Vec<u32>) {
-        if n <= SHORT_PIECE_SMALL {
-            ShortMerge::<SHORT_PIECE_SMALL>::of(symbols, n).run(self, ids);
+    /// The merge of a short piece (`1..=SHORT_PIECE_SYMBOLS` bytes) as a
+    /// [`ShortMerge`] on stack arrays, the smaller ones for a piece that fits
+    /// them.
+    fn merge_short(&self, piece: &[u8], ids: &mut Vec<u32>) {
+        let symbols = piece.iter().map(|&byte| self.byte_ids[usize::from(byte)]);
+        if piece.len() <= SHORT_PIECE_TINY {
+            ShortMerge::<SHORT_PIECE_TINY>::of(symbols, piece.len()).run(self, piece, ids);
+        } else if piece.len() <= SHORT_PIECE_SMALL {
+            ShortMerge::<SHORT_PIECE_SMALL>::of(symbols, piece.len()).run(self, piece, ids);
         } else {
-            ShortMerge::<SHORT_PIECE_SYMBOLS>::of(symbols, n).run(self, ids);
+            ShortMerge::<SHORT_PIECE_SYMBOLS>::of(symbols, piece.len()).run(self, piece, ids);
         }
     }
 
@@ -349,20 +452,21 @@ impl MergeTable {
     /// taken only when the pair at its position is still the pair it was
     /// pushed for (the rank names the pair; the model compares the token
     /// the pair produces, which comes to the same, see the module docs).
-    fn merge_long(&self, initial: impl ExactSizeIterator<Item = u32>, ids: &mut Vec<u32>) {
-        let last = initial.len() - 1;
-        let mut symbols: Vec<Symbol> = initial
+    fn merge_long(&self, piece: &[u8], ids: &mut Vec<u32>) {
+        let last = piece.len() - 1;
+        let mut symbols: Vec<Symbol> = piece
+            .iter()
             .enumerate()
-            .map(|(i, id)| Symbol {
-                id,
+            .map(|(i, &byte)| Symbol {
+                id: self.byte_ids[usize::from(byte)],
                 prev: if i == 0 { NONE } else { i as u32 - 1 },
                 next: if i == last { NONE } else { i as u32 + 1 },
             })
             .collect();
         let mut candidates: BinaryHeap<Reverse<(u32, u32)>> = (0..last)
             .filter_map(|i| {
-                let rank = self.rank_of(symbols[i].id, symbols[i + 1].id);
-                (rank != NO_RANK).then_some(Reverse((rank, i as u32)))
+                let merge = self.byte_pair(piece[i], piece[i + 1]);
+                (merge != Merge::NONE).then_some(Reverse((merge.rank(), i as u32)))
             })
             .collect();
         while let Some(Reverse((rank, pos))) = candidates.pop() {
@@ -372,23 +476,24 @@ impl MergeTable {
                 continue;
             }
             let right = symbols[next as usize];
-            if self.rank_of(id, right.id) != rank {
+            let merge = self.merge_of(id, right.id);
+            if merge.rank() != rank {
                 continue;
             }
-            symbols[at].id = self.new_ids[rank as usize];
+            symbols[at].id = merge.product();
             symbols[at].next = right.next;
             symbols[next as usize].id = NONE;
             if right.next != NONE {
                 symbols[right.next as usize].prev = pos;
-                let ahead = self.rank_of(symbols[at].id, symbols[right.next as usize].id);
-                if ahead != NO_RANK {
-                    candidates.push(Reverse((ahead, pos)));
+                let ahead = self.merge_of(symbols[at].id, symbols[right.next as usize].id);
+                if ahead != Merge::NONE {
+                    candidates.push(Reverse((ahead.rank(), pos)));
                 }
             }
             if prev != NONE {
-                let behind = self.rank_of(symbols[prev as usize].id, symbols[at].id);
-                if behind != NO_RANK {
-                    candidates.push(Reverse((behind, prev)));
+                let behind = self.merge_of(symbols[prev as usize].id, symbols[at].id);
+                if behind != Merge::NONE {
+                    candidates.push(Reverse((behind.rank(), prev)));
                 }
             }
         }
@@ -450,13 +555,15 @@ impl<const N: usize> ShortMerge<N> {
         merge
     }
 
-    /// Merges until no live pair is a merge, and appends the ids to `ids`.
+    /// Merges until no live pair is a merge, and appends the ids to `ids`;
+    /// `piece` is the bytes the symbols came from, whose pairs the first round
+    /// reads from the grid.
     #[inline(always)]
-    fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
+    fn run(mut self, table: &MergeTable, piece: &[u8], ids: &mut Vec<u32>) {
         let pairs = self.n.saturating_sub(1);
-        for at in 0..pairs {
-            let rank = table.rank_of(self.symbols[at], self.symbols[at + 1]);
-            self.set_pair(table, at, rank);
+        for (at, pair) in piece.windows(2).enumerate().take(pairs) {
+            let merge = table.byte_pair(pair[0], pair[1]);
+            self.set_pair(at, merge);
         }
         let mut best = self.least(pairs);
         while best != NO_KEY {
@@ -484,35 +591,35 @@ impl<const N: usize> ShortMerge<N> {
         // over the other keys, so that the loads overlap it.
         let ahead = if right < self.n {
             self.prev[right] = at as u8;
-            table.rank_of(self.symbols[at], self.symbols[right])
+            table.merge_of(self.symbols[at], self.symbols[right])
         } else {
-            NO_RANK
+            Merge::NONE
         };
         let behind = if left < self.n {
             self.keys[left] = NO_KEY;
-            table.rank_of(self.symbols[left], self.symbols[at])
+            table.merge_of(self.symbols[left], self.symbols[at])
         } else {
-            NO_RANK
+            Merge::NONE
         };
         let others = self.least(self.n - 1);
-        let key_at = self.set_pair(table, at, ahead);
+        let key_at = self.set_pair(at, ahead);
         let key_left = if left < self.n {
-            self.set_pair(table, left, behind)
+            self.set_pair(left, behind)
         } else {
             NO_KEY
         };
         others.min(key_at).min(key_left)
     }
 
-    /// Records the pair the symbol at `at` starts as a merge of `rank` (its
-    /// key and its product; no key for [`NO_RANK`]) and answers the key.
+    /// Records the pair the symbol at `at` starts as `merge` (its key and
+    /// its product; no key for [`Merge::NONE`]) and answers the key.
     #[inline(always)]
-    fn set_pair(&mut self, table: &MergeTable, at: usize, rank: u32) -> u32 {
-        let key = if rank == NO_RANK {
+    fn set_pair(&mut self, at: usize, merge: Merge) -> u32 {
+        let key = if merge == Merge::NONE {
             NO_KEY
         } else {
-            self.products[at] = table.new_ids[rank as usize];
-            rank << SHORT_KEY_BITS | at as u32
+            self.products[at] = merge.product();
+            merge.rank() << SHORT_KEY_BITS | at as u32
         };
         self.keys[at] = key;
         key
