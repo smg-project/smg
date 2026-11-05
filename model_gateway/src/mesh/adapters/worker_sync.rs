@@ -1466,6 +1466,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_owners_replacement_in_place_reaches_its_peers_import() {
+        // One node publishes a worker and another imports it; the owner
+        // then replaces the worker in place (`register_or_replace`: the
+        // discovery reconciler's upsert, the start-up workflow, a `PUT`)
+        // with a new model and role under the same address. The `Replaced`
+        // event publishes the new state under the same key, and the
+        // import must follow it instead of keeping the first specification
+        // for as long as it lives.
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+
+        let pub_registry = Arc::new(WorkerRegistry::new());
+        let publisher = adapter(ns.clone(), pub_registry.clone());
+        publisher.start();
+
+        let sub_registry = Arc::new(WorkerRegistry::new());
+        let subscriber =
+            WorkerSyncAdapter::new(ns, sub_registry.clone(), "node-b".into(), empty_cluster());
+        subscriber.start();
+
+        let url = "http://remote:9000";
+        pub_registry.register(local_worker(url)).unwrap();
+        assert!(
+            wait_for(|| sub_registry.get_by_url(url).is_some()).await,
+            "import did not land"
+        );
+        let imported_as = sub_registry.get_id_by_url(url).unwrap();
+
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("llama-4"))
+                .worker_type(crate::worker::WorkerType::Decode)
+                .build(),
+        );
+        pub_registry.register_or_replace(replacement);
+
+        assert!(
+            wait_for(|| sub_registry
+                .get_by_url(url)
+                .is_some_and(|worker| worker.model_id() == "llama-4"))
+            .await,
+            "the import did not follow the owner's replacement; it serves {:?}",
+            sub_registry
+                .get_by_url(url)
+                .map(|w| w.model_id().to_string())
+        );
+        let followed = sub_registry.get_by_url(url).unwrap();
+        assert_eq!(
+            *followed.worker_type(),
+            crate::worker::WorkerType::Decode,
+            "the role follows too"
+        );
+        assert_eq!(
+            sub_registry.get_id_by_url(url),
+            Some(imported_as),
+            "under the id the import adopted"
+        );
+    }
+
+    #[tokio::test]
     async fn claimed_import_publishes_from_next_mutation() {
         // The restart race end-to-end: a mesh import wins the URL, the local
         // workflow claims it via register_or_replace, and the worker must be
