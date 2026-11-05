@@ -34,6 +34,18 @@ fn opt_section(stats: &str) -> Option<&str> {
     Some(&stats[start..end])
 }
 
+/// A numeric option's value in the `"opt"` object, whole: a substring check
+/// would also accept a longer number with the same leading digits.
+fn option_number(opt: &str, name: &str) -> Option<u64> {
+    let key = format!("\"{name}\":");
+    let start = opt.find(&key)? + key.len();
+    let digits: String = opt[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 #[test]
 fn smg_binary_uses_global_jemalloc() {
     let stats = jemalloc_stats("stats_print:true,stats_print_opts:J")
@@ -54,7 +66,10 @@ fn smg_binary_uses_global_jemalloc() {
 fn smg_binary_applies_the_server_malloc_conf() {
     // The executable's `_rjem_malloc_conf` symbol: purge on a background
     // thread, dirty pages back to the OS after 10 s, muzzy pages at once,
-    // and 16 arenas instead of four per CPU.
+    // 16 arenas instead of four per CPU, and allocations below 32 MiB served
+    // from the arenas' dirty cache instead of the purged-at-free huge arena.
+    // jemalloc skips a misspelled entry with a warning on stderr and runs on,
+    // so each one is read back here.
     let stats = jemalloc_stats("stats_print:true,stats_print_opts:J")
         .expect("jemalloc statistics from the SMG executable");
     let opt = opt_section(&stats).expect("an \"opt\" section in the jemalloc statistics");
@@ -71,6 +86,11 @@ fn smg_binary_applies_the_server_malloc_conf() {
             "jemalloc did not take the executable's malloc_conf ({expected} missing): {opt}"
         );
     }
+    assert_eq!(
+        option_number(opt, "oversize_threshold"),
+        Some(32 << 20),
+        "jemalloc did not take the executable's oversize_threshold: {opt}"
+    );
 }
 
 #[test]
