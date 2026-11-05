@@ -1475,6 +1475,10 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("spill");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
+        Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
         Metrics::record_cache_aware_match_ratio(0.25);
         Metrics::record_cache_aware_match_ratio(0.75);
         Metrics::record_routing_key_source("header");
@@ -1506,6 +1510,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
         "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 2",
         "smg_cache_aware_policy_branch_total{branch=\"spill\"} 1",
+        "smg_manual_policy_branch_total{branch=\"occupied_hit\"} 2",
+        "smg_consistent_hashing_policy_branch_total{branch=\"routing_key_hit\"} 1",
+        "smg_prefix_hash_policy_branch_total{branch=\"ring_hit\"} 1",
         "smg_cache_aware_match_ratio_count 2",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",
