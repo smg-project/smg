@@ -168,17 +168,47 @@ pub fn deinterleave_rgb_to_planes(
     scale: [f32; 3],
     bias: [f32; 3],
 ) {
+    deinterleave_banded(rgb, r_plane, g_plane, b_plane, move |rgb, r, g, b| {
+        deinterleave_contiguous(rgb, r, g, b, scale, bias);
+    });
+}
+
+/// [`deinterleave_rgb_to_planes`] through a per-channel table instead of a
+/// scale and a bias: `plane[c][i] = table[c][rgb[i*3 + c]]`, for a reference
+/// whose arithmetic no single multiply-add reproduces in the last bit.
+fn deinterleave_rgb_to_planes_by_table(
+    rgb: &[u8],
+    r_plane: &mut [f32],
+    g_plane: &mut [f32],
+    b_plane: &mut [f32],
+    table: &[[f32; 256]; 3],
+) {
+    deinterleave_banded(rgb, r_plane, g_plane, b_plane, move |rgb, r, g, b| {
+        deinterleave_contiguous_by_table(rgb, r, g, b, table);
+    });
+}
+
+/// Band the pixels across the pool's threads and run `kernel` over each
+/// band's bytes and plane slices. Each output element depends only on its
+/// own input byte, so banding is BIT-IDENTICAL (elementwise f32, no
+/// reduction). Small images stay serial.
+fn deinterleave_banded<K>(
+    rgb: &[u8],
+    r_plane: &mut [f32],
+    g_plane: &mut [f32],
+    b_plane: &mut [f32],
+    kernel: K,
+) where
+    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]) + Copy + Send + Sync,
+{
     let pixels = r_plane.len();
     debug_assert_eq!(pixels, g_plane.len());
     debug_assert_eq!(pixels, b_plane.len());
     debug_assert!(rgb.len() >= pixels * 3);
 
-    // Each output element depends only on its own input byte, so banding the
-    // pixel range across threads is BIT-IDENTICAL (elementwise f32, no
-    // reduction). Small images stay serial.
     let nthreads = par_threads(pixels * 3 * 4, pixels);
     if nthreads <= 1 {
-        deinterleave_contiguous(rgb, r_plane, g_plane, b_plane, scale, bias);
+        kernel(rgb, r_plane, g_plane, b_plane);
         return;
     }
     let chunk = pixels.div_ceil(nthreads);
@@ -194,7 +224,7 @@ pub fn deinterleave_rgb_to_planes(
             gg = gt;
             bb = bt;
             let rgb_band = &rgb[p0 * 3..(p0 + n) * 3];
-            s.spawn(move |_| deinterleave_contiguous(rgb_band, rb, gb, bbnd, scale, bias));
+            s.spawn(move |_| kernel(rgb_band, rb, gb, bbnd));
             p0 += n;
         }
     });
@@ -239,6 +269,23 @@ fn deinterleave_contiguous(
     }
 }
 
+/// [`deinterleave_contiguous`] through a per-channel table: one load per byte.
+fn deinterleave_contiguous_by_table(
+    rgb: &[u8],
+    r_plane: &mut [f32],
+    g_plane: &mut [f32],
+    b_plane: &mut [f32],
+    table: &[[f32; 256]; 3],
+) {
+    let [red, green, blue] = table;
+    let (pixels, _) = rgb.as_chunks::<3>();
+    for (((pixel, r), g), b) in pixels.iter().zip(r_plane).zip(g_plane).zip(b_plane) {
+        *r = red[usize::from(pixel[0])];
+        *g = green[usize::from(pixel[1])];
+        *b = blue[usize::from(pixel[2])];
+    }
+}
+
 /// Build a [C, H, W] f32 tensor from interleaved RGB bytes with per-channel
 /// `scale` and `bias`: `output[c][i] = raw[i*3 + c] * scale[c] + bias[c]`.
 fn build_planar_tensor(
@@ -271,34 +318,66 @@ fn build_planar_tensor(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
+    image: (usize, usize),
+    canvas: (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
+    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
+        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
+    });
+}
+
+/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
+/// maps through `table[c][byte]` and the canvas outside the image holds
+/// `table[c][0]`, what a zero byte of padding maps to under the same
+/// arithmetic.
+pub(crate) fn paint_rgb_onto_planes_by_table(
+    rgb: &[u8],
+    image: (usize, usize),
+    canvas: (usize, usize),
+    table: &[[f32; 256]; 3],
+    planes: &mut [f32],
+) {
+    let black = [table[0][0], table[1][0], table[2][0]];
+    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
+        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
+    });
+}
+
+/// The canvas fill and the row walk of the paints: `black` fills the canvas,
+/// then `paint_row` maps each image row's bytes onto its three plane slices.
+fn paint_rows<K>(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
+    black: [f32; 3],
+    planes: &mut [f32],
+    paint_row: K,
+) where
+    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
+{
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(bias[0]);
-    g_plane.fill(bias[1]);
-    b_plane.fill(bias[2]);
+    r_plane.fill(black[0]);
+    g_plane.fill(black[1]);
+    b_plane.fill(black[2]);
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        deinterleave_rgb_to_planes(
+        paint_row(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
-            scale,
-            bias,
         );
     }
 }
@@ -2296,6 +2375,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
+        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
+        // tells the channels and the levels apart, and no multiply-add
+        // produces it.
+        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|level| {
+                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
+                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
+            })
+        });
+        let mut planes = vec![f32::NAN; 3 * 3 * 2];
+        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
+        for c in 0..3 {
+            for y in 0..2 {
+                for x in 0..3 {
+                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
+                    assert_eq!(
+                        planes[c * 6 + y * 3 + x].to_bits(),
+                        table[c][usize::from(level)].to_bits(),
+                        "channel {c} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deinterleave_by_table_is_bit_identical_banded_and_serial() {
+        // A row wide enough for the banded path; the serial kernel is the
+        // oracle.
+        let pixels = 1 << 20;
+        let rgb: Vec<u8> = (0..pixels * 3).map(|i| (i % 251) as u8).collect();
+        let table: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (level * 3 + c) as f32 / 7.0));
+        let mut serial = vec![0.0_f32; 3 * pixels];
+        {
+            let (r, rest) = serial.split_at_mut(pixels);
+            let (g, b) = rest.split_at_mut(pixels);
+            deinterleave_contiguous_by_table(&rgb, r, g, b, &table);
+        }
+        let mut banded = vec![0.0_f32; 3 * pixels];
+        {
+            let (r, rest) = banded.split_at_mut(pixels);
+            let (g, b) = rest.split_at_mut(pixels);
+            deinterleave_rgb_to_planes_by_table(&rgb, r, g, b, &table);
+        }
+        assert!(serial
+            .iter()
+            .zip(&banded)
+            .all(|(s, b)| s.to_bits() == b.to_bits()));
+        assert_eq!(serial[0].to_bits(), table[0][0].to_bits());
+        assert_eq!(serial[pixels].to_bits(), table[1][1].to_bits());
     }
 
     #[test]
