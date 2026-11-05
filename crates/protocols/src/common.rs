@@ -844,7 +844,7 @@ pub enum ToolChoiceValue {
 /// contract's nested object, `{"type": "allowed_tools", "allowed_tools":
 /// {"mode": ..., "tools": [{"type": "function", "function": {"name": ...}}]}}`,
 /// read and written in that shape; the flat spelling this route read before
-/// it read the contract's is still accepted ([`wire`]).
+/// it read the contract's is still accepted (the `wire` module).
 #[derive(Debug, Clone)]
 pub enum ToolChoice {
     Value(ToolChoiceValue),
