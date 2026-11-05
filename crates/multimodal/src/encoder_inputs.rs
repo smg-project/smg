@@ -20,7 +20,7 @@ use std::{
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, IxDyn, Slice};
 
-use crate::{pixel_convert, types::FieldLayout, vision::execution};
+use crate::{buffer_pool, pixel_convert, types::FieldLayout, vision::execution};
 
 /// The dtypes an encoder input is written in for the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +322,8 @@ impl EncoderInput {
 
     /// The input as little-endian bytes of `dtype`, consuming it: bytes
     /// already in `dtype` move out; anything else is written as
-    /// [`EncoderInputView::try_write_as`] writes it, with its errors.
+    /// [`EncoderInputView::try_write_as`] writes it, with its errors, and
+    /// the written-out bytes or patches go back to the buffer pool.
     pub fn into_bytes_as(self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
         match self {
             Self::Wire {
@@ -340,7 +341,17 @@ impl EncoderInput {
                 }
                 Ok(bytes)
             }
-            other => other.view().try_write_as(dtype),
+            other => {
+                let written = other.view().try_write_as(dtype);
+                match other {
+                    Self::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+                    Self::U8 { patches, .. } => {
+                        buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
+                    }
+                    Self::F32(_) => {}
+                }
+                written
+            }
         }
     }
 
@@ -603,8 +614,12 @@ impl<'a> EncoderInputView<'a> {
     /// other conversion is exact), or a wire whose bytes do not match its
     /// shape.
     pub fn try_write_as(&self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
-        let mut out = vec![0u8; self.len() * dtype.element_size()];
-        self.write_into(dtype, &mut out)?;
+        // A pooled buffer: `write_into` covers it or writes nothing.
+        let mut out = buffer_pool::take(self.len() * dtype.element_size());
+        if let Err(message) = self.write_into(dtype, &mut out) {
+            buffer_pool::recycle(out);
+            return Err(message);
+        }
         Ok(out)
     }
 
@@ -1816,5 +1831,70 @@ mod tests {
                 assert!(wire.write_as(EncoderDtype::Float32).is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use ndarray::Array2;
+
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    fn norm() -> PixelNorm {
+        PixelNorm {
+            scale: 1.0,
+            offset: [127.5; 3],
+            divisor: [127.5; 3],
+            channel_block: 392,
+        }
+    }
+
+    /// Patches written out in a float dtype return their buffer to the pool;
+    /// the written bytes are a pooled buffer of their own.
+    #[test]
+    fn patches_written_out_in_another_dtype_return_their_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 1,411,200 bytes of patches: the 2 MiB class; their bf16 wire is the 4 MiB class.
+            let (rows, features) = (1200, 1176);
+            let mut bytes = buffer_pool::take(rows * features);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index % 251) as u8;
+            }
+            let address = bytes.as_ptr();
+            let patches = Array2::from_shape_vec((rows, features), bytes).expect("shaped");
+            let wire = EncoderInput::bytes(patches, norm())
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("written");
+            assert_eq!(
+                (wire.len(), wire.capacity()),
+                (2 * rows * features, 4 << 20)
+            );
+            assert_eq!(MINE.held(), 2 << 20, "the patches came back");
+            let again = buffer_pool::take(rows * features);
+            assert_eq!(again.as_ptr(), address);
+        });
+    }
+
+    /// A `float32` wire narrowed to a half width returns its buffer to the pool.
+    #[test]
+    fn a_wire_written_in_a_narrower_dtype_returns_its_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 1.6 MB of float32: the 2 MiB class; the halves are below the pooled range.
+            let values = 1000 * 400;
+            let bytes = buffer_pool::take(values * 4);
+            let address = bytes.as_ptr();
+            let wire = EncoderInput::wire(bytes, EncoderDtype::Float32, vec![1000, 400], norm())
+                .expect("a wire");
+            let halves = wire
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("narrowed");
+            assert_eq!(halves.len(), values * 2);
+            assert_eq!(MINE.held(), 2 << 20, "the float32 wire came back");
+            let again = buffer_pool::take(values * 4);
+            assert_eq!(again.as_ptr(), address);
+        });
     }
 }

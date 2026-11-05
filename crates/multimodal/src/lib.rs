@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod buffer_pool;
 pub mod data_url;
 pub mod encoder_inputs;
 pub mod error;
