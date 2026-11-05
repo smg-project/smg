@@ -227,7 +227,11 @@ impl VllmEngine for MockScheduler {
     }
 }
 
-/// A frame in this wire's shape (its responses carry no request id).
+/// A frame in this wire's shape (its responses carry no request id). A
+/// chunk carries the running counts and the completion the whole output and
+/// the totals, as the Rust servicer streams them; the deprecated Python
+/// servicer streamed per-chunk deltas, and the gateway sums the chunk ids
+/// under either shape.
 fn response(frame: Frame) -> vllm::GenerateResponse {
     let response = match frame {
         Frame::Chunk(chunk) => GenResp::Chunk(vllm::GenerateStreamChunk {
