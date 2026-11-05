@@ -832,8 +832,8 @@ fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
 /// `disaggregation_mode`) the room places the request: a request whose
 /// Router pin names rank 0 but whose room's residue over two ranks is 1
 /// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
-/// with one warning line naming the request; a request whose pin agrees
-/// logs nothing.
+/// with one warning line naming the request, and a second such request on
+/// the connection with no warning; a request whose pin agrees logs nothing.
 #[tokio::test]
 async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let logs = captured_logs();
@@ -878,6 +878,40 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
         lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
         "{}",
         lines[0]
+    );
+
+    // Room 9 is rank 1 again and the pin still says 0: the connection's
+    // second yield, logged below WARN (the capture reads WARN and above).
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room9", 9, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room9", Some(1), Some(9))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room9", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(
+        logs.lines_containing("room9").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("room9")
     );
 
     // Room 8 is rank 0; the pin agrees: nothing logged.
@@ -1376,7 +1410,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
         input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
     });
     request.sampling_params.as_mut().unwrap().n = 2;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         pixel_values: Some(sg::TensorData {
             data: pixels.clone().into(),
@@ -1399,7 +1433,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             length: 3,
         }],
         ..Default::default()
-    });
+    }));
     let _stream = h
         .client
         .generate(request)
@@ -1569,11 +1603,11 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         input_ids: vec![1, 7, 7, 7, 2],
     });
     request.sampling_params.as_mut().unwrap().n = n;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         image_urls: vec![IMAGE_REFERENCE.to_string()],
         ..Default::default()
-    });
+    }));
     request
 }
 
@@ -1846,7 +1880,21 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
     assert_eq!(busy.loads[0].num_running_reqs, 1);
     assert_eq!(busy.loads[0].num_waiting_reqs, 2);
     assert!((busy.loads[0].token_usage - 0.05).abs() < 1e-9);
-    assert_eq!(busy.aggregate.unwrap().total_reqs, 3);
+    assert!(
+        (busy.loads[0].utilization - 0.05).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {busy:?}"
+    );
+    let aggregate = busy.aggregate.unwrap();
+    assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.05).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - busy.loads[0].gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -3451,7 +3499,10 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
 /// Two connected schedulers whose handshakes each say a data-parallel size
 /// of one: the zero-filled `GetLoads` before the first snapshot names the
 /// ranks the servicer serves (one per connected scheduler), as the pinned
-/// request path counts them.
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
 #[tokio::test]
 async fn the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();
@@ -3474,6 +3525,92 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 struct NativeVideoProcessor;
@@ -3495,7 +3632,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
             assert!(refs.pixel_values.is_none());
             assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
             request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
-            request.mm_inputs = Some(sg::MultimodalInputs {
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
                 modalities: vec!["video".into()],
                 pixel_values: Some(sg::TensorData {
                     data: vec![0; 32].into(),
@@ -3522,7 +3659,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
                     length: 3,
                 }],
                 ..Default::default()
-            });
+            }));
             Ok(request)
         })
     }
@@ -3548,10 +3685,10 @@ async fn native_video_refs_expand_before_scheduler_dispatch() {
     );
     let mut request = generate_request("native-video", true, Vec::new());
     request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     let _stream = h.client.generate(request).await.unwrap().into_inner();
     let received = recv_add(&mut h.engine_in).await;
     assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
@@ -3584,10 +3721,10 @@ async fn abort_during_native_media_processing_never_submits_to_scheduler() {
     })
     .await;
     let mut request = generate_request("pending-media", true, Vec::new());
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         image_urls: vec!["https://example.test/image.png".into()],
         ..Default::default()
-    });
+    }));
     let mut client = h.client.clone();
     #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
     let pending = tokio::spawn(async move { client.generate(request).await });
@@ -3638,10 +3775,10 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     .await;
     let mut original = generate_request("reuse-video", true, Vec::new());
     original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    original.mm_inputs = Some(sg::MultimodalInputs {
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     original.disaggregated_params = Some(sg::DisaggregatedParams {
         bootstrap_host: "127.0.0.1".into(),
         bootstrap_port: 8998,
@@ -3674,7 +3811,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     )
     .await;
     let mut decode = original.clone();
-    decode.media_identity = Some(identity.clone());
+    decode.media_identity = Some(Box::new(identity.clone()));
     let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
     let wire = recv_add(&mut d.engine_in).await;
     assert_eq!(wire.input_ids, prefill_wire.input_ids);
@@ -3706,7 +3843,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
                 .clear(),
             _ => bad.version += 1,
         }
-        req.media_identity = Some(bad);
+        req.media_identity = Some(Box::new(bad));
         fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
         let wire = recv_add(&mut d.engine_in).await;
         assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);
@@ -3731,4 +3868,132 @@ fn media_optimization_defaults_require_a_supported_identity() {
     assert_eq!(mm_hash_threads(None, false, "0", "0").unwrap(), 0);
     assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
     assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 1000)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 1000))),
+    )
+    .await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 1000))),
+    )
+    .await;
+    chunk(third.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 1000))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

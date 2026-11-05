@@ -285,7 +285,8 @@ async fn streaming_generate_over_zmq() {
         "one in-flight chunk per canned engine token: {text}"
     );
     assert_eq!(
-        text.matches("\"finish_reason\":\"stop\"").count(),
+        text.matches("\"finish_reason\":{\"type\":\"stop\"}")
+            .count(),
         1,
         "exactly one terminal chunk: {text}"
     );

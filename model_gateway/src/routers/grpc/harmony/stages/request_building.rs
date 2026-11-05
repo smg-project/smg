@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use smg_grpc_client::{
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    VllmEngineClient,
+    FormatSetAside, OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, VllmEngineClient,
 };
 use tracing::{debug, error};
 
@@ -252,6 +252,7 @@ fn build_harmony_proto(
                 SglangGenerateRequestOptions {
                     multimodal_inputs: None,
                     tool_call_constraint: tool_constraints,
+                    format_set_aside: FormatSetAside::default(),
                     require_reasoning: false,
                 },
             )?))
@@ -272,7 +273,7 @@ fn build_harmony_proto(
                 text,
                 token_ids,
                 None, // No multimodal in the Harmony pipeline
-                tool_constraints,
+                OutputConstraint::tool(tool_constraints),
             )?))
         }
         (BackendClient::Grpc(GrpcClient::Trtllm(c)), Responses(b)) => {
@@ -284,9 +285,15 @@ fn build_harmony_proto(
                 tool_constraints,
             )?))
         }
-        (BackendClient::Grpc(GrpcClient::Mlx(c)), Chat(b)) => ProtoGenerateRequest::Mlx(Box::new(
-            c.build_generate_request_from_chat(request_id, b, text, token_ids, tool_constraints)?,
-        )),
+        (BackendClient::Grpc(GrpcClient::Mlx(c)), Chat(b)) => {
+            ProtoGenerateRequest::Mlx(Box::new(c.build_generate_request_from_chat(
+                request_id,
+                b,
+                text,
+                token_ids,
+                OutputConstraint::tool(tool_constraints),
+            )?))
+        }
         (BackendClient::Grpc(GrpcClient::Mlx(c)), Responses(b)) => {
             ProtoGenerateRequest::Mlx(Box::new(c.build_generate_request_from_responses(
                 request_id,
@@ -332,7 +339,7 @@ fn build_vllm(
             text,
             token_ids,
             None, // No multimodal in the Harmony pipeline
-            tool_constraints,
+            OutputConstraint::tool(tool_constraints),
         )?,
         HarmonyBody::Responses(b) => VllmEngineClient::build_generate_request_from_responses(
             request_id,
@@ -361,7 +368,7 @@ fn build_tokenspeed(
             text,
             token_ids,
             None, // Harmony path: multimodal not yet wired
-            tool_constraints,
+            OutputConstraint::tool(tool_constraints),
         )?,
         HarmonyBody::Responses(b) => {
             TokenSpeedSchedulerClient::build_generate_request_from_responses(
@@ -392,6 +399,7 @@ fn build_sglang(
             SglangGenerateRequestOptions {
                 multimodal_inputs: None, // Harmony path: multimodal not yet wired
                 tool_call_constraint: tool_constraints,
+                format_set_aside: FormatSetAside::default(),
                 require_reasoning: false,
             },
         )?,

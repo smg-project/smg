@@ -23,7 +23,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{KvEventMonitor, RuntimeType, Worker, WorkerType},
+    worker::{KvEventMonitor, RuntimeType, SubscriptionKind, Worker, WorkerType},
 };
 use smg_test_harness as common;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
@@ -299,7 +299,9 @@ async fn build_bed(port: u16) -> Bed {
         .worker_registry
         .register(Arc::clone(&worker))
         .expect("register the worker");
-    kv_monitor.on_worker_added(&worker).await;
+    kv_monitor
+        .on_worker_added(&worker, SubscriptionKind::Events)
+        .await;
     let router = RouterFactory::create_router(&app_context)
         .await
         .expect("gRPC router");

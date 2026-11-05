@@ -2175,7 +2175,7 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
-        observability::logging::test_support::test_subscriber,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{
@@ -2191,16 +2191,10 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
+            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+            PrefillReservation, WorkerLoadGuard,
         },
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn retry_after(response: &Response) -> Option<&str> {
         response
@@ -6195,28 +6189,6 @@ mod tests {
     }
 
     // ---- the refusal line of a drained pool -------------------------------------------------
-
-    /// Counts, on this thread's subscriber, the ERROR events and the stage's
-    /// refusal lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
 
     /// A model whose only worker is down is refused with the
     /// `no_available_workers` 503, marked as reported for the loggers

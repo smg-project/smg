@@ -1,5 +1,5 @@
 //! Kimi K3's structural tag: the block of calls as the gateway's Kimi K3 parser writes it by hand,
-//! here from the table's markers and the request's tools.
+//! here from the table's markers, the tags' spelling and the request's tools.
 //!
 //! The table gives the block its close and its ways in (`Format::ways_into`): Kimi K3's prompt
 //! leaves the thought open in thinking mode and the answer otherwise, and a block the model could
@@ -30,18 +30,18 @@ use super::{
     schema::{self, shape, Definitions},
     CallMarkers, Count, Grammar, WayIn,
 };
+use crate::tagged::attributed::Tags;
 
-const OPEN: &str = "<|open|>";
-const CLOSE: &str = "<|close|>";
-const SEP: &str = "<|sep|>";
 /// The call's count of the turn's calls, from one.
 const INDEX: &str = "[1-9][0-9]*";
 
 /// The block of calls for `tools`, entered by `ways_in`, as many as `count` lets the model write,
-/// or `None` for a table whose calls sit in no block.
+/// or `None` for a table whose calls sit in no block. The argument tags are written in `tags`'
+/// spelling, the one the assembler reads them in.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     ways_in: &[WayIn<'_>],
+    tags: &Tags,
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Option<Grammar> {
@@ -49,7 +49,14 @@ pub(super) fn calls(
     let one_call = Grammar::Or(
         tools
             .iter()
-            .map(|tool| call(markers, &tool.function.name, &tool.function.parameters))
+            .map(|tool| {
+                call(
+                    markers,
+                    tags,
+                    &tool.function.name,
+                    tool.function.parameters_schema(),
+                )
+            })
             .collect(),
     );
     let content = count.calls(one_call);
@@ -57,56 +64,60 @@ pub(super) fn calls(
 }
 
 /// One call: the call's opener and the tool's name, its index, the arguments and the call's close.
-fn call(markers: &CallMarkers<'_>, name: &str, parameters: &Value) -> Grammar {
+fn call(markers: &CallMarkers<'_>, tags: &Tags, name: &str, parameters: &Value) -> Grammar {
     Grammar::Sequence(vec![
         Grammar::ConstString(format!("{}{}\" index=\"", markers.call_open, escape(name))),
         Grammar::Regex(INDEX.to_string()),
-        Grammar::ConstString(format!("\"{SEP}")),
-        arguments(parameters),
+        Grammar::ConstString(format!("\"{}", tags.tag_end.text())),
+        arguments(tags, parameters),
         Grammar::ConstString(markers.call_close.to_string()),
     ])
 }
 
 /// The arguments the tool's schema asks for: one tag per property, in the schema's order, each
 /// optional unless required; any arguments at all for a schema without properties.
-fn arguments(parameters: &Value) -> Grammar {
-    schema::arguments(parameters, argument, || {
-        Grammar::Star(Box::new(any_argument()))
-    })
+fn arguments(tags: &Tags, parameters: &Value) -> Grammar {
+    schema::arguments(
+        parameters,
+        |key, schema, definitions| argument(tags, key, schema, definitions),
+        || Grammar::Star(Box::new(any_argument(tags))),
+    )
 }
 
 /// One argument tag: the key, the type the property's schema pins and a value of that type, or
 /// the key with any type and any value when the schema pins none.
-fn argument(key: &str, schema: &Value, definitions: Definitions<'_>) -> Grammar {
+fn argument(tags: &Tags, key: &str, schema: &Value, definitions: Definitions<'_>) -> Grammar {
     let key = escape(key);
-    match shape(schema, definitions, any_value) {
+    let end = tags.tag_end.text();
+    match shape(schema, definitions, || any_value(tags)) {
         Some((type_name, value)) => Grammar::Sequence(vec![
             Grammar::ConstString(format!(
-                "{OPEN}argument key=\"{key}\" type=\"{type_name}\"{SEP}"
+                "{}{key}\" type=\"{type_name}\"{end}",
+                tags.parameter_open
             )),
             value,
-            Grammar::ConstString(format!("{CLOSE}argument{SEP}")),
+            Grammar::ConstString(tags.parameter_close.to_string()),
         ]),
         None => Grammar::Sequence(vec![
-            Grammar::ConstString(format!("{OPEN}argument key=\"{key}\" type=\"")),
+            Grammar::ConstString(format!("{}{key}\" type=\"", tags.parameter_open)),
             attribute_text(),
-            Grammar::ConstString(format!("\"{SEP}")),
-            any_value(),
-            Grammar::ConstString(format!("{CLOSE}argument{SEP}")),
+            Grammar::ConstString(format!("\"{end}")),
+            any_value(tags),
+            Grammar::ConstString(tags.parameter_close.to_string()),
         ]),
     }
 }
 
 /// An argument tag with any key, any type and any value.
-fn any_argument() -> Grammar {
+fn any_argument(tags: &Tags) -> Grammar {
     Grammar::Sequence(vec![
-        Grammar::ConstString(format!("{OPEN}argument key=\"")),
+        Grammar::ConstString(tags.parameter_open.to_string()),
         attribute_text(),
         Grammar::ConstString("\" type=\"".to_string()),
         attribute_text(),
-        Grammar::ConstString(format!("\"{SEP}")),
-        any_value(),
-        Grammar::ConstString(format!("{CLOSE}argument{SEP}")),
+        Grammar::ConstString(format!("\"{}", tags.tag_end.text())),
+        any_value(tags),
+        Grammar::ConstString(tags.parameter_close.to_string()),
     ])
 }
 
@@ -117,10 +128,17 @@ fn attribute_text() -> Grammar {
     }
 }
 
-/// A value written as it is: any text up to a marker, a lone `<` or `|` included.
-fn any_value() -> Grammar {
+/// A value written as it is: any text up to a marker (one of the tags' structural tokens, or
+/// the marker that ends a tag), a lone `<` or `|` included.
+fn any_value(tags: &Tags) -> Grammar {
     Grammar::AnyText {
-        excludes: vec![CLOSE.to_string(), OPEN.to_string(), SEP.to_string()],
+        excludes: tags
+            .structural_tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once(tags.tag_end.text()))
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -193,7 +211,7 @@ mod tests {
                 "required": ["city", "days"],
             }),
         )]);
-        let markers = value!(["<|close|>", "<|open|>", "<|sep|>"]);
+        let markers = value!(["<|open|>", "<|close|>", "<|sep|>"]);
         assert_eq!(
             call["elements"][3],
             value!({"type": "sequence", "elements": [
@@ -320,7 +338,7 @@ mod tests {
                     {"type": "const_string", "value": begin},
                     {"type": "any_text", "excludes": ["\"", "<|"]},
                     {"type": "const_string", "value": "\"<|sep|>"},
-                    {"type": "any_text", "excludes": ["<|close|>", "<|open|>", "<|sep|>"]},
+                    {"type": "any_text", "excludes": ["<|open|>", "<|close|>", "<|sep|>"]},
                     {"type": "const_string", "value": ARGUMENT_CLOSE},
                 ]})
             );

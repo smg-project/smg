@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod buffer_pool;
 pub mod data_url;
 pub mod encoder_inputs;
 pub mod error;
@@ -80,6 +81,33 @@ pub(crate) mod test_support {
     /// build their inputs with.
     pub(crate) fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
+    }
+
+    /// `w` by `h` RGB bytes that vary with the position and `seed`: the
+    /// resamplers' parity inputs.
+    pub(crate) fn gradient_rgb(w: usize, h: usize, seed: usize) -> Vec<u8> {
+        let mut data = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                data[i] = ((seed + x * 7 + y * 3) % 256) as u8;
+                data[i + 1] = ((seed + x * 5 + y * 11) % 256) as u8;
+                data[i + 2] = ((seed + x + y * 2) % 256) as u8;
+            }
+        }
+        data
+    }
+
+    /// `actual` is `expected` byte for byte; otherwise the test fails naming
+    /// `what`, the first differing byte and the two values there.
+    pub(crate) fn assert_same_bytes(actual: &[u8], expected: &[u8], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        if let Some(first) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+            panic!(
+                "{what}: first difference at byte {first}: {} vs {}",
+                actual[first], expected[first]
+            );
+        }
     }
 
     /// The assertions the processors' two-image tests share: both images

@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_grpc_client::FormatSetAside;
 use tracing::error;
 
 use crate::routers::{
@@ -50,6 +51,11 @@ pub(crate) struct Inputs<'a> {
     pub token_ids: Vec<u32>,
     /// The constraint as the request carries it, before the worker's shaping.
     pub tool_constraints: Option<(String, String)>,
+    /// Which of the body's own format fields the constraint answers (a
+    /// table's tag for a JSON `response_format`; the whole turn's grammar for
+    /// the `regex` and the `ebnf` too): the client's builders read them as
+    /// absent, so the engine's request carries the constraint alone.
+    pub format_set_aside: FormatSetAside,
     /// What derives the table's tag for a worker's start, where the table
     /// shapes it by the start (`regular::symphony::constraint::WorkerConstraint::table_tag`).
     pub table_tag: Option<Arc<dyn TagForStart>>,
@@ -91,6 +97,7 @@ pub(crate) fn build(
         processed_text,
         token_ids,
         tool_constraints,
+        format_set_aside,
         table_tag,
         first_token_tag,
         require_reasoning,
@@ -144,6 +151,7 @@ pub(crate) fn build(
         GenerateRequestBuildOptions {
             multimodal_inputs: multimodal_data,
             tool_constraints,
+            format_set_aside,
             require_reasoning,
             first_token_grammar: first_token_tag || led_for_first_token,
         },

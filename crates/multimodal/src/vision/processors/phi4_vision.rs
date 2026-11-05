@@ -453,7 +453,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -653,7 +653,7 @@ mod tests {
         let processor = Phi4VisionProcessor::new();
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert!(result.feature_token_counts[0] > 256); // At least global tokens
@@ -668,7 +668,7 @@ mod tests {
         let processor = Phi4VisionProcessor::new();
 
         let image = create_test_image(1000, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         // Wide image should have more crops in width direction
@@ -679,12 +679,14 @@ mod tests {
     fn test_preprocess_multiple_images() {
         let processor = Phi4VisionProcessor::new();
 
-        let images = vec![
+        let images = [
             create_test_image(500, 500, Rgb([100, 100, 100])),
             create_test_image(800, 400, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);

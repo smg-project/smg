@@ -513,6 +513,22 @@ mod tests {
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
+        // DeepSeek-V4-Pro ships the V4-Flash group's encoder, tokenizer and configuration files:
+        // the V4 table, by the member's name alone as well.
+        for v4 in ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-v4-pro"] {
+            assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
+        }
+        // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+        // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
+        for v3_2 in [
+            "deepseek-ai/DeepSeek-V3.2",
+            "deepseek-ai/DeepSeek-V3.2-Speciale",
+            "deepseek-ai/DeepSeek-V3.2-Exp",
+            "deepseek-ai/DeepSeek-V3.2-Exp-Base",
+            "deepseek-v3.2-exp",
+        ] {
+            assert_eq!(table_for(v3_2), Some(Table::DeepSeekV3_2), "{v3_2}");
+        }
         for mimo in [
             "XiaomiMiMo/MiMo-V2.6-Flash-RL",
             "XiaomiMiMo/MiMo-V2.6-Pro-RL",
@@ -734,7 +750,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                parameters: Some(
+                    json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },

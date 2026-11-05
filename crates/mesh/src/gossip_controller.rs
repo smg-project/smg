@@ -46,21 +46,22 @@ use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
-    mtls::{tls_server_name, MTLSManager},
+    dialer::Dialer,
+    mtls::tls_server_name,
     service::{
         broadcast_node_states,
         gossip::{
             gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
             StateSync, StreamMessage,
         },
-        try_ping, ClusterState,
+        ClusterState,
     },
 };
 use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
     transport::{
-        limits::MAX_MESSAGE_SIZE,
+        limits::{MAX_MESSAGE_SIZE, STREAM_HEARTBEAT_INTERVAL},
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
         sync_stream::build_heartbeat,
     },
@@ -81,7 +82,9 @@ pub struct GossipController {
     self_name: String,
     self_addr: SocketAddr,
     init_peer: Option<SocketAddr>,
-    mtls_manager: Option<Arc<MTLSManager>>,
+    /// The node's dials: the probes, the relayed probes and the status
+    /// broadcasts go through it, one channel per peer address.
+    dialer: Arc<Dialer>,
     // Track active sync_stream connections
     sync_connections: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Current stream round batch, drained once per round from MeshKV.
@@ -100,14 +103,14 @@ impl GossipController {
         self_addr: SocketAddr,
         self_name: &str,
         init_peer: Option<SocketAddr>,
-        mtls_manager: Option<Arc<MTLSManager>>,
+        dialer: Arc<Dialer>,
     ) -> Self {
         Self {
             state,
             self_name: self_name.to_string(),
             self_addr,
             init_peer,
-            mtls_manager,
+            dialer,
             sync_connections: Arc::new(Mutex::new(HashMap::new())),
             current_stream_batch: Arc::new(RwLock::new(Arc::new(crate::kv::RoundBatch::default()))),
             mesh_kv: None,
@@ -252,7 +255,8 @@ impl GossipController {
     /// generation. Every sixtieth round (~60 s) the retry managers of peers
     /// no longer in the table go; the join peer's entry stays, as it is never
     /// in the table under its placeholder name and its backoff must not
-    /// restart every minute.
+    /// restart every minute. The dialer's channels to addresses the table no
+    /// longer names go with them (the join peer's address stays too).
     fn periodic_gc(
         &self,
         round: u64,
@@ -268,6 +272,14 @@ impl GossipController {
             retry_managers.retain(|peer_name, _| {
                 targets.contains_key(peer_name) || peer_name == INIT_PEER_NAME
             });
+            let members: Vec<SocketAddr> = self
+                .state
+                .read()
+                .values()
+                .filter_map(|node| node.address.parse().ok())
+                .chain(self.init_peer)
+                .collect();
+            self.dialer.retain(|addr| members.contains(addr));
         }
     }
 
@@ -341,14 +353,15 @@ impl GossipController {
         };
         let peer_addr = peer.address.parse::<SocketAddr>()?;
         let peer_name = peer.name.clone();
-        match try_ping(
-            &peer,
-            Some(gossip_message::Payload::Ping(Ping {
-                state_sync: Some(state_sync),
-            })),
-            self.mtls_manager.clone(),
-        )
-        .await
+        match self
+            .dialer
+            .ping(
+                &peer,
+                Some(gossip_message::Payload::Ping(Ping {
+                    state_sync: Some(state_sync),
+                })),
+            )
+            .await
         {
             Ok(node_update) => {
                 log::info!("Received NodeUpdate from peer: {:?}", node_update);
@@ -406,15 +419,16 @@ impl GossipController {
                         node.address,
                         peer_addr
                     );
-                    if try_ping(
-                        node,
-                        Some(gossip_message::Payload::PingReq(PingReq {
-                            node: Some(peer.clone()),
-                        })),
-                        self.mtls_manager.clone(),
-                    )
-                    .await
-                    .is_ok()
+                    if self
+                        .dialer
+                        .ping(
+                            node,
+                            Some(gossip_message::Payload::PingReq(PingReq {
+                                node: Some(peer.clone()),
+                            })),
+                        )
+                        .await
+                        .is_ok()
                     {
                         reachable = true;
                         break;
@@ -453,7 +467,7 @@ impl GossipController {
                             vec![unreachable_node],
                             target_nodes,
                             None, // Use default timeout
-                            self.mtls_manager.clone(),
+                            Arc::clone(&self.dialer),
                         )
                         .await;
 
@@ -552,6 +566,9 @@ impl GossipController {
                 // The periodic sender: the shared round every second, with
                 // this end's round metrics around it. The peer is known from
                 // the start, so every round can carry its targeted entries.
+                // It also sends a heartbeat every
+                // `STREAM_HEARTBEAT_INTERVAL`, which the acceptor answers, so
+                // an idle stream is not closed by either end's idle timeout.
                 let incremental_sender_handle = {
                     let tx_incremental = tx.clone();
                     let self_name_incremental = self_name.clone();
@@ -564,9 +581,21 @@ impl GossipController {
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
                         let mut sender = SenderState::default();
+                        let mut last_heartbeat = tokio::time::Instant::now();
 
                         loop {
                             interval.tick().await;
+
+                            if last_heartbeat.elapsed() >= STREAM_HEARTBEAT_INTERVAL {
+                                last_heartbeat = tokio::time::Instant::now();
+                                let heartbeat = build_heartbeat(
+                                    shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                    &self_name_incremental,
+                                );
+                                if tx_incremental.send(heartbeat).await.is_err() {
+                                    return;
+                                }
+                            }
 
                             let round_start = Instant::now();
                             let stream_batch = stream_batch_handle.read().clone();
@@ -617,14 +646,13 @@ impl GossipController {
                     )
                     .await;
                     match frame {
-                        Frame::Continue => {}
+                        Frame::Continue | Frame::Heartbeat => {}
                         Frame::Ack { sequence, .. } => {
                             log::trace!("Received ACK from {} (seq: {})", peer_name, sequence);
                         }
                         Frame::Nack { sequence } => {
                             log::warn!("Received NACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Frame::Closed => break,
                     }
                 }
 
@@ -669,7 +697,8 @@ impl GossipController {
         );
 
         // Connect to peer's gRPC service via Endpoint so TLS can be configured.
-        let connect_url = if self.mtls_manager.is_some() {
+        // The stream keeps a connection of its own (see `dialer`).
+        let connect_url = if self.dialer.mtls_manager().is_some() {
             format!("https://{peer_addr}")
         } else {
             format!("http://{peer_addr}")
@@ -679,7 +708,7 @@ impl GossipController {
         let mut endpoint = Endpoint::from_shared(connect_url.clone())
             .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
 
-        if let Some(mtls_manager) = self.mtls_manager.clone() {
+        if let Some(mtls_manager) = self.dialer.mtls_manager() {
             let tls_domain = endpoint.uri().host().map_or_else(
                 || peer_name.clone(),
                 |host| tls_server_name(host).to_owned(),
@@ -1099,3 +1128,7 @@ mod dial_tests {
         assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/heartbeat_integration.rs"]
+mod heartbeat_tests;

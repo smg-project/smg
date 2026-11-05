@@ -11,6 +11,7 @@ from infra import worker as worker_module
 from infra.constants import (
     ENV_SGLANG_SERVICER_IMPL,
     ENV_TOKENSPEED_SERVICER_IMPL,
+    ENV_TRTLLM_SERVICER_IMPL,
     ENV_VLLM_SERVICER_IMPL,
     ConnectionMode,
 )
@@ -20,6 +21,7 @@ ENGINES = [
     ("vllm", ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL", True),
     ("tokenspeed", ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL", False),
     ("sglang", ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL", False),
+    ("trtllm", ENV_TRTLLM_SERVICER_IMPL, "SMG_TRTLLM_SERVICER_IMPL", False),
 ]
 
 
@@ -55,6 +57,25 @@ def test_an_unset_lane_exports_nothing_and_follows_the_package_default(
     monkeypatch.setenv(variable, "python")  # inherited from the shell: not the lane's word
     assert variable not in _worker(engine, ConnectionMode.GRPC)._build_env()
     assert hook_checks == ([True] if needs_hook and package_default == "rust" else [])
+
+
+def test_the_lanes_worker_log_filter_becomes_the_workers_rust_log(monkeypatch, hook_checks):
+    """A lane's E2E_WORKER_RUST_LOG is the worker process's RUST_LOG (the
+    tracing filter of the Rust servicer it hosts; the shell's own value yields
+    to it); unset or blank, the worker keeps whatever the shell exported."""
+    _package_default(monkeypatch, "rust")
+    monkeypatch.setenv("RUST_LOG", "warn")
+    monkeypatch.delenv(constants.ENV_WORKER_RUST_LOG, raising=False)
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == "warn"
+    monkeypatch.setenv(constants.ENV_WORKER_RUST_LOG, " ")
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == "warn"
+    monkeypatch.setenv(constants.ENV_WORKER_RUST_LOG, "info,engine_servicer::request=debug")
+    env = _worker("vllm", ConnectionMode.GRPC)._build_env()
+    assert env["RUST_LOG"] == "info,engine_servicer::request=debug"
+    monkeypatch.delenv("RUST_LOG")
+    assert _worker("vllm", ConnectionMode.GRPC)._build_env()["RUST_LOG"] == (
+        "info,engine_servicer::request=debug"
+    )
 
 
 @pytest.mark.parametrize(("engine", "lane_setting", "variable", "needs_hook"), ENGINES)

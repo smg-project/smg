@@ -31,6 +31,8 @@ use tower::{Layer, Service};
 
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// The random characters after the prefix of a fresh id.
+const RANDOM_PART_LEN: usize = 24;
 
 /// The longest inbound request id the gateway honours, in bytes. The ids
 /// proxies and clients commonly mint are 32 to 55 characters (a hex request
@@ -43,7 +45,7 @@ pub(super) const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
 /// [`MAX_INBOUND_REQUEST_ID_LEN`] visible-ASCII characters, no space among
 /// them. The HTTP parser lets a horizontal tab through, so a header value
 /// that parses as a string is not enough.
-pub(super) fn is_acceptable_inbound_id(value: &str) -> bool {
+fn is_acceptable_inbound_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_INBOUND_REQUEST_ID_LEN
         && value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
@@ -67,17 +69,17 @@ pub(super) fn generate_request_id(path: &str) -> String {
         "req-"
     };
 
-    // Generate a random string similar to OpenAI's format
-    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
+    // The random part in OpenAI's form, written after the prefix into the one
+    // String the id is: its exact capacity up front, no second buffer and no
+    // growth on the way. Byte indexing (O(1)) instead of chars().nth() (O(n)).
     let mut rng = rand::rng();
-    let random_part: String = (0..24)
-        .map(|_| {
-            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
-            REQUEST_ID_CHARS[idx] as char
-        })
-        .collect();
-
-    format!("{prefix}{random_part}")
+    let mut id = String::with_capacity(prefix.len() + RANDOM_PART_LEN);
+    id.push_str(prefix);
+    for _ in 0..RANDOM_PART_LEN {
+        let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
+        id.push(REQUEST_ID_CHARS[idx] as char);
+    }
+    id
 }
 
 /// Tower Layer for request ID middleware

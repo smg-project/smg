@@ -12,20 +12,34 @@
 //! that can match the empty string is declined like everything else outside
 //! the subset, and the caller keeps the `tokenizers` pipeline for it.
 //!
+//! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
+//! and their kin ship one template, the digit rule's bound apart) is matched
+//! by a [`Scanner`] instead of the program: each of its seven alternatives
+//! is decided at a position by a few class tests and class runs, which is
+//! what the backtracking engine arrives at for that shape, so the pieces are
+//! the same and no character is interpreted op by op. The classes are the
+//! parser's, so the two matchers cannot read a category differently.
+//!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
-use super::unicode;
+use super::{chain, unicode};
 
 /// A set of characters: Unicode categories, code point ranges, negation.
 #[derive(Debug, Clone, Default)]
-struct Class {
+pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
+    /// Categories taken out of the class before any negation: the engine's
+    /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
+    without: u16,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
+    /// Membership of U+0000..=U+FFFF, resolved once (empty until
+    /// [`Class::finish`]).
+    plane: PlaneSet,
 }
 
 /// A set of ASCII characters as a membership table, one entry per code
@@ -71,6 +85,67 @@ impl AsciiSet {
     }
 }
 
+/// Words of a [`PlaneSet`]: one bit per code point of the Basic
+/// Multilingual Plane.
+const PLANE_WORDS: usize = 0x1_0000 / 64;
+
+/// A set of characters of the Basic Multilingual Plane as a bitmap, 8 KiB.
+/// A class test on a character beyond ASCII was a binary search over the
+/// range table of each of the class's categories, once per character per
+/// class test (measured: half of a warm encode of prose with a sixth of its
+/// bytes outside ASCII); a bit test is one load. The planes above keep the
+/// tables: rare in prompts, and a bit per code point of them would be 136
+/// KiB per class.
+#[derive(Clone)]
+struct PlaneSet(Box<[u64; PLANE_WORDS]>);
+
+impl Default for PlaneSet {
+    fn default() -> Self {
+        Self(Box::new([0; PLANE_WORDS]))
+    }
+}
+
+impl std::fmt::Debug for PlaneSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members: u32 = self.0.iter().map(|word| word.count_ones()).sum();
+        f.debug_tuple("PlaneSet").field(&members).finish()
+    }
+}
+
+impl PlaneSet {
+    /// Membership of `code`, which the caller has checked is below U+10000.
+    #[inline]
+    fn contains(&self, code: u32) -> bool {
+        debug_assert!(code < 0x1_0000);
+        (self.0[(code >> 6) as usize & (PLANE_WORDS - 1)] >> (code & 63)) & 1 != 0
+    }
+
+    /// Inserts every code point of `ranges` that is in the plane.
+    fn insert_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] |= 1 << (code & 63);
+            }
+        }
+    }
+
+    /// Removes every code point of `ranges` that is in the plane.
+    fn remove_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] &= !(1 << (code & 63));
+            }
+        }
+    }
+
+    /// The complement within the plane.
+    fn negate(&mut self) {
+        for word in self.0.iter_mut() {
+            *word = !*word;
+        }
+    }
+}
+
 const CAT_LETTER: u16 = 1 << 0;
 const CAT_MARK: u16 = 1 << 1;
 const CAT_NUMBER: u16 = 1 << 2;
@@ -82,6 +157,10 @@ const CAT_TITLECASE: u16 = 1 << 7;
 const CAT_MODIFIER_LETTER: u16 = 1 << 8;
 const CAT_OTHER_LETTER: u16 = 1 << 9;
 const CAT_SPACE: u16 = 1 << 10;
+/// The `Han` script: the one script property the patterns use (a template
+/// cuts ideograph runs out before its letter classes and takes them out of
+/// those classes).
+const CAT_HAN: u16 = 1 << 11;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -89,7 +168,7 @@ const CAT_SPACE: u16 = 1 << 10;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -101,12 +180,20 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
     (CAT_MODIFIER_LETTER, unicode::MODIFIER_LETTER),
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
+    (CAT_HAN, unicode::HAN),
 ];
 
 #[inline]
 fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
     let index = ranges.partition_point(|&(_, end)| end < code);
     ranges.get(index).is_some_and(|&(start, _)| start <= code)
+}
+
+/// Whether `code` is in the table of any category of `categories`.
+fn in_categories(categories: u16, code: u32) -> bool {
+    CATEGORY_TABLES
+        .iter()
+        .any(|&(bit, table)| categories & bit != 0 && in_ranges(table, code))
 }
 
 impl Class {
@@ -118,24 +205,50 @@ impl Class {
             }
         }
         self.ascii = ascii;
+        self.plane = self.plane_set();
         self
+    }
+
+    /// The members of the class in the Basic Multilingual Plane: the class's
+    /// own ranges and the tables of its categories, the complement for a
+    /// negated class (the `hit != negated` of [`Class::contains_slow`]).
+    fn plane_set(&self) -> PlaneSet {
+        let mut plane = PlaneSet::default();
+        plane.insert_ranges(&self.ranges);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                plane.insert_ranges(table);
+            }
+        }
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.without & bit != 0 {
+                plane.remove_ranges(table);
+            }
+        }
+        if self.negated {
+            plane.negate();
+        }
+        plane
     }
 
     fn contains_slow(&self, code: u32) -> bool {
         let mut hit = in_ranges(&self.ranges, code);
         if !hit && self.categories != 0 {
-            hit = CATEGORY_TABLES
-                .iter()
-                .any(|&(bit, table)| self.categories & bit != 0 && in_ranges(table, code));
+            hit = in_categories(self.categories, code);
+        }
+        if hit && self.without != 0 {
+            hit = !in_categories(self.without, code);
         }
         hit != self.negated
     }
 
     #[inline]
-    fn contains(&self, c: char) -> bool {
+    pub(super) fn contains(&self, c: char) -> bool {
         let code = u32::from(c);
         if code < 128 {
             self.ascii.contains(code)
+        } else if code < 0x1_0000 {
+            self.plane.contains(code)
         } else {
             self.contains_slow(code)
         }
@@ -155,7 +268,7 @@ impl Class {
 }
 
 #[derive(Debug, Clone)]
-enum Node {
+pub(super) enum Node {
     /// One character of the class.
     Class(usize),
     /// Greedy repetition of one class character, `min..=max` times.
@@ -190,7 +303,7 @@ enum Node {
 /// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
 #[derive(Debug, Clone, Copy, Default)]
-struct First {
+pub(super) struct First {
     ascii: AsciiSet,
     non_ascii: bool,
     nullable: bool,
@@ -239,6 +352,11 @@ pub(crate) struct Pattern {
     program: Vec<Op>,
     /// The first-character sets the `Split` ops index.
     firsts: Vec<First>,
+    /// The matcher of the GPT-4 family's template, when the pattern is one.
+    scanner: Option<Scanner>,
+    /// What the pattern is as a stage of a three-stage chain, when it is
+    /// one (see [`chain`]).
+    part: Option<chain::Part>,
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -309,6 +427,8 @@ impl Pattern {
         if choices(&root) > MAX_CHOICES {
             return None;
         }
+        let scanner = Scanner::recognize(&root, &parser.classes);
+        let part = chain::Part::recognize(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -317,7 +437,29 @@ impl Pattern {
             classes: parser.classes,
             program,
             firsts,
+            scanner,
+            part,
         })
+    }
+
+    /// The pattern's classes, which its [`Part`](chain::Part) indexes.
+    pub(super) fn classes(&self) -> &[Class] {
+        &self.classes
+    }
+
+    /// What the pattern is as a stage of a three-stage chain, if anything.
+    pub(super) fn part(&self) -> Option<&chain::Part> {
+        self.part.as_ref()
+    }
+
+    /// This pattern matched by its program alone, the scanner set aside: the
+    /// tests hold the two against each other.
+    #[cfg(test)]
+    fn program_only(&self) -> Self {
+        Self {
+            scanner: None,
+            ..self.clone()
+        }
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -447,6 +589,355 @@ impl Pattern {
     }
 }
 
+/// A part of the GPT-4 family's template that one class fills: the bit of
+/// [`Scanner::ascii`] and the slot of [`Scanner::classes`] that hold it.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum Role {
+    /// The first character of a clitic alternative (a bit only: beyond
+    /// ASCII the alternatives are tried).
+    CliticStart,
+    /// The optional lead-in of a letter run (`[^\r\n\p{L}\p{N}]?`).
+    WordPrefix,
+    /// A letter run (`\p{L}+`).
+    Word,
+    /// A digit (`\p{N}`, up to the digit cap at once).
+    Digit,
+    /// The optional space before a punctuation run (` ?`).
+    PunctPrefix,
+    /// A punctuation run (`[^\s\p{L}\p{N}]+`).
+    Punct,
+    /// The line breaks after a punctuation run (`[\r\n]*`).
+    PunctBreak,
+    /// The whitespace before line breaks (`\s*`).
+    BreakSpace,
+    /// A run of line breaks (`[\r\n]+`).
+    Break,
+    /// Whitespace that leaves its last character to what follows (`\s+`
+    /// before `(?!\S)`).
+    TrailSpace,
+    /// What may not follow that whitespace (`\S`).
+    NotTrail,
+    /// A whitespace run (`\s+`).
+    Space,
+}
+
+/// The roles, so many slots of [`Scanner::classes`].
+const ROLES: usize = 12;
+
+/// The roles that one class fills, every role but the clitic start.
+const CLASSED_ROLES: [Role; ROLES - 1] = [
+    Role::WordPrefix,
+    Role::Word,
+    Role::Digit,
+    Role::PunctPrefix,
+    Role::Punct,
+    Role::PunctBreak,
+    Role::BreakSpace,
+    Role::Break,
+    Role::TrailSpace,
+    Role::NotTrail,
+    Role::Space,
+];
+
+impl Role {
+    #[inline(always)]
+    fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+/// The matcher of the GPT-4 family's pre-tokenizer template,
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// with whatever classes stand in those places and whatever bound the digit
+/// rule has (Qwen 2 and 3 take one digit, Llama 3 and GLM 4.6 up to three,
+/// Qwen 3.5 counts marks among the letters). For this shape, leftmost-first
+/// alternation over greedy runs comes down to a decision per alternative
+/// that one scan settles:
+///
+/// 1. a clitic: the first alternative whose characters follow in order;
+/// 2. a letter run, with the lead-in when a letter follows it;
+/// 3. up to the bound of digits;
+/// 4. a punctuation run, with the space when punctuation follows it, and
+///    the line breaks after the run;
+/// 5. whitespace ending in line breaks: the whitespace run up to and
+///    including its last line break, when it holds one;
+/// 6. whitespace before a non-space: the run short of its last character,
+///    or whole at the end of the text, when it has a character to give;
+/// 7. the whitespace run.
+///
+/// Each is what the engine's backtracking arrives at: a greedy optional
+/// lead-in is kept only when the run after it can start, a greedy run before
+/// a required class gives back characters until the class follows, and the
+/// first alternative to reach the end of the pattern wins.
+#[derive(Debug, Clone)]
+struct Scanner {
+    /// Per ASCII code point, a bit per [`Role`] whose class holds it.
+    ascii: [u16; 128],
+    /// The class of each role, read for characters beyond ASCII (the clitic
+    /// start's slot is unused).
+    classes: [usize; ROLES],
+    /// Whether a clitic alternative may begin beyond ASCII.
+    clitic_beyond_ascii: bool,
+    /// The clitic alternatives, each the classes of its characters in order.
+    clitics: Vec<Vec<usize>>,
+    /// The most digits the digit alternative takes at once.
+    digit_cap: u32,
+}
+
+impl Scanner {
+    /// The scanner of `root`, when it is the template; `None` for every other
+    /// shape, which the program matches.
+    fn recognize(root: &Node, classes: &[Class]) -> Option<Self> {
+        let Node::Alt { alternatives, .. } = root else {
+            return None;
+        };
+        let [clitics, word, digits, punct, breaks, trail, space] = alternatives.as_slice() else {
+            return None;
+        };
+        let Node::Alt {
+            alternatives: clitic_alternatives,
+            ..
+        } = clitics
+        else {
+            return None;
+        };
+        let clitics = clitic_alternatives
+            .iter()
+            .map(|alternative| match alternative {
+                Node::Class(class) => Some(vec![*class]),
+                Node::Concat(nodes) => nodes.iter().map(plain_class).collect(),
+                _ => None,
+            })
+            .collect::<Option<Vec<Vec<usize>>>>()?;
+        if clitics.iter().any(Vec::is_empty) {
+            return None;
+        }
+        let [word_prefix, word_run] = concat(word)? else {
+            return None;
+        };
+        let (digit, digit_cap) = match digits {
+            Node::Class(class) => (*class, 1),
+            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            _ => return None,
+        };
+        let [punct_prefix, punct_run, punct_break] = concat(punct)? else {
+            return None;
+        };
+        let [break_space, break_run] = concat(breaks)? else {
+            return None;
+        };
+        let [trail_space, not_trail] = concat(trail)? else {
+            return None;
+        };
+        let Node::NotAhead(not_trail) = not_trail else {
+            return None;
+        };
+        let mut roles = [0usize; ROLES];
+        roles[Role::WordPrefix as usize] = repeat(word_prefix, 0, 1)?;
+        roles[Role::Word as usize] = repeat(word_run, 1, u32::MAX)?;
+        roles[Role::Digit as usize] = digit;
+        roles[Role::PunctPrefix as usize] = repeat(punct_prefix, 0, 1)?;
+        roles[Role::Punct as usize] = repeat(punct_run, 1, u32::MAX)?;
+        roles[Role::PunctBreak as usize] = repeat(punct_break, 0, u32::MAX)?;
+        roles[Role::BreakSpace as usize] = repeat(break_space, 0, u32::MAX)?;
+        roles[Role::Break as usize] = repeat(break_run, 1, u32::MAX)?;
+        roles[Role::TrailSpace as usize] = repeat(trail_space, 1, u32::MAX)?;
+        roles[Role::NotTrail as usize] = *not_trail;
+        roles[Role::Space as usize] = repeat(space, 1, u32::MAX)?;
+        let mut ascii = [0u16; 128];
+        for (code, bits) in ascii.iter_mut().enumerate() {
+            let c = char::from(code as u8);
+            for role in CLASSED_ROLES {
+                if classes[roles[role as usize]].contains(c) {
+                    *bits |= role.bit();
+                }
+            }
+            if clitics
+                .iter()
+                .any(|alternative| classes[alternative[0]].contains(c))
+            {
+                *bits |= Role::CliticStart.bit();
+            }
+        }
+        let clitic_beyond_ascii = clitics
+            .iter()
+            .any(|alternative| classes[alternative[0]].first().non_ascii);
+        Some(Self {
+            ascii,
+            classes: roles,
+            clitic_beyond_ascii,
+            clitics,
+            digit_cap,
+        })
+    }
+
+    /// Whether `c` is in the class of `role`.
+    #[inline(always)]
+    fn has(&self, classes: &[Class], role: Role, c: char) -> bool {
+        let code = u32::from(c);
+        if code < 128 {
+            self.ascii[code as usize] & role.bit() != 0
+        } else {
+            classes[self.classes[role as usize]].contains(c)
+        }
+    }
+
+    /// The end of the run of `role`'s class that starts at `pos`.
+    #[inline(always)]
+    fn run_end(&self, classes: &[Class], text: &str, mut pos: usize, role: Role) -> usize {
+        while let Some((c, len)) = next_char(text, pos) {
+            if !self.has(classes, role, c) {
+                break;
+            }
+            pos += len;
+        }
+        pos
+    }
+
+    /// The end of the piece that starts at `pos`, if one does: the first of
+    /// the seven alternatives that matches there, as the engine picks it.
+    fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+        let (c, len) = next_char(text, pos)?;
+        let after = pos + len;
+        // 1. A clitic: the first alternative whose characters follow in order.
+        let may_start_clitic = if u32::from(c) < 128 {
+            self.ascii[u32::from(c) as usize] & Role::CliticStart.bit() != 0
+        } else {
+            self.clitic_beyond_ascii
+        };
+        if may_start_clitic {
+            'alternatives: for alternative in &self.clitics {
+                let mut p = pos;
+                for &class in alternative {
+                    match next_char(text, p) {
+                        Some((d, n)) if classes[class].contains(d) => p += n,
+                        _ => continue 'alternatives,
+                    }
+                }
+                return Some(p);
+            }
+        }
+        // 2. A letter run, with the lead-in when a letter follows it.
+        if self.has(classes, Role::WordPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Word, d) {
+                    return Some(self.run_end(classes, text, after + n, Role::Word));
+                }
+            }
+        }
+        if self.has(classes, Role::Word, c) {
+            return Some(self.run_end(classes, text, after, Role::Word));
+        }
+        // 3. Up to the bound of digits.
+        if self.has(classes, Role::Digit, c) {
+            let mut end = after;
+            let mut count = 1;
+            while count < self.digit_cap {
+                match next_char(text, end) {
+                    Some((d, n)) if self.has(classes, Role::Digit, d) => {
+                        end += n;
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            return Some(end);
+        }
+        // 4. A punctuation run, with the space when punctuation follows it,
+        //    and the line breaks after the run.
+        if self.has(classes, Role::PunctPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Punct, d) {
+                    let end = self.run_end(classes, text, after + n, Role::Punct);
+                    return Some(self.run_end(classes, text, end, Role::PunctBreak));
+                }
+            }
+        }
+        if self.has(classes, Role::Punct, c) {
+            let end = self.run_end(classes, text, after, Role::Punct);
+            return Some(self.run_end(classes, text, end, Role::PunctBreak));
+        }
+        // 5. Whitespace ending in line breaks: the greedy whitespace run
+        //    gives back characters until a line break follows it.
+        let mut end = self.run_end(classes, text, pos, Role::BreakSpace);
+        loop {
+            if let Some((d, n)) = next_char(text, end) {
+                if self.has(classes, Role::Break, d) {
+                    return Some(self.run_end(classes, text, end + n, Role::Break));
+                }
+            }
+            if end == pos {
+                break;
+            }
+            end = previous_boundary(text, end);
+        }
+        // 6. Whitespace before a non-space: the greedy run gives back its last
+        //    character while a non-space follows it, down to one.
+        if self.has(classes, Role::TrailSpace, c) {
+            let mut end = self.run_end(classes, text, after, Role::TrailSpace);
+            loop {
+                match next_char(text, end) {
+                    Some((d, _)) if self.has(classes, Role::NotTrail, d) => {}
+                    _ => return Some(end),
+                }
+                let shorter = previous_boundary(text, end);
+                if shorter == pos {
+                    break;
+                }
+                end = shorter;
+            }
+        }
+        // 7. The whitespace run.
+        if self.has(classes, Role::Space, c) {
+            return Some(self.run_end(classes, text, after, Role::Space));
+        }
+        None
+    }
+}
+
+/// The class of a node that is one character of a class.
+pub(super) fn plain_class(node: &Node) -> Option<usize> {
+    match node {
+        Node::Class(class) => Some(*class),
+        _ => None,
+    }
+}
+
+/// The class of a node that is a run of `min..=max` characters of one class.
+pub(super) fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
+    match node {
+        Node::ClassRepeat {
+            class,
+            min: node_min,
+            max: node_max,
+        } if *node_min == min && *node_max == max => Some(*class),
+        _ => None,
+    }
+}
+
+/// The nodes of a concatenation.
+pub(super) fn concat(node: &Node) -> Option<&[Node]> {
+    match node {
+        Node::Concat(nodes) => Some(nodes),
+        _ => None,
+    }
+}
+
+/// The start of the character before `pos`, a character boundary past 0.
+#[inline]
+pub(super) fn previous_boundary(text: &str, pos: usize) -> usize {
+    let mut p = pos - 1;
+    while !text.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
 /// Appends the ops of `node` to `program`; the first-character sets the
 /// splits index go to `firsts`. Alternatives are laid out in order, each
 /// ending in a jump past the alternation, so that the program tries them the
@@ -565,7 +1056,11 @@ impl Iterator for Matches<'_, '_> {
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
             let start = self.pos;
-            match self.pattern.match_at(self.text, start, &mut self.choices) {
+            let end = match &self.pattern.scanner {
+                Some(scanner) => scanner.match_at(&self.pattern.classes, self.text, start),
+                None => self.pattern.match_at(self.text, start, &mut self.choices),
+            };
+            match end {
                 Some(end) if end > start => {
                     self.pos = end;
                     return Some((start, end));
@@ -652,7 +1147,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
 }
 
 #[inline]
-fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
+pub(super) fn next_char(text: &str, pos: usize) -> Option<(char, usize)> {
     let byte = *text.as_bytes().get(pos)?;
     if byte < 0x80 {
         return Some((byte as char, 1));
@@ -915,8 +1410,25 @@ impl Parser<'_> {
             "Lt" => CAT_TITLECASE,
             "Lm" => CAT_MODIFIER_LETTER,
             "Lo" => CAT_OTHER_LETTER,
+            "Han" => CAT_HAN,
             _ => return None,
         })
+    }
+
+    /// `[^\p{X}...]` after `&&` inside a class: the properties it takes out
+    /// of the class. Nothing else may stand on either side of the `&&`.
+    fn parse_subtracted_properties(&mut self) -> Option<u16> {
+        if self.chars.next()? != '[' || self.chars.next()? != '^' {
+            return None;
+        }
+        let mut categories = 0;
+        loop {
+            match self.chars.next()? {
+                ']' if categories != 0 => return Some(categories),
+                '\\' if self.chars.next()? == 'p' => categories |= self.parse_property()?,
+                _ => return None,
+            }
+        }
     }
 
     /// The body of `[...]`, after the opening bracket.
@@ -945,9 +1457,23 @@ impl Parser<'_> {
                     'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
                     other => escaped_literal(other)?,
                 },
-                // Nested classes, intersections and POSIX brackets are not supported.
+                // An intersection with a negated property class closes the
+                // class: `[...&&[^\p{Han}]]`. Nested classes, other
+                // intersections and POSIX brackets are not supported.
+                '&' if self.chars.peek() == Some(&'&') => {
+                    // Nothing before the intersection would be the empty
+                    // set: declined, as every other shape of it is.
+                    if first {
+                        return None;
+                    }
+                    self.chars.next();
+                    class.without = self.parse_subtracted_properties()?;
+                    if self.chars.next()? != ']' {
+                        return None;
+                    }
+                    break;
+                }
                 '[' => return None,
-                '&' if self.chars.peek() == Some(&'&') => return None,
                 literal => literal,
             };
             first = false;
@@ -1007,6 +1533,8 @@ fn escaped_literal(c: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashMap;
+    use tiktoken_rs::CoreBPE;
     use tokenizers::utils::SysRegex;
 
     use super::*;
@@ -1016,12 +1544,22 @@ mod tests {
     const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    /// The template with a digit rule of up to two digits, and with an
+    /// unbounded one: the other two bounds the scanner takes.
+    const TWO_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const ANY_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const DIGITS: &str = r"\p{N}{1,3}";
     const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 8] = [GPT2, QWEN2, QWEN35, CL100K, DIGITS, CJK, DEEPSEEK, CASED];
+    /// The Kimi template: ideograph runs first, the cased letter runs
+    /// without the ideographs, the rest as cl100k's.
+    const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 11] = [
+        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED, KIMI,
+    ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -1122,6 +1660,12 @@ mod tests {
         '中',
         '文',
         '龥',
+        '々',
+        '〇',
+        '〡',
+        '⺀',
+        '𠀀',
+        '𮯰',
         'あ',
         'ん',
         'ア',
@@ -1231,9 +1775,16 @@ mod tests {
             r"a++",
             r"[[:alpha:]]",
             r"[a&&b]",
+            r"[\p{L}&&\p{Han}]",
+            r"[\p{L}&&[^a]]",
+            r"[\p{L}&&[^\p{Han}]a]",
+            r"[&&[^\p{Han}]]",
+            r"[&&a]",
+            r"[^&&a]",
+            r"[\p{L}&&[^]]",
             r"\d+",
             r"(?=a)",
-            r"\p{Han}",
+            r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
             r"(?:ab)+",
@@ -1259,6 +1810,87 @@ mod tests {
         }
     }
 
+    /// The code points the two cross-engine sweeps below check: every one of
+    /// the four planes that hold assigned scripts (0 to 3) and plane 14's
+    /// first block (tags and variation selectors), then a stride over the
+    /// unassigned and private planes. A script a Unicode version adds,
+    /// however small, lies inside the part swept whole.
+    fn code_points_swept() -> impl Iterator<Item = u32> + Clone {
+        (0u32..0x4_0000)
+            .chain(0xE_0000..0xE_1000)
+            .chain((0x4_0000..=0x10_FFFF).step_by(97))
+    }
+
+    /// The `Han` property and a class with it taken out agree with the
+    /// engine character by character over [`code_points_swept`], for the
+    /// property alone, negated, taken out of the Kimi template's two letter
+    /// classes, and taken out under an outer negation.
+    #[test]
+    fn han_and_the_classes_it_is_taken_out_of_agree_with_the_engine() {
+        let patterns = [
+            r"\p{Han}",
+            r"[^\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\p{L}\p{N}&&[^\p{Han}]]",
+            r"[a-z\p{M}&&[^\p{Han}\p{Lo}]]",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for pattern in patterns {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = engine.find_iter(&buf).next() == Some((0, buf.len()));
+                assert_eq!(ours, theirs, "{pattern} at U+{code:04X}");
+            }
+        }
+    }
+
+    /// The classes of the tiktoken templates the direct path reads, checked
+    /// over [`code_points_swept`] against the file's own encoder (a `CoreBPE`
+    /// whose pattern is the class alone encodes a code point it matches and
+    /// drops one it does not): the two engines' Unicode tables agree today,
+    /// and a version apart between them, a new script included, would show
+    /// here.
+    #[test]
+    fn the_tiktoken_template_classes_agree_with_the_files_own_encoder() {
+        let ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+        let classes = [
+            r"[\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\r\n\p{L}\p{N}]",
+            r"\p{L}",
+            r"\p{N}",
+            r"[^\s\p{L}\p{N}]",
+            r"\s",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for class in classes {
+            let parsed = Pattern::parse(class).expect("parses");
+            let own = CoreBPE::new(ranks.clone(), FxHashMap::default(), class)
+                .expect("the file's own encoder compiles the class");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = !own.encode_ordinary(&buf).is_empty();
+                assert_eq!(ours, theirs, "{class} at U+{code:04X}");
+            }
+        }
+    }
+
     #[test]
     fn matches_agree_with_the_engine_on_random_text() {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -1271,6 +1903,88 @@ mod tests {
                     ours,
                     oracle_matches(pattern, &text),
                     "pattern {pattern:?} text {text:?}"
+                );
+                if parsed.scanner.is_some() {
+                    let program: Vec<(usize, usize)> =
+                        parsed.program_only().find_iter(&text).collect();
+                    assert_eq!(ours, program, "pattern {pattern:?} text {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_gpt4_family_template_takes_the_scanner_and_no_other_shape_does() {
+        for (pattern, digit_cap) in [
+            (QWEN2, 1),
+            (QWEN35, 1),
+            (CL100K, 3),
+            (TWO_DIGITS, 2),
+            (ANY_DIGITS, u32::MAX),
+        ] {
+            let scanner = Pattern::parse(pattern)
+                .expect("parses")
+                .scanner
+                .expect("the template takes the scanner");
+            assert_eq!(scanner.digit_cap, digit_cap, "{pattern}");
+            assert_eq!(scanner.clitics.len(), 7, "{pattern}");
+            assert!(!scanner.clitic_beyond_ascii, "{pattern}");
+        }
+        // The last two alternatives the other way round, a digit rule of two
+        // or more, a lead-in run: the same classes in another shape.
+        const SWAPPED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+|\s+(?!\S)";
+        const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        for pattern in [
+            GPT2,
+            DIGITS,
+            CJK,
+            DEEPSEEK,
+            CASED,
+            SWAPPED,
+            TWO_OR_MORE,
+            LEAD_IN_RUN,
+        ] {
+            assert!(
+                Pattern::parse(pattern).expect("parses").scanner.is_none(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_agrees_with_the_program_and_the_engine_on_shaped_text() {
+        // Text shaped like JSON, code and prose: runs of spaces and line
+        // breaks before letters, digits, quotes and brackets, where the
+        // whitespace alternatives give characters back, clitics in every
+        // case, lead-ins of every kind, and the characters beyond ASCII
+        // that the classes hold or exclude.
+        const PARTS: &[&str] = &[
+            " ", "  ", "   ", "\n", "\n\n", "\r\n", "\t", "\u{A0}", "\u{2028}", "\u{3000}", "\"",
+            "'", "'s", "'S", "'ll", "'LL", "'ve", "'re", "'d", "'m", "'t", "'x", "'ſ", ":", ",",
+            ".", "{", "}", "[", "]", "(", ")", "-", "_", "a", "Word", "ſ", "é", "ß", "1", "22",
+            "333", "4444", "٣", "²", "中", "ก", "\u{301}", "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
+            "x",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for pattern in [QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(parsed.scanner.is_some(), "{pattern}");
+            let program = parsed.program_only();
+            for round in 0..2000 {
+                let text: String = (0..1 + round % 40)
+                    .map(|_| PARTS[(pseudo_random(&mut state) % PARTS.len() as u64) as usize])
+                    .collect();
+                let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                assert_eq!(
+                    ours,
+                    program.find_iter(&text).collect::<Vec<_>>(),
+                    "the program; pattern {pattern:?} text {text:?}"
+                );
+                assert_eq!(
+                    ours,
+                    oracle_matches(pattern, &text),
+                    "the engine; pattern {pattern:?} text {text:?}"
                 );
             }
         }
@@ -1510,5 +2224,69 @@ mod tests {
         worker
             .join()
             .expect("the matcher must not overflow a small stack");
+    }
+
+    /// The plane bitmap of a class answers as its range and category tables
+    /// do: every category table over the whole plane, a negated class with
+    /// ranges and categories over the whole plane, and every class of every
+    /// pattern over a stride of the plane, the pool and the planes above.
+    #[test]
+    fn the_plane_bitmap_agrees_with_the_tables() {
+        let plane = || (0u32..0x1_0000).filter_map(char::from_u32);
+        for &(bit, table) in &CATEGORY_TABLES {
+            let class = Class {
+                categories: bit,
+                ..Class::default()
+            }
+            .finish();
+            for c in plane() {
+                let code = u32::from(c);
+                assert_eq!(
+                    class.contains(c),
+                    in_ranges(table, code),
+                    "category {bit:#x} at U+{code:04X}"
+                );
+            }
+        }
+        let negated = Class {
+            negated: true,
+            categories: CAT_LETTER | CAT_MARK,
+            ranges: vec![(0x80, 0x9F), (0x3000, 0x303F), (0x1F600, 0x1F64F)],
+            ..Class::default()
+        }
+        .finish();
+        for c in plane() {
+            let code = u32::from(c);
+            assert_eq!(
+                negated.contains(c),
+                negated.contains_slow(code),
+                "the negated class at U+{code:04X}"
+            );
+        }
+        let beyond = [
+            '\u{1F600}',
+            '\u{1F3FD}',
+            '\u{20000}',
+            '\u{E0001}',
+            '\u{10FFFF}',
+        ];
+        for pattern in PATTERNS {
+            let parsed = Pattern::parse(pattern).expect("the pattern parses");
+            for (i, class) in parsed.classes().iter().enumerate() {
+                let sample = (0u32..0x1_0000)
+                    .step_by(7)
+                    .filter_map(char::from_u32)
+                    .chain(POOL.iter().copied())
+                    .chain(beyond);
+                for c in sample {
+                    let code = u32::from(c);
+                    assert_eq!(
+                        class.contains(c),
+                        class.contains_slow(code),
+                        "{pattern}: class {i} at U+{code:04X}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -21,7 +21,8 @@ Usage:
               only, nothing changed, exit 0 (on main every crate changed since the last
               release reads as unbumped by design; the cut bumps them); VERSION_OVERRIDE
               may be the cut's candidate version here (X.Y.Z-rc.N), what the cut writes
-              to the gateway and its mirrors
+              to the gateway and its mirrors; without it, main's development version
+              names it (1.15.0-dev: the first candidate, 1.15.0-rc.1)
 
 Environment:
     VERSION_OVERRIDE  X.Y.Z: the gateway's new version instead of the detected bump
@@ -129,6 +130,8 @@ class Fatal(Exception):
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 RELEASE_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
 CUT_VERSION = re.compile(r"^\d+\.\d+\.\d+(-rc\.\d+)?$")  # what a cut writes: a final or a candidate
+# what main reads between cuts: the next development version (1.15.0-dev once release/1.14 is cut)
+DEV_VERSION = re.compile(r"^(\d+\.\d+\.\d+)-dev$")
 FINAL_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 TOML_VERSION = re.compile(r'^version\s*=\s*"([^"]*)"', re.M)
 TOML_WORKSPACE_VERSION = re.compile(
@@ -147,6 +150,13 @@ def version_key(version: str) -> tuple[int, int, int, int, int] | None:
         return None
     major, minor, patch, candidate = match.groups()
     return (int(major), int(minor), int(patch), 0 if candidate else 1, int(candidate or 0))
+
+
+def first_candidate(version: str) -> str | None:
+    """The candidate a cut writes from main's development version: ``1.15.0-dev`` -> ``1.15.0-rc.1``;
+    None for any other spelling (a cut names its version then)."""
+    match = DEV_VERSION.match(version)
+    return f"{match.group(1)}-rc.1" if match else None
 
 
 def version_kind(file: str) -> str:
@@ -523,6 +533,8 @@ class Plan:
     cut_version: str | None = (
         None  # a plan only: what the cut writes to the gateway and its mirrors, whatever the verdict
     )
+    # a plan only: the cut version was read from main's development version, not given as VERSION_OVERRIDE
+    cut_version_derived: bool = False
 
     @property
     def gateway_set(self) -> bool:
@@ -709,12 +721,18 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
             + "; the mirrors agree."
         )
         return
-    gateway = (
-        f"the gateway and its mirrors to {plan.cut_version}"
-        if plan.cut_version
-        else "the gateway and its mirrors by the checker's own step (the cut writes the VERSION it is given there:"
-        " pass it as VERSION_OVERRIDE for those lines)"
-    )
+    if plan.cut_version and plan.cut_version_derived:
+        gateway = (
+            f"the gateway and its mirrors to {plan.cut_version} (the first candidate of main's development version"
+            f" {plan.gateway_version}; VERSION_OVERRIDE names another)"
+        )
+    elif plan.cut_version:
+        gateway = f"the gateway and its mirrors to {plan.cut_version}"
+    else:
+        gateway = (
+            "the gateway and its mirrors by the checker's own step (the cut writes the VERSION it is given there:"
+            " pass it as VERSION_OVERRIDE for those lines)"
+        )
     propose(
         plan,
         out,
@@ -814,11 +832,18 @@ def run(
     if mode == "plan":
         # the verdicts are walked in silence: on main before a cut every changed crate reads as unbumped by design
         silent = Out(io.StringIO())
-        show_plan(
-            examine(repo, tag, None, silent, crates, packages, mirrors, cut_version=override),
-            tag,
-            out,
+        gateway = next(c for c in crates if c.name == GATEWAY)
+        derived = None
+        if override is None and (root / gateway.version_file).is_file():
+            # main reads the next development version between cuts: its first candidate is what the cut writes
+            derived = first_candidate(
+                read_version("cargo", repo.read(gateway.version_file), gateway.version_file)
+            )
+        plan = examine(
+            repo, tag, None, silent, crates, packages, mirrors, cut_version=override or derived
         )
+        plan.cut_version_derived = derived is not None
+        show_plan(plan, tag, out)
         return 0
 
     out.line(

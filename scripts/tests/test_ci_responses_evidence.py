@@ -12,6 +12,13 @@ from pathlib import Path
 
 import pytest
 
+# Keep the selected interpreter loadable while preserving the closed fixture env.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
+
 SCRIPTS = Path(__file__).resolve().parents[1]
 VALIDATOR = SCRIPTS / "ci_responses_evidence.py"
 ORIGINAL_PATH = SCRIPTS / "ci_responses_original128.json"
@@ -372,6 +379,7 @@ def test_real_pytest_hooks_generate_verifiable_complete_evidence(evidence, skip_
         ],
         cwd=source,
         env={
+            **INTERPRETER_ENV,
             "PATH": os.defpath,
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "RESPONSES_EVIDENCE_DIR": str(directory),

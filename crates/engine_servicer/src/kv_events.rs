@@ -173,10 +173,13 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
      \"zmq\"}'";
 
-/// The TensorRT-LLM servicer's refusal: its wire relays no KV events yet (the
-/// engine's Python servicer does not implement the RPC either).
+/// The TensorRT-LLM servicer's refusal of a full subscription: the server
+/// relays KV events only when handed a publisher endpoint, and this engine's
+/// launcher hands none (the wire has no publisher yet); the load records
+/// alone (`loads_only`) are served, as on every wire.
 pub(crate) const TRTLLM_DISABLED_MESSAGE: &str = "KV cache events are not relayed for this \
-     engine yet: SubscribeKvEvents is not implemented by its servicer";
+     engine: its launcher hands the servicer no publisher endpoint. The load records are \
+     served to a loads_only subscription";
 
 /// When the relay subscribes to the publisher: at the servicer's start
 /// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
@@ -316,12 +319,17 @@ pub(crate) trait LoadSource: Send + Sync {
 /// differs by wire; [`LoadFromState`] adds the half every wire shares.
 pub(crate) trait RankLoads: Send + Sync {
     /// The record for `dp_rank` (`None`: a publisher that names no rank)
-    /// without the engine link's liveness fields, or `None` while the engine
-    /// has reported nothing.
+    /// without the engine link's liveness fields: a connected rank's last
+    /// figures, zero-filled until its first batch; `None` while the engine
+    /// is not connected or for a rank past the connected ones.
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
 
     /// The engine link whose liveness the record carries.
     fn engine_link(&self) -> &EngineLink;
+
+    /// The data-parallel ranks the servicer serves now (`Shared::rank_count`):
+    /// how many records a records-only stream reports per tick.
+    fn rank_count(&self) -> usize;
 }
 
 /// The relay's load source over a servicer state, held weakly (the relay
@@ -345,9 +353,15 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: any queue, running or window change, KV usage by half a percent,
-/// the rate by 5 % or 50 tokens per second.
-fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.running_requests != current.running_requests
+/// either throughput by 5 % or 50 tokens per second, or measured input
+/// capacity appearing/disappearing.
+pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+    let prefill_changed = match (last.prefill_throughput, current.prefill_throughput) {
+        (Some(last), Some(current)) => throughput_changed(last, current),
+        (None, None) => false,
+        _ => true,
+    };
+    prefill_changed || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
@@ -356,15 +370,18 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             - current.active_token_usage.unwrap_or(current.token_usage))
         .abs()
             > 0.005
-        || {
-            let delta = (last.gen_throughput - current.gen_throughput).abs();
-            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
-        }
+        || throughput_changed(last.gen_throughput, current.gen_throughput)
         // A growing engine silence goes out once a second, so a subscriber's
         // wedge bound is met within a second of the engine crossing it.
         || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
         || last.engine_reports_steps != current.engine_reports_steps
         || last.prefill_pending_tokens != current.prefill_pending_tokens
+}
+
+/// Ignore rate noise while publishing meaningful absolute or relative movement.
+fn throughput_changed(last: f64, current: f64) -> bool {
+    let delta = (last - current).abs();
+    delta > 50.0 || delta > 0.05 * last.max(current)
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
@@ -1102,7 +1119,7 @@ enum SnapshotPhase {
 }
 
 /// Seconds since the Unix epoch, the way the engines stamp their batches.
-fn unix_seconds() -> f64 {
+pub(crate) fn unix_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
@@ -1163,13 +1180,21 @@ impl Subscriber {
         self.last_sequence = Some(batch.sequence_number);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = 0;
-        batch.load = self.record(batch.dp_rank, false);
+        batch.load = self
+            .current(batch.dp_rank)
+            .map(|record| self.record(record, false));
         batch
     }
 
-    /// The next record for `rank` from the source, numbered.
-    fn record(&mut self, rank: Option<i32>, load_only: bool) -> Option<common::EngineLoad> {
-        let mut record = self.source.as_ref()?.load(rank)?;
+    /// The source's record for `rank` as it stands now, unnumbered; `None`
+    /// without a source or while it knows nothing.
+    fn current(&self, rank: Option<i32>) -> Option<common::EngineLoad> {
+        self.source.as_ref()?.load(rank)
+    }
+
+    /// `record`, read by [`current`](Self::current), numbered as the next
+    /// one sent on this stream and kept for the change check.
+    fn record(&mut self, mut record: common::EngineLoad, load_only: bool) -> common::EngineLoad {
         self.sample += 1;
         record.sample = self.sample;
         record.load_only = load_only;
@@ -1179,7 +1204,7 @@ impl Subscriber {
             smg_grpc_client::engine_load::core_only(&mut record);
         }
         self.last_record = Some(record.clone());
-        Some(record)
+        record
     }
 
     /// A `load_only` batch when the record moved since the last one sent,
@@ -1197,7 +1222,7 @@ impl Subscriber {
             None if self.records_before_first_batch => 0,
             None => return None,
         };
-        let current = self.source.as_ref()?.load(self.last_rank)?;
+        let current = self.current(self.last_rank)?;
         let changed = self
             .last_record
             .as_ref()
@@ -1211,7 +1236,9 @@ impl Subscriber {
             return None;
         }
         let rank = self.last_rank;
-        let record = self.record(rank, true)?;
+        // The record read for the change check is the one sent: one build
+        // per tick, whether or not it goes out.
+        let record = self.record(current, true);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = if changed {
             0

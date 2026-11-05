@@ -41,7 +41,7 @@ use super::{
     super::*,
     eof::{
         chat_spec, chat_text, collect_events, complete, complete_with_prompt, dispatch,
-        gated_stream, processor, scripted_stream, CharacterTokenizer,
+        gated_stream, messages_spec, processor, scripted_stream, CharacterTokenizer,
     },
 };
 use crate::routers::{
@@ -214,10 +214,10 @@ async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(chat_text(&events, 0, "content"), "abc");
     assert_eq!(chat_text(&events, 1, "content"), "xyz");
-    let mut finishes = finish_reasons(&events);
-    finishes.sort();
+    // The finish chunks go out in choice order, whatever order the choices
+    // closed in (choice 0 stopped before choice 1 completed here).
     assert_eq!(
-        finishes,
+        finish_reasons(&events),
         [(0, "stop".to_string()), (1, "length".to_string())],
         "{events:?}"
     );
@@ -228,6 +228,43 @@ async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     assert_eq!(usage["completion_tokens"], 10, "{usage}");
 }
 
+/// An engine message for a choice the request did not ask for ends the read
+/// as a decoding failure: the stream keeps one entry per expected choice.
+#[tokio::test]
+async fn a_choice_index_past_the_expected_choices_is_a_decoding_failure() {
+    let (gate_tx, gate) = oneshot::channel::<()>();
+    let (stream, server) = gated_stream(
+        vec![counted_chunk(0, "ab", 7), counted_chunk(1, "xy", 7)],
+        gate,
+        vec![complete_with_prompt(0, "length", 7)],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let result = timeout(
+        Duration::from_secs(5),
+        processor(false).process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            single_choice_spec(),
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the stream ends at the failure");
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    let error = format!("{result:?}");
+    assert!(result.is_err(), "{error}");
+    assert!(error.contains("choice index 1"), "{error}");
+    assert_eq!(chat_text(&events, 0, "content"), "ab", "{events:?}");
+}
+
 #[tokio::test]
 async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({
@@ -235,7 +272,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
         "max_tokens": 4096, "stop": "STOP"
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
@@ -274,22 +311,6 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     assert_eq!(outcome.completion_tokens, 8);
 }
 
-/// A plain Messages spec: text only, no thinking, no tools.
-fn messages_spec() -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: false,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-    }
-}
-
 #[tokio::test]
 async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
@@ -301,7 +322,7 @@ async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             stop_string("STOP"),
-            messages_spec(),
+            messages_spec(false),
             &tx,
             None,
         ),
@@ -681,7 +702,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
         "model": "eof-test", "prompt": "test", "stream": true, "max_tokens": 4096
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (stream, server) = scripted_stream(ended_on_the_stop(9), "0").await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
@@ -731,7 +752,7 @@ async fn a_stop_the_engine_ends_the_message_on_is_read_to_the_engines_end() {
             dispatch(),
             Arc::new(CharacterTokenizer::with_eos(vec![u32::from('$')])),
             no_stops(),
-            messages_spec(),
+            messages_spec(false),
             &tx,
             None,
         ),

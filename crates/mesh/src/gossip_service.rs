@@ -47,8 +47,8 @@ use tracing::instrument;
 
 use super::{
     crdt_kv::CrdtWatermark,
+    dialer::Dialer,
     metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
-    mtls::MTLSManager,
     partition::PartitionDetector,
     service::{
         gossip::{
@@ -56,11 +56,12 @@ use super::{
             gossip_server::{Gossip, GossipServer},
             GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
         },
-        try_ping, ClusterState,
+        ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
+        sync_stream::build_heartbeat,
     },
 };
 
@@ -111,7 +112,9 @@ pub struct GossipService {
     advertise_addr: SocketAddr,
     self_name: String,
     partition_detector: Option<Arc<PartitionDetector>>,
-    mtls_manager: Option<Arc<MTLSManager>>,
+    /// The node's dials: the relayed probes go through it, and the listener's
+    /// TLS configuration comes from the identity it holds.
+    dialer: Arc<Dialer>,
     /// Shared reference to the current stream RoundBatch, drained once
     /// per round by the GossipController. Server-side handlers read
     /// broadcast drain_entries and also emit targeted_entries addressed
@@ -137,7 +140,7 @@ impl GossipService {
             advertise_addr,
             self_name: self_name.to_string(),
             partition_detector: None,
-            mtls_manager: None,
+            dialer: Dialer::new(None),
             current_stream_batch: None,
             mesh_kv: None,
         }
@@ -170,8 +173,10 @@ impl GossipService {
         self
     }
 
-    pub fn with_mtls_manager(mut self, mtls_manager: Arc<MTLSManager>) -> Self {
-        self.mtls_manager = Some(mtls_manager);
+    /// The node's dialer, shared with the gossip controller and the handler:
+    /// with the node's TLS identity, the listener serves TLS.
+    pub(crate) fn with_dialer(mut self, dialer: Arc<Dialer>) -> Self {
+        self.dialer = dialer;
         self
     }
 
@@ -181,7 +186,7 @@ impl GossipService {
     /// not where the server is polled.
     async fn server_builder(&self) -> Result<Server> {
         let mut server = Server::builder();
-        if let Some(mtls_manager) = &self.mtls_manager {
+        if let Some(mtls_manager) = self.dialer.mtls_manager() {
             let tls = mtls_manager
                 .server_tls_config()
                 .await
@@ -286,7 +291,7 @@ impl Gossip for GossipService {
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
                 log::info!("PingReq to node {} addr:{}", node.name, node.address);
-                let res = try_ping(&node, None, self.mtls_manager.clone()).await?;
+                let res = self.dialer.ping(&node, None).await?;
                 Ok(Response::new(res))
             }
             _ => Err(Status::invalid_argument("Invalid message payload")),
@@ -417,13 +422,23 @@ impl Gossip for GossipService {
                 )
                 .await;
                 match frame {
+                    // The dialer names itself with a heartbeat; answering it
+                    // is the acceptor's part, once per heartbeat received.
+                    Frame::Heartbeat => {
+                        if tx
+                            .send(Ok(build_heartbeat(sequence, &self_name)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Frame::Continue | Frame::Ack { success: None, .. } => {}
                     Frame::Ack {
                         success: Some(success),
                         ..
                     } => record_ack(&peer_id, success),
                     Frame::Nack { .. } => record_nack(&peer_id),
-                    Frame::Closed => break,
                 }
             }
 

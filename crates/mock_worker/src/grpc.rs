@@ -7,7 +7,7 @@ use std::{
     future::{pending, Future},
     pin::{pin, Pin},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -34,7 +34,7 @@ use ts::{
 };
 
 use crate::{
-    config::Config,
+    config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
@@ -99,17 +99,37 @@ pub async fn serve_with_listener_until(
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
     script::register(&name);
-    let engine = cfg
-        .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
-    // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
-    let publisher = engine.as_ref().and_then(|engine| {
+    let ranks = Rank::spawn_all(&cfg, &name);
+    // The worker's vLLM-wire KV-event publisher, numbered by its port offset:
+    // its one rank's (the publisher ports are per worker, not per rank, so
+    // `Config::parse` refuses the flag on a worker of several ranks).
+    let publisher = ranks.first().and_then(|rank| {
         let port = addr.map(|a| a.port())?;
         let index = port.checked_sub(cfg.grpc_base_port)?;
-        // A gRPC worker is a single-rank engine: it publishes as rank 0.
         cfg.kv_zmq_for(index, 0)
-            .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
+            .map(|kv| crate::kv_zmq::serve(rank.engine.clone(), kv))
     });
+    // A prefill worker's bootstrap port, numbered by the same offset: bound
+    // before the worker serves, as an engine's bootstrap server is up when
+    // its health answers; a port that cannot be bound stops the worker as its
+    // own port would.
+    let bootstrap_port = addr
+        .map(|a| a.port())
+        .and_then(|port| port.checked_sub(cfg.grpc_base_port))
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match bootstrap_port {
+        Some(port) => match TcpListener::bind((cfg.host.as_str(), port)).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                tracing::error!(
+                    "grpc worker {addr:?} bootstrap port bind {}:{port} failed: {e}",
+                    cfg.host
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
     // (a KV-event subscription) before the server's graceful shutdown
@@ -124,15 +144,17 @@ pub async fn serve_with_listener_until(
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
     };
+    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
-        engine,
+        ranks,
+        scan_start: Arc::new(AtomicUsize::new(0)),
         capture,
         stopped,
-        prefill_pending: Arc::new(AtomicU64::new(0)),
         in_flight: WorkerInFlight::default(),
         overrides,
+        bootstrap_port,
     };
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
@@ -164,19 +186,58 @@ pub async fn serve_with_listener_until(
             tracing::error!("grpc worker {addr:?} stopped: {e}");
         }
     };
-    match publisher {
-        Some(publisher) => {
-            // When the server stops (the shutdown, or an error) the publisher
-            // goes with it; a publisher that stops on its own leaves the
-            // server serving, as before.
-            let mut server = pin!(server);
-            let mut publisher = pin!(publisher);
-            tokio::select! {
-                () = &mut server => {}
-                () = &mut publisher => server.await,
+    // The worker's side tasks run beside the server and go with it when it
+    // stops (the shutdown, or an error): the KV-event publisher, which leaves
+    // the server serving when it stops on its own, as before, and a prefill
+    // worker's bootstrap listener, which ends at the stop. The two are
+    // joined, so one ending early leaves the other polled.
+    let mut server = pin!(server);
+    let sides = async {
+        let publisher = async {
+            match publisher {
+                Some(publisher) => publisher.await,
+                None => pending().await,
             }
+        };
+        let bootstrap = async {
+            match bootstrap {
+                Some(bootstrap) => bootstrap.await,
+                None => pending().await,
+            }
+        };
+        tokio::join!(publisher, bootstrap);
+    };
+    tokio::select! {
+        () = &mut server => {}
+        () = sides => server.await,
+    }
+}
+
+/// A prefill worker's bootstrap port: where a decode partner's engine would
+/// rendezvous for the KV handoff, which the mock never performs (the decode
+/// side has the prompt). Each connection is accepted and closed, which is
+/// all the gateway's probe of the port asks, until the worker stops.
+async fn accept_and_close(listener: TcpListener, mut stopped: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((connection, _)) => drop(connection),
+                Err(e) => {
+                    tracing::warn!(
+                        "bootstrap port {:?}: accept failed: {e}",
+                        listener.local_addr().ok()
+                    );
+                    // A listener out of descriptors would fail every accept
+                    // at once; a pause keeps the loop from spinning on it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            // The wait's guard stays inside its own future: a select arm
+            // that yielded it would hold it across the loop's awaits.
+            () = async {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            } => break,
         }
-        None => server.await,
     }
 }
 
@@ -203,22 +264,120 @@ struct MockScheduler {
     /// The worker's name in the process (`grpc:<port>`): what the admin API
     /// and the script store address it by.
     name: String,
-    /// Present iff the worker runs the realistic engine simulator.
-    engine: Option<Engine>,
+    /// The worker's data-parallel ranks, one realistic engine each (empty for
+    /// a canned worker). A pinned request runs on its rank, an unpinned one
+    /// on the rank holding the fewest of this worker's requests.
+    ranks: Vec<Rank>,
+    /// Where the unpinned scan starts, one rank further each time, so
+    /// all-zero ties do not always resolve to rank 0.
+    scan_start: Arc<AtomicUsize>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
     capture: Option<Arc<Capture>>,
     /// Flips when the worker stops: ends the streams that have no end of
     /// their own.
     stopped: watch::Receiver<bool>,
-    /// Prompt tokens of the requests handed to the engine with no token yet:
-    /// the prefill work in hand, as a servicer reports it on its load record.
-    prefill_pending: Arc<AtomicU64>,
     /// The requests this worker is serving: what its load report counts as
-    /// running when no engine simulation runs.
+    /// running on a canned worker, which runs no engine simulation.
     in_flight: WorkerInFlight,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,
+    /// The bootstrap port this worker bound and advertises: a prefill
+    /// worker's, when it was given one.
+    bootstrap_port: Option<u16>,
+}
+
+/// One data-parallel rank of a gRPC worker: its engine, the prefill work in
+/// hand on it (prompt tokens handed to the engine with no token yet, as a
+/// servicer reports them on the rank's load record), and the requests this
+/// worker placed on it whose streams have not ended.
+#[derive(Clone)]
+struct Rank {
+    engine: Engine,
+    prefill_pending: Arc<AtomicU64>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Rank {
+    /// The worker's ranks: `--grpc-dp-size` realistic engines, rank `r` named
+    /// `<worker>:r<r>` in the process fleet (a single rank keeps the worker's
+    /// name) and stamping `r` on its KV-event batches; none for a canned
+    /// worker.
+    fn spawn_all(cfg: &Config, worker: &str) -> Vec<Rank> {
+        if !cfg.realistic {
+            return Vec::new();
+        }
+        let size = usize::from(cfg.grpc_dp_size.max(1));
+        (0..size)
+            .map(|rank| {
+                let mut params = cfg.engine.clone();
+                params.dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
+                let name = if size > 1 {
+                    format!("{worker}:r{rank}")
+                } else {
+                    worker.to_string()
+                };
+                Rank {
+                    engine: Engine::spawn_named(params, name, true),
+                    prefill_pending: Arc::new(AtomicU64::new(0)),
+                    in_flight: Arc::new(AtomicUsize::new(0)),
+                }
+            })
+            .collect()
+    }
+}
+
+/// A request placed on a rank: the rank's count comes down when this is
+/// dropped, with the stream that carries it (however the stream ends).
+struct Placed(Arc<AtomicUsize>);
+
+impl Drop for Placed {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The line a worker of several ranks logs per request: the rank the request
+/// came pinned to (`dp_rank=<n>`, or `dp_rank=None` for an unpinned one) and
+/// the rank it ran on. An engine's servicer logs the pinned rank in this form
+/// and the data-parallel e2e class reads a worker's log for it, so the mock
+/// twin of that class reads the mock as it reads an engine. A worker of one
+/// rank logs nothing: the line is about the placement, not the request.
+fn rank_line(request_id: &str, pin: Option<i32>, rank: usize) -> String {
+    let pin = pin.map_or_else(|| "None".to_string(), |pin| pin.to_string());
+    format!("request {request_id}: dp_rank={pin}, ran on rank {rank}")
+}
+
+impl MockScheduler {
+    /// The rank a request runs on: its `data_parallel_rank` when pinned (a
+    /// rank past the worker's is the caller's error, as the servicers answer
+    /// it), else the rank holding the fewest of this worker's requests, the
+    /// scan starting one rank further each time. The rank's count is taken
+    /// here, under no lock: two unpinned requests placed at once may read the
+    /// same counts, as a servicer's own balancer may.
+    fn place(&self, pin: Option<i32>) -> Result<(usize, Placed), Status> {
+        let count = self.ranks.len();
+        let rank = match pin {
+            Some(rank) => usize::try_from(rank)
+                .ok()
+                .filter(|rank| *rank < count)
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "data_parallel_rank {rank} out of range [0, {count})"
+                    ))
+                })?,
+            None => {
+                let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count.max(1);
+                (0..count)
+                    .map(|offset| (start + offset) % count)
+                    .min_by_key(|&rank| self.ranks[rank].in_flight.load(Ordering::Relaxed))
+                    .unwrap_or(0)
+            }
+        };
+        let in_flight = Arc::clone(&self.ranks[rank].in_flight);
+        in_flight.fetch_add(1, Ordering::Relaxed);
+        Ok((rank, Placed(in_flight)))
+    }
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -249,6 +408,70 @@ impl TokenSpeedScheduler for MockScheduler {
             }
         }
 
+        // A prefill worker's answer: the prompt side's completion alone,
+        // ahead of the script and of either engine mode. The decode side of
+        // the pair has the prompt and generates the output, so nothing is
+        // scripted here and nothing counts as a miss; the canned delay paces
+        // it as it paces a canned answer. The realistic engine's fault and
+        // admission hooks apply as to any request (the stall, a status
+        // before admission, the admission delay and rate), counted as the
+        // regular path counts them: `finish=error` ends the prompt side with
+        // `error` whatever the status and counts as a cut; with no output to
+        // cut after, a status cut fires at once, as a cut; a status before
+        // admission is a failure. The engine never runs the prompt: nothing
+        // is admitted, no record is left.
+        if self.cfg.role == Some(Role::Prefill) {
+            let mut finish_reason = "stop";
+            if !self.ranks.is_empty() {
+                let (rank, _placed) = self.place(req.data_parallel_rank)?;
+                if self.ranks.len() > 1 {
+                    let line = rank_line(&req.request_id, req.data_parallel_rank, rank);
+                    tracing::info!("{line}");
+                }
+                let engine = &self.ranks[rank].engine;
+                if let Some(fault) = engine.inject() {
+                    if !fault.stall.is_zero() {
+                        tokio::time::sleep(fault.stall).await;
+                    }
+                    if fault.finish_error {
+                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                        finish_reason = "error";
+                    } else if fault.status != 0 {
+                        if fault.after_tokens.is_some() {
+                            engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            engine.record_failure();
+                        }
+                        return Err(injected_status(fault.status));
+                    }
+                }
+                engine.admit().await;
+            }
+            if !self.cfg.gen_delay.is_zero() {
+                tokio::time::sleep(self.cfg.gen_delay).await;
+            }
+            let prompt_tokens = req
+                .tokenized
+                .as_ref()
+                .map_or(0, |tokenized| tokenized.input_ids.len());
+            let complete = ts::GenerateResponse {
+                request_id: req.request_id,
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: Vec::new(),
+                    finish_reason: finish_reason.to_string(),
+                    prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+                    completion_tokens: 0,
+                    cached_tokens: 0,
+                    index: 0,
+                    weight_version: self.cfg.weight_version.clone(),
+                    ..Default::default()
+                })),
+            };
+            return Ok(Response::new(Box::pin(
+                in_flight.until_done(stream::iter([Ok(complete)])),
+            )));
+        }
+
         // A scripted answer, ahead of either engine mode: the worker's queue
         // or the prompt's key decides ([`crate::script`]).
         let prompt_ids: &[u32] = req
@@ -256,23 +479,52 @@ impl TokenSpeedScheduler for MockScheduler {
             .as_ref()
             .map(|tokenized| tokenized.input_ids.as_slice())
             .unwrap_or(&[]);
-        let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
-            .map_err(Status::failed_precondition)?;
-        if let Some(answer) = scripted {
-            let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
+        // One scripted answer per choice the request samples (`n`).
+        let choices = req
+            .sampling_params
+            .as_ref()
+            .map_or(1, |params| usize::try_from(params.n).unwrap_or(usize::MAX));
+        // The rendered prompt the gateway sends beside the ids, for the
+        // answers filed under a text (read without a tokenizer).
+        let rendered: &str = req
+            .tokenized
+            .as_ref()
+            .map_or("", |tokenized| tokenized.original_text.as_str());
+        let scripted =
+            script::take_ids_per_choice(&self.cfg, &self.name, prompt_ids, rendered, choices)
+                .map_err(Status::failed_precondition)?;
+        if let Some(answers) = scripted {
+            // The request's limit ends each answer as it would an engine's.
+            let limit = req
+                .sampling_params
+                .as_ref()
+                .and_then(|params| params.max_new_tokens);
+            let answers = answers
+                .into_iter()
+                .map(|answer| answer.cut_to(limit))
+                .collect();
             let stream = scripted_stream(
-                answer,
+                answers,
                 req.request_id.clone(),
-                prompt_tokens,
+                prompt_ids.len(),
                 req.stream,
                 req.return_logprob,
+                usize::try_from(req.top_logprobs_num).unwrap_or(0),
                 self.cfg.weight_version.clone(),
             );
             return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
-        // Realistic mode: submit to the engine simulator and stream its output.
-        if let Some(engine) = &self.engine {
+        // Realistic mode: place the request on a rank, submit it to that
+        // rank's engine simulator and stream its output.
+        if !self.ranks.is_empty() {
+            let (rank, placed) = self.place(req.data_parallel_rank)?;
+            if self.ranks.len() > 1 {
+                let line = rank_line(&req.request_id, req.data_parallel_rank, rank);
+                tracing::info!("{line}");
+            }
+            let rank = &self.ranks[rank];
+            let engine = &rank.engine;
             // The fault hook's answer for this request, when one is armed: a
             // stall, a status before admission, or a cut after some output.
             let injected = engine.inject();
@@ -312,7 +564,7 @@ impl TokenSpeedScheduler for MockScheduler {
             let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
             let pending = (
-                Arc::clone(&self.prefill_pending),
+                Arc::clone(&rank.prefill_pending),
                 prompt_token_ids.len() as u64,
             );
             pending.0.fetch_add(pending.1, Ordering::Relaxed);
@@ -329,7 +581,12 @@ impl TokenSpeedScheduler for MockScheduler {
                 Some(pending),
                 cut,
                 weight_version,
-            );
+            )
+            // The rank's count rides with the stream: down when it is dropped.
+            .map(move |item| {
+                let _placed = &placed;
+                item
+            });
             return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
@@ -401,8 +658,11 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
-        if let Some(engine) = &self.engine {
-            engine.abort(request.into_inner().request_id);
+        // The abort does not name the request's rank: every rank is asked, an
+        // unknown id being harmless.
+        let request_id = request.into_inner().request_id;
+        for rank in &self.ranks {
+            rank.engine.abort(request_id.clone());
         }
         Ok(Response::new(ts::AbortResponse {
             success: true,
@@ -427,7 +687,7 @@ impl TokenSpeedScheduler for MockScheduler {
             pad_token_id: 0,
             bos_token_id: 1,
             weight_version: "mock".to_string(),
-            default_sampling_params_json: String::new(),
+            default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
             supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
         }))
@@ -452,6 +712,48 @@ impl TokenSpeedScheduler for MockScheduler {
                 )
             })
             .collect();
+        // A multi-rank worker advertises its width, as an engine's server args
+        // carry it; the gateway expands it into one worker per rank under
+        // `--dp-aware`. The admin API's info patch may still override it.
+        if self.ranks.len() > 1 {
+            fields.insert(
+                "dp_size".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        self.ranks.len().to_string(),
+                    )),
+                },
+            );
+        }
+        // A disaggregated worker advertises its role and, on the prefill
+        // side, the port its partners rendezvous on, as the engines' server
+        // args carry them; the gateway reads both into the worker's labels.
+        if let Some(role) = self.cfg.role {
+            fields.insert(
+                "disaggregation_mode".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        role.as_str().to_string(),
+                    )),
+                },
+            );
+            if let Some(port) = self.bootstrap_port {
+                fields.insert(
+                    "disaggregation_bootstrap_port".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::NumberValue(f64::from(port))),
+                    },
+                );
+            }
+        }
+        if let Some(protocol) = &self.cfg.pairing_protocol {
+            fields.insert(
+                "pairing_protocol".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(protocol.clone())),
+                },
+            );
+        }
         fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
         let server_args = (!fields.is_empty()).then_some(prost_types::Struct { fields });
         Ok(Response::new(ts::GetServerInfoResponse {
@@ -469,43 +771,56 @@ impl TokenSpeedScheduler for MockScheduler {
 
     async fn get_loads(
         &self,
-        _request: Request<ts::GetLoadsRequest>,
+        request: Request<ts::GetLoadsRequest>,
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
         self.overrides.note_loads_poll();
-        let load = match &self.engine {
-            Some(engine) => {
-                snapshot_to_scheduler_load(&engine.load().as_reported_by(self.cfg.loads_like))
-            }
-            None => {
-                // Without an engine simulation the work in flight is the
-                // canned and scripted answers whose streams are still open on
-                // this worker (not the process's other workers): the running
-                // count a load poll asks about, and nothing waits.
-                let running = i32::try_from(self.in_flight.get()).unwrap_or(i32::MAX);
-                ts::SchedulerLoad {
-                    active_token_usage: None,
-                    dp_rank: 0,
-                    num_running_reqs: running,
-                    num_waiting_reqs: 0,
-                    num_waiting_uncached_tokens: 0,
-                    num_total_reqs: running,
-                    num_used_tokens: 0,
-                    max_total_num_tokens: 1_000_000,
-                    max_running_requests: 0,
-                    token_usage: 0.0,
-                    gen_throughput: 0.0,
-                    cache_hit_rate: 0.0,
-                    utilization: 0.0,
-                    memory: None,
-                    queues: None,
-                }
-            }
+        // One entry per rank, the request's `dp_rank` keeping that rank's
+        // alone, as the servicers answer. A canned worker is one rank whose
+        // running count is the canned and scripted answers with a stream
+        // still open on this worker (not the process's other workers);
+        // nothing waits there.
+        let wanted = request.into_inner().dp_rank;
+        let mut loads: Vec<ts::SchedulerLoad> = if self.ranks.is_empty() {
+            let running = i32::try_from(self.in_flight.get()).unwrap_or(i32::MAX);
+            vec![ts::SchedulerLoad {
+                active_token_usage: None,
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: 0,
+                num_waiting_uncached_tokens: 0,
+                num_total_reqs: running,
+                num_used_tokens: 0,
+                max_total_num_tokens: 1_000_000,
+                max_running_requests: 0,
+                token_usage: 0.0,
+                gen_throughput: 0.0,
+                prefill_throughput: None,
+                cache_hit_rate: 0.0,
+                utilization: 0.0,
+                memory: None,
+                queues: None,
+            }]
+        } else {
+            self.ranks
+                .iter()
+                .enumerate()
+                .map(|(index, rank)| {
+                    let mut load = snapshot_to_scheduler_load(
+                        &rank.engine.load().as_reported_by(self.cfg.loads_like),
+                    );
+                    load.dp_rank = i32::try_from(index).unwrap_or(i32::MAX);
+                    load
+                })
+                .collect()
         };
+        if let Some(wanted) = wanted {
+            loads.retain(|load| load.dp_rank == wanted);
+        }
         Ok(Response::new(ts::GetLoadsResponse {
             timestamp: String::new(),
             version: "mock".to_string(),
-            dp_rank_count: 1,
-            loads: vec![load],
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
             aggregate: None,
         }))
     }
@@ -514,34 +829,75 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        match &self.engine {
-            // Realistic mode with prefix caching: stream the engine's KV events,
-            // each carrying the load record a servicer attaches.
-            Some(engine) if engine.kv_enabled() => {
-                let request = request.into_inner();
-                let events = with_load_records(
-                    engine.clone(),
-                    self.cfg.loads_like,
-                    self.cfg.step_reports,
-                    Arc::clone(&self.prefill_pending),
-                    request.load_records_before_first_batch,
-                    engine.subscribe_kv(request.start_sequence_number),
-                );
-                // A subscription ends with the worker's stop, as a serving
-                // engine's ends with its process; nothing else ends it, and
-                // the server's shutdown waits for it.
-                let mut stopped = self.stopped.clone();
-                let stop = async move {
-                    let _ = stopped.wait_for(|stop| *stop).await;
-                };
-                Ok(Response::new(Box::pin(events.take_until(stop))))
+        // Realistic mode with prefix caching: the ranks' KV events on one
+        // stream, each batch stamped with its rank and carrying the load
+        // record a servicer attaches for that rank; one record state over
+        // the merged stream, as the Rust relay keeps one per subscription
+        // (its heartbeat names the last batch's rank).
+        let request = request.into_inner();
+        if request.loads_only {
+            // The load records alone, every rank's at the record's cadence,
+            // from the ranks' engines whether or not they publish KV events:
+            // a servicer's own figures need no relay.
+            let sources: Vec<RankLoadSource> = self.ranks.iter().map(RankLoadSource::of).collect();
+            if sources.is_empty() {
+                return Err(Status::unimplemented(
+                    "mock-worker (load records require --engine realistic)",
+                ));
             }
-            // Otherwise Unimplemented, on which the gateway's KvEventMonitor gives
-            // up cleanly instead of keeping an idle per-worker task.
-            _ => Err(Status::unimplemented(
-                "mock-worker (KV events require --engine realistic with --prefix-cache true)",
-            )),
+            let records = load_records_only(sources, self.cfg.loads_like, self.cfg.step_reports);
+            let mut stopped = self.stopped.clone();
+            let stop = async move {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            };
+            return Ok(Response::new(Box::pin(records.take_until(stop))));
         }
+        let sources: Vec<RankLoadSource> = self
+            .ranks
+            .iter()
+            .filter(|rank| rank.engine.kv_enabled())
+            .map(|rank| RankLoadSource {
+                engine: rank.engine.clone(),
+                prefill_pending: Arc::clone(&rank.prefill_pending),
+            })
+            .collect();
+        if sources.is_empty() {
+            // Unimplemented, on which the gateway's KvEventMonitor gives up
+            // cleanly instead of keeping an idle per-worker task.
+            return Err(Status::unimplemented(
+                "mock-worker (KV events require --engine realistic with --prefix-cache true)",
+            ));
+        }
+        if sources.len() > 1 && request.start_sequence_number != 0 {
+            // One cursor names one rank's sequence (the gateway resumes with
+            // rank 0's). The relay refuses it over several ranks and the
+            // gateway comes back from zero; resuming every rank at that
+            // cursor would skip the other ranks' batches below it in silence.
+            return Err(Status::out_of_range(format!(
+                "mock-worker: {} ranks and a cursor names one rank's sequence; \
+                 resubscribe from zero",
+                sources.len()
+            )));
+        }
+        let streams: Vec<KvEventStream> = sources
+            .iter()
+            .map(|source| source.engine.subscribe_kv(request.start_sequence_number))
+            .collect();
+        let events = with_load_records(
+            sources,
+            self.cfg.loads_like,
+            self.cfg.step_reports,
+            request.load_records_before_first_batch,
+            Box::pin(stream::select_all(streams)),
+        );
+        // A subscription ends with the worker's stop, as a serving engine's
+        // ends with its process; nothing else ends it, and the server's
+        // shutdown waits for it.
+        let mut stopped = self.stopped.clone();
+        let stop = async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        };
+        Ok(Response::new(Box::pin(events.take_until(stop))))
     }
 
     async fn flush_cache(
@@ -868,53 +1224,71 @@ fn generate_stream(
     }))
 }
 
-/// The generate stream of a scripted answer: a `Chunk` per frame when the
-/// request streams, then the `Complete`, with the answer's pause before every
-/// frame but the first; the logprobs ride along when the request asked for
-/// them. A `Complete` that follows no chunk is what a non-streaming request
-/// reads, as it reads the engine's.
+/// The generate stream of the scripted answers of a request, one per choice
+/// in order: a `Chunk` per frame when the request streams, then the choice's
+/// `Complete` with its index, with the answer's pause before every frame but
+/// the first; the logprobs ride along when the request asked for them, with
+/// the request's `top_logprobs_num` alternatives per token. The `Complete`s
+/// that follow no chunk are what a non-streaming request reads, as it reads
+/// the engine's.
 fn scripted_stream(
-    answer: Answer,
+    answers: Vec<Answer>,
     request_id: String,
-    prompt_tokens: u32,
+    prompt_len: usize,
     stream_chunks: bool,
     return_logprob: bool,
+    top_logprobs: usize,
     weight_version: Option<String>,
 ) -> GenStream {
-    struct Scripted {
+    struct Choice {
+        index: u32,
         answer: Answer,
         frames: std::collections::VecDeque<script::Frame>,
-        request_id: String,
-        prompt_tokens: u32,
-        stream_chunks: bool,
-        return_logprob: bool,
-        weight_version: Option<String>,
         /// Output tokens sent so far (the chunks' running `completion_tokens`).
         sent: u32,
         started: bool,
-        done: bool,
     }
-    let frames = answer.token_frames().into();
+    struct Scripted {
+        choices: std::collections::VecDeque<Choice>,
+        request_id: String,
+        prompt_len: usize,
+        stream_chunks: bool,
+        return_logprob: bool,
+        top_logprobs: usize,
+        weight_version: Option<String>,
+    }
+    let choices = answers
+        .into_iter()
+        .enumerate()
+        .map(|(index, answer)| Choice {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            frames: answer.token_frames().into(),
+            answer,
+            sent: 0,
+            started: false,
+        })
+        .collect();
     let init = Scripted {
-        answer,
-        frames,
+        choices,
         request_id,
-        prompt_tokens,
+        prompt_len,
         stream_chunks,
         return_logprob,
+        top_logprobs,
         weight_version,
-        sent: 0,
-        started: false,
-        done: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
         loop {
-            if st.done {
-                return None;
-            }
-            let Some(frame) = st.frames.pop_front() else {
-                st.done = true;
-                let answer = &st.answer;
+            if st
+                .choices
+                .front()
+                .is_some_and(|choice| choice.frames.is_empty())
+            {
+                // Every frame of the choice went out: its `Complete`, then
+                // the next choice from its first frame.
+                let choice = st.choices.pop_front()?;
+                let answer = &choice.answer;
+                let prompt_tokens = answer.prompt_tokens(st.prompt_len);
                 let output_logprobs = answer
                     .logprobs
                     .as_ref()
@@ -924,7 +1298,11 @@ fn scripted_stream(
                     .map(|logprobs| ts::OutputLogProbs {
                         token_logprobs: logprobs.clone(),
                         token_ids: answer.output_ids.clone(),
-                        top_logprobs: Vec::new(),
+                        top_logprobs: top_logprobs_wire(answer.top_logprobs(
+                            &answer.output_ids,
+                            logprobs,
+                            st.top_logprobs,
+                        )),
                     });
                 let matched_stop = answer.matched_stop.as_ref().map(|stop| match stop {
                     MatchedStop::Token(id) => {
@@ -939,23 +1317,25 @@ fn scripted_stream(
                     response: Some(GenResp::Complete(ts::GenerateComplete {
                         output_ids: answer.output_ids.clone(),
                         finish_reason: answer.finish_reason.clone(),
-                        prompt_tokens: st.prompt_tokens,
+                        prompt_tokens,
                         completion_tokens: answer.completion_tokens(),
                         cached_tokens: answer.cached_tokens,
                         output_logprobs,
                         matched_stop,
-                        index: 0,
+                        index: choice.index,
                         weight_version: st.weight_version.clone(),
                         ..Default::default()
                     })),
                 };
                 return Some((Ok(complete), st));
-            };
-            if st.started && !st.answer.delay.is_zero() {
-                tokio::time::sleep(st.answer.delay).await;
             }
-            st.started = true;
-            st.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
+            let choice = st.choices.front_mut()?;
+            let frame = choice.frames.pop_front()?;
+            if choice.started && !choice.answer.delay.is_zero() {
+                tokio::time::sleep(choice.answer.delay).await;
+            }
+            choice.started = true;
+            choice.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
             if !st.stream_chunks {
                 continue;
             }
@@ -963,23 +1343,37 @@ fn scripted_stream(
                 .then(|| ts::OutputLogProbs {
                     token_logprobs: frame.logprobs.clone(),
                     token_ids: frame.ids.clone(),
-                    top_logprobs: Vec::new(),
+                    top_logprobs: top_logprobs_wire(choice.answer.top_logprobs(
+                        &frame.ids,
+                        &frame.logprobs,
+                        st.top_logprobs,
+                    )),
                 });
             let chunk = ts::GenerateResponse {
                 request_id: st.request_id.clone(),
                 response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
                     token_ids: frame.ids,
-                    prompt_tokens: st.prompt_tokens,
-                    completion_tokens: st.sent,
-                    cached_tokens: st.answer.cached_tokens,
+                    prompt_tokens: choice.answer.prompt_tokens(st.prompt_len),
+                    completion_tokens: choice.sent,
+                    cached_tokens: choice.answer.cached_tokens,
                     output_logprobs,
-                    index: 0,
+                    index: choice.index,
                     weight_version: st.weight_version.clone(),
                 })),
             };
             return Some((Ok(chunk), st));
         }
     }))
+}
+
+/// The answer's top alternatives in the wire's shape, one entry per position.
+fn top_logprobs_wire(top: Vec<script::TopAlternatives>) -> Vec<ts::TopLogProbs> {
+    top.into_iter()
+        .map(|position| ts::TopLogProbs {
+            values: position.values,
+            token_ids: position.ids,
+        })
+        .collect()
 }
 
 /// Map an engine load snapshot to the TokenSpeed `SchedulerLoad` wire type.
@@ -1050,14 +1444,143 @@ const LOAD_TICK: Duration = Duration::from_millis(100);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Where a rank's load record comes from: its engine and the prompt tokens
+/// handed to it with no token yet.
+struct RankLoadSource {
+    engine: engine::Engine,
+    prefill_pending: Arc<AtomicU64>,
+}
+
+impl RankLoadSource {
+    fn of(rank: &Rank) -> Self {
+        Self {
+            engine: rank.engine.clone(),
+            prefill_pending: Arc::clone(&rank.prefill_pending),
+        }
+    }
+
+    /// The rank's current record, numbered `sample`: its engine's load as
+    /// `GetLoads` reports it plus the liveness fields.
+    fn record(&self, like: LoadsLike, step_reports: bool, sample: u64) -> common::EngineLoad {
+        let snapshot = self.engine.load().as_reported_by(like);
+        let mut record = load_record(&snapshot, like, sample);
+        record.engine_silence_ms = silence_ms(&self.engine);
+        record.engine_reports_steps = Some(step_reports);
+        record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
+        record
+    }
+}
+
+/// One rank's clock on a records-only stream: what it last sent and when.
+struct RankClock {
+    last_record: Option<common::EngineLoad>,
+    last_sent_at: Option<Instant>,
+    idle_heartbeats: u32,
+}
+
+/// The records-only stream a `loads_only` subscriber gets, as the Rust
+/// servicer's (`crates/engine_servicer/src/load_stream.rs`): every rank's
+/// record at the first tick, then a rank's when its record moved or its
+/// heartbeat is due, each rank on its own clock; `load_only`, numbered 0,
+/// never an event.
+struct LoadRecordsOnly {
+    ranks: Vec<RankLoadSource>,
+    clocks: Vec<RankClock>,
+    like: LoadsLike,
+    step_reports: bool,
+    pending: std::collections::VecDeque<common::KvEventBatch>,
+    next_tick: Instant,
+    sample: u64,
+}
+
+impl LoadRecordsOnly {
+    fn collect_due(&mut self, now: Instant) {
+        for (index, (source, clock)) in self.ranks.iter().zip(&mut self.clocks).enumerate() {
+            let current = source.record(self.like, self.step_reports, 0);
+            let changed = clock
+                .last_record
+                .as_ref()
+                .is_none_or(|last| load_changed(last, &current));
+            let due_after = if clock.idle_heartbeats >= 2 {
+                HEARTBEAT_BACKOFF
+            } else {
+                HEARTBEAT_INTERVAL
+            };
+            let silent_for = clock
+                .last_sent_at
+                .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+            if !changed && silent_for < due_after {
+                continue;
+            }
+            self.sample += 1;
+            let mut record = current;
+            record.sample = self.sample;
+            record.load_only = true;
+            clock.idle_heartbeats = if changed {
+                0
+            } else {
+                clock.idle_heartbeats.saturating_add(1)
+            };
+            clock.last_sent_at = Some(now);
+            clock.last_record = Some(record.clone());
+            self.pending.push_back(common::KvEventBatch {
+                sequence_number: 0,
+                timestamp: engine::unix_seconds(),
+                events: Vec::new(),
+                dp_rank: Some(i32::try_from(index).unwrap_or(i32::MAX)),
+                snapshot: None,
+                load: Some(record),
+            });
+        }
+    }
+
+    async fn next(&mut self) -> common::KvEventBatch {
+        loop {
+            if let Some(batch) = self.pending.pop_front() {
+                return batch;
+            }
+            tokio::time::sleep_until(self.next_tick.into()).await;
+            let now = Instant::now();
+            self.next_tick = now + LOAD_TICK;
+            self.collect_due(now);
+        }
+    }
+}
+
+fn load_records_only(
+    ranks: Vec<RankLoadSource>,
+    like: LoadsLike,
+    step_reports: bool,
+) -> KvEventStream {
+    let records = LoadRecordsOnly {
+        clocks: ranks
+            .iter()
+            .map(|_| RankClock {
+                last_record: None,
+                last_sent_at: None,
+                idle_heartbeats: 0,
+            })
+            .collect(),
+        ranks,
+        like,
+        step_reports,
+        pending: std::collections::VecDeque::new(),
+        next_tick: Instant::now(),
+        sample: 0,
+    };
+    Box::pin(stream::unfold(records, |mut records| async move {
+        let batch = records.next().await;
+        Some((Ok(batch), records))
+    }))
+}
+
 struct LoadRecords {
     stream: KvEventStream,
-    engine: engine::Engine,
+    /// The ranks' sources, by rank; a batch's record is its rank's.
+    ranks: Vec<RankLoadSource>,
     like: LoadsLike,
     /// What the record says of the wire (`--step-reports`).
     step_reports: bool,
-    /// The worker's prompt tokens handed to the engine with no token yet.
-    prefill_pending: Arc<AtomicU64>,
     /// The subscriber takes `load_only` batches before the stream's first
     /// batch, numbered 0 (`SubscribeKvEventsRequest.
     /// load_records_before_first_batch`); unset, it waits for that batch.
@@ -1082,13 +1605,23 @@ enum Waited {
 }
 
 impl LoadRecords {
-    fn record(&mut self, load_only: bool) -> common::EngineLoad {
+    /// The source of `rank`'s record: rank 0's for a batch that names none
+    /// or one past the ranks.
+    fn source(&self, rank: Option<i32>) -> &RankLoadSource {
+        rank.and_then(|rank| usize::try_from(rank).ok())
+            .and_then(|rank| self.ranks.get(rank))
+            .unwrap_or(&self.ranks[0])
+    }
+
+    /// The current record of `rank`, numbered `sample`.
+    fn current(&self, rank: Option<i32>, sample: u64) -> common::EngineLoad {
+        self.source(rank)
+            .record(self.like, self.step_reports, sample)
+    }
+
+    fn record(&mut self, rank: Option<i32>, load_only: bool) -> common::EngineLoad {
         self.sample += 1;
-        let snapshot = self.engine.load().as_reported_by(self.like);
-        let mut record = load_record(&snapshot, self.like, self.sample);
-        record.engine_silence_ms = silence_ms(&self.engine);
-        record.engine_reports_steps = Some(self.step_reports);
-        record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
+        let mut record = self.current(rank, self.sample);
         record.load_only = load_only;
         // As the Rust relay: telemetry on heartbeats and the first record.
         if !load_only && self.sample > 1 {
@@ -1111,10 +1644,8 @@ impl LoadRecords {
             None if self.records_before_first_batch => 0,
             None => return None,
         };
-        let mut current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
-        current.engine_silence_ms = silence_ms(&self.engine);
-        current.engine_reports_steps = Some(self.step_reports);
-        current.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
+        // The heartbeat is the last batch's rank's, as the relay's.
+        let current = self.current(self.last_rank, 0);
         let changed = self
             .last_record
             .as_ref()
@@ -1127,7 +1658,7 @@ impl LoadRecords {
         if !changed && self.last_sent_at.elapsed() < due_after {
             return None;
         }
-        let record = self.record(true);
+        let record = self.record(self.last_rank, true);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = if changed {
             0
@@ -1145,25 +1676,28 @@ impl LoadRecords {
     }
 }
 
-/// `stream` with the engine's load record on every batch and `load_only`
-/// batches while the engine is quiet, as the Rust servicer's relay sends
-/// them (`crates/engine_servicer/src/kv_events.rs`): from the subscription
-/// on for a subscriber that takes records before the first batch
-/// (`records_before_first_batch`), from the stream's first batch otherwise.
+/// `stream` (the ranks' batches, each stamped with its rank) with the
+/// rank's load record on every batch and `load_only` batches while the
+/// stream is quiet, as the Rust servicer's relay sends them
+/// (`crates/engine_servicer/src/kv_events.rs`): one record state per
+/// subscription, the heartbeat naming the last batch's rank (so a quiet
+/// rank's records stop while another rank is active, as on the servicer);
+/// from the subscription on for a subscriber that takes records before the
+/// first batch (`records_before_first_batch`, rank 0's record then), from
+/// the stream's first batch otherwise.
 fn with_load_records(
-    engine: engine::Engine,
+    ranks: Vec<RankLoadSource>,
     like: LoadsLike,
     step_reports: bool,
-    prefill_pending: Arc<AtomicU64>,
     records_before_first_batch: bool,
     stream: KvEventStream,
 ) -> KvEventStream {
+    assert!(!ranks.is_empty(), "a load record needs a rank's source");
     let records = LoadRecords {
         stream,
-        engine,
+        ranks,
         like,
         step_reports,
-        prefill_pending,
         records_before_first_batch,
         last_seq: None,
         last_rank: Some(0),
@@ -1186,7 +1720,7 @@ fn with_load_records(
                     records.last_rank = batch.dp_rank;
                     records.last_sent_at = Instant::now();
                     records.idle_heartbeats = 0;
-                    batch.load = Some(records.record(false));
+                    batch.load = Some(records.record(batch.dp_rank, false));
                     return Some((Ok(batch), records));
                 }
                 Waited::Tick => {
@@ -1212,6 +1746,7 @@ fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
         max_running_requests: s.max_running_requests,
         token_usage: s.token_usage,
         gen_throughput: s.gen_throughput,
+        prefill_throughput: None,
         cache_hit_rate: s.cache_hit_rate,
         utilization: s.token_usage,
         memory: None,
@@ -1418,6 +1953,330 @@ mod tests {
         }
     }
 
+    /// A realistic scheduler of `ranks` ranks, as `serve_with_listener_until`
+    /// builds one, with no listener behind it; the stop sender keeps the
+    /// worker running.
+    fn scheduler_with_ranks(ranks: u16, port: u16) -> (MockScheduler, watch::Sender<bool>) {
+        let cfg = Arc::new(Config {
+            realistic: true,
+            grpc_dp_size: ranks,
+            engine: engine::EngineParams {
+                timing: engine::TimingModel::linear(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let name = format!("grpc:{port}");
+        let (stop, stopped) = watch::channel(false);
+        let service = MockScheduler {
+            ranks: Rank::spawn_all(&cfg, &name),
+            scan_start: Arc::new(AtomicUsize::new(0)),
+            capture: None,
+            stopped,
+            in_flight: WorkerInFlight::default(),
+            overrides: crate::overrides::for_port(port),
+            bootstrap_port: None,
+            name,
+            cfg,
+        };
+        (service, stop)
+    }
+
+    fn generate_request(id: &str, pin: Option<i32>, max_new: u32) -> ts::GenerateRequest {
+        ts::GenerateRequest {
+            request_id: id.to_string(),
+            tokenized: Some(ts::TokenizedInput {
+                input_ids: vec![11, 12, 13, 14],
+                ..Default::default()
+            }),
+            sampling_params: Some(ts::SamplingParams {
+                max_new_tokens: Some(max_new),
+                ..Default::default()
+            }),
+            stream: true,
+            data_parallel_rank: pin,
+            ..Default::default()
+        }
+    }
+
+    /// The engine the request was admitted on, from the process records.
+    fn admitted_on(request_id: &str) -> String {
+        engine::records_since(0, usize::MAX)
+            .into_iter()
+            .find(|record| record.request_id == request_id)
+            .unwrap_or_else(|| panic!("{request_id} was admitted"))
+            .worker
+    }
+
+    /// A pinned request runs on its rank's engine; a pin past the worker's
+    /// ranks is the caller's error, as the servicers answer it.
+    #[tokio::test]
+    async fn a_pinned_request_runs_on_its_rank() {
+        let (service, _stop) = scheduler_with_ranks(4, 65_101);
+        let mut stream = service
+            .generate(Request::new(generate_request("dp-pin-2", Some(2), 2)))
+            .await
+            .expect("accepted")
+            .into_inner();
+        while stream.next().await.is_some() {}
+        assert_eq!(admitted_on("dp-pin-2"), "grpc:65101:r2");
+        let refused = match service
+            .generate(Request::new(generate_request("dp-pin-4", Some(4), 2)))
+            .await
+        {
+            Err(status) => status,
+            Ok(_) => panic!("a pin past the ranks was accepted"),
+        };
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(
+            refused.message().contains("out of range [0, 4)"),
+            "{refused}"
+        );
+    }
+
+    /// Unpinned requests go to the rank holding the fewest of the worker's
+    /// requests, the scan start rotating, so three in a row on an idle worker
+    /// cover its three ranks; the counts come down when the streams end.
+    #[tokio::test]
+    async fn an_unpinned_request_goes_to_the_rank_with_the_fewest_requests() {
+        let (service, _stop) = scheduler_with_ranks(3, 65_102);
+        let mut streams = Vec::new();
+        for id in ["dp-free-a", "dp-free-b", "dp-free-c"] {
+            streams.push(
+                service
+                    .generate(Request::new(generate_request(id, None, 2)))
+                    .await
+                    .expect("accepted")
+                    .into_inner(),
+            );
+        }
+        let counts: Vec<usize> = service
+            .ranks
+            .iter()
+            .map(|rank| rank.in_flight.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(counts, vec![1, 1, 1]);
+        for stream in &mut streams {
+            while stream.next().await.is_some() {}
+        }
+        let mut placed: Vec<String> = ["dp-free-a", "dp-free-b", "dp-free-c"]
+            .iter()
+            .map(|id| admitted_on(id))
+            .collect();
+        placed.sort();
+        assert_eq!(
+            placed,
+            vec!["grpc:65102:r0", "grpc:65102:r1", "grpc:65102:r2"]
+        );
+        drop(streams);
+        let counts: Vec<usize> = service
+            .ranks
+            .iter()
+            .map(|rank| rank.in_flight.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(counts, vec![0, 0, 0]);
+    }
+
+    /// `GetLoads` lists one entry per rank, the request's `dp_rank` keeping
+    /// one; `GetServerInfo` advertises the width.
+    #[tokio::test]
+    async fn loads_and_server_info_report_the_ranks() {
+        let (service, _stop) = scheduler_with_ranks(4, 65_103);
+        let loads = service
+            .get_loads(Request::new(ts::GetLoadsRequest::default()))
+            .await
+            .expect("loads")
+            .into_inner();
+        assert_eq!(loads.dp_rank_count, 4);
+        let ranks: Vec<i32> = loads.loads.iter().map(|load| load.dp_rank).collect();
+        assert_eq!(ranks, vec![0, 1, 2, 3]);
+        let one = service
+            .get_loads(Request::new(ts::GetLoadsRequest {
+                dp_rank: Some(3),
+                include: Vec::new(),
+            }))
+            .await
+            .expect("loads")
+            .into_inner();
+        assert_eq!(
+            (one.dp_rank_count, one.loads.len(), one.loads[0].dp_rank),
+            (1, 1, 3)
+        );
+        let info = service
+            .get_server_info(Request::new(ts::GetServerInfoRequest::default()))
+            .await
+            .expect("info")
+            .into_inner();
+        let width = info
+            .server_args
+            .expect("server args")
+            .fields
+            .remove("dp_size")
+            .expect("dp_size");
+        assert_eq!(
+            width.kind,
+            Some(prost_types::value::Kind::StringValue("4".to_string()))
+        );
+    }
+
+    /// A `loads_only` subscription carries every rank's record and never an
+    /// event: one batch per rank at once, then the rank whose record moved.
+    #[tokio::test]
+    async fn a_loads_only_subscription_streams_each_ranks_record_and_no_events() {
+        let (service, _stop) = scheduler_with_ranks(3, 65_105);
+        let mut records = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                loads_only: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        let mut ranks = Vec::new();
+        for _ in 0..3 {
+            let batch = tokio::time::timeout(Duration::from_secs(2), records.next())
+                .await
+                .expect("a record at the first tick")
+                .expect("an item")
+                .expect("a batch");
+            assert!(batch.load.as_ref().is_some_and(|load| load.load_only));
+            assert!(batch.events.is_empty());
+            assert_eq!(batch.sequence_number, 0);
+            ranks.push(batch.dp_rank.expect("a rank"));
+        }
+        ranks.sort_unstable();
+        assert_eq!(ranks, vec![0, 1, 2]);
+
+        // A request on rank 1 fills blocks the engine would publish as
+        // events: this stream carries rank 1's moved record and no event.
+        let mut request = generate_request("dp-loads-1", Some(1), 4);
+        request.tokenized = Some(ts::TokenizedInput {
+            input_ids: (100..180).collect(),
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        while stream.next().await.is_some() {}
+        // Whatever comes next (rank 1's moved record, or the heartbeats) is
+        // a record without events; rank 1's arrives within its heartbeat.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let batch = tokio::time::timeout_at(deadline, records.next())
+                .await
+                .expect("rank 1's record in time")
+                .expect("an item")
+                .expect("a batch");
+            assert!(batch.events.is_empty(), "{batch:?}");
+            assert!(batch.load.as_ref().is_some_and(|load| load.load_only));
+            if batch.dp_rank == Some(1) {
+                break;
+            }
+        }
+    }
+
+    /// One subscription carries every rank's stream with one record state,
+    /// as the relay's: the first record (before any batch) is rank 0's, a
+    /// batch carries its own rank's record, and the heartbeat that follows
+    /// names the last batch's rank.
+    #[tokio::test]
+    async fn one_subscription_carries_every_ranks_batches_with_their_ranks_records() {
+        let (service, _stop) = scheduler_with_ranks(3, 65_104);
+        let mut events = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: true,
+                loads_only: false,
+            }))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("a record before the first batch")
+            .expect("an item")
+            .expect("a batch");
+        assert!(first.load.as_ref().is_some_and(|load| load.load_only));
+        assert_eq!((first.sequence_number, first.dp_rank), (0, Some(0)));
+
+        // A request on rank 2 long enough to fill blocks (the engine
+        // publishes a batch per completed block): its batches name rank 2
+        // and carry a record.
+        let mut request = generate_request("dp-sub-2", Some(2), 4);
+        request.tokenized = Some(ts::TokenizedInput {
+            input_ids: (100..180).collect(),
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        while stream.next().await.is_some() {}
+        let batch = loop {
+            let batch = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("rank 2's batch in time")
+                .expect("an item")
+                .expect("a batch");
+            if !batch.events.is_empty() {
+                break batch;
+            }
+        };
+        assert_eq!(batch.dp_rank, Some(2));
+        assert!(batch.load.as_ref().is_some_and(|load| !load.load_only));
+        let beat = loop {
+            let batch = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("a heartbeat in time")
+                .expect("an item")
+                .expect("a batch");
+            if batch.events.is_empty() {
+                break batch;
+            }
+        };
+        assert_eq!(
+            beat.dp_rank,
+            Some(2),
+            "the heartbeat names the last batch's rank"
+        );
+    }
+
+    /// As the relays: a resume cursor names one rank's sequence, so a
+    /// worker of several ranks refuses it (`OutOfRange`, on which the
+    /// gateway resubscribes from zero) instead of resuming every rank at
+    /// it and skipping the other ranks' earlier batches; a one-rank worker
+    /// resumes at the cursor as before.
+    #[tokio::test]
+    async fn a_resume_cursor_over_several_ranks_is_out_of_range() {
+        let (ranks, _stop) = scheduler_with_ranks(2, 65_106);
+        let subscribed = ranks
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                start_sequence_number: 5,
+                ..Default::default()
+            }))
+            .await;
+        let status = match subscribed {
+            Err(status) => status,
+            Ok(_) => panic!("a cursor over two ranks is refused"),
+        };
+        assert_eq!(status.code(), Code::OutOfRange);
+        assert!(status.message().contains("resubscribe from zero"));
+
+        let (one, _stop) = scheduler_with_ranks(1, 65_107);
+        assert!(
+            one.subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                start_sequence_number: 5,
+                ..Default::default()
+            }))
+            .await
+            .is_ok(),
+            "one rank resumes at its cursor"
+        );
+    }
+
     /// As the Rust relay: a subscriber that asks for records before the
     /// stream's first batch gets a `load_only` one numbered 0 within a tick;
     /// one that does not waits for the first batch, whose sequence the
@@ -1427,10 +2286,12 @@ mod tests {
         let engine = Engine::spawn(engine::EngineParams::default());
         let records = |asked: bool, kv: KvEventStream| {
             with_load_records(
-                engine.clone(),
+                vec![RankLoadSource {
+                    engine: engine.clone(),
+                    prefill_pending: Arc::new(AtomicU64::new(0)),
+                }],
                 LoadsLike::Mock,
                 false,
-                Arc::new(AtomicU64::new(0)),
                 asked,
                 kv,
             )
@@ -1583,5 +2444,19 @@ mod tests {
         let constraint = injected_status(422);
         assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
         assert!(smg_grpc_client::is_constraint_failure(&constraint));
+    }
+
+    /// The per-request line of a worker of several ranks carries the pin as
+    /// an engine's servicer writes it, and the rank the request ran on.
+    #[test]
+    fn the_rank_line_names_the_pin_and_the_rank() {
+        assert_eq!(
+            rank_line("r-7", Some(1), 1),
+            "request r-7: dp_rank=1, ran on rank 1"
+        );
+        assert_eq!(
+            rank_line("r-8", None, 0),
+            "request r-8: dp_rank=None, ran on rank 0"
+        );
     }
 }

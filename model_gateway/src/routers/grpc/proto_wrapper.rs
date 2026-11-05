@@ -42,6 +42,7 @@ mod multimodal;
 mod request;
 mod shm;
 
+use self::shm::vllm_mm_hash_identity;
 pub use self::{
     embed::{ProtoEmbedComplete, ProtoEmbedRequest},
     logprobs::{ProtoInputLogProbs, ProtoOutputLogProbs, ProtoTopLogProbs},
@@ -57,7 +58,6 @@ pub use self::{
         collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_tokenspeed_shm_with,
     },
 };
-use self::{logprobs::convert_trtllm_output_logprobs, shm::vllm_mm_hash_identity};
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
@@ -66,27 +66,6 @@ pub(crate) use self::{
         vllm_mm_identity,
     },
 };
-
-/// Helper macro to convert output logprobs from proto types to unified type.
-/// Both SGLang and vLLM have identical OutputLogProbs structure.
-/// Note: Cloning is necessary as we convert from borrowed proto types to owned unified types.
-/// OOM risk is mitigated by capping top_logprobs at 20 in sampling params.
-macro_rules! convert_output_logprobs {
-    ($lp:expr) => {
-        ProtoOutputLogProbs {
-            token_logprobs: $lp.token_logprobs.clone(),
-            token_ids: $lp.token_ids.clone(),
-            top_logprobs: $lp
-                .top_logprobs
-                .iter()
-                .map(|t| ProtoTopLogProbs {
-                    values: t.values.clone(),
-                    token_ids: t.token_ids.clone(),
-                })
-                .collect(),
-        }
-    };
-}
 
 /// Helper macro to convert input logprobs from proto types to unified type.
 macro_rules! convert_input_logprobs {
@@ -378,6 +357,115 @@ pub enum ProtoResponseVariant {
     None,
 }
 
+/// The accessors every engine-response wrapper answers with the same five-arm
+/// match, written once and invoked inside each wrapper's `impl` (as the engine
+/// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
+/// semantics of the response shape, the index, the four token counters and the
+/// reported weight version. What differs per wrapper (the typed accessors, the
+/// token ids, the logprobs, the finish reason) stays in its own `impl`.
+macro_rules! engine_response_basics {
+    () => {
+        /// Check if this is SGLang
+        pub fn is_sglang(&self) -> bool {
+            matches!(self, Self::Sglang(_))
+        }
+
+        /// Check if this is TensorRT-LLM
+        pub fn is_trtllm(&self) -> bool {
+            matches!(self, Self::Trtllm(_))
+        }
+
+        /// Check if this is MLX
+        pub fn is_mlx(&self) -> bool {
+            matches!(self, Self::Mlx(_))
+        }
+
+        /// Check if this is TokenSpeed
+        pub fn is_tokenspeed(&self) -> bool {
+            matches!(self, Self::TokenSpeed(_))
+        }
+
+        /// How this response's payloads relate to the preceding ones of its
+        /// stream — see [`ChunkSemantics`]: a `Delta` stream's counts are
+        /// accumulated chunk by chunk, a `Cumulative` stream's `Complete` reports
+        /// them.
+        pub fn chunk_semantics(&self) -> ChunkSemantics {
+            match self {
+                Self::Vllm(_) => ChunkSemantics::Delta,
+                Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                    ChunkSemantics::Cumulative
+                }
+            }
+        }
+
+        /// Get index (for n>1 support)
+        /// Returns the index of this output when n>1 was requested (0-indexed)
+        pub fn index(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.index,
+                Self::Vllm(c) => c.index,
+                Self::Trtllm(c) => c.sequence_index,
+                Self::Mlx(c) => c.index,
+                Self::TokenSpeed(c) => c.index,
+            }
+        }
+
+        /// Get prompt tokens
+        pub fn prompt_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.prompt_tokens,
+                Self::Vllm(c) => c.prompt_tokens,
+                Self::Trtllm(c) => c.prompt_tokens,
+                Self::Mlx(c) => c.prompt_tokens,
+                Self::TokenSpeed(c) => c.prompt_tokens,
+            }
+        }
+
+        /// Get completion tokens (the running count on a chunk, the total on a
+        /// `Complete`)
+        pub fn completion_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.completion_tokens,
+                Self::Vllm(c) => c.completion_tokens,
+                Self::Trtllm(c) => c.completion_tokens,
+                Self::Mlx(c) => c.completion_tokens,
+                Self::TokenSpeed(c) => c.completion_tokens,
+            }
+        }
+
+        /// Get cached tokens
+        pub fn cached_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.cached_tokens,
+                Self::Vllm(c) => c.cached_tokens,
+                Self::Trtllm(c) => c.cached_tokens,
+                Self::Mlx(c) => c.cached_tokens,
+                Self::TokenSpeed(c) => c.cached_tokens,
+            }
+        }
+
+        /// Get reasoning tokens.
+        pub fn reasoning_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.reasoning_tokens,
+                Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
+            }
+        }
+
+        /// Weight version the engine reported for this response. Only TokenSpeed
+        /// carries it on the wire; see [`is_reported_version`] for what counts.
+        pub fn weight_version(&self) -> Option<&str> {
+            match self {
+                Self::TokenSpeed(c) => c
+                    .weight_version
+                    .as_deref()
+                    .filter(|v| is_reported_version(v)),
+                Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            }
+        }
+    };
+}
+
 /// Unified GenerateStreamChunk
 #[derive(Clone)]
 pub enum ProtoGenerateStreamChunk {
@@ -389,6 +477,8 @@ pub enum ProtoGenerateStreamChunk {
 }
 
 impl ProtoGenerateStreamChunk {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -425,37 +515,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// How this chunk's payloads relate to the preceding ones — see
-    /// [`ChunkSemantics`].
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -467,38 +526,20 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
-        }
-    }
-
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
-        match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -515,59 +556,6 @@ impl ProtoGenerateStreamChunk {
                 .map(|lp| convert_input_logprobs!(lp)),
             // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
             Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
-        }
-    }
-
-    /// Get prompt tokens (cumulative)
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens (cumulative)
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
-    /// Get cached tokens (cumulative)
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
-    }
-
-    /// Get reasoning tokens (cumulative).
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
-    }
-
-    /// Weight version the engine reported for this chunk. Only TokenSpeed
-    /// carries it on the wire; see [`is_reported_version`] for what counts.
-    pub fn weight_version(&self) -> Option<&str> {
-        match self {
-            Self::TokenSpeed(c) => c
-                .weight_version
-                .as_deref()
-                .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 }
@@ -594,6 +582,8 @@ pub enum ProtoGenerateComplete {
 }
 
 impl ProtoGenerateComplete {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -642,38 +632,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// Chunk semantics of the stream this `Complete` terminates — see
-    /// [`ChunkSemantics`]. `Delta` streams already accumulated their counts
-    /// chunk by chunk; `Cumulative` streams report them here.
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -685,28 +643,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get prompt tokens
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
     /// Get finish reason
     pub fn finish_reason(&self) -> &str {
         match self {
@@ -715,18 +651,6 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => &c.finish_reason,
             Self::Mlx(c) => &c.finish_reason,
             Self::TokenSpeed(c) => &c.finish_reason,
-        }
-    }
-
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
         }
     }
 
@@ -780,37 +704,6 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => &c.output_token_ids,
             Self::Mlx(c) => &c.output_ids,
             Self::TokenSpeed(c) => &c.output_ids,
-        }
-    }
-
-    /// Get cached tokens
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
-    }
-
-    /// Get reasoning tokens.
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
-    }
-
-    /// Weight version the engine reported for this completion. Only TokenSpeed
-    /// carries it on the wire; see [`is_reported_version`] for what counts.
-    pub fn weight_version(&self) -> Option<&str> {
-        match self {
-            Self::TokenSpeed(c) => c
-                .weight_version
-                .as_deref()
-                .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -876,26 +769,20 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -2667,21 +2554,64 @@ mod tests {
             modality: common::Modality::Image as i32,
             url: "https://example.test/image.png".into(),
         });
-        assert!(request
-            .set_media_refs(mixed)
-            .unwrap_err()
-            .contains("single modality"));
+        request.set_media_refs(mixed).unwrap();
+        let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
+    }
+
+    /// The raw-file request's wire bytes are the files, length-delimited in
+    /// order, whether the generated field holds them as shared or as owned
+    /// bytes: what the TRT-LLM servicer reads does not change with the type.
+    #[test]
+    fn trtllm_raw_images_encode_as_the_files_length_delimited_in_order() {
+        let files: [&[u8]; 2] = [b"abc", b"de"];
+        let data = TrtllmMultimodalData {
+            image_data: files
+                .iter()
+                .map(|file| bytes::Bytes::from_static(file))
+                .collect(),
+        };
+        let mut expected = Vec::new();
+        for file in files {
+            // field 1, wire type 2 (length-delimited): the tag, the length, the bytes
+            expected.push(0x0a);
+            expected.push(u8::try_from(file.len()).unwrap());
+            expected.extend_from_slice(file);
+        }
+        assert_eq!(data.into_proto().encode_to_vec(), expected);
     }
 
     #[test]
     /// Account for all inline pixels and raw media across supported engine payloads.
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
         let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
-            image_data: vec![vec![0; 3], vec![0; 5]],
+            image_data: vec![
+                bytes::Bytes::from(vec![0; 3]),
+                bytes::Bytes::from(vec![0; 5]),
+            ],
         });
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            extra_batches: vec![SglangMultimodalData {
+                extra_batches: Vec::new(),
+                modality: "video".to_string(),
+                image_data: Vec::new(),
+                pixel_values: vec![0; 8],
+                pixel_values_shape: vec![2],
+                pixel_values_dtype: "float32".to_string(),
+                model_specific_tensors: HashMap::from([(
+                    "video_grid_thw".to_string(),
+                    TensorBytes {
+                        data: vec![0; 24],
+                        shape: vec![1, 3],
+                        dtype: "int64".to_string(),
+                    },
+                )]),
+                im_token_id: Some(8),
+                mm_placeholders: vec![(4, 2)],
+            }],
             modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
@@ -2698,7 +2628,7 @@ mod tests {
             im_token_id: None,
             mm_placeholders: vec![(0, 4)],
         });
-        assert_eq!(sglang.inline_bytes(), 42);
+        assert_eq!(sglang.inline_bytes(), 42 + 8 + 24);
     }
 
     #[test]

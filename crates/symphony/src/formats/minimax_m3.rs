@@ -10,6 +10,9 @@ use crate::{
     tagged::xml,
 };
 
+/// The separator token the template writes before every tag, dropped wherever it stands.
+pub const SEPARATOR: &str = "]<]minimax[>[";
+
 /// The MiniMax M3 table.
 pub fn minimax_m3() -> Format {
     Format::new("minimax_m3")
@@ -19,7 +22,7 @@ pub fn minimax_m3() -> Format {
         .terminal("calls_close", "</tool_call>")
         .terminal("invoke_open", "<invoke name=\"")
         .terminal("invoke_close", xml::INVOKE_CLOSE)
-        .ignores("separator", "]<]minimax[>[")
+        .ignores("separator", SEPARATOR)
         .state("start", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
@@ -55,8 +58,6 @@ mod tests {
         Declared,
     };
 
-    const SEP: &str = "]<]minimax[>[";
-
     /// A recorded output, separators and all: an empty thought, one invoke with a string and a
     /// nested object.
     const OUTPUT: &str = concat!(
@@ -73,7 +74,7 @@ mod tests {
             function: Function {
                 name: "alert".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "name": {"type": "string"},
                     "threshold": {"type": "number"},
                     "count": {"type": "integer"},
@@ -89,7 +90,7 @@ mod tests {
                     "meta": {"type": "object"},
                     "año": {"type": "integer"},
                     "cart": {"type": "object", "properties": {"item": {"type": "string"}}},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -107,7 +108,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -150,6 +151,7 @@ mod tests {
     /// Prose where the invoke has tags, before its first child or after its last: refused word by
     /// word, each word with the whitespace before it, under one counted `Malformed` event of no
     /// bytes per word, the newline after the tag the syntax read dropped as the template's; the
+    /// call keeps the member it read and gets no close, since the syntax refused bytes in it; the
     /// chat message's content and the stream's deltas never carry the words, at every cut and one
     /// character at a time alike, and the refused bytes joined are the model's prose, whole.
     #[test]
@@ -207,7 +209,7 @@ mod tests {
         ] {
             let whole = run_with(declared(), "", &[output]);
             assert_eq!(bytes(&whole), output);
-            assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
+            assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris""#, "{output:?}");
             assert_eq!(
                 words(&whole),
                 vec![(String::new(), MalformedReason::TextBetweenTags); 5],
@@ -251,7 +253,7 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(shown(&events), None);
         assert_eq!(refused(&events).concat(), "please note this");
-        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris""#);
     }
 
     /// Prose between two invokes, where the block's template only wraps: the chat message's
@@ -335,8 +337,8 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::ReasoningStart)));
         // Every separator is dropped, and the one after `latte` stays in the fragment that holds
         // the value, so the bytes keep their order.
-        assert!(events.contains(&dropped(SEP)));
-        let held = format!("<drink_id>latte{SEP}</drink_id>");
+        assert!(events.contains(&dropped(SEPARATOR)));
+        let held = format!("<drink_id>latte{SEPARATOR}</drink_id>");
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallArguments { source, .. } if source.text.ends_with(&held)
@@ -392,7 +394,7 @@ mod tests {
         let pieces = [
             "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Pa",
             "ris",
-            SEP,
+            SEPARATOR,
             "</name></invoke>\n</tool_call>",
         ];
         let events = run_with(tools(), "", &pieces);
@@ -401,7 +403,7 @@ mod tests {
             fragments_of(&events, 0),
             [r#"{"name": ""#, "Pa", "ris", "\"", "}"]
         );
-        assert!(events.contains(&dropped(SEP)));
+        assert!(events.contains(&dropped(SEPARATOR)));
     }
 
     #[test]
@@ -439,9 +441,12 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::ReasoningStart)));
 
         // Later in the content both markers are text, and a separator anywhere is dropped.
-        let events = run("", &["</mm:think>Say <mm:think>x</mm:think>", SEP, " done"]);
+        let events = run(
+            "",
+            &["</mm:think>Say <mm:think>x</mm:think>", SEPARATOR, " done"],
+        );
         assert_eq!(content(&events), "Say <mm:think>x</mm:think> done");
-        assert!(events.contains(&dropped(SEP)));
+        assert!(events.contains(&dropped(SEPARATOR)));
 
         // No marker at all: content.
         let events = run("", &["Hello."]);
@@ -491,8 +496,9 @@ mod tests {
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["f"]);
-        // The open object closes, and the leaf never written is refused.
-        assert_eq!(arguments_of(&events, 0), r#"{"opts": {"a": 1}}"#);
+        // The leaf never written is refused, so no close is made up for the call: the open object
+        // stands as the fragments wrote it, and the arguments are no whole value.
+        assert_eq!(arguments_of(&events, 0), r#"{"opts": {"a": 1"#);
         assert_eq!(ends(&events), 1);
         assert_eq!(content(&events), "The weather is sunny.");
         assert!(events.iter().any(|event| matches!(
@@ -564,9 +570,10 @@ mod tests {
         );
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
+        // The word between tags is refused, so the call gets no close after the members it read.
         assert_eq!(
             arguments_of(&events, 0),
-            r#"{"expr": "a < b and c > d", "n": 1, "q": "a <b> c"}"#
+            r#"{"expr": "a < b and c > d", "n": 1, "q": "a <b> c""#
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -597,7 +604,8 @@ mod tests {
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["add"]);
-        assert_eq!(arguments_of(&events, 0), r#"{"a": 1}"#);
+        // The tail is refused, so the call gets no close after the member it read.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": 1"#);
         let malformed: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -867,10 +875,10 @@ mod tests {
     /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) is refused
     /// from the element that would cross it: nothing of that member is written, the bytes from
     /// its own tag to the call's end are dropped as a malformed call's behind one counted
-    /// `Malformed { InvalidArguments }` of no bytes, the containers open close whole, so the
-    /// arguments stay a value a strict reader takes, and every byte is accounted for, whole and
-    /// at every cut. Nesting up to the bound reads as before, for an object's members and a
-    /// list's items alike.
+    /// `Malformed { InvalidArguments }` of no bytes, and nothing closes after it, since a call
+    /// the syntax refused bytes in is no whole call: the containers read stand open, a prefix the
+    /// reader takes and no whole value, and every byte is accounted for, whole and at every cut.
+    /// Nesting up to the bound reads as before, for an object's members and a list's items alike.
     #[test]
     fn nesting_past_the_json_readers_bound_is_refused_from_the_element_that_crosses_it() {
         use crate::{json::PartialJson, testing::the_same_at_every_cut};
@@ -942,8 +950,8 @@ mod tests {
             assert!(malformed(&events).is_empty(), "{tag}: {events:?}");
 
             // One element more: the element below the deepest container would make it the
-            // container past the bound, and is refused from its own tag to the call's end; the
-            // deepest container closes empty, the ones above it whole.
+            // container past the bound, and is refused from its own tag to the call's end; no
+            // container closes after it, the call being no whole call.
             let past = chain(tag, deepest + 1);
             let events = run("", &[&past]);
             assert_eq!(bytes(&events), past, "{tag}");
@@ -953,15 +961,18 @@ mod tests {
                 PartialJson::default().parse(&json, false).is_ok(),
                 "{tag}: a prefix the parser takes: {json}"
             );
-            let empty = if tag == "item" {
-                value!([])
+            let open = if tag == "item" {
+                format!("{{\"item\": [{}", "[".repeat(deepest - 2))
             } else {
-                value!({})
+                format!("{{{}", "\"d\": {".repeat(deepest - 1))
             };
             assert_eq!(
-                arguments(&events),
-                value!({ tag: wrapped(tag, empty, deepest - 2) }),
-                "{tag}: the member that crossed the bound is not written"
+                json, open,
+                "{tag}: the containers read stand open, the member that crossed the bound is not written"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&json).is_err(),
+                "{tag}: {json} reads as a whole value"
             );
             // Counted once, with no bytes of its own; the bytes from the tag of the element
             // that would cross the bound (the `deepest`-th) to the last closing tag are
@@ -1037,7 +1048,7 @@ mod tests {
         assert!(malformed(&events).is_empty(), "{events:?}");
 
         // One element more: the leaf's list would be the container past the bound; the leaf is
-        // refused from its own tag, the deepest container closes empty, the ones above it whole.
+        // refused from its own tag, and no container closes after it.
         let past = chain(deepest, "[1]");
         let events = run("", &[&past]);
         assert_eq!(bytes(&events), past);
@@ -1045,9 +1056,13 @@ mod tests {
         let json = arguments_of(&events, 0);
         assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
         assert_eq!(
-            arguments(&events),
-            value!({ "d": wrapped(value!({}), deepest - 2) }),
-            "the leaf that crossed the bound is not written"
+            json,
+            format!("{{{}", "\"d\": {".repeat(deepest - 1)),
+            "the containers read stand open, the leaf that crossed the bound is not written"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_err(),
+            "{json} reads as a whole value"
         );
         assert_eq!(
             malformed(&events),
@@ -1143,9 +1158,13 @@ mod tests {
         let json = arguments_of(&events, 0);
         assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
         assert_eq!(
-            arguments(&events),
-            value!({ "d": wrapped(value!({}), deepest - 2) }),
-            "the element that crossed the bound is not written"
+            json,
+            format!("{{{}", "\"d\": {".repeat(deepest - 1)),
+            "the containers read stand open, the element that crossed the bound is not written"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_err(),
+            "{json} reads as a whole value"
         );
         assert_eq!(
             malformed(&events),
@@ -1154,5 +1173,321 @@ mod tests {
         assert_eq!(refused(&events), format!("<d>{}", "</d>".repeat(deepest)));
         assert_eq!(content(&events), "");
         assert_eq!(ends(&events), 1);
+    }
+
+    /// A refused run inside an invoke that read an element before it and one after it: the
+    /// members stand as the call's fragments, and nothing is made up for the call's close at
+    /// `</invoke>`, so the arguments are a strict JSON prefix and no whole value (a client that
+    /// reads them as JSON is told the call failed, where it read a closed object with the word
+    /// missing before); the word is counted and never content; whole, one character at a time
+    /// and at every cut. The stop makes nothing up for such a call either, nor for a leaf it
+    /// found held for its close, so it announces no close; a call read whole announces its close.
+    #[test]
+    fn a_call_the_syntax_refused_bytes_inside_keeps_its_members_and_gets_no_close() {
+        use crate::{json::Prefix, testing::the_same_at_every_cut};
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated("<name>x</name>junk<count>3</count>")
+        );
+        let read = |pieces: &[&str]| run_with(tools(), "", pieces);
+        let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+        assert_eq!(
+            said.calls,
+            [(
+                "alert".to_string(),
+                r#"{"name": "x", "count": 3"#.to_string()
+            )]
+        );
+        assert_eq!(said.content, "");
+        let events = read(&[&output]);
+        assert_eq!(bytes(&events), output);
+        let written = arguments_of(&events, 0);
+        assert!(
+            Prefix::default().feed(&written).is_none(),
+            "{written:?} is no prefix the crate's JSON judge takes"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&written).is_err(),
+            "{written:?} reads as a whole value"
+        );
+        let reported: Vec<(String, MalformedReason)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            [(String::new(), MalformedReason::TextBetweenTags)]
+        );
+        let refused: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, "junk");
+        assert_eq!(ends(&events), 1);
+        // The same invoke read whole closes its object.
+        let clean = output.replace("junk", "");
+        let events = read(&[&clean]);
+        assert_eq!(arguments(&events), value!({"name": "x", "count": 3}));
+
+        // The stop: a leaf held for its close or a word the syntax refused leaves the call no
+        // whole call, so nothing closes and the stop announces no close.
+        for output in [
+            "</mm:think><tool_call>\n<invoke name=\"alert\"><count>3",
+            "</mm:think><tool_call>\n<invoke name=\"alert\"><name>x</name>junk",
+        ] {
+            let stopped = run_with(tools(), "", &[output]);
+            assert_eq!(bytes(&stopped), output);
+            assert!(
+                !stopped.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::OpenAtTheStop,
+                        ..
+                    }
+                )),
+                "{output:?}: {stopped:?}"
+            );
+            let written = arguments_of(&stopped, 0);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&written).is_err(),
+                "{output:?}: {written:?} reads as a whole value"
+            );
+        }
+        let whole = run_with(
+            tools(),
+            "",
+            &["</mm:think><tool_call>\n<invoke name=\"alert\"><count>3</count>"],
+        );
+        assert_eq!(arguments(&whole), value!({"count": 3}));
+        assert!(whole.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::OpenAtTheStop,
+                ..
+            }
+        )));
+    }
+
+    /// The reasons of the `Malformed` events of no bytes, in order: the refusals counted.
+    fn reported(events: &[Event]) -> Vec<MalformedReason> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } if text.text.is_empty() => Some(*why),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bytes refused as a malformed call's, concatenated.
+    fn refused(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A stray closing tag between elements, one that names nothing open, is refused and
+    /// counted but costs the call nothing: it carries no member the client could lose, so the
+    /// call closes whole. A tag the invoke's end cut short between elements is a member the
+    /// model had begun: refused as cut short, the call gets no close, and the stop announces
+    /// none for it.
+    #[test]
+    fn a_stray_close_between_elements_costs_the_call_nothing_and_a_cut_tag_its_close() {
+        use crate::testing::the_same_at_every_cut;
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated("<name>x</name></count><count>3</count>")
+        );
+        let read = |pieces: &[&str]| run_with(tools(), "", pieces);
+        let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+        assert_eq!(
+            said.calls,
+            [(
+                "alert".to_string(),
+                r#"{"name": "x", "count": 3}"#.to_string()
+            )]
+        );
+        assert_eq!(said.content, "");
+        let events = read(&[&output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(arguments(&events), value!({"name": "x", "count": 3}));
+        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
+        assert_eq!(refused(&events), "</count>");
+        assert_eq!(ends(&events), 1);
+
+        let cut = "</mm:think><tool_call>\n<invoke name=\"alert\"><name>x</name>\n<cou</invoke>\n</tool_call>";
+        let events = read(&[cut]);
+        assert_eq!(bytes(&events), cut);
+        assert_eq!(arguments_of(&events, 0), r#"{"name": "x""#);
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "<cou");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if &*text.text == "\n"
+        )));
+        assert_eq!(ends(&events), 1);
+        let at_the_stop = "</mm:think><tool_call>\n<invoke name=\"alert\"><name>x</name>\n<cou";
+        let events = read(&[at_the_stop]);
+        assert_eq!(bytes(&events), at_the_stop);
+        assert_eq!(arguments_of(&events, 0), r#"{"name": "x""#);
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "<cou");
+    }
+
+    /// A closing tag that names an open element further out, an inner close left out (`</range>`
+    /// missing), closes it out of order: the members after it would land in the wrong container
+    /// (`limit` inside `range`), so it is refused as any tag out of its place and the call is no
+    /// whole call. A closing tag that names nothing open costs the call nothing inside a
+    /// container as at the top.
+    #[test]
+    fn a_close_that_skips_an_inner_one_is_refused_and_one_that_names_nothing_open_is_free() {
+        use crate::testing::the_same_at_every_cut;
+        let search = || {
+            declared(
+                "search",
+                value!({"type": "object", "properties": {
+                    "filter": {"type": "object", "properties": {
+                        "range": {"type": "object", "properties": {"gte": {"type": "integer"}}},
+                    }},
+                    "limit": {"type": "integer"},
+                }}),
+            )
+        };
+        let invoke = |body: &str| {
+            format!(
+                "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"search\">{}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+                separated(body)
+            )
+        };
+        let read = |pieces: &[&str]| run_with(search(), "", pieces);
+        let misnested = invoke("<filter><range><gte>5</gte></filter><limit>10</limit>");
+        let said = the_same_at_every_cut(|pieces| read(pieces), &misnested);
+        assert_eq!(
+            said.calls,
+            [(
+                "search".to_string(),
+                r#"{"filter": {"range": {"gte": 5, "limit": 10"#.to_string()
+            )]
+        );
+        assert_eq!(said.content, "");
+        let events = read(&[&misnested]);
+        assert_eq!(bytes(&events), misnested);
+        let written = arguments_of(&events, 0);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&written).is_err(),
+            "{written:?} reads as a whole value"
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
+        assert_eq!(refused(&events), "</filter>");
+        assert_eq!(ends(&events), 1);
+
+        let stray = invoke("<filter><range><gte>5</gte></range></bogus></filter><limit>10</limit>");
+        let said = the_same_at_every_cut(|pieces| read(pieces), &stray);
+        assert_eq!(
+            said.calls,
+            [(
+                "search".to_string(),
+                r#"{"filter": {"range": {"gte": 5}}, "limit": 10}"#.to_string()
+            )]
+        );
+        let events = read(&[&stray]);
+        assert_eq!(bytes(&events), stray);
+        assert_eq!(
+            arguments(&events),
+            value!({"filter": {"range": {"gte": 5}}, "limit": 10})
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
+        assert_eq!(refused(&events), "</bogus>");
+        assert_eq!(ends(&events), 1);
+    }
+
+    /// The draw a fleet verifier once saw on the attributed syntax, on this one: an invoke that
+    /// names the tool and writes its arguments as text where the syntax has elements, so it read
+    /// no member. The call used to close as `{}`, a well-formed call under `tool_calls` with
+    /// nothing on the wire saying it had failed. Now it is no whole call: the syntax writes no
+    /// close for it, so its arguments are no JSON value, which a chat client's own reader
+    /// refuses and the Responses item says (`incomplete`); the refused bytes are counted and
+    /// never content; the Messages block keeps the `{}` a cut call's has, as the adapter's notes
+    /// say.
+    #[test]
+    fn a_call_whose_every_argument_the_syntax_refused_is_no_whole_call_to_any_client() {
+        use crate::{adapt, testing::the_same_at_every_cut};
+        const OUTPUT: &str = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"add_integers\">",
+            "a: 17, b: 25]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let read = |pieces: &[&str]| run_with(tools(), "", pieces);
+        let said = the_same_at_every_cut(|pieces| read(pieces), OUTPUT);
+        assert_eq!(said.content, "");
+        assert_eq!(said.reasoning, "");
+        assert_eq!(said.calls, [("add_integers".to_string(), String::new())]);
+
+        let events = read(&[OUTPUT]);
+        assert_eq!(bytes(&events), OUTPUT);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::TextBetweenTags } if text.text.is_empty()
+        )));
+        let refused: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            refused.contains("17") && refused.contains("25"),
+            "{refused:?}"
+        );
+
+        // Chat Completions: the call, under `tool_calls`, with arguments a strict reader refuses.
+        let choice = chat::message(0, &events);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(choice.message.content, None);
+        let calls = choice.message.tool_calls.as_deref().expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "add_integers");
+        let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(arguments).is_err(),
+            "{arguments:?} reads as a whole value"
+        );
+
+        // Responses: the item says the call is incomplete.
+        let output = adapt::responses::output("resp", &events);
+        let items = serde_json::to_value(&output.items).expect("wire");
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+        assert_eq!(items[0]["type"], "function_call", "{items}");
+        assert_eq!(items[0]["name"], "add_integers", "{items}");
+        assert_eq!(items[0]["status"], "incomplete", "{items}");
+
+        // Messages: the block carries `{}`, as a cut call's does; the call is not refused.
+        let message = adapt::messages::output(&events);
+        assert!(message.refused.is_empty(), "{:?}", message.refused);
+        let blocks = serde_json::to_value(&message.content).expect("wire");
+        assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+        assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
     }
 }

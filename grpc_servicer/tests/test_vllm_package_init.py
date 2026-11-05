@@ -373,6 +373,7 @@ def test_logging_attach_takes_effect_when_vllm_configures_after_the_first_call()
     assert "Generate request r1: media_refs=1" in stream.getvalue()
 
 
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 def test_servicer_attaches_logging_that_vllm_configured_after_its_import(monkeypatch):
     pytest.importorskip("vllm")
     from smg_grpc_servicer.vllm.servicer import VllmEngineServicer

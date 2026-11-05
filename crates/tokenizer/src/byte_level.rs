@@ -15,7 +15,8 @@
 //! sequences, so the lossy decode of the pending bytes alone is the text the
 //! reference would emit: the same pieces at the same tokens, and over a
 //! whole stream exactly `decode(all_ids)`. The pending buffer holds at most
-//! the bytes since the last emission, normally one partial character.
+//! the bytes since the last emission, normally one partial character; the
+//! stream's end releases it as `decode` renders the same bytes.
 
 use std::{
     borrow::Cow,
@@ -190,6 +191,27 @@ impl ByteLevelTableBuilder {
     }
 }
 
+/// The decoder kind of a `tokenizers` vocabulary as the load's log names it:
+/// the variant, with a `Sequence`'s members listed, `none` without a decoder.
+pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
+    fn variant(decoder: &DecoderWrapper) -> String {
+        let debug = format!("{decoder:?}");
+        debug
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or(debug.as_str())
+            .to_owned()
+    }
+    match decoder {
+        None => "none".to_owned(),
+        Some(DecoderWrapper::Sequence(sequence)) => {
+            let members: Vec<String> = sequence.get_decoders().iter().map(variant).collect();
+            format!("Sequence({})", members.join(", "))
+        }
+        Some(decoder) => variant(decoder),
+    }
+}
+
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
@@ -217,7 +239,6 @@ impl ByteLevelTable {
     /// Decode a complete HF sequence using the same bytes as incremental decode.
     /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
     /// only after concatenation so characters may span token boundaries.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
         let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
         for &id in ids {
@@ -252,7 +273,6 @@ impl ByteLevelTable {
     /// and one slice of the store the kind picks; the step's piece, with the
     /// text slice's boundary checks, is not built for a decode that only
     /// concatenates bytes.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     #[inline]
     fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
@@ -421,6 +441,19 @@ impl IncrementalDecoder for ByteLevelIncremental {
         })
     }
 
+    fn finish_into(&mut self, out: &mut String) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
+        // The emitted text ends at a character boundary, so the lossy decode
+        // of the pending bytes alone is the tail `decode` renders for the
+        // whole stream: the complete characters among them as they are, an
+        // incomplete or invalid sequence as the replacement character.
+        out.push_str(&String::from_utf8_lossy(&self.pending));
+        self.pending.clear();
+        Ok(true)
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
         self.text.clear();
@@ -430,7 +463,7 @@ impl IncrementalDecoder for ByteLevelIncremental {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use tokenizers::{
@@ -442,7 +475,7 @@ mod tests {
 
     use super::*;
 
-    const SPECIAL: &str = "<|im_end|>";
+    pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
 
     fn alphabet() -> Vec<char> {
@@ -462,7 +495,7 @@ mod tests {
     /// bytes of a 4-byte emoji, "Ġà" (a space plus the lead byte of a 3-byte
     /// character) and "ï¿½" (the three bytes of a literal U+FFFD), so
     /// characters get split across tokens in every way the fixtures show.
-    fn byte_level_tokenizer() -> HfTokenizer {
+    pub(crate) fn byte_level_tokenizer() -> HfTokenizer {
         let mut vocab = Vocab::default();
         for (id, ch) in alphabet().into_iter().enumerate() {
             vocab.insert(ch.to_string(), id as u32);

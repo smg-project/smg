@@ -27,6 +27,7 @@ use openai_protocol::{
         ToolChoiceValue,
     },
     generate::GenerateFinishReason,
+    profile::ProviderProfile,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -294,7 +295,8 @@ pub(crate) fn missing_tokenizer_response(
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
 /// costs more than the encode itself, so we tokenize inline. Larger prompts —
-/// the ones that actually pin a worker thread — are offloaded.
+/// the ones that actually pin a worker thread — are offloaded. A prompt of
+/// ids counts its ids' bytes, four each.
 const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
@@ -312,24 +314,25 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Run CPU-bound tokenization off the async worker threads so it cannot stall
-/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
-/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
-/// the offload round-trip dominating.
-async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+/// Run CPU-bound tokenizer work, an encode or a decode, off the async worker
+/// threads so it cannot stall the runtime, bounded by [`encode_permits`] so
+/// concurrent offloaded jobs cannot oversubscribe the CPU. Inputs below the
+/// threshold run inline to avoid the offload round-trip dominating.
+async fn offload<T, F>(len: usize, work: F) -> anyhow::Result<T>
 where
-    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     if len < ENCODE_OFFLOAD_MIN_BYTES {
-        return encode();
+        return work();
     }
     let _permit = encode_permits()
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(encode)
+    tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+        .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
 }
 
 /// Tokenize `text` through the offload policy of [`offload`].
@@ -340,6 +343,19 @@ pub(crate) async fn encode_blocking(
 ) -> anyhow::Result<Encoding> {
     offload(text.len(), move || {
         tokenizer.encode(&text, add_special_tokens)
+    })
+    .await
+}
+
+/// Decode `ids` through the offload policy of [`offload`]: a prompt given as
+/// ids leaves the worker thread at the same size a text prompt does.
+pub(crate) async fn decode_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    ids: Vec<u32>,
+    skip_special_tokens: bool,
+) -> anyhow::Result<String> {
+    offload(ids.len() * size_of::<u32>(), move || {
+        tokenizer.decode(&ids, skip_special_tokens)
     })
     .await
 }
@@ -457,8 +473,22 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// (`thinking.effort`, else the top-level field) is written over an entry,
 /// as the engine's own server renders it.
 fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined = HashMap::with_capacity(kwargs_capacity);
+    let request_kwargs = request
+        .chat_template_kwargs
+        .as_ref()
+        .map_or(0, HashMap::len);
+    let reasoning_effort = request.effective_reasoning_effort();
+    // A plain request (no tool choice, no response format, no kwargs, no
+    // effort) renders with no kwargs at all: its map stays unallocated.
+    let mut combined = if request.tool_choice.is_some()
+        || request.response_format.is_some()
+        || request_kwargs > 0
+        || reasoning_effort.is_some()
+    {
+        HashMap::with_capacity(3 + request_kwargs)
+    } else {
+        HashMap::new()
+    };
     if let Some(tool_choice) = &request.tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
@@ -470,7 +500,7 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
     }
-    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
+    if let Some(reasoning_effort) = reasoning_effort {
         combined.insert(
             REASONING_EFFORT_KEY.to_string(),
             Value::String(reasoning_effort.to_string()),
@@ -481,9 +511,13 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
 /// else the effective effort as the request's provider profile reads it
-/// (`ChatCompletionRequest::template_thinking`).
-fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.template_thinking()
+/// (`ChatCompletionRequest::template_thinking_for`, with the profile the
+/// preparation stage derived once for the request).
+fn resolve_template_thinking(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+) -> Option<bool> {
+    request.template_thinking_for(provider)
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -806,6 +840,7 @@ pub fn process_chat_messages_with_encoding(
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -817,6 +852,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
         // Get content format and transform messages accordingly: the format
@@ -878,7 +914,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             prepared_tools: prepared_tools.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
-            thinking: resolve_template_thinking(request),
+            thinking: resolve_template_thinking(request, provider),
             ..Default::default()
         };
 

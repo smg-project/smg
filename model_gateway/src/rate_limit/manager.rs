@@ -74,7 +74,7 @@ impl RateLimitManager {
         Ok(Self::new(backend))
     }
 
-    pub async fn reserve(&self, request: ReserveRequest) -> Reservation {
+    pub async fn reserve(&self, request: ReserveRequest<'_>) -> Reservation {
         let request_charge_id = request.request_charge_id;
         match self.backend.reserve(request).await {
             ReserveOutcome::Admitted => Reservation::Admitted(Arc::new(
@@ -115,7 +115,7 @@ mod tests {
         RateLimitManager::new(backend)
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest {
+    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
         ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new(tenant),

@@ -670,10 +670,12 @@ fn response_status(finish: Option<&FinishReason>) -> (ResponseStatus, Option<Inc
     }
 }
 
-/// Whether the joined argument fragments are a whole JSON value. Empty arguments are a call the
-/// model closed without any, so they are whole too.
+/// Whether the joined argument fragments are a whole JSON value. No fragment at all is none:
+/// every syntax writes `{}` for a call the model closed without arguments, so a call that ended
+/// with no fragment is one the parser did not read whole (cut right after its name, or a tagged
+/// call whose every pair the syntax refused, which gets no close).
 fn whole_arguments(arguments: &str) -> bool {
-    arguments.is_empty() || serde_json::from_str::<IgnoredAny>(arguments).is_ok()
+    serde_json::from_str::<IgnoredAny>(arguments).is_ok()
 }
 
 #[cfg(test)]
@@ -927,9 +929,22 @@ mod tests {
             "the status describes the call, whatever stopped the output"
         );
 
-        let without_arguments = [call(0, "get_time"), end(0), finish(FinishReason::Stop, 1)];
+        // No fragment at all: every syntax writes `{}` for a call the model closed without
+        // arguments, so a call that ended with none is one the parser did not read whole (a cut
+        // right after its name, a tagged call whose every pair the syntax refused).
+        let without_a_fragment = [call(0, "get_time"), end(0), finish(FinishReason::Stop, 1)];
         assert_eq!(
-            statuses(&output("r", &without_arguments).items),
+            statuses(&output("r", &without_a_fragment).items),
+            ["incomplete"]
+        );
+        let closed_without_arguments = [
+            call(0, "get_time"),
+            arguments(0, "{}"),
+            end(0),
+            finish(FinishReason::Stop, 1),
+        ];
+        assert_eq!(
+            statuses(&output("r", &closed_without_arguments).items),
             ["completed"]
         );
     }

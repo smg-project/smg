@@ -20,7 +20,10 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
-use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
+use crate::{
+    config::{ConfigError, ConfigResult},
+    routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -51,6 +54,15 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
 #[cfg(test)]
 pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
+}
+
+/// Whether `s` is a label the interner holds. A test that must prove a
+/// value never became a label asks this, which no neighbouring test's
+/// interning can disturb, where the interner's size moves with every
+/// label any test records.
+#[cfg(test)]
+pub(crate) fn is_interned(s: &str) -> bool {
+    STRING_INTERNER.contains_key(s)
 }
 
 /// Per-worker caches of the handles the gateway's per-request records go
@@ -386,6 +398,32 @@ impl Default for PrometheusConfig {
     }
 }
 
+impl PrometheusConfig {
+    /// Refuses a duration bucket list the exporter would render wrongly: a
+    /// bound that is not a finite number above 0, or bounds that do not
+    /// ascend strictly (the `le` labels of every duration histogram would
+    /// come out of order). The one check for every construction path, so
+    /// the CLI and the Python binding refuse the same list with the same
+    /// words.
+    pub fn validate_duration_buckets(buckets: &[f64]) -> ConfigResult<()> {
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                bad,
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Upkeep interval for histogram maintenance. Must match the value passed to
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
@@ -544,7 +582,7 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content; not such a marker in an output the request ran past the model's own end with ignore_eos, which counts as nothing), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
@@ -578,7 +616,7 @@ pub(crate) fn init_metrics() {
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
     describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
     describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
-    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: not_nfc (text not in NFC under an NFC normalizer) or piece_declined (the model declined a piece)");
+    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: piece_declined (the model declined a piece)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -613,7 +651,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_connections_active",
-        "Currently active HTTP connections"
+        "HTTP requests in flight at the edge layer, not open connections: an idle keep-alive connection carries no request and one HTTP/2 connection carries many"
     );
     describe_counter!(
         "smg_http_connection_timeouts_total",
@@ -833,7 +871,7 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
-         other_rank)"
+         other_rank, not_indexed: a batch of events on a stream opened for load records alone)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -1774,7 +1812,9 @@ impl Metrics {
         });
     }
 
-    /// Set active HTTP connections count
+    /// Set `smg_http_connections_active`: the count of HTTP requests in flight
+    /// at the edge layer (the callers pass the in-flight request tracker's
+    /// count), not of open connections.
     pub fn set_http_connections_active(count: usize) {
         handles::with_single(
             &handles::HTTP_CONNECTIONS_ACTIVE,
@@ -1929,7 +1969,6 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
     }
 
-    /// Record where a multimodal request's media is processed and why.
     /// Count a Responses stream whose terminal event was `response.failed`.
     ///
     /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
@@ -1955,6 +1994,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record where a multimodal request's media is processed and why.
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -2702,7 +2742,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Set running requests per worker
     /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
@@ -2946,7 +2985,6 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
-    /// Count a KV event batch by what the subscriber did with it.
     /// One load-monitor tick decision for a worker (see `PollMode`).
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
@@ -2957,6 +2995,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Count a KV event batch by what the subscriber did with it.
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
@@ -3426,11 +3465,15 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out `smg_engine_*` series for a removed worker.
-    ///
-    /// metrics-rs cannot delete series, so per the `remove_worker_metrics`
-    /// convention we set each to -1 (an impossible value for these gauges, whose
-    /// 0 is meaningful) until <https://github.com/metrics-rs/metrics/issues/653>.
+    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
+    /// ended while its URL stays registered: its status left `Ready`, or a
+    /// same-URL replacement has not yet published its own load (see
+    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
+    /// those series, so the last load would read as live. Each gauge is set
+    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// worker needs no sentinel: the store drops every `worker`-labelled
+    /// series with the registration ([`Self::remove_worker_metrics`]) and
+    /// no-ops the writes that follow, this one included.
     /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
     /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
     /// label set must exactly match `record_engine_load` (including `model` and

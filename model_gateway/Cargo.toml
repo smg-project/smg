@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.13.0"
+version = "1.15.0-dev"
 edition = "2021"
 rust-version.workspace = true
 description = "High-performance model-routing gateway for large-scale LLM deployments"
@@ -260,6 +260,11 @@ path = "benches/workers_endpoint.rs"
 name = "scheduler_admission"
 harness = false
 path = "benches/scheduler_admission.rs"
+
+[[bench]]
+name = "rate_limit_reserve"
+harness = false
+path = "benches/rate_limit_reserve.rs"
 
 [[bench]]
 name = "scheduler_load"

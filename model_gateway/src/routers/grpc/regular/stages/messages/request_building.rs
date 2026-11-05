@@ -5,6 +5,7 @@ use std::{borrow::Cow, sync::Arc};
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
@@ -73,6 +74,8 @@ fn build_messages_backed_plan(
             processed_text,
             token_ids,
             tool_constraints,
+            // A Messages body names no format of its own.
+            format_set_aside: FormatSetAside::default(),
             table_tag,
             first_token_tag,
             require_reasoning,
@@ -201,6 +204,7 @@ impl BuildStage for MessageRequestBuildingStage {
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
             plan,
             spec: ResponseSpec::Messages(spec),

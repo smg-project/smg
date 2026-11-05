@@ -40,6 +40,10 @@ from smg_grpc_proto.generated import common_pb2  # noqa: E402
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer  # noqa: E402
 from vllm.v1.engine.exceptions import EngineGenerateError  # noqa: E402
 
+# Every case builds the Python servicer directly: the explicit choice its
+# constructor requires (conftest).
+pytestmark = pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
+
 try:
     from vllm.exceptions import VLLMValidationError as RefusalError
 except ImportError:  # vLLM < 0.27 raises ValueError for request validation

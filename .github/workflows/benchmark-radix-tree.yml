@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
     paths:
+      - '.github/workflows/benchmark-radix-tree.yml'
+      - '.github/bench-gates/radix-tree.toml'
+      - 'scripts/bench_gate.py'
       - 'model_gateway/benches/radix_tree_benchmark.rs'
       - 'crates/kv_index/**'
       - '!crates/kv_index/**/tests/**'
@@ -12,6 +15,9 @@ on:
   pull_request:
     branches: [ main, release/** ]
     paths:
+      - '.github/workflows/benchmark-radix-tree.yml'
+      - '.github/bench-gates/radix-tree.toml'
+      - 'scripts/bench_gate.py'
       - 'model_gateway/benches/radix_tree_benchmark.rs'
       - 'crates/kv_index/**'
       - '!crates/kv_index/**/tests/**'
@@ -24,10 +30,6 @@ on:
 concurrency:
   group: benchmark-radix-tree-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read
@@ -47,13 +49,48 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-        with:
-          sccache-version: 'v0.10.0'
+
+      # A pull request is gated: its bench binary and the base branch's (the merge
+      # commit's first parent) are built in this checkout, run interleaved on this
+      # runner and compared id by id by scripts/bench_gate.py against the thresholds
+      # in .github/bench-gates/radix-tree.toml; the job fails on a gated regression.
+      # A push to main keeps the single summary run and the throughput sweeps.
+      - name: Build the pull request's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p "$RUNNER_TEMP/bench-gate"
+          cp scripts/bench_gate.py "$RUNNER_TEMP/bench-gate/"
+          python3 scripts/bench_gate.py build --out "$RUNNER_TEMP/bench-gate/pr" -- \
+            cargo bench -p smg --bench radix_tree_benchmark --no-run
+
+      - name: Build the base branch's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          head=$(git rev-parse HEAD)
+          git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
+          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
+            cargo bench -p smg --bench radix_tree_benchmark --no-run
+          git checkout --quiet "$head"
+
+      - name: Run the benchmark gate
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          python3 scripts/bench_gate.py run --gates .github/bench-gates/radix-tree.toml \
+            --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
+            --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
 
       - name: Run criterion benchmark
+        if: github.event_name != 'pull_request'
         timeout-minutes: 90
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           cargo bench --bench radix_tree_benchmark -- benchmark_summary 2>&1 | tee benchmark_output.txt
 
       - name: Run throughput benchmark (synthetic)
@@ -62,6 +99,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           cargo bench -p kv-index --bench throughput_bench -- \
             --num-sessions 200000 \
             --num-workers 256 \
@@ -83,6 +121,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           for trace in conversation_trace synthetic_trace toolagent_trace; do
             echo "=== ${trace} ==="
             cargo bench -p kv-index --bench throughput_bench -- \
@@ -104,14 +143,11 @@ jobs:
             benchmark_output.txt
             throughput_output.txt
             mooncake_output.txt
+            bench-gate/
           retention-days: 30
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
       - name: Summary
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         run: |
           echo "## Radix Tree Benchmark (Cache-Aware Routing)" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_output.txt ]; then

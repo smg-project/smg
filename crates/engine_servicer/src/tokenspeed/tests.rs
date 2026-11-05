@@ -42,7 +42,9 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     ServicerError,
 };
 
@@ -879,6 +881,47 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` of an id the servicer does not hold, never seen or already
+/// finished, is reported as not found, as the Python servicer and the other
+/// wires report it, not as a success.
+#[tokio::test]
+async fn abort_of_an_unknown_or_finished_id_is_reported_not_found() {
+    let mut h = harness(model_info(), None).await;
+    let abort = |request_id: &str| ts::AbortRequest {
+        request_id: request_id.to_string(),
+        reason: String::new(),
+    };
+    let unknown = h.client.abort(abort("nobody")).await.unwrap().into_inner();
+    assert!(!unknown.success, "{unknown:?}");
+    assert_eq!(unknown.message, "Request nobody not found");
+
+    let mut stream = h
+        .client
+        .generate(generate_request("r5", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r5", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The stream's end releases the registration (the entry leaves the map
+    // after the active count drops: read the map, which the abort reads);
+    // an abort after it finds nothing to end.
+    wait_until(|| h.server.state.shared.registry.len() == 0).await;
+    let finished = h.client.abort(abort("r5")).await.unwrap().into_inner();
+    assert!(!finished.success, "{finished:?}");
+    assert_eq!(finished.message, "Request r5 not found");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `Abort` ends the stream with an `abort` Complete and reaches the
 /// scheduler. The caller's own abort stays a completion (the scheduler's own
 /// terminal abort frame for it, which arrives after, reaches no stream and
@@ -1188,6 +1231,31 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(idle.loads[0].max_running_requests, 64);
     assert_eq!(idle.loads[0].num_running_reqs, 0);
     assert_eq!(idle.version, "tokenspeed");
+    // The rank the request names gets its own zero entry before any step (the
+    // records-only stream reads each rank this way); a rank past the
+    // connected ones gets none.
+    let own = h
+        .client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(0),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(own.loads.len(), 1);
+    assert_eq!(own.loads[0].dp_rank, 0);
+    assert_eq!(own.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
 
     // A step carrying a load snapshot updates the rank's report while the
     // request is in flight.
@@ -1213,6 +1281,10 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
             .is_some_and(|client| !client.get_loads().loads.is_empty())
     })
     .await;
+    // The server's own poll of the chunk credits the streamed token to the
+    // rank on the tracker (the request is not streamed to the client, so
+    // nothing here reads it first): the poll below runs once it has.
+    wait_until(|| h.server.state.shared.loads.estimate(0, 0).gen_throughput > 0.0).await;
     let loads = h
         .client
         .get_loads(ts::GetLoadsRequest::default())
@@ -1224,8 +1296,21 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!((load.num_running_reqs, load.num_waiting_reqs), (2, 1));
     assert_eq!(load.num_total_reqs, 3);
     assert!((load.token_usage - 0.1).abs() < 1e-9);
+    assert!(
+        (load.utilization - 0.1).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {load:?}"
+    );
     let aggregate = loads.aggregate.expect("aggregate");
     assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.1).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - load.gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
 
     // Once the rank's last request finished, its queue counts read idle (the
     // scheduler samples its snapshot before the finish is committed, so the
@@ -2021,6 +2106,98 @@ async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_comp
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Two connected schedulers, one of which has reported a load tail: the
+/// report lists both ranks, the silent one zero-filled (an idle scheduler,
+/// not a gone one), on the poll, on the rank a request names and on the
+/// record the records-only stream reads for it; a rank past the connected
+/// ones has none.
+#[tokio::test]
+async fn an_idle_rank_keeps_its_zero_entry_once_a_sibling_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_count = 2;
+    config.model.data_parallel_size = 2;
+    let server = TokenSpeedServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..default_ready_response()
+    };
+    let (rank0, rank1) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(0)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(1)),
+    );
+    let (mut rank0_in, mut rank0_out) = rank0.expect("rank 0 handshake").split();
+    let _rank1 = rank1.expect("rank 1 handshake");
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut rank0_in).await;
+    send(
+        &mut rank0_out,
+        &batch("r0", vec![10], 1, None, Some((2, 1, 10, 100))),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    wait_until(|| {
+        server
+            .state
+            .shared
+            .engine
+            .client
+            .get()
+            .is_some_and(|client| !client.get_loads().loads.is_empty())
+    })
+    .await;
+
+    let loads = client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 2, 1), (1, 0, 0)]
+    );
+    let idle = client
+        .get_loads(ts::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = kv_events::LoadFromState(Arc::downgrade(&server.state));
+    let record = kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    drop(stream);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Under attention data parallelism a disaggregated request goes to the
 /// rank of its room's residue, the engine's own dispatch rule on both sides
 /// (the decode receiver looks for the KV on the prefill rank of that
@@ -2028,9 +2205,12 @@ async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_comp
 /// handshake, not the order or the identity it dialled in with: here the
 /// scheduler that dialled in as identity 0 declares rank 1. An aggregated
 /// request goes where its pin says, under the same numbering, and a pin
-/// outside the ranks is refused as the engine refuses it.
+/// outside the ranks is refused as the engine refuses it. A pin that
+/// disagrees with the room yields to it: the connection's first such request
+/// is the warning line with the request's fields, the second logs below WARN.
 #[tokio::test]
 async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
+    let logs = captured_logs();
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model_info());
@@ -2088,6 +2268,58 @@ async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
         assert_eq!(done.finish_reason, "stop");
         assert!(stream.message().bounded().await.unwrap().is_none());
     }
+
+    // A pin that disagrees with the room yields to it (rooms 9 and 11 are
+    // rank 1, the pin says 0): the connection's first such request is the
+    // WARN line with the request's fields, the second logs below WARN (the
+    // capture reads WARN and above).
+    let mut yielding = disaggregated_request("pinned-9", 9);
+    yielding.data_parallel_rank = Some(0);
+    let mut first_yield = client
+        .generate(yielding)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-9", Some(9))
+    );
+    let mut yielding_again = disaggregated_request("pinned-11", 11);
+    yielding_again.data_parallel_rank = Some(0);
+    let mut second_yield = client
+        .generate(yielding_again)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-11", Some(11))
+    );
+    send(&mut rank1_out, &answer("pinned-9", 0)).await;
+    send(&mut rank1_out, &answer("pinned-11", 0)).await;
+    for stream in [&mut first_yield, &mut second_yield] {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    let lines = logs.lines_containing("pinned-9");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    for field in [
+        "WARN",
+        "data_parallel_rank conflicts with the bootstrap_room residue",
+        "data_parallel_rank=0",
+        "bootstrap_room=9",
+        "dp_size=2",
+    ] {
+        assert!(lines[0].contains(field), "{field} in {}", lines[0]);
+    }
+    assert!(
+        logs.lines_containing("pinned-11").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("pinned-11")
+    );
 
     let mut outside = generate_request("pin-9", false, Vec::new());
     outside.data_parallel_rank = Some(9);
@@ -2851,6 +3083,82 @@ async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
     }
 }
 
+/// An encode worker has no scheduler: `GetLoads` answers no rank, as the
+/// Python servicer answers it, not a zero-filled entry per connected engine;
+/// the record the relay and the records-only stream read for the role is
+/// none, so a records-only subscription pushes nothing where a generate
+/// worker's (the control, read first) pushes its rank's record at the first
+/// tick.
+#[tokio::test]
+async fn an_encode_worker_reports_no_scheduler_load() {
+    use crate::kv_events::RankLoads;
+
+    let mut generate = harness(model_info(), None).await;
+    assert!(
+        generate.server.state.rank_load(Some(0)).is_some(),
+        "a generate worker's rank has a record"
+    );
+    let mut records = generate
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    let batch = tokio::time::timeout(Duration::from_secs(5), records.message())
+        .await
+        .expect("a generate worker's record in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert!(
+        batch.load.as_ref().is_some_and(|load| load.load_only),
+        "{batch:?}"
+    );
+    drop(records);
+    generate
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+
+    let mut h = harness_with_ready(encode_model_info(), None, encode_ready()).await;
+    let loads = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(
+        (loads.dp_rank_count, loads.loads.len()),
+        (0, 0),
+        "{loads:?}"
+    );
+    let aggregate = loads.aggregate.expect("an aggregate");
+    assert_eq!((aggregate.total_reqs, aggregate.avg_token_usage), (0, 0.0));
+    assert!(
+        h.server.state.rank_load(Some(0)).is_none() && h.server.state.rank_load(None).is_none(),
+        "no record for the role"
+    );
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .is_err(),
+        "nothing is pushed for the role"
+    );
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The encode role: the encoder service takes an `Encode`, the request
 /// reaches the worker under the wire's encode type as the engine's tagged
 /// `EncodeRequest` (the worker's own rendezvous, the room, the item with its
@@ -3080,4 +3388,132 @@ fn an_encode_launch_without_its_rendezvous_address_is_refused_before_the_start()
             "{host:?}: {error:?}"
         );
     }
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info(), None).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 100)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 100))),
+    )
+    .await;
+    first.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 100))),
+    )
+    .await;
+    second.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 100))),
+    )
+    .await;
+    second.message().bounded().await.unwrap().unwrap();
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 100))),
+    )
+    .await;
+    third.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 100))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

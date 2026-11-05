@@ -48,11 +48,20 @@ enum ScopeKey {
 
 /// What was actually debited for a reservation, kept around so
 /// settle/close/abandon know which buckets to touch (and, for settlement,
-/// how much to true up). Holding the buckets' `Arc`s is also what keeps the
+/// how much to true up): the tenant-global bucket, and the model rule's
+/// when one matched. Holding the buckets' `Arc`s is also what keeps the
 /// idle sweep off them until the reservation ends.
 struct ActiveReservation {
-    buckets: Vec<Arc<ScopeBucket>>,
+    global: Arc<ScopeBucket>,
+    rule: Option<Arc<ScopeBucket>>,
     reserved_tokens: u32,
+}
+
+impl ActiveReservation {
+    /// The buckets debited, in lock order.
+    fn buckets(&self) -> impl Iterator<Item = &Arc<ScopeBucket>> {
+        std::iter::once(&self.global).chain(self.rule.iter())
+    }
 }
 
 pub struct LocalRateLimitBackend {
@@ -186,7 +195,7 @@ impl LocalRateLimitBackend {
 
 #[async_trait]
 impl RateLimitBackend for LocalRateLimitBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         // Idempotent per request_charge_id: a retry reuses the same
         // charge_id and must not be debited twice. Claim the slot before
         // any bucket work so a duplicate (even concurrent) call just
@@ -200,30 +209,31 @@ impl RateLimitBackend for LocalRateLimitBackend {
         let policy = self.policy.load();
         let tenant_policy = policy.policy_for(&request.tenant_key);
 
-        let mut buckets: Vec<Arc<ScopeBucket>> = Vec::with_capacity(2);
+        // The tenant-global bucket, and the model rule's when one matches:
+        // at most two, held as a pair.
         let global_key = ScopeKey::TenantGlobal(request.tenant_key.clone());
-        buckets.push(self.bucket_for(global_key, tenant_policy.limits));
-
-        if let Some(model_id) = request.model_id.as_deref() {
-            if let Some(rule) = tenant_policy.matching_rule(model_id) {
+        let global = self.bucket_for(global_key, tenant_policy.limits);
+        let rule = request
+            .model_id
+            .and_then(|model_id| tenant_policy.matching_rule(model_id))
+            .map(|rule| {
                 let rule_key =
                     ScopeKey::ModelRule(request.tenant_key.clone(), rule.rule_id.clone());
-                buckets.push(self.bucket_for(rule_key, rule.limits));
-            }
-        }
+                self.bucket_for(rule_key, rule.limits)
+            });
 
         // Fixed lock order (tenant-global, then model-rule): every
         // reservation for the same tenant locks in this same order, so
         // this can never deadlock. Different tenants never share a bucket,
-        // so cross-tenant ordering doesn't matter.
-        let mut locked: Vec<_> = buckets.iter().map(|b| (b, b.lock())).collect();
-        for (bucket, guard) in &mut locked {
-            bucket.refill(guard);
-        }
+        // so cross-tenant ordering doesn't matter. Each lock refills its
+        // bucket from the clock read that stamps the touch.
+        let mut global_guard = global.lock_and_refill();
+        let mut rule_guard = rule.as_ref().map(|bucket| bucket.lock_and_refill());
 
         let tokens_needed = f64::from(request.estimated_input_tokens);
         let mut denied_retry_after: Option<u64> = None;
-        for (bucket, guard) in &locked {
+        let locked = std::iter::once((&global, &global_guard)).chain(rule.iter().zip(&rule_guard));
+        for (bucket, guard) in locked {
             let dry = bucket.dry_run(guard, tokens_needed, 1.0);
             if !dry.allowed {
                 denied_retry_after =
@@ -235,13 +245,16 @@ impl RateLimitBackend for LocalRateLimitBackend {
             return ReserveOutcome::Denied { retry_after_secs };
         }
 
-        for (bucket, guard) in &mut locked {
+        global.debit(&mut global_guard, tokens_needed, 1.0);
+        if let (Some(bucket), Some(guard)) = (&rule, rule_guard.as_mut()) {
             bucket.debit(guard, tokens_needed, 1.0);
         }
-        drop(locked);
+        drop(global_guard);
+        drop(rule_guard);
 
         active_entry.insert(ActiveReservation {
-            buckets,
+            global,
+            rule,
             reserved_tokens: request.estimated_input_tokens,
         });
 
@@ -255,11 +268,10 @@ impl RateLimitBackend for LocalRateLimitBackend {
         let actual_total =
             i64::from(usage.actual_input_tokens) + i64::from(usage.completion_tokens);
         let delta = (actual_total - i64::from(reservation.reserved_tokens)) as f64;
-        for bucket in &reservation.buckets {
-            let mut guard = bucket.lock();
-            // Refill first, or a later deferred refill can overshoot
+        for bucket in reservation.buckets() {
+            // Refilled first, or a later deferred refill can overshoot
             // capacity and clamp, silently erasing this delta.
-            bucket.refill(&mut guard);
+            let mut guard = bucket.lock_and_refill();
             bucket.settle_tokens(&mut guard, delta);
         }
     }
@@ -300,7 +312,7 @@ mod tests {
         CompiledPolicySet::compile(&yaml).unwrap()
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest {
+    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
         ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new(tenant),
@@ -504,7 +516,7 @@ mod tests {
         let req = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("gpt-4".to_string()),
+            model_id: Some("gpt-4"),
             estimated_input_tokens: 40,
         };
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
@@ -515,7 +527,7 @@ mod tests {
         let second = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("gpt-4".to_string()),
+            model_id: Some("gpt-4"),
             estimated_input_tokens: 20,
         };
         assert!(matches!(
@@ -528,7 +540,7 @@ mod tests {
         let other_model = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("claude-3".to_string()),
+            model_id: Some("claude-3"),
             estimated_input_tokens: 20,
         };
         assert_eq!(backend.reserve(other_model).await, ReserveOutcome::Admitted);
@@ -577,7 +589,7 @@ mod tests {
         };
         let backend = LocalRateLimitBackend::new(CompiledPolicySet::compile(&yaml).unwrap());
         let gpt4 = |tokens| ReserveRequest {
-            model_id: Some("gpt-4".to_string()),
+            model_id: Some("gpt-4"),
             ..request("ip:203.0.113.7", tokens)
         };
         let req = gpt4(1);
@@ -669,6 +681,17 @@ mod tests {
     /// keeps the sweep off it) or finds it gone and starts a fresh one: an
     /// admitted reservation always holds the bucket the map serves for its
     /// key, never one the sweep removed out from under it.
+    ///
+    /// In rounds, so the sweep gets its evictions on any host: the reserve
+    /// threads hammer the key while the sweep passes back to back, then
+    /// park past their last close, and a pass over the parked bucket must
+    /// leave the map empty; the next round's reserves start it afresh
+    /// under the sweep. A free-running sweep has to find the bucket free
+    /// at its scan and again at its `remove_if`, which three reserve
+    /// threads allow a few times in a hundred passes on a many-core host,
+    /// where a pass over the map's many shards takes tens of microseconds,
+    /// so a floor of a thousand evictions it must win on its own is a
+    /// floor on the host's scheduling, not on the backend.
     #[test]
     fn a_reserve_racing_the_sweep_never_debits_a_removed_bucket() {
         use std::{
@@ -679,53 +702,82 @@ mod tests {
         use futures::FutureExt;
 
         const TENANT: &str = "ip:203.0.113.7";
+        const RESERVE_THREADS: usize = 3;
+        const ROUNDS: usize = 1000;
+        const RESERVES_PER_ROUND: usize = 100;
         // Refills a one-token draw in nanoseconds, so the bucket is full,
         // and sweepable, almost whenever no reserve holds it.
         let backend = LocalRateLimitBackend::new(policy_set(u32::MAX, u32::MAX));
         let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
         let stop = AtomicBool::new(false);
-        let evicted = AtomicUsize::new(0);
+        let parked = AtomicUsize::new(0);
+        let rounds = AtomicUsize::new(0);
+        // The rounds are a fixed amount of work; this bounds a starved run.
         let deadline = Instant::now() + Duration::from_secs(10);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    let n = backend.sweep_idle_buckets(Duration::ZERO);
-                    evicted.fetch_add(n, Ordering::Relaxed);
+                    backend.sweep_idle_buckets(Duration::ZERO);
+                    if parked.load(Ordering::Acquire) == RESERVE_THREADS {
+                        // Every reserve thread is past its close, so nothing
+                        // holds the bucket and it has long refilled: this
+                        // pass, if not the one just made, drops it.
+                        backend.sweep_idle_buckets(Duration::ZERO);
+                        assert!(
+                            backend.buckets.is_empty(),
+                            "the sweep kept a full bucket no reservation holds"
+                        );
+                        parked.store(0, Ordering::Relaxed);
+                        rounds.fetch_add(1, Ordering::Release);
+                    }
+                    // A pass, then the core: on a host with fewer cores than
+                    // threads the reserve threads run between passes rather
+                    // than after the sweep's whole slice.
+                    std::thread::yield_now();
                 }
             });
-            for _ in 0..3 {
+            for _ in 0..RESERVE_THREADS {
                 scope.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
-                        let req = request(TENANT, 1);
-                        let charge_id = req.request_charge_id;
-                        // reserve/close never await, so one poll finishes them.
-                        let outcome = backend.reserve(req).now_or_never().unwrap();
-                        assert_eq!(outcome, ReserveOutcome::Admitted);
-                        {
-                            let held = backend.active.get(&charge_id).unwrap();
-                            let served = backend.buckets.get(&key);
-                            assert!(
-                                served.is_some_and(|b| Arc::ptr_eq(&held.buckets[0], b.value())),
-                                "an admitted reservation holds a bucket the map no longer serves"
-                            );
+                        let round = rounds.load(Ordering::Acquire);
+                        for _ in 0..RESERVES_PER_ROUND {
+                            let req = request(TENANT, 1);
+                            let charge_id = req.request_charge_id;
+                            // reserve/close never await, so one poll finishes them.
+                            let outcome = backend.reserve(req).now_or_never().unwrap();
+                            assert_eq!(outcome, ReserveOutcome::Admitted);
+                            {
+                                let held = backend.active.get(&charge_id).unwrap();
+                                let served = backend.buckets.get(&key);
+                                assert!(
+                                    served.is_some_and(|b| Arc::ptr_eq(&held.global, b.value())),
+                                    "an admitted reservation holds a bucket the map no longer serves"
+                                );
+                            }
+                            backend
+                                .close_reserved_only(charge_id)
+                                .now_or_never()
+                                .unwrap();
                         }
-                        backend
-                            .close_reserved_only(charge_id)
-                            .now_or_never()
-                            .unwrap();
+                        parked.fetch_add(1, Ordering::Release);
+                        while rounds.load(Ordering::Acquire) == round
+                            && !stop.load(Ordering::Relaxed)
+                        {
+                            std::thread::yield_now();
+                        }
                     }
                 });
             }
-            while evicted.load(Ordering::Relaxed) < 1000 && Instant::now() < deadline {
+            while rounds.load(Ordering::Relaxed) < ROUNDS && Instant::now() < deadline {
                 std::thread::yield_now();
             }
             stop.store(true, Ordering::Relaxed);
         });
 
         assert!(
-            evicted.load(Ordering::Relaxed) >= 1000,
-            "the sweep never got to race a reserve"
+            rounds.load(Ordering::Relaxed) >= ROUNDS,
+            "the reserve threads and the sweep did not get through {ROUNDS} rounds in 10 s"
         );
     }
 

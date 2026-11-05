@@ -16,17 +16,18 @@ use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
     VllmGenerateStream, ZmqEngineClient,
 };
-use futures::{stream::SelectAll, Stream};
+use futures::Stream;
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
-    stream::{poll_engine_item, Choice, RequestStream},
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
@@ -45,7 +46,67 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    log_request_line(&req);
     submit(state, client, req, trace_headers, arrival).await
+}
+
+/// The tracing target of the per-request line: a reader that wants it raises
+/// this target alone (`RUST_LOG=info,engine_servicer::request=debug`); the
+/// production filter leaves it off, and an event below the filter costs the
+/// enabled check and nothing else.
+pub(super) const REQUEST_LINE_TARGET: &str = "engine_servicer::request";
+
+/// Log the request as received, at DEBUG under [`REQUEST_LINE_TARGET`], in the
+/// words the Python servicer logs for every `Generate` at INFO: what a reader
+/// of a worker's log greps for (a PD side's media placement, the rank the
+/// gateway pinned). The line is formatted only when that target is enabled.
+pub(super) fn log_request_line(req: &vllm::GenerateRequest) {
+    if tracing::enabled!(target: REQUEST_LINE_TARGET, tracing::Level::DEBUG) {
+        tracing::debug!(target: REQUEST_LINE_TARGET, "{}", request_line(req));
+    }
+}
+
+/// One line describing a `Generate` request as received, in the Python
+/// servicer's words: the input kind by its field name, whether it streams,
+/// whether a multimodal batch carries tensors the preprocessed path can use
+/// (pixels or model-specific tensors; a PD decode side built from the
+/// prefill's identity carries its grid tensors and so reads
+/// `preprocessed_mm=True, media_refs=0`, while a bare payload of hashes alone
+/// does not count), the count of worker-side media references, and the
+/// data-parallel rank the
+/// gateway pinned (`None` when it pinned none). Booleans and the absent rank
+/// spell as Python does, so the same log readers serve both servicers.
+pub(super) fn request_line(req: &vllm::GenerateRequest) -> String {
+    let input_type = match req.input {
+        Some(vllm::generate_request::Input::Tokenized(_)) => "tokenized",
+        Some(vllm::generate_request::Input::Text(_)) => "text",
+        None => "None",
+    };
+    let preprocessed_mm = req
+        .mm_inputs
+        .iter()
+        .chain(req.extra_mm_inputs.iter())
+        .any(|batch| batch.pixel_values.is_some() || !batch.model_specific_tensors.is_empty());
+    let media_refs = req.media_refs.as_ref().map_or(0, |refs| refs.items.len());
+    let dp_rank = req
+        .data_parallel_rank
+        .map_or_else(|| "None".to_string(), |rank| rank.to_string());
+    format!(
+        "Generate request {}: input_type={input_type}, stream={}, preprocessed_mm={}, \
+         media_refs={media_refs}, dp_rank={dp_rank}",
+        req.request_id,
+        python_bool(req.stream),
+        python_bool(preprocessed_mm),
+    )
+}
+
+/// A boolean as Python's logger spells it.
+fn python_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 /// The rejection notice a refused PD decode side owes its prefill side, so the
@@ -258,12 +319,12 @@ async fn submit(
         .iter()
         .find(|sub| sub.index() == 0)
         .or_else(|| subs.first())
-        .map_or(0, rank_of);
-    state.loads.submitted(rank, &request_id, prompt_tokens);
-    let loads = LoadsGuard {
-        state: Arc::clone(state),
-        request_id: request_id.clone(),
-    };
+        .map_or(0, |sub| rank_of(sub.engine_index()));
+    state
+        .shared
+        .loads
+        .submitted(rank, &request_id, prompt_tokens);
+    let loads = PendingGuard::new(Arc::clone(state), &request_id);
     let metrics = state.shared.metrics.request(
         arrival,
         u32::try_from(rank).ok(),
@@ -271,7 +332,7 @@ async fn submit(
         max_tokens,
         n,
     );
-    let mut choices = SelectAll::new();
+    let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
         let decoder = match &decoder {
@@ -294,28 +355,6 @@ async fn submit(
     ))
 }
 
-/// The data-parallel rank a choice's engine request went to, as the load
-/// tracker and `GetLoads` name it (an engine whose identity names no index
-/// counts as the first).
-fn rank_of(sub: &VllmGenerateStream) -> i32 {
-    sub.engine_index()
-        .and_then(|index| i32::try_from(index).ok())
-        .unwrap_or(0)
-}
-
-/// Takes the request out of the load tracker's queue when the stream ends,
-/// in case the engine never started it.
-struct LoadsGuard {
-    state: Arc<State>,
-    request_id: String,
-}
-
-impl Drop for LoadsGuard {
-    fn drop(&mut self) {
-        self.state.loads.finished(&self.request_id);
-    }
-}
-
 /// One choice of a generate request: the ZMQ-mapped stream plus the string
 /// stop matcher the engine cannot run itself.
 struct ChoiceStream {
@@ -333,8 +372,6 @@ struct ChoiceStream {
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
-    /// Whether this request's prompt went into the load tracker.
-    prompt_counted: bool,
     /// This choice's observation of the request's metrics.
     metrics: ChoiceMetrics,
     /// A PD prefill side's account of the media it processed, stamped on
@@ -342,9 +379,9 @@ struct ChoiceStream {
     media_identity: Option<Arc<vllm::MediaIdentity>>,
     /// The request this choice belongs to, for the load tracker.
     request_id: String,
-    /// The rank this choice's engine request went to, whose figures the
-    /// load tracker credits its prompt and tokens to.
-    rank: i32,
+    /// This choice's share of the load tracker's bookkeeping; its prefill
+    /// sample comes from the wire's engine timing, so its probe stays unarmed.
+    load: ChoiceLoad,
 }
 
 impl ChoiceStream {
@@ -362,33 +399,18 @@ impl ChoiceStream {
         Self {
             media_identity,
             request_id,
-            rank: rank_of(&inner),
+            load: ChoiceLoad::new(
+                rank_of(inner.engine_index()),
+                inner.index(),
+                PrefillProbe::default(),
+            ),
             state,
             inner: Some(inner),
             stops: StopMatcher::new(decoder, min_tokens),
             streaming,
             pending: None,
-            prompt_counted: false,
             metrics,
         }
-    }
-
-    /// Tell the load tracker, once per request (every choice of an `n > 1`
-    /// fan-out reports the same prompt), that the engine started it and how
-    /// much of the prompt was cached.
-    fn count_prompt(&mut self, prompt_tokens: u32, cached_tokens: u32) {
-        if self.prompt_counted || prompt_tokens == 0 {
-            return;
-        }
-        if self.inner.as_ref().is_some_and(|inner| inner.index() == 0) {
-            self.state.loads.first_output(
-                self.rank,
-                &self.request_id,
-                prompt_tokens,
-                cached_tokens,
-            );
-        }
-        self.prompt_counted = true;
     }
 
     /// A terminal response with the request's media identity on it, when
@@ -458,6 +480,7 @@ type ChoiceItem = Result<vllm::GenerateResponse, Status>;
 impl Stream for ChoiceStream {
     type Item = ChoiceItem;
 
+    /// Forward engine output and account for input capacity before frontend stop handling.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
@@ -471,6 +494,16 @@ impl Stream for ChoiceStream {
                 ControlFlow::Continue(item) => item,
                 ControlFlow::Break(poll) => return poll,
             };
+            if let Some((tokens, start, end)) = this
+                .inner
+                .as_mut()
+                .and_then(|inner| inner.take_prefill_sample())
+            {
+                this.state
+                    .shared
+                    .loads
+                    .prefill_computed(this.load.rank(), tokens, start, end);
+            }
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` (or an empty response)
@@ -483,7 +516,13 @@ impl Stream for ChoiceStream {
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
-                    this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
+                    this.load.count_prompt(
+                        &this.state.shared.loads,
+                        &this.request_id,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                        Instant::now(),
+                    );
                     this.metrics.complete(
                         &complete.finish_reason,
                         complete.prompt_tokens,
@@ -497,14 +536,21 @@ impl Stream for ChoiceStream {
                 }
                 return Poll::Ready(Some(Ok(response)));
             };
-            this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
             let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
             // The metrics' clock read serves the load tracker's window too.
             let at = this
                 .metrics
                 .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
                 .unwrap_or_else(Instant::now);
-            this.state.loads.generated_at(this.rank, tokens, at);
+            let loads = &this.state.shared.loads;
+            this.load.count_prompt(
+                loads,
+                &this.request_id,
+                chunk.prompt_tokens,
+                chunk.cached_tokens,
+                at,
+            );
+            this.load.generated(loads, tokens, at);
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {

@@ -17,9 +17,11 @@ on:
       - model_gateway/src/service_discovery/**
       - model_gateway/src/mesh/discovery/**
       # The start/skip gating for both discoveries now lives in `startup`,
-      # and `main` owns the CLI -> discovery-config conversion feeding it.
+      # and `cli/configure.rs` owns the CLI -> discovery-config conversion
+      # feeding it.
       - model_gateway/src/server.rs
       - model_gateway/src/main.rs
+      - model_gateway/src/cli/configure.rs
       - model_gateway/src/config/**
       # What a discovered worker becomes: its endpoint, and the workflow that
       # registers it.
@@ -44,10 +46,6 @@ on:
 permissions:
   contents: read
 
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-
 jobs:
   build:
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
@@ -57,8 +55,6 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-        with:
-          sccache-version: 'v0.10.0'
 
       - name: Build smg and mock-worker
         run: |

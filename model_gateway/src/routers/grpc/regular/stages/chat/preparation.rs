@@ -119,6 +119,13 @@ pub(crate) async fn prepare_chat_like(
         .await?;
         let media_order = media.media_order;
 
+        // The model's provider profile, derived once for the request, before
+        // the render that reads it (the thinking the prompt is rendered with);
+        // the stages after this one read it from the state (the output
+        // budget, the constraint's tool-call reading, the response spec).
+        let provider = ProviderProfile::for_model(&request.model);
+        ctx.state.provider = Some(provider);
+
         // Step 2: Process messages and apply chat template
         let (processed_messages, prompt_encoding) =
             match utils::process_chat_messages_with_placeholders(
@@ -126,6 +133,7 @@ pub(crate) async fn prepare_chat_like(
                 &*tokenizer,
                 media.placeholders(),
                 media_order,
+                provider,
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
@@ -166,16 +174,13 @@ pub(crate) async fn prepare_chat_like(
         // (`reading::prepare`). Only the chat stage chooses a parser:
         // transcription, which shares this preparation, keeps the legacy
         // parsers.
-        // The model's provider profile, derived once for the request: the
-        // stages after this one read it from the state (the output budget,
-        // the constraint's tool-call reading, the response spec).
-        let provider = ProviderProfile::for_model(&request.model);
-        ctx.state.provider = Some(provider);
         let reading::Prepared {
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,
             keeps_special_tokens: preserve_reasoning_special_tokens,
             names: parser_names,
+            prompt_thought,
+            reading,
         } = reading::prepare(
             ctx,
             symphony::Asks::Chat(request),
@@ -192,6 +197,8 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
+        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(
             request,

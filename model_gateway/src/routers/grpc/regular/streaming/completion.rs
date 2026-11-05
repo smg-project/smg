@@ -314,7 +314,9 @@ impl<'a> CompletionStream<'a> {
             self.total_cached = self.total_cached.max(chunk.cached_tokens());
             self.reasoning_tokens
                 .insert(index, chunk.reasoning_tokens());
-            self.total_completion.record_local_stop(index);
+            // The tracker keys by the engine's own choice index, as its
+            // chunks and Completes do; `index` is the client's.
+            self.total_completion.record_local_stop(chunk.index());
 
             if let Some(sfx) = self.spec.suffix.as_deref() {
                 StreamingProcessor::send_completion_chunk(

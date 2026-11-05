@@ -13,7 +13,10 @@ use engine_zmq_client::{
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
-        output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
+        output::{
+            EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
+            StopReason,
+        },
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
@@ -97,9 +100,14 @@ pub struct VllmGenerateStream {
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    scheduled_at: Option<f64>,
+    prefill_sample: Option<(u32, f64, f64)>,
+    prefill_sampled: bool,
+    prefill_preempted: bool,
 }
 
 impl VllmGenerateStream {
+    /// Start one choice with no observed timing or capacity sample.
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
@@ -116,7 +124,17 @@ impl VllmGenerateStream {
             first_prompt_token,
             input_logprobs_emitted: false,
             pending: None,
+            scheduled_at: None,
+            prefill_sample: None,
+            prefill_sampled: false,
+            prefill_preempted: false,
         }
+    }
+
+    /// Consume one actual computed-token sample and its engine-clock interval.
+    /// Initial queueing is excluded; preempted requests have no reliable interval.
+    pub fn take_prefill_sample(&mut self) -> Option<(u32, f64, f64)> {
+        self.prefill_sample.take()
     }
 
     /// The choice `index` stamped on this stream's responses.
@@ -203,10 +221,37 @@ impl MappedGenerateStream for VllmGenerateStream {
         &mut self.pending
     }
 
+    /// Map a step while retaining its first valid prefill timing for the servicer.
+    /// Scheduling events require vLLM `log_stats`; missing events yield no sample.
     fn map_output(
         &mut self,
         output: EngineCoreOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        for event in output.events.iter().flatten() {
+            match event.r#type {
+                EngineCoreEventType::Scheduled if self.scheduled_at.is_none() => {
+                    self.scheduled_at = Some(event.timestamp);
+                }
+                EngineCoreEventType::Preempted => self.prefill_preempted = true,
+                _ => {}
+            }
+        }
+        if !self.prefill_sampled {
+            if let Some(stats) = &output.prefill_stats {
+                self.prefill_sampled = true;
+                if !self.prefill_preempted
+                    && !matches!(
+                        output.finish_reason,
+                        Some(EngineCoreFinishReason::Abort | EngineCoreFinishReason::Error)
+                    )
+                {
+                    self.prefill_sample = self
+                        .scheduled_at
+                        .zip(output.batch_timestamp)
+                        .map(|(start, end)| (stats.num_computed_tokens, start, end));
+                }
+            }
+        }
         let top_k = self.top_logprobs;
         let state = &mut self.state;
         if let Some(stats) = &output.prefill_stats {
@@ -238,14 +283,22 @@ impl MappedGenerateStream for VllmGenerateStream {
                 }
             }
         }
-        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
-            token_logprobs: tick_logprobs_val.clone(),
-            token_ids: tick_logprobs_idx.clone(),
-            top_logprobs: tick_top_logprobs.clone(),
+        // The tick's columns go into the chunk as they are; the history the
+        // terminal `Complete` drains is extended from them.
+        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then_some(vllm::OutputLogProbs {
+            token_logprobs: tick_logprobs_val,
+            token_ids: tick_logprobs_idx,
+            top_logprobs: tick_top_logprobs,
         });
-        state.output_logprobs_val.extend(tick_logprobs_val);
-        state.output_logprobs_idx.extend(tick_logprobs_idx);
-        state.output_top_logprobs.extend(tick_top_logprobs);
+        if let Some(tick) = &chunk_logprobs {
+            state
+                .output_logprobs_val
+                .extend_from_slice(&tick.token_logprobs);
+            state.output_logprobs_idx.extend_from_slice(&tick.token_ids);
+            state
+                .output_top_logprobs
+                .extend(tick.top_logprobs.iter().cloned());
+        }
 
         // Prompt logprobs accumulate the same way (chunked prefill delivers
         // them incrementally); entry 0 per position is the actual prompt

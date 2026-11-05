@@ -21,8 +21,8 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
-    completion::CompletionRequest,
+    common::{GenerationRequest, InputIds},
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
@@ -39,6 +39,7 @@ use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
     stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
+    tenant_rate_limit::{self, TenantCharge},
 };
 use crate::{
     config::types::RetryConfig,
@@ -49,6 +50,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -170,7 +172,6 @@ impl From<PrefillAcquireError<Box<PairFailure>>> for PdSelectionFailure {
     }
 }
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -179,6 +180,21 @@ pub struct PDRouter {
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
     moriio_dp_turn: AtomicUsize,
+    /// The tenant rate limiter, when configured: every route that charges a
+    /// tenant reserves through it before its first dispatch
+    /// (`tenant_rate_limit::reserve`).
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("retry_config", &self.retry_config)
+            .field("prefill_admission", &self.prefill_admission)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Who records the prefill side's outcome for an attempt: the attempt, from
@@ -284,7 +300,11 @@ impl PdRoute for CompletionRequest {
 
     fn batch_size(&self) -> Option<usize> {
         match &self.prompt {
-            StringOrArray::Array(arr) if !arr.is_empty() => Some(arr.len()),
+            CompletionPrompt::Texts(_) | CompletionPrompt::TokenIdBatches(_)
+                if !self.prompt.is_empty() =>
+            {
+                Some(self.prompt.len())
+            }
             _ => None,
         }
     }
@@ -294,11 +314,14 @@ impl PdRoute for CompletionRequest {
     }
 
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
-        let text = match &self.prompt {
-            StringOrArray::String(s) => Some(s.clone()),
-            StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-        };
-        (text, None)
+        match &self.prompt {
+            CompletionPrompt::Text(s) => (Some(s.clone()), None),
+            CompletionPrompt::Texts(v) => (v.first().map(|s| s.to_string()), None),
+            // A prompt of ids routes on them, as `/generate`'s does; a batch
+            // is dispatched to one worker, so its first prompt is the signal.
+            CompletionPrompt::TokenIds(ids) => (None, Some(ids.clone())),
+            CompletionPrompt::TokenIdBatches(batches) => (None, batches.first().cloned()),
+        }
     }
 }
 
@@ -434,6 +457,7 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
@@ -576,10 +600,12 @@ impl PDRouter {
     }
 
     /// Every PD route: the routing derivatives and the request context from
-    /// the request, then the dual dispatch.
-    async fn route_pd<R: PdRoute + Serialize>(
+    /// the request, then the dual dispatch under the tenant's reservation
+    /// (`tenant_meta`: the routes that charge a tenant).
+    async fn route_pd<R: PdRoute + TenantCharge + Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         body: R,
         model_id: &str,
     ) -> Response {
@@ -605,13 +631,19 @@ impl PDRouter {
             model_id,
             headers: headers.cloned(),
         };
-        self.execute_dual_dispatch(headers, body, routing, context)
+        self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
     }
 
-    async fn execute_dual_dispatch<T: Serialize>(
+    /// The dual dispatch of one request, retried as the model's retry config
+    /// allows. With `tenant_meta` and the tenant rate limiter on, the request
+    /// reserves its estimate once, before any dispatch, and the one answer
+    /// the dispatch paths converge on resolves the reservation once
+    /// (`tenant_rate_limit`), as the regular HTTP router's typed route does.
+    async fn execute_dual_dispatch<T: TenantCharge + Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         original_request: T,
         routing: RoutingDerivatives,
         mut context: PDRequestContext<'_>,
@@ -619,6 +651,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        let is_stream = context.is_stream;
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not.
@@ -644,6 +677,18 @@ impl PDRouter {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // The estimate reads the body, not the routing text: a text-reading
+        // policy routes a completions batch on its first prompt alone
+        // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
+        let (reservation, denial) = tenant_rate_limit::reserve(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &original_request,
+            model,
+            None,
+        )
+        .await;
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -652,7 +697,9 @@ impl PDRouter {
             ReleasePoint::from_retry_config(retry_config),
         );
 
-        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+        let response = if let Some(denied) = denial {
+            denied
+        } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
@@ -700,6 +747,18 @@ impl PDRouter {
             )
             .await
         };
+
+        // The reservation resolves on the one answer both dispatch paths
+        // converge on. A buffered answer is the decode side's body, held
+        // whole already (read without a bound), so the re-read is unbounded.
+        let response = tenant_rate_limit::resolve(
+            reservation.as_ref(),
+            route,
+            is_stream,
+            response,
+            usize::MAX,
+        )
+        .await;
 
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
@@ -2634,35 +2693,42 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, super::chat_for_upstream(body), model_id)
-            .await
+        self.route_pd(
+            headers,
+            Some(tenant_meta),
+            super::chat_for_upstream(body),
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_messages_count_tokens(
@@ -2802,21 +2868,23 @@ impl RouterTrait for PDRouter {
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, Some(tenant_meta), body, model_id)
+            .await
     }
 
     async fn route_rerank(
@@ -2826,7 +2894,7 @@ impl RouterTrait for PDRouter {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, None, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -2862,7 +2930,7 @@ mod tests {
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
         middleware::ReportedRefusal,
-        observability::logging::test_support::test_subscriber,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
         test_support::RefusedAddress,
@@ -3027,6 +3095,12 @@ mod tests {
         assert_eq!(prompt.batch_size(), None);
         assert!(!prompt.returns_logprob());
         assert_eq!(prompt.routing_inputs(), (Some("only".to_string()), None));
+        let ids: CompletionRequest = req(json!({"model": "m", "prompt": [11, 12, 13]}));
+        assert_eq!(ids.batch_size(), None);
+        assert_eq!(ids.routing_inputs(), (None, Some(vec![11, 12, 13])));
+        let batches: CompletionRequest = req(json!({"model": "m", "prompt": [[11, 12], [13]]}));
+        assert_eq!(batches.batch_size(), Some(2));
+        assert_eq!(batches.routing_inputs(), (None, Some(vec![11, 12])));
 
         let rerank: RerankRequest = req(json!({"model": "m", "query": "q", "documents": ["d"]}));
         assert_eq!(RerankRequest::ROUTE, "/v1/rerank");
@@ -3056,6 +3130,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
+            rate_limit_manager: None,
         }
     }
 
@@ -5879,7 +5954,7 @@ mod tests {
         };
 
         let response = router
-            .execute_dual_dispatch(None, request, RoutingDerivatives::default(), context)
+            .execute_dual_dispatch(None, None, request, RoutingDerivatives::default(), context)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -6877,28 +6952,6 @@ mod tests {
         );
         assert!(decode.circuit_breaker_can_execute());
         assert!(prefill.circuit_breaker_can_execute());
-    }
-
-    /// Counts, on this thread's subscriber, the ERROR events and the refusal
-    /// lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// The sequential shape's pair: a prefill engine of the handoff kind (its

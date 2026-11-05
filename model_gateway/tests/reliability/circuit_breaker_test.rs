@@ -17,16 +17,30 @@ use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 mod circuit_breaker_tests {
     use super::*;
 
-    /// Test that circuit breaker opens after consecutive failures
+    /// One worker that fails every request, a breaker that trips at three failures and stays
+    /// open longer than the test runs, and one attempt per request, so that the sequence a
+    /// client sees is the breaker's own: the first three answers are the worker's 500, every
+    /// one after them the open breaker's 503, and the worker is never asked again. With the
+    /// default retries every request would retry its 500 and then the 503, and end as 503, so
+    /// the 500 the breaker counts would never reach the client.
     #[tokio::test]
     async fn test_circuit_breaker_opens_after_failures() {
-        let config = TestRouterConfig::round_robin_with_circuit_breaker(
+        const THRESHOLD: u32 = 3;
+        const REQUESTS: usize = 10;
+        let config = TestRouterConfig::round_robin_with_reliability(
             3200,
+            RetryConfig {
+                max_retries: 1,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            },
             CircuitBreakerConfig {
-                failure_threshold: 3,
+                failure_threshold: THRESHOLD,
                 success_threshold: 2,
-                timeout_duration_secs: 2,
-                window_duration_secs: 10,
+                timeout_duration_secs: 60,
+                window_duration_secs: 60,
             },
         );
 
@@ -38,11 +52,8 @@ mod circuit_breaker_tests {
 
         let app = ctx.create_app();
 
-        // Make requests until we see failures (500) and then circuit breaker opens (503)
-        let mut saw_500 = false;
-        let mut saw_503 = false;
-
-        for _ in 0..10 {
+        let mut statuses = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
             let payload = json!({
                 "text": "Test circuit breaker",
                 "stream": false
@@ -55,18 +66,21 @@ mod circuit_breaker_tests {
                 .body(Body::from(serde_json::to_string(&payload).unwrap()))
                 .unwrap();
 
-            let resp = app.clone().oneshot(req).await.unwrap();
-            match resp.status() {
-                StatusCode::INTERNAL_SERVER_ERROR => saw_500 = true,
-                StatusCode::SERVICE_UNAVAILABLE => saw_503 = true,
-                _ => {}
-            }
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
         }
 
-        // Should see 500 (worker error) and eventually 503 (circuit breaker open)
+        let (before_the_trip, after_the_trip) = statuses.split_at(THRESHOLD as usize);
         assert!(
-            saw_500 || saw_503,
-            "Should see either 500 (worker error) or 503 (circuit breaker open)"
+            before_the_trip
+                .iter()
+                .all(|status| *status == StatusCode::INTERNAL_SERVER_ERROR),
+            "the first {THRESHOLD} answers are the worker's own failures: {statuses:?}"
+        );
+        assert!(
+            after_the_trip
+                .iter()
+                .all(|status| *status == StatusCode::SERVICE_UNAVAILABLE),
+            "after {THRESHOLD} failures the breaker is open and every answer is its 503: {statuses:?}"
         );
 
         ctx.shutdown().await;

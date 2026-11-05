@@ -28,6 +28,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{Array2, Array3};
 
 use crate::{
+    buffer_pool,
     encoder_inputs::{EncoderDtype, EncoderInput, PixelNorm},
     pixel_convert::WireWriter,
     types::RgbFrameRef,
@@ -177,6 +178,10 @@ pub(super) fn pixel_norm(
         channel_block,
     }
 }
+
+/// The planar scratch of one sub-patch on the stack: three channel planes of
+/// a patch of up to 32 pixels a side (3 KiB).
+const PLANES_SCRATCH: usize = 3 * 32 * 32;
 
 fn dispatch_patch_blocks<T: Send + Sync>(
     region: &mut [T],
@@ -1278,7 +1283,7 @@ impl QwenVLProcessorBase {
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
-    fn plan_image_batch(&self, images: &[DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
+    fn plan_image_batch(&self, images: &[&DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
@@ -1355,7 +1360,7 @@ impl QwenVLProcessorBase {
     /// themselves, [`preprocess`](VisionPreProcessor::preprocess)'s form).
     fn preprocess_into_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         let batch = match self.plan_image_batch(images) {
@@ -1365,7 +1370,9 @@ impl QwenVLProcessorBase {
         let writer = WireWriter::new(&batch.norm, dtype)?;
         let element_size = writer.element_size();
         let wire_len = batch.total_patch_values * element_size;
-        let mut wire: Vec<u8> = vec![0u8; wire_len];
+        // A pooled buffer: its bytes are a previous request's until the
+        // bands below, which cover it exactly, are written.
+        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1373,6 +1380,7 @@ impl QwenVLProcessorBase {
             bands.push(band);
             remaining = rest;
         }
+        debug_assert!(remaining.is_empty(), "the image bands cover the wire");
         let filter = batch.filter;
         let writer = &writer;
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
@@ -1536,8 +1544,16 @@ impl QwenVLProcessorBase {
         // rows split into their channel runs with the vector loads of the
         // byte layout, then each plane converted in one run (not a row's
         // worth at a time) into its first temporal copy, which the other
-        // copies repeat.
-        let mut planes = vec![0u8; 3 * plane];
+        // copies repeat. The scratch lives on the stack (three planes of a
+        // patch of up to 32 pixels a side); a wider patch allocates it.
+        let mut planes_on_stack = [0u8; PLANES_SCRATCH];
+        let mut planes_on_heap = Vec::new();
+        let planes: &mut [u8] = if 3 * plane <= PLANES_SCRATCH {
+            &mut planes_on_stack[..3 * plane]
+        } else {
+            planes_on_heap.resize(3 * plane, 0);
+            &mut planes_on_heap
+        };
         for (bi, chunk) in band.chunks_mut(block_bytes).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
@@ -1592,7 +1608,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let batch = self.plan_image_batch(images)?;
         let ImageBatchPlan {
@@ -1606,8 +1622,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let image_plans = &batch.plans;
 
         // Each image owns a disjoint band of the patch buffer, so the images
-        // resize and patchify in parallel.
-        let mut all_patches: Vec<u8> = vec![0u8; total_patch_values];
+        // resize and patchify in parallel. A pooled buffer: its bytes are a
+        // previous request's until the bands, which cover it exactly, are
+        // written.
+        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1615,6 +1633,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             bands.push(band);
             remaining = rest;
         }
+        debug_assert!(
+            remaining.is_empty(),
+            "the image bands cover the patch buffer"
+        );
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
         // One image's resize and patch layout into its band: the work of one
         // task, whether it runs here or on the pool.
@@ -1695,7 +1717,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.preprocess_into_wire(images, dtype)
@@ -1713,7 +1735,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let (width, height) = frames[0].dimensions();
         let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0u8; plan.output_values];
+        // A pooled buffer, written end to end by the chunks below.
+        let mut all_patches = buffer_pool::take(plan.output_values);
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {
@@ -1773,7 +1796,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0u8; plan.output_values];
+        // A pooled buffer, written end to end by the bands below.
+        let mut all_patches = buffer_pool::take(plan.output_values);
         for frame in frames {
             let expected_len = (frame.width as usize)
                 .checked_mul(frame.height as usize)
@@ -1963,13 +1987,15 @@ mod tests {
             };
             let processor = build(&config);
             assert!(processor.supports_per_image_preprocessing());
-            let images = vec![
+            let images = [
                 create_sized_pattern_frame(7, 9, 3),
                 create_sized_pattern_frame(12, 6, 42),
                 create_sized_pattern_frame(8, 8, 250),
             ];
 
-            let batched = processor.preprocess(&images).unwrap();
+            let batched = processor
+                .preprocess(&images.iter().collect::<Vec<_>>())
+                .unwrap();
 
             let layouts = std::collections::HashMap::from([
                 ("image_grid_thw".to_string(), FieldLayout::Batched),
@@ -1977,7 +2003,7 @@ mod tests {
             ]);
             let parts = images
                 .iter()
-                .map(|image| processor.preprocess(std::slice::from_ref(image)).unwrap())
+                .map(|image| processor.preprocess(&[image]).unwrap())
                 .collect::<Vec<_>>();
             let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
 
@@ -2177,7 +2203,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let result = processor.preprocess(std::slice::from_ref(&image)).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
         let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
@@ -2671,14 +2697,15 @@ mod wire_tests {
         ];
         for processor in &processors {
             for images in &batches {
-                let two_pass = processor.preprocess(images).unwrap();
+                let images: Vec<&DynamicImage> = images.iter().collect();
+                let two_pass = processor.preprocess(&images).unwrap();
                 for dtype in [
                     EncoderDtype::BFloat16,
                     EncoderDtype::Float16,
                     EncoderDtype::Float32,
                 ] {
                     let wire = processor
-                        .preprocess_wire(images, dtype)
+                        .preprocess_wire(&images, dtype)
                         .expect("the Qwen base writes wires")
                         .unwrap();
                     assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
@@ -2700,9 +2727,139 @@ mod wire_tests {
                     );
                 }
                 assert!(processor
-                    .preprocess_wire(images, EncoderDtype::Uint8)
+                    .preprocess_wire(&images, EncoderDtype::Uint8)
                     .is_none());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use image::{DynamicImage, RgbImage};
+
+    use super::*;
+    use crate::{
+        buffer_pool::{self, BufferPool, SENTINEL},
+        encoder_inputs::EncoderDtype,
+    };
+
+    fn config() -> QwenVLConfig {
+        QwenVLConfig {
+            patch_size: 14,
+            merge_size: 2,
+            min_pixels: 256 * 28 * 28,
+            max_pixels: 1280 * 28 * 28,
+            video_min_pixels: 256 * 28 * 28,
+            video_max_pixels: 1280 * 28 * 28,
+            video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            temporal_patch_size: 2,
+            mean: [0.5, 0.5, 0.5],
+            std: [0.5, 0.5, 0.5],
+            model_name: "test-qwen-vl",
+        }
+    }
+
+    fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                ((seed + x * 7 + y * 3) % 256) as u8,
+                ((seed + x * 5 + y * 11) % 256) as u8,
+                ((seed + x + y * 2) % 256) as u8,
+            ])
+        }))
+    }
+
+    /// A pooled buffer holds a previous request's bytes, so the band writers
+    /// must write every byte they are given: a band primed with the sentinel
+    /// ends up equal to a zeroed one, on the wire path in both float widths
+    /// and on the patch-bytes path.
+    #[test]
+    fn the_band_writers_write_every_byte_of_their_band() {
+        let processor = QwenVLProcessorBase::new(config());
+        // 448x448 is the smallest size the rule accepts: no resize.
+        let image = gradient(448, 448, 3);
+        let batch = processor.plan_image_batch(&[&image]).expect("planned");
+        let plan = &batch.plans[0];
+        assert!(!plan.needs_resize);
+        for dtype in [EncoderDtype::Float32, EncoderDtype::BFloat16] {
+            let writer = WireWriter::new(&batch.norm, dtype).expect("a float writer");
+            let len = plan.patch_values * writer.element_size();
+            let mut zeroed = vec![0u8; len];
+            let mut primed = vec![SENTINEL; len];
+            for band in [&mut zeroed, &mut primed] {
+                processor
+                    .patchify_image_rgb_wire_into(&image, plan.grid_h, plan.grid_w, band, &writer)
+                    .expect("written");
+            }
+            assert!(
+                zeroed == primed,
+                "{dtype}: a byte of the wire band was left unwritten"
+            );
+        }
+        let mut zeroed = vec![0u8; plan.patch_values];
+        let mut primed = vec![SENTINEL; plan.patch_values];
+        for band in [&mut zeroed, &mut primed] {
+            let mut written = 0;
+            processor
+                .patchify_image_rgb_into(&image, plan.grid_h, plan.grid_w, band, &mut written)
+                .expect("written");
+            assert_eq!(written, plan.patch_values);
+        }
+        assert!(
+            zeroed == primed,
+            "a byte of the patch band was left unwritten"
+        );
+    }
+
+    /// The whole preprocess on a pooled buffer: the second run takes the
+    /// buffer the first one returned and writes the same bytes into it.
+    #[test]
+    fn a_preprocess_reuses_the_returned_buffer_and_writes_the_same_bytes() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let processor = QwenVLProcessorBase::new(config());
+            let image = gradient(448, 448, 5);
+            let wire = |processor: &QwenVLProcessorBase| {
+                processor
+                    .preprocess_wire(&[&image], EncoderDtype::Float32)
+                    .expect("one-pass")
+                    .expect("preprocessed")
+                    .encoder_input
+                    .into_bytes_as(EncoderDtype::Float32)
+                    .expect("the wire moves out")
+            };
+            let first = wire(&processor);
+            let address = first.as_ptr();
+            let reference = first.clone();
+            buffer_pool::recycle(first);
+            let second = wire(&processor);
+            assert_eq!(
+                second.as_ptr(),
+                address,
+                "the second run took the first run's buffer"
+            );
+            assert!(second == reference, "the bytes differ on the reused buffer");
+            let patches = |processor: &QwenVLProcessorBase| {
+                processor
+                    .preprocess(&[&image])
+                    .expect("preprocessed")
+                    .encoder_input
+                    .into_bytes_as(EncoderDtype::Uint8)
+                    .expect("the patch bytes")
+            };
+            let first = patches(&processor);
+            let held = MINE.held();
+            assert!(held > 0, "the patch buffer came back to the pool");
+            let reference = first.clone();
+            buffer_pool::recycle(first);
+            let second = patches(&processor);
+            assert_eq!(
+                MINE.held(),
+                held,
+                "the second run took and returned pooled buffers"
+            );
+            assert!(second == reference, "the bytes differ on the reused buffer");
+        });
     }
 }

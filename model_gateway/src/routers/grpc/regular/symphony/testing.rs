@@ -272,6 +272,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
         forbids_calls: false,
+        past_the_end: false,
     };
     let mut events = Events::new();
     let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");

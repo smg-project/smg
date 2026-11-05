@@ -124,8 +124,8 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// none when several do, so an entry does not outlive its cause on the cases
 /// another entry names), and when the tree holds its
 /// set and no loaded case is under it; the entries of a benchmark set the
-/// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
-/// alone, an id of one of its cases among them.
+/// tree omits (`bellwether unpack --sample-sets` writes one set in N, picked
+/// by its id) are left alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -164,48 +164,38 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v3.2-exp/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
+        "deepseek-v3.2-exp/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed, with \
+         the end token; the gateway continues it, the message's text after the generation \
+         header, as the serving engine's prefix append does (smg-project/smg#2434, the rule \
+         of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/text-developer-role",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the serving engine does for this architecture, which renders a \
-         developer message as a user turn under a heading; the reference is the run of the \
-         Jinja template the checkpoint ships, handed the developer message as a system one; \
-         the entry goes when the group is re-recorded under the engine's rule",
+        "deepseek-v3.2/render/continue-final-message",
+        "the checkpoint's own prompt encoder, which the gateway ports (smg-project/smg#1373), \
+         reads no `continue_final_message`: the vendor-code reference renders the final \
+         assistant message closed (the thought's closer, the response, the end of the \
+         message), while the gateway appends the prefill after the generation prompt as the \
+         serving engine's prefill path does; the same class as kimi-k3's entry",
     ),
     (
-        "deepseek-v3.2-exp/render/text-system-after-user",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed (an \
+         empty thought, the text, the end token); the gateway continues it, the message's \
+         text after the generation header, as the serving engine's prefix append does \
+         (smg-project/smg#2434, the rule of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/thinking-kwarg-on",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the serving engine does for this architecture, and switches thinking on \
-         from the `enable_thinking` alias as the engine's wrapper does; the reference is the \
-         run of the Jinja template the checkpoint ships, which reads no alias and leaves the \
-         thought closed; the entry goes when the group is re-recorded under the engine's rule",
-    ),
-    (
-        "deepseek-v3.2-exp/render/tools-declared-user-asks",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
-    ),
-    (
-        "deepseek-v3.2-exp/render/tools-schema-with-defs",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4.1-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message`: the vendor-code reference renders the final assistant \
+         message closed, with the end token; the gateway's port continues it through the \
+         encoder's own `wo_eos` route (no end token, no header; smg-project/smg#2524), the \
+         shape the template-oracle record of this case rendered",
     ),
     (
         "deepseek-v4.1-flash/render/hermes-func-calling-*",
@@ -222,13 +212,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
          single `arguments` parameter, so the reference is the template's own rendering of \
          a call history, not the encoder's (the cases without a call history match)",
-    ),
-    (
-        "deepseek-v4.1-flash/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -251,12 +234,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -267,18 +244,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
-        "nft-7b/render/swehero-5.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
@@ -309,12 +274,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
@@ -932,7 +891,7 @@ impl Report {
     /// hand-written case's shape. A benchmark case is `<set>-<n>` and a
     /// hand-written case a name, so an id that no read set prefixes is a
     /// hand-written case unless it ends in `-<n>`: a benchmark set the tree
-    /// omits, the unpack's sample being every Nth, leaves its entries alone,
+    /// omits, the sample being one set in N picked by its id, leaves its entries alone,
     /// an id of one of its cases among them, while an id of a hand-written
     /// case the tree no longer has (renamed, dropped, or a typo in the entry)
     /// is held to the hand-written set and read as gone.
@@ -2151,8 +2110,8 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     );
     // A prefix under which every loaded case matches must go, and so must one
     // under a set the tree holds that no loaded case begins with; one under a
-    // set the tree omits is left alone, since the tree holds every Nth
-    // benchmark set.
+    // set the tree omits is left alone, since the tree holds one benchmark
+    // set in N, picked by its id.
     let stale = BTreeMap::from([
         (
             "m/render/bfcl-multi-turn-*",
@@ -2208,7 +2167,7 @@ fn an_id_entry_of_an_omitted_benchmark_case_is_left_alone_and_of_a_lost_hand_wri
     // A hand-written case that matches now, a case of a set the tree holds
     // that is not among its cases, and a hand-written name the tree's set
     // lacks (renamed, dropped, or a typo) are stale; a case of a set the tree
-    // omits is left alone, since the tree holds every Nth benchmark set.
+    // omits is left alone, since the tree holds one benchmark set in N, picked by its id.
     let stale = BTreeMap::from([
         ("m/render/bfcl-multi-turn-base-9", "no such case"),
         ("m/render/text-developer-role", "matches now"),

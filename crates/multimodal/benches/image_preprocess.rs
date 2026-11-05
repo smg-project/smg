@@ -17,7 +17,8 @@ use criterion::{
 };
 use image::{imageops::FilterType, DynamicImage, RgbImage};
 use llm_multimodal::{
-    encoder_inputs::EncoderDtype,
+    buffer_pool,
+    encoder_inputs::{EncoderDtype, EncoderInput, PreprocessedEncoderInputs},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processors::{
@@ -27,6 +28,22 @@ use llm_multimodal::{
     },
     Modality,
 };
+
+/// Returns an iteration's output buffer to the crate's pool, as a request does
+/// once its tensor has been sent: the patch tensor or the wire goes back
+/// through the crate's own return path, a float tensor is dropped. Without
+/// this every iteration takes the pool's cold path (a class-sized zeroed
+/// allocation that the bench's allocator maps fresh each time), which is not
+/// what a request pays after the first one of its class.
+fn returned(inputs: PreprocessedEncoderInputs) {
+    match inputs.encoder_input {
+        EncoderInput::U8 { patches, .. } => {
+            buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
+        }
+        EncoderInput::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+        EncoderInput::F32(_) => {}
+    }
+}
 
 /// Create a synthetic RGB image with some variation (not all zeros).
 fn make_test_image(width: u32, height: u32) -> DynamicImage {
@@ -65,12 +82,12 @@ fn bench_qwen3_vl(c: &mut Criterion) {
     let mut group = c.benchmark_group("qwen3_vl_preprocess");
     for &(w, h) in sizes {
         let image = make_test_image(w, h);
-        let images = [image];
+        let images = [&image];
         group.bench_with_input(
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -79,14 +96,15 @@ fn bench_qwen3_vl(c: &mut Criterion) {
     // Batch benchmarks
     let mut group = c.benchmark_group("qwen3_vl_batch");
     for batch_size in [3, 5, 10] {
-        let images: Vec<DynamicImage> = (0..batch_size)
+        let owned: Vec<DynamicImage> = (0..batch_size)
             .map(|i| make_test_image(640 + i * 10, 480 + i * 10))
             .collect();
+        let images: Vec<&DynamicImage> = owned.iter().collect();
         group.bench_with_input(
             BenchmarkId::new("640x480", format!("batch{batch_size}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -103,9 +121,9 @@ fn bench_qwen3_vl(c: &mut Criterion) {
     ];
     for &(w, h, label) in extremes {
         let image = make_test_image(w, h);
-        let images = [image];
+        let images = [&image];
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
-            b.iter(|| processor.preprocess(imgs).unwrap());
+            b.iter(|| returned(processor.preprocess(imgs).unwrap()));
         });
     }
     group.finish();
@@ -126,12 +144,12 @@ fn bench_qwen2_vl(c: &mut Criterion) {
     let mut group = c.benchmark_group("qwen2_vl_preprocess");
     for &(w, h) in sizes {
         let image = make_test_image(w, h);
-        let images = [image];
+        let images = [&image];
         group.bench_with_input(
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -160,12 +178,12 @@ fn bench_llama4(c: &mut Criterion) {
     let mut group = c.benchmark_group("llama4_preprocess");
     for &(w, h) in sizes {
         let image = make_test_image(w, h);
-        let images = [image];
+        let images = [&image];
         group.bench_with_input(
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -254,8 +272,8 @@ fn bench_llama4_steps(c: &mut Criterion) {
             BenchmarkId::new("full_preprocess", format!("{w}x{h}")),
             &image,
             |b, img| {
-                let imgs = [img.clone()];
-                b.iter(|| processor.preprocess(&imgs).unwrap());
+                let imgs = [img];
+                b.iter(|| returned(processor.preprocess(&imgs).unwrap()));
             },
         );
 
@@ -491,12 +509,12 @@ const WIRE_DTYPES: [EncoderDtype; 2] = [EncoderDtype::BFloat16, EncoderDtype::Fl
 /// One image class through both arms, per wire dtype: the two passes
 /// (`preprocess` to the patch bytes, then the write in the wire's dtype, as
 /// assembly performs it) and the one pass (`preprocess_wire`). Both arms end
-/// with the owned wire bytes; the bytes are the same.
+/// with the wire bytes going back to the pool; the bytes are the same.
 fn bench_wire_arms<P: VisionPreProcessor>(
     group: &mut BenchmarkGroup<'_, CpuTime>,
     processor: &P,
     class: &str,
-    images: &[DynamicImage],
+    images: &[&DynamicImage],
     with_float16: bool,
 ) {
     let mut dtypes = WIRE_DTYPES.to_vec();
@@ -515,12 +533,14 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             images,
             |b, imgs| {
                 b.iter(|| {
-                    processor
-                        .preprocess(imgs)
-                        .unwrap()
-                        .encoder_input
-                        .into_bytes_as(dtype)
-                        .unwrap()
+                    buffer_pool::recycle(
+                        processor
+                            .preprocess(imgs)
+                            .unwrap()
+                            .encoder_input
+                            .into_bytes_as(dtype)
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -529,13 +549,15 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             images,
             |b, imgs| {
                 b.iter(|| {
-                    processor
-                        .preprocess_wire(imgs, dtype)
-                        .expect("the pixel-byte processors write wires")
-                        .unwrap()
-                        .encoder_input
-                        .into_bytes_as(dtype)
-                        .unwrap()
+                    buffer_pool::recycle(
+                        processor
+                            .preprocess_wire(imgs, dtype)
+                            .expect("the pixel-byte processors write wires")
+                            .unwrap()
+                            .encoder_input
+                            .into_bytes_as(dtype)
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -583,7 +605,8 @@ fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
         .measurement_time(Duration::from_secs(2));
     for &(class, w, h) in classes {
         let plan = processor.plan_image_grid(w, h);
-        let images = [make_test_image(w, h)];
+        let image = make_test_image(w, h);
+        let images = [&image];
         group.bench_with_input(
             BenchmarkId::new(
                 "single",
@@ -593,7 +616,7 @@ fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
                 ),
             ),
             &images,
-            |b, imgs| b.iter(|| processor.preprocess(imgs).unwrap()),
+            |b, imgs| b.iter(|| returned(processor.preprocess(imgs).unwrap())),
         );
     }
     group.finish();
@@ -632,7 +655,8 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
     for &(w, h, with_float16) in qwen3_classes {
         let target = qwen3.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
-        let images = [make_test_image(w, h)];
+        let image = make_test_image(w, h);
+        let images = [&image];
         bench_wire_arms(&mut group, &qwen3, &class, &images, with_float16);
     }
     group.finish();
@@ -652,7 +676,8 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
     for &(w, h, with_float16) in qwen2_classes {
         let target = qwen2.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
-        let images = [make_test_image(w, h)];
+        let image = make_test_image(w, h);
+        let images = [&image];
         bench_wire_arms(&mut group, &qwen2, &class, &images, with_float16);
     }
     group.finish();

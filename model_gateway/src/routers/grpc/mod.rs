@@ -25,31 +25,40 @@ pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience
+pub use harmony::detector::is_harmony_card;
 pub use multimodal::worker as worker_media;
 pub use proto_wrapper::{MultimodalData, TensorBytes};
 
 fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<Response>> {
+    match text_only_output_refusal(request) {
+        Some((code, message)) => Err(Box::new(error::bad_request(code, message))),
+        None => Ok(()),
+    }
+}
+
+/// The refusal (error code and message) of a chat request that asks for
+/// output other than text, which the gRPC backend does not produce. `pub` so
+/// that the Python binding's chat rendering refuses what serving refuses.
+pub fn text_only_output_refusal(request: &ChatCompletionRequest) -> Option<(&'static str, String)> {
     if request.return_audio == Some(true) {
-        return Err(Box::new(error::bad_request(
+        return Some((
             "audio_output_not_supported",
-            "'return_audio' must be false because the gRPC backend only supports text output",
-        )));
+            "'return_audio' must be false because the gRPC backend only supports text output"
+                .to_string(),
+        ));
     }
 
-    if let Some(modality) = request.modalities.as_ref().and_then(|modalities| {
+    let modality = request.modalities.as_ref().and_then(|modalities| {
         modalities
             .iter()
             .find(|modality| modality.as_str() != "text")
-    }) {
-        return Err(Box::new(error::bad_request(
-            "unsupported_output_modality",
-            format!(
-                "unsupported output modality '{modality}'; the gRPC backend only supports text output"
-            ),
-        )));
-    }
-
-    Ok(())
+    })?;
+    Some((
+        "unsupported_output_modality",
+        format!(
+            "unsupported output modality '{modality}'; the gRPC backend only supports text output"
+        ),
+    ))
 }
 
 /// Processed chat messages ready for gRPC generation.

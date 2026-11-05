@@ -1,6 +1,6 @@
 //! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
-//! surface (vLLM and TokenSpeed today), plus the connect entry points and
-//! metadata reads.
+//! surface, one connection for any of the four dialects of [`ZmqDialect`],
+//! plus the connect entry points and metadata reads.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,6 +16,7 @@ use engine_zmq_client::{
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
         handshake::{EngineCoreReadyResponse, REQUEST_KIND_ENCODE},
+        kv_transfer::KvTransferStats,
         sglang::{request::SglangRequest, SglangProtocol},
         tokenspeed::{
             request::TokenSpeedRequestType, wire_carries_control_calls, TokenSpeedProtocol,
@@ -35,6 +36,7 @@ use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto a
 use crate::sockets::unlink_stale_socket;
 use crate::{
     eos::EosTokenIds,
+    pin_yield::PinYieldNote,
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
@@ -155,6 +157,9 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// A pin's yield to the room on this connection: the first is logged at
+    /// WARN, the rest at DEBUG (`PinYieldNote`).
+    pin_yield: PinYieldNote,
     /// The bound on every generate request this connection opens, from its
     /// dispatch to its last message, set once by the caller that knows it
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
@@ -389,6 +394,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
         };
@@ -484,10 +490,11 @@ impl ZmqEngineClient {
     /// pair whose engine follows the room, where the engine's KV sender
     /// fails a request that runs elsewhere and the decode side looks for the
     /// KV. A request with a room goes to that rank on this connection from
-    /// now, a pin that disagrees yielding to it with a warning; a request
-    /// without a room, and every request on a connection nobody notes this
-    /// on (an aggregated engine, a decode side), is placed by its pin. Set
-    /// once: a later call changes nothing.
+    /// now, a pin that disagrees yielding to it (logged at WARN once per
+    /// connection, at DEBUG after); a request without a room, and every
+    /// request on a connection nobody notes this on (an aggregated engine, a
+    /// decode side), is placed by its pin. Set once: a later call changes
+    /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
     }
@@ -993,6 +1000,7 @@ impl ZmqEngineClient {
                 max_model_len,
                 &ranks,
                 logprobs,
+                &self.meta.pin_yield,
             )
             .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
@@ -1162,13 +1170,19 @@ impl ZmqEngineClient {
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
                 .mm_inputs
-                .as_ref()
+                .as_deref()
                 .map(encode_media_refs)
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?
                 .flatten();
-            let mut request = translate_request_sglang(sub, max_model_len, ranks, placement)
-                .map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(
+                sub,
+                max_model_len,
+                ranks,
+                placement,
+                &self.meta.pin_yield,
+            )
+            .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
                 hasher
@@ -1539,9 +1553,11 @@ impl ZmqEngineClient {
         Ok(())
     }
 
-    /// Latest per-rank load for one engine index, if the backend has reported
-    /// it: every dialect piggybacks it on its output batches.
-    fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
+    /// The latest load tail one rank sent (running, waiting, KV usage),
+    /// `None` before its first batch: every dialect piggybacks it on its
+    /// output batches. What [`Self::get_loads`] lists per rank, for a caller
+    /// that wants one rank's without the whole report.
+    pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
@@ -1629,23 +1645,56 @@ impl ZmqEngineClient {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
-            .filter_map(|engine| {
-                let dp_rank = engine.engine_id.engine_index()?;
-                let load = self.engine_load(dp_rank)?;
-                Some(SchedulerLoadSnapshot {
-                    dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
-                    num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
-                    num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
-                    token_usage: load.kv_cache_usage,
-                    ..Default::default()
-                })
-            })
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
             loads,
             ..Default::default()
+        }
+    }
+
+    /// One connected rank's entry of [`get_loads`](Self::get_loads), read
+    /// alone: what a per-rank reader (the relay's load record) wants, without
+    /// the vector of the other ranks. `None` for a rank not connected or not
+    /// reported yet.
+    pub fn rank_load(&self, dp_rank: u32) -> Option<SchedulerLoadSnapshot> {
+        self.engines()
+            .iter()
+            .any(|engine| engine.engine_id.engine_index() == Some(dp_rank))
+            .then(|| self.engine_load(dp_rank))
+            .flatten()
+            .map(|load| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
+                num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
+                num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                token_usage: load.kv_cache_usage,
+                ..Default::default()
+            })
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`] ([`Client::keep_kv_transfer`]): the taker
+    /// asks once; a client nobody drains keeps none.
+    pub fn keep_kv_transfer(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.keep_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.keep_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.keep_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.keep_kv_transfer(),
+        }
+    }
+
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call ([`Client::take_kv_transfer`]), by engine index; empty for an
+    /// engine family whose wire carries none or a client that never asked.
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.take_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.take_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.take_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.take_kv_transfer(),
         }
     }
 

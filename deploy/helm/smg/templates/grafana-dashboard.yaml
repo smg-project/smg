@@ -537,13 +537,13 @@ data:
           }
         },
         {
-          "title": "Active HTTP connections",
+          "title": "Requests in flight (edge)",
           "type": "timeseries",
           "datasource": "Prometheus",
           "targets": [
             {
               "expr": "sum(smg_http_connections_active{namespace=~\"$namespace\", job=~\"$job\"})",
-              "legendFormat": "connections"
+              "legendFormat": "requests"
             }
           ],
           "fieldConfig": {

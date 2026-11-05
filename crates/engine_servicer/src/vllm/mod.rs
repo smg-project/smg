@@ -205,21 +205,13 @@ impl std::fmt::Debug for VllmServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self).ok()?;
-        let load = match dp_rank {
-            // A rank the report has no entry for (it has not reported a
-            // scheduler step while another rank has) gets no record rather
-            // than another rank's figures, as under the Python servicer.
-            Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
-            None => response
-                .loads
-                .iter()
-                .find(|load| load.dp_rank == 0)
-                .or_else(|| response.loads.first())?,
-        };
+        // A connected rank reads its own entry (zero-filled until its first
+        // scheduler step, whichever rank reported first), never another
+        // rank's figures; a rank past the connected ones gets no record.
+        let load = info::rank_load(self, dp_rank)?;
         // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::loads`), so every rank's record reports it.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
         record.waiting_uncached_tokens =
             Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         Some(record)
@@ -228,6 +220,10 @@ impl crate::kv_events::RankLoads for State {
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
     }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
+    }
 }
 
 pub(super) struct State {
@@ -235,9 +231,6 @@ pub(super) struct State {
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
-    /// Queued token-work, generation throughput and hit rate from the
-    /// requests this servicer forwards, per rank, for `GetLoads`.
-    pub(super) loads: crate::load_tracker::LoadTracker,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
     pub(super) tokenizer: TokenizerSlot,
@@ -316,8 +309,12 @@ impl VllmServicerServer {
         )?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
-            loads: crate::load_tracker::LoadTracker::default(),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             tokenizer: TokenizerSlot::new(),
             media: config.media_processor.map(MediaGate::new),
         });
@@ -394,7 +391,8 @@ impl VllmServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

@@ -33,8 +33,7 @@ class TestChatCompletion:
 
     On the mock engine each test states the model's answer first (``mock_answers``, a
     no-op on a real engine), through the same checkpoint's tokenizer from an ungated
-    repository; the ``n=2`` and ``top_logprobs`` cases skip there, the mock answering one
-    choice per request with one logprob per token.
+    repository, one answer per choice the request samples.
     """
 
     # Whether the backend trims stop sequences from output.
@@ -51,33 +50,23 @@ class TestChatCompletion:
                     pytest.mark.skip_for_runtime(
                         "tokenspeed",
                         reason=(
-                            "tokenspeed's --enable-top-logprobs is not yet implemented "
-                            "(raises at startup); base output logprobs work via "
-                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                            "the engine computes top-k alternatives only for "
+                            "prefill-sampled tokens; a decode step returns none and "
+                            "the request is aborted"
                         ),
-                    ),
-                    pytest.mark.skip_for_runtime(
-                        "mock", reason="the mock scripts one logprob per token, no alternatives"
                     ),
                 ],
             ),
         ],
     )
-    @pytest.mark.parametrize(
-        "parallel_sample_num",
-        [
-            1,
-            pytest.param(
-                2,
-                marks=pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock answers one choice per request"
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
-        mock_answers.enqueue("Paris.")
+        # One answer per choice, stated with a logprob per token so the logprobs
+        # cases read them, and long enough for top_logprobs=5: the mock's
+        # alternatives are the answer's own distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         # Use temperature > 0 for n > 1 (greedy sampling rejects n > 1)
         temperature = 0.7 if parallel_sample_num > 1 else 0
         response = api_client.chat.completions.create(
@@ -126,35 +115,24 @@ class TestChatCompletion:
                     pytest.mark.skip_for_runtime(
                         "tokenspeed",
                         reason=(
-                            "tokenspeed's --enable-top-logprobs is not yet implemented "
-                            "(raises at startup); base output logprobs work via "
-                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                            "the engine computes top-k alternatives only for "
+                            "prefill-sampled tokens; a decode step returns none and "
+                            "the request is aborted"
                         ),
-                    ),
-                    pytest.mark.skip_for_runtime(
-                        "mock", reason="the mock scripts one logprob per token, no alternatives"
                     ),
                 ],
             ),
         ],
     )
-    @pytest.mark.parametrize(
-        "parallel_sample_num",
-        [
-            1,
-            pytest.param(
-                2,
-                marks=pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock answers one choice per request"
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion_stream(
         self, model, api_client, logprobs, parallel_sample_num, mock_answers
     ):
         """Test streaming chat completion with logprobs and parallel sampling."""
-        mock_answers.enqueue("Paris.")
+        # As above: one answer per choice, a logprob per token, at least five
+        # distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         temperature = 0.7 if parallel_sample_num > 1 else 0
         generator = api_client.chat.completions.create(
             model=model,
@@ -464,9 +442,9 @@ convenient hands-free control to your smart devices.
         return delta.content or getattr(delta, "reasoning_content", "") or ""
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss(TestChatCompletion):
     """Tests for chat completions API with Harmony model (GPT-OSS).
@@ -489,31 +467,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
                 marks=pytest.mark.skip_for_runtime(
                     "tokenspeed",
                     reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
-                    ),
-                ),
-            ),
-        ],
-    )
-    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
-        """Test non-streaming chat completion with logprobs and parallel sampling."""
-        super().test_chat_completion(model, api_client, logprobs, parallel_sample_num, mock_answers)
-
-    @pytest.mark.parametrize(
-        "logprobs",
-        [
-            None,
-            pytest.param(
-                5,
-                marks=pytest.mark.skip_for_runtime(
-                    "tokenspeed",
-                    reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                        "the engine computes top-k alternatives only for "
+                        "prefill-sampled tokens; a decode step returns none and "
+                        "the request is aborted"
                     ),
                 ),
             ),
@@ -543,9 +499,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
         pass
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
-@pytest.mark.model("openai/gpt-oss-120b")
+@pytest.mark.model("openai/gpt-oss-120b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss120B(TestChatCompletionGptOss):
     """Tests for chat completions API with Harmony model (GPT-OSS 120B, 4 GPU)."""

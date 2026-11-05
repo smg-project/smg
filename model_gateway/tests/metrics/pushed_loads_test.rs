@@ -14,7 +14,7 @@ use openai_protocol::worker::{RuntimeType, WorkerType};
 use smg::{
     config::RouterConfig,
     observability::metrics_server::start_metrics_server,
-    worker::{KvEventMonitor, ModelCard},
+    worker::{KvEventMonitor, ModelCard, SubscriptionKind},
 };
 
 use crate::common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with};
@@ -90,7 +90,9 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
             .worker_registry
             .register(Arc::clone(&worker))
             .unwrap();
-        kv_monitor.on_worker_added(&worker).await;
+        kv_monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
         urls.push(url);
     }
 

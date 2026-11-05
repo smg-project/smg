@@ -4,7 +4,7 @@
 //! in isolation.
 //!
 //! Calls `RouterTrait` methods directly, mirroring
-//! `routers/grpc/router.rs`'s own `pd_tests` module, rather than going
+//! `routers/grpc/router.rs`'s own `tests` module (`router/tests.rs`), rather than going
 //! through the full HTTP app: `test_harness/src/test_app.rs`'s lightweight test
 //! app doesn't wire the tenant-resolution middleware that would otherwise
 //! populate `tenant_request_meta`, so a real per-request tenant identity is
@@ -152,7 +152,7 @@ impl KeepingBackend {
 
 #[async_trait]
 impl RateLimitBackend for KeepingBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         if !self.seen.lock().insert(request.request_charge_id) {
             return ReserveOutcome::Admitted;
         }
@@ -406,8 +406,8 @@ async fn feature_disabled_is_a_no_op() {
 /// routes into it, and PD needs a distinct prefill+decode worker pair --
 /// both larger harness investments than this suite carries for its other
 /// cases, and the underlying reserve/settle mechanics they'd exercise are
-/// identical to what's already proven above and in `pipeline.rs`'s own
-/// `rate_limit_reserve_tests` (which drives `RateLimitReserveStage` directly
+/// identical to what's already proven above and in the pipeline's own
+/// `tests/rate_limit_reserve.rs` (which drives `RateLimitReserveStage` directly
 /// rather than through a real backend).
 #[tokio::test]
 async fn completion_denial_reaches_the_client() {

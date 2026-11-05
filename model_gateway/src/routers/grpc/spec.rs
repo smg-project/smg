@@ -21,8 +21,9 @@ use openai_protocol::{
     responses::ResponsesRequest,
 };
 
-use crate::routers::grpc::regular::{
-    stages::decisions::scoring::DecisionScoring, symphony::Assignment,
+use crate::routers::grpc::{
+    regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
+    utils::Names,
 };
 
 /// Response-phase contract for one request, handed on by request building.
@@ -104,6 +105,12 @@ pub(crate) struct ChatResponseSpec {
     /// Set by request building when Symphony reads the response (`regular::symphony`):
     /// the table, and the part of the rendered prompt the engine replays.
     pub symphony: Option<Assignment>,
+    /// The parser names the request's preparation resolved once from the model's
+    /// cards (`ProcessingState::parser_names`), handed on by request building for
+    /// the response's two readers (the reasoning parser's and the tool-call
+    /// parser's names); `None` when no resolution was made (a spec built from the
+    /// request alone), and the readers resolve them as before.
+    pub parser_names: Option<Names>,
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -159,6 +166,7 @@ impl ChatResponseSpec {
             unbilled_prompt_tokens: 0,
             reasoning_in_prefill: false,
             symphony: None,
+            parser_names: None,
         }
     }
 }
@@ -207,6 +215,12 @@ pub(crate) struct MessagesResponseSpec {
     /// `disable_parallel_tool_use: true`: only the first tool call is
     /// returned.
     pub first_tool_call_only: bool,
+    /// The parser names the request's preparation resolved once from the model's
+    /// cards (`ProcessingState::parser_names`), handed on by request building for
+    /// the response's two readers (the reasoning parser's and the tool-call
+    /// parser's names); `None` when no resolution was made (a spec built from the
+    /// request alone), and the readers resolve them as before.
+    pub parser_names: Option<Names>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -224,6 +238,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
+            parser_names: None,
         }
     }
 }
@@ -245,16 +260,11 @@ pub(crate) struct CompletionResponseSpec {
     pub ignore_eos: bool,
 }
 
-impl From<&CompletionRequest> for CompletionResponseSpec {
-    fn from(request: &CompletionRequest) -> Self {
-        let prompt_texts = if request.echo {
-            match &request.prompt {
-                StringOrArray::String(text) => vec![text.clone()],
-                StringOrArray::Array(texts) => texts.clone(),
-            }
-        } else {
-            Vec::new()
-        };
+impl CompletionResponseSpec {
+    /// `prompt_texts` are the prepared prompts' texts, one per prompt (a text
+    /// prompt as sent, a token prompt decoded); only an `echo` reads them, so
+    /// a builder passes none when the request asks for no echo.
+    pub(crate) fn new(request: &CompletionRequest, prompt_texts: Vec<String>) -> Self {
         Self {
             choices_per_prompt: request.choices(),
             echo: request.echo,

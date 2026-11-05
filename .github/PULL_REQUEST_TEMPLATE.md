@@ -16,6 +16,10 @@
 
 <!-- Provide a thorough reproducible test showing before and after behavior. -->
 
+## Release note
+
+<!-- One sentence on what a user gets, written to be pasted into the release notes as it stands, or "none" with the reason. The release notes are written from these sentences. -->
+
 <details>
 <summary>Checklist</summary>
 

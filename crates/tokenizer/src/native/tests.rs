@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap;
+use tiktoken_rs::CoreBPE;
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
     models::{
@@ -14,14 +16,25 @@ use tokenizers::{
         split::{Split, SplitPattern},
         PreTokenizerWrapper,
     },
-    processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
+    processors::{
+        bert::BertProcessing,
+        byte_level::ByteLevel as ByteLevelProcessor,
+        sequence::Sequence as ProcessorSequence,
+        template::{SpecialToken, TemplateProcessing},
+        PostProcessorWrapper,
+    },
     AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
+use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
-use super::*;
+use super::{
+    short_pieces::{ShortPieceKey, MIN_SLOTS},
+    *,
+};
 use crate::{
     encode_path::{encode_fallbacks, EncodeFallbacks, EncodePath},
     huggingface::HuggingFaceTokenizer,
+    kimi_k2_tokenizer::KIMI_K2_PATTERN,
 };
 
 const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -356,6 +369,14 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
     tokenizer
 }
 
+/// The native encoder of `tokenizer` with its seed read, as the loaders
+/// build it.
+fn seeded(tokenizer: &HfTokenizer) -> NativeEncoder {
+    let mut native = NativeEncoder::from_tokenizer(tokenizer).expect("native path");
+    native.seed_vocabulary(tokenizer.get_model());
+    native
+}
+
 #[test]
 fn every_shape_gets_a_native_path() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -438,19 +459,15 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         r"a split pattern outside the supported regex subset: \w+|\s+"
     );
-    // A post-processor that adds tokens, and a model that is not BPE.
+    // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_post_processor(Some(
-        TemplateProcessing::builder()
-            .try_single("<|im_start|> $A")
-            .expect("template")
-            .special_tokens(vec![("<|im_start|>", 0)])
-            .build()
-            .expect("post-processor"),
-    ));
+    tokenizer.with_post_processor(Some(BertProcessing::new(
+        ("[SEP]".to_owned(), 1),
+        ("[CLS]".to_owned(), 2),
+    )));
     assert_eq!(
         declined(&tokenizer),
-        "post-processor TemplateProcessing (only ByteLevel or none)"
+        "post-processor BertProcessing (only ByteLevel, TemplateProcessing or none)"
     );
     let tokenizer = HfTokenizer::new(WordLevel::default());
     assert_eq!(declined(&tokenizer), "the model is not BPE");
@@ -472,14 +489,12 @@ fn a_batch_takes_the_direct_path_input_by_input() {
         let added: Vec<&str> = shape.special.to_vec();
         let mut texts: Vec<String> = (0..8)
             .map(|round| random_text(&mut state, 1 + round * 5, &added))
-            .filter(|text| !shape.nfc || text.nfc().eq(text.chars()))
             .collect();
-        // Under an NFC shape, one input the direct encoder declines sits
-        // in the middle of the batch: it takes the `tokenizers` path on
-        // its own, and its neighbours stay on the direct path.
-        let declined = "e\u{301}";
+        // Under an NFC shape, one input not in NFC sits in the middle of
+        // the batch: it is normalized and encoded on the direct path like
+        // its neighbours.
         if shape.nfc {
-            texts.insert(texts.len() / 2, declined.to_string());
+            texts.insert(texts.len() / 2, "e\u{301}".to_string());
         }
         let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let batch = tokenizer.encode_batch(&inputs, false).expect(shape.name);
@@ -492,19 +507,11 @@ fn a_batch_takes_the_direct_path_input_by_input() {
                 "{}: {input:?}",
                 shape.name
             );
-            if shape.nfc && *input == declined && !tokenizer.uses_v1_encoder() {
-                assert!(
-                    matches!(encoding, Encoding::Hf(_)),
-                    "{}: the declined input takes the tokenizers path",
-                    shape.name
-                );
-            } else {
-                assert!(
-                    matches!(encoding, Encoding::Plain(_)),
-                    "{}: the batch left the direct path for {input:?}",
-                    shape.name
-                );
-            }
+            assert!(
+                matches!(encoding, Encoding::Plain(_)),
+                "{}: the batch left the direct path for {input:?}",
+                shape.name
+            );
         }
     }
 }
@@ -541,10 +548,7 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .collect();
         let mut compared = 0;
         for _ in 0..3 {
-            let mut text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
-            if shape.nfc {
-                text = text.nfc().collect();
-            }
+            let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
             let units = native.units(&text, true, true).len();
             assert!(
                 units >= 4,
@@ -552,17 +556,12 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
                 shape.name,
                 text.len()
             );
-            let (Ok(pooled), Ok(serial)) = (
-                native.encode_with(tokenizer.get_model(), &text, true),
-                native.encode_with(tokenizer.get_model(), &text, false),
-            ) else {
-                assert!(
-                    shape.nfc && text.nfc().ne(text.chars()),
-                    "{}: declined",
-                    shape.name
-                );
-                continue;
-            };
+            let pooled = native
+                .encode_with(Some(tokenizer.get_model()), &text, true, false)
+                .expect("pooled");
+            let serial = native
+                .encode_with(Some(tokenizer.get_model()), &text, false, false)
+                .expect("serial");
             compared += 1;
             assert_eq!(pooled, serial, "{}: the pool changed the ids", shape.name);
             let reference = tokenizer
@@ -608,10 +607,10 @@ fn a_normalized_added_token_across_a_cut_stays_whole() {
     );
     assert!(units.len() >= 4, "{} units", units.len());
     let pooled = native
-        .encode_with(tokenizer.get_model(), &text, true)
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
         .expect("pooled");
     let serial = native
-        .encode_with(tokenizer.get_model(), &text, false)
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
         .expect("serial");
     let reference = tokenizer
         .encode(text.as_str(), false)
@@ -645,10 +644,10 @@ fn chunking_goes_on_past_a_stretch_without_candidates() {
         units.len()
     );
     let pooled = native
-        .encode_with(tokenizer.get_model(), &text, true)
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
         .expect("pooled");
     let serial = native
-        .encode_with(tokenizer.get_model(), &text, false)
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
         .expect("serial");
     let reference = tokenizer
         .encode(text.as_str(), false)
@@ -667,7 +666,7 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
         if shape.nfc {
-            text = text.nfc().collect();
+            text = nfc(&text).into_owned();
         }
         let whole: Vec<String> = {
             let mut out = Vec::new();
@@ -697,14 +696,13 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
     let mut state = 0x0F0F_1234_ABCD_9876u64;
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
-        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let native = seeded(&tokenizer);
         let added: Vec<&str> = shape
             .special
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
             .collect();
-        let mut compared = 0;
         for round in 0..2000 {
             let text = random_text(&mut state, 1 + round % 40, &added);
             let reference = tokenizer
@@ -712,23 +710,13 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
                 .expect("encode")
                 .get_ids()
                 .to_vec();
-            match native.encode(tokenizer.get_model(), &text) {
-                Ok(ids) => {
-                    compared += 1;
-                    assert_eq!(ids, reference, "{}: {text:?}", shape.name);
-                }
-                Err(fallback) => assert!(
-                    fallback == Fallback::NotNfc && shape.nfc && text.nfc().ne(text.chars()),
-                    "{}: declined {text:?} as {fallback:?}",
-                    shape.name
-                ),
-            }
+            let ids = native
+                .encode(Some(tokenizer.get_model()), &text, false)
+                .unwrap_or_else(|fallback| {
+                    panic!("{}: declined {text:?} as {fallback:?}", shape.name)
+                });
+            assert_eq!(ids, reference, "{}: {text:?}", shape.name);
         }
-        assert!(
-            compared > 1000,
-            "{}: only {compared} texts compared",
-            shape.name
-        );
     }
 }
 
@@ -761,16 +749,19 @@ fn fixed_texts_match_tokenizers_for_every_shape() {
     let mut state = 0x7777_1111_2222_3333u64;
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
-        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let native = seeded(&tokenizer);
         for text in texts {
             let reference = tokenizer
                 .encode(text, false)
                 .expect("encode")
                 .get_ids()
                 .to_vec();
-            if let Ok(ids) = native.encode(tokenizer.get_model(), text) {
-                assert_eq!(ids, reference, "{}: {text:?}", shape.name);
-            }
+            let ids = native
+                .encode(Some(tokenizer.get_model()), text, false)
+                .unwrap_or_else(|fallback| {
+                    panic!("{}: declined {text:?} as {fallback:?}", shape.name)
+                });
+            assert_eq!(ids, reference, "{}: {text:?}", shape.name);
         }
     }
 }
@@ -874,13 +865,13 @@ fn marks_stay_with_their_letter(letter: &str, marks: &str, sentence: &str) {
                 .get_ids()
                 .to_vec();
             let ids = native
-                .encode(tokenizer.get_model(), text)
+                .encode(Some(tokenizer.get_model()), text, false)
                 .expect("the native path takes NFC text");
             assert_eq!(ids, reference, "{text:?}");
         }
         lengths.push(
             native
-                .encode(tokenizer.get_model(), &cluster)
+                .encode(Some(tokenizer.get_model()), &cluster, false)
                 .unwrap()
                 .len(),
         );
@@ -914,17 +905,290 @@ fn arabic_marks_stay_with_their_letter() {
 }
 
 #[test]
-fn text_not_in_nfc_is_declined_under_an_nfc_normalizer() {
+fn text_not_in_nfc_is_normalized_gap_by_gap_and_encoded_natively() {
     let mut state = 0x5555_6666_7777_8888u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    // A special token (matched on the raw text) whose last letter would
+    // compose with a mark after it, and a token matched after normalization
+    // whose last letter would too.
+    tokenizer
+        .add_special_tokens([AddedToken::from("USER", true)])
+        .expect("special token");
+    tokenizer
+        .add_tokens([AddedToken::from("foo bar", false).normalized(true)])
+        .expect("added token");
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let user = tokenizer
+        .token_to_id("USER")
+        .expect("the special token's id");
+    let foo_bar = tokenizer
+        .token_to_id("foo bar")
+        .expect("the added token's id");
+    for text in [
+        // "e" + combining acute composes under NFC.
+        "Cafe\u{301}",
+        // Marks reorder, then compose.
+        "a\u{323}\u{301}",
+        // Hangul jamo compose into a syllable.
+        "\u{1100}\u{1161}",
+        "\u{AC00}\u{11A8}",
+        // Thai marks reorder.
+        "ก\u{E48}\u{E38}",
+        // A mark right after a raw token: cut first, the mark stays alone.
+        "e<|im_start|>\u{301}x",
+        "USER\u{301} and Cafe\u{301}<|im_end|>\u{301}",
+        // A raw token that is not special.
+        "\u{1100}<tool_call>\u{1161}",
+        // A token matched after normalization: found after a composed
+        // letter, not found when the mark composes with its last letter.
+        "e\u{301}foo bar",
+        "foo bar\u{301}",
+        "e\u{301}foo bar\u{301} and foo bar",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        let ids = native
+            .encode(Some(model), text, false)
+            .unwrap_or_else(|fallback| panic!("{text:?} declined as {fallback:?}"));
+        assert_eq!(ids, reference.get_ids(), "{text:?}");
+    }
+    // The ids are those of the normalized text.
+    assert_eq!(
+        native.encode(Some(model), "Cafe\u{301}", false),
+        native.encode(Some(model), "Caf\u{E9}", false)
+    );
+    // The raw token is cut before normalization: a mark after it never
+    // composes with its last letter (normalizing the whole text first
+    // would turn "USER" + acute into "USEŔ" and lose the token).
+    let ids = native
+        .encode(Some(model), "USER\u{301}", false)
+        .expect("ids");
+    assert_eq!(ids.first(), Some(&user));
+    // The token matched after normalization sees the normalized gap: the
+    // composed last letter is no longer its spelling.
+    assert!(native
+        .encode(Some(model), "e\u{301}foo bar", false)
+        .expect("ids")
+        .contains(&foo_bar));
+    assert!(!native
+        .encode(Some(model), "foo bar\u{301}", false)
+        .expect("ids")
+        .contains(&foo_bar));
+}
+
+#[test]
+fn marks_and_compositions_newer_than_the_library_tables_read_as_the_library_does() {
+    // `tokenizers` normalizes with the Unicode 9.0 tables: a mark they do
+    // not know is a starter to them, which blocks a composition across it,
+    // and a pair they do not know never composes. A newer crate's tables
+    // compose both, and the ids would be those of other bytes.
+    let mut state = 0x7A7A_6B6B_5C5C_4D4Du64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
     let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-    // "e" + combining acute composes under NFC: not our business.
-    assert_eq!(
-        native.encode(tokenizer.get_model(), "Cafe\u{301}"),
-        Err(Fallback::NotNfc)
+    let model = tokenizer.get_model();
+    for text in [
+        // A letter, a mark from Unicode 14 (U+0899, combining class 220 in
+        // the current tables), an acute: the current tables compose the
+        // acute with the letter across the mark.
+        "a\u{899}\u{301}",
+        // The same with marks from Unicode 10 and 14 (U+1DF9, U+1DFA).
+        "a\u{1DF9}\u{301}",
+        "a\u{1DFA}\u{323}",
+        // Pairs the current tables compose into one Unicode 16 character
+        // (Kirat Rai, Gurung Khema, Tulu-Tigalari).
+        "\u{16D63}\u{16D67}",
+        "\u{1611E}\u{1611E}",
+        "\u{11382}\u{113C9}",
+        // Where both tables agree: a mark of class 230 blocks the acute in
+        // both, and an acute right after the letter composes in both.
+        "a\u{898}\u{301}",
+        "a\u{301}\u{899}",
+        // In a prompt, next to a raw added token.
+        "<|im_start|>user\nCafe\u{301} a\u{899}\u{301} \u{16D63}\u{16D67}<|im_end|>\n",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        let ids = native
+            .encode(Some(model), text, false)
+            .unwrap_or_else(|fallback| panic!("{text:?} declined as {fallback:?}"));
+        assert_eq!(ids, reference.get_ids(), "{text:?}");
+    }
+    // The ids are those of the text's own bytes, not of the composed form.
+    assert_ne!(
+        native.encode(Some(model), "a\u{899}\u{301}", false),
+        native.encode(Some(model), "\u{E1}\u{899}", false)
     );
-    assert!(native.encode(tokenizer.get_model(), "Caf\u{E9}").is_ok());
+}
+
+#[test]
+fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
+    // The stretch-wise check and copy against the library's crate run over
+    // the whole text, on texts that put non-ASCII runs at the start, at the
+    // end, right after one ASCII character, across the eight-byte steps of
+    // the scan, next to each other, and nowhere.
+    use unicode_normalization_alignments::is_nfc as library_is_nfc;
+    let library_nfc = |text: &str| -> String { text.nfc().map(|(ch, _)| ch).collect() };
+    let quick = NfcQuick::read();
+    let pieces = [
+        "a",
+        "b",
+        " ",
+        "1234567",
+        "12345678",
+        "e",
+        "\u{301}",
+        "\u{323}",
+        "\u{E9}",
+        "\u{1EA1}",
+        "ก",
+        "\u{E48}",
+        "\u{1100}",
+        "\u{1161}",
+        "\u{AC00}",
+        "中文",
+        "\u{4000}",
+        "\u{9FFF}",
+        "\u{3FFF}",
+        "\u{A000}",
+        "か",
+        "\u{3099}",
+        "\u{11A8}",
+        "\u{FF76}",
+        "、",
+        "🙂",
+        "\u{899}",
+        "<|im_start|>",
+        "\n",
+    ];
+    let mut state = 0x1357_9BDF_2468_ACE0u64;
+    let mut changed = 0;
+    for _ in 0..3000 {
+        let len = (pseudo_random(&mut state) % 9) as usize;
+        let text: String = (0..len)
+            .map(|_| pieces[(pseudo_random(&mut state) % pieces.len() as u64) as usize])
+            .collect();
+        let expected = library_nfc(&text);
+        assert_eq!(is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        assert_eq!(
+            quick.is_nfc(&text),
+            library_is_nfc(&text),
+            "{text:?} (quick)"
+        );
+        let normalized = nfc(&text);
+        assert_eq!(normalized.as_ref(), expected, "{text:?}");
+        assert_eq!(
+            matches!(normalized, Cow::Borrowed(_)),
+            text == expected,
+            "{text:?}: borrowed only when nothing changed"
+        );
+        changed += usize::from(text != expected);
+    }
+    assert!(changed > 150, "{changed} of 3000 texts changed");
+    // The shapes by name: ASCII alone, a run at the start, a mark after a
+    // letter it composes with or not, the letter at an eight-byte step, a
+    // run already in NFC next to one that is not.
+    for (text, in_nfc) in [
+        ("", true),
+        ("plain ascii", true),
+        ("\u{301}", true),
+        ("\u{301}x", true),
+        ("x\u{301}", true),
+        ("e\u{301}", false),
+        ("Cafe\u{301}", false),
+        ("1234567e\u{301}", false),
+        ("12345678e\u{301}", false),
+        ("123456789e\u{301}", false),
+        ("中文e\u{301}", false),
+        ("中文", true),
+        ("🙂", true),
+        ("a\u{899}\u{301}", true),
+        ("\u{1100}\u{1161} and \u{AC00}", false),
+        // Ideographs: a mark after one composes with nothing, a kana or a
+        // syllable after one composes as it would alone, runs at the edges.
+        ("漢\u{301}", true),
+        ("a漢\u{301}", true),
+        ("e\u{301}漢", false),
+        ("漢e\u{301}", false),
+        ("漢\u{3099}", true),
+        ("漢か\u{3099}", false),
+        ("漢が", true),
+        ("漢字\u{AC00}\u{11A8}", false),
+        ("漢字\u{AC01}\u{11A8}", true),
+        ("\u{4000}\u{9FFF}", true),
+        ("\u{3FFF}\u{A000}", true),
+        ("abc漢字", true),
+        ("漢字abc", true),
+        ("漢字 and 漢字\u{323}\u{301}", true),
+        ("漢字\u{301}\u{323}", false),
+    ] {
+        assert_eq!(is_nfc(text), in_nfc, "{text:?}");
+        assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
+        assert_eq!(nfc(text).as_ref(), library_nfc(text), "{text:?}");
+    }
+}
+
+#[test]
+fn every_shape_merges_its_misses_natively() {
+    let mut state = 0x6666_7777_8888_9999u64;
+    for shape in shapes() {
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let table = native.merges.as_ref();
+        assert!(table.is_some(), "{}", shape.name);
+        assert_eq!(
+            table.map(|table| table.ignore_merges),
+            Some(shape.ignore_merges),
+            "{}",
+            shape.name
+        );
+    }
+}
+
+#[test]
+fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
+    // A vocabulary without the token of byte 0x00: the table declines the
+    // model, the path stays, and its misses take the model's own merge.
+    let mut state = 0x1212_3434_5656_7878u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet.into_iter().filter(|&ch| ch != table[0]) {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    let mut merges = Merges::new();
+    for (a, b) in [("a", "b"), ("b", "c"), ("ab", "c"), ("a", "bc")] {
+        let merged = format!("{a}{b}");
+        if !vocab.contains_key(&merged) {
+            let id = vocab.len() as u32;
+            vocab.insert(merged, id);
+        }
+        merges.push((a.to_owned(), b.to_owned()));
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .expect("bpe");
+    tokenizer.with_model(bpe);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    assert!(native.merges.is_none());
+    for text in [
+        "abc",
+        "abcabc xabc",
+        "cab abcd",
+        "<|im_start|>abc<|im_end|>",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -948,9 +1212,11 @@ fn a_piece_the_model_declines_is_reported_after_the_work() {
     bpe.unk_token = Some("<unk>".to_owned());
     tokenizer.with_model(bpe);
     let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-    assert!(native.encode(tokenizer.get_model(), "plain text").is_ok());
+    assert!(native
+        .encode(Some(tokenizer.get_model()), "plain text", false)
+        .is_ok());
     assert_eq!(
-        native.encode(tokenizer.get_model(), "plain text\u{7F}"),
+        native.encode(Some(tokenizer.get_model()), "plain text\u{7F}", false),
         Err(Fallback::PieceDeclined)
     );
     assert!(tokenizer.encode("plain text\u{7F}", false).is_err());
@@ -961,28 +1227,39 @@ fn an_input_the_direct_encoder_gives_up_is_counted_and_encoded_by_tokenizers() {
     use crate::traits::Encoder;
     let mut state = 0x8888_9999_AAAA_BBBBu64;
     let shape = &shapes()[0];
-    let reference = tokenizer_of(shape, &mut state);
+    let mut reference = tokenizer_of(shape, &mut state);
+    // The model of `a_piece_the_model_declines_is_reported_after_the_work`:
+    // no character for byte 0x7F and no `unk_token` in the vocabulary.
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    for ch in table.iter().filter(|&&ch| ch != table[0x7F]) {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    let mut bpe = BPE::builder()
+        .vocab_and_merges(vocab, Merges::new())
+        .build()
+        .expect("bpe");
+    bpe.unk_token = Some("<unk>".to_owned());
+    reference.with_model(bpe);
     let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
     // The count applies to the direct path: with the v1 feature on, the
     // shape's split pattern is one the pipeline declines today.
     assert_eq!(ours.encode_path(), EncodePath::Native);
-    let not_nfc = |stats: &[EncodeFallbacks; 2]| {
+    let declined = |stats: &[EncodeFallbacks; 1]| {
         stats
             .iter()
-            .find(|s| s.reason == "not_nfc")
+            .find(|s| s.reason == "piece_declined")
             .map_or(0, |s| s.encodes)
     };
-    let before = not_nfc(&encode_fallbacks());
-    for text in ["Cafe\u{301}", "a\u{323}\u{301}", "\u{1100}\u{1161}"] {
-        let ids = ours.encode(text, false).expect("encode");
-        assert_eq!(
-            ids.token_ids(),
-            reference.encode(text, false).expect("encode").get_ids(),
-            "{text:?}"
-        );
+    let before = declined(&encode_fallbacks());
+    for text in ["plain text\u{7F}", "\u{7F}", "a\u{7F}b"] {
+        // The piece fails the `tokenizers` encode too: the error is its.
+        assert!(ours.encode(text, false).is_err(), "{text:?}");
+        assert!(reference.encode(text, false).is_err(), "{text:?}");
     }
     // Three inputs left the direct path here; other tests may add theirs.
-    assert!(not_nfc(&encode_fallbacks()) >= before + 3);
+    assert!(declined(&encode_fallbacks()) >= before + 3);
 }
 
 #[test]
@@ -990,10 +1267,14 @@ fn the_piece_cache_returns_the_same_ids() {
     let mut state = 0xABCD_EF01_2345_6789u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let text = "the same words the same words, again and again and again";
-    let first = native.encode(tokenizer.get_model(), text).expect("ids");
-    let second = native.encode(tokenizer.get_model(), text).expect("ids");
+    let first = native
+        .encode(Some(tokenizer.get_model()), text, false)
+        .expect("ids");
+    let second = native
+        .encode(Some(tokenizer.get_model()), text, false)
+        .expect("ids");
     assert_eq!(first, second);
     assert_eq!(
         first,
@@ -1015,7 +1296,7 @@ fn a_split_pattern_that_can_match_empty_declines_the_tokenizer() {
         for text in ["ab1", "the same words 12"] {
             let reference = tokenizer.encode(text, false).expect("encode");
             assert_eq!(
-                native.encode(tokenizer.get_model(), text),
+                native.encode(Some(tokenizer.get_model()), text, false),
                 Ok(reference.get_ids().to_vec()),
                 "{text:?}"
             );
@@ -1031,7 +1312,7 @@ fn piece_caches_belong_to_their_encoder() {
     let mut state = 0x1357_9BDF_2468_ACE0u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let threads = 4;
     let barrier = std::sync::Barrier::new(threads);
@@ -1039,7 +1320,9 @@ fn piece_caches_belong_to_their_encoder() {
         for _ in 0..threads {
             let (native, barrier) = (&native, &barrier);
             scope.spawn(move || {
-                native.encode(model, "the same words again").expect("ids");
+                native
+                    .encode(Some(model), "the same words again", false)
+                    .expect("ids");
                 barrier.wait();
             });
         }
@@ -1047,11 +1330,170 @@ fn piece_caches_belong_to_their_encoder() {
     let caches: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| cache.get_mut().short.len())
+        .map(|cache| cache.get_mut().short_entries())
         .collect();
     assert_eq!(caches.len(), threads, "{caches:?}");
     assert!(caches.iter().all(|&entries| entries > 0), "{caches:?}");
     drop(native);
+}
+
+/// The raw bytes a vocabulary entry stands for, back through the byte-level
+/// alphabet; `None` for an entry with a character outside it.
+fn raw_bytes(entry: &str) -> Option<Vec<u8>> {
+    let table = bytes_char();
+    entry
+        .chars()
+        .map(|c| table.iter().position(|&a| a == c).map(|b| b as u8))
+        .collect()
+}
+
+#[test]
+fn the_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in shapes() {
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let mut seeded = 0;
+        for entry in tokenizer.get_vocab(false).keys() {
+            let Some(key) = raw_bytes(entry).and_then(|bytes| ShortPieceKey::of(&bytes)) else {
+                continue;
+            };
+            let expected: Vec<u32> = model
+                .tokenize(entry)
+                .expect("the model tokenizes its own entry")
+                .iter()
+                .map(|token| token.id)
+                .collect();
+            let mut ids = Vec::new();
+            assert!(
+                native.seed.ids_into(key, &mut ids),
+                "{}: {entry:?} is not seeded",
+                shape.name
+            );
+            assert_eq!(ids, expected, "{}: {entry:?}", shape.name);
+            seeded += 1;
+        }
+        assert_eq!(native.seed.len(), seeded, "{}", shape.name);
+        assert!(seeded > 256, "{}: {seeded}", shape.name);
+    }
+}
+
+#[test]
+fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
+    // The vocabulary has "xyz" but the merges make only "xy": the model
+    // tokenizes its own entry as two ids under the merges and as itself under
+    // `ignore_merges`; the seed holds what the model gives, either way, and
+    // so does the encode.
+    for ignore_merges in [false, true] {
+        let mut vocab = Vocab::default();
+        for (id, c) in bytes_char().iter().enumerate() {
+            vocab.insert(c.to_string(), id as u32);
+        }
+        let xy = vocab.len() as u32;
+        vocab.insert("xy".to_owned(), xy);
+        let xyz = vocab.len() as u32;
+        vocab.insert("xyz".to_owned(), xyz);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+            .ignore_merges(ignore_merges)
+            .build()
+            .expect("bpe");
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let z = model.token_to_id("z").expect("z");
+        let expected = if ignore_merges {
+            vec![xyz]
+        } else {
+            vec![xy, z]
+        };
+        let mut ids = Vec::new();
+        assert!(native
+            .seed
+            .ids_into(ShortPieceKey::of(b"xyz").expect("key"), &mut ids));
+        assert_eq!(ids, expected, "ignore_merges {ignore_merges}");
+        assert_eq!(
+            tokenizer.encode("xyz", false).expect("encode").get_ids(),
+            expected.as_slice(),
+            "ignore_merges {ignore_merges}"
+        );
+        assert_eq!(
+            native.encode(Some(model), "xyz", false),
+            Ok(expected),
+            "ignore_merges {ignore_merges}"
+        );
+    }
+}
+
+#[test]
+fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
+    // The encoder is built over a model with `ignore_merges` on, so its seed
+    // holds "xyz" as the entry's own id; the encode then runs over a copy of
+    // the model with `ignore_merges` off, which merges "xyz" into two ids.
+    // A vocabulary word is answered by the seed (the entry's id), a piece the
+    // vocabulary lacks by the model; both land in the thread's packed tier.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let xyz = vocab.len() as u32;
+    vocab.insert("xyz".to_owned(), xyz);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut merging = bpe.clone();
+    merging.ignore_merges = false;
+    let merging = ModelWrapper::BPE(merging);
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let mut native = seeded(&tokenizer);
+    let z = merging.token_to_id("z").expect("z");
+    let q = merging.token_to_id("q").expect("q");
+    assert_eq!(
+        merging
+            .tokenize("xyz")
+            .expect("tokenize")
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        [xy, z],
+        "the merging copy merges the entry"
+    );
+    assert_eq!(
+        native.encode(Some(&merging), "xyz", false),
+        Ok(vec![xyz]),
+        "the seed answered"
+    );
+    assert_eq!(
+        native.encode(Some(&merging), "xyz", false),
+        Ok(vec![xyz]),
+        "the thread tier answered"
+    );
+    assert_eq!(
+        native.encode(Some(&merging), "xyq", false),
+        Ok(vec![xy, q]),
+        "the model answered"
+    );
+    let caches: Vec<(usize, usize)> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            let cache = cache.get_mut();
+            (
+                cache.packed.as_ref().map_or(0, ShortPieceTable::len),
+                cache.short.len(),
+            )
+        })
+        .collect();
+    assert_eq!(caches, [(2, 0)]);
 }
 
 /// Distinct words for distinct `i`: distinct pieces.
@@ -1071,28 +1513,36 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let threads = 24u32;
+    // The encoder counts 4,096 threads already, as a gateway with many
+    // runtime and blocking threads would: each thread's share is a thousand
+    // pieces, which its 15,000 distinct words exceed many times over.
+    let counted = 4_096;
+    native.threads.store(counted, Ordering::Relaxed);
     let barrier = std::sync::Barrier::new(threads as usize);
     std::thread::scope(|scope| {
         for t in 0..threads {
             let (native, barrier) = (&native, &barrier);
             scope.spawn(move || {
-                native.encode(model, "warm").expect("ids");
+                native.encode(Some(model), "warm", false).expect("ids");
                 barrier.wait();
-                // More distinct pieces than one thread's share, and
-                // together far more than the total.
                 let text: String = (0..15_000)
                     .map(|i| format!(" {}", word(i * threads + t)))
                     .collect();
                 // On this thread, not the pool: the test is about the
                 // caches the encoding threads hold.
-                native.encode_with(model, &text, false).expect("ids");
+                native
+                    .encode_with(Some(model), &text, false, false)
+                    .expect("ids");
             });
         }
     });
-    assert_eq!(native.threads.load(Ordering::Relaxed), threads as usize);
+    assert_eq!(
+        native.threads.load(Ordering::Relaxed),
+        counted + threads as usize
+    );
     let share = native.piece_cache_share();
     assert!(share < PIECE_CACHE_CAPACITY, "{share}");
     let long_share = native.long_piece_bytes_share();
@@ -1100,7 +1550,7 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let caches: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| cache.get_mut().short.len())
+        .map(|cache| cache.get_mut().short_entries())
         .collect();
     assert_eq!(caches.len(), threads as usize, "{caches:?}");
     assert!(
@@ -1111,6 +1561,79 @@ fn piece_caches_stay_within_their_bound_across_threads() {
         caches.iter().sum::<usize>() <= PIECE_CACHE_TOTAL_CAPACITY,
         "{caches:?}"
     );
+    // Every thread joined before any table grew, so none has more slots
+    // than its share takes.
+    let slots: Vec<usize> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            cache
+                .get_mut()
+                .packed
+                .as_ref()
+                .map_or(0, ShortPieceTable::slots)
+        })
+        .collect();
+    assert!(
+        slots
+            .iter()
+            .all(|&slots| slots <= ShortPieceTable::slots_for(share)),
+        "share {share}, slots {slots:?}"
+    );
+}
+
+/// A thread's packed table starts with the fewest slots, grows with the
+/// distinct pieces the thread meets up to its share, and is made anew for a
+/// smaller share (threads joined since it grew) when it is cleared.
+#[test]
+fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let packed = |native: &mut NativeEncoder| -> (usize, usize) {
+        let caches: Vec<(usize, usize)> = native
+            .piece_cache
+            .iter_mut()
+            .filter_map(|cache| cache.get_mut().packed.as_ref())
+            .map(|packed| (packed.slots(), packed.len()))
+            .collect();
+        assert_eq!(caches.len(), 1, "{caches:?}");
+        caches[0]
+    };
+    let short = native
+        .encode(Some(model), "a few words", false)
+        .expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert_eq!(slots, MIN_SLOTS, "a short prompt grows nothing");
+    assert!(len <= 4, "{len}");
+    // More distinct pieces than the bound of 16,384 the cache had (a text of
+    // 32k tokens cleared it on every pass), fewer than the share: the table
+    // grows to the slots they take and keeps every one of them.
+    let text: String = (0..20_000).map(|i| format!(" {}", word(i))).collect();
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert!(len >= 20_000, "{len}");
+    assert!(len < PIECE_CACHE_CAPACITY, "{len}");
+    assert_eq!(slots, ShortPieceTable::slots_for(len));
+    assert!(slots < ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY));
+    // Threads join (the share falls to a fifth of the entries held): the
+    // clear at the next piece makes the table anew for the new share, and
+    // the thread's pieces are answered as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(share < len / 4, "{share} < {len} / 4");
+    let more: String = (20_000..25_000).map(|i| format!(" {}", word(i))).collect();
+    native
+        .encode_with(Some(model), &more, false, false)
+        .expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert_eq!(slots, ShortPieceTable::slots_for(share));
+    assert!(len <= share, "{len} <= {share}");
+    assert_eq!(native.encode(Some(model), "a few words", false), Ok(short));
 }
 
 /// `len` letters, distinct for distinct `i`: one piece of `len` bytes
@@ -1134,7 +1657,7 @@ fn long_pieces_are_cached_by_their_bytes() {
     let mut state = 0x0BAD_F00D_1234_5678u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let short = letters(CACHED_PIECE_MAX_BYTES, 1);
     let long = letters(CACHED_PIECE_MAX_BYTES + 1, 2);
@@ -1143,7 +1666,7 @@ fn long_pieces_are_cached_by_their_bytes() {
     // Newlines split the words without joining a space to them.
     let text = format!("{short}\n{long}\n{longest}\n{beyond}");
     let reference = tokenizer.encode(text.as_str(), false).expect("encode");
-    let first = native.encode(model, &text).expect("ids");
+    let first = native.encode(Some(model), &text, false).expect("ids");
     assert_eq!(first, reference.get_ids());
     {
         let cache = native
@@ -1167,7 +1690,7 @@ fn long_pieces_are_cached_by_their_bytes() {
     }
     // The second encode is answered from the cache: the same ids, and
     // the cache as it was.
-    let second = native.encode(model, &text).expect("ids");
+    let second = native.encode(Some(model), &text, false).expect("ids");
     assert_eq!(second, first);
     let cache = native
         .piece_cache
@@ -1187,7 +1710,7 @@ fn long_pieces_stay_within_their_byte_share() {
     let mut state = 0x7A7A_5B5B_3C3C_1D1Du64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     // Distinct long pieces worth more than one thread's share: each
     // entry takes its 80 bytes, its ids (at least 27, the model merges
@@ -1196,7 +1719,7 @@ fn long_pieces_stay_within_their_byte_share() {
     let text: String = (0..words)
         .map(|i| format!("{}\n", letters(80, i)))
         .collect();
-    native.encode(model, &text).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
     let share = native.long_piece_bytes_share();
     let cache = native
         .piece_cache
@@ -1237,7 +1760,7 @@ fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
             "{text:?}: the quick check should be unsure here"
         );
         let ids = native
-            .encode(tokenizer.get_model(), text)
+            .encode(Some(tokenizer.get_model()), text, false)
             .unwrap_or_else(|fallback| {
                 panic!("{text:?} is in NFC and must take the native path, not {fallback:?}")
             });
@@ -1247,8 +1770,8 @@ fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
             "{text:?}"
         );
     }
-    // Not in NFC: composition or reordering would change the text, so
-    // these stay with `tokenizers`.
+    // Not in NFC: composition or reordering changes the text; the path
+    // normalizes it and the ids are those `tokenizers` gives.
     for text in [
         "Cafe\u{301}",
         "a\u{323}\u{301}",
@@ -1257,9 +1780,544 @@ fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
         "ก\u{E48}\u{E38}",
     ] {
         assert_eq!(
-            native.encode(tokenizer.get_model(), text),
-            Err(Fallback::NotNfc),
+            native
+                .encode(Some(tokenizer.get_model()), text, false)
+                .unwrap_or_else(|fallback| panic!("{text:?} declined as {fallback:?}")),
+            tokenizer.encode(text, false).expect("encode").get_ids(),
             "{text:?}"
         );
     }
+}
+
+/// `post_processor` built from a single template and its special tokens.
+fn template(single: &str, tokens: Vec<SpecialToken>) -> TemplateProcessing {
+    TemplateProcessing::builder()
+        .try_single(single)
+        .expect("a single template")
+        .special_tokens(tokens)
+        .build()
+        .expect("a template post-processor")
+}
+
+#[test]
+fn a_template_post_processor_frames_the_ids_on_request() {
+    let mut state = 0x1F2E_3D4C_5B6A_7988u64;
+    let shape = &shapes()[0];
+    let base = tokenizer_of(shape, &mut state);
+    let id = |token: &str| base.token_to_id(token).expect("a special token's id");
+    let (start, end, eot) = (id("<|im_start|>"), id("<|im_end|>"), id("<|endoftext|>"));
+    // A token before and one after; the byte-level processor in front of
+    // a template, the form the Llama-3-class files carry; a special token
+    // standing for two ids.
+    let forms: [(&str, PostProcessorWrapper); 3] = [
+        (
+            "before and after",
+            template(
+                "<|im_start|> $A <|im_end|>",
+                vec![("<|im_start|>", start).into(), ("<|im_end|>", end).into()],
+            )
+            .into(),
+        ),
+        (
+            "byte-level then template",
+            ProcessorSequence::new(vec![
+                ByteLevelProcessor::default().trim_offsets(false).into(),
+                template("<|endoftext|> $A", vec![("<|endoftext|>", eot).into()]).into(),
+            ])
+            .into(),
+        ),
+        (
+            "a two-id token",
+            template(
+                "$A <|turn|>",
+                vec![SpecialToken::new(
+                    "<|turn|>".to_owned(),
+                    vec![end, eot],
+                    vec!["<|im_end|>".to_owned(), "<|endoftext|>".to_owned()],
+                )
+                .expect("two ids")],
+            )
+            .into(),
+        ),
+    ];
+    let added: Vec<&str> = shape
+        .special
+        .iter()
+        .copied()
+        .chain(shape.added.iter().map(|(s, _)| *s))
+        .collect();
+    for (name, post_processor) in forms {
+        let mut tokenizer = tokenizer_of(shape, &mut state);
+        tokenizer.with_post_processor(Some(post_processor));
+        let native = NativeEncoder::from_tokenizer(&tokenizer)
+            .unwrap_or_else(|declined| panic!("{name}: {declined}"));
+        let model = tokenizer.get_model();
+        for round in 0..300 {
+            let text = if round == 0 {
+                String::new()
+            } else {
+                random_text(&mut state, 1 + round % 40, &added)
+            };
+            for add_special_tokens in [false, true] {
+                let reference = tokenizer
+                    .encode(text.as_str(), add_special_tokens)
+                    .expect("encode");
+                let ids = native
+                    .encode(Some(model), &text, add_special_tokens)
+                    .unwrap_or_else(|fallback| panic!("{name}: {text:?} declined as {fallback:?}"));
+                assert_eq!(
+                    ids,
+                    reference.get_ids(),
+                    "{name}: {text:?} with special tokens {add_special_tokens}"
+                );
+            }
+        }
+        // The pooled encode frames the whole result once.
+        let long = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+        assert_eq!(
+            native
+                .encode_with(Some(model), &long, true, true)
+                .expect("pooled"),
+            tokenizer
+                .encode(long.as_str(), true)
+                .expect("encode")
+                .get_ids(),
+            "{name}: pooled"
+        );
+        // The plain encode of a segment never frames.
+        assert_eq!(
+            native.encode_plain(Some(model), "hello").expect("plain"),
+            native.encode(Some(model), "hello", false).expect("ids"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_template_before_the_byte_level_processor_frames_the_ids_too() {
+    let mut state = 0x2A2B_2C2D_2E2F_3031u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let mut tokenizer = tokenizer_of(&shape, &mut state);
+    let id = |token: &str| tokenizer.token_to_id(token).expect("a special token's id");
+    let (gmask, sop) = (id("[gMASK]"), id("<sop>"));
+    tokenizer.with_post_processor(Some(ProcessorSequence::new(vec![
+        template(
+            "[gMASK] $A <sop>",
+            vec![("[gMASK]", gmask).into(), ("<sop>", sop).into()],
+        )
+        .into(),
+        ByteLevelProcessor::default().trim_offsets(true).into(),
+    ])));
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    assert_eq!(
+        native.frame,
+        Frame {
+            before: vec![gmask],
+            after: vec![sop],
+        }
+    );
+    for text in ["", "hello world", "x[gMASK]y<sop>"] {
+        for add_special_tokens in [false, true] {
+            assert_eq!(
+                native
+                    .encode(Some(tokenizer.get_model()), text, add_special_tokens)
+                    .expect("ids"),
+                tokenizer
+                    .encode(text, add_special_tokens)
+                    .expect("encode")
+                    .get_ids(),
+                "{text:?} with special tokens {add_special_tokens}"
+            );
+        }
+    }
+}
+
+#[test]
+fn template_shapes_outside_the_frame_are_declined() {
+    use serde_json::json;
+    let declined = |post_processor: Value| {
+        NativeEncoder::frame_from(&post_processor)
+            .expect_err("declined")
+            .to_string()
+    };
+    let tokens = json!({
+        "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+        "<none>": {"id": "<none>", "ids": [], "tokens": []},
+    });
+    let bos = json!({"SpecialToken": {"id": "<s>", "type_id": 0}});
+    let none = json!({"SpecialToken": {"id": "<none>", "type_id": 0}});
+    let a = json!({"Sequence": {"id": "A", "type_id": 0}});
+    let b = json!({"Sequence": {"id": "B", "type_id": 1}});
+    let template = |single: Vec<Value>| {
+        json!({
+            "type": "TemplateProcessing",
+            "single": single,
+            "pair": [bos, a, b],
+            "special_tokens": tokens,
+        })
+    };
+    // The frame the file reader of `tokenizers` takes as it is but the
+    // library's builder would refuse: the body dropped, the body twice, a
+    // second sequence, a token outside the map.
+    assert_eq!(
+        declined(template(vec![bos.clone()])),
+        "a TemplateProcessing single template without one $A sequence"
+    );
+    assert_eq!(
+        declined(template(vec![a.clone(), a.clone()])),
+        "a TemplateProcessing single template without one $A sequence"
+    );
+    assert_eq!(
+        declined(template(vec![a.clone(), b.clone()])),
+        "a TemplateProcessing single template with a $B sequence"
+    );
+    assert_eq!(
+        declined(template(vec![
+            json!({"SpecialToken": {"id": "<unk>", "type_id": 0}}),
+            a.clone(),
+        ])),
+        "a TemplateProcessing special token \"<unk>\" missing from its map"
+    );
+    assert_eq!(
+        declined(json!({"type": "RobertaProcessing", "sep": ["</s>", 2], "cls": ["<s>", 0]})),
+        "post-processor RobertaProcessing (only ByteLevel, TemplateProcessing or none)"
+    );
+    // A template after one with special-token pieces: the library hands
+    // that one's pieces to the next unmerged (two take its pair template,
+    // three hit a `todo!()` in `TemplateProcessing::process_encodings`),
+    // whether the next adds ids or not, and a piece with an empty id list
+    // is a piece too; a template of `$A` alone passes one encoding through
+    // and may come before one that adds.
+    let two_templates = |first: Vec<Value>, second: Vec<Value>| {
+        json!({
+            "type": "Sequence",
+            "processors": [template(first), template(second)],
+        })
+    };
+    let after_pieces =
+        "a post-processor sequence with a template after one with special-token pieces";
+    assert_eq!(
+        declined(two_templates(
+            vec![bos.clone(), a.clone()],
+            vec![a.clone(), bos.clone()]
+        )),
+        after_pieces
+    );
+    assert_eq!(
+        declined(two_templates(vec![bos.clone(), a.clone()], vec![a.clone()])),
+        after_pieces
+    );
+    assert_eq!(
+        declined(two_templates(vec![a.clone(), none], vec![a.clone()])),
+        after_pieces
+    );
+    assert_eq!(
+        NativeEncoder::frame_from(&two_templates(
+            vec![a.clone()],
+            vec![a.clone(), bos.clone()]
+        ))
+        .expect("frame"),
+        Frame {
+            before: vec![],
+            after: vec![1],
+        }
+    );
+    // A sequence inside a sequence, and a member of another kind.
+    assert_eq!(
+        declined(json!({
+            "type": "Sequence",
+            "processors": [{"type": "Sequence", "processors": [template(vec![a.clone()])]}],
+        })),
+        "a post-processor sequence inside a sequence"
+    );
+    assert_eq!(
+        declined(json!({
+            "type": "Sequence",
+            "processors": [{"type": "RobertaProcessing", "sep": ["</s>", 2], "cls": ["<s>", 0]}],
+        })),
+        "post-processor RobertaProcessing in a sequence (only ByteLevel or TemplateProcessing)"
+    );
+    // The shapes taken: the Llama-3-class form, and a pair template that
+    // is never read.
+    assert_eq!(
+        NativeEncoder::frame_from(&template(vec![bos.clone(), a.clone()])).expect("frame"),
+        Frame {
+            before: vec![1],
+            after: vec![],
+        }
+    );
+    assert_eq!(
+        NativeEncoder::frame_from(&json!({
+            "type": "Sequence",
+            "processors": [
+                {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true},
+                template(vec![a.clone(), bos.clone()]),
+            ],
+        }))
+        .expect("frame"),
+        Frame {
+            before: vec![],
+            after: vec![1],
+        }
+    );
+}
+
+#[test]
+fn the_ideograph_run_is_exact_at_its_utf8_edges() {
+    // U+4000 is E4 80 80, U+9FFF is E9 BF BF; U+3FFF (E3 BF BF) and U+A000
+    // (EA 80 80) are outside, as are the kana under E3 and the Hangul
+    // syllables under EA..=ED. A continuation byte never starts a run.
+    assert_eq!(ideograph_run("\u{4000}".as_bytes()), 3);
+    assert_eq!(ideograph_run("\u{9FFF}".as_bytes()), 3);
+    assert_eq!(ideograph_run("\u{3FFF}".as_bytes()), 0);
+    assert_eq!(ideograph_run("\u{A000}".as_bytes()), 0);
+    assert_eq!(ideograph_run("か".as_bytes()), 0);
+    assert_eq!(ideograph_run("\u{AC00}".as_bytes()), 0);
+    assert_eq!(ideograph_run("漢字か漢".as_bytes()), 6);
+    assert_eq!(ideograph_run("漢字abc".as_bytes()), 6);
+    assert_eq!(ideograph_run(&"漢".as_bytes()[1..]), 0);
+    assert_eq!(checked_run("か漢".as_bytes()), 3);
+    assert_eq!(checked_run("かな abc".as_bytes()), 6);
+    assert_eq!(checked_run("\u{301}\u{3099}漢".as_bytes()), 5);
+    assert_eq!(checked_run("漢".as_bytes()), 0);
+    // The stretches of a mixed text: settled runs on their own, the ASCII
+    // character before a run of other characters kept with it.
+    let text = "ab漢字e\u{301}か\u{3099}漢 x";
+    let got: Vec<(usize, &str, bool)> = stretches(text).collect();
+    assert_eq!(
+        got,
+        [
+            (0, "ab", true),
+            (2, "漢字", true),
+            (8, "e\u{301}か\u{3099}", false),
+            (17, "漢", true),
+            (20, " x", true),
+        ]
+    );
+}
+
+#[test]
+fn the_ideograph_range_is_settled_by_the_crates_own_tables() {
+    // Every code point of U+4000..=U+9FFF, read from the tables the native
+    // path normalizes with: combining class 0, no canonical decomposition,
+    // the quick check's Yes (so not the second element of any composition:
+    // those are the quick check's Maybe, by its definition), and no
+    // composition with any possible second element after it. The candidate
+    // second elements are every code point the quick check calls Maybe;
+    // three known compositions outside the range show the walk sees them;
+    // the counts are asserted at the end.
+    use unicode_normalization_alignments::char::{
+        canonical_combining_class, compose, decompose_canonical,
+    };
+    let quick = |ch: char| is_nfc_quick(std::iter::once(ch));
+    let seconds: Vec<char> = (0..=0x10FFFFu32)
+        .filter_map(char::from_u32)
+        .filter(|&ch| quick(ch) == IsNormalized::Maybe)
+        .collect();
+    assert!(seconds.contains(&'\u{301}'));
+    assert!(seconds.contains(&'\u{3099}'));
+    assert!(seconds.contains(&'\u{11A8}'));
+    assert_eq!(compose('e', '\u{301}'), Some('\u{E9}'));
+    assert_eq!(compose('か', '\u{3099}'), Some('が'));
+    assert_eq!(compose('\u{AC00}', '\u{11A8}'), Some('\u{AC01}'));
+    let (mut walked, mut compositions) = (0usize, 0usize);
+    for ch in '\u{4000}'..='\u{9FFF}' {
+        walked += 1;
+        assert_eq!(canonical_combining_class(ch), 0, "{ch:?}");
+        let mut parts = Vec::new();
+        decompose_canonical(ch, |part| parts.push(part));
+        assert_eq!(parts, [ch], "{ch:?}");
+        assert_eq!(quick(ch), IsNormalized::Yes, "{ch:?}");
+        compositions += seconds
+            .iter()
+            .filter(|&&second| compose(ch, second).is_some())
+            .count();
+    }
+    // The counts of the walk: the range, the crate's Maybe set (Unicode 9.0
+    // tables), and no composition between them.
+    assert_eq!(walked, 0x6000);
+    assert_eq!(seconds.len(), 110);
+    assert_eq!(compositions, 0);
+}
+
+#[test]
+fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
+    // Chinese prose with full-width punctuation and no ASCII at all: every
+    // mark is a checked stretch on its own and every run of ideographs a
+    // settled one. `checked_run` ends at the first ASCII or ideograph lead
+    // byte; scanning the whole non-ASCII run first and trimming it to the
+    // first ideograph read the rest of the line again for every mark.
+    let line = "漢字中文测试，漢字中文测试。".repeat(512);
+    let got: Vec<(usize, &str, bool)> = stretches(&line).collect();
+    assert_eq!(got.len(), 2048);
+    let mut at = 0;
+    for (start, stretch, settled) in &got {
+        assert_eq!(*start, at);
+        at += stretch.len();
+        if *settled {
+            assert_eq!(*stretch, "漢字中文测试");
+        } else {
+            assert!(*stretch == "，" || *stretch == "。", "{stretch:?}");
+        }
+    }
+    assert_eq!(at, line.len());
+    assert!(is_nfc(&line));
+    assert!(matches!(nfc(&line), Cow::Borrowed(_)));
+    // The checked run ends at an ideograph, at an ASCII byte, or at the end.
+    assert_eq!(checked_run("，漢".as_bytes()), 3);
+    assert_eq!(checked_run("，。、漢字".as_bytes()), 9);
+    assert_eq!(checked_run("，。x".as_bytes()), 6);
+    assert_eq!(checked_run("，。".as_bytes()), 6);
+    assert_eq!(checked_run("x".as_bytes()), 0);
+}
+
+/// A tiktoken vocabulary over the pool: the 256 bytes and `merges` tokens
+/// learnt from a corpus by the byte-pair rule (the most frequent adjacent
+/// pair inside a word becomes the next token), the byte tokens ranked
+/// first or, as in a file whose byte tokens are not its first lines, last.
+fn tiktoken_ranks(state: &mut u64, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
+    let corpus = random_text(state, 6000, &[]);
+    let mut symbols: Vec<Vec<u8>> = corpus.bytes().map(|b| vec![b]).collect();
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    while tokens.len() < merges {
+        let mut counts: FxHashMap<(Vec<u8>, Vec<u8>), usize> = FxHashMap::default();
+        for pair in symbols.windows(2) {
+            if pair[0] == b" " || pair[1] == b" " || pair[0] == b"\n" || pair[1] == b"\n" {
+                continue;
+            }
+            *counts
+                .entry((pair[0].clone(), pair[1].clone()))
+                .or_default() += 1;
+        }
+        let Some(((a, b), _)) = counts
+            .into_iter()
+            .max_by_key(|((a, b), n)| (*n, std::cmp::Reverse((a.clone(), b.clone()))))
+        else {
+            break;
+        };
+        let token = [a.as_slice(), b.as_slice()].concat();
+        if seen.insert(token.clone()) {
+            tokens.push(token.clone());
+        }
+        let mut merged = Vec::with_capacity(symbols.len());
+        let mut i = 0;
+        while i < symbols.len() {
+            if i + 1 < symbols.len() && symbols[i] == a && symbols[i + 1] == b {
+                merged.push(token.clone());
+                i += 2;
+            } else {
+                merged.push(symbols[i].clone());
+                i += 1;
+            }
+        }
+        symbols = merged;
+    }
+    let mut ranks = FxHashMap::default();
+    let (byte_base, token_base) = if bytes_last {
+        (tokens.len() as u32, 0)
+    } else {
+        (0, 256)
+    };
+    for byte in 0..=255u8 {
+        ranks.insert(vec![byte], byte_base + u32::from(byte));
+    }
+    for (i, token) in tokens.into_iter().enumerate() {
+        ranks.insert(token, token_base + i as u32);
+    }
+    ranks
+}
+
+/// A tiktoken vocabulary rides the direct path as the file's own encoder
+/// encodes it: the Kimi template with the byte tokens first and last, and
+/// the cl100k template; special tokens cut out of the raw text (`encode`)
+/// or read as text (`encode_plain`); random text of every pool character
+/// with the specials sprinkled in, short, and long enough for the thread
+/// pool; against `tiktoken_rs::CoreBPE` over the same ranks.
+#[test]
+fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
+    const SPECIALS: [&str; 4] = ["[BOS]", "[EOS]", "<|open|>", "<|reserved_token_1|>"];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for (pattern, bytes_last) in [
+        (KIMI_K2_PATTERN, false),
+        (KIMI_K2_PATTERN, true),
+        (CL100K, false),
+    ] {
+        let ranks = tiktoken_ranks(&mut state, 600, bytes_last);
+        let next = ranks.len() as u32 + 7;
+        let specials: Vec<(String, u32)> = SPECIALS
+            .iter()
+            .enumerate()
+            .map(|(i, special)| ((*special).to_owned(), next + i as u32))
+            .collect();
+        let native =
+            NativeEncoder::from_ranks(&ranks, pattern, &specials).expect("the direct path");
+        assert!(native.chain.is_none());
+        assert_eq!(native.stages.len(), 1);
+        let own = CoreBPE::new(ranks.clone(), specials.iter().cloned().collect(), pattern)
+            .expect("the file's encoder");
+        for round in 0..1500 {
+            let text = random_text(&mut state, 1 + round % 48, &SPECIALS);
+            assert_eq!(
+                native.encode(None, &text, false),
+                Ok(own.encode_with_special_tokens(&text)),
+                "bytes last {bytes_last}: {text:?}"
+            );
+            assert_eq!(
+                native.encode_plain(None, &text),
+                Ok(own.encode_ordinary(&text)),
+                "bytes last {bytes_last}, plain: {text:?}"
+            );
+        }
+        let long = long_text(&mut state, &SPECIALS, 3 * PARALLEL_MIN_BYTES);
+        assert_eq!(
+            native.encode(None, &long, false),
+            Ok(own.encode_with_special_tokens(&long))
+        );
+        assert_eq!(
+            native.encode_plain(None, &long),
+            Ok(own.encode_ordinary(&long))
+        );
+    }
+}
+
+#[test]
+fn a_tiktoken_vocabulary_outside_the_path_declines() {
+    let mut state = 0x1234_5678_9ABC_DEF1u64;
+    let ranks = tiktoken_ranks(&mut state, 50, false);
+    let declined = |ranks: &FxHashMap<Vec<u8>, u32>, pattern: &str, specials: &[(String, u32)]| {
+        NativeEncoder::from_ranks(ranks, pattern, specials)
+            .expect_err("declined")
+            .to_string()
+    };
+    assert_eq!(
+        declined(&ranks, r"\w+|\s+", &[]),
+        r"a split pattern outside the supported regex subset: \w+|\s+"
+    );
+    assert_eq!(
+        declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
+        "special token \"\" without content"
+    );
+    assert_eq!(
+        declined(
+            &ranks,
+            KIMI_K2_PATTERN,
+            &[
+                ("<|b|>".to_owned(), 300),
+                ("<|a|>".to_owned(), 301),
+                ("<|a|>x".to_owned(), 302),
+            ]
+        ),
+        "special token \"<|a|>\" is a prefix of \"<|a|>x\""
+    );
+    let mut incomplete = ranks.clone();
+    incomplete.remove([0x7Fu8].as_slice());
+    assert_eq!(
+        declined(&incomplete, KIMI_K2_PATTERN, &[]),
+        "byte 0x7f has no token"
+    );
+    assert!(NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &[]).is_ok());
 }
