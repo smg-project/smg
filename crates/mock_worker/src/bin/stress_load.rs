@@ -140,6 +140,10 @@ struct Args {
     /// (`response_format: json_schema`).
     #[arg(long, default_value_t = false)]
     json_schema: bool,
+    /// Chat requests ask for logprobs: the sampled token's and this many
+    /// alternatives per token (`logprobs: true, top_logprobs: N`).
+    #[arg(long)]
+    logprobs: Option<u32>,
     /// Spread the requests over this many tenant ids (0: no tenant header).
     #[arg(long, default_value_t = 0)]
     tenants: usize,
@@ -386,6 +390,9 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
     if args.json_schema && args.mode != Mode::Chat {
         anyhow::bail!("--json-schema applies to --mode chat only");
     }
+    if args.logprobs.is_some() && args.mode != Mode::Chat {
+        anyhow::bail!("--logprobs applies to --mode chat only");
+    }
     let mut bodies = Vec::with_capacity(distinct);
     for i in 0..distinct {
         let body = match args.mode {
@@ -399,6 +406,10 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
                 });
                 if args.json_schema {
                     body["response_format"] = answer_schema();
+                }
+                if let Some(top_logprobs) = args.logprobs {
+                    body["logprobs"] = json!(true);
+                    body["top_logprobs"] = json!(top_logprobs);
                 }
                 body
             }
