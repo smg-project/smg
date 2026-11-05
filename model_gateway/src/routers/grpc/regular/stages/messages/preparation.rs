@@ -65,10 +65,6 @@ impl MessagePreparationStage {
         ctx: &mut RequestContext,
         request: &CreateMessageRequest,
     ) -> Result<(), Response> {
-        if let Some(refusal) = output_format_refusal(request) {
-            return Err(refusal);
-        }
-
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "MessagePreparationStage::prepare_messages")
             .map_err(|e| *e)?;
@@ -228,23 +224,10 @@ impl MessagePreparationStage {
     }
 }
 
-/// A structured output format would be dropped with the other pass-through
-/// fields and the answer returned unconstrained, so it is refused by name.
-fn output_format_refusal(request: &CreateMessageRequest) -> Option<Response> {
-    let field = request.output_format_field()?;
-    Some(error::bad_request(
-        "unsupported_output_format",
-        format!(
-            "{field} is not supported: the gateway cannot constrain a Messages answer to a format"
-        ),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{output_format_refusal, CreateMessageRequest};
     use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
 
     #[test]
@@ -423,44 +406,96 @@ mod tests {
         }
     }
 
-    /// An output format under either field is a 400 naming the field; a
-    /// request without one is not refused.
-    #[test]
-    fn an_output_format_is_refused_by_the_field_it_comes_under() {
-        let request = |extra: serde_json::Value| -> CreateMessageRequest {
-            let mut body = serde_json::json!({
-                "model": "m", "max_tokens": 8,
+    /// A structured output format, under `output_config.format` or the
+    /// field's earlier top-level name, is the answer's schema: where no table
+    /// reads the response the stage hands it to the engine as its own
+    /// JSON-schema constraint (a table gives it its tag instead, see
+    /// `regular::symphony::constraint`). A request without one is constrained
+    /// by nothing.
+    #[tokio::test]
+    async fn the_stage_constrains_the_answer_to_the_output_formats_schema() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::TokenizerRegistry;
+        use openai_protocol::messages::CreateMessageRequest;
+        use serde_json::json;
+
+        use crate::{
+            routers::grpc::{
+                common::stages::PipelineStage,
+                context::{PreparationOutput, RequestContext},
+                regular::{
+                    stages::{messages::MessagePreparationStage, testing::components_over},
+                    symphony,
+                },
+            },
+            worker::WorkerRegistry,
+        };
+
+        const MODEL: &str = "format-model";
+        let (_dir, tokenizer) = byte_tokenizer_with_template(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}",
+        );
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        tokenizer_registry
+            .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let components = components_over(
+            tokenizer_registry,
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
+        let schema = json!({
+            "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
+        });
+        let format = json!({"type": "json_schema", "schema": schema});
+        for (extra, constrained) in [
+            (json!({"output_config": {"format": format}}), true),
+            (json!({"output_format": format}), true),
+            (json!({"output_config": {"effort": "high"}}), false),
+            (json!({}), false),
+        ] {
+            let mut body = json!({
+                "model": MODEL, "max_tokens": 8,
                 "messages": [{"role": "user", "content": "hi"}]
             });
             body.as_object_mut()
-                .expect("an object")
-                .extend(extra.as_object().expect("an object").clone());
-            serde_json::from_value(body).expect("a Messages request")
-        };
-        let format = serde_json::json!({"type": "json_schema", "schema": {"type": "object"}});
-        for (extra, field) in [
-            (
-                serde_json::json!({"output_format": format}),
-                "output_format",
-            ),
-            (
-                serde_json::json!({"output_config": {"format": format}}),
-                "output_config.format",
-            ),
-        ] {
-            let response = output_format_refusal(&request(extra)).expect("a refusal");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+            let mut ctx = RequestContext::for_messages(
+                Arc::new(request),
+                None,
+                MODEL.into(),
+                components.clone(),
+            );
+            MessagePreparationStage::new(&[])
+                .execute(&mut ctx)
+                .await
+                .unwrap_or_else(|response| panic!("{extra}: {}", response.status()));
+            let constraint = match ctx.state.preparation.take() {
+                Some(PreparationOutput::Messages {
+                    tool_constraints, ..
+                }) => tool_constraints,
+                _ => panic!("{extra}: no messages preparation"),
+            };
+            let pair = match constraint {
+                Ok(symphony::Prepared::Constraint {
+                    constraint,
+                    first_token,
+                }) => {
+                    assert!(!first_token, "{extra}");
+                    Some(constraint.to_tuple())
+                }
+                Ok(symphony::Prepared::None) => None,
+                other => panic!("{extra}: {other:?}"),
+            };
             assert_eq!(
-                response
-                    .headers()
-                    .get("x-smg-error-code")
-                    .and_then(|v| v.to_str().ok()),
-                Some("unsupported_output_format"),
-                "{field}"
+                pair,
+                constrained.then(|| ("json_schema".to_string(), schema.to_string())),
+                "{extra}"
             );
         }
-        assert!(
-            output_format_refusal(&request(serde_json::json!({"output_format": null}))).is_none()
-        );
     }
 }

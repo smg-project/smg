@@ -50,6 +50,7 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_tool_pairing(&req.messages)?;
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
+    validate_output_format(req)?;
     validate_thinking(req)
 }
 
@@ -363,6 +364,30 @@ fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
             return Err(invalid(
                 "unknown_tool_field",
                 format!("tools.{index}.custom.{field}: Extra inputs are not permitted"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An output format's schema is a JSON object, under either field it comes
+/// in ([`CreateMessageRequest::output_schema`]); the format's `type` is the
+/// deserializer's to refuse.
+fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    let under = [
+        (
+            "output_config.format",
+            req.output_config
+                .as_ref()
+                .and_then(|config| config.format.as_ref()),
+        ),
+        ("output_format", req.output_format.as_ref()),
+    ];
+    for (field, format) in under {
+        if format.is_some_and(|format| !format.schema().is_object()) {
+            return Err(invalid(
+                "output_format_schema_not_an_object",
+                format!("{field}.schema: Input should be a valid dictionary"),
             ));
         }
     }
@@ -737,5 +762,27 @@ mod tests {
             ),
             "{refusal}"
         );
+    }
+
+    /// An output format's schema is a JSON object, under either field it
+    /// comes in; the field is named as the public API names it.
+    #[test]
+    fn an_output_formats_schema_is_an_object() {
+        for field in ["output_config.format", "output_format"] {
+            let body = |schema: Value| {
+                let format = json!({"type": "json_schema", "schema": schema});
+                match field {
+                    "output_format" => json!({"output_format": format}),
+                    _ => json!({"output_config": {"format": format}}),
+                }
+            };
+            accepted(body(json!({"type": "object"})));
+            assert!(
+                rejection(body(json!("an object"))).contains(&format!(
+                    "{field}.schema: Input should be a valid dictionary"
+                )),
+                "{field}"
+            );
+        }
     }
 }
