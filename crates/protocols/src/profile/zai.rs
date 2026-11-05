@@ -175,12 +175,11 @@ fn validate_thinking_enabled(
     Ok(())
 }
 
-/// Each effort field must hold a name the model takes. `takes` says which
-/// names it takes. Both fields are forwarded, so a bad name in either
-/// field counts.
+/// Refuse an effort name the model does not accept, in `reasoning_effort`
+/// and in `thinking.effort`. Both fields are forwarded, so both are checked.
 fn validate_efforts(
     req: &ChatCompletionRequest,
-    takes: impl Fn(&str) -> bool,
+    accepted: impl Fn(&str) -> bool,
     hint: &str,
 ) -> Result<(), validator::ValidationError> {
     let efforts = [
@@ -191,7 +190,7 @@ fn validate_efforts(
         ("reasoning_effort", req.reasoning_effort.as_deref()),
     ];
     for (field, effort) in efforts {
-        if effort.is_some_and(|effort| !takes(effort)) {
+        if effort.is_some_and(|effort| !accepted(effort)) {
             return Err(pinned("reasoning_effort_not_allowed", field, hint));
         }
     }
