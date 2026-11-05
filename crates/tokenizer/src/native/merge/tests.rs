@@ -11,7 +11,9 @@ use tokenizers::{
     Model,
 };
 
-use super::{super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS};
+use super::{
+    super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
+};
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
 fn alphabet_vocab() -> (Vocab, [char; 256]) {
@@ -191,6 +193,9 @@ fn pieces() -> Vec<Vec<u8>> {
     .map(|s| s.as_bytes().to_vec())
     .collect();
     for len in [
+        SHORT_PIECE_TINY - 1,
+        SHORT_PIECE_TINY,
+        SHORT_PIECE_TINY + 1,
         SHORT_PIECE_SMALL - 1,
         SHORT_PIECE_SMALL,
         SHORT_PIECE_SMALL + 1,
@@ -446,8 +451,10 @@ fn the_leftmost_of_a_repeated_pair_merges_first() {
     let a = bpe.token_to_id("a").expect("a");
     assert_eq!(table_ids(&table, b"aaa"), vec![aa, a]);
     assert_eq!(table_ids(&table, b"aaaaa"), vec![aa, aa, a]);
-    // On both sizes of the stack arrays and on the heap.
+    // On the three sizes of the stack arrays and on the heap.
     for len in [
+        SHORT_PIECE_TINY,
+        SHORT_PIECE_TINY + 1,
         SHORT_PIECE_SMALL,
         SHORT_PIECE_SMALL + 1,
         SHORT_PIECE_SYMBOLS,
@@ -703,11 +710,23 @@ fn the_merges_read_are_the_models_merges_with_a_gap_in_the_ids_too() {
     }
 }
 
+/// The table is the byte-pair grid (256 x 256 words) and its entries: a
+/// power of two of buckets, one cache line of four sixteen-byte entries
+/// each, at a load of one half or less.
 #[test]
-fn the_tables_bytes_are_the_grid_the_slots_and_the_ids() {
+fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
-    let grid = 512 * 512 * size_of::<u32>();
-    assert!(table.bytes() > grid, "{}", table.bytes());
-    assert!(table.bytes() < grid + 64 * 1024, "{}", table.bytes());
+    let merges = merges().len();
+    let grid = 256 * 256 * size_of::<u64>();
+    let entries = (table.bytes() - size_of::<MergeTable>() - grid) / 16;
+    assert!(entries.is_power_of_two(), "{entries} entries");
+    assert!(
+        entries >= 2 * merges,
+        "{entries} entries for {merges} merges"
+    );
+    assert!(
+        entries < 4 * merges + 8,
+        "{entries} entries for {merges} merges"
+    );
 }
