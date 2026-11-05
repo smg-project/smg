@@ -7,10 +7,12 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     fmt, fs,
     io::{self, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -144,7 +146,11 @@ impl HubRepo {
     /// ref). The metadata request and the body's GET are both awaited here
     /// rather than left to the client's own download, which spawns a task per
     /// chunk and detaches it when the download is dropped: a fetch dropped at
-    /// its bound ends with no task reading a body that never comes.
+    /// its bound ends with no task reading a body that never comes. A body
+    /// of another length than the metadata request announced is a failed
+    /// fetch, nothing written: a close-delimited answer cut short reads as a
+    /// complete body, and cached under the file's etag it would be served as
+    /// the file from then on.
     async fn fetch(&self, filename: &str) -> Result<PathBuf, ApiError> {
         if let Some(path) = self.cache.get(filename) {
             return Ok(path);
@@ -160,6 +166,14 @@ impl HubRepo {
             .error_for_status()?
             .bytes()
             .await?;
+        if body.len() != metadata.size() {
+            return Err(io::Error::other(format!(
+                "{filename}: the Hub sent {} of {} bytes",
+                body.len(),
+                metadata.size()
+            ))
+            .into());
+        }
         let blob = self.cache.blob_path(metadata.etag());
         write_whole(&blob, &body)?;
         let pointer = self
@@ -180,13 +194,15 @@ fn write_whole(path: &Path, content: &[u8]) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::other("a blob path has no directory"))?;
     fs::create_dir_all(dir)?;
-    let mut builder = tempfile::Builder::new();
     // The mode a created file gets (0o666 under the umask), as the client's
     // own blobs have, not a temporary file's owner-only one: the cache is
     // read by every user of it.
     #[cfg(unix)]
-    builder.permissions(fs::Permissions::from_mode(0o666));
-    let mut file = builder.tempfile_in(dir)?;
+    let mut file = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o666))
+        .tempfile_in(dir)?;
+    #[cfg(not(unix))]
+    let mut file = tempfile::Builder::new().tempfile_in(dir)?;
     file.write_all(content)?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
@@ -499,65 +515,84 @@ mod tests {
         );
     }
 
-    /// The commit and etag the withholding Hub names, and the length of the
-    /// body it never sends.
+    /// The commit and etag the stub Hub names, and the length it announces
+    /// for the file (never sent whole).
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const ETAG: &str = "etag-of-the-withheld-file";
-    const WITHHELD_LEN: usize = 42;
+    const ANNOUNCED_LEN: usize = 42;
+
+    /// What the stub Hub makes of the file's own request.
+    #[derive(Clone, Copy)]
+    enum Body {
+        /// The status line and the announced length, then nothing: the
+        /// connection stays open until the client closes it.
+        Withheld,
+        /// A close-delimited answer (no length) cut after a quarter of the
+        /// announced bytes, then closed: what the client reads as a complete
+        /// body.
+        Cut,
+    }
 
     /// A Hub on loopback that answers a file's metadata request (`Range:
     /// bytes=0-0`) with the commit, etag and content range the client reads,
-    /// and the file's own request with its status line and length and nothing
-    /// more: the body never comes, and the connection stays open until the
-    /// client closes it, which the Hub records.
-    struct WithholdingHub {
+    /// and the file's own request as `body` says; it records the file's
+    /// request arriving and, for a withheld body, the client closing the
+    /// connection.
+    struct StubHub {
         endpoint: String,
-        /// The file's request arrived; its body is being withheld.
-        withholding: Arc<AtomicBool>,
-        /// The client closed the connection the body was withheld on.
+        /// The file's request arrived.
+        requested: Arc<AtomicBool>,
+        /// The client closed the connection a withheld body was on.
         closed: Arc<AtomicBool>,
     }
 
-    impl WithholdingHub {
-        fn start() -> Self {
+    impl StubHub {
+        fn start(body: Body) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
-            let withholding = Arc::new(AtomicBool::new(false));
+            let requested = Arc::new(AtomicBool::new(false));
             let closed = Arc::new(AtomicBool::new(false));
-            let flags = (withholding.clone(), closed.clone());
+            let flags = (requested.clone(), closed.clone());
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    let (withholding, closed) = flags.clone();
-                    thread::spawn(move || answer(stream, &withholding, &closed));
+                    let (requested, closed) = flags.clone();
+                    thread::spawn(move || answer(stream, body, &requested, &closed));
                 }
             });
             Self {
                 endpoint,
-                withholding,
+                requested,
                 closed,
             }
         }
     }
 
-    /// One connection's answer: the metadata, or the status line of the body
-    /// that is then withheld until the client gives up the connection.
-    fn answer(mut stream: TcpStream, withholding: &AtomicBool, closed: &AtomicBool) {
+    /// One connection's answer: the metadata, or the file's `body`.
+    fn answer(mut stream: TcpStream, body: Body, requested: &AtomicBool, closed: &AtomicBool) {
         let head = request_head(&mut stream);
         if head.contains("bytes=0-0\r\n") {
             let answer = format!(
                 "HTTP/1.1 206 Partial Content\r\nx-repo-commit: {COMMIT}\r\netag: \"{ETAG}\"\r\n\
-                 content-range: bytes 0-0/{WITHHELD_LEN}\r\ncontent-length: 1\r\n\
+                 content-range: bytes 0-0/{ANNOUNCED_LEN}\r\ncontent-length: 1\r\n\
                  connection: close\r\n\r\n{{"
             );
             let _ = stream.write_all(answer.as_bytes());
             return;
         }
-        let answer = format!("HTTP/1.1 200 OK\r\ncontent-length: {WITHHELD_LEN}\r\n\r\n");
-        let _ = stream.write_all(answer.as_bytes());
-        withholding.store(true, Ordering::SeqCst);
-        let mut buf = [0u8; 256];
-        while matches!(stream.read(&mut buf), Ok(read) if read > 0) {}
-        closed.store(true, Ordering::SeqCst);
+        requested.store(true, Ordering::SeqCst);
+        match body {
+            Body::Withheld => {
+                let answer = format!("HTTP/1.1 200 OK\r\ncontent-length: {ANNOUNCED_LEN}\r\n\r\n");
+                let _ = stream.write_all(answer.as_bytes());
+                let mut buf = [0u8; 256];
+                while matches!(stream.read(&mut buf), Ok(read) if read > 0) {}
+                closed.store(true, Ordering::SeqCst);
+            }
+            Body::Cut => {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n");
+                let _ = stream.write_all(&[b'{'; ANNOUNCED_LEN / 4]);
+            }
+        }
     }
 
     /// A request's head off `stream`, up to and including the blank line.
@@ -637,7 +672,7 @@ mod tests {
     /// one such task per fetch that ran out of its bound.)
     #[tokio::test]
     async fn a_fetch_whose_body_the_hub_withholds_ends_at_its_bound_with_nothing_behind() {
-        let hub = WithholdingHub::start();
+        let hub = StubHub::start(Body::Withheld);
         let home = tempfile::tempdir().expect("a cache directory");
         let _env = HubEnv::set(home.path(), &hub.endpoint);
         let metrics = tokio::runtime::Handle::current().metrics();
@@ -649,7 +684,7 @@ mod tests {
             .expect_err("the body never comes");
         let message = format!("{failed:#}");
         assert!(
-            hub.withholding.load(Ordering::SeqCst),
+            hub.requested.load(Ordering::SeqCst),
             "the Hub had the file's request before the bound elapsed: {message}"
         );
         assert!(HubFetchError::is(&failed), "{message}");
@@ -677,6 +712,34 @@ mod tests {
                 .join("hub/models--cell--withheld/snapshots")
                 .exists(),
             "nothing of the file is in the cache; the next resolution fetches it again"
+        );
+    }
+
+    /// A Hub whose answer to the file's request ends before the size its
+    /// metadata announced (a close-delimited answer cut short, which the
+    /// client reads as a complete body) is a failed fetch naming the sizes:
+    /// nothing is written, so the next resolution asks again instead of the
+    /// cache serving the cut file as `config.json` from then on.
+    #[tokio::test]
+    async fn a_body_cut_short_of_the_announced_size_is_not_cached() {
+        let hub = StubHub::start(Body::Cut);
+        let home = tempfile::tempdir().expect("a cache directory");
+        let _env = HubEnv::set(home.path(), &hub.endpoint);
+
+        let failed = resolve_within("cell/cut", Duration::from_secs(30))
+            .await
+            .expect_err("a cut body is not the file");
+        let message = format!("{failed:#}");
+        assert!(hub.requested.load(Ordering::SeqCst), "{message}");
+        assert!(HubFetchError::is(&failed), "{message}");
+        assert!(
+            message.contains("config.json") && message.contains("the Hub sent 10 of 42 bytes"),
+            "the error names the file and the sizes: {message}"
+        );
+        let repo = home.path().join("hub/models--cell--cut");
+        assert!(
+            !repo.join("blobs").exists() && !repo.join("snapshots").exists(),
+            "nothing of the file is in the cache"
         );
     }
 }
