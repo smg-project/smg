@@ -225,3 +225,63 @@ def test_an_unanswered_memory_query_fails_the_guard(guard: Guard) -> None:
     assert result.returncode == 1
     assert error_lines(result.stdout) == [f"::error::Unable to query GPU memory on node '{NODE}'."]
     assert result.elapsed < 10
+
+
+def test_deadline_crossing_after_print_requires_a_new_memory_read(
+    guard: Guard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard.busy()
+    guard.listed_app(0, 4242)
+    guard.listed_app(1, 4243)
+    guard.container("0123abcd bench:latest bench-1 up 3 hours")
+    hook = tmp_path / "guard-clock.sh"
+    hook.write_text(
+        """unset SECONDS
+SECONDS=0
+SMG_TEST_CLOCK_ADVANCED=0
+sleep() { :; }
+echo() {
+    builtin echo "$@"
+    local smg_echo_status=$?
+    case "${1-}" in
+        "gpu guard: 0s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_CLOCK_ADVANCED" -eq 0 ]; then
+                SMG_TEST_CLOCK_ADVANCED=1
+                SECONDS=1
+            fi
+            ;;
+    esac
+    return "$smg_echo_status"
+}
+"""
+    )
+    # BASH_ENV affects only the owned child and its shims, and monkeypatch restores it.
+    # Once unset, SECONDS is an ordinary variable: no wall-clock delay drives this case.
+    monkeypatch.setenv("BASH_ENV", str(hook))
+    result = guard.run(wait=1)
+    assert result.returncode == 1, result.stdout + result.stderr
+    readings = READING.findall(result.stdout)
+    assert readings and readings[0][0] == "0", result.stdout
+    assert len(readings) >= 2, result.stdout
+    assert int(readings[-1][0]) >= 1, result.stdout
+    # An extra printed line alone is insufficient: the guard must query memory again.
+    calls = (guard.state / "calls").read_text()
+    assert calls.count("--query-gpu=index,memory.used") >= 2, calls
+    assert result.stdout.count(REPORT_HEADER) == 2, result.stdout
+    for card, pid in ((0, 4242), (1, 4243)):
+        assert (
+            f"gpu guard: GPU {card}: pid {pid} (/usr/bin/python3) holds 80327 MiB; "
+            "not in this job's pid namespace" in result.stdout
+        )
+    assert (
+        "gpu guard: containers of this runner's docker: 0123abcd bench:latest bench-1 up 3 hours"
+        in result.stdout
+    )
+    (error,) = error_lines(result.stdout)
+    assert error.startswith(f"::error::GPU not clean on node '{NODE}' after ")
+    assert error.endswith(
+        ", held by a process outside this job's view (another pid namespace: "
+        "a previous job's engine still exiting, or a leaked context):"
+    )
+    lines = result.stdout.splitlines()
+    assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
