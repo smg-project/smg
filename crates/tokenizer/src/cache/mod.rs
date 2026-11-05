@@ -18,6 +18,7 @@ mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
+mod sampler;
 #[cfg(test)]
 mod test_encoders;
 

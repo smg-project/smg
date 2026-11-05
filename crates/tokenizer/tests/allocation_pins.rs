@@ -325,3 +325,94 @@ fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
         ids.token_ids().len()
     );
 }
+
+/// The special token the prefix cache splits at, in the added vocabulary of
+/// the byte-level BPE below.
+const TURN_END: &str = "<|im_end|>";
+
+/// The `k`th one-turn text. The texts differ in one number of four digits,
+/// each digit one id on the byte-level vocabulary, so every prefix has the
+/// same bytes and ids and every entry charges the budget the same.
+fn turn(k: usize) -> String {
+    format!("turn {k:04} the hello{TURN_END}the end")
+}
+
+#[test]
+fn a_prefix_cache_entry_costs_its_shared_ids_and_an_eviction_round_nothing() {
+    let inner: Arc<dyn Tokenizer> = Arc::new(HuggingFaceTokenizer::from_tokenizer(
+        common::byte_level_bpe(&common::FEW_MERGES, &[TURN_END]),
+    ));
+    let prefix_cached = |budget: usize| {
+        CachedTokenizer::new(
+            Arc::clone(&inner),
+            CacheConfig {
+                enable_l0: false,
+                enable_l1: true,
+                l1_max_memory: budget,
+                ..CacheConfig::default()
+            },
+        )
+    };
+    let texts: Vec<String> = (0..4).map(turn).collect();
+    // A cache with room for everything: what one entry charges the budget,
+    // and every piece of the texts through the library's own word cache, so
+    // the encodes below read nothing lazy.
+    let roomy = prefix_cached(1 << 20);
+    for text in &texts {
+        roomy.encode(text, false).expect("the miss encodes");
+    }
+    let stats = roomy.l1_cache_stats().expect("the prefix cache is on");
+    assert_eq!(stats.entries, 4, "a one-turn text seeds one prefix entry");
+    let size = stats.memory_bytes / 4;
+    assert_eq!(
+        size * 4,
+        stats.memory_bytes,
+        "the four entries are of one size"
+    );
+    // A cache with room for less than one entry: the miss path without its
+    // insert, the second text on it as on the cache below.
+    let roomless = prefix_cached(size - 1);
+    roomless.encode(&texts[0], false).expect("a miss");
+    let (_, no_insert) = allocations_during(|| roomless.encode(&texts[1], false).expect("a miss"));
+    assert_eq!(roomless.l1_cache_stats().map(|s| s.entries), Some(0));
+    // Room for three entries, after one pass over the texts and a clear: the
+    // map slot an entry's key hashes to gets its table at its first entry
+    // and the key index its room at its first key, and a clear keeps both,
+    // so the pass below reads the inserts alone. The second insert is the
+    // pinned one, the fourth has to make room.
+    let cached = prefix_cached(3 * size);
+    for text in &texts {
+        cached.encode(text, false).expect("a miss");
+    }
+    cached.clear_cache();
+    cached.encode(&texts[0], false).expect("a miss");
+    let (_, steady) = allocations_during(|| cached.encode(&texts[1], false).expect("a miss"));
+    cached.encode(&texts[2], false).expect("a miss");
+    assert_eq!(cached.l1_cache_stats().map(|s| s.entries), Some(3));
+    let (_, evicting) = allocations_during(|| cached.encode(&texts[3], false).expect("a miss"));
+    assert_eq!(
+        cached.l1_cache_stats().map(|s| (s.entries, s.memory_bytes)),
+        Some((3, 3 * size)),
+        "the fourth entry took the room of one"
+    );
+    assert!(
+        steady >= no_insert,
+        "the miss that inserted allocated {steady} times, the one that could not {no_insert}"
+    );
+    assert_eq!(
+        steady - no_insert,
+        1,
+        "inserting a prefix entry allocated {} times beyond the miss path that leads to it \
+         ({no_insert}): today the entry's shared ids, and nothing else; a box around the entry's \
+         timestamp moves this to 2, a copy of the ids to 2 as well (the miss that had to make room \
+         allocated {evicting} times)",
+        steady - no_insert
+    );
+    assert_eq!(
+        evicting, steady,
+        "the miss that had to make room allocated {evicting} times where one with room allocated \
+         {steady}: an eviction round draws its samples from the key index, reads them and removes \
+         one without allocating; a sample list per round moves this up by one, an iterator over \
+         a map per sample by one for every shard of that map it crosses"
+    );
+}
