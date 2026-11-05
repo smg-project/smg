@@ -362,16 +362,3 @@ jobs:
           path: ${{ runner.temp }}/bellwether-reports/
           if-no-files-found: ignore
           retention-days: 30
-
-      # The stats are for reading, not a verdict. When the job ends before the
-      # Rust setup put sccache on PATH (the unpack failed, say), the step says
-      # so and passes, instead of failing in its turn and hiding the step that
-      # did.
-      - name: Show sccache stats
-        if: always()
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats
-          else
-            echo "::notice::sccache is not on PATH, the Rust setup did not run: no stats to show"
-          fi
