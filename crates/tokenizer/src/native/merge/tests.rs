@@ -247,6 +247,22 @@ fn every_piece_merges_to_the_models_ids() {
     }
 }
 
+/// The pairs a tiktoken vocabulary's table holds: every cut of every token
+/// of two bytes or more whose two halves are tokens.
+fn split_pairs(ranks: &FxHashMap<Vec<u8>, u32>) -> usize {
+    ranks
+        .keys()
+        .filter(|token| token.len() >= 2)
+        .map(|token| {
+            (1..token.len())
+                .filter(|&cut| {
+                    ranks.contains_key(&token[..cut]) && ranks.contains_key(&token[cut..])
+                })
+                .count()
+        })
+        .sum()
+}
+
 /// A tiktoken vocabulary's table merges every piece as the file's own
 /// encoder does: the merges of `merges()` as ranks (bytes first and bytes
 /// last), the pieces of `pieces()`, and pieces that are tokens themselves
@@ -258,7 +274,8 @@ fn a_tiktoken_vocabulary_merges_as_its_own_encoder_does() {
         let ranks = ranks_of(&merges(), bytes_last);
         let table = MergeTable::from_ranks(&ranks).expect("a complete table");
         assert!(!table.ignore_merges);
-        assert_eq!(table.merges(), ranks.len());
+        // One entry per split of a token into two tokens.
+        assert_eq!(table.merges(), split_pairs(&ranks));
         let own = own_encoder(&ranks);
         let mut tokens: Vec<Vec<u8>> = ranks.keys().cloned().collect();
         tokens.sort();

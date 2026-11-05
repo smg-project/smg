@@ -1636,6 +1636,48 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     assert_eq!(native.encode(Some(model), "a few words", false), Ok(short));
 }
 
+/// A thread whose share fell (threads joined) since it last read it is
+/// within the new share from the start of its next encode call, with no
+/// miss in that call.
+#[test]
+fn a_thread_whose_share_fell_is_within_it_from_its_next_encode_on() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let entries = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().short_entries())
+            .sum()
+    };
+    let head: String = (0..200).map(|i| format!(" {}", word(i))).collect();
+    let text: String = (0..20_000).map(|i| format!(" {}", word(i))).collect();
+    let before = native
+        .encode_with(Some(model), &head, false, false)
+        .expect("ids");
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(entries(&mut native) >= 20_000);
+    // Threads join: the share falls below what this thread holds, which it
+    // keeps until its next encode.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(share < 20_000, "{share}");
+    assert!(entries(&mut native) >= 20_000);
+    // The next encode call, of pieces the thread has all met, starts within
+    // the share and answers as before.
+    let after = native
+        .encode_with(Some(model), &head, false, false)
+        .expect("ids");
+    assert_eq!(after, before);
+    let held = entries(&mut native);
+    assert!(held <= share, "{held} <= {share}");
+}
+
 /// `len` letters, distinct for distinct `i`: one piece of `len` bytes
 /// under the byte-level split (letters only, no space). The padding is
 /// a letter `word` never uses, so no two differ only in where it starts.
