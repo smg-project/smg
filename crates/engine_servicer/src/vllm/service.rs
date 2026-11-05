@@ -1,6 +1,5 @@
 //! `vllm.grpc.engine.VllmEngine` over the shared state: each RPC delegates to
-//! its handler module; RPCs the Rust path does not serve yet answer
-//! UNIMPLEMENTED so the Python servicer stays the place for them.
+//! its handler module.
 
 use std::sync::Arc;
 

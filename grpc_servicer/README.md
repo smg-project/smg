@@ -289,12 +289,14 @@ the engine connects (a scrape during the engine's start answers
 the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
 on its own thread, and closes
 with the servicer; a port equal to `--port` is refused before the engine
-starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
-no endpoint). A planned warm-up's own requests go through the request path
-and are counted like any other, so the first scrapes include them.
+starts. The endpoint is the Rust servicer's (the default); the deprecated
+Python servicer (`--servicer-impl python`) exposes none, and the flag (or its
+variable) is refused under it the same way. A planned warm-up's own requests
+go through the request path and are counted like any other, so the first
+scrapes include them.
 
 ```bash
-vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust --metrics-port 29100
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --metrics-port 29100
 curl -s http://127.0.0.1:29100/metrics | grep smg_servicer_requests_total
 ```
 
@@ -1294,9 +1296,9 @@ this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
 
 #### Metrics (`--metrics-port`)
 
-With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
-defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
-on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
+Under the Rust servicer (the default), `--metrics-port <port>` (and
+`--metrics-host`, defaulting to the gRPC `--host`) serves its Prometheus
+metrics on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
 `SMG_SGLANG_SERVICER_METRICS_HOST` are the environment forms the flags
 override, and without either there is no endpoint. The flags are this package's
 (the same plugin that adds `--servicer-impl`); a `SGLANG_PLUGINS` whitelist
@@ -1309,7 +1311,7 @@ servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
 on the Rust path either).
 
 ```bash
-sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust --metrics-port 29100
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --metrics-port 29100
 ```
 
 #### Headless over ZMQ (no SGLang change)
