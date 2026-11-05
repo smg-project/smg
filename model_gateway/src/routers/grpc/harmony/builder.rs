@@ -149,13 +149,14 @@ mod own_thread_tests {
     }
 }
 
-/// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format using Harmony's tokenizer.
 ///
 /// Delegates to the shared `convert_proto_logprobs` with Harmony's built-in tokenizer
 /// for token ID decoding.
 pub(crate) fn convert_harmony_logprobs(
     encoding: &HarmonyEncoding,
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
     utils::convert_proto_logprobs(proto_logprobs, |token_id| {
@@ -235,7 +236,7 @@ impl ToolLike for Tool {
         Some(ToolDescription::new(
             self.function.name.clone(),
             self.function.description.clone().unwrap_or_default(),
-            Some(self.function.parameters.clone()),
+            Some(self.function.parameters_schema().clone()),
         ))
     }
 }
@@ -282,7 +283,7 @@ impl ToolLike for ResponseTool {
             ResponseTool::Function(ft) => Some(ToolDescription::new(
                 ft.function.name.clone(),
                 ft.function.description.clone().unwrap_or_default(),
-                Some(ft.function.parameters.clone()),
+                Some(ft.function.parameters_schema().clone()),
             )),
             ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
             _ => None,
@@ -1661,13 +1662,13 @@ mod tests {
                     function: Function {
                         name: "image_generation".to_string(),
                         description: Some("mcp-exposed duplicate".to_string()),
-                        parameters: json!({
+                        parameters: Some(json!({
                             "type": "object",
                             "properties": {
                                 "prompt": {"type": "string"}
                             },
                             "required": ["prompt"]
-                        }),
+                        })),
                         strict: None,
                         extra: Default::default(),
                     },

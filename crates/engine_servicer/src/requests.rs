@@ -15,9 +15,11 @@ use std::{
     },
 };
 
-use futures::stream::{SelectAll, Stream};
+use futures::stream::Stream;
 use tokio::sync::oneshot;
 use tonic::Status;
+
+use crate::stream::Choices;
 
 /// Why a registered request's stream is being cancelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,7 +251,7 @@ pub(crate) trait HeldTerminal {
 /// engine side). Taking the terminals first is the point: a request the
 /// engine had finished on the tick before the shutdown keeps its completion.
 pub(crate) fn settle_shutdown<C: HeldTerminal + Stream + Unpin>(
-    choices: &mut SelectAll<C>,
+    choices: &mut Choices<C>,
 ) -> (VecDeque<C::Response>, bool) {
     let finished = choices
         .iter_mut()
@@ -454,8 +456,8 @@ mod tests {
         }
     }
 
-    fn choices(items: Vec<Choice>) -> SelectAll<Choice> {
-        let mut all = SelectAll::new();
+    fn choices(items: Vec<Choice>) -> Choices<Choice> {
+        let mut all = Choices::new();
         for item in items {
             all.push(item);
         }
@@ -468,7 +470,7 @@ mod tests {
         let (finished, cut) = settle_shutdown(&mut all);
         assert_eq!(finished, ["length"]);
         assert!(cut, "the choice still open is what the shutdown cuts");
-        assert!(all.is_empty(), "the choices are dropped afterwards");
+        assert_eq!(all.iter().count(), 0, "the choices are dropped afterwards");
     }
 
     #[test]

@@ -401,7 +401,7 @@ pub(crate) fn tool(name: &str, parameters: Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },

@@ -791,10 +791,10 @@ mod tests {
                     function: Function {
                         name: "internal_search".to_string(),
                         description: Some("user function".to_string()),
-                        parameters: json!({
+                        parameters: Some(json!({
                             "type": "object",
                             "properties": { "query": { "type": "string" } },
-                        }),
+                        })),
                         strict: None,
                         extra: Default::default(),
                     },

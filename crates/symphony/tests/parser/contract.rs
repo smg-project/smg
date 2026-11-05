@@ -75,11 +75,11 @@ fn qwen3_tagged() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -99,11 +99,11 @@ fn seed_oss() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -124,11 +124,11 @@ fn keyed_tools() -> Declared {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: value!({"type": "object", "properties": {
+            parameters: Some(value!({"type": "object", "properties": {
                 "city": {"type": "string"},
                 "days": {"type": "integer"},
                 "note": {"type": ["string", "null"]},
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -300,12 +300,12 @@ fn minimax_m3() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -365,7 +365,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },

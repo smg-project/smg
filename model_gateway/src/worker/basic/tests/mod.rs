@@ -10,6 +10,7 @@ use super::*;
 use crate::worker::{
     circuit_breaker::{CircuitBreakerConfig, CircuitState},
     metadata::DecodingLabels,
+    test_support::no_health_check,
     BasicWorkerBuilder, OverloadThresholds,
 };
 
@@ -51,15 +52,6 @@ fn adopting_a_live_breaker_republishes_its_state_gauge() {
         assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
         assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
     });
-}
-
-/// Health config that skips health checks — workers start Ready immediately.
-/// Use in tests that don't test the health check lifecycle.
-fn no_health_check() -> HealthCheckConfig {
-    HealthCheckConfig {
-        disable_health_check: true,
-        ..HealthCheckConfig::default()
-    }
 }
 
 #[test]

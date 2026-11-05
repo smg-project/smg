@@ -25,7 +25,9 @@
 //! the model's failed call, which the families' own parsers drop whole. Such bytes are refused
 //! ([`refuse`]): a `Malformed` event of no bytes with the reason counts the failure
 //! where it stands, the bytes leave as `Dropped { MalformedCall }`, and a call that started keeps
-//! the pairs it read.
+//! the pairs it read and gets no close, since it is no whole call ([`Assembler::close`]); a bare
+//! closing tag between pairs is the one refusal that costs the call nothing, since it carries no
+//! member the client could lose.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
@@ -201,6 +203,12 @@ pub struct Assembler {
     stage: Stage,
     /// The function's name once `ToolCallStart` was pushed.
     function: Option<String>,
+    /// Whether the syntax refused bytes inside the started call (text where it has tags, a tag
+    /// out of its place or cut short, an empty key, a key or a value held for its close that the
+    /// call's end cut; not a bare closing tag between pairs, [`Self::release_stray_close`]): the
+    /// model's call had something in it the client will not get, so it is no whole call, and
+    /// nothing is made up for its close ([`Self::close`]).
+    refused: bool,
     done: bool,
 }
 
@@ -243,6 +251,7 @@ impl Assembler {
             object: Object::new(index),
             stage: Stage::Name,
             function: None,
+            refused: false,
             done: false,
         }
     }
@@ -267,19 +276,31 @@ impl Assembler {
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. A call that has not been
-    /// named yet is named from the text so far; after the last value the object is closed; inside
-    /// a value held for its close what was held is refused and the object closes without that
-    /// member; inside a streamed string the string is closed first
-    /// ([`Self::close_open_string`]): the model ended the call, so the value's bytes are the value
-    /// whole, and one `Malformed { OpenAtTheMarker }` event of no bytes before the closing quote
-    /// says the marker closed it; a block with no name at all has its bytes, the marker's
-    /// included, refused.
+    /// named yet is named from the text so far; after the last value the object is closed, when
+    /// the syntax read the call whole; inside a key or a value held for its close what was held
+    /// is refused and its member is never written, as is a tag the end cut short between pairs,
+    /// the member the model had begun; inside a streamed string the string is closed
+    /// first ([`Self::close_open_string`]): the model ended the call, so the value's bytes are the
+    /// value whole, and one `Malformed { OpenAtTheMarker }` event of no bytes before the closing
+    /// quote says the marker closed it; a block with no name at all has its bytes, the marker's
+    /// included, refused. A call inside which the syntax refused bytes, here or earlier
+    /// (`refused`), gets no close: the model put something in the call that the client will not
+    /// get, so its arguments stay the strict JSON prefix the fragments wrote and no whole value,
+    /// which is how a client that reads them as JSON is told, as a cut call tells it. (The
+    /// families' own parsers hand such a call out whole with the pairs their reader matched, `{}`
+    /// when none; a client read a well-formed call with no word that the model's call had
+    /// failed.)
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
         }
         self.close_open_string(MalformedReason::OpenAtTheMarker, out);
         let held = self.scanner.held().to_string();
+        if self.started() && matches!(self.stage, Stage::Between) && !held.is_empty() {
+            // A tag the end cut short between pairs (`<arg_k`): the whitespace before it is the
+            // template's and leaves as wrapping; the tag is refused below.
+            self.object.drop_carried(out);
+        }
         self.object.carried.push_str(&held);
         if matches!(self.stage, Stage::Name) {
             self.name_call(out);
@@ -290,13 +311,22 @@ impl Assembler {
             return;
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
-            Stage::Between | Stage::Name => {}
-            // A key, a tag or a value held for its close that the end cut short: its bytes are
-            // refused, its member is never written, and the object closes.
-            _ => self.object.refuse(MalformedReason::TagCutShort, out),
+            Stage::Between | Stage::Name if held.is_empty() => {}
+            // A key, a value held for its close, or a tag the end cut short, in a pair or between
+            // two: its bytes are refused, and its member is never written, since the model had
+            // begun one the client will not get.
+            _ => self.report(MalformedReason::TagCutShort, out),
         }
-        let source = Text::uncounted(std::mem::take(&mut self.object.carried));
-        self.object.close(source, out);
+        if self.refused {
+            // No close for a call the syntax refused bytes in: the fragments stand, a strict JSON
+            // prefix and no whole value, and the refusal's own event of no bytes stands inside the
+            // call, as the contract asks of a call that ends without whole arguments. The
+            // whitespace carried since the last tag is the template's, dropped as its wrapping.
+            self.object.drop_carried(out);
+        } else {
+            let source = Text::uncounted(std::mem::take(&mut self.object.carried));
+            self.object.close(source, out);
+        }
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
@@ -408,14 +438,16 @@ impl Assembler {
 
     /// The stream's stop inside the call: the model's own end of output, not a cut. The call ends
     /// as its closing marker would end it, with no bytes for the end ([`Self::close`]): a call
-    /// not yet named is named from its text, a key or a value held for its close that the stop
-    /// found open is refused and the object closes without that member, a block with no name has
-    /// its bytes refused. A streamed string still open is closed first
-    /// ([`Self::close_open_string`]), under the stop's word. One `Malformed { OpenAtTheStop }`
-    /// event of no bytes stands before the fragment that closes what was open, so that the shape
-    /// is counted ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed
-    /// under any table, and for the call itself where the table has no stop row (`as_marker`),
-    /// since there the template writes the marker the model skipped.
+    /// not yet named is named from its text, a key or a value held for its close, or a tag between
+    /// pairs, that the stop found open is refused and the call gets no close, as any call the
+    /// syntax refused bytes in
+    /// (`refused`), a block with no name has its bytes refused. A streamed string still open is
+    /// closed first ([`Self::close_open_string`]), under the stop's word. One `Malformed {
+    /// OpenAtTheStop }` event of no bytes stands before the fragment that closes what was open,
+    /// so that the shape is counted ([`open_at_the_stop`](super::open_at_the_stop)): for a string
+    /// the stop closed under any table, and for the call itself where the table has no stop row
+    /// (`as_marker`), since there the template writes the marker the model skipped, and only for
+    /// a call read whole: a call that gets no close has none to announce.
     pub fn stop(mut self, as_marker: bool, out: &mut Events) {
         if self.done {
             return;
@@ -425,8 +457,13 @@ impl Assembler {
             self.object.carried.push_str(&held);
             self.name_call(out);
         }
+        // A key or a value held for its close, or a tag between pairs, that the stop found open is
+        // refused by the close below, and a call the syntax refused bytes in gets no close:
+        // nothing to announce.
+        let whole =
+            !self.refused && matches!(self.stage, Stage::Between) && self.scanner.held().is_empty();
         let string_closed = self.close_open_string(MalformedReason::OpenAtTheStop, out);
-        if !string_closed && self.started() && !as_marker {
+        if !string_closed && self.started() && !as_marker && whole {
             super::open_at_the_stop(out);
         }
         self.close("", out);
@@ -473,8 +510,7 @@ impl Assembler {
                 if self.started() {
                     self.tag_between(tag, out);
                 } else {
-                    self.object.drop_carried(out);
-                    refuse(bytes.to_string(), MalformedReason::TagOutOfPlace, out);
+                    self.release(bytes, MalformedReason::TagOutOfPlace, out);
                 }
             }
             Stage::Between => self.tag_between(tag, out),
@@ -482,7 +518,7 @@ impl Assembler {
                 let key = self.object.carried[*start..].to_string();
                 self.object.carried.push_str(bytes);
                 if key.is_empty() {
-                    self.object.refuse(MalformedReason::EmptyKey, out);
+                    self.report(MalformedReason::EmptyKey, out);
                     self.stage = Stage::Between;
                 } else {
                     self.stage = Stage::Keyed { key };
@@ -499,7 +535,7 @@ impl Assembler {
             // A tag cuts a key short, or stands where the syntax has another: the bytes so far
             // are refused, and the tag is read as between keys.
             _ => {
-                self.object.refuse(MalformedReason::TagCutShort, out);
+                self.report(MalformedReason::TagCutShort, out);
                 self.stage = Stage::Between;
                 self.tag_between(tag, out);
             }
@@ -507,7 +543,10 @@ impl Assembler {
     }
 
     /// A tag between keys: `<arg_key>` opens one, once the call has started; the other three, and
-    /// any tag in a block that named no call, have no place here and are refused.
+    /// any tag in a block that named no call, have no place here and are refused: `<arg_value>`
+    /// opens a value with no key, a member the client will not get, so the call is then no whole
+    /// call ([`Self::release`]); a bare closing tag costs it nothing
+    /// ([`Self::release_stray_close`]).
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = self.tags.text(tag);
         if tag == KEY_OPEN && self.started() {
@@ -515,9 +554,10 @@ impl Assembler {
             self.stage = Stage::Key {
                 start: self.object.carried.len(),
             };
+        } else if matches!(tag, KEY_CLOSE | VALUE_CLOSE) && self.started() {
+            self.release_stray_close(bytes, out);
         } else {
-            self.object.drop_carried(out);
-            refuse(bytes.to_string(), MalformedReason::TagOutOfPlace, out);
+            self.release(bytes, MalformedReason::TagOutOfPlace, out);
         }
     }
 
@@ -535,10 +575,40 @@ impl Assembler {
             if space {
                 self.object.carried.push_str(run);
             } else {
-                self.object.drop_carried(out);
-                refuse(run.to_string(), MalformedReason::TextBetweenTags, out);
+                self.release(run, MalformedReason::TextBetweenTags, out);
             }
         }
+    }
+
+    /// `text` the syntax has no place for (a word between tags, a tag out of its place), refused
+    /// with `why` ([`refuse`]): the whitespace carried before it is the template's, dropped as
+    /// its wrapping, so the refused bytes are the model's text alone. Inside a started call the
+    /// call is then no whole call ([`Self::close`]).
+    fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        self.object.drop_carried(out);
+        refuse(text.to_string(), why, out);
+        self.refused |= self.started();
+    }
+
+    /// A bare closing tag between pairs, `</arg_key>` or `</arg_value>` where the syntax has the
+    /// next key's tag or the call's close: refused and counted like any tag out of its place
+    /// ([`Self::release`]), but the one refusal that costs the call nothing, since the tag carries
+    /// no member the client could lose; the call is as whole after it as before (a recorded
+    /// output writes the last value's close twice).
+    fn release_stray_close(&mut self, bytes: &str, out: &mut Events) {
+        self.object.drop_carried(out);
+        refuse(bytes.to_string(), MalformedReason::TagOutOfPlace, out);
+    }
+
+    /// The carried bytes refused with `why` ([`Object::refuse`]: the counted event of no bytes,
+    /// the bytes as `Dropped { MalformedCall }`); nothing when none. Inside a started call the
+    /// call is then no whole call ([`Self::close`]).
+    fn report(&mut self, why: MalformedReason, out: &mut Events) {
+        if self.object.carried.is_empty() {
+            return;
+        }
+        self.object.refuse(why, out);
+        self.refused |= self.started();
     }
 
     /// The text so far is the call's name, less the whitespace around it: the call starts, and
@@ -645,7 +715,11 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::{json::PartialJson, testing::bytes};
+    use crate::{
+        json::{PartialJson, Prefix},
+        tagged::{dropped, nothing_empty},
+        testing::bytes,
+    };
 
     const CLOSE: &str = "</tool_call>";
 
@@ -655,11 +729,11 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "s": {"type": "string"},
                     "n": {"type": "integer"},
                     "ns": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -668,7 +742,12 @@ mod tests {
 
     /// The events of one block fed in `pieces`, closed by the call's marker or cut.
     fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
-        let mut assembler = Assembler::new(0, "call_0", Tags::PLAIN);
+        run_with(Tags::PLAIN, pieces, cut)
+    }
+
+    /// [`run`] under a family's spelling of the tags.
+    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
+        let mut assembler = Assembler::new(0, "call_0", tags);
         let mut out = Events::new();
         let declared = declared();
         for piece in pieces {
@@ -679,6 +758,19 @@ mod tests {
         } else {
             assembler.close(CLOSE, &mut out);
         }
+        out.drain()
+    }
+
+    /// The events of one block fed in `pieces`, then the stream's stop under a table with no stop
+    /// row.
+    fn stopped(pieces: &[&str]) -> Vec<Event<'static>> {
+        let mut assembler = Assembler::new(0, "call_0", Tags::PLAIN);
+        let mut out = Events::new();
+        let declared = declared();
+        for piece in pieces {
+            assembler.feed(piece, &declared, &mut out);
+        }
+        assembler.stop(false, &mut out);
         out.drain()
     }
 
@@ -873,7 +965,8 @@ mod tests {
             )],
             false,
         );
-        assert_eq!(arguments(&events), r#"{"n": 1}"#);
+        // The pair the syntax read stands; the call refused the empty pair, so it gets no close.
+        assert_eq!(arguments(&events), r#"{"n": 1"#);
         assert!(malformed(&events)
             .iter()
             .any(|(_, why)| *why == MalformedReason::EmptyKey));
@@ -890,7 +983,8 @@ mod tests {
             &["f<arg_key>na<arg_key>n</arg_key><arg_value>1</arg_value>"],
             false,
         );
-        assert_eq!(arguments(&events), r#"{"n": 1}"#);
+        // The pair the syntax read stands; the call refused the cut key, so it gets no close.
+        assert_eq!(arguments(&events), r#"{"n": 1"#);
         assert!(malformed(&events)
             .iter()
             .any(|(text, why)| text.is_empty() && *why == MalformedReason::TagCutShort));
@@ -1157,7 +1251,8 @@ mod tests {
             &["f\n<arg_key>n</arg_key>\n junk \n<arg_value>1</arg_value>\n"],
             false,
         );
-        assert_eq!(arguments(&events), r#"{"n": 1}"#);
+        // The pair the syntax read stands; the call refused the word, so it gets no close.
+        assert_eq!(arguments(&events), r#"{"n": 1"#);
         assert!(malformed(&events)
             .iter()
             .any(|(text, why)| text.is_empty() && *why == MalformedReason::TextBetweenTags));
@@ -1268,5 +1363,146 @@ mod tests {
                 "cut at {cut}"
             );
         }
+    }
+
+    /// A refused run inside a call that read a pair before it and one after it, in the three
+    /// spellings of the tags: the pairs stand as the call's fragments, and nothing is made up for
+    /// the call's close, so the arguments are a strict JSON prefix and no whole value (what the
+    /// fragments promise until a call's own end says it is whole: a client that reads them as
+    /// JSON is told the call failed, where it read a closed object with the word missing before);
+    /// the word is counted and never content; whole and at every cut. A call the syntax read
+    /// whole still closes its object.
+    #[test]
+    fn a_call_the_syntax_refused_bytes_inside_keeps_its_pairs_and_gets_no_close() {
+        for tags in [Tags::PLAIN, Tags::K2_HORIZON, Tags::HY4] {
+            let call = format!(
+                "f{key}s{key_close}{value}Paris{value_close}junk{key}n{key_close}{value}3{value_close}",
+                key = tags.key_open,
+                key_close = tags.key_close,
+                value = tags.value_open,
+                value_close = tags.value_close
+            );
+            let all = format!("{call}{CLOSE}");
+            let mut cuts: Vec<Vec<&str>> = vec![vec![call.as_str()]];
+            cuts.extend(
+                (1..call.len())
+                    .filter(|&cut| call.is_char_boundary(cut))
+                    .map(|cut| vec![&call[..cut], &call[cut..]]),
+            );
+            for pieces in cuts {
+                let events = run_with(tags, &pieces, false);
+                nothing_empty(&events);
+                let written = arguments(&events);
+                assert_eq!(written, r#"{"s": "Paris", "n": 3"#, "{tags:?} {pieces:?}");
+                assert!(
+                    Prefix::default().feed(&written).is_none(),
+                    "{tags:?} {pieces:?}: {written:?} is no prefix the crate's JSON judge takes"
+                );
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&written).is_err(),
+                    "{tags:?} {pieces:?}: {written:?} reads as a whole value"
+                );
+                // A cut inside the word splits its report in two; every report is of no bytes.
+                let reported = malformed(&events);
+                assert!(
+                    !reported.is_empty()
+                        && reported.iter().all(|(text, why)| {
+                            text.is_empty() && *why == MalformedReason::TextBetweenTags
+                        }),
+                    "{tags:?} {pieces:?}: {reported:?}"
+                );
+                assert_eq!(refused(&events).concat(), "junk", "{tags:?} {pieces:?}");
+                assert_eq!(ends(&events), [CLOSE], "{tags:?} {pieces:?}");
+                assert_eq!(bytes(&events), all, "{tags:?} {pieces:?}");
+            }
+            let clean = call.replace("junk", "");
+            let events = run_with(tags, &[&clean], false);
+            assert_eq!(arguments(&events), r#"{"s": "Paris", "n": 3}"#, "{tags:?}");
+            assert!(malformed(&events).is_empty(), "{tags:?}");
+        }
+    }
+
+    /// A call whose every pair the syntax refused (the values written without their tag, as a
+    /// model once wrote both of a call's parameters) is no whole call: no fragment and no close,
+    /// where `{}` closed before. The stop makes nothing up for such a call either, nor for a value
+    /// it found held for its close, so it announces no close; a call read whole announces its
+    /// close as before.
+    #[test]
+    fn a_call_whose_every_pair_the_syntax_refused_gets_no_close_at_the_marker_or_the_stop() {
+        let events = run(
+            &["f<arg_key>a</arg_key>17</arg_value><arg_key>b</arg_key>25</arg_value>"],
+            false,
+        );
+        nothing_empty(&events);
+        assert_eq!(starts(&events), 1);
+        assert_eq!(arguments(&events), "");
+        assert!(reasons(&events).contains(&MalformedReason::TextBetweenTags));
+        let refused = refused(&events).concat();
+        assert!(
+            refused.contains("17") && refused.contains("25"),
+            "{refused:?}"
+        );
+        assert_eq!(ends(&events), [CLOSE]);
+        for output in [
+            "f<arg_key>n</arg_key><arg_value>12",
+            "f<arg_key>s</arg_key><arg_value>Paris</arg_value>junk",
+            "f<arg_key>a</arg_key>17</arg_value>",
+        ] {
+            let events = stopped(&[output]);
+            nothing_empty(&events);
+            assert!(
+                !malformed(&events)
+                    .iter()
+                    .any(|(_, why)| *why == MalformedReason::OpenAtTheStop),
+                "{output:?}: {events:?}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments(&events)).is_err(),
+                "{output:?}: {:?} reads as a whole value",
+                arguments(&events)
+            );
+            assert_eq!(bytes(&events), output, "{output:?}");
+        }
+        let whole = stopped(&["f<arg_key>n</arg_key><arg_value>12</arg_value>"]);
+        assert_eq!(arguments(&whole), r#"{"n": 12}"#);
+        assert_eq!(malformed(&whole), [("", MalformedReason::OpenAtTheStop)]);
+    }
+
+    /// A stray closing tag between pairs (`</arg_value>` written twice after the last value, a
+    /// recorded shape) is refused and counted but costs the call nothing: it carries no member
+    /// the client could lose, so the call closes whole. A tag the block's end cut short between
+    /// pairs is a member the model had begun: refused as cut short, the call gets no close, and
+    /// the stop announces none for it.
+    #[test]
+    fn a_stray_close_between_pairs_costs_the_call_nothing_and_a_cut_tag_its_close() {
+        for stray in ["</arg_value>", "</arg_key>"] {
+            let call = format!("f<arg_key>n</arg_key><arg_value>1</arg_value>\n{stray}\n");
+            let events = run(&[&call], false);
+            nothing_empty(&events);
+            assert_eq!(arguments(&events), r#"{"n": 1}"#, "{stray}");
+            assert_eq!(
+                malformed(&events),
+                [("", MalformedReason::TagOutOfPlace)],
+                "{stray}"
+            );
+            assert_eq!(refused(&events), [stray], "{stray}");
+            assert_eq!(dropped(&events), ["\n"], "{stray}");
+            assert_eq!(ends(&events), [CLOSE], "{stray}");
+            assert_eq!(bytes(&events), format!("{call}{CLOSE}"), "{stray}");
+        }
+        let call = "f<arg_key>n</arg_key><arg_value>1</arg_value>\n<arg_k";
+        let events = run(&[call], false);
+        nothing_empty(&events);
+        assert_eq!(arguments(&events), r#"{"n": 1"#);
+        assert_eq!(malformed(&events), [("", MalformedReason::TagCutShort)]);
+        assert_eq!(refused(&events), ["<arg_k"]);
+        assert_eq!(dropped(&events), ["\n"]);
+        assert_eq!(ends(&events), [CLOSE]);
+        assert_eq!(bytes(&events), format!("{call}{CLOSE}"));
+        let events = stopped(&[call]);
+        nothing_empty(&events);
+        assert_eq!(arguments(&events), r#"{"n": 1"#);
+        assert_eq!(malformed(&events), [("", MalformedReason::TagCutShort)]);
+        assert_eq!(bytes(&events), call);
     }
 }

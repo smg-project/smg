@@ -24,11 +24,15 @@ type NodeRef = Arc<Node>;
 /// Default DashMap uses num_cpus * 4 shards (e.g., 256 on 64-core machines).
 ///
 /// Root node uses higher shard count since ALL requests pass through it.
-/// Other nodes use lower count as traffic diverges through the tree.
+/// Other nodes use lower count as traffic diverges through the tree: their
+/// tenant and children maps hold a handful of entries, every shard a walk
+/// enters is one allocation (dashmap's iterator wraps each shard guard in an
+/// `Arc`), and every shard is a cache-padded lock in every node, so they take
+/// dashmap's minimum of two.
 ///
 /// This reduces memory by ~90% vs default while maintaining good concurrency.
 const ROOT_SHARD_COUNT: usize = 32;
-const NODE_SHARD_COUNT: usize = 8;
+const NODE_SHARD_COUNT: usize = 2;
 
 /// Create a children DashMap for non-root nodes
 #[inline]

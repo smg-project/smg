@@ -1504,34 +1504,12 @@ async fn unsized_clip_decodes(probed_frames: usize, expected: usize) {
 async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("clip.mp4");
-    let generated = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x48:rate=30:duration=2",
-            "-c:v",
-            "mpeg4",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let probed = Command::new("ffprobe")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+    if !generate_clip(
+        &path,
+        "testsrc=size=64x48:rate=30:duration=2",
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"],
+    )
+    .await
     {
         return;
     }
@@ -1544,28 +1522,7 @@ async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
     let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
         .await
         .expect("ffmpeg decode");
-    let (frames, sampling): (Vec<Vec<u8>>, _) = match decoded {
-        DecodedVideoFrames::Rgb {
-            video, sampling, ..
-        } => (
-            video
-                .frame_refs()
-                .expect("frame refs")
-                .iter()
-                .map(|frame| frame.data.to_vec())
-                .collect(),
-            sampling,
-        ),
-        DecodedVideoFrames::Images {
-            frames, sampling, ..
-        } => (
-            frames
-                .iter()
-                .map(|frame| frame.to_rgb8().into_raw())
-                .collect(),
-            sampling,
-        ),
-    };
+    let (frames, sampling) = frames_and_sampling(decoded);
     let sampling = sampling.expect("ffprobe reports the frame rate and count");
     assert!(
         (sampling.source_fps - 30.0).abs() < 1e-6,
@@ -1635,34 +1592,12 @@ async fn ffmpeg_path_converts_frames_like_the_engine_loader() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("clip.mp4");
     // Rows of 16 pixels and an even height: the sizes the SIMD converters take.
-    let generated = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x48:rate=30:duration=1",
-            "-c:v",
-            "mpeg4",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let probed = Command::new("ffprobe")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+    if !generate_clip(
+        &path,
+        "testsrc=size=64x48:rate=30:duration=1",
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"],
+    )
+    .await
     {
         return;
     }

@@ -54,6 +54,11 @@ impl TrtllmGenerateStream {
         }
     }
 
+    /// The choice index this stream stamps on its responses.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     /// The engine-side id of this choice's request.
     pub fn request_id(&self) -> &str {
         self.inner.request_id()
@@ -413,15 +418,11 @@ pub(crate) fn translate_request_trtllm(
             Some((kind.to_string(), guided.guide))
         }
     };
+    // The request's raw image files are `Bytes` already: they ride behind
+    // the request as they are.
     let images: Vec<bytes::Bytes> = req
         .multimodal_input
-        .map(|input| {
-            input
-                .image_data
-                .into_iter()
-                .map(bytes::Bytes::from)
-                .collect()
-        })
+        .map(|input| input.image_data)
         .unwrap_or_default();
     Ok(TrtllmGenerateReqInput {
         rid: req.request_id,
@@ -574,7 +575,7 @@ mod tests {
             config_json: None,
         });
         req.multimodal_input = Some(trtllm::MultimodalInput {
-            image_data: vec![b"img".to_vec()],
+            image_data: vec![bytes::Bytes::from_static(b"img")],
         });
         req.cache_salt_id = Some(99);
         req.disaggregated_params = Some(trtllm::DisaggregatedParams {
@@ -888,7 +889,7 @@ mod tests {
 
         let mut req = request("r1");
         req.multimodal_input = Some(trtllm::MultimodalInput {
-            image_data: vec![b"img".to_vec()],
+            image_data: vec![bytes::Bytes::from_static(b"img")],
         });
         let mut stream = client.generate_trtllm(req).await.unwrap();
         let first = stream.next().await.unwrap().unwrap();

@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::{sync::oneshot, time::timeout};
 
-use super::{super::HarmonyStreamingProcessor, usage::harmony_tokens};
+use super::{super::HarmonyStreamingProcessor, chunk, usage::harmony_tokens};
 use crate::routers::{
     common::sse::sse_channel,
     grpc::{
@@ -38,18 +38,6 @@ const STOP: &str = "STOP";
 /// The one stop the router enforces in these turns.
 fn stops() -> Vec<String> {
     vec![STOP.to_string()]
-}
-
-fn chunk(token_ids: Vec<u32>) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
-            index: 0,
-            prompt_tokens: 3,
-            completion_tokens: token_ids.len() as u32,
-            token_ids,
-            ..Default::default()
-        })),
-    }
 }
 
 fn complete(output_ids: Vec<u32>, finish_reason: &str) -> proto::GenerateResponse {

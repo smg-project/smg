@@ -436,13 +436,16 @@ mod tests {
             "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
         );
         // The model's own end of output there ends the call as its closing tag would: the value
-        // held for its close is refused, the object closes without it, and one word says the
-        // stop closed the call.
+        // held for its close is refused, and no close is made up for a call the syntax refused
+        // bytes in, so no word says the stop closed it.
         let stopped = run(PROMPT, &[output]);
-        assert_eq!(arguments_of(&stopped, 0), "{}");
-        assert!(stopped.iter().any(|event| matches!(
+        assert_eq!(arguments_of(&stopped, 0), "");
+        assert!(!stopped.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+            Event::Malformed {
+                why: MalformedReason::OpenAtTheStop,
+                ..
+            }
         )));
         // A partial structural terminal at the end of the output (`<|close|>` begins the
         // argument's, the call's and the tools' close) is a tag the end cut short: it is dropped,
@@ -647,8 +650,8 @@ mod tests {
         // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
         // every byte in exactly one event, in the output's order, and none of it content. Cut
         // by the token limit the argument is the call's own fragment, as written; at the model's own
-        // stop the call ends as its closing tag would end it, the held number reported, the
-        // object closed without it, and the one word says the stop closed the call.
+        // stop the call ends as its closing tag would end it, the held number refused and no close
+        // made up for a call the syntax refused bytes in, so no word says the stop closed it.
         let tokens = [
             "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
             "<|open|>argument key=\"n\" type=\"number\"<|sep|>",
@@ -702,7 +705,8 @@ mod tests {
         );
         let stopped = run(PROMPT_THINKING_OFF, &tokens);
         in_order(&stopped);
-        assert_eq!(arguments_of(&stopped, 0), "{}");
+        // The held number is refused, so the call gets no close: no whole value, as at the cut.
+        assert_eq!(arguments_of(&stopped, 0), "");
         assert!(
             stopped.iter().any(|event| matches!(
                 event,
@@ -718,9 +722,13 @@ mod tests {
             )),
             "the held number is refused, never content: {stopped:?}"
         );
-        assert!(stopped.iter().any(|event| matches!(
+        // Nothing is closed for a call the syntax refused bytes in: the stop announces no close.
+        assert!(!stopped.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+            Event::Malformed {
+                why: MalformedReason::OpenAtTheStop,
+                ..
+            }
         )));
     }
 
@@ -741,9 +749,10 @@ mod tests {
     }
 
     /// A call whose arguments the model wrote as JSON and closed with a `json` region of its own
-    /// (seen live): the call is read with no arguments, and the JSON with the region's tags is
-    /// refused as the model's failed call, counted and never content, where `{…}<|close|>json
-    /// <|sep|>` reached the client as content before.
+    /// (seen live): the call is read with no arguments and gets no close, so a client is told it
+    /// failed rather than handed `{}`, and the JSON with the region's tags is refused as the
+    /// model's failed call, counted and never content, where `{…}<|close|>json<|sep|>` reached
+    /// the client as content before.
     #[test]
     fn arguments_written_as_json_in_a_region_of_the_models_own_are_refused_never_content() {
         const OUTPUT: &str = concat!(
@@ -757,7 +766,7 @@ mod tests {
         for pieces in [vec![OUTPUT], OUTPUT.split_inclusive(',').collect()] {
             let events = run(PROMPT, &pieces);
             assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
-            assert_eq!(arguments_of(&events, 0), "{}", "{pieces:?}");
+            assert_eq!(arguments_of(&events, 0), "", "{pieces:?}");
             let shown: String = events
                 .iter()
                 .filter_map(|event| match event {

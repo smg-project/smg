@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::LazyLock,
 };
 
 use serde::{
@@ -997,23 +998,20 @@ pub struct Tool {
     pub function: Function,
 }
 
-/// Per the OpenAI spec, omitting `parameters` defines a function with an
-/// empty parameter list, so a missing field deserializes to an empty schema.
-fn empty_parameters_schema() -> Value {
-    Value::Object(Map::new())
-}
+/// The schema a function declared without `parameters` is read with wherever
+/// a schema is needed: per the OpenAI spec, omitting the field defines a
+/// function with an empty parameter list.
+static EMPTY_PARAMETERS_SCHEMA: LazyLock<Value> = LazyLock::new(|| Value::Object(Map::new()));
 
-/// An explicit `"parameters": null` means the same as omitting the field
-/// (the serving engine reads it as "no schema" too), and `null` is not a JSON Schema, so it
-/// is normalised to the empty schema once here rather than in every consumer:
-/// the structural-tag builders, the JSON-schema constraint and the renderers.
-fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+/// `parameters` as the client gave it: `None` for an explicit `null` as for
+/// an absent field. The serving engine reads both as "no schema" and its own
+/// template sees `null` for both, so the two must stay apart from a client's
+/// own `{}`, which the template renders as `{}`.
+fn deserialize_parameters<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
     let value = Value::deserialize(deserializer)?;
-    Ok(if value.is_null() {
-        empty_parameters_schema()
-    } else {
-        value
-    })
+    Ok((!value.is_null()).then_some(value))
 }
 
 #[serde_with::skip_serializing_none]
@@ -1021,11 +1019,16 @@ fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
-    #[serde(
-        default = "empty_parameters_schema",
-        deserialize_with = "deserialize_parameters"
-    )]
-    pub parameters: Value, // JSON Schema
+    /// The parameter schema as the client gave it; `None` when it gave none
+    /// (the field absent or `null`). Left out of a serialized function then,
+    /// as any optional field the client left out (a Responses function tool,
+    /// whose reference lists the field as required and nullable, writes `null`
+    /// for it: [`crate::responses::FunctionTool`]); the chat template is handed
+    /// `null` for it (what the engine's own template reads for such a
+    /// function). Read through [`Function::parameters_schema`] where a schema
+    /// object is needed.
+    #[serde(default, deserialize_with = "deserialize_parameters")]
+    pub parameters: Option<Value>, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
     /// The fields of the function object beyond the ones above, as the request
@@ -1036,6 +1039,15 @@ pub struct Function {
     /// them.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Function {
+    /// The schema the function is read with: the client's, or the empty
+    /// schema when it gave none. The constraint builders, the structural tags
+    /// and the parsers read an object; only the template sees the difference.
+    pub fn parameters_schema(&self) -> &Value {
+        self.parameters.as_ref().unwrap_or(&EMPTY_PARAMETERS_SCHEMA)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1958,23 +1970,36 @@ mod tests {
     #[test]
     fn function_deserializes_without_parameters() {
         // Per the OpenAI spec, omitting `parameters` defines a function with
-        // an empty parameter list.
+        // an empty parameter list: no schema was given, and a consumer that
+        // needs one reads the empty schema.
         let value = json!({"name": "web_search", "description": ""});
         let function: Function = serde_json::from_value(value).expect("parameterless function");
-        assert_eq!(function.parameters, json!({}));
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
 
-        // An explicit null is the same thing; `serde(default)` alone would
-        // keep `Value::Null`, which is not a JSON Schema and would reach the
-        // constraint builders as one.
+        // An explicit null is the same thing: `Value::Null` is not a JSON
+        // Schema and must not reach the constraint builders as one.
         let value = json!({"name": "web_search", "parameters": null});
         let function: Function = serde_json::from_value(value).expect("null parameters");
-        assert_eq!(function.parameters, json!({}));
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
+
+        // Serialized, such a function leaves the field out, as the client
+        // did; a client's own `{}` stays apart from it.
+        assert_eq!(
+            serde_json::to_value(&function).unwrap(),
+            json!({"name": "web_search"})
+        );
+        let empty: Function =
+            serde_json::from_value(json!({"name": "web_search", "parameters": {}})).unwrap();
+        assert_eq!(empty.parameters, Some(json!({})));
 
         // A real schema passes through untouched.
         let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
         let value = json!({"name": "web_search", "parameters": schema});
         let function: Function = serde_json::from_value(value).expect("schema");
-        assert_eq!(function.parameters, schema);
+        assert_eq!(function.parameters.as_ref(), Some(&schema));
+        assert_eq!(function.parameters_schema(), &schema);
     }
 
     #[test]

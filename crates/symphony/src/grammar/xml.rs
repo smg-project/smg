@@ -199,7 +199,13 @@ pub(super) fn calls(
     };
     let invokes = tools
         .iter()
-        .map(|tool| writer.invoke(markers, &tool.function.name, &tool.function.parameters))
+        .map(|tool| {
+            writer.invoke(
+                markers,
+                &tool.function.name,
+                tool.function.parameters_schema(),
+            )
+        })
         .collect();
     // The block holds at least one invoke whether or not the request asks for a call: an empty
     // block is no answer.

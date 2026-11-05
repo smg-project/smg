@@ -9,17 +9,10 @@ use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
     super::*,
-    eof::{chunk, complete, dispatch, scripted_stream, CharacterTokenizer},
+    eof::{chunk, complete, dispatch, response_processor, scripted_stream, CharacterTokenizer},
     symphony_chat::{message_blocks, message_events},
 };
-use crate::{
-    routers::grpc::{
-        context,
-        regular::{processor::ResponseProcessor, symphony::Assignment},
-        spec::MessagesResponseSpec,
-    },
-    worker::WorkerRegistry,
-};
+use crate::routers::grpc::{context, regular::symphony::Assignment, spec::MessagesResponseSpec};
 
 /// Every `display` a request can state, and none, with whether the thinking text is returned.
 const DISPLAYS: [(Option<&str>, bool); 4] = [
@@ -54,19 +47,6 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
         });
     }
     spec
-}
-
-/// The non-streaming processor with the Qwen3 reasoning parser.
-fn response_processor() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
 }
 
 /// The thinking text a display returns for `thought`: the thought, or nothing under `omitted`.

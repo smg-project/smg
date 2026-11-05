@@ -1504,6 +1504,11 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let threads = 24u32;
+    // The encoder counts 4,096 threads already, as a gateway with many
+    // runtime and blocking threads would: each thread's share is a thousand
+    // pieces, which its 15,000 distinct words exceed many times over.
+    let counted = 4_096;
+    native.threads.store(counted, Ordering::Relaxed);
     let barrier = std::sync::Barrier::new(threads as usize);
     std::thread::scope(|scope| {
         for t in 0..threads {
@@ -1511,8 +1516,6 @@ fn piece_caches_stay_within_their_bound_across_threads() {
             scope.spawn(move || {
                 native.encode(model, "warm", false).expect("ids");
                 barrier.wait();
-                // More distinct pieces than one thread's share, and
-                // together far more than the total.
                 let text: String = (0..15_000)
                     .map(|i| format!(" {}", word(i * threads + t)))
                     .collect();
@@ -1522,7 +1525,10 @@ fn piece_caches_stay_within_their_bound_across_threads() {
             });
         }
     });
-    assert_eq!(native.threads.load(Ordering::Relaxed), threads as usize);
+    assert_eq!(
+        native.threads.load(Ordering::Relaxed),
+        counted + threads as usize
+    );
     let share = native.piece_cache_share();
     assert!(share < PIECE_CACHE_CAPACITY, "{share}");
     let long_share = native.long_piece_bytes_share();
@@ -1586,20 +1592,23 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     let (slots, len) = packed(&mut native);
     assert_eq!(slots, MIN_SLOTS, "a short prompt grows nothing");
     assert!(len <= 4, "{len}");
-    // More distinct pieces than the fill bound of every table short of the
-    // full share's, fewer than the share: the table grows to its full size.
-    let text: String = (0..15_000).map(|i| format!(" {}", word(i))).collect();
+    // More distinct pieces than the bound of 16,384 the cache had (a text of
+    // 32k tokens cleared it on every pass), fewer than the share: the table
+    // grows to the slots they take and keeps every one of them.
+    let text: String = (0..20_000).map(|i| format!(" {}", word(i))).collect();
     native.encode_with(model, &text, false, false).expect("ids");
     let (slots, len) = packed(&mut native);
-    assert_eq!(slots, ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY));
-    assert!(len >= 15_000, "{len}");
-    // Threads join (the share falls to a quarter of the entries held): the
+    assert!(len >= 20_000, "{len}");
+    assert!(len < PIECE_CACHE_CAPACITY, "{len}");
+    assert_eq!(slots, ShortPieceTable::slots_for(len));
+    assert!(slots < ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY));
+    // Threads join (the share falls to a fifth of the entries held): the
     // clear at the next piece makes the table anew for the new share, and
     // the thread's pieces are answered as before.
-    native.threads.store(64, Ordering::Relaxed);
+    native.threads.store(1_024, Ordering::Relaxed);
     let share = native.piece_cache_share();
-    assert!(share < len, "{share} < {len}");
-    let more: String = (15_000..20_000).map(|i| format!(" {}", word(i))).collect();
+    assert!(share < len / 4, "{share} < {len} / 4");
+    let more: String = (20_000..25_000).map(|i| format!(" {}", word(i))).collect();
     native.encode_with(model, &more, false, false).expect("ids");
     let (slots, len) = packed(&mut native);
     assert_eq!(slots, ShortPieceTable::slots_for(share));

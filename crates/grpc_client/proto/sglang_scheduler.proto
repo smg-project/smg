@@ -644,6 +644,11 @@ message SchedulerLoad {
   optional LoRAMetrics lora = 14;
   optional DisaggregationMetrics disaggregation = 15;
   optional QueueMetrics queues = 16;
+
+  // Computed input tokens per active prefill second, the servicer's own
+  // measurement; absent if unknown or stale. Numbered 18 (the next free
+  // number) so the existing field numbers stay stable.
+  optional double prefill_throughput = 18;
 }
 
 message MemoryMetrics {

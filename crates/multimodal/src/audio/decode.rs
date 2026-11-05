@@ -34,6 +34,21 @@ const DEFAULT_AUDIO_MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 static AUDIO_PROCESS_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 static AUDIO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 
+/// The highest sample rate a header is believed: the rate at which one second
+/// of mono `f32` fills the decoded-size cap (`DEFAULT_AUDIO_MAX_DECODED_BYTES`
+/// over the sample size, 67 108 864 Hz), so a longer clip at a higher rate is
+/// over the cap anyway. Nothing real is stored within two decades of it: PCM
+/// tops out at 768 kHz, and the external decoder renders DSD at 352.8 kHz
+/// (DSD64) to 5.6 MHz (DSD1024); one flipped bit in a WAV's rate field (8 kHz
+/// read as 2 147 491 648 Hz) is 32 times past it. A header above the bound is
+/// a corrupt field, refused before a decoder is built; the cost of a rate
+/// below it is bounded by the cap on the decode and by the resampler's own
+/// kernel bound (`transforms::MAX_RESAMPLE_KERNEL_LEN`) on the resample. Both
+/// decoders read the bound here, the in-process one from the container's
+/// codec parameters and from its decoded buffers, the external one from its
+/// probe, so it lives in one place.
+const MAX_AUDIO_SAMPLE_RATE_HZ: usize = DEFAULT_AUDIO_MAX_DECODED_BYTES / size_of::<f32>();
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedAudio {
     pub samples: Vec<f32>,
@@ -148,11 +163,16 @@ fn decode_audio_mono_f32_symphonia_with_limits(
                 "Symphonia audio track is missing codec parameters".to_string(),
             )
         })?;
+    // The header's rate is held to the bound before a decoder is built; a
+    // container that states none is judged by its first decoded buffer.
+    let mut sample_rate = audio_params.sample_rate.map(|rate| rate as usize);
+    if let Some(rate) = sample_rate {
+        ensure_sample_rate_within_bounds(rate)?;
+    }
     let mut decoder = get_codecs()
         .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
         .map_err(|e| TransformError::ShapeError(format!("Symphonia decoder failed: {e}")))?;
 
-    let mut sample_rate = audio_params.sample_rate.map(|rate| rate as usize);
     let mut mono = Vec::new();
     let mut interleaved = Vec::new();
     loop {
@@ -184,7 +204,11 @@ fn decode_audio_mono_f32_symphonia_with_limits(
         ensure_symphonia_deadline(started, timeout)?;
 
         let spec = audio_buf.spec();
-        sample_rate = Some(spec.rate() as usize);
+        let rate = spec.rate() as usize;
+        if sample_rate != Some(rate) {
+            ensure_sample_rate_within_bounds(rate)?;
+            sample_rate = Some(rate);
+        }
         let channels = spec.channels().count();
         if channels == 0 {
             return Err(TransformError::ShapeError(
@@ -322,6 +346,24 @@ fn finish_decoded_audio(
     })
 }
 
+/// The sample rate a header or a probe states, held to the bound: none (0 Hz)
+/// is a clip with no duration, above `MAX_AUDIO_SAMPLE_RATE_HZ` a corrupt
+/// field; either is refused before any sample is decoded or resampled.
+fn ensure_sample_rate_within_bounds(sample_rate: usize) -> Result<(), TransformError> {
+    if sample_rate == 0 {
+        return Err(TransformError::ShapeError(
+            "audio sample rate must be positive; the header states 0 Hz".to_string(),
+        ));
+    }
+    if sample_rate > MAX_AUDIO_SAMPLE_RATE_HZ {
+        return Err(TransformError::ShapeError(format!(
+            "audio sample rate {sample_rate} Hz is above the {MAX_AUDIO_SAMPLE_RATE_HZ} Hz bound \
+             (one second at that rate fills the decoded-size cap); the header is corrupt"
+        )));
+    }
+    Ok(())
+}
+
 async fn probe_audio_sample_rate(input_path: &Path) -> Result<usize, MediaConnectorError> {
     let mut command = Command::new("ffprobe");
     command
@@ -343,16 +385,21 @@ async fn probe_audio_sample_rate(input_path: &Path) -> Result<usize, MediaConnec
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    parse_probed_sample_rate(&String::from_utf8_lossy(&output.stdout)).map_err(audio_decode)
+}
+
+/// The sample rate the external probe printed (the stream's, one number on a
+/// line of its own), held to the same bound as a header the in-process
+/// decoder reads: the external decoder never runs for a rate that is refused.
+fn parse_probed_sample_rate(stdout: &str) -> Result<usize, TransformError> {
+    let sample_rate = stdout
         .lines()
         .find_map(|line| line.trim().parse::<usize>().ok())
-        .filter(|rate| *rate > 0)
         .ok_or_else(|| {
-            MediaConnectorError::AudioDecode(format!(
-                "failed to parse ffprobe sample rate: {stdout:?}"
-            ))
-        })
+            TransformError::ShapeError(format!("failed to parse ffprobe sample rate: {stdout:?}"))
+        })?;
+    ensure_sample_rate_within_bounds(sample_rate)?;
+    Ok(sample_rate)
 }
 
 async fn write_temp_audio_file_async(
@@ -505,7 +552,12 @@ mod tests {
     use super::*;
     use crate::error::MediaFault;
 
-    fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+    /// A 16-bit PCM WAV whose `fmt ` chunk says what the caller asks: the
+    /// sample rate and channel count as given, the byte rate and block align
+    /// derived from them as a writer would (wrapping, as the 32-bit field
+    /// does), so a header a fuzzer would scramble can be written on purpose.
+    fn wav_i16(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+        let block_align = channels.wrapping_mul(2);
         let data_bytes = samples.len() as u32 * 2;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RIFF");
@@ -513,10 +565,14 @@ mod tests {
         bytes.extend_from_slice(b"WAVEfmt ");
         bytes.extend_from_slice(&16_u32.to_le_bytes());
         bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
         bytes.extend_from_slice(&sample_rate.to_le_bytes());
-        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(
+            &sample_rate
+                .wrapping_mul(u32::from(block_align))
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&block_align.to_le_bytes());
         bytes.extend_from_slice(&16_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&data_bytes.to_le_bytes());
@@ -524,6 +580,10 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         bytes
+    }
+
+    fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        wav_i16(sample_rate, 1, samples)
     }
 
     #[test]
@@ -580,6 +640,92 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("Symphonia timed out"));
+    }
+
+    /// A header whose rate field is corrupt (8 kHz with one bit flipped reads
+    /// 2 147 491 648 Hz) is refused from the probed parameters, before a
+    /// decoder is built: the rate would otherwise size a resampling kernel of
+    /// 35 M coefficients per phase downstream, minutes of work for a clip that
+    /// yields two samples. The same for a rate just past the bound; the rates
+    /// real files carry (PCM to 768 kHz, DSD as the external decoder renders
+    /// it) and the bound itself are decoded as they are. The refusal is the
+    /// decoder's verdict on the clip: the request's fault, answered as an
+    /// undecodable clip is.
+    #[test]
+    fn a_header_rate_above_the_bound_is_refused_before_the_clip_is_decoded() {
+        assert_eq!(MAX_AUDIO_SAMPLE_RATE_HZ, 67_108_864);
+        for rate in [2_147_491_648_u32, 67_108_865] {
+            let error = decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(rate, 1, &[0; 480])))
+                .expect_err("a rate above the bound");
+            assert!(
+                matches!(&error, TransformError::ShapeError(message)
+                    if message.contains(&format!("{rate} Hz")) && message.contains("67108864 Hz")),
+                "{rate} Hz: {error}"
+            );
+            let refused = audio_decode(error);
+            assert!(
+                matches!(refused, MediaConnectorError::AudioDecode(_)),
+                "{refused}"
+            );
+            assert_eq!(refused.fault(), MediaFault::Client);
+            assert_eq!(refused.code(), crate::error::MediaErrorCode::FetchFailed);
+        }
+        for rate in [705_600_u32, 768_000, 2_822_400, 67_108_864] {
+            let decoded = decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(rate, 1, &[0; 480])))
+                .unwrap_or_else(|error| panic!("{rate} Hz: {error}"));
+            assert_eq!(decoded.sample_rate, rate as usize);
+            assert_eq!(decoded.samples.len(), 480);
+        }
+    }
+
+    /// A header that claims 0 Hz is refused the same way, before the clip is
+    /// decoded; it used to decode whole and fail in the frontend.
+    #[test]
+    fn a_header_rate_of_zero_is_refused_before_the_clip_is_decoded() {
+        let error = decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(0, 1, &[0; 480])))
+            .expect_err("a 0 Hz header");
+        assert!(
+            matches!(&error, TransformError::ShapeError(message) if message.contains("0 Hz")),
+            "{error}"
+        );
+    }
+
+    /// A channel count the format cannot carry (none, or more than the
+    /// container has positions for) is refused at the probe, before any
+    /// sample is decoded.
+    #[test]
+    fn a_channel_count_the_format_cannot_carry_is_refused_at_the_probe() {
+        for channels in [0_u16, 1_000] {
+            let error =
+                decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(16_000, channels, &[0; 480])))
+                    .expect_err("an impossible channel count");
+            assert!(
+                matches!(&error, TransformError::ShapeError(message)
+                    if message.contains("probe failed") && message.contains("channel")),
+                "{channels} channels: {error}"
+            );
+        }
+    }
+
+    /// The external probe's rate is held to the same bound, so the external
+    /// decoder never runs for a header the in-process one refuses: a rate of
+    /// 0, one above the bound, or no whole number at all.
+    #[test]
+    fn a_probed_rate_is_held_to_the_same_bound() {
+        assert_eq!(parse_probed_sample_rate("16000\n").unwrap(), 16_000);
+        assert_eq!(parse_probed_sample_rate("\n768000\n").unwrap(), 768_000);
+        assert_eq!(parse_probed_sample_rate("67108864\n").unwrap(), 67_108_864);
+        for stdout in ["0\n", "2147491648\n", "67108865\n", "0.5\n", "N/A\n", ""] {
+            let error = parse_probed_sample_rate(stdout).expect_err(stdout);
+            assert!(
+                matches!(error, TransformError::ShapeError(_)),
+                "{stdout:?}: {error}"
+            );
+        }
+        assert!(parse_probed_sample_rate("2147491648\n")
+            .unwrap_err()
+            .to_string()
+            .contains("67108864 Hz"));
     }
 
     #[test]

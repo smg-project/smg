@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,15 @@ import yaml
 SCRIPT = Path(__file__).resolve().parents[1] / "ci_version_only.py"
 CHECKER = SCRIPT.with_name("check_release_versions.py")
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "pr-test-rust.yml"
+# The interpreter's own library path, for the subprocesses below that run it with an
+# environment built from scratch: a shared-libpython build (the hosted tool cache's, for one)
+# finds libpython through the loader variable its setup exported, and without it the child
+# exits 127 ("error while loading shared libraries") before its first line of Python.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
 
 
 def _load(path: Path, name: str):
@@ -334,7 +344,12 @@ def run(tree: Tree, *args: str) -> subprocess.CompletedProcess[str]:
         [sys.executable, str(SCRIPT), "-C", str(tree.root), *args],
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tree.root), "PYTHONDONTWRITEBYTECODE": "1"},
+        env={
+            **INTERPRETER_ENV,
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tree.root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
     )
 
 
@@ -505,7 +520,7 @@ def run_lanes_step(script: str, tmp_path: Path, **env: str) -> dict[str, str]:
         input=body,
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(output), **env},
+        env={**INTERPRETER_ENV, "PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(output), **env},
     )
     assert done.returncode == 0, done.stderr
     return dict(line.split("=", 1) for line in output.read_text().splitlines())

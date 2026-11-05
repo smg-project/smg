@@ -118,6 +118,25 @@ pub(crate) fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
     }
 }
 
+/// The raw-file transport hands the engine each frame's own file: the
+/// request's bytes are the frame's bytes, shared, not a copy of them.
+#[test]
+fn the_raw_file_transport_shares_each_frames_bytes_with_the_request() {
+    let intermediate = single_image_intermediate();
+    let MediaBatch::Images(frames) = &intermediate.media else {
+        panic!("an image batch");
+    };
+    let raw = frames[0].raw_bytes.clone();
+    let data = assemble_trtllm(intermediate).unwrap();
+    assert_eq!(data.image_data.len(), 1);
+    assert_eq!(data.image_data[0], raw);
+    assert_eq!(
+        data.image_data[0].as_ptr(),
+        raw.as_ptr(),
+        "the request copied the frame's bytes instead of sharing them"
+    );
+}
+
 #[test]
 fn a_single_whole_item_moves_its_encoder_input_into_the_same_payload() {
     use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;

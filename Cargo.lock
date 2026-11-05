@@ -7876,7 +7876,6 @@ dependencies = [
  "prost",
  "rand 0.10.2",
  "rustls",
- "rustls-pemfile",
  "serde",
  "tempfile",
  "tokio",

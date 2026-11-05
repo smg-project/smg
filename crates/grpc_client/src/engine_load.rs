@@ -17,7 +17,7 @@ use openai_protocol::worker::{
     EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, SchedulerLoadSnapshot,
 };
 
-use crate::{common_proto as common, sglang_proto, tokenspeed_proto, vllm_proto};
+use crate::{common_proto as common, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
 fn unsigned(value: i32) -> u32 {
     u32::try_from(value).unwrap_or(0)
@@ -62,11 +62,31 @@ impl From<&vllm_proto::SchedulerLoad> for common::EngineLoad {
     }
 }
 
+/// The TensorRT-LLM service's report: the same shape as vLLM's, no sections.
+impl From<&trtllm_proto::SchedulerLoad> for common::EngineLoad {
+    fn from(load: &trtllm_proto::SchedulerLoad) -> Self {
+        Self {
+            prefill_throughput: load.prefill_throughput,
+            cache_hit_rate: Some(load.cache_hit_rate),
+            num_used_tokens: Some(load.num_used_tokens),
+            max_total_num_tokens: Some(load.max_total_num_tokens),
+            ..core(
+                load.num_running_reqs,
+                load.num_waiting_reqs,
+                load.token_usage,
+                load.gen_throughput,
+                load.max_running_requests,
+            )
+        }
+    }
+}
+
 /// SGLang's report: the core, the cache hit rate, the token counts and
 /// every optional section it carries.
 impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &sglang_proto::SchedulerLoad) -> Self {
         Self {
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -122,6 +142,7 @@ impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &tokenspeed_proto::SchedulerLoad) -> Self {
         Self {
+            prefill_throughput: load.prefill_throughput,
             active_token_usage: load.active_token_usage,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
@@ -232,6 +253,42 @@ pub fn core_only(record: &mut common::EngineLoad) {
 mod tests {
     use super::*;
 
+    /// Every engine's poll carries the measured input capacity the same way
+    /// into the record and back to the snapshot, present or absent.
+    #[test]
+    fn every_engine_carries_the_measured_input_capacity_alike() {
+        for rate in [Some(4_321.0), None] {
+            let sglang = sglang_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            let tokenspeed = tokenspeed_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            let vllm = vllm_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            for record in [
+                common::EngineLoad::from(&sglang),
+                common::EngineLoad::from(&tokenspeed),
+                common::EngineLoad::from(&vllm),
+            ] {
+                assert_eq!(record.prefill_throughput, rate);
+                assert_eq!(
+                    SchedulerLoadSnapshot::from(&record).prefill_throughput,
+                    rate
+                );
+            }
+            assert_eq!(SchedulerLoadSnapshot::from(sglang).prefill_throughput, rate);
+            assert_eq!(
+                SchedulerLoadSnapshot::from(tokenspeed).prefill_throughput,
+                rate
+            );
+        }
+    }
+
     /// Polling and core-only push records preserve optional input capacity.
     #[test]
     fn prefill_capacity_survives_poll_push_and_core_only_and_clears_when_absent() {
@@ -269,6 +326,7 @@ mod tests {
             utilization: 0.1875,
             max_running_requests: 128,
             num_waiting_uncached_tokens: 0,
+            prefill_throughput: None,
             memory: Some(sglang_proto::MemoryMetrics {
                 weight_gb: 15.0,
                 kv_cache_gb: 40.0,
@@ -339,6 +397,7 @@ mod tests {
             token_usage: 0.25,
             active_token_usage: Some(0.125),
             gen_throughput: 900.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.6,
             utilization: 0.25,
             memory: Some(tokenspeed_proto::MemoryMetrics {
@@ -384,6 +443,35 @@ mod tests {
         let polled = SchedulerLoadSnapshot::from(rank);
         let record = common::EngineLoad::from(&rank);
         assert!(record.memory.is_none() && record.queues.is_none());
+        assert_eq!(
+            format!("{polled:?}"),
+            format!("{:?}", pushed(&record, rank.dp_rank))
+        );
+    }
+
+    /// A TensorRT-LLM rank reads the same on both wires, the measured
+    /// capacity included.
+    #[test]
+    fn a_trtllm_rank_reads_the_same_from_the_record_as_from_the_poll() {
+        let rank = trtllm_proto::SchedulerLoad {
+            dp_rank: 1,
+            num_running_reqs: 3,
+            num_waiting_reqs: 2,
+            num_total_reqs: 5,
+            num_used_tokens: 640,
+            max_total_num_tokens: 6_400,
+            token_usage: 0.1,
+            gen_throughput: 800.0,
+            cache_hit_rate: 0.5,
+            utilization: 0.1,
+            max_running_requests: 32,
+            num_waiting_uncached_tokens: 0,
+            prefill_throughput: Some(12_000.0),
+        };
+        let polled = SchedulerLoadSnapshot::from(rank);
+        let record = common::EngineLoad::from(&rank);
+        assert!(record.memory.is_none() && record.queues.is_none());
+        assert_eq!(record.prefill_throughput, Some(12_000.0));
         assert_eq!(
             format!("{polled:?}"),
             format!("{:?}", pushed(&record, rank.dp_rank))

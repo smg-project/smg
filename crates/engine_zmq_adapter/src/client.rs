@@ -1553,9 +1553,11 @@ impl ZmqEngineClient {
         Ok(())
     }
 
-    /// Latest per-rank load for one engine index, if the backend has reported
-    /// it: every dialect piggybacks it on its output batches.
-    fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
+    /// The latest load tail one rank sent (running, waiting, KV usage),
+    /// `None` before its first batch: every dialect piggybacks it on its
+    /// output batches. What [`Self::get_loads`] lists per rank, for a caller
+    /// that wants one rank's without the whole report.
+    pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
@@ -1643,17 +1645,7 @@ impl ZmqEngineClient {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
-            .filter_map(|engine| {
-                let dp_rank = engine.engine_id.engine_index()?;
-                let load = self.engine_load(dp_rank)?;
-                Some(SchedulerLoadSnapshot {
-                    dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
-                    num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
-                    num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
-                    token_usage: load.kv_cache_usage,
-                    ..Default::default()
-                })
-            })
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
         WorkerLoadResponse {
             timestamp: String::new(),
@@ -1661,6 +1653,25 @@ impl ZmqEngineClient {
             loads,
             ..Default::default()
         }
+    }
+
+    /// One connected rank's entry of [`get_loads`](Self::get_loads), read
+    /// alone: what a per-rank reader (the relay's load record) wants, without
+    /// the vector of the other ranks. `None` for a rank not connected or not
+    /// reported yet.
+    pub fn rank_load(&self, dp_rank: u32) -> Option<SchedulerLoadSnapshot> {
+        self.engines()
+            .iter()
+            .any(|engine| engine.engine_id.engine_index() == Some(dp_rank))
+            .then(|| self.engine_load(dp_rank))
+            .flatten()
+            .map(|load| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
+                num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
+                num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                token_usage: load.kv_cache_usage,
+                ..Default::default()
+            })
     }
 
     /// Keep the KV-transfer samples the engines report from now on, for

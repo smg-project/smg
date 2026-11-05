@@ -585,13 +585,13 @@ mod qwen_xml_tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather information".to_string()),
-                parameters: serde_json::json!({
+                parameters: Some(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "city": {"type": "string"},
                         "units": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -701,12 +701,12 @@ mod qwen_xml_tests {
             function: Function {
                 name: "test_function".to_string(),
                 description: None,
-                parameters: serde_json::json!({
+                parameters: Some(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "nested": {"type": "object"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

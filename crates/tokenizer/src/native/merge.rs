@@ -45,8 +45,24 @@ mod serialized;
 /// grid (1 MiB of ranks): the byte tokens and the earliest merges, which a
 /// piece's first round of candidates is made of.
 const GRID_SIDE: usize = 512;
-/// Pieces of up to this many symbols (bytes) merge on stack arrays.
-const SHORT_PIECE_SYMBOLS: usize = 16;
+/// Pieces of up to this many symbols merge on stack arrays, a [`ShortMerge`]:
+/// a run of forty CJK ideographs, a word of a script without word spaces, a
+/// long identifier. A piece of up to [`SHORT_PIECE_SMALL`] symbols takes
+/// arrays of that size, so a word's set-up is a few stores.
+const SHORT_PIECE_SYMBOLS: usize = 128;
+/// The smaller arrays of a short merge.
+const SHORT_PIECE_SMALL: usize = 32;
+/// Bits of a position in a short merge's key, `rank << SHORT_KEY_BITS |
+/// position`: an unsigned minimum over the keys is the least rank and,
+/// among its repeats, the leftmost position.
+const SHORT_KEY_BITS: u32 = SHORT_PIECE_SYMBOLS.trailing_zeros();
+/// The position bits of a short merge's key.
+const SHORT_KEY_MASK: u32 = (1 << SHORT_KEY_BITS) - 1;
+/// The key of a live symbol whose pair is no merge, past every packed key.
+const NO_KEY: u32 = u32::MAX;
+/// Ranks a short merge's key carries; a model with more merges declines
+/// the table (a vocabulary has some hundred thousand).
+const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
 /// An empty slot of the open-addressed table; no pair of ids has this key.
@@ -111,6 +127,11 @@ impl MergeTable {
             .map_err(|e| Declined::from(format!("the model does not serialize: {e}")))?;
         let SerializedMerges(merges) = serde_json::from_str(&serialized)
             .map_err(|e| Declined::from(format!("the model's merges do not read back: {e}")))?;
+        if merges.len() >= MAX_RANKS {
+            return Err(Declined::from(
+                "more merges than a short merge's keys carry",
+            ));
+        }
         let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
         table.byte_ids = byte_ids;
         let mut token = String::new();
@@ -223,52 +244,26 @@ impl MergeTable {
     /// call, a hit pays nothing for the merge and a miss pays the call.
     #[inline(never)]
     pub(super) fn merge(&self, piece: &[u8], ids: &mut Vec<u32>) {
+        if piece.is_empty() {
+            return;
+        }
+        let symbols = piece.iter().map(|&byte| self.byte_ids[usize::from(byte)]);
         if piece.len() <= SHORT_PIECE_SYMBOLS {
-            self.merge_short(piece, ids);
+            self.merge_short(symbols, piece.len(), ids);
         } else {
-            self.merge_long(piece, ids);
+            self.merge_long(symbols, ids);
         }
     }
 
-    /// The merge of a short piece: the symbols and the ranks of the adjacent
-    /// pairs on stack arrays, each round a scan for the least rank (the
-    /// leftmost of equal ranks, which can only be the same pair twice), the
-    /// two pairs the merged symbol forms recomputed.
-    fn merge_short(&self, piece: &[u8], ids: &mut Vec<u32>) {
-        let mut symbols = [0u32; SHORT_PIECE_SYMBOLS];
-        let mut ranks = [NO_RANK; SHORT_PIECE_SYMBOLS - 1];
-        let mut len = piece.len();
-        for (symbol, &byte) in symbols.iter_mut().zip(piece) {
-            *symbol = self.byte_ids[usize::from(byte)];
+    /// The merge of a short piece, `n` initial symbols (`1..=SHORT_PIECE_SYMBOLS`),
+    /// as a [`ShortMerge`] on stack arrays, the smaller ones for a piece that
+    /// fits them.
+    fn merge_short(&self, symbols: impl Iterator<Item = u32>, n: usize, ids: &mut Vec<u32>) {
+        if n <= SHORT_PIECE_SMALL {
+            ShortMerge::<SHORT_PIECE_SMALL>::of(symbols, n).run(self, ids);
+        } else {
+            ShortMerge::<SHORT_PIECE_SYMBOLS>::of(symbols, n).run(self, ids);
         }
-        for (rank, pair) in ranks.iter_mut().zip(symbols[..len].windows(2)) {
-            *rank = self.rank_of(pair[0], pair[1]);
-        }
-        loop {
-            let (mut best, mut at) = (NO_RANK, 0);
-            for (i, &rank) in ranks[..len.saturating_sub(1)].iter().enumerate() {
-                if rank < best {
-                    (best, at) = (rank, i);
-                }
-            }
-            if best == NO_RANK {
-                break;
-            }
-            symbols[at] = self.new_ids[best as usize];
-            if at + 2 < len {
-                // The symbols past the merged pair, and the pairs among them.
-                symbols.copy_within(at + 2..len, at + 1);
-                ranks.copy_within(at + 2..len - 1, at + 1);
-            }
-            len -= 1;
-            if at > 0 {
-                ranks[at - 1] = self.rank_of(symbols[at - 1], symbols[at]);
-            }
-            if at + 1 < len {
-                ranks[at] = self.rank_of(symbols[at], symbols[at + 1]);
-            }
-        }
-        ids.extend_from_slice(&symbols[..len]);
     }
 
     /// The merge of a long piece, the model's own loop: a linked list of
@@ -276,13 +271,12 @@ impl MergeTable {
     /// taken only when the pair at its position is still the pair it was
     /// pushed for (the rank names the pair; the model compares the token
     /// the pair produces, which comes to the same, see the module docs).
-    fn merge_long(&self, piece: &[u8], ids: &mut Vec<u32>) {
-        let last = piece.len() - 1;
-        let mut symbols: Vec<Symbol> = piece
-            .iter()
+    fn merge_long(&self, initial: impl ExactSizeIterator<Item = u32>, ids: &mut Vec<u32>) {
+        let last = initial.len() - 1;
+        let mut symbols: Vec<Symbol> = initial
             .enumerate()
-            .map(|(i, &byte)| Symbol {
-                id: self.byte_ids[usize::from(byte)],
+            .map(|(i, id)| Symbol {
+                id,
                 prev: if i == 0 { NONE } else { i as u32 - 1 },
                 next: if i == last { NONE } else { i as u32 + 1 },
             })
@@ -326,6 +320,139 @@ impl MergeTable {
                 .map(|symbol| symbol.id)
                 .filter(|&id| id != NONE),
         );
+    }
+}
+
+/// The merge of a short piece: the live symbols as a linked list over arrays
+/// of `N` (a multiple of eight, at most [`SHORT_PIECE_SYMBOLS`]), and for
+/// each live symbol the key of the pair it starts with its right neighbour,
+/// its rank over its position ([`NO_KEY`] for no merge), so that the least
+/// key names the next merge: the least rank and, among its repeats, the
+/// leftmost position (the rule of the module documentation). A merge unlinks
+/// the right symbol, writes the product, looks up the two pairs the product
+/// now forms, and takes the minimum over the other keys while those lookups
+/// are in flight (their latency is the merge's critical path otherwise); the
+/// minimum runs eight lanes wide, vector instructions without a branch per
+/// key. This replaces a scan over the ranks of arrays of sixteen that moved
+/// the symbols past each merge down by one: a run of six CJK ideographs or
+/// a word of a script without word spaces took the heap path, with its two
+/// allocations.
+struct ShortMerge<const N: usize> {
+    symbols: [u32; N],
+    /// The id the pair each live symbol starts produces, when it is a merge.
+    products: [u32; N],
+    keys: [u32; N],
+    /// The live neighbours by position: `next` of the last symbol is `n`,
+    /// `prev` of the first is 255, both past every position.
+    next: [u8; N],
+    prev: [u8; N],
+    /// Initial symbols.
+    n: usize,
+}
+
+impl<const N: usize> ShortMerge<N> {
+    /// The list of the `n` initial `symbols` (`1..=N`), no pair looked up.
+    #[inline(always)]
+    fn of(symbols: impl Iterator<Item = u32>, n: usize) -> Self {
+        const { assert!(N.is_multiple_of(8) && N <= SHORT_PIECE_SYMBOLS) };
+        debug_assert!(0 < n && n <= N);
+        let mut merge = Self {
+            symbols: [0; N],
+            products: [0; N],
+            keys: [NO_KEY; N],
+            next: [0; N],
+            prev: [0; N],
+            n,
+        };
+        for (at, id) in symbols.take(N).enumerate() {
+            merge.symbols[at] = id;
+            merge.next[at] = (at + 1) as u8;
+            merge.prev[at] = (at as u8).wrapping_sub(1);
+        }
+        merge
+    }
+
+    /// Merges until no live pair is a merge, and appends the ids to `ids`.
+    #[inline(always)]
+    fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
+        let pairs = self.n.saturating_sub(1);
+        for at in 0..pairs {
+            let rank = table.rank_of(self.symbols[at], self.symbols[at + 1]);
+            self.set_pair(table, at, rank);
+        }
+        let mut best = self.least(pairs);
+        while best != NO_KEY {
+            best = self.merge_at(table, (best & SHORT_KEY_MASK) as usize);
+        }
+        let mut at = 0;
+        while at < self.n {
+            ids.push(self.symbols[at]);
+            at = self.next[at] as usize;
+        }
+    }
+
+    /// Merges the pair the symbol at `at` starts, and answers the least key
+    /// after it.
+    #[inline(always)]
+    fn merge_at(&mut self, table: &MergeTable, at: usize) -> u32 {
+        self.symbols[at] = self.products[at];
+        let dead = self.next[at] as usize;
+        let right = self.next[dead] as usize;
+        self.next[at] = right as u8;
+        let left = self.prev[at] as usize;
+        self.keys[dead] = NO_KEY;
+        self.keys[at] = NO_KEY;
+        // The two pairs the product forms, looked up before the minimum
+        // over the other keys, so that the loads overlap it.
+        let ahead = if right < self.n {
+            self.prev[right] = at as u8;
+            table.rank_of(self.symbols[at], self.symbols[right])
+        } else {
+            NO_RANK
+        };
+        let behind = if left < self.n {
+            self.keys[left] = NO_KEY;
+            table.rank_of(self.symbols[left], self.symbols[at])
+        } else {
+            NO_RANK
+        };
+        let others = self.least(self.n - 1);
+        let key_at = self.set_pair(table, at, ahead);
+        let key_left = if left < self.n {
+            self.set_pair(table, left, behind)
+        } else {
+            NO_KEY
+        };
+        others.min(key_at).min(key_left)
+    }
+
+    /// Records the pair the symbol at `at` starts as a merge of `rank` (its
+    /// key and its product; no key for [`NO_RANK`]) and answers the key.
+    #[inline(always)]
+    fn set_pair(&mut self, table: &MergeTable, at: usize, rank: u32) -> u32 {
+        let key = if rank == NO_RANK {
+            NO_KEY
+        } else {
+            self.products[at] = table.new_ids[rank as usize];
+            rank << SHORT_KEY_BITS | at as u32
+        };
+        self.keys[at] = key;
+        key
+    }
+
+    /// The least of the first `len` keys, eight lanes at a time (the keys
+    /// past the live pairs are [`NO_KEY`], so the lanes may run on to the
+    /// next eight).
+    #[inline(always)]
+    fn least(&self, len: usize) -> u32 {
+        let lim = (len + 7) & !7;
+        let mut lanes = [NO_KEY; 8];
+        for chunk in self.keys[..lim].as_chunks::<8>().0 {
+            for (lane, &key) in lanes.iter_mut().zip(chunk) {
+                *lane = (*lane).min(key);
+            }
+        }
+        lanes.into_iter().min().unwrap_or(NO_KEY)
     }
 }
 

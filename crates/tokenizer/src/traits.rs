@@ -128,8 +128,8 @@ pub trait Encoder: Send + Sync {
 /// Per-stream state that turns generated token ids into text one at a time.
 ///
 /// Implementations own whatever they need (pending bytes, a decode window)
-/// and must produce, over a whole stream, the text [`Decoder::decode`] gives
-/// for all of its ids.
+/// and must produce, over a whole stream, steps and finish together, the
+/// text [`Decoder::decode`] gives for all of its ids.
 pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
     /// the token only extends a multi-byte character or is skipped).
@@ -144,6 +144,16 @@ pub trait IncrementalDecoder: Send + Sync {
         let text = self.step(token_id)?;
         out.push_str(&text);
         Ok(!text.is_empty())
+    }
+
+    /// The stream's end: appends the text the decoder still holds, rendered
+    /// as [`Decoder::decode`] renders the end of the same ids (an incomplete
+    /// trailing sequence as the replacement character), and says whether
+    /// there was any. The default is for a decoder that holds nothing back
+    /// between steps.
+    fn finish_into(&mut self, out: &mut String) -> Result<bool> {
+        let _ = out;
+        Ok(false)
     }
 
     /// Forget all state, as for a new stream.
@@ -179,15 +189,48 @@ pub trait Decoder: Send + Sync {
 
     /// Release text buffered by incremental decoding at end of input. A
     /// decoder whose final text no longer starts with what it emitted reports
-    /// `prefix_mismatch` and returns the remainder instead of failing.
+    /// `prefix_mismatch` and returns the remainder instead of failing. The
+    /// default releases what [`decode_step`](Self::decode_step) holds: the
+    /// window's decode past the emitted prefix (an incomplete trailing
+    /// character as the replacement character, the way `decode` ends it),
+    /// and leaves the window empty.
     fn finish_decode(
         &self,
-        _ids: &mut Vec<TokenIdType>,
-        _prefix: &mut String,
-        _prefix_index: &mut usize,
-        _skip_special_tokens: bool,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
     ) -> Result<DecodeStep> {
-        Ok(DecodeStep::default())
+        // Nothing past the emitted text: a stream that ended on a settled
+        // token, or a seeded sequence that generated nothing.
+        let step = if ids.len() <= *prefix_index {
+            DecodeStep::default()
+        } else {
+            let decoded = self.decode(ids, skip_special_tokens)?;
+            let (text, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
+                Some(rest) => (rest.to_string(), false),
+                None => {
+                    // The decode no longer starts with the emitted text:
+                    // stream what follows their common prefix; nothing
+                    // already emitted is retracted.
+                    let common = decoded
+                        .char_indices()
+                        .zip(prefix.chars())
+                        .find(|((_, a), b)| a != b)
+                        .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
+                    crate::decode_activity::note_prefix_mismatch(false);
+                    (decoded[common..].to_string(), true)
+                }
+            };
+            DecodeStep {
+                text: (!text.is_empty()).then_some(text),
+                prefix_mismatch,
+            }
+        };
+        ids.clear();
+        prefix.clear();
+        *prefix_index = 0;
+        Ok(step)
     }
 
     /// Incremental decode step — called once per generated token.

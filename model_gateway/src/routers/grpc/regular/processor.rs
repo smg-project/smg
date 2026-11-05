@@ -196,7 +196,7 @@ impl ResponseProcessor {
         // token are in the list like the content: a client reads the
         // model's margin at every position of the output, and the list's
         // length is the completion's token count on both sides.
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        let logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -265,7 +265,7 @@ impl ResponseProcessor {
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The output's logprobs as the engine reports them, one entry per generated token, as
         // on the older path: a message without content keeps them like any other.
-        choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        choice.logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -350,6 +350,7 @@ impl ResponseProcessor {
             usage: messages_usage_from_counts(
                 complete.prompt_tokens(),
                 complete.completion_tokens(),
+                complete.cached_tokens(),
                 thinking_requested.then_some(complete.reasoning_tokens().max(reasoning_tokens)),
             ),
             container: None,
@@ -708,7 +709,6 @@ impl ResponseProcessor {
             let output_token_logprobs = if request_logprobs {
                 complete
                     .output_logprobs()
-                    .as_ref()
                     .map(utils::convert_generate_output_logprobs)
             } else {
                 None
@@ -1075,13 +1075,15 @@ impl ResponseProcessor {
             None
         };
 
-        // Step 5: Build usage. A turn that ran with thinking reports its
-        // thinking tokens: the engine's own count when it keeps one, else the
-        // tokens the parser placed in the thinking span.
+        // Step 5: Build usage. The engine's prefix-cache hit is the cache-read
+        // count. A turn that ran with thinking reports its thinking tokens:
+        // the engine's own count when it keeps one, else the tokens the parser
+        // placed in the thinking span.
         let thinking_requested = messages_request.thinking_requested;
         let usage = messages_usage_from_counts(
             complete.prompt_tokens(),
             complete.completion_tokens(),
+            complete.cached_tokens(),
             thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
         );
 
@@ -1530,17 +1532,26 @@ fn normalize_assistant_content(text: String) -> Option<String> {
     }
 }
 
-/// Usage for a unary Messages response. Cache counters are integer zeros,
-/// never null: the Anthropic wire contract has always-present cache counters
-/// (0 when caching is unused) and clients do arithmetic on them; the
+/// Usage for a unary Messages response, from the engine's counts: the whole
+/// prompt (`prompt_tokens`) and its prefix-cache hit (`cached_tokens`), the
+/// counts the settlement and the metrics keep whole. The Anthropic wire splits
+/// them: `input_tokens` is the input outside the cache and
+/// `cache_read_input_tokens` the hit, their sum the prompt (the HTTP tenant
+/// settlement sums them back that way). Cache counters are integers, never
+/// null: the wire contract has always-present cache counters and clients do
+/// arithmetic on them; `cache_creation_input_tokens` stays zero, as the
+/// gateway writes no breakpoint-driven cache entries of its own. The
 /// cache-creation breakdown, service tier and inference geography are always
 /// written too, and `output_tokens_details` when the turn ran with thinking.
 fn messages_usage_from_counts(
-    input_tokens: u32,
+    prompt_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     thinking_tokens: Option<u32>,
 ) -> messages::Usage {
-    let usage = messages::Usage::from_counts(input_tokens, output_tokens);
+    let usage =
+        messages::Usage::from_counts(prompt_tokens.saturating_sub(cached_tokens), output_tokens)
+            .with_cache_read_input_tokens(cached_tokens);
     match thinking_tokens {
         Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
         None => usage,
@@ -1603,18 +1614,37 @@ mod messages_usage_wire_tests {
     /// a serde attr silently skipped would still fail here).
     #[test]
     fn cache_counters_serialize_as_integer_zeros() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, None)).unwrap();
         assert_eq!(v["input_tokens"], 25);
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
     }
 
+    /// The engine's whole prompt and its hit become the wire's split: the
+    /// input outside the cache beside the hit as the cache-read counter, their
+    /// sum the prompt; a miss leaves the whole prompt as input beside an
+    /// integer zero; a hit an engine reports above its prompt count leaves no
+    /// negative input; the creation counter stays zero throughout.
+    #[test]
+    fn cache_read_input_tokens_is_the_engines_prefix_cache_hit() {
+        let v = serde_json::to_value(messages_usage_from_counts(945, 12, 896, None)).unwrap();
+        assert_eq!(v["input_tokens"], 49);
+        assert_eq!(v["cache_read_input_tokens"], 896);
+        assert_eq!(v["cache_creation_input_tokens"], 0);
+        let v = serde_json::to_value(messages_usage_from_counts(945, 12, 0, None)).unwrap();
+        assert_eq!(v["input_tokens"], 945);
+        assert_eq!(v["cache_read_input_tokens"], 0);
+        let v = serde_json::to_value(messages_usage_from_counts(10, 1, 16, None)).unwrap();
+        assert_eq!(v["input_tokens"], 0);
+        assert_eq!(v["cache_read_input_tokens"], 16);
+    }
+
     /// The public API writes these keys on every message; a typed client
     /// reads a missing `cache_creation` as a decode error, not as zero.
     #[test]
     fn always_present_usage_keys_are_written_without_thinking() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, None)).unwrap();
         assert_eq!(
             v["cache_creation"],
             serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
@@ -1633,9 +1663,9 @@ mod messages_usage_wire_tests {
     /// included: the key says thinking was on, the count says how much.
     #[test]
     fn thinking_tokens_are_written_when_the_turn_ran_with_thinking() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(40))).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, Some(40))).unwrap();
         assert_eq!(v["output_tokens_details"]["thinking_tokens"], 40);
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(0))).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, Some(0))).unwrap();
         assert_eq!(v["output_tokens_details"]["thinking_tokens"], 0);
     }
 }

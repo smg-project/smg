@@ -9,7 +9,7 @@ use tokenizers::{
     Model,
 };
 
-use super::{super::bytes_char, MergeTable, SHORT_PIECE_SYMBOLS};
+use super::{super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS};
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
 fn alphabet_vocab() -> (Vocab, [char; 256]) {
@@ -143,10 +143,14 @@ fn pieces() -> Vec<Vec<u8>> {
     .map(|s| s.as_bytes().to_vec())
     .collect();
     for len in [
+        SHORT_PIECE_SMALL - 1,
+        SHORT_PIECE_SMALL,
+        SHORT_PIECE_SMALL + 1,
         SHORT_PIECE_SYMBOLS - 1,
         SHORT_PIECE_SYMBOLS,
         SHORT_PIECE_SYMBOLS + 1,
         40,
+        100,
         257,
     ] {
         pieces.push(vec![b'a'; len]);
@@ -199,10 +203,20 @@ fn the_leftmost_of_a_repeated_pair_merges_first() {
     let a = bpe.token_to_id("a").expect("a");
     assert_eq!(table_ids(&table, b"aaa"), vec![aa, a]);
     assert_eq!(table_ids(&table, b"aaaaa"), vec![aa, aa, a]);
-    let long = vec![b'a'; SHORT_PIECE_SYMBOLS * 2 + 1];
-    let mut expected = vec![aa; SHORT_PIECE_SYMBOLS];
-    expected.push(a);
-    assert_eq!(table_ids(&table, &long), expected);
+    // On both sizes of the stack arrays and on the heap.
+    for len in [
+        SHORT_PIECE_SMALL,
+        SHORT_PIECE_SMALL + 1,
+        SHORT_PIECE_SYMBOLS,
+        SHORT_PIECE_SYMBOLS + 1,
+        SHORT_PIECE_SYMBOLS * 2 + 1,
+    ] {
+        let mut expected = vec![aa; len / 2];
+        if len % 2 == 1 {
+            expected.push(a);
+        }
+        assert_eq!(table_ids(&table, &vec![b'a'; len]), expected, "{len} a's");
+    }
 }
 
 #[test]
@@ -269,8 +283,9 @@ fn random_pieces_merge_to_the_models_ids_on_a_random_vocabulary() {
         .build()
         .expect("a random BPE");
     let table = table_of(&bpe);
+    // Lengths across both sizes of the stack arrays and onto the heap.
     for round in 0..3000 {
-        let len = 1 + round % 48;
+        let len = 1 + round % 140;
         let start = next() as usize % (corpus.len() - len);
         let piece = &corpus[start..start + len];
         assert_eq!(

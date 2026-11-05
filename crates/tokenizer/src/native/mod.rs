@@ -98,19 +98,38 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// `encode_volume` shows both, and that the cost of text no pass has seen
 /// does not depend on how much a thread encoded before); a first sight of a
 /// vocabulary word costs a read of the encoder's seed, of another piece the
-/// model's merges.
-const PIECE_CACHE_CAPACITY: usize = 16_384;
+/// model's merges. The bound holds the distinct pieces of a document of
+/// several hundred thousand tokens, so a long document, and a batch of many
+/// prompts, warm on a second pass as a short prompt does (at 16,384 a text
+/// of 32k tokens cleared the cache on every pass, and documents of 128k and
+/// 500k tokens encoded as slowly warm as cold: measured). Memory: a thread's
+/// table grows with use (see `short_pieces`), so a thread that encodes
+/// little holds a few KB; at the full bound it has 524,288 slots of 33
+/// bytes, 16.5 MiB. The pieces of 16 to 64 bytes count against the same
+/// bound in a map (`PieceCache::short`) at about 140 bytes an entry (its
+/// slot with the table's slack, the piece and the ids as two boxes), so a
+/// thread whose entries were all such pieces would hold about 35 MiB.
+/// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
+/// grew by 8 MB on a 128k-token vocabulary and did not move on three
+/// larger ones, whose peak is the file load.
+const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
 /// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
 /// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
-/// the slots for its cap (33 bytes a slot: 1 MiB at the full cap), and is
-/// made anew for a smaller cap when it is cleared, so a thread that encodes
-/// little holds little and the packed tables of one tokenizer stay under
-/// about 24 MiB however many runtime and blocking threads encode with it
-/// (the maps of the longer pieces share the count); they are freed with the
-/// encoder.
-const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
+/// the slots for its cap, and is made anew for a smaller cap when it is
+/// cleared, so a thread that encodes little holds little and the packed
+/// tables of one tokenizer stay under 352 MiB however many runtime and
+/// blocking threads encode with it (sixteen threads at the full bound hold
+/// 264 MiB; more threads share the total, each table rounded up to a power
+/// of two slots, at most eight thirds of the total in slots). The maps of
+/// the pieces of 16 to 64 bytes share the count at about 140 bytes an
+/// entry, so the count-bounded tiers of one tokenizer hold at most about
+/// 560 MiB when every entry is such a piece, 352 MiB when every entry is
+/// packed; the long pieces add `LONG_PIECE_BYTES_TOTAL` at most. Before
+/// this bound the same ceilings were a sixteenth of these. All of it is
+/// freed with the encoder.
+const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
 /// `LONG_PIECE_BYTES_TOTAL`.
@@ -1002,7 +1021,8 @@ impl NativeEncoder {
                 .map(|unit| {
                     let mut ids = Vec::new();
                     let mut mapped = String::new();
-                    self.encode_unit(model, unit, &mut mapped, &mut ids)
+                    let mut cache = self.thread_piece_cache().borrow_mut();
+                    self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)
                         .map(|()| ids)
                 })
                 .collect::<Result<_, _>>()?;
@@ -1018,8 +1038,9 @@ impl NativeEncoder {
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
         let mut mapped = String::new();
+        let mut cache = self.thread_piece_cache().borrow_mut();
         for unit in &units {
-            self.encode_unit(model, unit, &mut mapped, &mut ids)?;
+            self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)?;
         }
         ids.extend_from_slice(after);
         Ok(ids)
@@ -1193,18 +1214,20 @@ impl NativeEncoder {
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
     /// (the pieces after it are tokenized all the same, as in the whole-text
-    /// encode).
+    /// encode). `cache` is the encoding thread's piece cache
+    /// ([`Self::thread_piece_cache`]), borrowed by the caller for the unit.
     fn encode_unit(
         &self,
         model: &ModelWrapper,
         unit: &Segment<'_>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
             let mut per_piece = |piece: &str| {
-                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids) {
+                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
                     fallback = Some(declined);
                 }
             };
@@ -1261,29 +1284,30 @@ impl NativeEncoder {
     /// thread's cache comes first because it is small and hot: the pieces of
     /// the prompts a thread encodes, a few hundred KB, where the seed is
     /// several MB of lines a warm encode would read at random (measured:
-    /// the seed first cost a warm prose encode a tenth more).
+    /// the seed first cost a warm prose encode a tenth more). `cache` is the
+    /// thread's own ([`Self::thread_piece_cache`]), looked up and borrowed by
+    /// the encode once rather than here once per piece (measured: 4 % of the
+    /// instructions per token of a warm encode on a 151k byte-level
+    /// vocabulary).
     fn tokenize_piece(
         &self,
         model: &ModelWrapper,
         piece: &str,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
         let key = ShortPieceKey::of(bytes);
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        let cache = self.piece_cache.get_or(|| {
-            self.threads.fetch_add(1, Ordering::Relaxed);
-            RefCell::default()
-        });
         if let Some(key) = key {
-            if let Some(packed) = &cache.borrow().packed {
+            if let Some(packed) = &cache.packed {
                 if packed.ids_into(key, ids) {
                     return Ok(());
                 }
             }
         } else if cacheable {
-            if let Some(found) = cache.borrow().get(bytes) {
+            if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
             }
@@ -1312,35 +1336,42 @@ impl NativeEncoder {
         }
         if let Some(key) = key {
             let share = self.piece_cache_share();
-            let mut pieces = cache.borrow_mut();
-            if pieces.short_entries() >= share {
-                pieces.clear_short(share);
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
             }
-            pieces
+            cache
                 .packed
                 .get_or_insert_with(ShortPieceTable::new)
                 .insert(key, &ids[start..], share);
         } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
             let share = self.piece_cache_share();
-            let mut pieces = cache.borrow_mut();
-            if pieces.short_entries() >= share {
-                pieces.clear_short(share);
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
             }
-            pieces.short.insert(bytes.into(), ids[start..].into());
+            cache.short.insert(bytes.into(), ids[start..].into());
         } else if cacheable {
             let entry = LONG_PIECE_ENTRY_BYTES + bytes.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
             if entry <= share {
-                let mut pieces = cache.borrow_mut();
-                if pieces.long_bytes + entry > share {
-                    pieces.long.clear();
-                    pieces.long_bytes = 0;
+                if cache.long_bytes + entry > share {
+                    cache.long.clear();
+                    cache.long_bytes = 0;
                 }
-                pieces.long_bytes += entry;
-                pieces.long.insert(bytes.into(), ids[start..].into());
+                cache.long_bytes += entry;
+                cache.long.insert(bytes.into(), ids[start..].into());
             }
         }
         Ok(())
+    }
+
+    /// The calling thread's piece cache for this encoder, made at the
+    /// thread's first encode with it (from then on the thread counts toward
+    /// every thread's share, see [`Self::piece_cache_share`]).
+    fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
+        self.piece_cache.get_or(|| {
+            self.threads.fetch_add(1, Ordering::Relaxed);
+            RefCell::default()
+        })
     }
 
     /// The piece in the byte-level alphabet, the form the model's vocabulary

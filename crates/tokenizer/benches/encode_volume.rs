@@ -2,9 +2,10 @@
 //! encoded: a document of N tokens encoded again after one pass over it
 //! (`repeat`: every piece it holds was seen once already) and a document of N
 //! tokens no pass has seen, after documents of the same size (`fresh`). The
-//! corpus is cache-hostile by default: pseudo-words from a vocabulary wider
-//! than a thread's piece-cache share, digits and short CJK runs, no special
-//! tokens; `VOLUME_BENCH_CORPUS=prose` uses repeated paragraphs instead.
+//! corpus is cache-hostile by default: pseudo-words from a vocabulary of some
+//! 170,000 words, most of them seen once in a document, digits and short CJK
+//! runs, no special tokens; `VOLUME_BENCH_CORPUS=prose` uses repeated
+//! paragraphs instead.
 //!
 //! `VOLUME_BENCH_TOKENIZERS=name=dir,...` selects the tokenizers (without it
 //! the bench says so on one line and exits without measuring, so a plain

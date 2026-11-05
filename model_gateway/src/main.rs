@@ -5147,4 +5147,56 @@ mod tests {
         );
         assert_eq!(listener.runtime_worker_threads, Some(2));
     }
+
+    /// `configure` validates the configuration once, through the builder's
+    /// `build()`: a second pass over the same value repeats every file read
+    /// of the validators (the scheduler YAML, the log-directory probe) for no
+    /// second opinion. An inotify watch on the scheduler file counts the
+    /// read-only opens `configure` closes; the count does not depend on
+    /// timing, since the events queue until they are read. The watch takes
+    /// the opens as well: the kernel folds two identical queued events into
+    /// one, and the open between two closes keeps them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        use std::mem::MaybeUninit;
+
+        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = dir.path().join("scheduler.yaml");
+        std::fs::write(&scheduler, "{}\n").unwrap();
+        let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(
+            &watch,
+            &scheduler,
+            WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
+        )
+        .unwrap();
+
+        let cli = cli_args_from(&[
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            scheduler.to_str().unwrap(),
+        ]);
+        cli.configure(vec![], vec![]).expect("configures");
+
+        // Every read-only open `configure` made has closed by now; the
+        // non-blocking read drains what queued and stops at an empty queue.
+        let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut events = inotify::Reader::new(&watch, &mut buf);
+        let mut reads = 0;
+        loop {
+            match events.next() {
+                Ok(event) => {
+                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                        reads += 1;
+                    }
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => break,
+                Err(error) => panic!("reading the inotify events: {error}"),
+            }
+        }
+        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
+    }
 }

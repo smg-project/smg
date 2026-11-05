@@ -50,8 +50,12 @@ type NodeRef = Arc<Node>;
 /// Shard counts for DashMaps to balance concurrency vs allocation overhead.
 /// Root node has more shards due to higher contention.
 const ROOT_SHARD_COUNT: usize = 32;
-/// Child nodes typically have few entries, minimize shard overhead.
-const NODE_SHARD_COUNT: usize = 4;
+/// A node's tenant and children maps hold a handful of entries, so their
+/// shards buy no concurrency and cost twice: every shard a walk enters is one
+/// allocation (dashmap's iterator wraps each shard guard in an `Arc`), so the
+/// holders read of every match allocates once per shard, and every shard is
+/// a cache-padded lock in every node. Two is dashmap's minimum.
+const NODE_SHARD_COUNT: usize = 2;
 
 /// Eviction policy matching SGLang's scheduler options.
 /// The gateway should use the same policy as the backend worker to stay in sync.

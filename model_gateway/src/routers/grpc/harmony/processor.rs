@@ -179,7 +179,7 @@ impl HarmonyResponseProcessor {
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
                     .output_logprobs()
-                    .map(|lp| convert_harmony_logprobs(encoding, &lp))
+                    .map(|lp| convert_harmony_logprobs(encoding, lp))
             } else {
                 None
             };

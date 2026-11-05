@@ -1,6 +1,7 @@
 mod alias_pipeline;
 mod build_parity;
 mod generate_body;
+mod generate_pretokenized;
 mod glm53;
 mod model_label;
 mod rate_limit_reserve;
@@ -66,6 +67,7 @@ use crate::{
         },
     },
     tenant::TenantKey,
+    test_support,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
@@ -157,14 +159,19 @@ impl GatedScheduler {
     }
 }
 
-fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>> {
+/// The stub's two frames for `request_id`: one token, then the finish, both counting
+/// `prompt_tokens` as the prompt the request carried, as an engine reports it.
+fn generate_frames(
+    request_id: &str,
+    prompt_tokens: u32,
+) -> Vec<Result<ts::GenerateResponse, Status>> {
     use ts::generate_response::Response as GenResp;
     vec![
         Ok(ts::GenerateResponse {
             request_id: request_id.to_string(),
             response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
                 token_ids: vec![100],
-                prompt_tokens: 2,
+                prompt_tokens,
                 completion_tokens: 1,
                 cached_tokens: 0,
                 output_logprobs: None,
@@ -177,7 +184,7 @@ fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>
             response: Some(GenResp::Complete(ts::GenerateComplete {
                 output_ids: vec![100],
                 finish_reason: "stop".to_string(),
-                prompt_tokens: 2,
+                prompt_tokens,
                 completion_tokens: 1,
                 cached_tokens: 0,
                 output_logprobs: None,
@@ -229,10 +236,12 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .map(|t| t.original_text.clone())
                     .unwrap_or_default(),
             );
+        let input_ids = request.tokenized.map(|t| t.input_ids).unwrap_or_default();
+        let prompt_tokens = u32::try_from(input_ids.len()).unwrap_or(u32::MAX);
         self.seen_input_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(request.tokenized.map(|t| t.input_ids).unwrap_or_default());
+            .push(input_ids);
         self.seen_request_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -290,7 +299,10 @@ impl TokenSpeedScheduler for GatedScheduler {
             if let Some(probe) = probe {
                 Self::await_probe(&probe, &released).await;
             }
-            for (index, frame) in generate_frames(&request_id).into_iter().enumerate() {
+            for (index, frame) in generate_frames(&request_id, prompt_tokens)
+                .into_iter()
+                .enumerate()
+            {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
                 }
@@ -2933,9 +2945,9 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
 
 // ------------------------------------------------------------------
 // DeepSeek-V4.1 parity through the pipeline with the real checkpoint
-// tokenizer. Needs `DEEPSEEK_V41_MODEL_DIR` (or the tokenizer crate's
-// download cache); skips otherwise, like the tokenizer crate's parity
-// test.
+// tokenizer: `DEEPSEEK_V41_MODEL_DIR`, else the tokenizer files fetched
+// once into the package's cache; skips only when the hub is unreachable,
+// like the tokenizer crate's parity test.
 // ------------------------------------------------------------------
 
 const V41_RENDER_FIXTURES: &str = include_str!(
@@ -2953,14 +2965,12 @@ const V41_IMAGE_TOKEN_ID: u32 = 129264;
 /// the multimodal crate's goldens.
 const V41_CORN_TOKENS: usize = 189;
 
-fn deepseek_v41_model_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("DEEPSEEK_V41_MODEL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../crates/tokenizer/.tokenizer_cache/deepseek_v41")
-        });
-    (dir.join("tokenizer.json").is_file() && dir.join("config.json").is_file()).then_some(dir)
+/// The checkpoint's tokenizer directory, fetched on a blocking thread: the
+/// download blocks, and must not run on the runtime.
+async fn deepseek_v41_model_dir() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(test_support::ensure_deepseek_v41_cached)
+        .await
+        .expect("the download thread")
 }
 
 #[expect(
@@ -2968,7 +2978,10 @@ fn deepseek_v41_model_dir() -> Option<PathBuf> {
     reason = "test diagnostic: says why the parity test did not run"
 )]
 fn skip_no_tokenizer() {
-    eprintln!("skipping: no DeepSeek-V4.1 tokenizer (set DEEPSEEK_V41_MODEL_DIR)");
+    eprintln!(
+        "skipping: no DeepSeek-V4.1 tokenizer (the hub is unreachable; set {})",
+        test_support::DEEPSEEK_V41_MODEL_DIR_ENV
+    );
 }
 
 /// The recorded request (`messages`, kwargs) and reference ids of one
@@ -3101,7 +3114,7 @@ async fn v41_run_chat_on(
 /// renderer writes that revision's effort budget.
 #[tokio::test]
 async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3160,7 +3173,7 @@ async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
 /// the client's mistake, so it surfaces as 400, not 500.
 #[tokio::test]
 async fn deepseek_v41_invalid_effort_is_a_bad_request() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3186,7 +3199,7 @@ async fn deepseek_v41_invalid_effort_is_a_bad_request() {
 /// instead of refusing the request.
 #[tokio::test]
 async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3231,7 +3244,7 @@ async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
 /// example), and the worker is told that span as the placeholder range.
 #[tokio::test]
 async fn deepseek_v41_image_expands_to_the_reference_span() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3369,7 +3382,7 @@ fn a_router_error_carries_the_reason_behind_its_class() {
 /// dispatched (the engine would admit the request and never schedule it).
 #[tokio::test]
 async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3407,7 +3420,7 @@ async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
 /// `false` refuses it.
 #[tokio::test]
 async fn deepseek_v41_image_follows_the_servicer_vision_verdict() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };

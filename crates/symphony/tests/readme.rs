@@ -730,8 +730,8 @@ const GROUPS: &[Group] = &[
         released: "2025-12-01",
         smg: (Some("deepseek32"), None),
         table: Some(Table::DeepSeekV3_2),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(19),
+        status: Status::Replaying,
     },
     Group {
         slug: "deepseek-v3.2-exp",
@@ -740,7 +740,7 @@ const GROUPS: &[Group] = &[
         released: "2025-09-29",
         smg: (Some("deepseek32"), None),
         table: Some(Table::DeepSeekV3_2),
-        set: Some(184_972),
+        set: Some(576_854),
         status: Status::Replaying,
     },
     Group {
@@ -750,8 +750,8 @@ const GROUPS: &[Group] = &[
         released: "2026-04-22",
         smg: (Some("deepseek_v4"), Some("deepseek_v4")),
         table: Some(Table::DeepSeekV4),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(28),
+        status: Status::Replaying,
     },
     Group {
         slug: "deepseek-v4.1-flash",
@@ -760,7 +760,7 @@ const GROUPS: &[Group] = &[
         released: "2026-09-10",
         smg: (Some("deepseek_v41"), Some("deepseek_v41")),
         table: Some(Table::DeepSeekV4_1),
-        set: Some(589_659),
+        set: Some(589_671),
         status: Status::Replaying,
     },
     Group {
@@ -1243,7 +1243,7 @@ const GROUPS: &[Group] = &[
         released: "2025-07-11",
         smg: (Some("kimik2"), Some("kimi")),
         table: Some(Table::KimiK2),
-        set: Some(5),
+        set: Some(19),
         status: Status::Replaying,
     },
     Group {
@@ -1253,7 +1253,7 @@ const GROUPS: &[Group] = &[
         released: "2025-09-03",
         smg: (Some("kimik2"), Some("kimi")),
         table: Some(Table::KimiK2),
-        set: Some(5),
+        set: Some(19),
         status: Status::Replaying,
     },
     Group {
@@ -1263,7 +1263,7 @@ const GROUPS: &[Group] = &[
         released: "2025-11-04",
         smg: (Some("kimik2"), Some("kimi_thinking")),
         table: Some(Table::KimiK2),
-        set: Some(5),
+        set: Some(23),
         status: Status::Replaying,
     },
     Group {
@@ -1273,7 +1273,7 @@ const GROUPS: &[Group] = &[
         released: "2026-01-01",
         smg: (Some("kimik2"), Some("kimi_k25")),
         table: Some(Table::KimiK2),
-        set: Some(5),
+        set: Some(23),
         status: Status::Replaying,
     },
     Group {
@@ -1283,7 +1283,7 @@ const GROUPS: &[Group] = &[
         released: "2026-04-14",
         smg: (Some("kimik2"), Some("kimi")),
         table: Some(Table::KimiK2),
-        set: Some(6),
+        set: Some(24),
         status: Status::Replaying,
     },
     Group {
@@ -1293,7 +1293,7 @@ const GROUPS: &[Group] = &[
         released: "2026-06-11",
         smg: (Some("kimik2"), Some("kimi")),
         table: Some(Table::KimiK2),
-        set: Some(10),
+        set: Some(28),
         status: Status::Replaying,
     },
     Group {
@@ -2536,7 +2536,7 @@ fn tag_tools() -> Vec<Tool> {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
