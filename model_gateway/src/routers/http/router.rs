@@ -97,7 +97,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge, TenantReservation},
+            tenant_rate_limit::{self, Estimate, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
@@ -587,7 +587,7 @@ impl Router {
             tenant_meta,
             typed_req,
             model_id,
-            routing_text,
+            Estimate::Text(routing_text),
         )
         .await
     }

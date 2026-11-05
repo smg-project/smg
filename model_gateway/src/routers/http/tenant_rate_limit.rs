@@ -289,26 +289,40 @@ pub(crate) struct TenantReservation {
     samples_per_prompt: u32,
 }
 
+/// Where a reservation's estimate comes from
+/// ([`TenantCharge::estimated_input_tokens`]).
+pub(crate) enum Estimate<'a> {
+    /// Counted here, from the request's routing text when routing already
+    /// extracted it, else from its body.
+    Text(Option<&'a str>),
+    /// Counted by the caller already: the disaggregated router counts the
+    /// body's own for its prefill side's silence bound and hands it on, so
+    /// a request's words are counted once.
+    Counted(u32),
+}
+
 /// Reserve `request`'s estimate for `tenant_meta` under `manager`, once per
 /// logical request and before any dispatch: every attempt dispatches under
 /// this one reservation. With a limiter and a tenant to charge, either the
 /// reservation or the denial, which is the request's answer, never retried;
 /// `(None, None)` for a request outside the limiter (no limiter configured,
-/// or a route that charges no tenant). `routing_text` is the request's
-/// routing text when routing already extracted it
-/// ([`TenantCharge::estimated_input_tokens`]).
+/// or a route that charges no tenant). `estimate` says where the estimate
+/// comes from ([`Estimate`]).
 pub(crate) async fn reserve<T: TenantCharge>(
     manager: Option<&RateLimitManager>,
     tenant_meta: Option<&TenantRequestMeta>,
     request: &T,
     model_id: &str,
-    routing_text: Option<&str>,
+    estimate: Estimate<'_>,
 ) -> (Option<TenantReservation>, Option<Response>) {
     let (Some(manager), Some(tenant_meta)) = (manager, tenant_meta) else {
         return (None, None);
     };
     let cell = RateLimitCell::new();
-    let estimate = request.estimated_input_tokens(routing_text);
+    let estimate = match estimate {
+        Estimate::Text(routing_text) => request.estimated_input_tokens(routing_text),
+        Estimate::Counted(tokens) => tokens,
+    };
     match cell.reserve(manager, tenant_meta, model_id, estimate).await {
         Ok(()) => (
             Some(TenantReservation {

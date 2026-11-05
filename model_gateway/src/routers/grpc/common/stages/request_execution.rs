@@ -3,7 +3,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,13 +24,17 @@ use crate::{
     },
     routers::{
         common::{
-            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             kv_transfer::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
+            pd_silence::{
+                await_prefill_within, judge_prefill_side, silent_side_answer, PrefillBound,
+                SilenceVerdict, DECODE_SILENCE_MESSAGE, PREFILL_SILENCE_MESSAGE,
+            },
             retry::mark_non_retryable,
         },
         error,
@@ -54,11 +58,7 @@ use crate::{
             },
         },
     },
-    worker::{
-        basic::WorkerTypeExt,
-        liveness::{self, SideReprieve},
-        ConnectionModeExt, PrefillLoadGuard, Worker,
-    },
+    worker::{basic::WorkerTypeExt, liveness, ConnectionModeExt, PrefillLoadGuard, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -1620,215 +1620,15 @@ fn retire_pd_side(
     });
 }
 
-/// The message a prefill side's silence verdict starts with (see
-/// [`prefill_side_silent`]); it tells the verdict from an engine's own
-/// `DEADLINE_EXCEEDED`.
-const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
-
-/// The message of the verdict that puts a prefill side's silence on its
-/// stalled decode partner (see [`decode_partner_silent`]).
-const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
-
 /// The message a sequential decode side's silence verdict starts with (see
 /// [`decode_side_silent`]); it tells the verdict from an engine's own
 /// `DEADLINE_EXCEEDED`.
 const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
 
-/// The bound on one prefill side's silence, counted from its dispatch (see
-/// [`liveness::prefill_side_bound`]); the dispatch instant stays with it,
-/// as a reprieve past the deadline may count from there, and so does the
-/// worker's backlog once a reprieve has read it, for both phases of the
-/// side (see [`liveness::prefill_side_reprieve`]).
-#[derive(Clone, Debug)]
-struct PrefillBound {
-    dispatched: Instant,
-    deadline: Instant,
-    bound: Duration,
-    /// The silence a stalled decode partner is judged by (see
-    /// [`stalled_decode_partner`]): a decode side's bound for the same
-    /// prompt, which counts its prefill time once where `bound` counts it
-    /// twice (see [`liveness::decode_side_bound`]).
-    partner_bound: Duration,
-    backlog: Arc<OnceLock<Duration>>,
-}
-
-impl PrefillBound {
-    /// The bound for a side of `prompt_tokens` dispatched to `worker` at
-    /// `dispatched`; `None` when the rule is off.
-    fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        let partner_bound = liveness::decode_side_bound(worker, prompt_tokens)?;
-        Self::of(
-            liveness::prefill_side_bound(worker, prompt_tokens)?,
-            dispatched,
-        )
-        .map(|bound| Self {
-            partner_bound,
-            ..bound
-        })
-    }
-
-    /// A bound of `bound` from `dispatched`, a stalled decode partner judged
-    /// by the same. A bound past the clock's range never expires: `None`,
-    /// and the side stays unbounded.
-    fn of(bound: Duration, dispatched: Instant) -> Option<Self> {
-        let deadline = dispatched.checked_add(bound)?;
-        Some(Self {
-            dispatched,
-            deadline,
-            bound,
-            partner_bound: bound,
-            backlog: Arc::default(),
-        })
-    }
-}
-
-/// What a prefill side's silence verdict was judged on (see
-/// [`liveness::SideReprieve::Silent`]).
-#[derive(Clone, Copy, Debug)]
-struct PrefillSilence {
-    /// The side's own bound.
-    bound: Duration,
-    /// How long the side had waited since its dispatch.
-    waited: Duration,
-    /// How long its worker had answered nothing (`None`: never).
-    silent: Option<Duration>,
-    /// What that silence was judged against: the bound, or the time the
-    /// backlog of a run that had not answered takes.
-    window: Duration,
-}
-
-/// The verdict on a prefill side that produced nothing within its bound, in
-/// `phase` (`dispatch`: the call returned no stream; `first_response`: the
-/// stream yielded nothing), while its worker answered no other side for its
-/// window either: the bound, or the time the backlog of a run that had not
-/// answered takes (see [`liveness::prefill_side_reprieve`]). One WARN naming
-/// the worker, the request, how long the side waited, how long the worker
-/// had answered nothing against which window and how long ago it last
-/// answered anything or showed a decode side a handoff (a handoff only
-/// reprieves, so the silence a verdict names is the worker's own), the
-/// worker-error counter under the timeout class, and
-/// the status the side's failure is reported with. Nothing else bounds this
-/// wait below the request's own timeout: the engine's health probes keep
-/// passing, the queue timeout ended at worker selection, and the admission
-/// gate only gates the dispatch. The attempt fails here; the retry layer
-/// takes the request to another prefill worker when one is available (see
-/// [`prefill_silence_response`]).
-fn prefill_side_silent(
-    worker: &Arc<dyn Worker>,
-    connection: &'static str,
-    request_id: &str,
-    prompt_tokens: u64,
-    silence: PrefillSilence,
-    phase: &'static str,
-) -> tonic::Status {
-    let millis = |span: Duration| u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
-    let ago = |ago: Option<Duration>| {
-        ago.map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"))
-    };
-    let worker_last_answer = ago(worker.prefill_answered_ago());
-    let worker_last_handoff = ago(worker.prefill_handed_off_ago());
-    warn!(
-        request_id = %request_id,
-        worker = worker.redacted_url(),
-        worker_type = metrics_labels::WORKER_PREFILL,
-        phase,
-        prompt_tokens,
-        bound_ms = millis(silence.bound),
-        waited_ms = millis(silence.waited),
-        worker_silent_ms = silence.silent.map(millis),
-        window_ms = millis(silence.window),
-        worker_last_answer = %worker_last_answer,
-        worker_last_handoff = %worker_last_handoff,
-        "PD prefill side produced nothing past its silence bound, and its worker answered no other side for its silence window; giving up on it"
-    );
-    Metrics::record_worker_error(
-        metrics_labels::WORKER_PREFILL,
-        connection,
-        metrics_labels::ERROR_TIMEOUT,
-    );
-    let PrefillSilence {
-        bound,
-        waited,
-        silent,
-        window,
-    } = silence;
-    let worker_silent = match silent {
-        Some(silent) => {
-            format!("its worker answered nothing for {silent:.1?} of a {window:.1?} window")
-        }
-        None => format!("its worker never answered (a {window:.1?} window)"),
-    };
-    tonic::Status::deadline_exceeded(format!(
-        "{PREFILL_SILENCE_MESSAGE} {waited:.1?} of its dispatch ({phase}, bound {bound:.1?}): {worker_silent}"
-    ))
-}
-
 /// Whether `status` is a prefill side's silence verdict.
 fn is_prefill_silence(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::DeadlineExceeded
         && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
-}
-
-/// The decode partner of a prefill side whose silence bound passed, when the
-/// silence is the partner's: on the parallel dispatch shape the prefill
-/// side's first response waits for the decode side, so a decode worker that
-/// stopped producing makes every prefill side look silent and the prefill
-/// worker answer no side at all. A decode worker that still holds streams it
-/// had been producing for and has produced nothing for `bound` (a decode
-/// side's bound for the prompt, see [`PrefillBound`]) has stalled
-/// ([`Worker::output_silence`]); one that is still producing, or
-/// holds no such stream (its streams ended, or its in-flight work has shown
-/// nothing yet: a frozen prefill in front of an idle decode looks like that,
-/// and the prefill keeps the verdict as before), is not read as the cause.
-/// `None` without a partner (the sequential shape sends the decode side
-/// after the prefill answered, so a silent prefill there is its own).
-fn stalled_decode_partner(
-    partner: Option<&Arc<dyn Worker>>,
-    bound: Duration,
-) -> Option<(Arc<dyn Worker>, Duration)> {
-    let decode = partner?;
-    let silence = decode
-        .output_silence()
-        .filter(|silence| *silence >= bound)?;
-    Some((Arc::clone(decode), silence))
-}
-
-/// The verdict on a prefill side that produced nothing within its bound
-/// while its decode partner had stalled mid-stream (see
-/// [`stalled_decode_partner`]): one WARN naming the decode worker, the
-/// prefill worker and the request, the worker-error counter under the
-/// timeout class for the DECODE worker, and the status the attempt fails
-/// with, which the retry layer may take to another decode worker (see
-/// [`decode_silence_response`]). Nothing is charged to the prefill worker,
-/// which was waiting on its partner.
-fn decode_partner_silent(
-    prefill: &Arc<dyn Worker>,
-    decode: &Arc<dyn Worker>,
-    connection: &'static str,
-    request_id: &str,
-    bound: Duration,
-    silence: Duration,
-    phase: &'static str,
-) -> tonic::Status {
-    warn!(
-        request_id = %request_id,
-        worker = decode.redacted_url(),
-        worker_type = metrics_labels::WORKER_DECODE,
-        prefill_worker = prefill.redacted_url(),
-        phase,
-        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
-        decode_silence_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
-        "PD decode worker has produced nothing for the silence bound on the streams it was serving, and the prefill side waits on it; giving up on the pair and charging the decode worker"
-    );
-    Metrics::record_worker_error(
-        metrics_labels::WORKER_DECODE,
-        connection,
-        metrics_labels::ERROR_TIMEOUT,
-    );
-    tonic::Status::deadline_exceeded(format!(
-        "{DECODE_SILENCE_MESSAGE} {bound:.1?} of the prefill leg's dispatch ({phase}): the prefill \
-         leg waited on it (decode silent for {silence:.1?})"
-    ))
 }
 
 /// Whether `status` is the verdict of [`decode_partner_silent`].
@@ -1843,13 +1643,7 @@ fn is_decode_silence(status: &tonic::Status) -> bool {
 /// alone (the prefill stays selectable) and the answer stands when no other
 /// decode worker is available.
 fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> Response {
-    let mut response = PdSide::Decode.answer(
-        SidePhase::Silent,
-        http::StatusCode::GATEWAY_TIMEOUT,
-        status.message(),
-    );
-    mark_failed_side(&mut response, decode.as_ref());
-    response
+    silent_side_answer(PdSide::Decode, status.message(), decode.as_ref())
 }
 
 /// The breaker samples of a parallel dispatch whose two sides both answered
@@ -1905,63 +1699,14 @@ fn record_silence_outcome(
 /// stays selectable) and the answer stands when no other prefill worker is
 /// available (see `attempt_ledger::FailedSide`).
 fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
-    let mut response = PdSide::Prefill.answer(
-        SidePhase::Silent,
-        http::StatusCode::GATEWAY_TIMEOUT,
-        status.message(),
-    );
-    mark_failed_side(&mut response, prefill.as_ref());
-    response
+    silent_side_answer(PdSide::Prefill, status.message(), prefill.as_ref())
 }
 
-/// One check of a prefill side past its deadline, in `phase`: how much
-/// longer it waits (see [`liveness::prefill_side_reprieve`]), or the
-/// verdict that takes its place. Once its worker has answered nothing
-/// within the side's bound, a decode `partner` that had stalled mid-stream
-/// takes the verdict at once (see [`stalled_decode_partner`]; the parallel
-/// shape passes the decode worker, the sequential shape none), whatever the
-/// worker's backlog; otherwise the prefill's verdict, once the worker has
-/// been silent for its window.
-fn judge_prefill_side(
-    worker: &Arc<dyn Worker>,
-    partner: Option<&Arc<dyn Worker>>,
-    bound: &PrefillBound,
-    connection: &'static str,
-    request_id: &str,
-    prompt_tokens: u64,
-    phase: &'static str,
-) -> Result<Duration, tonic::Status> {
-    let waited = bound.dispatched.elapsed();
-    let standing = liveness::prefill_side_reprieve(worker, bound.bound, waited, &bound.backlog);
-    if standing.past_bound() {
-        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.partner_bound) {
-            return Err(decode_partner_silent(
-                worker,
-                &decode,
-                connection,
-                request_id,
-                bound.partner_bound,
-                silence,
-                phase,
-            ));
-        }
-    }
-    match standing {
-        SideReprieve::WithinBound(more) | SideReprieve::FirstAnswerDue(more) => Ok(more),
-        SideReprieve::Silent { silent, window } => Err(prefill_side_silent(
-            worker,
-            connection,
-            request_id,
-            prompt_tokens,
-            PrefillSilence {
-                bound: bound.bound,
-                waited,
-                silent,
-                window,
-            },
-            phase,
-        )),
-    }
+/// The verdict as the pipeline's side streams fail with it: the deadline
+/// status its message tells from an engine's own (see [`is_prefill_silence`],
+/// [`is_decode_silence`]).
+fn silence_status(verdict: SilenceVerdict) -> tonic::Status {
+    tonic::Status::deadline_exceeded(verdict.message)
 }
 
 /// Await a prefill side's dispatch within its bound. Past the deadline the
@@ -1985,31 +1730,28 @@ async fn dispatch_prefill_within(
     let (Some(bound), Some(worker)) = (bound, worker) else {
         return dispatch.await;
     };
-    let mut deadline = bound.deadline;
-    loop {
-        if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
-            return result;
-        }
-        match judge_prefill_side(
-            &worker,
-            partner.as_ref(),
-            &bound,
-            connection,
-            &request_id,
-            prompt_tokens,
-            "dispatch",
-        ) {
-            Ok(more) => deadline = Instant::now() + more,
-            Err(verdict) => {
-                retire_pd_side(
-                    PdSide::Prefill,
-                    connection,
-                    Arc::clone(&worker),
-                    dispatch,
-                    Retirement::Silent,
-                );
-                return Err(verdict);
-            }
+    match await_prefill_within(
+        Some(&bound),
+        dispatch.as_mut(),
+        &worker,
+        partner.as_ref(),
+        connection,
+        &request_id,
+        prompt_tokens,
+        "dispatch",
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(verdict) => {
+            retire_pd_side(
+                PdSide::Prefill,
+                connection,
+                Arc::clone(&worker),
+                dispatch,
+                Retirement::Silent,
+            );
+            Err(silence_status(verdict))
         }
     }
 }
@@ -2064,7 +1806,8 @@ async fn first_prefill_response_within(
             request_id,
             prompt_tokens,
             "first_response",
-        )?;
+        )
+        .map_err(silence_status)?;
         deadline = Instant::now() + more;
     }
 }
@@ -2992,7 +2735,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        routers::common::{
+            attempt_ledger::FailedSide,
+            pd_silence::{decode_partner_silent, prefill_side_silent, PrefillSilence},
+            retry::is_retryable_response,
+        },
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
             WorkerType,
@@ -4079,16 +3826,18 @@ mod tests {
             partner_bound: Duration::from_millis(300),
             ..bound_from(dispatched, Duration::from_secs(2))
         };
-        let status = judge_prefill_side(
-            &prefill,
-            Some(&decode),
-            &bound,
-            metrics_labels::CONNECTION_GRPC,
-            "chatcmpl-partner-bound",
-            32_768,
-            "first_response",
-        )
-        .expect_err("its worker answered nothing within the side's bound");
+        let status = silence_status(
+            judge_prefill_side(
+                &prefill,
+                Some(&decode),
+                &bound,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-partner-bound",
+                32_768,
+                "first_response",
+            )
+            .expect_err("its worker answered nothing within the side's bound"),
+        );
         assert!(is_decode_silence(&status), "{status:?}");
         decode.note_output_ended();
     }
@@ -4281,7 +4030,7 @@ mod tests {
         record_pd_dispatch_outcomes(
             &workers,
             &AttemptLedger::default(),
-            &Err(verdict),
+            &Err(silence_status(verdict)),
             &decode_stream(),
         );
         assert_eq!(
@@ -4313,7 +4062,7 @@ mod tests {
         record_pd_dispatch_outcomes(
             &workers,
             &AttemptLedger::default(),
-            &Err(verdict),
+            &Err(silence_status(verdict)),
             &decode_stream(),
         );
         assert_eq!(prefill.circuit_breaker_state(), CircuitState::Open);
