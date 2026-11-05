@@ -159,7 +159,10 @@ pub(crate) fn convert_harmony_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
-    utils::convert_proto_logprobs(proto_logprobs, |token_id| {
+    // Every candidate the engine sent: this path does not cut them to the request's
+    // `top_logprobs` yet, where the regular path does; the cut changes what a client
+    // gets, so it is a change of its own.
+    utils::convert_proto_logprobs(proto_logprobs, None, |token_id| {
         tokenizer
             .decode_utf8([token_id])
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
