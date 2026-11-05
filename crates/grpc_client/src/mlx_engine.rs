@@ -8,7 +8,7 @@ use openai_protocol::{
 use tonic::{transport::Channel, Request};
 use tracing::debug;
 
-use crate::BoxedTraceInjector;
+use crate::{request_fields::OutputConstraint, BoxedTraceInjector};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -132,12 +132,14 @@ impl MlxEngineClient {
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
-        Self::reject_constraint(constraint.as_ref())?;
+        Self::reject_constraint(constraint.tool.as_ref())?;
         Self::reject_n(body.n)?;
         Self::reject_stop_strings(body.stop.as_ref().is_some_and(|s| !s.is_empty()))?;
-        Self::reject_response_format(body.response_format.is_some())?;
+        Self::reject_response_format(
+            body.response_format.is_some() && !constraint.set_aside.response_format,
+        )?;
 
         let sampling_params = Self::build_sampling_params_from_chat(body);
         Ok(Self::make_generate_request(
@@ -190,9 +192,9 @@ impl MlxEngineClient {
         body: &CreateMessageRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
-        Self::reject_constraint(constraint.as_ref())?;
+        Self::reject_constraint(constraint.tool.as_ref())?;
         Self::reject_stop_strings(body.stop_sequences.as_ref().is_some_and(|s| !s.is_empty()))?;
 
         let sampling_params = Self::build_sampling_params_from_messages(body);

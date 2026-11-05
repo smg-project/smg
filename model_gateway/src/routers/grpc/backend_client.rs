@@ -15,8 +15,8 @@ use openai_protocol::{
 };
 use smg_grpc_client::{
     common_proto, sglang_proto, tokenizer_bundle::StreamBundle, tokenspeed_proto, vllm_proto,
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    VllmEngineClient,
+    OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, VllmEngineClient,
 };
 
 use crate::{
@@ -446,7 +446,10 @@ fn build_zmq_request<B>(
                     processed_text,
                     token_ids,
                     mm,
-                    options.tool_constraints,
+                    OutputConstraint {
+                        tool: options.tool_constraints,
+                        set_aside: options.format_set_aside,
+                    },
                 )
             })?;
             request.set_grammar_from_first_token(options.first_token_grammar);
@@ -461,7 +464,10 @@ fn build_zmq_request<B>(
                     processed_text,
                     token_ids,
                     mm,
-                    options.tool_constraints,
+                    OutputConstraint {
+                        tool: options.tool_constraints,
+                        set_aside: options.format_set_aside,
+                    },
                 )
             })
         }
@@ -485,6 +491,7 @@ fn build_zmq_request<B>(
                 SglangGenerateRequestOptions {
                     multimodal_inputs: sglang_mm,
                     tool_call_constraint: options.tool_constraints,
+                    format_set_aside: options.format_set_aside,
                     require_reasoning: options.require_reasoning && !options.first_token_grammar,
                 },
             )?;

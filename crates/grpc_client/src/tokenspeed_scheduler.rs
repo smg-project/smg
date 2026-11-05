@@ -17,8 +17,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        completion_constraint, plain_constraint, response_format_schema, stop_strings,
-        ConstraintKind, PlainSampling,
+        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
+        OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
@@ -104,9 +104,9 @@ impl TokenSpeedSchedulerClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_inputs: Option<tokenspeed_proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::GenerateRequest, String> {
-        let sampling_params = Self::build_sampling_params_from_chat(body, tool_call_constraint)?;
+        let sampling_params = Self::build_sampling_params_from_chat(body, constraint)?;
         Ok(tokenspeed_proto::GenerateRequest {
             request_id,
             tokenized: Some(tokenspeed_proto::TokenizedInput {
@@ -181,10 +181,9 @@ impl TokenSpeedSchedulerClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_inputs: Option<tokenspeed_proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::GenerateRequest, String> {
-        let sampling_params =
-            Self::build_sampling_params_from_messages(body, tool_call_constraint)?;
+        let sampling_params = Self::build_sampling_params_from_messages(body, constraint.tool)?;
         Ok(tokenspeed_proto::GenerateRequest {
             request_id,
             tokenized: Some(tokenspeed_proto::TokenizedInput {
@@ -229,7 +228,7 @@ impl TokenSpeedSchedulerClient {
 
     fn build_sampling_params_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::SamplingParams, String> {
         let stop_sequences = stop_strings(request.stop.as_ref());
 
@@ -251,7 +250,7 @@ impl TokenSpeedSchedulerClient {
             no_stop_trim: request.no_stop_trim,
             sampling_seed: Self::chat_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
-            constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
+            constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
     }
@@ -373,29 +372,30 @@ impl TokenSpeedSchedulerClient {
 
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<tokenspeed_proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(schema) = response_format_schema(request)? {
+        let format = body_format(request, set_aside)?;
+        if let Some(schema) = format.schema {
             constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
                 schema,
             ));
         }
 
-        if let Some(ebnf) = &request.ebnf {
+        if let Some(ebnf) = format.ebnf {
             constraints.push(tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
+                ebnf.to_string(),
             ));
         }
-        if let Some(regex) = &request.regex {
+        if let Some(regex) = format.regex {
             constraints.push(tokenspeed_proto::sampling_params::Constraint::Regex(
-                regex.clone(),
+                regex.to_string(),
             ));
         }
 
-        // response_format wins over tool_call_constraint when both are set.
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        // response_format wins over the tool constraint when both are set.
+        if let Some((constraint_type, constraint_value)) = tool {
             if constraints.is_empty() {
                 let tool_constraint =
                     Self::constraint_from_pair(constraint_type, constraint_value)?;
@@ -737,6 +737,54 @@ mod seed_resolution_tests {
 mod constraint_mapping_tests {
     use super::*;
     use crate::request_fields::ConstraintKind;
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
+        use crate::request_fields::FormatSetAside;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let constraint_of = |constraint: OutputConstraint| {
+            TokenSpeedSchedulerClient::build_generate_request_from_chat(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                None,
+                constraint,
+            )
+            .expect("built")
+            .sampling_params
+            .expect("sampling params")
+            .constraint
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            constraint_of(OutputConstraint::tool(tag.clone())),
+            Some(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the constraint.
+        assert_eq!(
+            constraint_of(OutputConstraint {
+                tool: tag,
+                set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+            }),
+            Some(tokenspeed_proto::sampling_params::Constraint::StructuralTag("tag".to_string()))
+        );
+    }
 
     /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]

@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        completion_constraint, plain_constraint, response_format_schema, stop_strings,
-        ConstraintKind, PlainSampling,
+        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
+        OutputConstraint, PlainSampling,
     },
     AbortOnDropClient, BoxedTraceInjector,
 };
@@ -111,7 +111,7 @@ impl TrtllmServiceClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
-        tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
         Self::build_generate_request_from_chat_parts(
             request_id,
@@ -119,7 +119,7 @@ impl TrtllmServiceClient {
             processed_text,
             token_ids,
             multimodal_input,
-            tool_call_constraint,
+            constraint,
         )
     }
 
@@ -130,7 +130,7 @@ impl TrtllmServiceClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
@@ -139,7 +139,7 @@ impl TrtllmServiceClient {
         let output_config = Self::build_output_config_from_chat(body);
 
         // Build guided decoding params if needed
-        let guided_decoding = Self::build_guided_decoding_from_chat(body, tool_call_constraint)?;
+        let guided_decoding = Self::build_guided_decoding_from_chat(body, constraint)?;
 
         let stop = stop_strings(body.stop.as_ref());
 
@@ -338,36 +338,36 @@ impl TrtllmServiceClient {
     /// Build GuidedDecodingParams from ChatCompletionRequest
     fn build_guided_decoding_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
         // Collect non-tool constraint (response_format, ebnf, regex)
-        let mut guided =
-            response_format_schema(request)?.map(|schema| proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                guide: schema,
-            });
+        let format = body_format(request, set_aside)?;
+        let mut guided = format.schema.map(|schema| proto::GuidedDecodingParams {
+            guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
+            guide: schema,
+        });
 
         if guided.is_none() {
-            if let Some(ebnf) = &request.ebnf {
+            if let Some(ebnf) = format.ebnf {
                 guided = Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
-                    guide: ebnf.clone(),
+                    guide: ebnf.to_string(),
                 });
             }
         }
 
         if guided.is_none() {
-            if let Some(regex) = &request.regex {
+            if let Some(regex) = format.regex {
                 guided = Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
-                    guide: regex.clone(),
+                    guide: regex.to_string(),
                 });
             }
         }
 
         // Tool call constraint — drop if another constraint already set
         // (matches TRT-LLM HTTP behavior where response_format takes priority)
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        if let Some((constraint_type, constraint_value)) = tool {
             if guided.is_some() {
                 warn!("Constrained decoding is not compatible with tool calls, dropping tool constraint");
             } else {
@@ -447,7 +447,7 @@ impl TrtllmServiceClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_messages(body);
         let output_config = proto::OutputConfig {
@@ -460,7 +460,7 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        let guided_decoding = Self::build_guided_decoding_from_responses(tool_call_constraint)?;
+        let guided_decoding = Self::build_guided_decoding_from_responses(constraint.tool)?;
 
         let stop = body.stop_sequences.clone().unwrap_or_default();
         let max_tokens = body.max_tokens;
@@ -772,6 +772,57 @@ mod tests {
         .unwrap();
         assert_eq!(request.sampling_config.unwrap().seed, Some(7));
         assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the request's one guide, where the body's schema wins when nothing
+    /// is set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_guide() {
+        use crate::request_fields::FormatSetAside;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let guide_of = |constraint: OutputConstraint| {
+            TrtllmServiceClient::build_generate_request_from_chat_parts(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                None,
+                constraint,
+            )
+            .expect("built")
+            .guided_decoding
+            .map(|guided| (guided.guide_type, guided.guide))
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            guide_of(OutputConstraint::tool(tag.clone())),
+            Some((
+                proto::guided_decoding_params::GuideType::JsonSchema as i32,
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the guide.
+        assert_eq!(
+            guide_of(OutputConstraint {
+                tool: tag,
+                set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+            }),
+            Some((
+                proto::guided_decoding_params::GuideType::StructuralTag as i32,
+                "tag".to_string()
+            ))
+        );
     }
 
     /// A plain request names at most one structured constraint, as a completion

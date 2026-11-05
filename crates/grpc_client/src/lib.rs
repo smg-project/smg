@@ -47,6 +47,7 @@ pub use h2;
 pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use request_deadline::{is_request_timeout, RequestDeadline};
+pub use request_fields::{FormatSetAside, OutputConstraint};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
 };
