@@ -105,9 +105,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   engine's copy of the encoder (V4-Pro shares the group and replays its sets under its own row):
   28 parse cases, sixteen common and twelve turns, which the corpus harness
   (`tests/bellwether_parse_fixtures.rs`) replayed from bellwether's record tree every one bitwise
-  but the listed reasoning probe (bellwether #16). The fixture pin predates that record (it holds
-  sixteen earlier common cases of V4.1-Flash and no set of V4-Flash, which the harness skips until
-  the pin holds it); the pinned harness replays the record once the pin moves past it.
+  but the listed reasoning probe (bellwether #16). The fixture pin holds that record (V4-Flash's 28
+  cases and V4.1-Flash's 28, where it held sixteen earlier common cases of V4.1-Flash and no set
+  of V4-Flash), and the pinned harness replays it.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
   `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
   ends the conversation or that an assistant turn follows (a coding agent's environment notes and
@@ -179,9 +179,9 @@ no parameters, every kind of value, non-ASCII text) are hand-written cases of be
 which its recorder renders through the engine's copy of the encoder (V3.2 and V3.2-Speciale as one
 group, V3.2-Exp as its own): 19 parse cases a group, eleven common and eight turns, which the
 corpus harness (`tests/bellwether_parse_fixtures.rs`) replayed from bellwether's record tree every
-one bitwise. The fixture pin predates that record (it holds three earlier cases of V3.2-Exp and no
-set of V3.2, whose slugs the harness skips until the pin holds them); the pinned harness replays
-the record once the pin moves past it. The nine cases whose message carries a thought are not
+one bitwise. The fixture pin holds that record (19 cases each for V3.2 and V3.2-Exp, where it held
+three earlier cases of V3.2-Exp and no set of V3.2), and the pinned harness replays it. The nine
+cases whose message carries a thought are not
 recorded: the encoder's chat-mode
 default renders none for a request that leaves the thinking switch alone, and the recorder
 refuses a reference the rendered turn does not carry. What the table leaves open: the live
