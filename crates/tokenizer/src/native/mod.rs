@@ -116,17 +116,18 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// little holds a few KB; at the full bound it has 524,288 slots of 33
 /// bytes, 16.5 MiB (the table keys pieces of up to `SHORT_PIECE_MAX_BYTES`
 /// bytes with up to fifteen ids each, four in the slot and the rest in a
-/// spill: 15 MiB more at most, cleared with the table). The pieces of 16
-/// to 64 bytes count against the same bound in a map (`PieceCache::short`):
-/// its slot with the table's slack, the piece and the ids as two boxes,
-/// about 140 bytes for a typical entry (a 20-byte piece with four ids) and
-/// about 430 at most (a 64-byte piece whose ids are its bytes), so a thread
-/// whose entries were all such pieces holds about 35 MiB, 108 MiB in that
-/// worst case. A clear at the bound keeps both tiers' arrays (the packed
-/// table's slots unless the share fell, the map's buckets) and drops their
-/// entries, so a thread that filled its packed table on one kind of text
-/// and then meets such pieces holds both, about 51 MiB with typical map
-/// entries and 140 MiB at the worst case the count bound allows.
+/// spill: 15 MiB more at most, emptied with the table, its capacity kept).
+/// The pieces of 16 to 64 bytes count against the same bound in a map
+/// (`PieceCache::short`): its slot with the table's slack, the piece and
+/// the ids as two boxes, about 140 bytes for a typical entry (a 20-byte
+/// piece with four ids) and about 430 at most (a 64-byte piece whose ids
+/// are its bytes), so a thread whose entries were all such pieces holds
+/// about 35 MiB, 108 MiB in that worst case. A clear at the bound keeps
+/// both tiers' arrays (the packed table's slots and its spill's capacity,
+/// unless the share fell, and the map's buckets) and drops their entries,
+/// so a thread that filled its packed table on one kind of text and then
+/// meets such pieces holds both, about 51 MiB with typical map entries and
+/// 140 MiB at the worst case the count bound allows.
 /// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
@@ -145,9 +146,10 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear
 /// keeps the packed slots beside a map that regrows, so the count-bounded
 /// tiers of one tokenizer hold at most the sum of the two: about 820 MiB at
-/// sixteen threads with typical map entries (about 1.9 GiB were every map
-/// entry the worst case), toward 352 + 560 MiB with the rounding of more
-/// threads; the long pieces add `LONG_PIECE_BYTES_TOTAL` at most. A thread
+/// sixteen threads with typical map entries (about 2.2 GiB, sixteen times
+/// the 140 MiB of a thread, were every map entry the worst case), toward
+/// 352 + 560 MiB with the rounding of more threads; the long pieces add
+/// `LONG_PIECE_BYTES_TOTAL` at most. A thread
 /// reads its share at every miss and at the start of every encode call, so
 /// after threads join it is within the smaller share from its next call on
 /// and holds at most its earlier share until then, or until it exits if it
@@ -231,6 +233,11 @@ impl PieceCache {
     /// Entries of the tiers bounded by count, `packed` and `short`.
     fn short_entries(&self) -> usize {
         self.packed.as_ref().map_or(0, ShortPieceTable::len) + self.short.len()
+    }
+
+    /// Slots of the packed tier, none before the thread's first short piece.
+    fn packed_slots(&self) -> usize {
+        self.packed.as_ref().map_or(0, ShortPieceTable::slots)
     }
 
     /// Forgets the tiers bounded by count; the packed table keeps its slots
@@ -1531,14 +1538,18 @@ impl NativeEncoder {
     /// The calling thread's piece cache, borrowed for one encode call and
     /// within the thread's share at the start of it: a thread whose share
     /// fell since it last read it (threads joined) clears its count-bounded
-    /// tiers here, so every thread that still encodes is within the share
-    /// from its next call on (a miss during a call reads the share too, see
-    /// [`Self::tokenize_piece`]; a thread that never encodes again holds
-    /// what it had until it exits). One relaxed load per call.
+    /// tiers here, by their entries or by the slots of its packed table (a
+    /// table grown for the earlier share keeps its slots through a clear at
+    /// the bound; here it is made anew for the share), so every thread that
+    /// still encodes is within the share from its next call on (a miss
+    /// during a call reads the share too, see [`Self::tokenize_piece`]; a
+    /// thread that never encodes again holds what it had until it exits).
+    /// One relaxed load and two compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
-        if cache.short_entries() > share {
+        let slots = ShortPieceTable::slots_for(share);
+        if cache.short_entries() > share || cache.packed_slots() > slots {
             cache.clear_short(share);
         }
         cache

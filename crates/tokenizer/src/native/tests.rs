@@ -28,7 +28,7 @@ use tokenizers::{
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
-    short_pieces::{ShortPieceKey, MIN_SLOTS},
+    short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
 use crate::{
@@ -1429,6 +1429,42 @@ fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
 }
 
 #[test]
+fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup() {
+    // The seed reads the ids `0..vocab_size`: with "xy" at 300 and "xyz" at
+    // 301 in a vocabulary of 258 entries both lie beyond it, so the seed does
+    // not cover the short entries and the whole-piece lookup of
+    // `ignore_merges` stays on; "xyz" is then its own entry, as the model
+    // says, where the lookup skipped would give the merge's two ids.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    vocab.insert("xy".to_owned(), 300);
+    vocab.insert("xyz".to_owned(), 301);
+    assert_eq!(vocab.len(), 258);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let mut ids = Vec::new();
+    assert!(!native
+        .seed
+        .ids_into(ShortPieceKey::of(b"xyz").expect("key"), &mut ids));
+    assert!(!native.seed_covers_short_entries);
+    assert_eq!(
+        tokenizer.encode("xyz", false).expect("encode").get_ids(),
+        [301]
+    );
+    assert_eq!(native.encode(Some(model), "xyz", false), Ok(vec![301]));
+}
+
+#[test]
 fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
     // The encoder is built over a model with `ignore_merges` on, so its seed
     // holds "xyz" as the entry's own id; the encode then runs over a copy of
@@ -1676,6 +1712,72 @@ fn a_thread_whose_share_fell_is_within_it_from_its_next_encode_on() {
     assert_eq!(after, before);
     let held = entries(&mut native);
     assert!(held <= share, "{held} <= {share}");
+}
+
+/// A thread's packed table grown for an earlier share keeps its slots
+/// through a clear at the bound; once the share fell below them (threads
+/// joined) the thread's next encode call makes the table anew for the
+/// share, entries within it or not.
+#[test]
+fn a_thread_whose_packed_table_outgrew_its_share_remakes_it_at_its_next_encode() {
+    let mut state = 0xF00D_CAFE_DEAD_BEEFu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let slots = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().packed_slots())
+            .sum()
+    };
+    let entries = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().short_entries())
+            .sum()
+    };
+    let head: String = (0..200).map(|i| format!(" {}", word(i))).collect();
+    let text: String = (0..20_000).map(|i| format!(" {}", word(i))).collect();
+    let before = native
+        .encode_with(Some(model), &head, false, false)
+        .expect("ids");
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    let grown = slots(&mut native);
+    // Threads join: the share falls below the entries, and the clear at the
+    // start of the next call keeps the slots, which still serve the share.
+    native.threads.store(256, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(entries(&mut native) > share, "{share}");
+    assert_eq!(
+        native
+            .encode_with(Some(model), &head, false, false)
+            .expect("ids"),
+        before
+    );
+    assert!(entries(&mut native) <= share);
+    assert_eq!(slots(&mut native), grown);
+    // More threads join: the entries are within the new share, the slots are
+    // not; the next call makes the table anew for the share.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(entries(&mut native) <= share, "{share}");
+    assert!(grown > ShortPieceTable::slots_for(share), "{grown} slots");
+    assert_eq!(
+        native
+            .encode_with(Some(model), &head, false, false)
+            .expect("ids"),
+        before
+    );
+    let kept = slots(&mut native);
+    assert!(
+        kept <= ShortPieceTable::slots_for(share),
+        "{kept} slots for a share of {share}"
+    );
 }
 
 /// `len` letters, distinct for distinct `i`: one piece of `len` bytes
