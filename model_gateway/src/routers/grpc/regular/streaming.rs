@@ -62,8 +62,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoInputLogProbs,
-                ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
+                ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -1572,6 +1572,47 @@ impl StreamingProcessor {
             .map_err(|_| "Failed to send chunks".to_string())
     }
 
+    /// The engine's next message as the packed loops read it (the chat and
+    /// Messages streams). The engine is polled once in place before the
+    /// events written into `buffer` leave: a message it has ready joins the
+    /// frame being written, so the messages ready at one poll leave as one
+    /// frame; when it has none ready, the frame leaves before the reader
+    /// parks, so no text waits for the engine. The frame carrying the first
+    /// token leaves before the engine is polled again, whatever is ready
+    /// behind it: the client's first token waits for nothing. The one poll
+    /// registers the reader's wake where the message will come from; `next`
+    /// resumes it after the flush. `first_token_out` turns true once that
+    /// frame has left (`first_token_seen`: the stream has produced its first
+    /// token); the yield there hands the frame to the body driving this
+    /// reading, which writes it to the connection before the reading resumes
+    /// (see `DrivenBody`). A failed flush is the channel's end.
+    async fn next_packed(
+        grpc_stream: &mut ProtoStream,
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        first_token_out: &mut bool,
+        first_token_seen: bool,
+    ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
+        let mut next = std::pin::pin!(grpc_stream.next());
+        let ready = if *first_token_out {
+            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+        } else {
+            Poll::Pending
+        };
+        match ready {
+            Poll::Ready(item) => Ok(item),
+            Poll::Pending => {
+                let frame_out = !buffer.is_empty();
+                Self::flush_chunks(tx, buffer).await?;
+                if frame_out && !*first_token_out && first_token_seen {
+                    *first_token_out = true;
+                    tokio::task::yield_now().await;
+                }
+                Ok(next.await)
+            }
+        }
+    }
+
     /// The chunk that opens a choice: the assistant role with the public
     /// API's first delta ([`opening_choice`]).
     async fn send_role_chunk(
@@ -1740,13 +1781,13 @@ impl StreamingProcessor {
         stop
     }
 
-    /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
+    /// Feeds Symphony's `events` to the content-block `machine` and writes the stream events it
     /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
     /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
     /// when a `Finish` was among the events. The machine writes into the stream's `blocks`
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     /// A step that is one text delta into the open text block, the steady state of a streamed
-    /// answer, goes straight from the borrowed text to the frame ([`Self::send_text_delta`])
+    /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
     /// when the machine says it would send exactly that
     /// ([`adapt::messages::Stream::direct_text_index`]): no owned event and no `String` per delta.
     async fn send_symphony_blocks(
@@ -1784,9 +1825,11 @@ impl StreamingProcessor {
     }
 
     /// Write a `MessageStreamEvent` into `buffer` and hand it to the SSE
-    /// channel as one frame: the written bytes are split off, no copy, and
-    /// the buffer keeps its room for the next event (the chat stream's
-    /// `push_chunk` does the same).
+    /// channel as one frame at once: the written bytes are split off, no
+    /// copy, and the buffer keeps its room for the next event. The send-now
+    /// primitive of the error paths; the stream loops write through
+    /// [`Self::write_messages_event`] and flush, as the chat stream's
+    /// `push_chunk` buffers.
     async fn send_messages_event(
         tx: &SseSender,
         buffer: &mut BytesMut,
@@ -3137,42 +3180,18 @@ impl<'a> ChatStream<'a> {
                 self.engine_outlived = true;
             }
             let response = if self.final_indices.is_none() && !self.engine_outlived {
-                // The engine is polled once in place before the chunks
-                // written so far leave: a message it has ready joins the
-                // frame being written, so the messages ready at one poll
-                // leave as one frame; when it has none ready, the frame
-                // leaves before the reader parks, so no text waits for the
-                // engine. The frame carrying the first token leaves before
-                // the engine is polled again, whatever is ready behind it:
-                // the client's first token waits for nothing. The one poll
-                // registers the reader's wake where the message will come
-                // from; `next` resumes it after the flush.
-                let item = {
-                    let mut next = std::pin::pin!(grpc_stream.next());
-                    let ready = if self.first_token_out {
-                        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
-                    } else {
-                        Poll::Pending
-                    };
-                    match ready {
-                        Poll::Ready(item) => item,
-                        Poll::Pending => {
-                            let frame_out = !self.sse_buffer.is_empty();
-                            StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                            if frame_out && !self.first_token_out && self.first_token_time.is_some()
-                            {
-                                self.first_token_out = true;
-                                // The first token's frame reaches the
-                                // connection before the engine is read
-                                // again: the body driving this reading
-                                // hands it out on this yield and writes it
-                                // (see `DrivenBody`).
-                                tokio::task::yield_now().await;
-                            }
-                            next.await
-                        }
-                    }
-                };
+                // The packed read (`StreamingProcessor::next_packed`): the
+                // messages ready at one poll share a frame; the first
+                // token's frame leaves alone, before the engine is polled
+                // again.
+                let item = StreamingProcessor::next_packed(
+                    grpc_stream,
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &mut self.first_token_out,
+                    self.first_token_time.is_some(),
+                )
+                .await?;
                 if item.is_none() && grpc_stream.client_left() {
                     // The client's departure ends the read here: text the
                     // decoder or a parser still holds can reach nobody, and
@@ -4701,33 +4720,18 @@ impl<'a> MessagesStream<'a> {
             let response = if self.decoder_finished_at_eof || self.engine_outlived {
                 None
             } else {
-                // As the chat loop reads: the engine is polled once in place
-                // before the events written so far leave, so the events ready
-                // at one poll share a frame; when it has none ready, the frame
-                // leaves before the reader parks. The frame carrying the first
-                // token leaves, and is written, before the engine is polled
-                // again (`first_token_out`).
-                let next = {
-                    let mut next = std::pin::pin!(grpc_stream.next());
-                    let ready = if self.first_token_out {
-                        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
-                    } else {
-                        Poll::Pending
-                    };
-                    match ready {
-                        Poll::Ready(item) => item,
-                        Poll::Pending => {
-                            let frame_out = !self.sse_buffer.is_empty();
-                            StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                            if frame_out && !self.first_token_out && self.first_token_time.is_some()
-                            {
-                                self.first_token_out = true;
-                                tokio::task::yield_now().await;
-                            }
-                            next.await
-                        }
-                    }
-                };
+                // The packed read, as the chat loop's
+                // (`StreamingProcessor::next_packed`): the events ready at one
+                // poll share a frame; the first token's frame leaves alone,
+                // before the engine is polled again.
+                let next = StreamingProcessor::next_packed(
+                    grpc_stream,
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &mut self.first_token_out,
+                    self.first_token_time.is_some(),
+                )
+                .await?;
                 if next.is_none() && grpc_stream.client_left() {
                     // As on the chat path: the departure ends the read before
                     // held-back text is flushed to the closed sender.
