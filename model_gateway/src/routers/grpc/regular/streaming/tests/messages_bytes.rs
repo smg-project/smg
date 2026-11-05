@@ -11,12 +11,13 @@
 
 use smg_grpc_client::vllm_engine::proto;
 use symphony::{formats::qwen3, CallSyntax};
+use tokio::sync::oneshot;
 
 use super::{
     super::*,
     eof::{
-        chat_spec, chunk, complete, complete_with_prompt, processor, scripted_stream,
-        CharacterTokenizer,
+        chat_spec, chunk, complete, complete_with_prompt, messages_spec, processor,
+        scripted_stream, staged_stream, CharacterTokenizer,
     },
     sse_bytes::assert_recorded_bytes,
 };
@@ -167,4 +168,101 @@ async fn messages_stream_bytes_match_the_recorded_fixtures() {
         let actual = stream_bytes(&scenario).await;
         assert_recorded_bytes(scenario.name, scenario.must_contain, &actual);
     }
+}
+
+/// As the chat stream packs its frames: `message_start` leaves at once, before
+/// the engine is read (as it always has); the frame carrying the first token
+/// (the block's start and its delta) leaves on its own as soon as the message
+/// is processed, and after it the events the engine has ready at one poll
+/// leave as one frame: the second delta, ready with the first, leaves alone
+/// once the first frame is out (the loop does not wait for more); the two
+/// after the gate share a frame; the stream's tail (the block's stop,
+/// `message_delta`, `message_stop`), written after the read, is one frame.
+#[tokio::test]
+async fn ready_engine_messages_share_a_frame_after_the_first_token_on_the_messages_stream() {
+    let (gate, gated) = oneshot::channel();
+    let (stream, server) = staged_stream(
+        vec![
+            (None, vec![chunk(0, "a"), chunk(0, "b")]),
+            (
+                Some(gated),
+                vec![chunk(0, "c"), chunk(0, "d"), complete(0, "stop")],
+            ),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    let dispatch = context::DispatchMetadata {
+        request_id: "msg-frames".to_string(),
+        model: "fixture-model".to_string(),
+        created: 1,
+        weight_version: None,
+    };
+    let processor = processor(false);
+    let reading = async {
+        let result = processor
+            .process_messages_streaming_chunks(
+                stream,
+                dispatch,
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, true),
+                messages_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let reader = async {
+        let mut frames = Vec::new();
+        // The start event, then the two messages ready at once: the reader
+        // parks at the gate only after their three frames left.
+        for _ in 0..3 {
+            frames.push(rx.recv().await.expect("a frame").expect("a write"));
+        }
+        gate.send(()).expect("the reader waits at the gate");
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame.expect("a write"));
+        }
+        frames
+    };
+    let (result, frames) = tokio::join!(reading, reader);
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let events: Vec<(usize, String)> = frames
+        .iter()
+        .map(|frame| {
+            let text = String::from_utf8_lossy(frame).to_string();
+            (text.matches("event: ").count(), text)
+        })
+        .collect();
+    let shape: Vec<usize> = events.iter().map(|(count, _)| *count).collect();
+    assert_eq!(
+        shape,
+        [1, 2, 1, 2, 3],
+        "message_start alone, the block's start with the first token, the second token alone, the two after the gate together, the tail: {events:?}"
+    );
+    assert!(
+        events[0].1.starts_with("event: message_start\n"),
+        "{events:?}"
+    );
+    assert!(
+        events[1].1.starts_with("event: content_block_start\n")
+            && events[1].1.contains(r#""text":"a""#),
+        "{events:?}"
+    );
+    assert!(events[2].1.contains(r#""text":"b""#), "{events:?}");
+    assert!(
+        events[3].1.contains(r#""text":"c""#) && events[3].1.contains(r#""text":"d""#),
+        "{events:?}"
+    );
+    assert!(
+        events[4].1.starts_with("event: content_block_stop\n")
+            && events[4]
+                .1
+                .ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+        "{events:?}"
+    );
 }
