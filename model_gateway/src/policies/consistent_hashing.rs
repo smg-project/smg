@@ -790,4 +790,58 @@ mod tests {
         let policy = ConsistentHashingPolicy::new();
         assert_eq!(policy.name(), "consistent_hashing");
     }
+
+    /// Sixteen workers on a ring and forty-eight session keys: every key lands
+    /// where it did when a per-request URL map translated the ring's answer,
+    /// with every worker eligible and with three of them not ready (their keys
+    /// move to the next eligible owner clockwise, the rest stay). The
+    /// placement is the ring's; the translation must not move it.
+    #[test]
+    fn the_recorded_key_set_lands_where_the_ring_placed_it() {
+        const RECORDED_ALL_ELIGIBLE: [usize; 48] = [
+            7, 4, 2, 15, 13, 12, 9, 12, 5, 12, 11, 0, 3, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 3, 1, 7, 15, 11, 11, 13, 8, 6, 2, 3, 0, 10, 10, 13,
+        ];
+        const RECORDED_THREE_NOT_READY: [usize; 48] = [
+            4, 4, 2, 15, 13, 12, 9, 12, 5, 12, 5, 0, 10, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 6, 1, 5, 15, 6, 4, 13, 8, 6, 2, 6, 0, 10, 10, 13,
+        ];
+        let policy = ConsistentHashingPolicy::new();
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let keys: Vec<String> = (0..48).map(|i| format!("session-{i}")).collect();
+        let placements = |workers: &[Arc<dyn Worker>]| -> Vec<usize> {
+            keys.iter()
+                .map(|key| {
+                    let info = SelectWorkerInfo {
+                        routing_key: Some(key),
+                        hash_ring: Some(ring.clone()),
+                        ..Default::default()
+                    };
+                    let (result, branch) = policy.select_worker_impl(workers, &info);
+                    assert_eq!(branch, Branch::RoutingKeyHit, "key {key}");
+                    result.expect("an eligible owner exists")
+                })
+                .collect()
+        };
+        assert_eq!(
+            placements(&workers),
+            RECORDED_ALL_ELIGIBLE,
+            "with every worker eligible the keys placed {:?}",
+            placements(&workers)
+        );
+        for not_ready in [3, 7, 11] {
+            workers[not_ready].set_status(WorkerStatus::NotReady);
+        }
+        let moved = placements(&workers);
+        assert!(
+            !moved.contains(&3) && !moved.contains(&7) && !moved.contains(&11),
+            "a not-ready worker owns a key: {moved:?}"
+        );
+        assert_eq!(
+            moved, RECORDED_THREE_NOT_READY,
+            "with three workers not ready the keys placed {moved:?}"
+        );
+    }
 }
