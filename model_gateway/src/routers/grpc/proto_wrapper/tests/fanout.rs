@@ -1,5 +1,5 @@
 //! The fan-out stream: children polled from a rotating cursor and retired as they end, prefill
-//! drained through it, and the test-only child impl that lets one fan-out nest in another.
+//! drained through it, and the test-only child impl that lets `drain_prefill` take a bare fan-out.
 
 use std::{
     collections::VecDeque,
