@@ -2788,20 +2788,6 @@ struct ChoiceState {
     reader: Option<Reader>,
 }
 
-/// The state of choice `index`, or the decoding failure an index past the
-/// choices the request expects is.
-fn choice_mut(
-    choices: &mut [ChoiceState],
-    index: u32,
-) -> Result<&mut ChoiceState, utils::StreamFailure> {
-    let expected = choices.len();
-    choices.get_mut(index as usize).ok_or_else(|| {
-        utils::StreamFailure::from(format!(
-            "engine sent choice index {index}; the request expects {expected} choice(s)"
-        ))
-    })
-}
-
 /// One chat completion's SSE stream being read off the engine: what the
 /// spec and the dispatch decide for the whole stream, the per-choice
 /// trackers, decoders, parsers and readers the loop keeps, and the frame,
@@ -3227,7 +3213,7 @@ impl<'a> ChatStream<'a> {
         // (an engine that saw the stop sends its Complete instead): counted,
         // not read; the request is aborted once every choice has closed,
         // until then another choice may still be streaming.
-        let choice = choice_mut(&mut self.choices, index)?;
+        let choice = utils::choice_mut(&mut self.choices, index)?;
         if choice.stopped {
             self.tail_tokens += chunk.token_ids().len() as u64;
             choice.tailed = true;
@@ -3396,7 +3382,7 @@ impl<'a> ChatStream<'a> {
         // (another choice kept the stream open) is the tail's end: the
         // choice closed at its stop with that step's counts, so only the
         // counts the stop could not know are taken from it.
-        let choice = choice_mut(&mut self.choices, index)?;
+        let choice = utils::choice_mut(&mut self.choices, index)?;
         if choice.tailed {
             choice.completed = true;
             choice.spec_accepted = complete.spec_accepted_tokens();
