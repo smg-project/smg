@@ -539,7 +539,11 @@ impl Tree {
     /// Remember `node` as the end of the path hashed `path_hash`: the node
     /// carries the hash and the map names the node. A node that already
     /// carries it costs one load; a hash moving to another node (its earlier
-    /// node was detached and the text re-inserted) replaces the entry.
+    /// node was detached and the text re-inserted) replaces the entry; a
+    /// node handed a second hash keeps the newer one and its earlier entry
+    /// leaves the map (one text ends at one node here; the rule is the token
+    /// tree's, where two sequences that differ only inside their last page
+    /// end at one node), so the map holds at most one entry per hashed node.
     fn record_hash(&self, node: &NodeRef, path_hash: Option<u64>) {
         let Some(path_hash) = path_hash else {
             return;
@@ -547,8 +551,13 @@ impl Tree {
         if node.path_hash.load(Ordering::Relaxed) == path_hash {
             return;
         }
-        node.path_hash.store(path_hash, Ordering::Relaxed);
         self.hashed.insert(path_hash, Arc::downgrade(node));
+        let earlier = node.path_hash.swap(path_hash, Ordering::Relaxed);
+        if earlier != 0 && earlier != path_hash {
+            self.hashed.remove_if(&earlier, |_, weak| {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+            });
+        }
     }
 
     /// Drop the entry that names `node`, if it still does (a re-inserted
@@ -1359,6 +1368,11 @@ impl Tree {
                 }
             }
         }
+
+        // An entry whose node left without passing `forget_hash` (a record
+        // that crossed the node's detach) leaves here, so the map never
+        // outgrows the tree's hashed nodes by more than one eviction pass.
+        self.hashed.retain(|_, node| node.strong_count() > 0);
 
         debug!("After eviction - Used size per tenant:");
         for entry in &self.tenant_char_count {

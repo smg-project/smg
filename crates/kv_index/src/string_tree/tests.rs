@@ -2223,6 +2223,36 @@ fn eviction_forgets_a_hash_with_its_node_oldest_first() {
 }
 
 #[test]
+fn a_node_handed_a_second_hash_keeps_the_newer_one_only() {
+    // One text ends at one node, so a second hash on a node is the caller's
+    // doing here; the rule is the token tree's (two sequences that differ
+    // only inside their last page end at one node), kept in the twin.
+    let tree = Tree::new();
+    let older = crate::hash_node_path("hello world");
+    let newer = crate::hash_node_path("hello world?");
+    tree.insert_text_with_hash("hello world", "t1", older);
+    tree.insert_text_with_hash("hello world", "t1", newer);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+}
+
+#[test]
+fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
+    // A record that crosses its node's detach leaves an entry naming a node
+    // that is gone; the next pass that evicts drops it.
+    let tree = Tree::new();
+    tree.insert_text_with_hash("hello", "t1", crate::hash_node_path("hello"));
+    tree.hashed.insert(7, Weak::new());
+    assert_eq!(tree.hashed_paths(), 2);
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
 fn a_working_set_within_the_budget_keeps_every_hash() {
     let tree = Tree::new();
     let paths: Vec<String> = (0..20)

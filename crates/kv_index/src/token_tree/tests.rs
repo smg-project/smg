@@ -2430,6 +2430,56 @@ fn the_hash_names_the_aligned_path_and_a_sequence_under_one_page_records_nothing
 }
 
 #[test]
+fn two_tails_over_one_aligned_path_leave_one_hash_on_their_node() {
+    // `base ++ [a]` and `base ++ [b, c]` both end at the node of `base` (the
+    // tree aligns to the page): the node keeps the newer hash, the older
+    // entry leaves the map with it, the older tail re-inserted takes the hash
+    // back, and eviction takes the one entry that is left.
+    let tree = TokenTree::new();
+    let base = make_tokens(0, 2);
+    let mut first = base.clone();
+    first.push(100);
+    let mut second = base.clone();
+    second.extend([200, 201]);
+    let (older, newer) = (
+        crate::hash_token_path(&first),
+        crate::hash_token_path(&second),
+    );
+    tree.insert_tokens_with_hash(&first, "t1", older);
+    tree.match_and_insert_with_hash(&second, Some(newer), |_| Some("t1"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.insert_tokens_with_hash(&first, "t1", older);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(older, "t3"));
+    assert!(!tree.insert_tenant_by_hash(newer, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(older, "t4"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
+    // A record that crosses its node's detach leaves an entry naming a node
+    // that is gone; the next pass that evicts drops it.
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 1);
+    tree.insert_tokens_with_hash(&path, "t1", crate::hash_token_path(&path));
+    tree.hashed.insert(7, Weak::new());
+    assert_eq!(tree.hashed_paths(), 2);
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
 fn a_plain_insert_records_no_hash() {
     let tree = TokenTree::new();
     let path = make_tokens(0, 2);
@@ -2557,10 +2607,12 @@ fn removing_a_tenant_everywhere_forgets_the_hashes_of_the_nodes_it_empties() {
 #[test]
 fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     // 20,000 operations over conversation-shaped sequences (pages shared
-    // within a conversation, a first page shared across four heads): hashed
-    // and plain inserts, lookups by hash and budget evictions. After every
-    // eviction the map names exactly the live hashed nodes, and a hash that
-    // resolves names a sequence the tree then matches in full.
+    // within a conversation, a first page shared across four heads, every
+    // sequence also under a short unaligned tail that ends at the same
+    // node): hashed and plain inserts, lookups by hash and budget evictions.
+    // After every eviction the map names exactly the live hashed nodes, and
+    // a hash that resolves names a sequence the tree then matches to its
+    // page-aligned length.
     use rand::{rngs::StdRng, RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(1377);
     let mut pool: Vec<Vec<TokenId>> = Vec::new();
@@ -2572,6 +2624,10 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
                 1,
             ));
             pool.push(tokens.clone());
+            let mut tailed = tokens.clone();
+            let tail = 1 + conversation % (PAGE_SIZE as u32 - 1);
+            tailed.extend(2_000_000 + turn..2_000_000 + turn + tail);
+            pool.push(tailed);
         }
     }
     let tenants = ["t1", "t2", "t3", "t4"];
@@ -2588,7 +2644,7 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
                 if tree.insert_tenant_by_hash(crate::hash_token_path(tokens), who) {
                     assert_eq!(
                         tree.match_prefix_with_counts(tokens).matched_token_count,
-                        tokens.len()
+                        align_to_page(tokens.len(), PAGE_SIZE)
                     );
                 }
             }
