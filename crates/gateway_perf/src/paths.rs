@@ -301,6 +301,7 @@ mod tests {
         for (name, tokens) in [
             ("messages_stream", 300),
             ("generate_stream", 300),
+            ("completion_stream", 300),
             ("generate_stream_long", 2000),
         ] {
             let spec = path_named(name).unwrap();

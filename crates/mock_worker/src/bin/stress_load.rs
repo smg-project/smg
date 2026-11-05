@@ -15,10 +15,12 @@
 //! function schemas), `responses` (the Responses API with `store: true`,
 //! `--chain` requests per session linked by `previous_response_id`) and
 //! `image` (`--image <file>` inline as a data URL, `--images-per-request`
-//! copies, before the text), `messages` (the Messages API, one user message)
-//! and `embeddings` (the prompt as the input). `--json-schema` asks a chat
-//! request for a JSON answer under a fixed schema. `--tenants N` spreads the
-//! requests over N tenant ids sent in `--tenant-header`.
+//! copies, before the text), `messages` (the Messages API, one user message),
+//! `embeddings` (the prompt as the input), `generate` (the engine-native
+//! `/generate` route, the prompt as its `text`) and `completion`
+//! (`/v1/completions`, the prompt as its `prompt`). `--json-schema` asks a
+//! chat request for a JSON answer under a fixed schema. `--tenants N` spreads
+//! the requests over N tenant ids sent in `--tenant-header`.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
@@ -98,7 +100,7 @@ enum Mode {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate)"
+    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate, completion)"
 )]
 struct Args {
     /// Gateway base URL.
