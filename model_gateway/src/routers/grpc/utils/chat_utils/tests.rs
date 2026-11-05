@@ -71,6 +71,24 @@ fn process_chat_messages_rejects_unknown_content_parts() {
     assert!(error.contains("vendor_media"));
 }
 
+/// A refusal part is the assistant's: on any other role it is refused before
+/// the engine wire, as the unknown parts are, so no pipeline drops it.
+#[test]
+fn a_refusal_part_outside_an_assistant_turn_is_refused() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    let error = validate_chat_content_parts(&messages).unwrap_err();
+    assert!(error.contains("refusal"), "{error}");
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([

@@ -520,7 +520,8 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render.
+/// gRPC backends require content parts the gateway knows how to render, and
+/// a refusal part only where the contract defines it: on an assistant turn.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
     for message in messages {
         let content = match message {
@@ -532,16 +533,27 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
             ChatMessage::Assistant { content, .. } => content.as_ref(),
             ChatMessage::Function { .. } => None,
         };
+        let assistant = matches!(message, ChatMessage::Assistant { .. });
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
-                if let ContentPart::Unknown(fields) = part {
-                    let type_name = fields
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("<missing>");
-                    return Err(format!(
-                        "Unsupported chat content part type {type_name:?} for gRPC backends"
-                    ));
+                match part {
+                    ContentPart::Unknown(fields) => {
+                        let type_name = fields
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>");
+                        return Err(format!(
+                            "Unsupported chat content part type {type_name:?} for gRPC backends"
+                        ));
+                    }
+                    ContentPart::Refusal { .. } if !assistant => {
+                        return Err(
+                            "Unsupported chat content part type \"refusal\" outside an assistant \
+                             message for gRPC backends"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -721,15 +733,14 @@ fn transform_content_field(
     Ok(())
 }
 
-/// A popped assistant message's prefill: its string content, or its text
-/// parts (a refusal part among them) joined in order.
+/// A popped assistant message's prefill: its string content, or its text parts joined in order.
 fn prefill_text(content: Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
-                .filter_map(|part| part.get("text").or_else(|| part.get("refusal"))?.as_str())
+                .filter_map(|part| part.get("text")?.as_str())
                 .collect(),
         ),
         _ => None,
