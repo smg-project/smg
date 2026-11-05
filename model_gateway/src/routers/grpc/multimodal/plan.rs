@@ -217,6 +217,39 @@ pub(crate) async fn prepare_placeholder_tokens(
     engine_limits: &HashMap<Modality, EngineItemLimit>,
     reads_format: impl Fn(EncoderInputFormat) -> bool,
 ) -> Result<PlaceholderTokens> {
+    prepare_placeholder_tokens_with_env(
+        plan,
+        model_id,
+        tokenizer,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        engine_limits,
+        reads_format,
+        modality_limit_override,
+    )
+    .await
+}
+
+/// `prepare_placeholder_tokens` with the deployment-wide limit override (the
+/// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
+/// passes `|_| None` and holds the spec default under test whatever the shell
+/// it runs in exports.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input of the one lookup"
+)]
+async fn prepare_placeholder_tokens_with_env(
+    plan: &MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+    engine_limits: &HashMap<Modality, EngineItemLimit>,
+    reads_format: impl Fn(EncoderInputFormat) -> bool,
+    env_override: impl Fn(Modality) -> Option<usize>,
+) -> Result<PlaceholderTokens> {
     anyhow::ensure!(!plan.is_empty(), "multimodal media plan is empty");
     let model_config = components
         .config_registry
@@ -250,7 +283,7 @@ pub(crate) async fn prepare_placeholder_tokens(
         &spec_limits,
         engine_limits,
         &components.modality_limit_overrides,
-        modality_limit_override,
+        env_override,
     );
     check_item_counts(plan, &limits).map_err(|error| anyhow::anyhow!("{error}"))?;
     let requested = plan
@@ -439,7 +472,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
             },
         )]);
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -448,6 +481,7 @@ mod tests {
             "unused",
             &engine,
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
@@ -461,7 +495,7 @@ mod tests {
         // Without an engine limit the plan passes the count check and reaches
         // the placeholder resolution (which the mock tokenizer, lacking the
         // token, then refuses).
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -470,6 +504,7 @@ mod tests {
             "unused",
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
@@ -506,7 +541,7 @@ mod tests {
             let plan = &plan;
             let tokenizer = &tokenizer;
             async move {
-                prepare_placeholder_tokens(
+                prepare_placeholder_tokens_with_env(
                     plan,
                     "org/kimi-k3",
                     tokenizer,
@@ -515,6 +550,7 @@ mod tests {
                     "unused",
                     &engine,
                     |_| true,
+                    |_| None,
                 )
                 .await
             }
@@ -731,7 +767,7 @@ mod tests {
             let plan = &plan;
             let tokenizer = &tokenizer;
             async move {
-                prepare_placeholder_tokens(
+                prepare_placeholder_tokens_with_env(
                     plan,
                     "m",
                     tokenizer,
@@ -740,6 +776,7 @@ mod tests {
                     source,
                     &HashMap::new(),
                     |format| fleet_reads_format(&fleet(runtime), "m", format),
+                    |_| None,
                 )
                 .await
             }
@@ -792,7 +829,7 @@ mod tests {
         }]);
 
         for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
-            let placeholders = prepare_placeholder_tokens(
+            let placeholders = prepare_placeholder_tokens_with_env(
                 &plan,
                 "m6",
                 &tokenizer,
@@ -801,6 +838,7 @@ mod tests {
                 source,
                 &HashMap::new(),
                 |_| true,
+                |_| None,
             )
             .await
             .unwrap_or_else(|error| panic!("{mode:?} placement: {error:#}"));
@@ -813,7 +851,7 @@ mod tests {
                 .expect("no anchors of the router's own to verify");
         }
 
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "m6",
             &tokenizer,
@@ -822,6 +860,7 @@ mod tests {
             source,
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .expect_err("the router cannot process media it has no spec for");
