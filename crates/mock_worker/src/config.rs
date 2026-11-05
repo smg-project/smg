@@ -38,6 +38,13 @@ pub struct Config {
     pub zmq_count: u16,
     /// Engine index of the first ZMQ rank; ranks use `[start, start+count)`.
     pub zmq_start_index: u32,
+    /// A ZMQ rank's step period in milliseconds. When set, the rank sends an
+    /// engine's steps: one message per period carrying the next output of
+    /// every request that has one; a request that produced faster than the
+    /// period waits its turn, one output per step. Zero, the default, sends
+    /// one message per token as it comes, the shape the tests have read so
+    /// far.
+    pub zmq_step_ms: u64,
     /// Model id advertised by every worker (one model, many replicas).
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
@@ -281,6 +288,7 @@ impl Default for Config {
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
+            zmq_step_ms: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
             default_sampling_params_json: String::new(),
@@ -341,6 +349,7 @@ impl Config {
                 "--grpc-wire" => cfg.grpc_wire = value(&mut args, &flag)?.parse()?,
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
+                "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
                     cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -619,6 +628,9 @@ pub fn usage() -> String {
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
+       --zmq-step-ms <ms>       the ranks' step period: one output message per period with the next\n\
+                                token of every running request (an engine's step; a faster request\n\
+                                waits its turn); 0 sends one message per token (default 0)\n\
        --model <id|dir>         advertised model id, or a model directory whose\n\
                                 generation_config.json gives the sampling defaults gRPC\n\
                                 workers report (default mock-model)\n\
@@ -1059,5 +1071,23 @@ mod tests {
         let cfg = parse(&[&grpc[..], &["--grpc-max-message-bytes", "4194304"]].concat())
             .expect("--grpc-max-message-bytes parses");
         assert_eq!(cfg.grpc_max_message_bytes, 4_194_304);
+    }
+
+    /// A ZMQ rank sends one message per token unless `--zmq-step-ms` gives
+    /// it a step period.
+    #[test]
+    fn zmq_step_ms_default_zero_and_takes_milliseconds() {
+        let zmq = [
+            "--zmq-handshake",
+            "ipc:///tmp/mock-handshake",
+            "--zmq-count",
+            "1",
+        ];
+        assert_eq!(parse(&zmq).expect("defaults").zmq_step_ms, 0);
+        let stepping = parse(&[&zmq[..], &["--zmq-step-ms", "5"]].concat()).expect("a period");
+        assert_eq!(stepping.zmq_step_ms, 5);
+        let refused = parse(&[&zmq[..], &["--zmq-step-ms", "soon"]].concat())
+            .expect_err("not a number of milliseconds");
+        assert!(refused.contains("--zmq-step-ms"), "{refused}");
     }
 }

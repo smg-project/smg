@@ -6,16 +6,19 @@
 //! same continuous-batching [`Engine`] simulator the other protocols use.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     future::{pending, Future},
     pin::pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, PoisonError,
+    },
     time::Duration,
 };
 
 use engine_zmq_client::{
     codec::OpaqueValue,
-    mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+    mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngineOutput},
     protocol::vllm::{
         logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
         output::{
@@ -29,6 +32,7 @@ use engine_zmq_client::{
 use tokio::{
     sync::mpsc,
     task::{AbortHandle, JoinSet},
+    time::Instant,
 };
 
 use crate::{
@@ -44,6 +48,58 @@ use crate::{
 // This is best-effort transport linger, not a delivery acknowledgement; the
 // process-wide drain deadline still bounds shutdown if the frontend is stuck.
 const OUTPUT_LINGER: Duration = Duration::from_secs(1);
+
+/// What a rank has pushed on its output socket: the messages that carried
+/// request outputs and the outputs in them (a utility reply is neither). The
+/// admin API reads them (`GET /admin/zmq/{worker}`), where a test tells a
+/// step of many outputs from one message per token.
+#[derive(Default)]
+pub struct OutputCounts {
+    batch_messages: AtomicU64,
+    outputs: AtomicU64,
+}
+
+impl OutputCounts {
+    /// Count one pushed message.
+    fn pushed(&self, message: &EngineCoreOutputs) {
+        if let Some(batch) = message.as_request_batch() {
+            self.batch_messages.fetch_add(1, Ordering::Relaxed);
+            self.outputs
+                .fetch_add(batch.outputs.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The messages that carried request outputs, and the outputs in them.
+    pub fn read(&self) -> (u64, u64) {
+        (
+            self.batch_messages.load(Ordering::Relaxed),
+            self.outputs.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static OUTPUT_COUNTS: OnceLock<Mutex<HashMap<String, Arc<OutputCounts>>>> = OnceLock::new();
+
+/// The counts of the rank named `name` (`zmq:<index>`), created on first use.
+fn output_counts(name: &str) -> Arc<OutputCounts> {
+    OUTPUT_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The counts of a rank that has served in this process, by its name.
+pub fn rank_output_counts(name: &str) -> Option<Arc<OutputCounts>> {
+    OUTPUT_COUNTS
+        .get()?
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(name)
+        .cloned()
+}
 
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
 /// requests until the frontend disconnects.
@@ -111,16 +167,87 @@ pub async fn serve_until(
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<EngineCoreOutputs>();
+    // The frontend's aborts take their own lane to the writer: a request's
+    // outputs still waiting for a step stand for steps not taken, and only
+    // the frontend's abort drops them (an answer the engine itself ends with
+    // `Abort` keeps its tokens, as without a period).
+    let (abort_tx, mut abort_rx) = mpsc::unbounded_channel::<(String, EngineCoreOutputs)>();
+    let step = (cfg.zmq_step_ms > 0).then(|| Duration::from_millis(cfg.zmq_step_ms));
+    let counts = output_counts(&name);
     #[expect(
         clippy::disallowed_methods,
-        reason = "the writer ends with the output channel; a drain awaits it"
+        reason = "the writer ends with the output and abort channels; a drain awaits it"
     )]
     let writer = tokio::spawn(async move {
         let mut output = output;
-        while let Some(outputs) = out_rx.recv().await {
-            if let Err(error) = output.send_outputs(&outputs).await {
-                tracing::warn!("zmq engine output send failed: {error}");
-                return;
+        // With a period, an engine's step clock: what the forwarders push
+        // waits in the step queue and every period one message goes out with
+        // the next output of every request that has one; a utility reply
+        // goes as it came. Without one, every message goes as it came.
+        let mut steps = step.map(|period| (StepQueue::default(), period));
+        let mut next_step_at: Option<Instant> = None;
+        let (mut outputs_open, mut aborts_open) = (true, true);
+        while outputs_open
+            || aborts_open
+            || steps.as_ref().is_some_and(|(queue, _)| !queue.is_empty())
+        {
+            let due = async {
+                match next_step_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = due => {
+                    if let Some((queue, period)) = steps.as_mut() {
+                        match queue.next_step() {
+                            Some(message) => {
+                                if !push(&mut output, &counts, &message).await {
+                                    return;
+                                }
+                                next_step_at = Some(Instant::now() + *period);
+                            }
+                            None => next_step_at = None,
+                        }
+                    }
+                }
+                received = out_rx.recv(), if outputs_open => match (received, steps.as_mut()) {
+                    (Some(EngineCoreOutputs::RequestBatch(batch)), Some((queue, period))) => {
+                        queue.push(batch);
+                        if next_step_at.is_none() {
+                            next_step_at = Some(Instant::now() + *period);
+                        }
+                    }
+                    (Some(message), _) => {
+                        if !push(&mut output, &counts, &message).await {
+                            return;
+                        }
+                    }
+                    (None, _) => outputs_open = false,
+                },
+                aborted = abort_rx.recv(), if aborts_open => match (aborted, steps.as_mut()) {
+                    (Some((request_id, terminal)), Some((queue, period))) => {
+                        queue.abort(&request_id);
+                        match terminal {
+                            EngineCoreOutputs::RequestBatch(batch) => queue.push(batch),
+                            other => {
+                                if !push(&mut output, &counts, &other).await {
+                                    return;
+                                }
+                            }
+                        }
+                        if next_step_at.is_none() {
+                            next_step_at = Some(Instant::now() + *period);
+                        }
+                    }
+                    (Some((_, terminal)), None) => {
+                        if !push(&mut output, &counts, &terminal).await {
+                            return;
+                        }
+                    }
+                    (None, _) => aborts_open = false,
+                },
             }
         }
         tokio::time::sleep(OUTPUT_LINGER).await;
@@ -267,12 +394,14 @@ pub async fn serve_until(
                     if let Some(handle) = inflight.remove(&request_id) {
                         handle.abort();
                     }
-                    // Push a terminal Abort output so the frontend stream ends.
-                    let _ = out_tx.send(terminal_batch(
+                    // A terminal Abort output ends the frontend's stream; the
+                    // writer drops what the request still had waiting.
+                    let terminal = terminal_batch(
                         engine_index,
-                        request_id,
+                        request_id.clone(),
                         EngineCoreFinishReason::Abort,
-                    ));
+                    );
+                    let _ = abort_tx.send((request_id, terminal));
                 }
             }
             Ok(EngineInbound::StartDpWave { wave, .. }) => {
@@ -309,6 +438,7 @@ pub async fn serve_until(
         // writer's transport linger. Keep the input alive until that finishes:
         // dropping it early makes the frontend fail even queued final outputs.
         drop(out_tx);
+        drop(abort_tx);
         if let Err(e) = writer.await {
             tracing::error!("zmq engine {engine_index} output writer panicked: {e}");
         }
@@ -531,6 +661,143 @@ fn token_batch(
     })
 }
 
+/// One message on the output socket, counted; `false` once the socket has
+/// failed and the writer is done.
+async fn push(
+    output: &mut MockEngineOutput,
+    counts: &OutputCounts,
+    message: &EngineCoreOutputs,
+) -> bool {
+    if let Err(error) = output.send_outputs(message).await {
+        tracing::warn!("zmq engine output send failed: {error}");
+        return false;
+    }
+    counts.pushed(message);
+    true
+}
+
+/// An output waiting for its step, and whether the batch it came in named
+/// its request finished (a finish without an output of its own, an abort's
+/// acknowledgement, waits as an output-less entry).
+struct Pending {
+    output: Option<EngineCoreOutput>,
+    finished: bool,
+}
+
+/// The step queue of a rank with a step period: the forwarders' batches are
+/// taken apart into per-request queues, and every step takes the oldest
+/// waiting output of every request that has one, in the order the requests
+/// first appeared, as an engine's step carries one output per running
+/// request. A request that produced faster than the period waits its turn,
+/// one output per step; its finish rides with the output its batch named
+/// (an answer the engine ends with `Abort` keeps its tokens like any other);
+/// the frontend's abort ([`StepQueue::abort`]) drops the outputs still
+/// waiting for its request, which stand for steps that have not happened,
+/// so the terminal that follows goes out on the next step alone; the latest
+/// load, KV-transfer samples and timestamp go on the next step.
+#[derive(Default)]
+struct StepQueue {
+    waiting: HashMap<String, VecDeque<Pending>>,
+    order: Vec<String>,
+    /// The next step's header: the engine index, the latest load, samples
+    /// and timestamp, outputs and finished set empty.
+    header: RequestBatchOutputs,
+}
+
+impl StepQueue {
+    /// Queue a forwarder's batch.
+    fn push(&mut self, batch: RequestBatchOutputs) {
+        let finished = batch.finished_requests.unwrap_or_default();
+        let mut named = BTreeSet::new();
+        for output in batch.outputs {
+            let done = finished.contains(&output.request_id);
+            named.insert(output.request_id.clone());
+            self.queue_of(output.request_id.clone()).push_back(Pending {
+                output: Some(output),
+                finished: done,
+            });
+        }
+        for request_id in finished.into_iter().filter(|id| !named.contains(id)) {
+            self.queue_of(request_id).push_back(Pending {
+                output: None,
+                finished: true,
+            });
+        }
+        self.header.engine_index = batch.engine_index;
+        if batch.scheduler_stats.is_some() {
+            self.header.scheduler_stats = batch.scheduler_stats;
+        }
+        if batch.kv_transfer.is_some() {
+            self.header.kv_transfer = batch.kv_transfer;
+        }
+        self.header.timestamp = batch.timestamp;
+    }
+
+    /// Whether nothing waits for a step.
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// The frontend aborted `request_id`: what it still had waiting stood
+    /// for steps not taken and is dropped.
+    fn abort(&mut self, request_id: &str) {
+        if let Some(queue) = self.waiting.get_mut(request_id) {
+            queue.clear();
+        }
+    }
+
+    fn queue_of(&mut self, request_id: String) -> &mut VecDeque<Pending> {
+        if !self.waiting.contains_key(&request_id) {
+            self.order.push(request_id.clone());
+        }
+        self.waiting.entry(request_id).or_default()
+    }
+
+    /// The next step, or `None` when nothing waits.
+    fn next_step(&mut self) -> Option<EngineCoreOutputs> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let mut outputs = Vec::with_capacity(self.order.len());
+        let mut finished = BTreeSet::new();
+        for request_id in &self.order {
+            let Some(pending) = self
+                .waiting
+                .get_mut(request_id)
+                .and_then(VecDeque::pop_front)
+            else {
+                continue;
+            };
+            if let Some(output) = pending.output {
+                outputs.push(output);
+            }
+            if pending.finished {
+                finished.insert(request_id.clone());
+            }
+        }
+        let waiting = &mut self.waiting;
+        self.order.retain(|request_id| {
+            if waiting
+                .get(request_id)
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                true
+            } else {
+                waiting.remove(request_id);
+                false
+            }
+        });
+        let header = std::mem::take(&mut self.header);
+        self.header.engine_index = header.engine_index;
+        self.header.timestamp = header.timestamp;
+        Some(EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            outputs,
+            finished_requests: (!finished.is_empty()).then_some(finished),
+            ..header
+        }))
+    }
+}
+
 /// A terminal batch carrying only a finish reason (for aborts).
 fn terminal_batch(
     engine_index: u32,
@@ -594,6 +861,209 @@ mod tests {
             engine: EngineParams::default(),
             ..Config::default()
         }
+    }
+
+    fn batch(
+        request_id: &str,
+        ids: Vec<u32>,
+        finish: Option<EngineCoreFinishReason>,
+        running: Option<u64>,
+    ) -> RequestBatchOutputs {
+        let stats = running.map(|running| SchedulerStats {
+            num_running_reqs: running,
+            ..Default::default()
+        });
+        token_batch(0, request_id.to_string(), ids, finish, stats)
+            .as_request_batch()
+            .cloned()
+            .expect("a batch")
+    }
+
+    fn step_of(queue: &mut StepQueue) -> RequestBatchOutputs {
+        queue
+            .next_step()
+            .as_ref()
+            .and_then(EngineCoreOutputs::as_request_batch)
+            .cloned()
+            .expect("a step")
+    }
+
+    fn requests(step: &RequestBatchOutputs) -> Vec<&str> {
+        step.outputs
+            .iter()
+            .map(|output| output.request_id.as_str())
+            .collect()
+    }
+
+    /// A step carries the next output of every request that has one, in the
+    /// order the requests first appeared; a request that produced faster
+    /// than the period waits its turn, one output per step.
+    #[test]
+    fn a_step_carries_one_output_per_request_and_a_fast_request_waits_its_turn() {
+        let mut queue = StepQueue::default();
+        assert!(queue.next_step().is_none(), "nothing waits");
+        queue.push(batch("a", vec![1], None, None));
+        queue.push(batch("a", vec![2], None, None));
+        queue.push(batch("b", vec![3], None, None));
+        queue.push(batch("a", vec![4], None, None));
+        queue.push(batch("c", vec![5], None, None));
+        let first = step_of(&mut queue);
+        assert_eq!(requests(&first), ["a", "b", "c"]);
+        assert_eq!(first.outputs[0].new_token_ids, [1]);
+        let second = step_of(&mut queue);
+        assert_eq!(requests(&second), ["a"]);
+        assert_eq!(second.outputs[0].new_token_ids, [2]);
+        let third = step_of(&mut queue);
+        assert_eq!(requests(&third), ["a"]);
+        assert_eq!(third.outputs[0].new_token_ids, [4]);
+        assert!(queue.next_step().is_none(), "every output went out");
+        queue.push(batch("b", vec![6], None, None));
+        assert_eq!(
+            requests(&step_of(&mut queue)),
+            ["b"],
+            "a request may come back"
+        );
+    }
+
+    /// A finish rides with the output its batch named, a finish without an
+    /// output of its own ends its request in the next step, and the latest
+    /// load goes on the next step and on that step only.
+    #[test]
+    fn a_finish_rides_with_its_output_and_the_load_with_the_next_step() {
+        let mut queue = StepQueue::default();
+        queue.push(batch("a", vec![1], None, Some(2)));
+        queue.push(batch(
+            "a",
+            vec![2],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ));
+        queue.push(batch("b", vec![3], None, None));
+        let first = step_of(&mut queue);
+        assert_eq!(requests(&first), ["a", "b"]);
+        assert_eq!(first.finished_requests, None);
+        assert_eq!(
+            first
+                .scheduler_stats
+                .as_ref()
+                .map(|stats| stats.num_running_reqs),
+            Some(2)
+        );
+        let second = step_of(&mut queue);
+        assert_eq!(requests(&second), ["a"]);
+        assert_eq!(
+            second.finished_requests,
+            Some(BTreeSet::from(["a".to_string()]))
+        );
+        assert_eq!(
+            second.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Length)
+        );
+        assert_eq!(
+            second.scheduler_stats, None,
+            "the load went with the step before"
+        );
+        queue.push(RequestBatchOutputs {
+            engine_index: 0,
+            finished_requests: Some(BTreeSet::from(["b".to_string()])),
+            ..Default::default()
+        });
+        let third = step_of(&mut queue);
+        assert!(
+            third.outputs.is_empty(),
+            "an acknowledgement carries no output"
+        );
+        assert_eq!(
+            third.finished_requests,
+            Some(BTreeSet::from(["b".to_string()]))
+        );
+        assert!(queue.next_step().is_none());
+    }
+
+    /// The frontend's abort drops the outputs still waiting for its request,
+    /// which stand for steps that have not happened, so the terminal that
+    /// follows goes out on the next step alone; the other requests' outputs
+    /// are untouched.
+    #[test]
+    fn the_frontends_abort_drops_the_outputs_still_waiting_for_its_request() {
+        let mut queue = StepQueue::default();
+        queue.push(batch("a", vec![1], None, None));
+        queue.push(batch("a", vec![2], None, None));
+        queue.push(batch("b", vec![3], None, None));
+        queue.abort("a");
+        queue.push(batch(
+            "a",
+            Vec::new(),
+            Some(EngineCoreFinishReason::Abort),
+            None,
+        ));
+        let first = step_of(&mut queue);
+        assert_eq!(requests(&first), ["a", "b"]);
+        assert_eq!(
+            first.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Abort)
+        );
+        assert!(
+            first.outputs[0].new_token_ids.is_empty(),
+            "the waiting tokens are gone"
+        );
+        assert_eq!(
+            first.finished_requests,
+            Some(BTreeSet::from(["a".to_string()]))
+        );
+        assert!(
+            queue.next_step().is_none(),
+            "nothing of a's is left behind the abort"
+        );
+    }
+
+    /// An answer the engine itself ends with `Abort` (a scripted finish
+    /// reason) keeps every token it produced: the period changes the wire's
+    /// shape and nothing else.
+    #[test]
+    fn an_abort_the_engine_answers_with_keeps_its_waiting_tokens() {
+        let mut queue = StepQueue::default();
+        queue.push(batch("a", vec![1], None, None));
+        queue.push(batch(
+            "a",
+            vec![2],
+            Some(EngineCoreFinishReason::Abort),
+            None,
+        ));
+        let first = step_of(&mut queue);
+        assert_eq!(first.outputs[0].new_token_ids, [1]);
+        assert_eq!(first.finished_requests, None);
+        let second = step_of(&mut queue);
+        assert_eq!(second.outputs[0].new_token_ids, [2]);
+        assert_eq!(
+            second.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Abort)
+        );
+        assert_eq!(
+            second.finished_requests,
+            Some(BTreeSet::from(["a".to_string()]))
+        );
+        assert!(queue.next_step().is_none());
+    }
+
+    /// The output counts tell a step of many outputs from one message per
+    /// token: a batch message counts once, its outputs by their number, a
+    /// utility reply not at all.
+    #[test]
+    fn output_counts_read_batch_messages_and_their_outputs() {
+        let counts = OutputCounts::default();
+        let mut queue = StepQueue::default();
+        queue.push(batch("a", vec![1], None, None));
+        queue.push(batch("b", vec![2], None, None));
+        queue.push(batch("c", vec![3], None, None));
+        counts.pushed(&queue.next_step().expect("a step of three"));
+        counts.pushed(&token_batch(0, "a".to_string(), vec![4], None, None));
+        counts.pushed(&EngineCoreOutputs::Utility(UtilityCallOutput {
+            engine_index: 0,
+            timestamp: 0.0,
+            output: UtilityOutput::from_outcome(7, Err("not answered".to_string())),
+        }));
+        assert_eq!(counts.read(), (2, 4));
     }
 
     /// End-to-end over ipc://: the engine-zmq-client connector (frontend) drives

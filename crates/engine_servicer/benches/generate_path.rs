@@ -1,16 +1,22 @@
 //! The cost of the generate path, in process, over the crate's mock engine:
 //! a servicer answers streamed requests whose engine side is a mock that
-//! replies to every add with one chunk per token and a `length` finish. What
-//! criterion times is one closed-loop request end to end (the gRPC call, the
-//! engine add, the chunks back through the servicer, the terminal), with the
-//! metrics endpoint off or on (`GENERATE_PATH_METRICS=on`), so the two can be
-//! compared and the per-request and per-token cost of the observations read.
+//! answers in steps, as an engine does: one output message per step carrying
+//! the next token of every running request, a `length` finish on each
+//! request's last. What criterion times is a closed loop of
+//! `GENERATE_PATH_STREAMS` concurrent requests end to end (the gRPC calls,
+//! the engine adds, the steps back through the servicer, the terminals; `1`
+//! and `48` by default, a comma-separated list), with the metrics endpoint
+//! off or on (`GENERATE_PATH_METRICS=on`), so the two can be compared and the
+//! per-request and per-token cost of the observations read, alone and under
+//! the per-output work of a step of many.
 //!
 //! For a counter-based reading (`perf stat` on the binary),
-//! `GENERATE_PATH_REQUESTS=<n>` runs `n` requests and exits without
-//! criterion; `GENERATE_PATH_TOKENS` sets the tokens per request (64 by
-//! default), so two runs at different token counts separate the per-token
-//! cost from the per-request one. With the endpoint on, a scrape every
+//! `GENERATE_PATH_REQUESTS=<n>` runs `n` requests, in rounds of the first
+//! `GENERATE_PATH_STREAMS` entry at once (one by default; `48` for the
+//! counters of the 48-stream shape), and exits without criterion;
+//! `GENERATE_PATH_TOKENS` sets the tokens per request (64 by default), so two
+//! runs at different token counts separate the per-token cost from the
+//! per-request one. With the endpoint on, a scrape every
 //! `GENERATE_PATH_SCRAPE_EVERY` requests reports its render time.
 //!
 //! `GENERATE_PATH_WIRE=vllm|sglang|tokenspeed|trtllm` (vllm by default) picks
@@ -30,7 +36,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -46,7 +55,6 @@ use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack},
     mock_engine::{
         connect_to_frontend, default_ready_response, EngineInbound, MockEngine, MockEngineInput,
-        MockEngineOutput,
     },
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -68,7 +76,7 @@ use engine_zmq_client::{
     },
     EngineId,
 };
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use smg_grpc_client::{
     sglang_proto as sg, sglang_proto::sglang_scheduler_client::SglangSchedulerClient,
     tokenspeed_proto as ts,
@@ -76,6 +84,7 @@ use smg_grpc_client::{
     trtllm_proto::trtllm_service_client::TrtllmServiceClient, vllm_proto as vllm,
     vllm_proto::vllm_engine_client::VllmEngineClient,
 };
+use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
 /// The wire under the bench: its servicer, its proto and its mock engine.
@@ -151,15 +160,79 @@ fn metrics_on() -> bool {
     std::env::var("GENERATE_PATH_METRICS").is_ok_and(|value| value == "on")
 }
 
-/// The mock engine's side of the wire: every add is answered with
-/// `tokens` single-token chunks and a `length` finish, in the wire's own
-/// output shape.
+/// The concurrent streams of a closed loop (`GENERATE_PATH_STREAMS`, a
+/// comma-separated list; `1,48` by default).
+fn streams_per_loop() -> Vec<u64> {
+    std::env::var("GENERATE_PATH_STREAMS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|streams| streams.trim().parse().ok())
+                .filter(|streams| *streams > 0)
+                .collect::<Vec<u64>>()
+        })
+        .filter(|streams| !streams.is_empty())
+        .unwrap_or_else(|| vec![1, 48])
+}
+
+/// The mock engine's side of the wire, answering in steps as an engine does:
+/// every add joins the running set, and each step sends one message in the
+/// wire's output shape with the next token of every running request
+/// (`tokens` tokens each, a `length` finish on the last). A reader task takes
+/// the adds off the socket, so the stepper never waits for one while requests
+/// run.
 async fn answer_adds(wire: Wire, engine: MockEngine, tokens: u32) {
-    let (input, output) = engine.split();
-    match wire {
-        Wire::Vllm => answer_vllm_adds(input, output, tokens).await,
-        Wire::Sglang | Wire::Trtllm => answer_slim_adds(wire, input, output, tokens).await,
-        Wire::TokenSpeed => answer_tokenspeed_adds(input, output, tokens).await,
+    let (mut input, mut output) = engine.split();
+    let (adds, mut added) = mpsc::unbounded_channel::<String>();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the reader ends with the frontend's socket, as the mock engine does"
+    )]
+    let _reader = tokio::spawn(async move {
+        loop {
+            let add = match wire {
+                Wire::Vllm => match input.recv().await {
+                    Ok(EngineInbound::Add(request)) => Some(request.request_id.clone()),
+                    Ok(_) => None,
+                    Err(_) => return,
+                },
+                Wire::Sglang | Wire::TokenSpeed | Wire::Trtllm => {
+                    let Some(add) = next_add_rid(wire, &mut input).await else {
+                        return;
+                    };
+                    add
+                }
+            };
+            if let Some(rid) = add {
+                if adds.send(rid).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let mut running: Vec<(String, u32)> = Vec::new();
+    loop {
+        if running.is_empty() {
+            match added.recv().await {
+                Some(rid) => running.push((rid, 0)),
+                None => return,
+            }
+        }
+        while let Ok(rid) = added.try_recv() {
+            running.push((rid, 0));
+        }
+        for (_, sent) in &mut running {
+            *sent += 1;
+        }
+        if output
+            .send_frames(step_frames(wire, &running, tokens))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        running.retain(|(_, sent)| *sent < tokens);
     }
 }
 
@@ -202,117 +275,83 @@ async fn next_add_rid(wire: Wire, input: &mut MockEngineInput) -> Option<Option<
     })
 }
 
-/// The SGLang and TensorRT-LLM wires: one slim batch per token, as their
-/// schedulers' plugins send them.
-async fn answer_slim_adds(
-    wire: Wire,
-    mut input: MockEngineInput,
-    mut output: MockEngineOutput,
-    tokens: u32,
-) {
-    while let Some(add) = next_add_rid(wire, &mut input).await {
-        let Some(rid) = add else { continue };
-        for token in 0..tokens {
-            let finished = token + 1 == tokens;
-            let batch = BatchTokenIDSlimOutput {
-                rids: vec![rid.clone()],
-                output_ids: vec![vec![token + 10]],
-                finished_reasons: vec![if finished {
-                    "length".to_string()
-                } else {
-                    String::new()
-                }],
-                finished_messages: vec![None],
-                finished_matched: vec![None],
-                prompt_tokens: vec![3],
-                completion_tokens: vec![token + 1],
-                cached_tokens: vec![0],
-                output_token_logprobs_val: vec![Vec::new()],
-                output_token_logprobs_idx: vec![Vec::new()],
+/// One step's message in the wire's output shape: the token every running
+/// request got this step (its `sent`th), a `length` finish where it was the
+/// last of the `tokens`.
+fn step_frames(wire: Wire, running: &[(String, u32)], tokens: u32) -> Vec<Bytes> {
+    let count = running.len();
+    let rids: Vec<String> = running.iter().map(|(rid, _)| rid.clone()).collect();
+    let output_ids: Vec<Vec<u32>> = running.iter().map(|(_, sent)| vec![sent + 9]).collect();
+    let finished_reasons: Vec<String> = running
+        .iter()
+        .map(|(_, sent)| {
+            if *sent == tokens {
+                "length".to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+    let completion_tokens: Vec<u32> = running.iter().map(|(_, sent)| *sent).collect();
+    let encoded = match wire {
+        Wire::Vllm => {
+            let finished: BTreeSet<String> = running
+                .iter()
+                .filter(|(_, sent)| *sent == tokens)
+                .map(|(rid, _)| rid.clone())
+                .collect();
+            encode_msgpack(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 0,
-                num_running: 1,
-                num_waiting: 0,
-                kv_used_tokens: 10,
-                kv_total_tokens: 100,
-                finished_status: vec![None],
+                outputs: running
+                    .iter()
+                    .map(|(rid, sent)| EngineCoreOutput {
+                        request_id: rid.clone(),
+                        new_token_ids: vec![sent + 9],
+                        finish_reason: (*sent == tokens).then_some(EngineCoreFinishReason::Length),
+                        ..Default::default()
+                    })
+                    .collect(),
+                finished_requests: (!finished.is_empty()).then_some(finished),
                 ..Default::default()
-            };
-            output
-                .send_frames(vec![Bytes::from(
-                    encode_msgpack(&batch).expect("a slim batch encodes"),
-                )])
-                .await
-                .expect("the mock engine's output is sent");
+            }))
         }
-    }
-}
-
-/// The TokenSpeed wire: one slim batch per token, as its scheduler sends them.
-async fn answer_tokenspeed_adds(
-    mut input: MockEngineInput,
-    mut output: MockEngineOutput,
-    tokens: u32,
-) {
-    while let Some(add) = next_add_rid(Wire::TokenSpeed, &mut input).await {
-        let Some(rid) = add else { continue };
-        for token in 0..tokens {
-            let finished = token + 1 == tokens;
-            let batch = BatchTokenIDOutSlim {
-                rids: vec![rid.clone()],
-                output_ids: vec![vec![token + 10]],
-                finished_reasons: vec![if finished {
-                    "length".to_string()
-                } else {
-                    String::new()
-                }],
-                prompt_tokens: vec![3],
-                completion_tokens: vec![token + 1],
-                cached_tokens: vec![0],
-                output_token_logprobs_val: vec![Vec::new()],
-                output_token_logprobs_idx: vec![Vec::new()],
-                engine_index: 0,
-                num_running: 1,
-                num_waiting: 0,
-                kv_active_pages: 1,
-                kv_total_pages: 100,
-                ..Default::default()
-            };
-            output
-                .send_frames(vec![Bytes::from(
-                    encode_msgpack(&batch).expect("a slim batch encodes"),
-                )])
-                .await
-                .expect("the mock engine's output is sent");
-        }
-    }
-}
-
-/// The vLLM wire: one engine-core batch per token.
-async fn answer_vllm_adds(mut input: MockEngineInput, mut output: MockEngineOutput, tokens: u32) {
-    while let Ok(inbound) = input.recv().await {
-        let EngineInbound::Add(request) = inbound else {
-            continue;
-        };
-        let id = request.request_id.clone();
-        for token in 0..tokens {
-            let finish = (token + 1 == tokens).then_some(EngineCoreFinishReason::Length);
-            let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
-                engine_index: 0,
-                outputs: vec![EngineCoreOutput {
-                    request_id: id.clone(),
-                    new_token_ids: vec![token + 10],
-                    finish_reason: finish,
-                    ..Default::default()
-                }],
-                finished_requests: finish.map(|_| BTreeSet::from([id.clone()])),
-                ..Default::default()
-            });
-            output
-                .send_outputs(&batch)
-                .await
-                .expect("the mock engine's output is sent");
-        }
-    }
+        Wire::Sglang | Wire::Trtllm => encode_msgpack(&BatchTokenIDSlimOutput {
+            rids,
+            output_ids,
+            finished_reasons,
+            finished_messages: vec![None; count],
+            finished_matched: (0..count).map(|_| None).collect(),
+            prompt_tokens: vec![3; count],
+            completion_tokens,
+            cached_tokens: vec![0; count],
+            output_token_logprobs_val: vec![Vec::new(); count],
+            output_token_logprobs_idx: vec![Vec::new(); count],
+            engine_index: 0,
+            num_running: u64::try_from(count).unwrap_or(u64::MAX),
+            num_waiting: 0,
+            kv_used_tokens: 10,
+            kv_total_tokens: 100,
+            finished_status: vec![None; count],
+            ..Default::default()
+        }),
+        Wire::TokenSpeed => encode_msgpack(&BatchTokenIDOutSlim {
+            rids,
+            output_ids,
+            finished_reasons,
+            prompt_tokens: vec![3; count],
+            completion_tokens,
+            cached_tokens: vec![0; count],
+            output_token_logprobs_val: vec![Vec::new(); count],
+            output_token_logprobs_idx: vec![Vec::new(); count],
+            engine_index: 0,
+            num_running: u64::try_from(count).unwrap_or(u64::MAX),
+            num_waiting: 0,
+            kv_active_pages: 1,
+            kv_total_pages: 100,
+            ..Default::default()
+        }),
+    };
+    vec![Bytes::from(encoded.expect("a step encodes"))]
 }
 
 /// The wire's running servicer.
@@ -446,6 +485,7 @@ impl Server {
 }
 
 /// The wire's gRPC client, driving one streamed request at a time.
+#[derive(Clone)]
 enum Client {
     Vllm(VllmEngineClient<Channel>),
     Sglang(SglangSchedulerClient<Channel>),
@@ -593,7 +633,7 @@ struct Bed {
     server: Server,
     client: Client,
     tokens: u32,
-    sent: u64,
+    sent: AtomicU64,
     _dir: tempfile::TempDir,
 }
 
@@ -637,16 +677,34 @@ impl Bed {
             server,
             client: Client::new(wire, channel),
             tokens,
-            sent: 0,
+            sent: AtomicU64::new(0),
             _dir: dir,
         }
     }
 
-    /// One streamed request, read to its end; returns the tokens received.
-    async fn request(&mut self) -> u32 {
-        self.sent += 1;
+    /// `streams` streamed requests at once, each read to its end; returns
+    /// the tokens received over all of them, every token every stream was
+    /// due: a step whose outputs did not all reach their streams fails here.
+    async fn requests(&self, streams: u64) -> u32 {
+        let first = self.sent.fetch_add(streams, Ordering::Relaxed) + 1;
+        let received: u32 = join_all((first..first + streams).map(|id| self.request(id)))
+            .await
+            .into_iter()
+            .sum();
+        assert_eq!(
+            u64::from(received),
+            streams * u64::from(self.tokens),
+            "every stream ends with its tokens"
+        );
+        received
+    }
+
+    /// One streamed request under `id`, read to its end; returns the tokens
+    /// received.
+    async fn request(&self, id: u64) -> u32 {
         self.client
-            .request(format!("r{}", self.sent), self.tokens)
+            .clone()
+            .request(format!("r{id}"), self.tokens)
             .await
     }
 
@@ -674,26 +732,33 @@ fn resident_kb() -> Option<u64> {
 }
 
 /// The counter-based run: `GENERATE_PATH_REQUESTS` requests in a closed
-/// loop, the wall time, the scrape times and the resident set after the
-/// first thousand requests and at the end printed.
+/// loop of rounds of the first `GENERATE_PATH_STREAMS` entry at once, the
+/// wall time, the scrape times and the resident set after the first thousand
+/// requests and at the end printed.
 fn counted_run(runtime: &tokio::runtime::Runtime, requests: u64) {
     let tokens = tokens_per_request();
     let metrics = metrics_on();
+    let streams = streams_per_loop()[0];
     let scrape_every = env_u64("GENERATE_PATH_SCRAPE_EVERY").unwrap_or(0);
     let wire = Wire::from_env();
-    let mut bed = runtime.block_on(Bed::start(wire, tokens, metrics));
+    let bed = runtime.block_on(Bed::start(wire, tokens, metrics));
     let started = Instant::now();
     let mut received = 0u64;
     let mut scrapes = Vec::new();
     let mut rss_after_1k = None;
-    for sent in 1..=requests {
-        received += u64::from(runtime.block_on(bed.request()));
-        if scrape_every > 0 && sent % scrape_every == 0 {
+    let mut sent = 0u64;
+    let mut scrapes_due = 0u64;
+    while sent < requests {
+        let round = streams.min(requests - sent);
+        received += u64::from(runtime.block_on(bed.requests(round)));
+        sent += round;
+        if scrape_every > 0 && sent / scrape_every > scrapes_due {
+            scrapes_due = sent / scrape_every;
             if let Some(scrape) = bed.scrape() {
                 scrapes.push(scrape);
             }
         }
-        if sent == 1000 {
+        if rss_after_1k.is_none() && sent >= 1000 {
             rss_after_1k = resident_kb();
         }
     }
@@ -706,8 +771,8 @@ fn counted_run(runtime: &tokio::runtime::Runtime, requests: u64) {
         );
     }
     eprintln!(
-        "generate_path: {requests} requests x {tokens} tokens on the {} wire, metrics {}: \
-         {received} tokens in {:.3} s ({:.1} us per request)",
+        "generate_path: {requests} requests x {tokens} tokens, {streams} at once, on the {} wire, \
+         metrics {}: {received} tokens in {:.3} s ({:.1} us per request)",
         bed.wire.name(),
         if metrics { "on" } else { "off" },
         elapsed.as_secs_f64(),
@@ -756,22 +821,25 @@ fn bench_generate_path(c: &mut Criterion) {
     let tokens = tokens_per_request();
     let metrics = metrics_on();
     let wire = Wire::from_env();
-    let mut bed = runtime.block_on(Bed::start(wire, tokens, metrics));
+    let bed = runtime.block_on(Bed::start(wire, tokens, metrics));
     let mut group = c.benchmark_group("generate_path");
-    group.throughput(Throughput::Elements(u64::from(tokens)));
     // The vLLM row keeps its name (the ledger's rows read it); the other
-    // wires' rows carry theirs.
+    // wires' rows carry theirs, and the rows of several streams at once
+    // their count.
     let suffix = match wire {
         Wire::Vllm => String::new(),
         other => format!("_{}", other.name()),
     };
-    group.bench_function(
-        format!(
-            "request_{tokens}_tokens_metrics_{}{suffix}",
-            if metrics { "on" } else { "off" }
-        ),
-        |b| b.iter(|| runtime.block_on(bed.request())),
-    );
+    let metrics_label = if metrics { "on" } else { "off" };
+    for streams in streams_per_loop() {
+        let id = if streams == 1 {
+            format!("request_{tokens}_tokens_metrics_{metrics_label}{suffix}")
+        } else {
+            format!("streams_{streams}_x_{tokens}_tokens_metrics_{metrics_label}{suffix}")
+        };
+        group.throughput(Throughput::Elements(u64::from(tokens) * streams));
+        group.bench_function(id, |b| b.iter(|| runtime.block_on(bed.requests(streams))));
+    }
     group.finish();
     if let Some((time, bytes)) = bed.scrape() {
         eprintln!(
