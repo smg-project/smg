@@ -4,6 +4,7 @@ lacks; the main workflow's tooling step runs the whole test directory rather tha
 list kept by hand."""
 
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -11,6 +12,13 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+# Closed fixture environments still need the setup interpreter's loader paths.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "pr-test-rust.yml"
@@ -95,7 +103,7 @@ def _run_finish_gate(tmp_path, *, source=None, results=None, step="Check CI resu
     return subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
         cwd=work,
-        env={"PATH": str(binary), "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**INTERPRETER_ENV, "PATH": str(binary), "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
         timeout=5,
