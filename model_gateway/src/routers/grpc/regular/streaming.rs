@@ -3189,18 +3189,49 @@ impl<'a> ChatStream<'a> {
                 self.engine_outlived = true;
             }
             let response = if self.final_indices.is_none() && !self.engine_outlived {
-                // The packed read (`StreamingProcessor::next_packed`): the
-                // messages ready at one poll share a frame; the first
-                // token's frame leaves alone, before the engine is polled
-                // again.
-                let item = StreamingProcessor::next_packed(
-                    grpc_stream,
-                    self.tx,
-                    &mut self.sse_buffer,
-                    &mut self.first_token_out,
-                    self.first_token_time.is_some(),
-                )
-                .await?;
+                // The packed read, kept inline here: the Messages and
+                // completion loops read through
+                // `StreamingProcessor::next_packed`, the same block as a
+                // shared future, which on this stream cost about 85
+                // instructions per delta (+1.1 percent of a 128-delta
+                // request on the pair of record); this loop is the
+                // most-travelled one, so its twin stays by measurement.
+                // The engine is polled once in place before the chunks
+                // written so far leave: a message it has ready joins the
+                // frame being written, so the messages ready at one poll
+                // leave as one frame; when it has none ready, the frame
+                // leaves before the reader parks, so no text waits for the
+                // engine. The frame carrying the first token leaves before
+                // the engine is polled again, whatever is ready behind it:
+                // the client's first token waits for nothing. The one poll
+                // registers the reader's wake where the message will come
+                // from; `next` resumes it after the flush.
+                let item = {
+                    let mut next = std::pin::pin!(grpc_stream.next());
+                    let ready = if self.first_token_out {
+                        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+                    } else {
+                        Poll::Pending
+                    };
+                    match ready {
+                        Poll::Ready(item) => item,
+                        Poll::Pending => {
+                            let frame_out = !self.sse_buffer.is_empty();
+                            StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                            if frame_out && !self.first_token_out && self.first_token_time.is_some()
+                            {
+                                self.first_token_out = true;
+                                // The first token's frame reaches the
+                                // connection before the engine is read
+                                // again: the body driving this reading
+                                // hands it out on this yield and writes it
+                                // (see `DrivenBody`).
+                                tokio::task::yield_now().await;
+                            }
+                            next.await
+                        }
+                    }
+                };
                 if item.is_none() && grpc_stream.client_left() {
                     // The client's departure ends the read here: text the
                     // decoder or a parser still holds can reach nobody, and
