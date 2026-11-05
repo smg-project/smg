@@ -86,7 +86,7 @@ fn narrowed_to_none(tool_choice: &ToolChoice) -> String {
             function.name
         ),
         ToolChoice::AllowedTools { .. } => {
-            "Invalid value for 'tool_choice.tools': the listed tools are not found in 'tools'."
+            "Invalid value for 'tool_choice.allowed_tools.tools': the listed tools are not found in 'tools'."
                 .to_string()
         }
         ToolChoice::Value(_) => "Invalid value for 'tool_choice': no tool to call.".to_string(),
