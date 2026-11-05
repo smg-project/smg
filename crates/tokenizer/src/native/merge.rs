@@ -111,16 +111,16 @@ impl Merge {
 }
 
 /// One entry of the pair table: the pair's key, `a << 32 | b` or
-/// [`EMPTY_KEY`], and its merge; sixteen bytes, aligned so that the
-/// [`BUCKET`] entries of a bucket share one cache line. Before this layout
-/// the table kept the keys, the ranks and the products in three arrays and a
-/// dense grid of the small-id pairs in front of them: a lookup on a cold
-/// piece read the key, then the rank, then the product by rank, three lines
-/// each a memory latency apart, and the grid's branch mispredicted on every
-/// round that mixed byte pairs with the pairs of products (measured: the
-/// merge was a third of a cold encode, most of it those reads).
+/// [`EMPTY_KEY`], and its merge; sixteen bytes, [`BUCKET`] to a [`Bucket`].
+/// Before this layout the table kept the keys, the ranks and the products in
+/// three arrays and a dense grid of the small-id pairs in front of them: a
+/// lookup on a cold piece read the key, then the rank, then the product by
+/// rank, three lines each a memory latency apart, and the grid's branch
+/// mispredicted on every round that mixed byte pairs with the pairs of
+/// products (measured: the merge was a third of a cold encode, most of it
+/// those reads).
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
+#[repr(C)]
 struct Entry {
     key: u64,
     merge: Merge,
@@ -131,6 +131,23 @@ impl Entry {
         key: EMPTY_KEY,
         merge: Merge::NONE,
     };
+}
+
+/// One bucket of the pair table: [`BUCKET`] entries on one cache line, the
+/// alignment the type's own. A boxed slice of entries is aligned to an entry,
+/// so whether a bucket shared a line was the allocator's to decide, and one
+/// that hands large blocks back sixteen bytes past a line (the system
+/// allocator, under the tests and the crate's benches) had every bucket span
+/// two.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Bucket([Entry; BUCKET]);
+
+const _: () = assert!(size_of::<Entry>() == 16);
+const _: () = assert!(size_of::<Bucket>() == 64);
+
+impl Bucket {
+    const EMPTY: Self = Self([Entry::EMPTY; BUCKET]);
 }
 
 /// The merges of one byte-level BPE model; see the module documentation.
@@ -149,7 +166,7 @@ pub(super) struct MergeTable {
     /// buckets: a pair's key hashes to a bucket of [`BUCKET`] entries, and a
     /// lookup reads the bucket whole (one compare per entry, no branch) and
     /// goes on to the next bucket only when none matched and none was empty.
-    entries: Box<[Entry]>,
+    buckets: Box<[Bucket]>,
     /// Bits a key's hash is shifted right by to give its first bucket; the
     /// table holds `1 << (64 - shift)` buckets.
     shift: u32,
@@ -164,25 +181,6 @@ pub(super) struct MergeTable {
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct SerializedMerges<'a>(#[serde(borrow)] Vec<(Cow<'a, str>, Cow<'a, str>)>);
-
-/// The byte each byte token's id stands for, sorted by id, for the grid.
-fn byte_of_id(byte_ids: &[u32; 256]) -> Vec<(u32, u8)> {
-    let mut byte_of_id: Vec<(u32, u8)> = byte_ids
-        .iter()
-        .enumerate()
-        .map(|(byte, &id)| (id, byte as u8))
-        .collect();
-    byte_of_id.sort_unstable();
-    byte_of_id
-}
-
-/// The byte token `id` stands for, if it is one.
-fn byte_of(byte_of_id: &[(u32, u8)], id: u32) -> Option<u8> {
-    byte_of_id
-        .binary_search_by_key(&id, |&(id, _)| id)
-        .ok()
-        .map(|at| byte_of_id[at].1)
-}
 
 impl MergeTable {
     /// The table of `model`'s merges, or why the model's own merge stays in
@@ -222,7 +220,6 @@ impl MergeTable {
         }
         let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
         table.byte_ids = byte_ids;
-        let byte_of_id = byte_of_id(&byte_ids);
         let mut token = String::new();
         for (rank, (left, right)) in merges.iter().enumerate() {
             let rank = u32::try_from(rank)
@@ -241,12 +238,9 @@ impl MergeTable {
                     "merge {left:?} + {right:?} names a token outside the vocabulary"
                 )));
             };
-            let merge = Merge::new(rank, new_id);
-            table.insert(a, b, merge);
-            if let (Some(left), Some(right)) = (byte_of(&byte_of_id, a), byte_of(&byte_of_id, b)) {
-                table.byte_grid[usize::from(left) * 256 + usize::from(right)] = merge;
-            }
+            table.insert(a, b, Merge::new(rank, new_id));
         }
+        table.fill_byte_grid();
         Ok(table)
     }
 
@@ -296,14 +290,10 @@ impl MergeTable {
         }
         let mut table = Self::with_capacity(splits.len(), false);
         table.byte_ids = byte_ids;
-        let byte_of_id = byte_of_id(&byte_ids);
         for &(left, right, rank) in &splits {
-            let merge = Merge::new(rank, rank);
-            table.insert(left, right, merge);
-            if let (Some(a), Some(b)) = (byte_of(&byte_of_id, left), byte_of(&byte_of_id, right)) {
-                table.byte_grid[usize::from(a) * 256 + usize::from(b)] = merge;
-            }
+            table.insert(left, right, Merge::new(rank, rank));
         }
+        table.fill_byte_grid();
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
             if token.len() < 2 {
@@ -330,7 +320,7 @@ impl MergeTable {
         Self {
             byte_ids: [0; 256],
             byte_grid: vec![Merge::NONE; 256 * 256].into_boxed_slice(),
-            entries: vec![Entry::EMPTY; buckets * BUCKET].into_boxed_slice(),
+            buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
             shift,
             merges,
             ignore_merges,
@@ -339,19 +329,27 @@ impl MergeTable {
 
     /// Bytes the table holds, for the load log.
     pub(super) fn bytes(&self) -> usize {
-        size_of::<Self>() + size_of_val(&*self.byte_grid) + size_of_val(&*self.entries)
+        size_of::<Self>() + size_of_val(&*self.byte_grid) + size_of_val(&*self.buckets)
     }
 
-    /// Ranks the table holds (one per merge of a model; one per token of a
-    /// tiktoken vocabulary, whose splits share their token's rank).
+    /// Pairs the table was built from (one per merge of a model; one per
+    /// split of a token into two tokens of a tiktoken vocabulary, the splits
+    /// of one token sharing its rank).
     pub(super) fn merges(&self) -> usize {
         self.merges
     }
 
-    /// The buckets of the table, each one cache line.
-    #[inline(always)]
-    fn buckets(&self) -> &[[Entry; BUCKET]] {
-        self.entries.as_chunks::<BUCKET>().0
+    /// Fills the byte-pair grid from the bucket table once the pairs are in,
+    /// one lookup per pair of bytes: the grid then answers as the table does
+    /// for any vocabulary, one whose byte tokens share an id included (a map
+    /// from id back to byte filled one of the two bytes' rows), and a pair
+    /// recorded twice keeps the later merge in one place.
+    fn fill_byte_grid(&mut self) {
+        for a in 0..256 {
+            for b in 0..256 {
+                self.byte_grid[a * 256 + b] = self.merge_of(self.byte_ids[a], self.byte_ids[b]);
+            }
+        }
     }
 
     #[inline(always)]
@@ -376,10 +374,10 @@ impl MergeTable {
     /// merge, as the model's merge map does.
     fn insert(&mut self, a: u32, b: u32, merge: Merge) {
         let key = Self::pair_key(a, b);
-        let mask = self.buckets().len() - 1;
+        let mask = self.buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
-            for entry in &mut self.entries[bucket * BUCKET..(bucket + 1) * BUCKET] {
+            for entry in &mut self.buckets[bucket].0 {
                 if entry.key == key || entry.key == EMPTY_KEY {
                     *entry = Entry { key, merge };
                     return;
@@ -395,13 +393,13 @@ impl MergeTable {
     #[inline]
     fn merge_of(&self, a: u32, b: u32) -> Merge {
         let key = Self::pair_key(a, b);
-        let buckets = self.buckets();
+        let buckets = &self.buckets;
         let mask = buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
             let mut found = Merge::NONE;
             let mut empty = false;
-            for entry in &buckets[bucket] {
+            for entry in &buckets[bucket].0 {
                 if entry.key == key {
                     found = entry.merge;
                 }

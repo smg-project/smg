@@ -727,6 +727,34 @@ fn the_merges_read_are_the_models_merges_with_a_gap_in_the_ids_too() {
     }
 }
 
+/// The byte-pair grid answers as the bucket table does on a vocabulary
+/// that gives two byte characters one id: the model merges the pair by id
+/// for either byte, and so does the table's first round. (The merge's
+/// product is in the vocabulary under both spellings, on one id too: the
+/// model names a merge by either byte when it serializes its merges.)
+#[test]
+fn two_byte_characters_on_one_id_merge_as_the_model_does() {
+    let (mut vocab, table) = alphabet_vocab();
+    let a = vocab["a"];
+    vocab.insert("b".to_owned(), a);
+    let ac = vocab.len() as u32;
+    vocab.insert("ac".to_owned(), ac);
+    vocab.insert("bc".to_owned(), ac);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("a".to_owned(), "c".to_owned())])
+        .build()
+        .expect("a byte-level BPE");
+    let merges = table_of(&bpe);
+    for piece in [&b"ac"[..], b"bc", b"abc", b"cb"] {
+        assert_eq!(
+            table_ids(&merges, piece),
+            model_ids(&bpe, &table, piece),
+            "{piece:?}"
+        );
+    }
+    assert_eq!(table_ids(&merges, b"bc"), [ac]);
+}
+
 /// The table is the byte-pair grid (256 x 256 words) and its entries: a
 /// power of two of buckets, one cache line of four sixteen-byte entries
 /// each, at a load of one half or less.
