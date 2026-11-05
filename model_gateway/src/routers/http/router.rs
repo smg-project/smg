@@ -2456,7 +2456,8 @@ impl Router {
             retries_enabled: self.retry_config.max_retries > 1
                 || self
                     .worker_registry
-                    .any_model_retry_override_enables_retries(),
+                    .any_model_retry_override_enables_retries()
+                || self.has_context_capacity_variance(crate::worker::UNKNOWN_MODEL_ID),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
             tenant_rate_limited: self.rate_limit_manager.is_some(),
         })
@@ -4428,6 +4429,21 @@ mod tests {
             },
             true,
         );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_RETRYABLE)
+        );
+    }
+
+    #[test]
+    fn context_capacity_variance_keeps_small_bodies_buffered() {
+        let mut router = context_router(vec![
+            context_worker("http://worker1:8080", 16),
+            context_worker("http://worker2:8080", 32),
+        ]);
+        router.retry_config.max_retries = 1;
+        router.max_buffered_request_bytes = 1024;
+
         assert_eq!(
             router.request_body_path(&headers_with_content_length(Some("64")), false),
             BodyPath::Buffer(REASON_RETRYABLE)
