@@ -13,8 +13,8 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::{
-            pil_to_filter, resize_bicubic_pil_rgb, resize_rgb_bytes, rgb_bytes, round_half_to_even,
-            TransformError,
+            pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes,
+            round_half_to_even, TransformError,
         },
     },
 };
@@ -315,6 +315,12 @@ impl Pixels {
     }
 }
 
+/// One frame's bytes as the reference lays them out: resized to the content
+/// size, then zero-padded to the target canvas. The reference image and video
+/// processors resize with the torchvision antialiased kernel on the bytes
+/// (a bicubic `resample` takes that kernel's uint8 form, which parts from
+/// Pillow's quantization by up to two levels at the scale extremes: tiny
+/// upscales and 4K-8K downscales), so a bicubic resize takes the same kernel here.
 fn prepare<'a, F: RgbSource>(
     frame: &'a F,
     geometry: Geometry,
@@ -335,7 +341,7 @@ fn prepare<'a, F: RgbSource>(
         raw.into_owned()
     } else {
         let resized = if filter == FilterType::CatmullRom {
-            resize_bicubic_pil_rgb(
+            resize_bicubic_torch_aa_rgb(
                 raw.as_ref(),
                 source_w,
                 source_h,
@@ -1060,5 +1066,105 @@ mod tests {
             rows,
             "patch rows must equal the summed grid volumes"
         );
+    }
+
+    /// A bicubic resize takes the reference's kernel, torchvision's
+    /// antialiased bicubic on the bytes, which its CPU path runs natively on
+    /// `u8`. Pillow's bicubic agrees with it at ordinary ratios and parts by
+    /// one or two 8-bit levels at the scale extremes, so the pins are two extreme
+    /// upscales: the digest of the reference's bytes (torchvision 0.28.0 on
+    /// the seeded input) and the positions where Pillow's bytes differ.
+    #[test]
+    fn prepare_resizes_with_the_reference_kernel_at_extreme_ratios() {
+        use sha2::{Digest, Sha256};
+
+        struct Case {
+            width: u32,
+            height: u32,
+            seed: u32,
+            // SHA-256 of the reference's 28x28 bytes.
+            digest: &'static str,
+            // (index, Pillow's byte, the reference's byte) where the two kernels part.
+            differing: &'static [(usize, u8, u8)],
+        }
+        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                    ((state >> 16) & 0xff) as u8
+                })
+                .collect()
+        }
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        let cases = [
+            Case {
+                width: 2,
+                height: 2,
+                seed: 11,
+                digest: "58b97a38d107b21c7635038b616e5fd0593204b93b82bdca5ddf413f20c7866d",
+                differing: &[
+                    (597, 132, 133),
+                    (600, 132, 133),
+                    (626, 123, 122),
+                    (653, 152, 153),
+                    (660, 172, 171),
+                    (902, 163, 164),
+                    (1040, 97, 98),
+                    (1292, 85, 84),
+                    (1490, 205, 204),
+                    (1689, 253, 252),
+                    (1692, 253, 252),
+                    (1718, 98, 99),
+                    (1745, 225, 224),
+                    (1752, 3, 4),
+                ],
+            },
+            Case {
+                width: 7,
+                height: 5,
+                seed: 13,
+                digest: "aaf8d4df4d527fe8ad579d91011a959e53427463ffcdf8331683256ac2838e7b",
+                differing: &[
+                    (662, 205, 206),
+                    (1157, 155, 154),
+                    (1260, 24, 25),
+                    (1315, 33, 34),
+                    (1702, 89, 90),
+                ],
+            },
+        ];
+        for case in cases {
+            let Case {
+                width,
+                height,
+                seed,
+                digest,
+                differing,
+            } = case;
+            let data = lcg_bytes((width * height * 3) as usize, seed);
+            let image = DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, data).unwrap());
+            // Content and target both 28x28: the resized bytes are the whole canvas.
+            let geometry = Geometry {
+                target: (28, 28),
+                content: (28, 28),
+            };
+            let bytes = prepare(&image, geometry, FilterType::CatmullRom, true).unwrap();
+            assert_eq!(bytes.len(), 28 * 28 * 3);
+            for &(index, pillow, reference) in differing {
+                assert_eq!(
+                    bytes[index], reference,
+                    "{width}x{height} -> 28x28 byte {index} (Pillow gives {pillow})"
+                );
+            }
+            assert_eq!(
+                hex(&Sha256::digest(bytes.as_ref())),
+                digest,
+                "{width}x{height} -> 28x28"
+            );
+        }
     }
 }
