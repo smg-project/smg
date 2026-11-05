@@ -2067,12 +2067,11 @@ impl Router {
             })?;
         }
 
+        // Validated once, by the builder's `build()` inside `to_router_config`;
+        // `startup` validates once more for a library caller that never went
+        // through the builder.
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
-        })?;
-
-        router_config.validate().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
         })?;
 
         let service_discovery_config = router_config

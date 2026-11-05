@@ -41,7 +41,7 @@ pub(super) fn calls(
             tags,
             &ends,
             &tool.function.name,
-            &tool.function.parameters,
+            tool.function.parameters_schema(),
         )
     });
     // The block's own newlines, where the template writes them: before each call and before the
@@ -76,7 +76,7 @@ pub(super) fn compact_calls(
             Tag::new(
                 format!("{}{}", markers.call_open, tool.function.name),
                 Grammar::JsonSchema {
-                    schema: tool.function.parameters.clone(),
+                    schema: tool.function.parameters_schema().clone(),
                     style: Some("glm_xml".to_string()),
                     excludes: Vec::new(),
                     whitespace: Whitespace::Free,

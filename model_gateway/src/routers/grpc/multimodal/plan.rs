@@ -217,6 +217,39 @@ pub(crate) async fn prepare_placeholder_tokens(
     engine_limits: &HashMap<Modality, EngineItemLimit>,
     reads_format: impl Fn(EncoderInputFormat) -> bool,
 ) -> Result<PlaceholderTokens> {
+    prepare_placeholder_tokens_with_env(
+        plan,
+        model_id,
+        tokenizer,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        engine_limits,
+        reads_format,
+        modality_limit_override,
+    )
+    .await
+}
+
+/// `prepare_placeholder_tokens` with the deployment-wide limit override (the
+/// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
+/// passes `|_| None` and holds the spec default under test whatever the shell
+/// it runs in exports.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input of the one lookup"
+)]
+async fn prepare_placeholder_tokens_with_env(
+    plan: &MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+    engine_limits: &HashMap<Modality, EngineItemLimit>,
+    reads_format: impl Fn(EncoderInputFormat) -> bool,
+    env_override: impl Fn(Modality) -> Option<usize>,
+) -> Result<PlaceholderTokens> {
     anyhow::ensure!(!plan.is_empty(), "multimodal media plan is empty");
     let model_config = components
         .config_registry
@@ -250,7 +283,7 @@ pub(crate) async fn prepare_placeholder_tokens(
         &spec_limits,
         engine_limits,
         &components.modality_limit_overrides,
-        modality_limit_override,
+        env_override,
     );
     check_item_counts(plan, &limits).map_err(|error| anyhow::anyhow!("{error}"))?;
     let requested = plan
@@ -439,7 +472,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
             },
         )]);
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -448,6 +481,7 @@ mod tests {
             "unused",
             &engine,
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
@@ -461,7 +495,7 @@ mod tests {
         // Without an engine limit the plan passes the count check and reaches
         // the placeholder resolution (which the mock tokenizer, lacking the
         // token, then refuses).
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "org/llava",
             &tokenizer,
@@ -470,11 +504,128 @@ mod tests {
             "unused",
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .unwrap_err()
         .to_string();
         assert!(!error.contains("limit of"), "{error}");
+    }
+
+    /// The specs that declare images without a count of their own leave the
+    /// bound to the engine's advertised limit and the router's knobs: for
+    /// each family, with neither a request above the ten the specs used to
+    /// copy goes through, and the flag and the engine's limit still refuse
+    /// it, each naming itself.
+    #[tokio::test]
+    async fn the_specs_without_an_image_count_of_their_own_leave_the_bound_to_the_engine_and_the_knobs(
+    ) {
+        let families = [
+            (
+                "org/qwen3-vl",
+                "<|image_pad|>",
+                151655,
+                serde_json::json!({"model_type": "qwen3_vl", "image_token_id": 151655}),
+            ),
+            (
+                "org/qwen2-vl",
+                "<|image_pad|>",
+                151655,
+                serde_json::json!({"model_type": "qwen2_vl", "image_token_id": 151655}),
+            ),
+            (
+                "org/inkling",
+                "<|unused_200054|>",
+                200054,
+                serde_json::json!({
+                    "model_type": "inkling_mm_model",
+                    "vision_config": {"decoder_dmodel": 6144}
+                }),
+            ),
+            (
+                "org/muse-spark",
+                "<|patch|>",
+                200092,
+                serde_json::json!({"model_type": "muse_spark", "image_token_id": 200092}),
+            ),
+            (
+                "org/kimi-k3",
+                "<|media_pad|>",
+                163605,
+                serde_json::json!({"model_type": "kimi_k3", "media_placeholder_token_id": 163605}),
+            ),
+        ];
+        let plan = image_urls(11);
+        for (model_id, placeholder, token_id, config) in families {
+            let registry = Arc::new(MultimodalConfigRegistry::new());
+            registry.insert(
+                "tok".to_string(),
+                Arc::new(MultimodalModelConfig::new(
+                    config,
+                    PreProcessorConfig::default(),
+                    None,
+                )),
+            );
+            let tokenizer = MockTokenizer::new().with_tokens(&[(placeholder, token_id)]);
+            let prepare = |image_limit, engine: HashMap<Modality, EngineItemLimit>| {
+                let components = MultimodalComponents::new(
+                    registry.clone(),
+                    image_limit,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .unwrap();
+                let plan = &plan;
+                let tokenizer = &tokenizer;
+                async move {
+                    prepare_placeholder_tokens_with_env(
+                        plan,
+                        model_id,
+                        tokenizer,
+                        &components,
+                        "tok",
+                        "unused",
+                        &engine,
+                        |_| true,
+                        |_| None,
+                    )
+                    .await
+                }
+            };
+
+            let placeholders = prepare(None, HashMap::new())
+                .await
+                .unwrap_or_else(|error| panic!("{model_id}: no engine limit and no knob: {error}"));
+            assert_eq!(
+                placeholders.get(Modality::Image),
+                Some(placeholder),
+                "{model_id}"
+            );
+
+            let error = prepare(Some(10), HashMap::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("11 image items")
+                    && error.contains("limit of 10")
+                    && error.contains("(--mm-per-request-image-limit)"),
+                "{model_id}: {error}"
+            );
+
+            let engine = HashMap::from([(
+                Modality::Image,
+                EngineItemLimit {
+                    limit: 8,
+                    runtime: RuntimeType::Vllm,
+                },
+            )]);
+            let error = prepare(None, engine).await.unwrap_err().to_string();
+            assert!(
+                error.contains("limit of 8") && error.contains("the engine's"),
+                "{model_id}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -658,7 +809,7 @@ mod tests {
             let plan = &plan;
             let tokenizer = &tokenizer;
             async move {
-                prepare_placeholder_tokens(
+                prepare_placeholder_tokens_with_env(
                     plan,
                     "m",
                     tokenizer,
@@ -667,6 +818,7 @@ mod tests {
                     source,
                     &HashMap::new(),
                     |format| fleet_reads_format(&fleet(runtime), "m", format),
+                    |_| None,
                 )
                 .await
             }
@@ -719,7 +871,7 @@ mod tests {
         }]);
 
         for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
-            let placeholders = prepare_placeholder_tokens(
+            let placeholders = prepare_placeholder_tokens_with_env(
                 &plan,
                 "m6",
                 &tokenizer,
@@ -728,6 +880,7 @@ mod tests {
                 source,
                 &HashMap::new(),
                 |_| true,
+                |_| None,
             )
             .await
             .unwrap_or_else(|error| panic!("{mode:?} placement: {error:#}"));
@@ -740,7 +893,7 @@ mod tests {
                 .expect("no anchors of the router's own to verify");
         }
 
-        let error = prepare_placeholder_tokens(
+        let error = prepare_placeholder_tokens_with_env(
             &plan,
             "m6",
             &tokenizer,
@@ -749,6 +902,7 @@ mod tests {
             source,
             &HashMap::new(),
             |_| true,
+            |_| None,
         )
         .await
         .expect_err("the router cannot process media it has no spec for");

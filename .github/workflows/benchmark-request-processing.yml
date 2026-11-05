@@ -91,6 +91,7 @@ jobs:
         timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           cargo bench --bench request_processing -- benchmark_summary --exact 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results

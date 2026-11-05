@@ -42,6 +42,7 @@ mod multimodal;
 mod request;
 mod shm;
 
+use self::shm::vllm_mm_hash_identity;
 pub use self::{
     embed::{ProtoEmbedComplete, ProtoEmbedRequest},
     logprobs::{ProtoInputLogProbs, ProtoOutputLogProbs, ProtoTopLogProbs},
@@ -57,7 +58,6 @@ pub use self::{
         collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_tokenspeed_shm_with,
     },
 };
-use self::{logprobs::convert_trtllm_output_logprobs, shm::vllm_mm_hash_identity};
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
@@ -66,27 +66,6 @@ pub(crate) use self::{
         vllm_mm_identity,
     },
 };
-
-/// Helper macro to convert output logprobs from proto types to unified type.
-/// Both SGLang and vLLM have identical OutputLogProbs structure.
-/// Note: Cloning is necessary as we convert from borrowed proto types to owned unified types.
-/// OOM risk is mitigated by capping top_logprobs at 20 in sampling params.
-macro_rules! convert_output_logprobs {
-    ($lp:expr) => {
-        ProtoOutputLogProbs {
-            token_logprobs: $lp.token_logprobs.clone(),
-            token_ids: $lp.token_ids.clone(),
-            top_logprobs: $lp
-                .top_logprobs
-                .iter()
-                .map(|t| ProtoTopLogProbs {
-                    values: t.values.clone(),
-                    token_ids: t.token_ids.clone(),
-                })
-                .collect(),
-        }
-    };
-}
 
 /// Helper macro to convert input logprobs from proto types to unified type.
 macro_rules! convert_input_logprobs {
@@ -547,26 +526,20 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -796,26 +769,20 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -2593,11 +2560,36 @@ mod tests {
         assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
     }
 
+    /// The raw-file request's wire bytes are the files, length-delimited in
+    /// order, whether the generated field holds them as shared or as owned
+    /// bytes: what the TRT-LLM servicer reads does not change with the type.
+    #[test]
+    fn trtllm_raw_images_encode_as_the_files_length_delimited_in_order() {
+        let files: [&[u8]; 2] = [b"abc", b"de"];
+        let data = TrtllmMultimodalData {
+            image_data: files
+                .iter()
+                .map(|file| bytes::Bytes::from_static(file))
+                .collect(),
+        };
+        let mut expected = Vec::new();
+        for file in files {
+            // field 1, wire type 2 (length-delimited): the tag, the length, the bytes
+            expected.push(0x0a);
+            expected.push(u8::try_from(file.len()).unwrap());
+            expected.extend_from_slice(file);
+        }
+        assert_eq!(data.into_proto().encode_to_vec(), expected);
+    }
+
     #[test]
     /// Account for all inline pixels and raw media across supported engine payloads.
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
         let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
-            image_data: vec![vec![0; 3], vec![0; 5]],
+            image_data: vec![
+                bytes::Bytes::from(vec![0; 3]),
+                bytes::Bytes::from(vec![0; 5]),
+            ],
         });
         assert_eq!(trtllm.inline_bytes(), 8);
 

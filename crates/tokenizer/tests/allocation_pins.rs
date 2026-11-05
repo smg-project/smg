@@ -16,8 +16,9 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use common::counting_alloc::{calls, Counting};
 use llm_tokenizer::{
-    traits::{Encoder, Tokenizer},
-    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence,
+    chat_template::ChatTemplateParams,
+    traits::{Encoder, PromptEncoding, Tokenizer},
+    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence, TiktokenTokenizer,
 };
 use tokenizers::{
     decoders::{
@@ -171,6 +172,37 @@ fn distinct(steps: &[usize]) -> BTreeSet<usize> {
     steps.iter().copied().collect()
 }
 
+/// A first sight of a piece of up to 128 bytes merges on the stack. What
+/// the encode allocates is its list of units, its ids (the list, grown once
+/// past its guess) and the thread's cache entry for a piece longer than the
+/// packed table keys (the piece and its ids, two boxes): five calls. What
+/// moves it: a merge that returns to the heap (the linked list and the
+/// candidate heap of the long merge were two more calls), a cache tier that
+/// copies differently. The opt-in v1 pipeline, when its feature is compiled
+/// in, takes a BPE tokenizer in front of the direct path, so this pin of the
+/// direct path's merge is built without that feature.
+#[cfg(not(feature = "tokenizers-v1"))]
+#[test]
+fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
+    let tokenizer = byte_level();
+    // The thread's cache and its map tier exist and have room: the pieces
+    // below settle both before the measured piece.
+    for letter in ["a", "b", "c", "d", "e", "f"] {
+        let settled = letter.repeat(40);
+        tokenizer.encode(&settled, false).expect("an encode");
+    }
+    // One piece of forty bytes under the byte-level split, with merges in it.
+    let piece = "hello".repeat(8);
+    let (encoding, calls) = allocations_during(|| tokenizer.encode(&piece, false));
+    let encoding = encoding.expect("an encode");
+    assert_eq!(encoding.token_ids().len(), 24, "h e llo, eight times");
+    assert_eq!(
+        calls, 5,
+        "a first sight of a 40-byte piece allocated {calls} times: the units, the ids and the \
+         cache entry are five, the merge itself none"
+    );
+}
+
 #[test]
 fn a_decode_step_on_a_byte_level_vocabulary_allocates_nothing() {
     let tokenizer = byte_level();
@@ -225,4 +257,102 @@ fn a_decode_step_on_a_byte_fallback_vocabulary_costs_two_strings_today() {
             distinct(steady)
         );
     }
+}
+
+/// A byte-level tiktoken vocabulary (one token per byte) with the four control
+/// tokens the segmented renderer writes, under a configuration that selects
+/// that renderer and the checkpoint's own piece cuts, as the served
+/// checkpoints do; its ids are the prompt's bytes, so the count below reads
+/// the encode's own work, not a merge table's.
+fn segmented_tiktoken_dir() -> tempfile::TempDir {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let model: String = (0u32..256)
+        .map(|b| format!("{} {b}\n", STANDARD.encode([b as u8])))
+        .collect();
+    std::fs::write(dir.path().join("tiktoken.model"), model).expect("the model");
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        r#"{"added_tokens_decoder": {
+            "300": {"content": "<|open|>", "special": false},
+            "301": {"content": "<|close|>", "special": false},
+            "302": {"content": "<|sep|>", "special": false},
+            "303": {"content": "<|end_of_msg|>", "special": true}
+        }}"#,
+    )
+    .expect("the tokenizer config");
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3"}"#,
+    )
+    .expect("the model config");
+    dir
+}
+
+/// Forty turns of a conversation, each a sentence or two.
+fn forty_messages() -> Vec<serde_json::Value> {
+    (0..40)
+        .map(|k| {
+            let (role, text) = if k % 2 == 0 {
+                (
+                    "user",
+                    "Please summarize the paragraph about the history of computing.",
+                )
+            } else {
+                (
+                    "assistant",
+                    "Computing began with mechanical calculators and grew into networks.",
+                )
+            };
+            serde_json::json!({"role": role, "content": format!("{text} ({k})")})
+        })
+        .collect()
+}
+
+/// The allocation calls of a forty-turn segmented encode today: the library's
+/// own encodes make almost all of it (a parts list and a rank list per word it
+/// merges); the ids buffer, sized up front at one id per three bytes, makes one
+/// and its regrowths on this one-id-per-byte vocabulary (about twice the
+/// reservation) make the rest of its share; nothing is made per segment.
+const PIN_SEGMENTED_ENCODE_CALLS: usize = 2_430;
+
+#[test]
+fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
+    let dir = segmented_tiktoken_dir();
+    let tokenizer = TiktokenTokenizer::from_dir(dir.path()).expect("the tokenizer loads");
+    let messages = forty_messages();
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let render = || {
+        tokenizer
+            .apply_chat_template_with_encoding(&messages, params(), None)
+            .expect("the render")
+    };
+    // One warm render: whatever is lazy on the path is built here.
+    let warm = render();
+    let PromptEncoding::Deferred(job) = warm.encoding else {
+        panic!("the segmented renderer defers its encode");
+    };
+    let expected_ids = job.run().expect("the encode").token_ids().to_vec();
+    let rendered = render();
+    let PromptEncoding::Deferred(job) = rendered.encoding else {
+        panic!("the segmented renderer defers its encode");
+    };
+    let (ids, calls) = allocations_during(|| job.run().expect("the encode"));
+    assert_eq!(ids.token_ids(), expected_ids, "the ids are the render's");
+    assert_eq!(
+        calls,
+        PIN_SEGMENTED_ENCODE_CALLS,
+        "encoding the segments of a forty-turn render ({} ids; about twenty segments per turn, \
+         every piece of a tag's attributes one of them) allocated {calls} times: the library's \
+         own encodes make almost all of it, the ids buffer sized up front at one id per three \
+         bytes makes one and its regrowths on this one-id-per-byte vocabulary the rest of its \
+         share, and nothing is made per segment; a list per segment (the checkpoint's cut of a \
+         segment shorter than its bounds, or a vector around the text) moves this up by the \
+         segment count (about 760), a tighter or looser sizing rule by the regrowths it saves \
+         or adds, and a change of the library by what its encodes make",
+        ids.token_ids().len()
+    );
 }

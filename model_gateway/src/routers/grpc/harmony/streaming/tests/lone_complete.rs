@@ -17,7 +17,9 @@ use super::{super::HarmonyStreamingProcessor, usage::harmony_tokens};
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{
-        context, harmony::try_harmony_encoding, regular::streaming::tests::eof::scripted_stream,
+        context,
+        harmony::try_harmony_encoding,
+        regular::streaming::tests::eof::{choice_trail, scripted_stream},
         utils,
     },
 };
@@ -98,23 +100,6 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
         "the stream completes without an error event: {events:?}"
     );
     events
-}
-
-/// Per choice, the role and finish reason of each of its deltas, in stream
-/// order.
-fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
-    events
-        .iter()
-        .filter_map(|event| {
-            let choice = event["choices"].get(0)?;
-            (choice["index"] == index).then(|| {
-                (
-                    choice["delta"]["role"].as_str(),
-                    choice["finish_reason"].as_str(),
-                )
-            })
-        })
-        .collect()
 }
 
 #[tokio::test]

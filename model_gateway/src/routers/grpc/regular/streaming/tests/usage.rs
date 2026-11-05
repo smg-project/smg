@@ -30,16 +30,13 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use super::{
     super::*,
     eof::{
-        chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
-        processor, scripted_stream, trailers_frame, CharacterTokenizer,
+        chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
+        mock_worker_endpoint, processor, response_processor, scripted_stream, trailers_frame,
+        CharacterTokenizer,
     },
     symphony_chat::assigned_message,
 };
-use crate::{
-    rate_limit::test_support::RecordingBackend,
-    routers::grpc::{pipeline::RequestPipeline, regular::processor::ResponseProcessor},
-    worker::WorkerRegistry,
-};
+use crate::{rate_limit::test_support::RecordingBackend, routers::grpc::pipeline::RequestPipeline};
 
 /// A scripted worker stream and the mock server that owns its connection.
 type Scripted = (ProtoStream, JoinHandle<()>);
@@ -177,19 +174,6 @@ fn dispatch() -> context::DispatchMetadata {
         created: 1,
         weight_version: None,
     }
-}
-
-/// The non-streamed processor with the parsers of [`processor`].
-fn response_processor() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
 }
 
 fn tokenizer() -> Arc<dyn Tokenizer> {
@@ -371,23 +355,6 @@ async fn non_streamed_generate(
         .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
     responses
-}
-
-/// A Messages request with thinking on or off, no tools.
-fn messages_spec(thinking: bool) -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: thinking,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    }
 }
 
 /// Drive the Messages streaming path over `stream` with a reservation to
@@ -888,9 +855,13 @@ async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
 }
 
 /// The settlement of a Messages request carries the engine's counts, streamed
-/// and not, though the Messages usage reports no cache hits and the greater
-/// of the engine's and the parser's thinking count: the engine's cache hit
-/// and its own thinking count, zero where its frames carry none.
+/// and not: the engine's cache hit and its own thinking count, zero where its
+/// frames carry none. The Messages usage reports the same cache hit as
+/// `cache_read_input_tokens` beside `input_tokens` = the prompt outside the
+/// cache, on the final `message_delta` and on the collected message (integers
+/// either way; the `message_start` skeleton stays at zero, as it precedes the
+/// engine's frames), and the greater of the engine's and the parser's
+/// thinking count.
 #[tokio::test]
 async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
     let texts = ["<think>", "ab", "</think>", "de"];
@@ -912,12 +883,36 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
             .rfind(|event| event["type"] == "message_delta")
             .expect("a message_delta event");
         assert_eq!(
-            delta["usage"]["cache_read_input_tokens"], 0,
-            "{name}: the Messages usage reports no cache hits"
+            delta["usage"]["cache_read_input_tokens"], expected.cached_input_tokens,
+            "{name}: the message_delta usage reports the engine's cache hit"
+        );
+        assert_eq!(delta["usage"]["cache_creation_input_tokens"], 0, "{name}");
+        assert_eq!(
+            delta["usage"]["input_tokens"],
+            expected.actual_input_tokens - expected.cached_input_tokens,
+            "{name}: the message_delta input_tokens is the prompt outside the cache"
+        );
+        let start = events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("a message_start event");
+        assert_eq!(
+            start["message"]["usage"]["cache_read_input_tokens"], 0,
+            "{name}: the skeleton precedes the engine's frames"
         );
         let (message, counts) = non_streamed_messages(scripted().await, messages_spec(true)).await;
         assert_eq!(counts.settlement(), expected, "{name}: non-streamed");
-        assert_eq!(message.usage.cache_read_input_tokens, Some(0), "{name}");
+        assert_eq!(
+            message.usage.cache_read_input_tokens,
+            Some(expected.cached_input_tokens),
+            "{name}: the collected message reports the engine's cache hit"
+        );
+        assert_eq!(message.usage.cache_creation_input_tokens, Some(0), "{name}");
+        assert_eq!(
+            message.usage.input_tokens,
+            expected.actual_input_tokens - expected.cached_input_tokens,
+            "{name}: the collected message's input_tokens is the prompt outside the cache"
+        );
     }
 }
 

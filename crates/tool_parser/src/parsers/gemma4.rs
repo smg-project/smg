@@ -174,7 +174,7 @@ fn decode_call(input: &str, tools: &[Tool]) -> Option<(String, Value, usize)> {
     let schema = tools
         .iter()
         .find(|tool| tool.function.name == name)
-        .map(|tool| &tool.function.parameters)
+        .map(|tool| tool.function.parameters_schema())
         .unwrap_or(&Value::Null);
     let args = reader.object(close, 0, schema)?;
     Some((name.to_owned(), args, args_start + reader.pos))

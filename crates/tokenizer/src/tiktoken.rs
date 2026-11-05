@@ -24,7 +24,8 @@ use crate::{
         join_segments,
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
-            self, apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, RenderedXtml,
+            apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, KimiXtml,
+            RenderedXtml,
         },
         PromptSegment, RendererProfile, TemplateAnswers,
     },
@@ -41,9 +42,9 @@ use crate::{
 enum Renderer {
     Jinja,
     KimiK25Tools,
-    /// Kimi-K3 renders its prompt entirely in the native XTML encoder (no Jinja
-    /// chat template). See [`crate::encoders::kimi_k3_xtml`].
-    KimiK3Xtml,
+    /// Kimi-K3 and Kimi-K3.1 render their prompt entirely in the native XTML
+    /// encoder (no Jinja chat template). See [`crate::encoders::kimi_k3_xtml`].
+    KimiXtml(KimiXtml),
 }
 
 impl Renderer {
@@ -52,7 +53,7 @@ impl Renderer {
     fn profile(self) -> Option<RendererProfile> {
         match self {
             Self::Jinja | Self::KimiK25Tools => None,
-            Self::KimiK3Xtml => Some(kimi_k3_xtml::PROFILE),
+            Self::KimiXtml(model) => Some(model.profile()),
         }
     }
 }
@@ -416,7 +417,7 @@ impl TiktokenTokenizer {
             checkpoint_pieces: kimi,
             tools_key_sorted: match renderer {
                 Renderer::KimiK25Tools => true,
-                Renderer::KimiK3Xtml => false,
+                Renderer::KimiXtml(_) => false,
                 Renderer::Jinja => kimi,
             },
         })
@@ -515,8 +516,8 @@ impl TiktokenTokenizer {
             // This is the layer the checkpoint's own `apply_chat_template` sits
             // at, so it applies that wrapper's `thinking_effort` default. K3 does
             // not continue a final message (its prefill is the assistant prefix).
-            Renderer::KimiK3Xtml => Ok((
-                apply_kimi_k3_xtml_with_effort_default(messages, &params)?,
+            Renderer::KimiXtml(model) => Ok((
+                apply_kimi_k3_xtml_with_effort_default(model, messages, &params)?,
                 false,
             )),
         }
@@ -729,31 +730,81 @@ fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
 /// checkpoint's pieces when `checkpoint_pieces` is set. The allowed-special
 /// set is built once per prompt; `encode_with_special_tokens` would rebuild
 /// it for every piece, and a Kimi prompt has hundreds of control pieces.
+/// The ids are the segments' own encodes, one after another: a prompt's ids
+/// are the ids of any split of its segments, encoded apart and joined.
 fn encode_segments(
     bpe: &CoreBPE,
     segments: &[PromptSegment],
     checkpoint_pieces: bool,
 ) -> Result<Vec<TokenIdType>> {
-    let allowed = bpe.special_tokens();
-    let mut ids = Vec::new();
+    let mut ids = Vec::with_capacity(ids_capacity(segments));
+    encode_segments_into(
+        bpe,
+        &bpe.special_tokens(),
+        segments,
+        checkpoint_pieces,
+        &mut ids,
+    )?;
+    Ok(ids)
+}
+
+/// Room for the ids of `segments` before any is encoded: one id per three
+/// bytes of text, the direct encoder's rule for prose and code. A prompt
+/// denser than that grows the buffer once; nothing grows it per segment.
+fn ids_capacity(segments: &[PromptSegment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| segment.text.len())
+        .sum::<usize>()
+        / 3
+        + 8
+}
+
+/// [`encode_segments`], appending to `ids`, with the allowed-special set the
+/// caller built once for the prompt (`bpe.special_tokens()`): a caller that
+/// holds some of the segments' ids already writes the rest around them into
+/// one buffer.
+fn encode_segments_into(
+    bpe: &CoreBPE,
+    allowed: &HashSet<&str>,
+    segments: &[PromptSegment],
+    checkpoint_pieces: bool,
+    ids: &mut Vec<TokenIdType>,
+) -> Result<()> {
     for segment in segments {
-        let pieces = if checkpoint_pieces {
-            self::checkpoint_pieces(&segment.text)
-        } else {
-            vec![segment.text.as_str()]
-        };
-        for piece in pieces {
-            if segment.allow_special {
-                let (ids_of_piece, _) = bpe
-                    .encode(piece, &allowed)
-                    .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
-                ids.extend(ids_of_piece);
-            } else {
-                ids.extend(bpe.encode_ordinary(piece));
+        // The checkpoint cuts at a window of characters and at a run of them, both longer than
+        // this bound in bytes: a shorter segment is one piece, encoded without the cut's walk
+        // over its characters and the list of its pieces.
+        if checkpoint_pieces && segment.text.len() > CHECKPOINT_RUN_CHARS {
+            for piece in self::checkpoint_pieces(&segment.text) {
+                encode_piece(bpe, allowed, piece, segment.allow_special, ids)?;
             }
+        } else {
+            encode_piece(bpe, allowed, &segment.text, segment.allow_special, ids)?;
         }
     }
-    Ok(ids)
+    Ok(())
+}
+
+/// One piece's ids, appended: a control piece with the special tokens of
+/// `allowed` recognized, a text piece as ordinary BPE.
+#[inline(always)]
+fn encode_piece(
+    bpe: &CoreBPE,
+    allowed: &HashSet<&str>,
+    piece: &str,
+    allow_special: bool,
+    ids: &mut Vec<TokenIdType>,
+) -> Result<()> {
+    if allow_special {
+        let (ids_of_piece, _) = bpe
+            .encode(piece, allowed)
+            .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
+        ids.extend(ids_of_piece);
+    } else {
+        ids.extend(bpe.encode_ordinary(piece));
+    }
+    Ok(())
 }
 
 impl Encoder for TiktokenTokenizer {
@@ -891,7 +942,7 @@ impl TokenizerTrait for TiktokenTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        if !matches!(self.renderer, Renderer::KimiK3Xtml) {
+        let Renderer::KimiXtml(model) = self.renderer else {
             let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
             let (mut text, continued_final_message) =
                 self.apply_with_continuation(messages, params)?;
@@ -905,22 +956,34 @@ impl TokenizerTrait for TiktokenTokenizer {
                 continued_final_message,
                 generation_prompt: generation_prompt_unless_continued && !continued_final_message,
             });
-        }
+        };
         // K3's ids are not a function of the flat text: render the reference's
         // segments and hand the caller the piecewise encode to run where it
         // would have encoded the text. The renderer reads none of
         // `params.special_tokens`, so the injection `apply_chat_template`
         // performs is a no-op here.
         let RenderedXtml { segments, pending } =
-            render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
+            render_kimi_k3_xtml_prompt(model, messages, &params, assistant_prefix)?;
         let text = join_segments(&segments);
-        // Piecewise encoding makes the stub's own count its share of the full encode.
+        // Piecewise encoding makes the stub's own count its share of the full
+        // encode: its ids, encoded once here for the count, are kept for the
+        // job, which writes the segments before and after them around them.
         let checkpoint_pieces = self.checkpoint_pieces;
-        let unbilled_prompt_tokens =
-            encode_segments(&self.tokenizer, &segments[pending], checkpoint_pieces)?.len() as u32;
+        let pending_ids = encode_segments(
+            &self.tokenizer,
+            &segments[pending.clone()],
+            checkpoint_pieces,
+        )?;
+        let unbilled_prompt_tokens = pending_ids.len() as u32;
         let bpe = Arc::clone(&self.tokenizer);
         let job = EncodeJob::new(move || {
-            encode_segments(&bpe, &segments, checkpoint_pieces).map(Encoding::Tiktoken)
+            let allowed = bpe.special_tokens();
+            let mut ids = Vec::with_capacity(ids_capacity(&segments));
+            let (before, after) = (&segments[..pending.start], &segments[pending.end..]);
+            encode_segments_into(&bpe, &allowed, before, checkpoint_pieces, &mut ids)?;
+            ids.extend_from_slice(&pending_ids);
+            encode_segments_into(&bpe, &allowed, after, checkpoint_pieces, &mut ids)?;
+            Ok(Encoding::Tiktoken(ids))
         });
         Ok(ChatTemplateOutput {
             text,
@@ -1018,7 +1081,11 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
         .unwrap_or_default();
     if arch_strs.contains(&"KimiK3ForConditionalGeneration") {
         tracing::debug!(?path, "selected KimiK3Xtml chat-template renderer");
-        return Renderer::KimiK3Xtml;
+        return Renderer::KimiXtml(KimiXtml::K3);
+    }
+    if arch_strs.contains(&"KimiK31ForConditionalGeneration") {
+        tracing::debug!(?path, "selected KimiK31Xtml chat-template renderer");
+        return Renderer::KimiXtml(KimiXtml::K31);
     }
     if arch_strs.contains(&"KimiK25ForConditionalGeneration") {
         tracing::debug!(?path, "selected KimiK25Tools chat-template renderer");
@@ -1031,7 +1098,11 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
     match value.get("model_type").and_then(|v| v.as_str()) {
         Some("kimi_k3") => {
             tracing::debug!(?path, "selected KimiK3Xtml renderer via model_type");
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        }
+        Some("kimi_k31") => {
+            tracing::debug!(?path, "selected KimiK31Xtml renderer via model_type");
+            Renderer::KimiXtml(KimiXtml::K31)
         }
         Some("kimi_k25") => {
             tracing::debug!(?path, "selected KimiK25Tools renderer via model_type");
@@ -1092,12 +1163,39 @@ mod tests {
             .collect()
     }
 
+    /// The pieces the gateway's per-stream decoder emits for `ids`, then what
+    /// its finish releases.
+    fn stream_then_finish(
+        tokenizer: &Arc<dyn Tokenizer>,
+        ids: &[TokenIdType],
+        skip: bool,
+    ) -> (Vec<String>, String) {
+        let mut sequence = Sequence::new_with_options(Arc::clone(tokenizer), skip);
+        let pieces = ids
+            .iter()
+            .map(|&id| sequence.append_token(id).unwrap())
+            .collect();
+        (pieces, sequence.finish().unwrap())
+    }
+
+    /// Ranks `a`, `b`, the lead byte C3, the continuation byte A9 and the three
+    /// bytes of a literal U+FFFD: a character can end a stream unfinished.
+    const PARTIAL_BYTE_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\nww== 2\nqQ== 3\n77+9 4\n";
+
     fn write_minimal_tiktoken_dir(
         tokenizer_config: &str,
         model_config: Option<&str>,
     ) -> tempfile::TempDir {
+        write_tiktoken_dir(MINIMAL_TIKTOKEN_MODEL, tokenizer_config, model_config)
+    }
+
+    fn write_tiktoken_dir(
+        model: &str,
+        tokenizer_config: &str,
+        model_config: Option<&str>,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tiktoken.model"), MINIMAL_TIKTOKEN_MODEL).unwrap();
+        std::fs::write(dir.path().join("tiktoken.model"), model).unwrap();
         std::fs::write(dir.path().join("tokenizer_config.json"), tokenizer_config).unwrap();
         if let Some(model_config) = model_config {
             std::fs::write(dir.path().join("config.json"), model_config).unwrap();
@@ -1161,7 +1259,16 @@ mod tests {
         );
         assert!(matches!(
             detect_renderer_from_config(k3.path()),
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        ));
+
+        let k31 = write_minimal_tiktoken_dir(
+            "{}",
+            Some(r#"{"architectures": ["KimiK31ForConditionalGeneration"]}"#),
+        );
+        assert!(matches!(
+            detect_renderer_from_config(k31.path()),
+            Renderer::KimiXtml(KimiXtml::K31)
         ));
 
         let k25 = write_minimal_tiktoken_dir(
@@ -1192,7 +1299,14 @@ mod tests {
         let k3_model_type = write_minimal_tiktoken_dir("{}", Some(r#"{"model_type": "kimi_k3"}"#));
         assert!(matches!(
             detect_renderer_from_config(k3_model_type.path()),
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        ));
+
+        let k31_model_type =
+            write_minimal_tiktoken_dir("{}", Some(r#"{"model_type": "kimi_k31"}"#));
+        assert!(matches!(
+            detect_renderer_from_config(k31_model_type.path()),
+            Renderer::KimiXtml(KimiXtml::K31)
         ));
 
         let k25_model_type =
@@ -1521,6 +1635,85 @@ mod tests {
         assert!(err.to_string().contains("unknown token id"), "{err}");
     }
 
+    /// A stream that ends while the per-stream decoder holds bytes (a lead byte,
+    /// a lone continuation byte, a literal replacement character, a byte before
+    /// a skipped special token): its finish releases what the full decode
+    /// renders for them, and the pieces before it hold as they did.
+    #[test]
+    fn stream_end_releases_the_bytes_it_holds() {
+        let dir = write_tiktoken_dir(
+            PARTIAL_BYTE_TIKTOKEN_MODEL,
+            r#"{"added_tokens_decoder": {"5": {"content": "[EOS]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_some());
+        let cases: [(&[TokenIdType], bool, &str); 6] = [
+            (&[2], false, "\u{FFFD}"),
+            (&[0, 1, 3], false, "ab\u{FFFD}"),
+            (&[4], false, "\u{FFFD}"),
+            (&[2, 3], false, "é"),
+            (&[3, 5], true, "\u{FFFD}"),
+            (&[3, 5], false, "\u{FFFD}[EOS]"),
+        ];
+        for (ids, skip, expected) in cases {
+            assert_eq!(
+                tokenizer.decode(ids, skip).unwrap(),
+                expected,
+                "ids={ids:?}"
+            );
+            let (pieces, finish) = stream_then_finish(&tokenizer, ids, skip);
+            assert_eq!(
+                pieces.concat() + &finish,
+                expected,
+                "ids={ids:?} skip={skip}: pieces {pieces:?}, finish {finish:?}"
+            );
+        }
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
+        assert_eq!(pieces, ["a", "b", ""]);
+        assert_eq!(finish, "\u{FFFD}");
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[3, 5], true);
+        assert_eq!(pieces, ["", ""]);
+        assert_eq!(finish, "\u{FFFD}");
+    }
+
+    /// The same end through the generic decoder (no per-id table because an
+    /// added token sits far beyond the ranks): the window's held bytes are
+    /// released as the full decode renders them.
+    #[test]
+    fn stream_end_releases_the_bytes_it_holds_on_the_generic_path() {
+        let dir = write_tiktoken_dir(
+            PARTIAL_BYTE_TIKTOKEN_MODEL,
+            r#"{"added_tokens_decoder": {"100000000": {"content": "[FAR]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_none());
+        let cases: [(&[TokenIdType], &str); 3] = [
+            (&[2], "\u{FFFD}"),
+            (&[0, 1, 3], "ab\u{FFFD}"),
+            (&[2, 3], "é"),
+        ];
+        for (ids, expected) in cases {
+            assert_eq!(
+                tokenizer.decode(ids, false).unwrap(),
+                expected,
+                "ids={ids:?}"
+            );
+            let (pieces, finish) = stream_then_finish(&tokenizer, ids, false);
+            assert_eq!(
+                pieces.concat() + &finish,
+                expected,
+                "ids={ids:?}: pieces {pieces:?}, finish {finish:?}"
+            );
+        }
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
+        assert_eq!(pieces, ["a", "b", ""]);
+        assert_eq!(finish, "\u{FFFD}");
+    }
+
     #[test]
     fn test_incremental_decode_keeps_the_generic_path_for_distant_ids() {
         // An added token far beyond the ranks: no per-id table is built for
@@ -1630,6 +1823,25 @@ mod tests {
         assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
     }
 
+    /// The segment encode skips the checkpoint's cut for a segment of at most
+    /// `CHECKPOINT_RUN_CHARS` bytes: such a text holds at most that many
+    /// characters, so neither cut can fall inside it and it is one piece.
+    #[test]
+    fn a_segment_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
+        let at_the_bound = " ".repeat(CHECKPOINT_RUN_CHARS);
+        assert_eq!(
+            checkpoint_pieces(&at_the_bound),
+            vec![at_the_bound.as_str()]
+        );
+        let past_it = " ".repeat(CHECKPOINT_RUN_CHARS + 1);
+        assert_eq!(checkpoint_pieces(&past_it).len(), 2);
+        let two_byte_characters = "\u{e9}".repeat(CHECKPOINT_RUN_CHARS / 2);
+        assert_eq!(
+            checkpoint_pieces(&two_byte_characters),
+            vec![two_byte_characters.as_str()]
+        );
+    }
+
     #[test]
     fn checkpoint_pieces_cut_at_the_window_and_at_long_runs() {
         assert_eq!(checkpoint_pieces(""), Vec::<&str>::new());
@@ -1736,7 +1948,7 @@ mod tests {
         let ids = job.run().unwrap();
         let expected = encode_segments(
             &tokenizer.tokenizer,
-            &render_kimi_k3_xtml_prompt(&messages, &params(), None)
+            &render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params(), None)
                 .unwrap()
                 .segments,
             tokenizer.checkpoint_pieces,

@@ -56,6 +56,15 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
+/// Whether `s` is a label the interner holds. A test that must prove a
+/// value never became a label asks this, which no neighbouring test's
+/// interning can disturb, where the interner's size moves with every
+/// label any test records.
+#[cfg(test)]
+pub(crate) fn is_interned(s: &str) -> bool {
+    STRING_INTERNER.contains_key(s)
+}
+
 /// Per-worker caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's, the per-worker
 /// request counters' and gauges', the breaker's outcomes', the selection's,

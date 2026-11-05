@@ -91,7 +91,7 @@ impl RateLimitCell {
         let request = ReserveRequest {
             request_charge_id: tenant_meta.request_charge_id,
             tenant_key: tenant_meta.tenant_key.clone(),
-            model_id: Some(model_id.to_string()),
+            model_id: Some(model_id),
             estimated_input_tokens,
         };
         match manager.reserve(request).await {
@@ -185,7 +185,7 @@ mod tests {
 
     #[async_trait]
     impl RateLimitBackend for CountingBackend {
-        async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+        async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
             ReserveOutcome::Admitted
         }
         async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}

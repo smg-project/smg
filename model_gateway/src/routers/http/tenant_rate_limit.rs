@@ -39,7 +39,8 @@ use openai_protocol::{
     },
     systemone::SystemOneRequest,
 };
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{value::RawValue, Value};
 
 #[cfg(test)]
 use crate::routers::common::request_lease::test_probe::DropProbeRequest;
@@ -402,11 +403,25 @@ fn hold_in_body(response: Response, attachment: ReservationAttachment) -> Respon
 /// its cache is not recorded; which of the output it counted as reasoning
 /// is recorded on `/v1/interactions` only.
 fn usage_from_body(route: &str, samples_per_prompt: u32, body: &[u8]) -> Option<UsageSettlement> {
-    let value: Value = serde_json::from_slice(body).ok()?;
     if route == "/generate" {
+        let value: Value = serde_json::from_slice(body).ok()?;
         return generate_usage(&value, samples_per_prompt);
     }
-    let usage = value.get("usage")?;
+    // The answer's `usage` object alone is read into a value; the rest of
+    // the document (the choices, the text) is scanned past, not built.
+    #[derive(Deserialize)]
+    struct UsageOnly<'a> {
+        #[serde(borrow)]
+        usage: Option<&'a RawValue>,
+    }
+    let usage: Value = serde_json::from_str(
+        serde_json::from_slice::<UsageOnly<'_>>(body)
+            .ok()?
+            .usage?
+            .get(),
+    )
+    .ok()?;
+    let usage = &usage;
     let (input, output) = match route {
         "/v1/embeddings" | "/v1/classify" => (
             as_u32(usage.get("prompt_tokens")?)?,

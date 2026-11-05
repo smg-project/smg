@@ -62,7 +62,9 @@ experiments against it transfer to engines:
 - **pass loop** — every pass has a token budget (`--max-batched-tokens`, 8192)
   and a sequence cap (`--max-running`, 256). Running requests go first, each
   taking one decode token or a prefill chunk; then the queue is admitted FCFS
-  while budget and KV room remain. With `--prefill-first true` (SGLang) a pass
+  while budget and KV room remain. A queued request whose client has gone (its
+  stream closed with no abort) leaves the queue at the next pass, without a
+  prefill, as a running one does. With `--prefill-first true` (SGLang) a pass
   that contains prefill runs prefill only.
 - **block-level KV pool** — `--kv-blocks`/`--kv-tokens` physical blocks of
   `--block-size` tokens, keyed by content hash with reference counts; idle

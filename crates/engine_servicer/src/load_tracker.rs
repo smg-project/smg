@@ -21,7 +21,10 @@
 //!   service-rate estimate, not GPU kernel time. At least two valid samples
 //!   are required; up to 64 are retained for 60 seconds. Missing engine timing,
 //!   preemptions, zero-work hits and intervals shorter than 1 ms do not calibrate
-//!   capacity. vLLM must enable `log_stats` to emit the scheduling events;
+//!   capacity. vLLM must enable `log_stats` to emit the scheduling events. A
+//!   wire that carries no engine timing measures on the servicer's clock
+//!   instead, from the requests that met no queue on their rank
+//!   ([`PrefillProbe`]: the submit to the first output, once per request);
 //! - generation throughput is the tokens the rank streamed over the last
 //!   [`THROUGHPUT_WINDOW`];
 //! - the hit rate is cached over prompt tokens across the rank's last
@@ -34,9 +37,13 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
+
+use engine_zmq_client::protocol::EngineLoad;
+
+use crate::servicer::WireState;
 
 /// How far back streamed tokens count toward the throughput.
 pub(crate) const THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
@@ -142,9 +149,21 @@ struct Inner {
 
 /// Per-servicer load bookkeeping, kept per rank; every method is cheap and
 /// lock-scoped.
-#[derive(Default)]
 pub(crate) struct LoadTracker {
     inner: Mutex<Inner>,
+    /// Where the servicer-clock prefill samples count their seconds from
+    /// ([`Self::prefill_observed`]): one axis per tracker, so a rank's
+    /// intervals union on it.
+    epoch: Instant,
+}
+
+impl Default for LoadTracker {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            epoch: Instant::now(),
+        }
+    }
 }
 
 impl LoadTracker {
@@ -152,13 +171,19 @@ impl LoadTracker {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A request with `prompt_tokens` was handed to `rank`.
-    pub(crate) fn submitted(&self, rank: i32, request_id: &str, prompt_tokens: u32) {
-        self.lock().pending.push_back(Pending {
+    /// A request with `prompt_tokens` was handed to `rank`. Whether the rank
+    /// had no request of this servicer in flight ahead of it (none submitted
+    /// and not started), which a servicer-clock prefill sample needs
+    /// ([`PrefillProbe`]).
+    pub(crate) fn submitted(&self, rank: i32, request_id: &str, prompt_tokens: u32) -> bool {
+        let mut inner = self.lock();
+        let idle = !inner.pending.iter().any(|pending| pending.rank == rank);
+        inner.pending.push_back(Pending {
             request_id: request_id.to_string(),
             prompt_tokens,
             rank,
         });
+        idle
     }
 
     /// `rank`'s first output for a request: it has started, and its prompt
@@ -195,6 +220,23 @@ impl LoadTracker {
     /// ends. Zero-work cache hits and invalid timings cannot calibrate capacity.
     pub(crate) fn prefill_computed(&self, rank: i32, tokens: u32, start: f64, end: f64) {
         self.prefill_computed_at(rank, tokens, start, end, Instant::now());
+    }
+
+    /// A prefill observed on the servicer's clock, on a wire that carries no
+    /// engine timing: `tokens` computed between the submit (`started`, the
+    /// engine had accepted the request) and its first output (`ended`). The
+    /// caller vouches that the request met no queue on the rank (see
+    /// [`PrefillProbe`]); the sample goes through the same validity rule and
+    /// estimator as an engine-timed one.
+    pub(crate) fn prefill_observed(
+        &self,
+        rank: i32,
+        tokens: u32,
+        started: Instant,
+        ended: Instant,
+    ) {
+        let seconds = |at: Instant| at.saturating_duration_since(self.epoch).as_secs_f64();
+        self.prefill_computed_at(rank, tokens, seconds(started), seconds(ended), ended);
     }
 
     /// Validate and retain a sample with a local expiry timestamp.
@@ -279,6 +321,206 @@ impl LoadTracker {
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.lock().pending.len()
+    }
+
+    /// The prefill samples `rank` holds (expired ones included until the
+    /// next estimate trims them).
+    #[cfg(test)]
+    pub(crate) fn prefill_samples(&self, rank: i32) -> usize {
+        self.lock()
+            .ranks
+            .get(&rank)
+            .map_or(0, |figures| figures.prefills.len())
+    }
+}
+
+/// The data-parallel rank a choice's engine request went to, as the tracker
+/// and `GetLoads` name it (an engine whose identity names no index counts as
+/// the first).
+pub(crate) fn rank_of(engine_index: Option<u32>) -> i32 {
+    engine_index
+        .and_then(|index| i32::try_from(index).ok())
+        .unwrap_or(0)
+}
+
+/// Whether a rank's last load tail leaves a newly handed request no queue:
+/// nothing waiting and room in the admission window (`window` 0 or less:
+/// unknown, counts as room). A rank without a tail yet has reported no
+/// batch since boot and has room.
+pub(crate) fn rank_has_room(tail: Option<EngineLoad>, window: i32) -> bool {
+    let Some(tail) = tail else {
+        return true;
+    };
+    let window = u64::try_from(window).unwrap_or(0);
+    tail.num_waiting == 0 && (window == 0 || tail.num_running < window)
+}
+
+/// One request's servicer-clock prefill sample on a wire without engine
+/// timing: armed at the submit when the request met no queue on its rank
+/// (nothing of this servicer in flight ahead of it, the rank's last load
+/// tail with nothing waiting and room in its window, a single choice), taken
+/// once at the request's first output with its prompt figures. The interval
+/// holds more than the prefill: the two wire hops and the wait for the
+/// scheduler's current step (near-constant), and on the workers the gateway
+/// reads this field for, the prefill role of a disaggregated pair, the
+/// bootstrap wait for the decode peer and the KV transfer, which grow with
+/// the prompt (an encoder's embeddings awaited on a language-side worker
+/// likewise). The reading is therefore low, never high: by a fixed share on
+/// a co-located worker, by a proportional one on a prefill-role worker. A
+/// saturated rank yields none and its estimate expires into the gateway's
+/// fallback.
+#[derive(Debug, Default)]
+pub(crate) struct PrefillProbe {
+    started: Option<Instant>,
+}
+
+impl PrefillProbe {
+    /// Armed at `started` when `admitted` (the request met no queue), unarmed
+    /// otherwise.
+    pub(crate) fn new(admitted: bool, started: Instant) -> Self {
+        Self {
+            started: admitted.then_some(started),
+        }
+    }
+
+    /// The request's first output with its prompt figures, read at `now`:
+    /// the computed tokens (the prompt less what was cached) over the
+    /// interval since the submit, once; nothing when unarmed or taken.
+    pub(crate) fn first_output(
+        &mut self,
+        loads: &LoadTracker,
+        rank: i32,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+        now: Instant,
+    ) {
+        if let Some(started) = self.started.take() {
+            loads.prefill_observed(
+                rank,
+                prompt_tokens.saturating_sub(cached_tokens),
+                started,
+                now,
+            );
+        }
+    }
+}
+
+/// What a wire knows when it hands a request to the engine, for
+/// [`LoadTracker::submit`].
+pub(crate) struct Submission<'a> {
+    pub(crate) request_id: &'a str,
+    /// The rank the request's first choice went to: the choice that reports
+    /// the prompt, so the queued work and the hit rate land there.
+    pub(crate) rank: i32,
+    pub(crate) prompt_tokens: u32,
+    /// The request's `n`; 0 is unset, one choice.
+    pub(crate) choices: u32,
+    /// The rank's last load tail, `None` before its first batch.
+    pub(crate) tail: Option<EngineLoad>,
+    /// The engine's admission window; 0 or less when unknown.
+    pub(crate) window: i32,
+    /// The servicer's instant after the engine accepted the request.
+    pub(crate) at: Instant,
+}
+
+impl LoadTracker {
+    /// A request handed to the engine: queued as by [`Self::submitted`], and
+    /// the servicer-clock probe for its first choice, armed when the request
+    /// met no queue on its rank (nothing of ours ahead of it, the rank's
+    /// last load tail with nothing waiting and room in its window, a single
+    /// choice).
+    pub(crate) fn submit(&self, submission: Submission<'_>) -> PrefillProbe {
+        let idle = self.submitted(
+            submission.rank,
+            submission.request_id,
+            submission.prompt_tokens,
+        );
+        PrefillProbe::new(
+            idle && submission.choices <= 1 && rank_has_room(submission.tail, submission.window),
+            submission.at,
+        )
+    }
+}
+
+/// One choice's share of the tracker's bookkeeping, held by the wire's
+/// choice stream: the rank its own engine request went to (an unpinned
+/// fan-out is placed per choice, so each credits its tokens where they were
+/// made), the servicer-clock probe (the first choice's, armed when the
+/// request met no queue; unarmed on the rest) and whether the request's
+/// prompt was counted.
+#[derive(Debug)]
+pub(crate) struct ChoiceLoad {
+    rank: i32,
+    /// Whether this is the request's first choice, the one that reports its
+    /// prompt (every choice of an `n > 1` fan-out reports the same one).
+    first: bool,
+    probe: PrefillProbe,
+    prompt_counted: bool,
+}
+
+impl ChoiceLoad {
+    pub(crate) fn new(rank: i32, index: u32, probe: PrefillProbe) -> Self {
+        Self {
+            rank,
+            first: index == 0,
+            probe,
+            prompt_counted: false,
+        }
+    }
+
+    /// The rank the choice's engine request went to.
+    pub(crate) fn rank(&self) -> i32 {
+        self.rank
+    }
+
+    /// The choice's output with the request's prompt figures, read at
+    /// `now`: once per request, the tracker learns that the engine started
+    /// it and how much of the prompt was cached, and the probe reads the
+    /// prefill it timed.
+    pub(crate) fn count_prompt(
+        &mut self,
+        loads: &LoadTracker,
+        request_id: &str,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+        now: Instant,
+    ) {
+        if self.prompt_counted || prompt_tokens == 0 {
+            return;
+        }
+        if self.first {
+            loads.first_output(self.rank, request_id, prompt_tokens, cached_tokens);
+            self.probe
+                .first_output(loads, self.rank, prompt_tokens, cached_tokens, now);
+        }
+        self.prompt_counted = true;
+    }
+
+    /// The choice streamed `tokens` to the client at `at`.
+    pub(crate) fn generated(&self, loads: &LoadTracker, tokens: u32, at: Instant) {
+        loads.generated_at(self.rank, tokens, at);
+    }
+}
+
+/// Takes a request out of the tracker's queue when its stream ends, in case
+/// the engine never started it; the request's stream holds one.
+pub(crate) struct PendingGuard<S: WireState> {
+    state: Arc<S>,
+    request_id: String,
+}
+
+impl<S: WireState> PendingGuard<S> {
+    pub(crate) fn new(state: Arc<S>, request_id: &str) -> Self {
+        Self {
+            state,
+            request_id: request_id.to_string(),
+        }
+    }
+}
+
+impl<S: WireState> Drop for PendingGuard<S> {
+    fn drop(&mut self) {
+        self.state.shared().loads.finished(&self.request_id);
     }
 }
 
@@ -436,6 +678,164 @@ mod tests {
         // Cached can never exceed the prompt.
         tracker.first_output(0, "odd", 10, 50);
         assert!(tracker.estimate_at(0, 0, now).cache_hit_rate <= 1.0);
+    }
+
+    /// One recorded sequence of prefills reads the same capacity whether its
+    /// ends come from an engine's clock or from the servicer's instants (the
+    /// wires without engine timing): the two paths share the estimator.
+    #[test]
+    fn servicer_clock_samples_read_the_same_capacity_as_engine_clock_ones() {
+        let recorded = [
+            (1_000_u32, 10.0_f64, 12.0_f64),
+            (2_000, 11.0, 13.0),
+            (600, 20.0, 20.5),
+        ];
+        let engine_timed = LoadTracker::default();
+        let servicer_timed = LoadTracker::default();
+        let now = Instant::now();
+        let origin = servicer_timed.epoch;
+        for (tokens, start, end) in recorded {
+            engine_timed.prefill_computed_at(0, tokens, start, end, now);
+            servicer_timed.prefill_observed(
+                0,
+                tokens,
+                origin + Duration::from_secs_f64(start),
+                origin + Duration::from_secs_f64(end),
+            );
+        }
+        // 3600 computed tokens over 3 + 0.5 active seconds, the overlap of
+        // the first two prefills counted once.
+        let expected = 3_600.0 / 3.5;
+        assert_eq!(
+            engine_timed.estimate_at(0, 0, now).prefill_throughput,
+            Some(expected)
+        );
+        assert_eq!(
+            servicer_timed
+                .estimate_at(0, 0, origin + Duration::from_secs(21))
+                .prefill_throughput,
+            Some(expected)
+        );
+        assert_eq!(servicer_timed.prefill_samples(0), 3);
+    }
+
+    /// A servicer-clock sample is taken once per request, from an armed
+    /// probe only, and its tokens are the prompt less what was cached.
+    #[test]
+    fn a_probe_samples_the_computed_tokens_once_when_armed() {
+        let tracker = LoadTracker::default();
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut unarmed = PrefillProbe::new(false, start);
+        unarmed.first_output(&tracker, 0, 1_000, 0, start + second);
+        let mut default = PrefillProbe::default();
+        default.first_output(&tracker, 0, 1_000, 0, start + second);
+        assert_eq!(tracker.prefill_samples(0), 0);
+        let mut armed = PrefillProbe::new(true, start);
+        armed.first_output(&tracker, 0, 1_000, 400, start + second);
+        // A later output of the same request adds nothing.
+        armed.first_output(&tracker, 0, 1_000, 400, start + 2 * second);
+        assert_eq!(tracker.prefill_samples(0), 1);
+        let mut later = PrefillProbe::new(true, start + 10 * second);
+        later.first_output(&tracker, 0, 300, 0, start + 11 * second);
+        // 600 + 300 computed tokens over two one-second prefills.
+        assert_eq!(
+            tracker
+                .estimate_at(0, 0, start + 11 * second)
+                .prefill_throughput,
+            Some(450.0)
+        );
+        // A prompt served whole from the cache computes nothing.
+        let mut hit = PrefillProbe::new(true, start + 20 * second);
+        hit.first_output(&tracker, 0, 500, 500, start + 21 * second);
+        assert_eq!(tracker.prefill_samples(0), 2);
+    }
+
+    /// The submit says whether the rank had nothing of ours in flight ahead
+    /// of the request; the rank's last load tail must show no queue and room
+    /// in its window for the request to have met no queue.
+    #[test]
+    fn a_request_meets_no_queue_only_on_an_idle_rank_with_room() {
+        let tracker = LoadTracker::default();
+        assert!(tracker.submitted(0, "a", 100));
+        assert!(!tracker.submitted(0, "b", 100), "a is ahead of b");
+        assert!(tracker.submitted(1, "c", 100), "another rank");
+        tracker.first_output(0, "a", 100, 0);
+        assert!(!tracker.submitted(0, "d", 100), "b has not started");
+        tracker.finished("b");
+        tracker.first_output(0, "d", 100, 0);
+        assert!(tracker.submitted(0, "e", 100));
+
+        let tail = |num_running, num_waiting| {
+            Some(EngineLoad {
+                num_running,
+                num_waiting,
+                kv_cache_usage: 0.0,
+            })
+        };
+        assert!(rank_has_room(None, 8), "no batch since boot");
+        assert!(rank_has_room(tail(3, 0), 8));
+        assert!(!rank_has_room(tail(3, 1), 8), "one waits");
+        assert!(!rank_has_room(tail(8, 0), 8), "the window is full");
+        assert!(rank_has_room(tail(8, 0), 0), "an unknown window");
+        assert!(rank_has_room(tail(8, 0), -1), "an unknown window");
+        assert_eq!(
+            (rank_of(None), rank_of(Some(3)), rank_of(Some(u32::MAX))),
+            (0, 3, 0)
+        );
+    }
+
+    /// Each choice of a request credits its own rank: a fan-out placed per
+    /// choice never lands choice `i`'s tokens on choice 0's rank, the first
+    /// choice alone counts the prompt (once) and drops the pending entry, a
+    /// request of more than one choice takes no prefill sample, and the
+    /// single-choice form of the same submit arms the probe.
+    #[test]
+    fn choice_loads_credit_their_own_rank() {
+        let loads = LoadTracker::default();
+        let now = Instant::now();
+        let probe = loads.submit(Submission {
+            request_id: "r",
+            rank: 0,
+            prompt_tokens: 100,
+            choices: 2,
+            tail: None,
+            window: 0,
+            at: now,
+        });
+        assert_eq!(loads.pending(), 1);
+        let mut first = ChoiceLoad::new(0, 0, probe);
+        let mut second = ChoiceLoad::new(1, 1, PrefillProbe::default());
+        assert_eq!((first.rank(), second.rank()), (0, 1));
+        let later = now + Duration::from_millis(50);
+        // Not the first choice: no prompt sample, the request stays pending.
+        second.count_prompt(&loads, "r", 100, 0, later);
+        assert_eq!(loads.pending(), 1);
+        second.generated(&loads, 7, later);
+        first.count_prompt(&loads, "r", 100, 40, later);
+        // Once per request: a later output of the first choice adds nothing.
+        first.count_prompt(&loads, "r", 100, 40, later);
+        first.generated(&loads, 3, later);
+        assert_eq!(loads.pending(), 0);
+        assert_eq!(loads.prefill_samples(0), 0, "two choices never sample");
+        let rank0 = loads.estimate_at(0, 0, later);
+        let rank1 = loads.estimate_at(1, 0, later);
+        // 3 tokens on rank 0 and 7 on rank 1 over the window, 40 of 100
+        // prompt tokens cached on rank 0 and nothing counted on rank 1.
+        assert_eq!((rank0.gen_throughput, rank1.gen_throughput), (1.5, 3.5));
+        assert_eq!((rank0.cache_hit_rate, rank1.cache_hit_rate), (0.4, 0.0));
+        let armed = loads.submit(Submission {
+            request_id: "s",
+            rank: 1,
+            prompt_tokens: 100,
+            choices: 1,
+            tail: None,
+            window: 0,
+            at: later,
+        });
+        let mut only = ChoiceLoad::new(1, 0, armed);
+        only.count_prompt(&loads, "s", 100, 0, later + Duration::from_millis(10));
+        assert_eq!((loads.pending(), loads.prefill_samples(1)), (0, 1));
     }
 
     /// Two ranks serve: each rank's hit rate, throughput and queued work are

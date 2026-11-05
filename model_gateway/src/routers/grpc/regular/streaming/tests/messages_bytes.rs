@@ -1,5 +1,8 @@
-//! The exact SSE bytes of Messages streams, pinned per scenario: text,
-//! thinking then text, a tool call and a length stop, driven over scripted
+//! The exact SSE bytes of Messages streams, pinned per scenario: text, text
+//! under Symphony (the answer over several chunks: the first delta opens the
+//! block through the content-block machine, the following ones go straight
+//! from the borrowed text to the frame), thinking then text, a tool call and a
+//! length stop, driven over scripted
 //! engine frames and compared byte for byte with
 //! `fixtures/messages_<scenario>.sse`. The fixtures hold the bytes the
 //! per-event copies produced, so any change to the wire format of a Messages
@@ -7,6 +10,7 @@
 //! rewrite them from the current code.
 
 use smg_grpc_client::vllm_engine::proto;
+use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
     super::*,
@@ -16,11 +20,15 @@ use super::{
     },
     sse_bytes::assert_recorded_bytes,
 };
+use crate::routers::grpc::regular::symphony::Assignment;
 
 struct MessagesScenario {
     name: &'static str,
     with_tools: bool,
     thinking: bool,
+    /// Symphony's Qwen3 table reads the message (the content-block machine writes the events)
+    /// instead of the reasoning and tool parsers.
+    symphony: bool,
     /// The served model; a Kimi name gives the tool call its deterministic id.
     model: &'static str,
     frames: Vec<proto::GenerateResponse>,
@@ -35,6 +43,7 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_text",
             with_tools: false,
             thinking: false,
+            symphony: false,
             model: "fixture-model",
             frames: vec![
                 chunk(0, "Hello"),
@@ -44,9 +53,27 @@ fn scenarios() -> Vec<MessagesScenario> {
             must_contain: r#""text":", world""#,
         },
         MessagesScenario {
+            name: "messages_symphony_text",
+            with_tools: false,
+            thinking: false,
+            symphony: true,
+            model: "fixture-model",
+            frames: vec![
+                chunk(0, "Hello"),
+                chunk(0, ", wor"),
+                chunk(0, "ld"),
+                chunk(0, " "),
+                chunk(0, "caf\u{e9}"),
+                chunk(0, " \"again\""),
+                complete_with_prompt(0, "stop", 10),
+            ],
+            must_contain: r#""text":"ld""#,
+        },
+        MessagesScenario {
             name: "messages_thinking_then_text",
             with_tools: false,
             thinking: true,
+            symphony: false,
             model: "fixture-model",
             frames: vec![
                 chunk(0, "<think>because"),
@@ -59,6 +86,7 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_tool_use",
             with_tools: true,
             thinking: false,
+            symphony: false,
             model: "kimi-fixture",
             frames: vec![
                 chunk(0, r#"{"name": "lookup", "#),
@@ -71,6 +99,7 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_length",
             with_tools: false,
             thinking: false,
+            symphony: false,
             model: "fixture-model",
             frames: vec![chunk(0, "a"), complete(0, "length")],
             must_contain: r#""stop_reason":"max_tokens""#,
@@ -100,7 +129,12 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
             Vec::new().into()
         },
         stop_sequences: None,
-        symphony: None,
+        symphony: scenario.symphony.then(|| Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: false,
+            past_the_end: false,
+        }),
         first_tool_call_only: false,
         parser_names: None,
     };

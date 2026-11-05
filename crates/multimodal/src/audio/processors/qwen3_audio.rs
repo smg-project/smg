@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     audio::{
-        transforms::{bandlimited_resample, hann_window, mel_basis},
+        transforms::{bandlimited_resample, hann_window, mel_bands, mel_basis},
         AudioPreProcessor, DecodedAudio,
     },
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -420,25 +420,8 @@ impl MelFrontend {
     fn build(params: &Qwen3AudioParams) -> Self {
         let fft_bins = params.n_fft / 2 + 1;
         let filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
-        // A filter is a triangle over the bins, so its weight is one contiguous band and a bin
-        // carries weight in at most two filters (394 of the 25,728 weights are non-zero at the
-        // default geometry); the band is read off the weights rather than assumed, and an
-        // all-zero filter gets an empty one.
-        let bands = (0..params.n_mels)
-            .map(|mel| {
-                let row = &filters[mel * fft_bins..(mel + 1) * fft_bins];
-                match row.iter().position(|weight| *weight != 0.0) {
-                    Some(first) => {
-                        let last = row
-                            .iter()
-                            .rposition(|weight| *weight != 0.0)
-                            .map_or(first, |index| index + 1);
-                        (first, last)
-                    }
-                    None => (0, 0),
-                }
-            })
-            .collect();
+        // 394 of the 25,728 weights are non-zero at the default geometry.
+        let bands = mel_bands(&filters, params.n_mels, fft_bins);
         Self {
             window: hann_window(params.n_fft),
             filters,

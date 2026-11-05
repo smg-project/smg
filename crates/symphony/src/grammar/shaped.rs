@@ -297,7 +297,7 @@ impl<'l> Writing<'l> {
                 parameters.of_tool(shape, layout, values, tool, limited)
             }
             Self::Json => Some(Grammar::JsonSchema {
-                schema: tool.function.parameters.clone(),
+                schema: tool.function.parameters_schema().clone(),
                 style: None,
                 excludes: Vec::new(),
                 whitespace: Whitespace::Free,
@@ -346,7 +346,7 @@ impl<'l> Parameters<'l> {
         tool: &Tool,
         limited: bool,
     ) -> Option<Grammar> {
-        let parameters = &tool.function.parameters;
+        let parameters = tool.function.parameters_schema();
         let properties = parameters
             .get("properties")
             .and_then(Value::as_object)
@@ -894,7 +894,7 @@ mod tests {
                 {"type": "sequence", "elements": [
                     {"type": "regex", "pattern": "[0-9]+"},
                     {"type": "const_string", "value": ">"},
-                    {"type": "json_schema", "json_schema": tool.function.parameters},
+                    {"type": "json_schema", "json_schema": tool.function.parameters_schema()},
                 ]},
                 {"type": "const_string", "value": "</c>"},
             ]})

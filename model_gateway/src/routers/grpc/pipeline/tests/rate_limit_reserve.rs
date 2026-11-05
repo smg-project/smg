@@ -178,7 +178,7 @@ async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
     let check = ReserveRequest {
         request_charge_id: uuid::Uuid::now_v7(),
         tenant_key: TenantKey::new("test-tenant"),
-        model_id: Some(MODEL.to_string()),
+        model_id: Some(MODEL),
         estimated_input_tokens: 6,
     };
     assert!(matches!(
@@ -214,7 +214,7 @@ async fn settle_reservation_charges_the_counts_and_not_their_split() {
     let check = |tokens: u32| ReserveRequest {
         request_charge_id: uuid::Uuid::now_v7(),
         tenant_key: TenantKey::new("test-tenant"),
-        model_id: Some(MODEL.to_string()),
+        model_id: Some(MODEL),
         estimated_input_tokens: tokens,
     };
     assert!(matches!(

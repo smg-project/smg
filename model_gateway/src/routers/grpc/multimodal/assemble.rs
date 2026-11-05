@@ -452,7 +452,8 @@ fn assemble_trtllm(
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("TRT-LLM assembly requires an image batch");
     };
-    let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
+    // The request shares each frame's file; nothing is copied per image.
+    let image_data = images.iter().map(|f| f.raw_bytes.clone()).collect();
     Ok(TrtllmMultimodalData { image_data })
 }
 

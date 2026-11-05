@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use serde_json::Value;
 use validator::{Validate, ValidationError};
 
@@ -522,10 +522,10 @@ pub enum NamespaceTool {
     Custom(CustomTool),
 }
 
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, schemars::JsonSchema)]
 pub struct FunctionTool {
-    /// Flatten to match Responses API tool JSON shape.
+    /// Flat, as the Responses API tool JSON shape is; the schema follows the
+    /// function object, the wire form is written below.
     #[serde(flatten)]
     pub function: Function,
 }
@@ -543,6 +543,39 @@ impl<'de> Deserialize<'de> for FunctionTool {
             return Err(serde::de::Error::unknown_field(key, FIELDS));
         }
         Ok(Self { function })
+    }
+}
+
+/// A function tool writes `parameters` whether or not the client gave a
+/// schema: the Responses API reference lists the field as required and
+/// nullable (the chat API's reference, which [`Function`]'s own form follows,
+/// as optional), so a tool declared without one is forwarded, and echoed back,
+/// with `"parameters": null`, as the engine's own server writes it. The other
+/// fields keep the function object's form and order.
+impl Serialize for FunctionTool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Function {
+            name,
+            description,
+            parameters,
+            strict,
+            extra,
+        } = &self.function;
+        let mut tool = serializer.serialize_map(Some(
+            2 + usize::from(description.is_some()) + usize::from(strict.is_some()) + extra.len(),
+        ))?;
+        tool.serialize_entry("name", name)?;
+        if let Some(description) = description {
+            tool.serialize_entry("description", description)?;
+        }
+        tool.serialize_entry("parameters", parameters)?;
+        if let Some(strict) = strict {
+            tool.serialize_entry("strict", strict)?;
+        }
+        for (key, value) in extra {
+            tool.serialize_entry(key, value)?;
+        }
+        tool.end()
     }
 }
 
@@ -3665,7 +3698,9 @@ fn validate_openai_structured_output_rules(
         };
         let function = &function_tool.function;
         if function.strict == Some(true) {
-            if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
+            if let Some(path) =
+                strict_schema_missing_additional_properties(function.parameters_schema())
+            {
                 return Err(invalid(
                     "invalid_function_parameters",
                     format!(
@@ -3923,12 +3958,12 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             // the OpenAI vendor profile in the cross-parameter validation).
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
-                if !function.parameters.is_object() {
+                if !function.parameters_schema().is_object() {
                     return Err(invalid(
                         "invalid_type",
                         format!(
                             "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
-                            json_type_name(&function.parameters)
+                            json_type_name(function.parameters_schema())
                         ),
                     ));
                 }

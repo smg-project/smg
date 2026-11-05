@@ -16,20 +16,18 @@
 //! count on purpose. The preprocess calls are pinned per resize row path (scalar, NEON):
 //! a re-pin records each count on its own architecture, and a failing run prints its
 //! table with the failure.
-#![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
+mod common;
+
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
     io::Cursor,
     path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
-    },
+    sync::{atomic::Ordering, Arc, Mutex, MutexGuard},
 };
 
 use bytes::Bytes;
+use common::counting_alloc::{Counting, BYTES, CALLS, LARGE_CALLS};
 use image::{DynamicImage, ImageReader, Rgba, RgbaImage};
 use llm_multimodal::{
     configure_parallelism,
@@ -40,43 +38,6 @@ use llm_multimodal::{
     },
     Parallelism,
 };
-
-/// An allocation at or above this size is a buffer of the image's own scale (a decoded
-/// frame, a resized plane, a wire), not bookkeeping.
-const LARGE: usize = 256 * 1024;
-
-struct Counting;
-
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-static LARGE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        if layout.size() >= LARGE {
-            LARGE_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        // SAFETY: the layout is the caller's, handed to the system allocator unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(new_size, Ordering::Relaxed);
-        if new_size >= LARGE {
-            LARGE_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;

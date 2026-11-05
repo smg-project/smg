@@ -230,7 +230,11 @@ impl GrpcClient {
                 let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
-            _ => Err(tonic::Status::unimplemented(
+            Self::Trtllm(client) => {
+                let resp = client.get_loads(include()).await?;
+                Ok(WorkerLoadResponse::from(resp))
+            }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "GetLoads RPC not supported for this backend",
             )),
         }

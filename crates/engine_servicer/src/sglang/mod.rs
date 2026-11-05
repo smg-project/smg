@@ -282,11 +282,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let response = info::loads(self, dp_rank).ok()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(
-            response.loads.first()?,
-        ))
+        let load = response.loads.first()?;
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::loads`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 
     fn engine_link(&self) -> &EngineLink {

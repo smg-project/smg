@@ -37,8 +37,9 @@ texts with the batch methods. The batch methods and longer calls release the
 GIL. A decode of 4096 ids or more, the parse, checks and render of a chat
 request of 16 KiB or more, a Hub download, and reading and hashing the
 loaded files for the fingerprint stay on the calling thread; what can reach
-rayon (the batch methods, building the tokenizer, and any encode of 16 KiB
-or more, a chat's prompt among them) runs on a Rust thread pool of
+rayon (the batch methods, ``apply_chat_template`` given several
+conversations, building the tokenizer, and any encode of 16 KiB or more, a
+chat's prompt among them) runs on a Rust thread pool of
 ``SMG_TOKENIZER_THREADS`` threads (one when ``TOKENIZERS_PARALLELISM`` is
 off, rayon's default otherwise: ``RAYON_NUM_THREADS``, else the CPU count),
 one per process: a process forked after the parent used the tokenizer (torch
@@ -65,8 +66,9 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, cast
 
 from smg.smg_rs import Tokenizer as _Tokenizer
 
@@ -77,12 +79,24 @@ if TYPE_CHECKING:
         def tolist(self) -> Any: ...
 
     # Annotations only (the wheel supports Python 3.9, where `X | Y` does not
-    # evaluate): a chat completion request, as a mapping or as its JSON text;
-    # token ids, as a sequence or an array or tensor of them.
+    # evaluate): a chat message, in the shape a client sends to
+    # /v1/chat/completions; a chat completion request, as a mapping or as its
+    # JSON text; token ids, as a sequence or an array or tensor of them.
+    Message = Mapping[str, Any]
     ChatRequest = Mapping[str, Any] | str | bytes
     TokenIds = Sequence[int] | _ToList
 
-__all__ = ["RenderedChat", "Tokenizer"]
+__all__ = ["RenderWarning", "RenderedChat", "Tokenizer"]
+
+
+class RenderWarning(UserWarning):
+    """A rewrite SMG made to a request while rendering it, which serving
+    only logs: tool-call ``arguments`` that are not a JSON object rendered as
+    ``{}``, message extensions of another provider's profile dropped,
+    deprecated fields migrated. :meth:`Tokenizer.render_chat` returns them;
+    :meth:`Tokenizer.apply_chat_template` issues them as warnings of this
+    category (``warnings.simplefilter("error", RenderWarning)`` makes them
+    errors)."""
 
 
 class RenderedChat(TypedDict):
@@ -101,10 +115,7 @@ class RenderedChat(TypedDict):
     the header opens, if it opens one). ``continued_final_message`` says
     whether the renderer kept the final message open itself, as
     ``continue_final_message`` asks. ``warnings`` lists the rewrites SMG made
-    to the request while rendering it, which serving only logs: tool-call
-    ``arguments`` that are not a JSON object rendered as ``{}``, message
-    extensions of another provider's profile dropped, deprecated fields
-    migrated.
+    to the request while rendering it (see :class:`RenderWarning`).
     """
 
     text: str
@@ -113,6 +124,36 @@ class RenderedChat(TypedDict):
     generation_prompt: bool
     continued_final_message: bool
     warnings: list[str]
+
+
+# transformers' apply_chat_template arguments (4.x and 5.x) that have no
+# equivalent in SMG serving, with why. Given their no-op value (None or False)
+# they are accepted and ignored; any other value is refused rather than
+# handed to the template as a variable.
+_UNSUPPORTED_CHAT_ARGUMENTS = {
+    "chat_template": "the chat template is fixed when the tokenizer loads "
+    "(Tokenizer(source, chat_template=path)), as the gateway fixes it at startup",
+    "documents": "SMG serving does not pass per-request documents to the template",
+    "padding": "pad the returned ids yourself",
+    "truncation": "truncate the returned ids yourself",
+    "max_length": "truncate the returned ids yourself",
+    "return_tensors": "the ids come back as lists of ints",
+    "return_dict": "render_chat() returns the text, the ids and how they were rendered",
+    "return_assistant_tokens_mask": "SMG's renderers record no assistant spans",
+    "tokenizer_kwargs": "chat prompts encode without special tokens, as SMG serving encodes them",
+    "sanitize_control_tokens": "SMG serving has no such switch: control-token text in a message "
+    "encodes as its renderer encodes it",
+}
+
+# Template variables SMG's render context fills itself, which a keyword
+# argument does not replace: refused, with why. (transformers lets one replace
+# strftime_now; given messages, its call to Jinja's render() fails.)
+_CONTEXT_VARIABLES = {
+    "messages": "the conversation fills it; pass that as the first argument",
+    "strftime_now": "the template writes the local time at the render, as in serving; to pin "
+    "it, start the process with SOURCE_DATE_EPOCH set (read once, as the process loads its "
+    "first chat template)",
+}
 
 
 def _json_value(value: Any) -> Any:
@@ -152,11 +193,13 @@ def _ids(token_ids: Any) -> Any:
     return tolist() if callable(tolist) else token_ids
 
 
-def _rendered(rendered: tuple[str, list[int], bool, bool, bool, list[str]]) -> RenderedChat:
-    text, token_ids, from_text, generation_prompt, continued, render_warnings = rendered
+def _rendered(
+    rendered: tuple[str, list[int] | None, bool, bool, bool, list[str], bool],
+) -> RenderedChat:
+    text, token_ids, from_text, generation_prompt, continued, render_warnings, _ = rendered
     return RenderedChat(
         text=text,
-        token_ids=token_ids,
+        token_ids=token_ids if token_ids is not None else [],
         from_text=from_text,
         generation_prompt=generation_prompt,
         continued_final_message=continued,
@@ -408,7 +451,7 @@ class Tokenizer:
         as ``transformers`` does by default. SMG encodes ``/v1/completions``,
         ``/generate`` and ``/v1/tokenize`` text with ``add_special_tokens=False``
         and embedding input with ``True``; a chat prompt's special tokens come
-        from its template (see :meth:`render_chat`). As in
+        from its template (see :meth:`apply_chat_template`). As in
         ``transformers``, special-token text in the input (``<|im_end|>``)
         encodes to the special token.
         """
@@ -470,6 +513,148 @@ class Tokenizer:
             )
         rendered = self._inner.render_chat_batch([_request_json(r) for r in requests])
         return [_rendered(r) for r in rendered]
+
+    def apply_chat_template(
+        self,
+        conversation: Sequence[Message] | Sequence[Sequence[Message]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        *,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool | str = False,
+        tokenize: bool = True,
+        tool_choice: str | Mapping[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        **template_kwargs: Any,
+    ) -> str | list[int] | list[str] | list[list[int]]:
+        """Render a conversation (or a list of conversations) as SMG renders
+        it, shaped like ``transformers``' ``apply_chat_template``.
+
+        Returns the token ids SMG feeds the model (``tokenize=True``) or the
+        prompt text; a list of conversations returns a list, rendered in
+        parallel. ``tools=None`` declares no tools and ``tools=[]`` an empty
+        list, which templates (and the gateway) tell apart. Keyword arguments
+        beyond these reach the template as ``chat_template_kwargs`` do
+        (``enable_thinking=False``); one that names a variable the render
+        fills itself (``messages``, ``strftime_now``, a special token the
+        checkpoint defines) raises ``TypeError``, as SMG would not pass it,
+        and so does a ``transformers`` argument SMG has no equivalent for
+        (``chat_template``, ``documents``, ``padding``, ``truncation``,
+        ``max_length``, ``return_tensors``, ``return_dict``,
+        ``return_assistant_tokens_mask``, ``tokenizer_kwargs``,
+        ``sanitize_control_tokens``) unless it is given its no-op value
+        (``None`` or ``False``), which is ignored. ``continue_final_message``
+        continues the final message's content: ``True``, or ``"content"``, as
+        ``transformers`` 5 names the field to continue (any other field raises
+        ``TypeError``). ``tool_choice`` and ``reasoning_effort`` are request
+        fields, which the gateway also hands the template. Messages are what a
+        client sends to ``/v1/chat/completions``: a tool call carries its
+        ``id`` and ``type``, as the gateway requires.
+
+        A rendering that does not do what ``add_generation_prompt`` or
+        ``continue_final_message`` ask (a checkpoint whose own encoder writes
+        the generation header after a final user or tool message, a final
+        message that is not the assistant's to continue) raises
+        ``ValueError``; :meth:`render_chat` returns such a rendering as SMG
+        makes it. A final assistant message that the renderer cannot continue
+        itself is continued as SMG continues it: its text appended after the
+        generation header. The rewrites SMG makes while rendering are issued
+        as :class:`RenderWarning`. For renderers that encode segment by
+        segment, the ids are not the encode of the returned text;
+        :meth:`render_chat` says which.
+        """
+        for name, reason in _UNSUPPORTED_CHAT_ARGUMENTS.items():
+            if name not in template_kwargs:
+                continue
+            if template_kwargs[name] is None or template_kwargs[name] is False:
+                del template_kwargs[name]
+                continue
+            raise TypeError(f"apply_chat_template() does not take {name!r}: {reason}")
+        self._check_template_kwargs(template_kwargs)
+        if isinstance(continue_final_message, str) and continue_final_message != "content":
+            raise TypeError(
+                "apply_chat_template() does not take "
+                f"continue_final_message={continue_final_message!r}: SMG continues the final "
+                "message's content (True)"
+            )
+
+        def request(messages: Sequence[Message]) -> str:
+            body: dict[str, Any] = {
+                "messages": list(messages),
+                # Always sent: the gateway renders the generation header
+                # when the request leaves it out.
+                "add_generation_prompt": add_generation_prompt,
+            }
+            if continue_final_message:
+                body["continue_final_message"] = True
+            if tools is not None:
+                body["tools"] = list(tools)
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
+            if reasoning_effort is not None:
+                body["reasoning_effort"] = reasoning_effort
+            if template_kwargs:
+                body["chat_template_kwargs"] = template_kwargs
+            return _request_json(body)
+
+        def checked(
+            rendered: tuple[str, list[int] | None, bool, bool, bool, list[str], bool], label: str
+        ) -> tuple[str | list[int], list[str]]:
+            text, token_ids, _, generation_prompt, _, render_warnings, continues = rendered
+            if continue_final_message and not continues:
+                raise ValueError(
+                    f"{label}SMG did not continue the final message, as continue_final_message "
+                    "asks: it continues a final assistant message only, and renders a "
+                    "conversation that ends with another role's message closed; render_chat() "
+                    "returns this rendering as it is"
+                )
+            if not continue_final_message and generation_prompt != add_generation_prompt:
+                written = "wrote" if generation_prompt else "did not write"
+                raise ValueError(
+                    f"{label}SMG {written} the generation prompt although add_generation_prompt "
+                    f"is {add_generation_prompt} (a renderer with an encoder of its own writes it "
+                    "as the engines' encoders do); render_chat() returns this rendering as it is"
+                )
+            result = (token_ids or []) if tokenize else text
+            return result, [f"{label}{message}" for message in render_warnings]
+
+        batched = (
+            isinstance(conversation, (list, tuple))
+            and len(conversation) > 0
+            and isinstance(conversation[0], (list, tuple))
+        )
+        if batched:
+            conversations = cast("Sequence[Sequence[Message]]", conversation)
+            rendered = self._inner.render_chat_batch(
+                [request(messages) for messages in conversations], tokenize
+            )
+            results = []
+            for index, one in enumerate(rendered):
+                result, render_warnings = checked(one, f"requests[{index}]: ")
+                for message in render_warnings:
+                    warnings.warn(message, RenderWarning, stacklevel=2)
+                results.append(result)
+            return cast("list[str] | list[list[int]]", results)
+        messages = cast("Sequence[Message]", conversation)
+        result, render_warnings = checked(self._inner.render_chat(request(messages), tokenize), "")
+        for message in render_warnings:
+            warnings.warn(message, RenderWarning, stacklevel=2)
+        return result
+
+    def _check_template_kwargs(self, template_kwargs: Mapping[str, Any]) -> None:
+        """Refuse the keyword arguments SMG's render context does not let
+        replace its own variables."""
+        for name, reason in _CONTEXT_VARIABLES.items():
+            if name in template_kwargs:
+                raise TypeError(
+                    f"apply_chat_template() does not pass {name!r} to the template: {reason}"
+                )
+        for name in ("bos_token", "eos_token", "unk_token", "pad_token"):
+            token = self._special(name)
+            if name in template_kwargs and token is not None:
+                raise TypeError(
+                    f"apply_chat_template() does not pass {name!r} to the template: the "
+                    f"checkpoint's own ({token!r}) fills it, as in serving"
+                )
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (

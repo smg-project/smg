@@ -191,7 +191,8 @@ fn validate_strict_schemas(req: &ChatCompletionRequest) -> Result<(), validator:
         if tool.function.strict != Some(true) {
             continue;
         }
-        if let Some(context) = object_without_additional_properties_false(&tool.function.parameters)
+        if let Some(context) =
+            object_without_additional_properties_false(tool.function.parameters_schema())
         {
             return Err(invalid(
                 "invalid_function_parameters",

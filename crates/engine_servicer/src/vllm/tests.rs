@@ -2333,6 +2333,67 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The record the relay reads for a rank is the entry `GetLoads` lists for
+/// it, reported or not yet (the zero-filled entry with the servicer's own
+/// figures), rank 0 for a publisher that names no rank, and nothing for a
+/// rank past the connected ones.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        let answer = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .expect("GetLoads answers")
+            .into_inner();
+        if answer
+            .loads
+            .iter()
+            .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == 2)
+        {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rank 1's figures in time: {answer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let ranks: Vec<i32> = answer.loads.iter().map(|load| load.dp_rank).collect();
+    assert_eq!(ranks, [0, 1], "rank 0 is listed before its first step");
+    let state = &h.server.state;
+    for load in &answer.loads {
+        let mut expected = common::EngineLoad::from(load);
+        expected.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        assert_eq!(
+            state.rank_load(Some(load.dp_rank)),
+            Some(expected),
+            "rank {}",
+            load.dp_rank
+        );
+    }
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(2)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
 /// servicer's message. With one configured, the call resolves before any
 /// event (headers go out eagerly, as the Python relay's initial metadata),

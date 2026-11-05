@@ -29,6 +29,7 @@ use crate::{
     engine_link::{ConnectInputs, EngineLink},
     health::HealthReporter,
     kv_events::{KvEventRelay, LoadFromState, RankLoads},
+    load_tracker::LoadTracker,
     metrics::{MetricsListener, ServicerMetrics, ServicerState, Snapshot},
     requests::RequestRegistry,
     ServerThread, ServicerConfig, ServicerError, Shutdown,
@@ -81,6 +82,10 @@ pub(crate) struct Shared {
     serving: AtomicBool,
     pub(crate) started: Instant,
     pub(crate) started_at: SystemTime,
+    /// Queued token-work, prefill and generation throughput and the hit rate
+    /// from the requests this servicer forwards, per rank, for `GetLoads`
+    /// and the pushed load record of every wire.
+    pub(crate) loads: LoadTracker,
 }
 
 impl Shared {
@@ -101,6 +106,7 @@ impl Shared {
             serving: AtomicBool::new(true),
             started: Instant::now(),
             started_at: SystemTime::now(),
+            loads: LoadTracker::default(),
         }
     }
 

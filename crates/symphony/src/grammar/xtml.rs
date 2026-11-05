@@ -54,7 +54,7 @@ pub(super) fn calls(
                     markers,
                     tags,
                     &tool.function.name,
-                    &tool.function.parameters,
+                    tool.function.parameters_schema(),
                 )
             })
             .collect(),

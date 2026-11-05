@@ -671,6 +671,30 @@ fn load_only_marker(batch: &common::KvEventBatch) -> bool {
     batch.load.as_ref().is_some_and(|load| load.load_only)
 }
 
+/// A tick reads the source once: the record read for the change check is
+/// the one a heartbeat carries. With the tick, the heartbeat interval and
+/// the backoff equal, every tick sends, so the reads count the ticks.
+#[tokio::test]
+async fn a_heartbeat_reads_the_source_once() {
+    let loads = StubLoads::new(2, 0);
+    let interval = Duration::from_millis(50);
+    let lab = start_lab_with_loads(Arc::clone(&loads), interval, interval, interval).await;
+    let mut stream = lab.subscribe(0).expect("history");
+    let first = read(&mut stream).await;
+    assert!(!load_only_marker(&first));
+    let before = loads.asked.load(Ordering::Relaxed);
+    for _ in 0..10 {
+        let beat = read(&mut stream).await;
+        assert!(load_only_marker(&beat), "{beat:?}");
+    }
+    let reads = loads.asked.load(Ordering::Relaxed) - before;
+    // The tick after the tenth heartbeat may have read already.
+    assert!(
+        (10..=11).contains(&reads),
+        "{reads} reads of the source for ten heartbeats"
+    );
+}
+
 /// A frozen engine's record changes in nothing but its silence; that goes
 /// out once a second, so a subscriber's wedge threshold is met within a
 /// second of the engine crossing it instead of at the heartbeat backoff.

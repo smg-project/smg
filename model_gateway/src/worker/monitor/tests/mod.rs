@@ -1,3 +1,6 @@
+mod prom_scrape;
+mod worker_load_manager;
+
 use std::collections::HashMap;
 
 use openai_protocol::{

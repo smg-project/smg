@@ -329,6 +329,9 @@ pub(crate) struct Reader {
     /// and the bytes between two refused blocks go out with the blocks
     /// ([`Self::hold_refused`]); the rest is the template's.
     framing: Vec<Framing>,
+    /// The bytes of the runs `framing` holds, one after another in one buffer, kept for the
+    /// response: a run is a range of it, and a run that follows the last one grows the last.
+    framing_text: String,
     /// The text the test trap springs on, when this process runs with one
     /// ([`isolation::test_trap`]): a step whose delta carries it panics the reader, so the
     /// request's isolation is driven end to end. `None` in every other process: one branch per
@@ -360,10 +363,12 @@ impl Reader {
             called: false,
             refused: String::new(),
             framing: Vec::new(),
+            framing_text: String::new(),
             trap: isolation::test_trap(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
-        // move from the replay's own buffer into the caller's, whatever delta that one borrows.
+        // move from the replay's own buffer into the caller's one by one, whatever delta that one
+        // borrows; nothing is collected on the way.
         let mut replayed = Events::new();
         reader.feed(
             Input::Prompt {
@@ -372,8 +377,8 @@ impl Reader {
             },
             &mut replayed,
         )?;
-        for event in replayed.into_owned() {
-            out.push(event);
+        for event in replayed.consume() {
+            out.push(event.into_owned());
         }
         Ok(reader)
     }
@@ -577,7 +582,7 @@ impl Reader {
                         break;
                     }
                     Event::Reasoning(_) | Event::ReasoningStart | Event::ReasoningEnd => {
-                        self.framing.clear();
+                        self.clear_framing();
                     }
                     Event::Content(_)
                     | Event::Malformed { .. }
@@ -629,12 +634,14 @@ impl Reader {
     /// dropped since the last event that was not a drop, joined to the last when neither is a
     /// marker and it follows it, so a run of whitespace is one entry however it arrived.
     fn hold_framing(&mut self, text: &str, at: usize, marker: bool) {
+        let start = self.framing_text.len();
+        self.framing_text.push_str(text);
         match self.framing.last_mut() {
             Some(last) if !marker && !last.marker && last.at + last.text.len() == at => {
-                last.text.push_str(text);
+                last.text.end = self.framing_text.len();
             }
             _ => self.framing.push(Framing {
-                text: text.to_string(),
+                text: start..self.framing_text.len(),
                 at,
                 marker,
             }),
@@ -657,10 +664,16 @@ impl Reader {
             0
         };
         for run in self.framing.drain(from..) {
-            self.refused.push_str(&run.text);
+            self.refused.push_str(&self.framing_text[run.text]);
         }
-        self.framing.clear();
+        self.clear_framing();
         self.refused.push_str(text);
+    }
+
+    /// The held runs go, their one buffer kept for the next.
+    fn clear_framing(&mut self) {
+        self.framing.clear();
+        self.framing_text.clear();
     }
 
     /// The output went on past what was held, with text or a call: the held runs are debris
@@ -668,14 +681,15 @@ impl Reader {
     /// the answer; after a call nothing more is held (`called`).
     fn drop_held(&mut self) {
         self.refused.clear();
-        self.framing.clear();
+        self.clear_framing();
     }
 }
 
 /// A run the table dropped, held until what follows says whose it is: a refused block's opener
 /// and the bytes between two refused blocks go out with the blocks; the rest is the template's.
 struct Framing {
-    text: String,
+    /// The run's bytes, in the reader's one buffer of held runs (`framing_text`).
+    text: std::ops::Range<usize>,
     /// Where the run starts in the output.
     at: usize,
     /// Whether the run is a marker of the table (`Dropped { Wrapper }` with a byte that is not
@@ -978,11 +992,13 @@ mod tests {
 
     /// A call whose elements nest past the bound the JSON reader applies to every syntax
     /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) still reaches
-    /// the client as a call: its arguments close whole without the member that crossed the
-    /// bound, so a strict reader takes them, and the output counts as malformed under
-    /// `invalid_arguments`, once.
+    /// the client as a call, and as no whole one: the member that crossed the bound is refused,
+    /// something the model put in the call that the client will not get, so no close is made up
+    /// for the call (the rule of every tagged syntax): its arguments are the containers the
+    /// reader took, open, which a strict reader refuses, and the output counts as malformed
+    /// under `invalid_arguments`, once.
     #[test]
-    fn a_call_nested_past_the_bound_reaches_the_client_whole_and_counts_as_malformed() {
+    fn a_call_nested_past_the_bound_reaches_the_client_as_no_whole_call_and_counts_as_malformed() {
         use symphony::{adapt::chat::message, formats::minimax_m3, json::PartialJson};
         let levels = PartialJson::DEFAULT_MAX_DEPTH + 1;
         let body = format!("{}1{}", "<d>".repeat(levels), "</d>".repeat(levels))
@@ -997,19 +1013,21 @@ mod tests {
             let calls = choice.message.tool_calls.expect("the call");
             assert_eq!(calls.len(), 1, "{events:?}");
             assert_eq!(calls[0].function.name, "lookup");
-            let arguments: Value =
-                serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
-                    .expect("arguments a strict reader takes");
-            // The arguments object and the containers below it, as many as the reader takes:
-            // the deepest closes empty, the member that would have crossed the bound unwritten.
-            let mut depth = 0;
-            let mut value = &arguments;
-            while let Some(inner) = value.get("d") {
-                depth += 1;
-                value = inner;
-            }
-            assert_eq!(depth, PartialJson::DEFAULT_MAX_DEPTH - 1, "{arguments}");
-            assert_eq!(value, &serde_json::json!({}), "{arguments}");
+            let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+            // The arguments object and the containers below it, as many as the reader takes,
+            // all open: no close is made up for a call the syntax refused bytes in, and the
+            // member that would have crossed the bound is unwritten.
+            assert_eq!(
+                arguments,
+                format!(
+                    "{{{}",
+                    "\"d\": {".repeat(PartialJson::DEFAULT_MAX_DEPTH - 1)
+                )
+            );
+            assert!(
+                serde_json::from_str::<Value>(arguments).is_err(),
+                "{arguments} reads as a whole value"
+            );
             assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
         });
         let outputs = line_with(

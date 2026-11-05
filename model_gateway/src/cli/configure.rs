@@ -1367,16 +1367,17 @@ impl CliArgs {
         }
     }
 
-    /// Phase 3, configure: the router configuration, validated, wrapped in
-    /// the server configuration. Every refusal is a [`ConfigError`] naming
-    /// the flag; nothing has been bound or spawned when one is raised.
+    /// Phase 3, configure: the router configuration, validated once by the
+    /// builder's `build()`, wrapped in the server configuration. Every
+    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
+    /// or spawned when one is raised. (`startup` validates once more, for a
+    /// library caller that never went through the builder.)
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<ServerConfig> {
         let router_config = self.to_router_config(prefill_urls, encode_urls)?;
-        router_config.validate()?;
         self.to_server_config(router_config)
     }
 }

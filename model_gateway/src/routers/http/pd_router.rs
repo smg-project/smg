@@ -2923,7 +2923,7 @@ mod tests {
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
         middleware::ReportedRefusal,
-        observability::logging::test_support::test_subscriber,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
         test_support::RefusedAddress,
@@ -6939,28 +6939,6 @@ mod tests {
         );
         assert!(decode.circuit_breaker_can_execute());
         assert!(prefill.circuit_breaker_can_execute());
-    }
-
-    /// Counts, on this thread's subscriber, the ERROR events and the refusal
-    /// lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// The sequential shape's pair: a prefill engine of the handoff kind (its

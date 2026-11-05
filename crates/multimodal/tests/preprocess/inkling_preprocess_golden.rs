@@ -122,7 +122,7 @@ fn inkling_audio_preprocess_matches_checked_in_golden() {
             sample_rate: case.sample_rate,
         };
         let result = processor
-            .preprocess_decoded_clips(vec![decoded])
+            .preprocess_decoded_clips(&[&decoded])
             .expect("Inkling audio preprocessing failed");
 
         assert_eq!(
