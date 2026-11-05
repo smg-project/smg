@@ -5,9 +5,10 @@
 //! same-host engine — vLLM EngineCore or TokenSpeed ([`ZmqEngineClient`]).
 //! `BackendClient` keeps those
 //! first-class siblings — `GrpcClient` stays pure gRPC — while the execution
-//! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
+//! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
+use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
@@ -29,7 +30,9 @@ use crate::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::{self, fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
+        zmq_client::{
+            self, fold_tokenizer_eos_backstop, SglangProfileStart, ZmqDialect, ZmqEngineClient,
+        },
         MultimodalData,
     },
     worker::RuntimeType,
@@ -82,6 +85,18 @@ impl BackendClient {
         matches!(self, Self::Zmq(_))
     }
 
+    /// The bootstrap rendezvous the engine behind a direct-ZMQ connection
+    /// declared at its handshake (`host`, `port`): where a prefill or encode
+    /// engine's bootstrap server listens. `None` on a gRPC backend, whose
+    /// worker's registration carries the rendezvous, and on an engine that
+    /// declared none.
+    pub fn declared_bootstrap(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::Grpc(_) => None,
+            Self::Zmq(client) => client.ready_response()?.bootstrap_address(),
+        }
+    }
+
     /// Finalize a built generate request for this backend's wire: resolve
     /// string `stop`s the engine cannot match (token-only wires and SGLang's
     /// `skip_tokenizer_init` workers) into `stop_token_ids`, folding in EOS
@@ -114,6 +129,16 @@ impl BackendClient {
             fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops
+    }
+
+    /// Whether the backend answers the admin RPCs (cache flush, profiling):
+    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
+    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
+    pub fn carries_admin_calls(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.carries_control_calls(),
+        }
     }
 
     /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
@@ -178,9 +203,13 @@ impl BackendClient {
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "FlushCache not supported over ZMQ",
-            )),
+            // The reply wait is the servicers' rule, read from the adapter.
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?;
+                Ok(common_proto::FlushCacheResponse { success, message })
+            }
         }
     }
 
@@ -190,18 +219,22 @@ impl BackendClient {
     ) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StartProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
         }
     }
 
     pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StopProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => {
+                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
         }
     }
 
@@ -211,6 +244,19 @@ impl BackendClient {
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         match self {
             Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+
+    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
+    /// (the engine pushes its scheduler stats on that wire already).
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_load_records().await,
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents not supported over ZMQ",
             )),
@@ -429,7 +475,9 @@ fn build_zmq_request<B>(
         // flag; the gateway's parser fills in the count where it runs.
         ZmqDialect::Sglang => {
             let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
-            let req = sglang(
+            let (sglang_mm, extras) =
+                sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+            let mut req = sglang(
                 request_id,
                 body,
                 processed_text,
@@ -440,10 +488,20 @@ fn build_zmq_request<B>(
                     require_reasoning: options.require_reasoning && !options.first_token_grammar,
                 },
             )?;
+            req.extra_mm_inputs = extras;
             Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
         }
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
+
+/// The direct ZMQ lane builds no request for a TensorRT-LLM engine: that
+/// engine is reached through its gRPC servicer (the Rust servicer speaks the
+/// engine's wire on its node), and the gateway's own link to the wire serves
+/// the other dialects only.
+pub(crate) const DIRECT_LANE_NOT_FOR_TRTLLM: &str =
+    "a TensorRT-LLM engine is served through its gRPC \
+                                          servicer, not the gateway's direct ZMQ lane";
 
 /// Build a request kind with no multimodal or tool inputs (completion, plain
 /// generate) for a ZMQ backend. `text` is the builders' shared text parameter
@@ -475,6 +533,7 @@ fn build_zmq_plain_request<B, T>(
         ZmqDialect::Sglang => Ok(ProtoGenerateRequest::Sglang(Box::new(sglang(
             request_id, body, text, token_ids,
         )?))),
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
 
@@ -521,10 +580,16 @@ fn zmq_tokenspeed_mm(
 /// [`zmq_vllm_mm`] for the mismatch semantics.
 fn zmq_sglang_mm(
     inputs: Option<MultimodalData>,
-) -> Result<Option<sglang_proto::MultimodalInputs>, String> {
+) -> Result<
+    Option<(
+        sglang_proto::MultimodalInputs,
+        Vec<sglang_proto::MultimodalInputs>,
+    )>,
+    String,
+> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::Sglang(data) => Ok(data.into_proto()),
+            MultimodalData::Sglang(data) => Ok(data.into_protos()),
             other => Err(mm_variant_mismatch("SGLang", &other)),
         })
         .transpose()

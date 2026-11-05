@@ -86,7 +86,7 @@ pub struct VideoClipOptions {
     /// the double the request or the checkpoint named it.
     pub sample_fps: f64,
     /// The long-side cap the caller asked for, when it named one; the frames
-    /// were already scaled to it.
+    /// are already scaled except on native SGLang MiniMax, which applies Pillow here.
     pub max_long_side_pixel: Option<u32>,
 }
 
@@ -144,6 +144,13 @@ pub trait VisionPreProcessor: Send + Sync {
 
     /// Preprocess a batch of images.
     ///
+    /// The batch is borrowed image by image, as
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) borrows a clip's
+    /// frames: a caller holding its decoded images behind shared handles
+    /// (the gateway's `ImageFrame` cells) passes their references instead of
+    /// copying every image into one contiguous batch. No implementation owns,
+    /// consumes or mutates an input, so the borrowed form costs them nothing.
+    ///
     /// # Arguments
     /// * `images` - Input images to preprocess
     ///
@@ -151,7 +158,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Preprocessed encoder inputs ready for the model, or an error.
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
 
     /// [`preprocess`](Self::preprocess) under a request's context. A processor
@@ -159,7 +166,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// ignores the context.
     fn preprocess_with_context(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         _context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess(images)
@@ -174,7 +181,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// in `dtype` would produce.
     fn preprocess_wire(
         &self,
-        _images: &[DynamicImage],
+        _images: &[&DynamicImage],
         _dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         None

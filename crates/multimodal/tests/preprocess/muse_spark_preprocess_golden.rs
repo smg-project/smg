@@ -14,7 +14,7 @@
 //! replacement, stamps included.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
 use llm_multimodal::{
     media::{sampled_frame_indices, FrameSampling, VideoFetchConfig},
     registry::{MediaItemInfo, ModelMetadata, ModelRegistry, Tokenizer},
@@ -27,6 +27,8 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 use serde_json::json;
+
+use super::{fnv1a, make_seeded_image};
 
 const GOLDEN: &str = include_str!("../fixtures/golden/muse_spark_preprocess_fingerprints.json");
 
@@ -151,25 +153,6 @@ fn decoded(replacement: &PromptReplacement) -> String {
     out
 }
 
-fn make_seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
-}
-
-fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
 fn images_for(case: &GoldenCase) -> Vec<DynamicImage> {
     match &case.source {
         Source::Seed { seed } => vec![make_seeded_image(case.width, case.height, *seed)],
@@ -256,7 +239,7 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         let name = &case.name;
         let images = images_for(case);
         let out = processor
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap_or_else(|e| panic!("{name}: preprocess: {e}"));
         let grid: Vec<i64> = match &case.grid_thw {
             serde_json::Value::Array(rows) if rows.first().is_some_and(|v| v.is_array()) => rows

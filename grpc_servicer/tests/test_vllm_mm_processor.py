@@ -1047,6 +1047,7 @@ class TestProcess:
         assert self.processor(self._Renderer())._short_side_floor is None
 
 
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 class TestServicerWiring:
     """With vLLM installed, the servicer constructor stays two-argument and reads the env."""
 

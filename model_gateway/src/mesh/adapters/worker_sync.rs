@@ -59,8 +59,8 @@ use tracing::{debug, info, warn};
 use crate::{
     service_discovery::DISCOVERY_ID_LABEL,
     worker::{
-        endpoint_key, event::WorkerEvent, registry::WorkerId, ConnectionMode, EndpointKey, Worker,
-        WorkerOrigin, WorkerRegistry,
+        endpoint::Endpoint, endpoint_key, event::WorkerEvent, registry::WorkerId, ConnectionMode,
+        EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
     },
 };
 
@@ -303,14 +303,25 @@ impl WorkerSyncAdapter {
         // to test membership, and feeds the backfill below so the
         // namespace is scanned once per pass.
         let live: HashSet<String> = self.workers.keys("").into_iter().collect();
-        for (id, _) in self.worker_registry.get_all_with_ids() {
+        for (id, worker) in self.worker_registry.get_all_with_ids() {
             let key = format!("{PREFIX}{}", id.as_str());
-            if !live.contains(&key) {
-                // Missing backing key: same handling as a live tombstone
-                // event — imports are removed, locally-owned state is
-                // re-asserted.
-                self.sync_key_from_store(&key, id.as_str());
+            if live.contains(&key) {
+                continue;
             }
+            // A local worker this node never publishes (`is_publishable`
+            // keeps a host-local ZMQ worker off the mesh) has no key by
+            // design: nothing is missing for it, where a published worker's
+            // missing key is a foreign tombstone to re-assert and an
+            // import's a tombstone to apply.
+            let never_published = self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local)
+                && !self.is_publishable(&id, &worker);
+            if never_published {
+                continue;
+            }
+            // Missing backing key: same handling as a live tombstone
+            // event — imports are removed, locally-owned state is
+            // re-asserted.
+            self.sync_key_from_store(&key, id.as_str());
         }
         self.backfill_keys(live);
     }
@@ -420,7 +431,7 @@ impl WorkerSyncAdapter {
                 if self.worker_registry.remove_remote(&id).is_some() {
                     info!(
                         owner = %state.owner,
-                        url = %state.url,
+                        url = %Endpoint::redacted_str(&state.url),
                         worker_id = %id.as_str(),
                         "removed mesh-imported worker: its owner node is down"
                     );
@@ -428,7 +439,7 @@ impl WorkerSyncAdapter {
             }
             None => debug!(
                 owner = %state.owner,
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "ignoring worker state published by a node that is down"
             ),
         }
@@ -444,7 +455,7 @@ impl WorkerSyncAdapter {
         if let Some(id) = self.import_of_key(state) {
             if self.worker_registry.remove_remote(&id).is_some() {
                 info!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     worker_id = %id.as_str(),
                     "removed mesh-imported worker: this gateway removed its endpoint"
                 );
@@ -468,7 +479,7 @@ impl WorkerSyncAdapter {
             // and has new ones delayed by a pass at most.
             OwnerLiveness::GoneWithinGrace => debug!(
                 owner = %state.owner,
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
@@ -547,7 +558,7 @@ impl WorkerSyncAdapter {
         if !entry.logged {
             entry.logged = true;
             info!(
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 removed_instance = ?entry.instance,
                 incoming_instance = ?incoming,
                 "Ignoring a peer's state for an endpoint this gateway removed (logged once per endpoint)"
@@ -720,7 +731,7 @@ impl WorkerSyncAdapter {
 /// the minimal builder. JSON is self-describing and round-trips them.
 fn worker_state_of(worker_id: &WorkerId, worker: &Arc<dyn Worker>, owner: &str) -> WorkerState {
     let spec = serde_json::to_vec(&worker.metadata().spec).unwrap_or_else(|err| {
-        warn!(url = %worker.url(), %err, "failed to encode WorkerSpec; publishing without spec");
+        warn!(url = %worker.redacted_url(), %err, "failed to encode WorkerSpec; publishing without spec");
         Vec::new()
     });
     WorkerState {
@@ -809,6 +820,7 @@ mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::BasicWorkerBuilder;
@@ -878,6 +890,22 @@ mod tests {
         WorkerSyncAdapter::new(ns, registry, "node-a".into(), cluster)
     }
 
+    /// A fresh `node-a` bed: the worker namespace on a new mesh, an empty
+    /// registry and the adapter over them with an empty membership view. The
+    /// mesh handle is dropped here: the namespace holds the store and the
+    /// subscriber registry by `Arc`, and no test read the handle again.
+    fn setup() -> (
+        Arc<CrdtNamespace>,
+        Arc<WorkerRegistry>,
+        Arc<WorkerSyncAdapter>,
+    ) {
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+        let registry = Arc::new(WorkerRegistry::new());
+        let adapter = adapter(ns.clone(), registry.clone());
+        (ns, registry, adapter)
+    }
+
     fn local_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
@@ -899,10 +927,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_worker_changed_writes_decodable_state() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry);
+        let (ns, _registry, adapter) = setup();
 
         let state = sample_state("w1", "http://worker-a:8080");
         adapter.on_worker_changed("w1", &state);
@@ -914,10 +939,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_worker_removed_tombstones_the_entry() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry);
+        let (ns, _registry, adapter) = setup();
 
         let state = sample_state("w1", "http://worker-a:8080");
         adapter.on_worker_changed("w1", &state);
@@ -962,10 +984,7 @@ mod tests {
         // A bad payload should not propagate into the registry and
         // must not kill the spawned task — a subsequent valid write
         // still lands.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         ns.put("worker:bogus", b"not-bincode".to_vec());
@@ -1034,10 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_tombstone_removes_mesh_imported_worker() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         // Import a peer's worker, then deliver its tombstone.
@@ -1059,10 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_tombstone_never_removes_local_worker() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let id = registry
@@ -1087,10 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_publishes_local_registration() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let id = registry
@@ -1117,10 +1127,7 @@ mod tests {
     async fn outbound_never_publishes_local_zmq_worker() {
         // ZMQ workers are host-local capacity: their `ipc://` endpoint is
         // meaningless off this machine, so they stay out of the mesh.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let zmq: Arc<dyn Worker> = Arc::new(
@@ -1161,10 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_never_republishes_mesh_imported_worker() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         // A peer's state arrives (direct put models the gossiped write).
@@ -1191,10 +1195,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_tombstones_local_removal() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let id = registry
@@ -1212,10 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_recovers_missed_put_and_missed_tombstone() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         // No start(): models every notification being dropped.
 
         ns.put(
@@ -1237,14 +1235,52 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
+    async fn the_reconcile_pass_leaves_a_local_zmq_worker_alone_which_it_never_published() {
+        // A host-local ZMQ worker has no key by design (it is never
+        // published); its absent key is not a missed remote tombstone, so a
+        // pass neither asks the registry to remove it nor warns of a refused
+        // tombstone no peer sent.
+        let (ns, registry, adapter) = setup();
+        let zmq: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/smg-local.sock")
+                .model(ModelCard::new("llama-3"))
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let zmq_id = registry.register(zmq).unwrap();
+        let http_id = registry
+            .register(local_worker("http://local:8080"))
+            .unwrap();
+
+        adapter.reconcile_once();
+        adapter.reconcile_once();
+
+        assert!(
+            registry.get(&zmq_id).is_some() && registry.get(&http_id).is_some(),
+            "both local workers stay registered"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", zmq_id.as_str())).is_none(),
+            "the pass does not publish the ZMQ worker either"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", http_id.as_str())).is_some(),
+            "the pass re-asserts the published worker whose key is missing"
+        );
+        assert!(
+            !logs_contain("Refusing remote tombstone"),
+            "a pass must not take the absent key of a worker this node never publishes \
+             for a remote tombstone"
+        );
+    }
+
+    #[tokio::test]
     async fn rapid_put_then_delete_converges_to_absent() {
         // Both queued events resolve against the store (which holds the
         // tombstone by the time they drain), so a stale put echo can never
         // resurrect a removed worker regardless of drain timing.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         ns.put(
@@ -1308,10 +1344,7 @@ mod tests {
         // The restart race end-to-end: a mesh import wins the URL, the local
         // workflow claims it via register_or_replace, and the worker must be
         // published from its next mutation onward.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         // Ghost state from a previous incarnation arrives first.
@@ -1346,10 +1379,7 @@ mod tests {
         // peer), so a lag resync must not re-put unchanged state. A put
         // always notifies local subscribers, so an empty channel after the
         // second resync proves the skip.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
 
         let id = registry
             .register(local_worker("http://local:8080"))
@@ -1375,10 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn resync_publishes_local_skips_mesh_and_tombstones_stale() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
 
         // One local worker, one mesh import, one phantom previously
         // published id whose worker is gone.
@@ -1424,10 +1451,7 @@ mod tests {
 
     #[tokio::test]
     async fn published_state_names_this_node_as_owner() {
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
 
         let id = registry
             .register(local_worker("http://local:8080"))
@@ -1456,10 +1480,7 @@ mod tests {
             version: u64,
             spec: Vec<u8>,
         }
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
 
         let legacy = Legacy {
             worker_id: "old-w1".into(),
@@ -1789,10 +1810,7 @@ mod tests {
         // Discovery (or an operator) removed the worker here: a peer's key for
         // the same instance must not bring it back, a new instance at the
         // reused address imports, and a fresh local registration re-admits it.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let url = "http://10.0.0.5:8000";
@@ -1845,10 +1863,7 @@ mod tests {
         // No spec (an older publisher, an encoding failure) or a spec this
         // build cannot decode names no instance: nothing tells it from the
         // removed one, so it is held back; a decodable new instance imports.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let url = "http://10.0.0.6:8000";
@@ -1878,10 +1893,7 @@ mod tests {
     async fn a_removed_worker_without_an_instance_holds_back_every_peer_state() {
         // The removed worker carried no provider instance id (added by hand):
         // nothing can tell a peer's state apart, so every one is held back.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
         adapter.start();
 
         let url = "http://10.0.0.7:8000";
@@ -1949,10 +1961,7 @@ mod tests {
         // dropped the worker; a pass in that gap imports the endpoint from a
         // peer's key. The hold removes that import on the key's next pass,
         // and leaves an import of another instance at the address alone.
-        let mesh = MeshKV::new("node-a".into());
-        let ns = worker_namespace(&mesh);
-        let registry = Arc::new(WorkerRegistry::new());
-        let adapter = adapter(ns.clone(), registry.clone());
+        let (ns, registry, adapter) = setup();
 
         let url = "http://10.0.0.8:8000";
         ns.put(

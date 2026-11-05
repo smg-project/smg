@@ -6,6 +6,9 @@
 // HELLO/INIT/READY handshake, a DEALER registers on the input socket and
 // receives requests, and a PUSH sends outputs back.
 
+//! A mock engine for tests and test tooling: it plays the engine process's role over ZMQ, for the
+//! crate's loopback tests and, behind `mock-engine`, for `mock-worker` and other crates' tests.
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -91,6 +94,17 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_config: None,
         cache_trace_epochs: Vec::new(),
         positional_layouts: std::collections::BTreeMap::new(),
+        tensor_aux_frames: false,
+        request_types: Vec::new(),
+        disaggregation_mode: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        model_type: None,
+        architectures: Vec::new(),
+        mrope_positions: None,
+        spatial_merge_size: None,
+        image_token_id: None,
+        video_token_id: None,
     }
 }
 
@@ -250,12 +264,13 @@ impl MockEngine {
     }
 }
 
-fn ready_message(status: &str) -> ReadyMessage {
+fn ready_message(status: &str, engine_count: Option<usize>) -> ReadyMessage {
     ReadyMessage {
         status: Some(status.to_string()),
         local: Some(true),
         headless: Some(true),
         parallel_config_hash: None,
+        engine_count,
     }
 }
 
@@ -280,12 +295,17 @@ async fn within<T>(step: &'static str, future: impl std::future::Future<Output =
 }
 
 async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
-    let Some(socket_path) = endpoint.strip_prefix("ipc://") else {
-        return Ok(());
-    };
+    // A dial to an endpoint nothing listens on yet fails at once, so wait
+    // for the frontend's bind: its socket file, or its TCP port.
     timeout(CONNECT_TIMEOUT, async {
-        while tokio::net::UnixStream::connect(socket_path).await.is_err() {
-            sleep(Duration::from_millis(20)).await;
+        if let Some(socket_path) = endpoint.strip_prefix("ipc://") {
+            while tokio::net::UnixStream::connect(socket_path).await.is_err() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        } else if let Some(address) = endpoint.strip_prefix("tcp://") {
+            while tokio::net::TcpStream::connect(address).await.is_err() {
+                sleep(Duration::from_millis(20)).await;
+            }
         }
     })
     .await
@@ -310,6 +330,16 @@ pub async fn hello(
     handshake_address: &str,
     engine_id: impl Into<EngineId>,
 ) -> Result<MockEngineHandshake> {
+    hello_in_group(handshake_address, engine_id, None).await
+}
+
+/// [`hello`] from an engine whose HELLO declares the size of the group it
+/// dials with (`engine_count`, none when `None`).
+pub async fn hello_in_group(
+    handshake_address: &str,
+    engine_id: impl Into<EngineId>,
+    engine_count: Option<usize>,
+) -> Result<MockEngineHandshake> {
     let engine_id = engine_id.into();
     let identity = peer_identity(&engine_id)?;
 
@@ -324,7 +354,10 @@ pub async fn hello(
     .await??;
 
     handshake
-        .send(ZmqMessage::from(encode_msgpack(&ready_message("HELLO"))?))
+        .send(ZmqMessage::from(encode_msgpack(&ready_message(
+            "HELLO",
+            engine_count,
+        ))?))
         .await?;
     let init_frames = within("mock engine: INIT from the servicer", handshake.recv())
         .await??
@@ -383,15 +416,25 @@ impl MockEngineHandshake {
     /// Announce READY, then register on the input socket with `ready_response`
     /// and open the output PUSH socket.
     pub async fn ready(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {
+        self.announce_ready().await?.register(ready_response).await
+    }
+
+    /// Announce READY and stop there, the data sockets not yet dialed: the
+    /// instant between a real engine's READY and its input connection, held
+    /// for as long as a test needs the frontend to act first (it turns to
+    /// its input socket once the last READY is in).
+    pub async fn announce_ready(self) -> Result<MockEngineReady> {
         let Self {
             mut handshake,
             identity,
             init,
         } = self;
         handshake
-            .send(ZmqMessage::from(encode_msgpack(&ready_message("READY"))?))
+            .send(ZmqMessage::from(encode_msgpack(&ready_message(
+                "READY", None,
+            ))?))
             .await?;
-        Self::register(identity, init, ready_response).await
+        Ok(MockEngineReady { identity, init })
     }
 
     async fn register(
@@ -444,4 +487,41 @@ impl MockEngineHandshake {
             output: MockEngineOutput { socket: output },
         })
     }
+}
+
+/// A mock engine that has announced READY and not yet registered on the
+/// input socket.
+pub struct MockEngineReady {
+    identity: PeerIdentity,
+    init: HandshakeInitMessage,
+}
+
+impl MockEngineReady {
+    /// Register on the input socket with `ready_response` and open the
+    /// output PUSH socket.
+    pub async fn register(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {
+        let Self { identity, init } = self;
+        MockEngineHandshake::register(identity, init, ready_response).await
+    }
+}
+
+/// An engine generation's input DEALER dialing the frontend's input endpoint
+/// anew, as libzmq's does by itself when the frontend binds again under a
+/// connected engine: no handshake and no registration, which an engine says
+/// once at its start. Dropping the half is that generation's exit.
+pub async fn redial_input(
+    input_address: &str,
+    engine_id: impl Into<EngineId>,
+) -> Result<MockEngineInput> {
+    let identity = peer_identity(&engine_id.into())?;
+    wait_for_endpoint(input_address).await?;
+    let mut input_options = SocketOptions::default();
+    input_options.peer_identity(identity);
+    let mut socket = DealerSocket::with_options(input_options);
+    within(
+        "mock engine: dialing the input endpoint again",
+        socket.connect(input_address),
+    )
+    .await??;
+    Ok(MockEngineInput { socket })
 }

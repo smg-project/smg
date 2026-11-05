@@ -301,7 +301,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -397,13 +397,8 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
 #[cfg(test)]
 mod tests {
-    use image::RgbImage;
-
     use super::*;
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::test_support::create_test_image;
 
     #[test]
     fn test_phi3_vision_processor_default() {
@@ -478,7 +473,7 @@ mod tests {
         let processor = Phi3VisionProcessor::new();
 
         let image = create_test_image(504, 504, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
 
@@ -500,12 +495,14 @@ mod tests {
     fn test_phi3_vision_preprocess_multiple() {
         let processor = Phi3VisionProcessor::new();
 
-        let images = vec![
+        let images = [
             create_test_image(504, 504, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);

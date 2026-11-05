@@ -20,10 +20,6 @@ concurrency:
   group: rust-cache-warmer
   cancel-in-progress: false
 
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-
 permissions:
   contents: read
 

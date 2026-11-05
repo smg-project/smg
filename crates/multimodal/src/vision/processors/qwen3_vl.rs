@@ -303,14 +303,14 @@ impl VisionPreProcessor for Qwen3VLProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -352,11 +352,10 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::{
+        test_support::{assert_two_image_batch, create_test_image},
+        vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
+    };
 
     #[test]
     fn test_qwen3_vl_processor_default() {
@@ -470,7 +469,7 @@ mod tests {
         let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
         let image = create_test_image(640, 480, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -500,42 +499,16 @@ mod tests {
         };
         let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
-        let images = vec![
+        let images = [
             create_test_image(640, 480, Rgb([100, 100, 100])),
             create_test_image(480, 640, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
-        // Both images processed
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
-
-        // encoder_input is 2D [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
-
-        // Check grid_thw shape
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("image_grid_thw")
-        {
-            assert_eq!(shape, &[2, 3]); // 2 images, 3 values (T, H, W) each
-            assert_eq!(data.len(), 6);
-        } else {
-            panic!("Expected image_grid_thw to be IntTensor");
-        }
-
-        // Check patches_per_image
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("patches_per_image")
-        {
-            assert_eq!(shape, &[2]); // 2 images
-            assert_eq!(data.len(), 2);
-            // Total patches should match encoder_input first dim
-            let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.encoder_input.shape()[0]);
-        } else {
-            panic!("Expected patches_per_image to be IntTensor");
-        }
+        assert_two_image_batch(&result);
     }
 
     // Per-image-independence guard for the smg gateway pixel cache (EPD P1): the
@@ -557,11 +530,9 @@ mod tests {
         let image_a = create_test_image(640, 480, Rgb([100, 110, 120]));
         let image_b = create_test_image(420, 560, Rgb([10, 200, 90]));
 
-        let batched = processor
-            .preprocess(&[image_a.clone(), image_b.clone()])
-            .unwrap();
-        let single_a = processor.preprocess(&[image_a]).unwrap();
-        let single_b = processor.preprocess(&[image_b]).unwrap();
+        let batched = processor.preprocess(&[&image_a, &image_b]).unwrap();
+        let single_a = processor.preprocess(&[&image_a]).unwrap();
+        let single_b = processor.preprocess(&[&image_b]).unwrap();
 
         // Feature token counts line up per image.
         assert_eq!(

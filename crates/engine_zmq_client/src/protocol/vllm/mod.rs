@@ -105,7 +105,7 @@ impl EngineProtocol for VllmProtocol {
     /// Encode the request with its large typed tensors as auxiliary frames
     /// ([`encode_with_aux_frames`]); raw features keep the encoding their
     /// producer gave them, and the text path its one allocation.
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
         encode_with_aux_frames(request)
     }
 
@@ -144,18 +144,27 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
+    /// Decode the batch and retain its engine timestamp on each local output.
     fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
-                outputs: batch.outputs,
+                outputs: batch
+                    .outputs
+                    .into_iter()
+                    .map(|mut output| {
+                        output.batch_timestamp = Some(batch.timestamp);
+                        output
+                    })
+                    .collect(),
                 finished_request_ids: batch
                     .finished_requests
                     .map(|ids| ids.into_iter().collect())
                     .unwrap_or_default(),
-                load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
+                load: batch.scheduler_stats.map(EngineLoad::from),
+                kv_transfer: batch.kv_transfer,
                 wave: None,
                 utility: None,
             }),
@@ -247,7 +256,7 @@ mod tests {
 
         let request = media_request();
         let before = encode_msgpack(&request).unwrap();
-        let (payload, aux) = VllmProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
         assert_eq!(
             aux.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
@@ -295,7 +304,7 @@ mod tests {
                     multimodal::MmKwargValue::Tensor(tensor()),
                 ]));
             }
-            let (payload, aux) = VllmProtocol::encode_add(&request).unwrap();
+            let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
             assert!(aux.is_empty(), "size={size}");
             assert_eq!(payload, encode_msgpack(&request).unwrap());
         }
@@ -309,12 +318,12 @@ mod tests {
             panic!()
         };
         features[0].mm_position.is_embed.as_mut().unwrap().data = WireArrayData::AuxIndex(1);
-        let (payload, frames) = VllmProtocol::encode_add(&request).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
         let raw = decode_value(&encode_msgpack(&request.mm_features).unwrap()).unwrap();
         request.mm_features = Some(MmFeaturesPayload::Raw(raw));
-        let (payload, frames) = VllmProtocol::encode_add(&request).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
     }
@@ -323,7 +332,7 @@ mod tests {
     #[test]
     fn text_request_wire_is_unchanged() {
         let request = EngineCoreRequest::default();
-        let (payload, frames) = VllmProtocol::encode_add(&request).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
         assert_eq!(payload, encode_msgpack(&request).unwrap());
         assert!(frames.is_empty());
     }
@@ -343,7 +352,6 @@ mod tests {
                 num_waiting_reqs: runnable,
                 num_skipped_waiting_reqs: deferred,
                 kv_cache_usage: 0.5,
-                ..Default::default()
             });
             assert_eq!(load.num_waiting, total);
             assert_eq!(load.num_running, 2);

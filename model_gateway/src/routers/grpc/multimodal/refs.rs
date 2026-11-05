@@ -1,5 +1,5 @@
 //! Media-reference forwarding: decide per request whether the router
-//! preprocesses media itself or forwards references to a vLLM gRPC worker that
+//! preprocesses media itself or forwards references to a gRPC worker that
 //! advertises worker-side processing, and build the wire payload.
 
 use std::{
@@ -208,12 +208,17 @@ impl std::fmt::Display for MmRefsError {
 /// Whether `worker` can fetch and process media references itself.
 pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
     let spec = &worker.metadata().spec;
-    spec.runtime_type == RuntimeType::Vllm
-        && *worker.connection_mode() == ConnectionMode::Grpc
+    *worker.connection_mode() == ConnectionMode::Grpc
         && spec
             .labels
             .get(MM_PROCESSOR_LABEL)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| match spec.runtime_type {
+                RuntimeType::Vllm => !value.is_empty(),
+                RuntimeType::Sglang => value
+                    .trim()
+                    .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR),
+                _ => false,
+            })
 }
 
 /// Whether `worker` processes media references with the gateway's own
@@ -237,10 +242,7 @@ pub(crate) fn worker_runs_gateway_pipeline(worker: &dyn Worker) -> bool {
 /// for the engine's prompt updates. Such a request is placed only on workers
 /// that run the pipeline ([`worker_runs_gateway_pipeline`]); a model without
 /// a spec renders the engine's own placeholders and needs no pin.
-pub(crate) fn plan_needs_gateway_pipeline(
-    plan: &MediaPlan,
-    placeholders: &PlaceholderTokens,
-) -> bool {
+fn plan_needs_gateway_pipeline(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
     !placeholders.is_worker_only()
         && plan
             .modalities()
@@ -264,7 +266,7 @@ fn fleet_runs_gateway_pipeline(registry: &WorkerRegistry, model_id: &str) -> boo
 /// `"true"`, see [`SUPPORTS_VISION_LABEL`]) on the gRPC pipeline and does not
 /// process media references: under worker-side placement no image or video
 /// ever reaches it. A worker without the label is unknown, never this.
-pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
+fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
     worker.connection_mode().uses_grpc_pipeline()
         && worker
             .metadata()
@@ -284,9 +286,7 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
 /// model is neither refused in preparation nor named as waiting for a
 /// media-capable worker (readiness, the registration warning): a capable
 /// worker changes nothing for it.
-pub(crate) fn pool_has_encode_worker<'a>(
-    workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
-) -> bool {
+fn pool_has_encode_worker<'a>(workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>) -> bool {
     workers
         .into_iter()
         .any(|worker| matches!(worker.worker_type(), WorkerType::Encode))
@@ -351,7 +351,7 @@ pub(crate) fn models_without_media_processing(
 }
 
 /// URL schemes `worker` advertised; empty when it advertised none.
-pub(crate) fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
+fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
     worker
         .metadata()
         .spec
@@ -724,14 +724,15 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::HealthCheckConfig;
-
     use super::*;
     use crate::{
         routers::grpc::multimodal::{
             config::MultimodalConfigRegistry, settings::MultimodalSettings,
         },
-        worker::{BasicWorkerBuilder, ModelCard, WorkerType},
+        worker::{
+            test_support::{no_health_check, registry_with},
+            BasicWorkerBuilder, ModelCard, WorkerType,
+        },
     };
 
     const MODEL: &str = "qwen3-vl";
@@ -765,6 +766,7 @@ mod tests {
         )
         .expect("components");
         components.processing = mode;
+        assert!(!components.drain_fetches_on_error);
         components
     }
 
@@ -779,10 +781,7 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .runtime_type(runtime)
             .connection_mode(connection)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
+            .health_config(no_health_check());
         for (key, value) in labels {
             builder = builder.label(*key, *value);
         }
@@ -801,14 +800,6 @@ mod tests {
         )
     }
 
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
-    }
-
     type AcceptCase = (
         RuntimeType,
         ConnectionMode,
@@ -817,8 +808,9 @@ mod tests {
     );
 
     #[test]
-    fn accepts_only_labeled_vllm_grpc_workers() {
-        let cases: [AcceptCase; 5] = [
+    /// Forward references only to gRPC workers advertising a supported processor.
+    fn accepts_only_supported_labeled_grpc_workers() {
+        let cases: [AcceptCase; 8] = [
             (
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
@@ -842,6 +834,19 @@ mod tests {
                 RuntimeType::Sglang,
                 ConnectionMode::Grpc,
                 &[(MM_PROCESSOR_LABEL, "inprocess")],
+                false,
+            ),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Grpc,
+                &[(MM_PROCESSOR_LABEL, "smg")],
+                true,
+            ),
+            (RuntimeType::Sglang, ConnectionMode::Grpc, &[], false),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Zmq,
+                &[(MM_PROCESSOR_LABEL, "smg")],
                 false,
             ),
         ];
@@ -988,10 +993,7 @@ mod tests {
                 .connection_mode(ConnectionMode::Grpc)
                 .label(MM_PROCESSOR_LABEL, "inprocess")
                 .label(MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data")
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let epd = registry_with(vec![
@@ -1116,10 +1118,7 @@ mod tests {
                 .worker_type(WorkerType::Encode)
                 .runtime_type(RuntimeType::Vllm)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let epd = registry_with(vec![plain("grpc://127.0.0.1:9806"), encode]);
@@ -1185,10 +1184,7 @@ mod tests {
                 .worker_type(worker_type)
                 .runtime_type(RuntimeType::Vllm)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                });
+                .health_config(no_health_check());
             for (key, value) in labels {
                 builder = builder.label(*key, *value);
             }

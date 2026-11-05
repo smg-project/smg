@@ -41,7 +41,8 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
+        Bounded,
     },
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeRelease, EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
@@ -75,6 +76,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         servicer: servicer_config(dir, handshake),
         model,
         encode_dispatcher: None,
+        media_processor: None,
     }
 }
 
@@ -84,15 +86,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
 /// the other test's servicer and wait forever for its INIT.
 fn handshake_address(dir: &std::path::Path) -> String {
     format!("ipc://{}", dir.join("handshake").display())
-}
-
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -139,12 +132,32 @@ async fn harness_with(
     model: SglangModelInfo,
     configure: impl FnOnce(&mut SglangServicerConfig),
 ) -> Harness {
+    harness_with_media_reuse(model, configure, false).await
+}
+
+/// Create a connected fake scheduler with explicit media reuse settings for control-stream tests.
+async fn harness_with_media_reuse(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+    reuse: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     configure(&mut config);
     let ranks = u32::try_from(config.servicer.engine_count).expect("a small rank count");
-    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let server = if reuse {
+        SglangServicerServer::start_with_media_options(
+            config,
+            Some(engine_zmq_adapter::SglangCpuMmHasher::new(
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
+            true,
+        )
+    } else {
+        SglangServicerServer::start(config)
+    }
+    .expect("servicer starts");
     let mut engines = Vec::new();
     for index in 0..ranks {
         engines.push(
@@ -819,8 +832,8 @@ fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
 /// `disaggregation_mode`) the room places the request: a request whose
 /// Router pin names rank 0 but whose room's residue over two ranks is 1
 /// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
-/// with one warning line naming the request; a request whose pin agrees
-/// logs nothing.
+/// with one warning line naming the request, and a second such request on
+/// the connection with no warning; a request whose pin agrees logs nothing.
 #[tokio::test]
 async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let logs = captured_logs();
@@ -865,6 +878,40 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
         lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
         "{}",
         lines[0]
+    );
+
+    // Room 9 is rank 1 again and the pin still says 0: the connection's
+    // second yield, logged below WARN (the capture reads WARN and above).
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room9", 9, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room9", Some(1), Some(9))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room9", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(
+        logs.lines_containing("room9").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("room9")
     );
 
     // Room 8 is rank 0; the pin agrees: nothing logged.
@@ -1363,7 +1410,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
         input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
     });
     request.sampling_params.as_mut().unwrap().n = 2;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         pixel_values: Some(sg::TensorData {
             data: pixels.clone().into(),
@@ -1386,7 +1433,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             length: 3,
         }],
         ..Default::default()
-    });
+    }));
     let _stream = h
         .client
         .generate(request)
@@ -1410,13 +1457,23 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             (feature.dtype.as_str(), feature.shape.as_slice()),
             ("float32", &[2, 4][..])
         );
-        assert_eq!(feature.data.as_ref(), pixels.as_slice());
+        assert_eq!(
+            feature.data.as_raw_view().expect("inline bytes").as_ref(),
+            pixels.as_slice()
+        );
         let grid_tensor = &item.model_specific_data["image_grid_thw"];
         assert_eq!(
             (grid_tensor.dtype.as_str(), grid_tensor.shape.as_slice()),
             ("int64", &[1, 3][..])
         );
-        assert_eq!(grid_tensor.data.as_ref(), grid.as_slice());
+        assert_eq!(
+            grid_tensor
+                .data
+                .as_raw_view()
+                .expect("inline bytes")
+                .as_ref(),
+            grid.as_slice()
+        );
         assert_eq!(engine_request.input_ids, vec![1, 7, 7, 7, 2, 3, 4, 5, 6]);
         rids.push(engine_request.rid);
     }
@@ -1546,11 +1603,11 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         input_ids: vec![1, 7, 7, 7, 2],
     });
     request.sampling_params.as_mut().unwrap().n = n;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         image_urls: vec![IMAGE_REFERENCE.to_string()],
         ..Default::default()
-    });
+    }));
     request
 }
 
@@ -2325,20 +2382,11 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
 /// history, and the first subscription gets them as the engine's whole state.
 #[tokio::test]
 async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
-    use zeromq::{prelude::*, PubSocket};
+    use crate::testing::{bound_publisher, relay_takes_the_first_two_batches};
 
-    use crate::kv_events::golden;
-
-    let mut publisher = PubSocket::new();
-    let port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
+    let (mut publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model).await;
     let relay = h
@@ -2348,35 +2396,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // The SUB connect is asynchronous: publish sequence 0 until the relay,
-    // with no subscriber of its own yet, has taken it (repeats are duplicates).
-    let batch1 = golden::bytes(golden::BATCH1);
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 0, &batch1))
-            .await
-            .expect("publish");
-        if relay.counts().relayed >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        relay.counts().relayed,
-        1,
-        "the relay took sequence 0 before any gateway subscribed"
-    );
-    publisher
-        .send(golden::frame(b"kv", 1, &golden::bytes(golden::BATCH2)))
-        .await
-        .expect("publish");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(relay.counts().relayed, 2);
+    relay_takes_the_first_two_batches(&mut publisher, &relay).await;
 
     // The first gateway gets both from the history: the engine's whole state.
     let mut stream = h
@@ -2404,29 +2424,13 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    use crate::kv_events::golden;
-
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model).await;
     let relay = h
@@ -2436,61 +2440,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -3530,4 +3480,506 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
     );
     drop(engine);
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two connected schedulers whose handshakes each say a data-parallel size
+/// of one: the zero-filled `GetLoads` before the first snapshot names the
+/// ranks the servicer serves (one per connected scheduler), as the pinned
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
+#[tokio::test]
+async fn the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+struct NativeVideoProcessor;
+
+impl SglangMediaProcessor for NativeVideoProcessor {
+    /// Advertise the deterministic processor contract used by this test fixture.
+    fn identity_key(&self) -> Option<&str> {
+        Some("test-processor")
+    }
+
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        mut request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(async move {
+            let refs = request.mm_inputs.take().unwrap();
+            assert_eq!(refs.video_urls, ["data:video/mp4;base64,AA=="]);
+            assert!(refs.pixel_values.is_none());
+            assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
+            request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                modalities: vec!["video".into()],
+                pixel_values: Some(sg::TensorData {
+                    data: vec![0; 32].into(),
+                    shape: vec![2, 4],
+                    dtype: "float32".into(),
+                }),
+                model_specific_tensors: [(
+                    "video_grid_thw".into(),
+                    sg::TensorData {
+                        data: [1i64, 2, 2]
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        shape: vec![1, 3],
+                        dtype: "int64".into(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                im_token_id: Some(7),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                ..Default::default()
+            }));
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+/// References must expand tokens before their video tensors reach the scheduler.
+async fn native_video_refs_expand_before_scheduler_dispatch() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(NativeVideoProcessor));
+    })
+    .await;
+    let info = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.server_args.unwrap().fields["mm_processor"].kind,
+        Some(Kind::StringValue("smg".into()))
+    );
+    let mut request = generate_request("native-video", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    let _stream = h.client.generate(request).await.unwrap().into_inner();
+    let received = recv_add(&mut h.engine_in).await;
+    assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
+    let mm = received.mm_inputs.unwrap();
+    assert_eq!(mm.mm_items[0].modality, SglangWireModality::Video);
+    assert_eq!(mm.mm_items[0].offsets, Some(vec![(1, 3)]));
+    assert!(mm.mm_items[0]
+        .model_specific_data
+        .contains_key("video_grid_thw"));
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+struct PendingMediaProcessor;
+
+impl SglangMediaProcessor for PendingMediaProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        _request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+/// Aborting preprocessing unregisters the request without sending scheduler work.
+async fn abort_during_native_media_processing_never_submits_to_scheduler() {
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(PendingMediaProcessor));
+    })
+    .await;
+    let mut request = generate_request("pending-media", true, Vec::new());
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        image_urls: vec!["https://example.test/image.png".into()],
+        ..Default::default()
+    }));
+    let mut client = h.client.clone();
+    #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
+    let pending = tokio::spawn(async move { client.generate(request).await });
+    wait_until(|| h.server.active_requests() == 1).await;
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "pending-media".into(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = pending.bounded().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Cancelled);
+    wait_until(|| h.server.active_requests() == 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Keep engine hash opt-outs authoritative and reject out-of-range concurrency.
+fn cpu_mm_hash_configuration_preserves_engine_opt_outs() {
+    use super::mm_hash_threads;
+    assert_eq!(mm_hash_threads(Some("0"), true, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(Some("16"), true, "0", "0").unwrap(), 16);
+    for (gpu, skip) in [("64", "0"), ("0", "1"), ("unknown", "0"), ("0", "true")] {
+        assert_eq!(mm_hash_threads(Some("16"), true, gpu, skip).unwrap(), 0);
+    }
+    for invalid in ["-1", "33", "x"] {
+        assert!(mm_hash_threads(Some(invalid), true, "0", "0").is_err());
+    }
+}
+
+#[tokio::test]
+/// Verify early metadata delivery and Decode reuse or original-reference fallback.
+async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
+    use smg_grpc_client::sglang_media_identity as contract;
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"prefill"}"#.into();
+    let mut p = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut original = generate_request("reuse-video", true, Vec::new());
+    original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    original.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".into(),
+        bootstrap_port: 8998,
+        bootstrap_room: 1,
+    });
+    let mut prefill = original.clone();
+    prefill.return_media_identity = true;
+    let mut stream = p.client.generate(prefill).await.unwrap().into_inner();
+    let prefill_wire = recv_add(&mut p.engine_in).await;
+    // No engine output or KV readiness has been supplied: the control item
+    // must still arrive, otherwise real PD would deadlock here.
+    let early = tokio::time::timeout(Duration::from_secs(1), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(early.response.is_none());
+    let identity = early.media_identity.unwrap();
+    assert!(contract::validate(
+        &identity,
+        &original,
+        "v1:0.5.20:test-processor"
+    ));
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"decode"}"#.into();
+    let mut d = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut decode = original.clone();
+    decode.media_identity = Some(Box::new(identity.clone()));
+    let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
+    let wire = recv_add(&mut d.engine_in).await;
+    assert_eq!(wire.input_ids, prefill_wire.input_ids);
+    let pmm = prefill_wire.mm_inputs.unwrap();
+    let dmm = wire.mm_inputs.unwrap();
+    assert!(dmm.mm_items[0].feature.is_none());
+    assert!(pmm.mm_items[0].feature.is_some());
+    assert_eq!(dmm.mm_items[0].hash, pmm.mm_items[0].hash);
+    assert_eq!(dmm.mm_items[0].offsets, pmm.mm_items[0].offsets);
+    assert_eq!(
+        dmm.mm_items[0].model_specific_data,
+        pmm.mm_items[0].model_specific_data
+    );
+    let mut fallback_streams = Vec::new();
+    for case in 0..5 {
+        let mut req = original.clone();
+        req.request_id = format!("fallback-{case}");
+        let mut bad = identity.clone();
+        bad.request_digest = contract::request_digest(&req);
+        match case {
+            0 => bad.processor_key = "different-config".into(),
+            1 => bad.request_digest[0] ^= 1,
+            2 => bad.mm_inputs.as_mut().unwrap().mm_placeholders[0].length = u32::MAX,
+            3 => bad
+                .mm_inputs
+                .as_mut()
+                .unwrap()
+                .model_specific_tensors
+                .clear(),
+            _ => bad.version += 1,
+        }
+        req.media_identity = Some(Box::new(bad));
+        fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
+        let wire = recv_add(&mut d.engine_in).await;
+        assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);
+        assert!(
+            wire.mm_inputs.unwrap().mm_items[0].feature.is_some(),
+            "case {case} must process references"
+        );
+    }
+    p.server.stop(Duration::from_secs(5)).unwrap();
+    d.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Only complete supported processor contracts enable the default optimization.
+fn media_optimization_defaults_require_a_supported_identity() {
+    assert!(media_reuse_enabled(None, true).unwrap());
+    assert!(!media_reuse_enabled(None, false).unwrap());
+    assert!(!media_reuse_enabled(Some("0"), true).unwrap());
+    assert!(media_reuse_enabled(Some("1"), false).unwrap());
+    assert!(media_reuse_enabled(Some("auto"), true).is_err());
+    assert_eq!(mm_hash_threads(None, true, "0", "0").unwrap(), 16);
+    assert_eq!(mm_hash_threads(None, false, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 1000)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 1000))),
+    )
+    .await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 1000))),
+    )
+    .await;
+    chunk(third.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 1000))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

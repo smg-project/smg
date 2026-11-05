@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
     },
     time::{Duration, Instant},
 };
@@ -51,7 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
+        Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -100,15 +101,6 @@ async fn assert_handshake_released(handshake: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     UnixListener::bind(path).expect("handshake endpoint released");
-}
-
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -232,7 +224,7 @@ fn batch(
             ..Default::default()
         }],
         finished_requests: finish.map(|_| BTreeSet::from([request_id.to_string()])),
-        scheduler_stats: stats.map(Box::new),
+        scheduler_stats: stats,
         ..Default::default()
     })
 }
@@ -253,6 +245,122 @@ fn generate_request(id: &str, stream: bool, stop: Vec<String>) -> vllm::Generate
         }),
         stream,
         ..Default::default()
+    }
+}
+
+/// The request line logged for every `Generate` spells the Python servicer's
+/// words, so a reader of the worker's log (the PD media placement, the rank
+/// pin) serves both servicers: the input kind by its field name, Python
+/// booleans, `None` for an unpinned request, `preprocessed_mm` true only for
+/// a batch that carries pixels or model-specific tensors (a bare identity
+/// payload of hashes alone reads false; a PD decode side built from the
+/// prefill's identity carries its grid tensors and reads true), the count of
+/// worker-side media references.
+#[test]
+fn the_request_line_spells_the_python_servicers_words() {
+    let mut req = generate_request("r-1", true, Vec::new());
+    assert_eq!(
+        generate::request_line(&req),
+        "Generate request r-1: input_type=tokenized, stream=True, preprocessed_mm=False, \
+         media_refs=0, dp_rank=None"
+    );
+    req.stream = false;
+    req.data_parallel_rank = Some(1);
+    req.media_refs = Some(vllm::MediaRefs {
+        items: vec![
+            vllm::MediaRef {
+                modality: common::Modality::Image as i32,
+                url: "https://example.test/a.jpg".to_string(),
+            },
+            vllm::MediaRef {
+                modality: common::Modality::Video as i32,
+                url: "https://example.test/b.mp4".to_string(),
+            },
+        ],
+    });
+    assert_eq!(
+        generate::request_line(&req),
+        "Generate request r-1: input_type=tokenized, stream=False, preprocessed_mm=False, \
+         media_refs=2, dp_rank=1"
+    );
+    // An identity payload (hashes only) is not a preprocessed batch; pixels or
+    // model-specific tensors in any batch are.
+    req.media_refs = None;
+    req.mm_inputs = Some(vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string()],
+        ..Default::default()
+    });
+    assert!(generate::request_line(&req).contains("preprocessed_mm=False, media_refs=0"));
+    req.extra_mm_inputs = vec![vllm::MultimodalInputs {
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            vllm::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    }];
+    assert!(generate::request_line(&req).contains("preprocessed_mm=True, media_refs=0"));
+    req.input = Some(vllm::generate_request::Input::Text("hello".to_string()));
+    assert!(generate::request_line(&req).starts_with("Generate request r-1: input_type=text,"));
+    req.input = None;
+    assert!(generate::request_line(&req).starts_with("Generate request r-1: input_type=None,"));
+}
+
+/// The line is a DEBUG event under its own target, so a worker-log reader
+/// raises that target alone and the production filter never pays for the
+/// formatting: a subscriber at DEBUG receives the line under the target, a
+/// subscriber at INFO receives nothing.
+#[test]
+fn the_request_line_is_a_debug_event_under_its_own_target() {
+    fn captured(level: tracing::Level) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(move || LockedBuffer(Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            generate::log_request_line(&generate_request("r-dbg", true, Vec::new()));
+        });
+        let bytes = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    let at_debug = captured(tracing::Level::DEBUG);
+    assert!(at_debug.contains("DEBUG"), "{at_debug}");
+    assert!(
+        at_debug.contains(generate::REQUEST_LINE_TARGET),
+        "{at_debug}"
+    );
+    assert!(
+        at_debug.contains(
+            "Generate request r-dbg: input_type=tokenized, stream=True, preprocessed_mm=False, \
+             media_refs=0, dp_rank=None"
+        ),
+        "{at_debug}"
+    );
+    assert_eq!(captured(tracing::Level::INFO), "");
+}
+
+/// A `MakeWriter` over a shared buffer for the subscriber a test installs.
+struct LockedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LockedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -788,13 +896,13 @@ async fn kv_transfer_params_pass_through_both_ways() {
 
     let mut outputs = batch("pd1", vec![7], Some(EngineCoreFinishReason::Length), None);
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].kv_transfer_params = Some(serde_json::json!({
+        batch.outputs[0].kv_transfer_params = Some(Box::new(serde_json::json!({
             "do_remote_prefill": true,
             "remote_block_ids": [1, 2],
             "remote_engine_id": "eng-a",
             "remote_host": "10.0.0.1",
             "remote_port": 5600,
-        }));
+        })));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let finished = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -1140,12 +1248,12 @@ async fn spec_decode_counts_reach_the_complete() {
         None,
     );
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].spec_decode_metrics = Some(SpecDecodeMetrics {
+        batch.outputs[0].spec_decode_metrics = Some(Box::new(SpecDecodeMetrics {
             num_spec_tokens: 3,
             histogram: vec![1, 2, 0, 1],
             num_draft_tokens: 9,
             ..Default::default()
-        });
+        }));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let done = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -1490,19 +1598,11 @@ async fn the_launchers_running_window_wins_over_the_handshakes() {
 /// history, and the first subscription gets them as the engine's whole state.
 #[tokio::test]
 async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
-    use kv_events::golden;
-    use zeromq::{prelude::*, PubSocket};
+    use crate::testing::{bound_publisher, relay_takes_the_first_two_batches};
 
-    let mut publisher = PubSocket::new();
-    let port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
+    let (mut publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let relay = h
@@ -1512,35 +1612,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // The SUB connect is asynchronous: publish sequence 0 until the relay,
-    // with no subscriber of its own yet, has taken it (repeats are duplicates).
-    let batch1 = golden::bytes(golden::BATCH1);
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 0, &batch1))
-            .await
-            .expect("publish");
-        if relay.counts().relayed >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        relay.counts().relayed,
-        1,
-        "the relay took sequence 0 before any gateway subscribed"
-    );
-    publisher
-        .send(golden::frame(b"kv", 1, &golden::bytes(golden::BATCH2)))
-        .await
-        .expect("publish");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(relay.counts().relayed, 2);
+    relay_takes_the_first_two_batches(&mut publisher, &relay).await;
 
     // The first gateway gets both from the history: the engine's whole state.
     let mut stream = h
@@ -1563,7 +1635,8 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 }
 
 /// Deferred requests survive the wire, adapter, gRPC poll and KV load record,
-/// remain rank-local, and disappear when the engine drains its queues.
+/// remain rank-local (the other rank's zero-filled entry stays zero), and
+/// disappear when the engine drains its queues.
 #[tokio::test]
 async fn remote_kv_waiting_load_is_reported_per_rank() {
     let mut model = model_info();
@@ -1576,11 +1649,11 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
         rank1_out
             .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 1,
-                scheduler_stats: Some(Box::new(SchedulerStats {
+                scheduler_stats: Some(SchedulerStats {
                     num_waiting_reqs: runnable,
                     num_skipped_waiting_reqs: deferred,
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }))
             .await
@@ -1601,13 +1674,24 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(loads.loads.len(), 1);
-        let load = &loads.loads[0];
-        assert_eq!(load.dp_rank, 1);
-        assert_eq!(load.num_waiting_reqs, expected_total);
+        assert_eq!(loads.loads.len(), 2, "one entry per rank: {loads:?}");
+        let by_rank = |rank: i32| {
+            loads
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == rank)
+                .unwrap_or_else(|| panic!("rank {rank}'s entry: {loads:?}"))
+        };
+        assert_eq!(by_rank(1).num_waiting_reqs, expected_total);
         let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
         assert_eq!(record.waiting_requests, expected_record_total);
-        assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+        // Rank 0 has not reported: its entry and record stay zero-filled,
+        // never rank 1's queue.
+        assert_eq!(by_rank(0).num_waiting_reqs, 0);
+        assert_eq!(
+            kv_events::LoadSource::load(&source, Some(0)).map(|record| record.waiting_requests),
+            Some(0)
+        );
     }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -1615,7 +1699,8 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the
-/// second's figures (or the second reading zero while it serves).
+/// second's figures (or the second reading zero while it serves), from the
+/// second's first step on: a zero-filled entry, not a missing one.
 #[tokio::test]
 async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     let mut model = model_info();
@@ -1647,7 +1732,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
                 }),
                 ..Default::default()
             }],
-            scheduler_stats: Some(Box::new(step(1))),
+            scheduler_stats: Some(step(1)),
             ..Default::default()
         }))
         .await
@@ -1656,15 +1741,48 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10, 11, 12, 13]
     );
-    // Rank 0 has not reported a scheduler step: a batch of its gets no
-    // record rather than rank 1's figures.
+    // Rank 0 has not reported a scheduler step: its entry, and the record a
+    // batch of its would carry, are zero-filled (an idle rank, not a gone
+    // one), never rank 1's figures.
+    wait_until(|| {
+        h.server
+            .state
+            .shared
+            .engine()
+            .is_ok_and(|client| client.get_loads().loads.len() == 1)
+    })
+    .await;
     let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    let idle = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's zero record");
+    assert_eq!(
+        (
+            idle.running_requests,
+            idle.cache_hit_rate,
+            idle.gen_throughput
+        ),
+        (0, Some(0.0), 0.0),
+        "{idle:?}"
+    );
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2, "{loads:?}");
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 1)]
+    );
     // Then rank 0 reports an idle step.
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
-            scheduler_stats: Some(Box::new(step(0))),
+            scheduler_stats: Some(step(0)),
             ..Default::default()
         }))
         .await
@@ -1813,23 +1931,84 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Exercise the production path: vLLM wire -> Rust servicer -> gRPC GetLoads,
+/// plus the record used by the KV-event relay. Only actual input work counts.
+#[tokio::test]
+async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, mut input, mut output) = two_rank_harness(model).await;
+    for (id, start) in [("p1", 10.0), ("p2", 20.0)] {
+        let mut request = generate_request(id, true, vec![]);
+        request.data_parallel_rank = Some(1);
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        assert_eq!(recv_add(&mut input).await.request_id, id);
+        output
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 1,
+                timestamp: start + 0.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.to_string(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Queued,
+                            timestamp: start - 9.0,
+                        },
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Scheduled,
+                            timestamp: start,
+                        },
+                    ]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank1 = loads.loads.iter().find(|load| load.dp_rank == 1).unwrap();
+    assert_eq!(rank1.prefill_throughput, Some(4.0));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
+    assert_eq!(record.prefill_throughput, Some(4.0));
+    assert_eq!(
+        kv_events::LoadSource::load(&source, Some(0))
+            .unwrap()
+            .prefill_throughput,
+        None
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Every relayed batch carries the servicer's load record: the figures
 /// `GetLoads` answers with, so the gateway reads the queue, running set, KV
 /// usage and window at every scheduler step.
 #[tokio::test]
 async fn relayed_batches_carry_the_servicers_load_record() {
-    use zeromq::{prelude::*, PubSocket};
+    use zeromq::prelude::*;
 
-    let mut publisher = PubSocket::new();
-    let port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
+    use crate::testing::bound_publisher;
+
+    let (mut publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let mut stream = h
@@ -1888,28 +2067,13 @@ async fn relayed_batches_carry_the_servicers_load_record() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use kv_events::golden;
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let relay = h
@@ -1919,61 +2083,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -2152,6 +2262,77 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A subscriber that wants the load records alone gets them with or without
+/// a relay (the servicer's own figures need none): `load_only` batches
+/// numbered 0, one per rank, with the engine's telemetry, and never an
+/// event; a rank's record follows its own clock.
+#[tokio::test]
+async fn loads_only_streams_each_ranks_record_without_a_relay() {
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.client
+            .subscribe_kv_events(common::SubscribeKvEventsRequest {
+                loads_only: true,
+                ..Default::default()
+            }),
+    )
+    .await
+    .expect("the call resolves")
+    .expect("subscribe: no relay is needed for the records")
+    .into_inner();
+    let mut ranks = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a record in time")
+            .expect("stream open")
+            .expect("a batch");
+        assert_eq!(batch.sequence_number, 0);
+        assert!(batch.events.is_empty());
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only);
+        assert_eq!(load.running_requests, 0);
+        assert_eq!(
+            load.max_total_num_tokens,
+            Some(h.server.state.shared.kv_capacity_tokens())
+        );
+        ranks.push(batch.dp_rank.expect("a rank"));
+    }
+    ranks.sort_unstable();
+    assert_eq!(ranks, vec![0, 1], "one record per rank at the first tick");
+    // Rank 1 reports a scheduler step with work: its record moves, rank 0's
+    // does not, so the next batch is rank 1's alone.
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    // Rank 1's moved record comes within a tick; a heartbeat of rank 0 may
+    // precede it on a slow box. Every batch is a record without events.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let batch = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .expect("rank 1's record in time")
+            .expect("stream open")
+            .expect("a batch");
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only && batch.events.is_empty(), "{batch:?}");
+        if batch.dp_rank == Some(1) && load.waiting_requests == 2 {
+            assert_eq!(load.running_requests, 0);
+            break;
+        }
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
 /// servicer's message. With one configured, the call resolves before any
 /// event (headers go out eagerly, as the Python relay's initial metadata),
@@ -2192,6 +2373,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
             .subscribe_kv_events(common::SubscribeKvEventsRequest {
                 start_sequence_number: 0,
                 load_records_before_first_batch: false,
+                loads_only: false,
             }),
     )
     .await
@@ -2546,9 +2728,9 @@ fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
             request_id: request_id.to_string(),
-            pooling_output: Some(PoolingOutput::new(
+            pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
-            )),
+            ))),
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],
@@ -3389,6 +3571,35 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The vocabulary of structural-tag nodes the engine's grammar compiler takes
+/// is a fact of the installation the launcher read: advertised so the Router
+/// spells such a worker's structural tags in the older vocabulary; a launcher
+/// that reported none advertises none.
+#[tokio::test]
+async fn server_info_advertises_the_structural_tag_vocabulary() {
+    let mut model = model_info();
+    model.structural_tag_vocabulary = "older".to_string();
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.structural_tag_vocabulary, "older");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.structural_tag_vocabulary, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]
@@ -4015,12 +4226,25 @@ async fn drain_refuses_new_decode_requests_but_keeps_the_rejection_notice() {
 /// A PD decode side on `connector`, with the request the adapter refuses
 /// after admission closed and before the engine got it (a negative
 /// temperature fails its own check of the sampling params): the refusal
-/// path of the notice.
+/// path of the notice. The Mooncake flag is what the launcher hands for a
+/// top-level connector of that name.
 fn decode_side_on(connector: &str) -> VllmModelInfo {
     let mut model = model_info();
     model.kv_connector = connector.to_string();
     model.kv_role = "kv_consumer".to_string();
     model.kv_engine_id = "decode-engine".to_string();
+    model.runs_mooncake = connector == "MooncakeConnector";
+    model
+}
+
+/// A PD decode side behind a `MultiConnector` whose projection stays at the
+/// wrapper (a second P2P child beside the mover, an empty child engine id, a
+/// malformed sibling: the launcher reports the wrapper's own name), with
+/// `runs_mooncake` as the launcher reads it off the raw config.
+fn wrapper_projected_decode_side(runs_mooncake: bool) -> VllmModelInfo {
+    let mut model = decode_side_on("MultiConnector");
+    model.kv_engine_id = "eng-d".to_string();
+    model.runs_mooncake = runs_mooncake;
     model
 }
 
@@ -4088,6 +4312,55 @@ async fn a_mooncake_decode_side_withholds_the_notice_with_one_warning_line() {
     assert_eq!(accepted.request_id, "pd-mooncake");
     assert!(!accepted.abort_immediately);
     assert_eq!(logs.lines_containing("pd-mooncake").len(), 1);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A decode side behind a wrapper whose projection stays at the wrapper
+/// withholds the notice when a Mooncake child runs under it: the flag the
+/// launcher reads off the raw config decides, not the projected name (the
+/// wrapper hands the notice's allocation to every child and merges every
+/// child's finished transfers, so the Mooncake child would die on it).
+#[tokio::test]
+async fn a_wrapper_projected_decode_side_that_runs_mooncake_withholds_the_notice() {
+    let logs = captured_logs();
+    let mut h = harness(wrapper_projected_decode_side(true), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-wrapper-mooncake"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("pd-wrapper-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("KV-transfer rejection notice withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The same wrapper-projected decode side without a Mooncake child (NIXL
+/// beside a store) still sends the notice.
+#[tokio::test]
+async fn a_wrapper_projected_decode_side_without_a_mooncake_child_still_sends_the_notice() {
+    let mut h = harness(wrapper_projected_decode_side(false), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-wrapper-nixl"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "pd-wrapper-nixl");
+    assert!(notice.abort_immediately);
+    assert_eq!(
+        recv_abort(&mut h.engine_in).await,
+        vec!["pd-wrapper-nixl".to_string()]
+    );
+    assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -5016,4 +5289,41 @@ async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held()
         .unwrap();
     while late.message().bounded().await.unwrap().is_some() {}
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A data-parallel engine whose ranks were launched independently: each
+/// rank's handshake says a data-parallel size of one while the servicer
+/// serves two. `GetServerInfo` advertises the two (the gateway expands the
+/// worker into that many rank workers under `--dp-aware`) and the
+/// zero-filled `GetLoads` before the first snapshot names both ranks.
+#[tokio::test]
+async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let server = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(server.data_parallel_size, 2);
+
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 }

@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use engine_zmq_client::protocol::sglang::output::{MatchedStop, SglangOutput};
 use futures::{stream::SelectAll, Stream, StreamExt};
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::time::{Instant, Sleep};
@@ -16,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     client::zmq_status, sglang::SglangGenerateStream, tokenspeed::TokenSpeedGenerateStream,
-    vllm::VllmGenerateStream,
+    trtllm::TrtllmGenerateStream, vllm::VllmGenerateStream,
 };
 
 /// Streaming generate output over ZMQ, presented as vLLM-proto
@@ -39,11 +40,70 @@ pub struct ZmqGenerateStream {
 /// The merged per-choice sub-streams of one dialect.
 enum SubStreams {
     /// vLLM EngineCore outputs.
-    Vllm(SelectAll<VllmGenerateStream>),
+    Vllm(Subs<VllmGenerateStream>),
     /// TokenSpeed outputs.
-    TokenSpeed(SelectAll<TokenSpeedGenerateStream>),
+    TokenSpeed(Subs<TokenSpeedGenerateStream>),
     /// SGLang outputs.
-    Sglang(SelectAll<SglangGenerateStream>),
+    Sglang(Subs<SglangGenerateStream>),
+    /// TensorRT-LLM outputs (the shim's slim records).
+    Trtllm(Subs<TrtllmGenerateStream>),
+}
+
+/// The subs of one request: the one sub of a request without fan-out, polled
+/// directly, or the `SelectAll` merge of an `n > 1` fan-out. The merge
+/// re-queues a sub behind every item it yields (a task node allocated and the
+/// sub moved out and back in per output), which a single sub never needs. The
+/// one sub is boxed once at the start (a dialect stream is about 1 KB) so the
+/// merged stream, and every wrapper holding it, stays the size it was.
+enum Subs<S> {
+    /// The one sub of a request without fan-out; `None` once it ended.
+    One(Option<Box<S>>),
+    /// The `n > 1` fan-out, polled together and yielding as ready.
+    Many(SelectAll<S>),
+}
+
+impl<S: Stream + Unpin> Subs<S> {
+    fn new(mut subs: Vec<S>) -> Self {
+        if subs.len() == 1 {
+            Self::One(subs.pop().map(Box::new))
+        } else {
+            Self::Many(subs.into_iter().collect())
+        }
+    }
+
+    /// The next item of the subs still open; `None` once every sub ended
+    /// (and on every poll after that).
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        match self {
+            Self::One(sub) => {
+                let Some(stream) = sub.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                let next = stream.poll_next_unpin(cx);
+                if matches!(next, Poll::Ready(None)) {
+                    *sub = None;
+                }
+                next
+            }
+            Self::Many(subs) => subs.poll_next_unpin(cx),
+        }
+    }
+
+    /// `id` of every sub still open.
+    fn ids<'a>(&'a self, id: fn(&'a S) -> &'a str) -> Vec<&'a str> {
+        match self {
+            Self::One(sub) => sub.as_deref().into_iter().map(id).collect(),
+            Self::Many(subs) => subs.iter().map(id).collect(),
+        }
+    }
+
+    /// Drop every sub still open.
+    fn clear(&mut self) {
+        match self {
+            Self::One(sub) => *sub = None,
+            Self::Many(subs) => subs.clear(),
+        }
+    }
 }
 
 impl SubStreams {
@@ -52,33 +112,30 @@ impl SubStreams {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<vllm::GenerateResponse, tonic::Status>>> {
         match self {
-            Self::Vllm(streams) => streams.poll_next_unpin(cx),
-            Self::TokenSpeed(streams) => streams.poll_next_unpin(cx),
-            Self::Sglang(streams) => streams.poll_next_unpin(cx),
+            Self::Vllm(subs) => subs.poll_next(cx),
+            Self::TokenSpeed(subs) => subs.poll_next(cx),
+            Self::Sglang(subs) => subs.poll_next(cx),
+            Self::Trtllm(subs) => subs.poll_next(cx),
         }
     }
 
     /// The engine-side request ids of the subs still open.
     fn request_ids(&self) -> Vec<&str> {
         match self {
-            Self::Vllm(streams) => streams.iter().map(VllmGenerateStream::request_id).collect(),
-            Self::TokenSpeed(streams) => streams
-                .iter()
-                .map(TokenSpeedGenerateStream::request_id)
-                .collect(),
-            Self::Sglang(streams) => streams
-                .iter()
-                .map(SglangGenerateStream::request_id)
-                .collect(),
+            Self::Vllm(subs) => subs.ids(VllmGenerateStream::request_id),
+            Self::TokenSpeed(subs) => subs.ids(TokenSpeedGenerateStream::request_id),
+            Self::Sglang(subs) => subs.ids(SglangGenerateStream::request_id),
+            Self::Trtllm(subs) => subs.ids(TrtllmGenerateStream::request_id),
         }
     }
 
     /// Drop every sub still open, which aborts its engine-side request.
     fn clear(&mut self) {
         match self {
-            Self::Vllm(streams) => streams.clear(),
-            Self::TokenSpeed(streams) => streams.clear(),
-            Self::Sglang(streams) => streams.clear(),
+            Self::Vllm(subs) => subs.clear(),
+            Self::TokenSpeed(subs) => subs.clear(),
+            Self::Sglang(subs) => subs.clear(),
+            Self::Trtllm(subs) => subs.clear(),
         }
     }
 }
@@ -126,16 +183,20 @@ struct StreamDeadline {
 }
 
 impl ZmqGenerateStream {
-    pub(crate) fn vllm(streams: SelectAll<VllmGenerateStream>) -> Self {
-        Self::new(SubStreams::Vllm(streams))
+    pub(crate) fn vllm(subs: Vec<VllmGenerateStream>) -> Self {
+        Self::new(SubStreams::Vllm(Subs::new(subs)))
     }
 
-    pub(crate) fn tokenspeed(streams: SelectAll<TokenSpeedGenerateStream>) -> Self {
-        Self::new(SubStreams::TokenSpeed(streams))
+    pub(crate) fn tokenspeed(subs: Vec<TokenSpeedGenerateStream>) -> Self {
+        Self::new(SubStreams::TokenSpeed(Subs::new(subs)))
     }
 
-    pub(crate) fn sglang(streams: SelectAll<SglangGenerateStream>) -> Self {
-        Self::new(SubStreams::Sglang(streams))
+    pub(crate) fn sglang(subs: Vec<SglangGenerateStream>) -> Self {
+        Self::new(SubStreams::Sglang(Subs::new(subs)))
+    }
+
+    pub(crate) fn trtllm(subs: Vec<TrtllmGenerateStream>) -> Self {
+        Self::new(SubStreams::Trtllm(Subs::new(subs)))
     }
 
     fn new(subs: SubStreams) -> Self {
@@ -345,6 +406,95 @@ impl StreamState {
             response: Some(response),
         }
     }
+}
+
+/// A slim record's matched stop in the vLLM-proto shape.
+pub(crate) fn matched_stop_of(matched: MatchedStop) -> vllm::generate_complete::MatchedStop {
+    match matched {
+        MatchedStop::TokenId(id) => vllm::generate_complete::MatchedStop::MatchedTokenId(id),
+        MatchedStop::Text(text) => vllm::generate_complete::MatchedStop::MatchedStopStr(text),
+    }
+}
+
+/// One tick of the slim record, mapped the way every wire that answers with
+/// it maps it: the per-request counts (reported directly, cumulative for the
+/// completion), the sampled and ranked logprob columns (this tick's on the
+/// chunk, accumulated for the `Complete`), the prompt-logprob columns (on
+/// the prefill tick, once per request, chunked prefill may split them), then
+/// the tick as a response with the prompt logprobs attached where the proto
+/// carries them. `finish` is the terminal verdict the wire's module resolved
+/// first (each applies its own abort policy before this; an abort never
+/// reaches here).
+pub(crate) fn map_slim_output(
+    state: &mut StreamState,
+    index: u32,
+    output: SglangOutput,
+    finish: Option<(String, Option<vllm::generate_complete::MatchedStop>)>,
+    pending: &mut Option<vllm::GenerateResponse>,
+    input_logprobs_emitted: &mut bool,
+) -> vllm::GenerateResponse {
+    if output.prompt_tokens > 0 {
+        state.prompt_tokens = output.prompt_tokens;
+    }
+    if output.cached_tokens > 0 {
+        state.cached_tokens = output.cached_tokens;
+    }
+    state.completion_tokens = output.completion_tokens;
+    state.output_ids.extend(output.output_ids.iter().copied());
+    if !output.input_logprobs_val.is_empty() {
+        state
+            .prompt_logprobs
+            .extend(
+                output
+                    .input_logprobs_val
+                    .iter()
+                    .map(|lp| vllm::InputTokenLogProb {
+                        value: lp.map(|lp| lp as f32),
+                    }),
+            );
+        state
+            .prompt_token_ids
+            .extend(output.input_logprobs_idx.iter().copied());
+        state.prompt_top_logprobs.extend(
+            output
+                .input_top_logprobs_val
+                .iter()
+                .zip(&output.input_top_logprobs_idx)
+                .map(|(values, token_ids)| vllm::TopLogProbs {
+                    values: values.iter().map(|&lp| lp as f32).collect(),
+                    token_ids: token_ids.clone(),
+                }),
+        );
+    }
+    // Ranked candidates per position, as the engine reports them.
+    let tick_top_logprobs: Vec<vllm::TopLogProbs> = output
+        .output_top_logprobs_val
+        .iter()
+        .zip(&output.output_top_logprobs_idx)
+        .map(|(values, token_ids)| vllm::TopLogProbs {
+            values: values.iter().map(|&lp| lp as f32).collect(),
+            token_ids: token_ids.clone(),
+        })
+        .collect();
+    let chunk_logprobs = (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
+        token_logprobs: output
+            .output_logprobs_val
+            .iter()
+            .map(|&lp| lp as f32)
+            .collect(),
+        token_ids: output.output_logprobs_idx.clone(),
+        top_logprobs: tick_top_logprobs.clone(),
+    });
+    state
+        .output_logprobs_val
+        .extend(output.output_logprobs_val.iter().map(|&lp| lp as f32));
+    state
+        .output_logprobs_idx
+        .extend(output.output_logprobs_idx.iter().copied());
+    state.output_top_logprobs.extend(tick_top_logprobs);
+    let mut response = state.emit_tick(index, output.output_ids, chunk_logprobs, finish, pending);
+    state.attach_input_logprobs(pending, input_logprobs_emitted, &mut response);
+    response
 }
 
 /// The per-dialect half of a ZMQ generate stream: the wire stream, the parked
@@ -850,5 +1000,55 @@ mod tests {
             EngineInbound::Abort(ids) => assert_eq!(ids, vec!["r-unbounded".to_string()]),
             other => panic!("expected the drop's abort, got {other:?}"),
         }
+    }
+
+    /// An `n > 1` request is a fan-out of `n` engine requests merged into the
+    /// one stream: every sub's chunks and completion arrive, each tagged with
+    /// its choice index, in whatever order the engine answers; the stream ends
+    /// once every sub completed and stays ended, and nothing is aborted.
+    #[tokio::test]
+    async fn a_fanned_out_request_merges_its_subs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, engine) = connected(dir.path(), None).await;
+        let (mut input, mut output) = engine.split();
+
+        let mut req = request("r-fan", vec![1, 2]);
+        req.sampling_params.as_mut().unwrap().n = 2;
+        let mut stream = client.generate_vllm(req).await.expect("generate");
+        expect_add(&mut input, "r-fan-0").await;
+        expect_add(&mut input, "r-fan-1").await;
+        // The second sub finishes first; the first one takes two ticks.
+        output
+            .send_outputs(&tick("r-fan-1", 21, Some(EngineCoreFinishReason::Stop)))
+            .await
+            .unwrap();
+        output
+            .send_outputs(&tick("r-fan-0", 10, None))
+            .await
+            .unwrap();
+        output
+            .send_outputs(&tick("r-fan-0", 11, Some(EngineCoreFinishReason::Stop)))
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        let mut completes = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item.expect("ok").response {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    chunks.push((chunk.index, chunk.token_ids));
+                }
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    completes.push((complete.index, complete.output_ids));
+                }
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+        chunks.sort();
+        completes.sort();
+        assert_eq!(chunks, vec![(0, vec![10]), (0, vec![11]), (1, vec![21])]);
+        assert_eq!(completes, vec![(0, vec![10, 11]), (1, vec![21])]);
+        assert!(stream.next().await.is_none(), "an ended stream stays ended");
+        drop(stream);
+        expect_nothing(&mut input, Duration::from_millis(300)).await;
     }
 }

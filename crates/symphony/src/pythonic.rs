@@ -35,7 +35,7 @@ use crate::{
     tagged::{
         assembler::push_escaped,
         end_cut_call,
-        value::{cut as cut_json, json, python_literal, Kind},
+        value::{cut as cut_json, json, python_literal, reads_back_as_an_argument, Kind},
     },
     Declared,
 };
@@ -761,7 +761,7 @@ impl Assembler {
         let value = match self.values {
             Values::Quoted => quoted_value(&text, kind),
             Values::Python | Values::Json => python_literal(&text)
-                .filter(|json| reads_back(json))
+                .filter(|json| reads_back_as_an_argument(json))
                 .unwrap_or_else(|| json(&text, None)),
         };
         self.push_member(key, &value, out);
@@ -778,7 +778,7 @@ impl Assembler {
         self.written += 1;
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: fragment,
+            json: fragment.into(),
             source: Text::uncounted(std::mem::take(&mut self.carried)),
         });
     }
@@ -830,7 +830,7 @@ impl Assembler {
                 return Some(json(inner, kind));
             }
         }
-        python_literal(text).filter(|json| reads_back(json))
+        python_literal(text).filter(|json| reads_back_as_an_argument(json))
     }
 
     /// The call's own `)`: `}` (or `{}`) with `source`, then `ToolCallEnd` with the parenthesis.
@@ -839,7 +839,7 @@ impl Assembler {
     fn end_call<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: if self.written == 0 { "{}" } else { "}" }.to_string(),
+            json: if self.written == 0 { "{}" } else { "}" }.into(),
             source,
         });
         out.push(Event::ToolCallEnd {
@@ -868,13 +868,7 @@ impl Assembler {
     }
 
     fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The content held under the bare list, given back.
@@ -909,11 +903,6 @@ impl Assembler {
     }
 }
 
-/// Whether `json` is one JSON value a client can take as an argument.
-fn reads_back(json: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(json).is_ok()
-}
-
 /// A value under [`Values::Quoted`]: between double quotes, the text inside them as it stands,
 /// since the template writes the string's characters as they are and decodes no escape (a
 /// backslash and an `r` in a value are those two characters, not a carriage return, and a
@@ -926,7 +915,7 @@ fn quoted_value(text: &str, kind: Option<Kind>) -> String {
         return json(inner, kind);
     }
     python_literal(text)
-        .filter(|json| reads_back(json))
+        .filter(|json| reads_back_as_an_argument(json))
         .unwrap_or_else(|| json(text, kind))
 }
 
@@ -1008,11 +997,13 @@ impl crate::engine::CallAssembler for Assembler {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::{
+        json::PartialJson,
+        testing::{arguments, bytes, content, tool},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -1063,6 +1054,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A list nested past the bound the crate's JSON reader puts on a call's arguments, the
+    /// arguments object counted: the value is a string holding its text, as any text that reader
+    /// does not take is, whole at the call's `)` and at a cut alike, so that the fragments stay a
+    /// prefix the reader takes (the fuzz campaign's `json-prefix` class on this syntax). One level
+    /// shallower reads as the JSON it is.
+    #[test]
+    fn a_value_nested_past_the_json_readers_bound_is_a_string_whole_and_cut() {
+        let past = PartialJson::DEFAULT_MAX_DEPTH;
+        let deep = format!("{}1{}", "[".repeat(past), "]".repeat(past));
+        let within = format!("{}1{}", "[".repeat(past - 1), "]".repeat(past - 1));
+        assert_eq!(
+            arguments(&run(&[&format!("f(a={deep})")])),
+            format!("{{\"a\": \"{deep}\"}}")
+        );
+        assert_eq!(
+            arguments(&run(&[&format!("f(a={within})")])),
+            format!("{{\"a\": {within}}}")
+        );
+        let open = "[".repeat(past);
+        assert_eq!(
+            arguments(&Ending::Stream.run(&[&format!("f(a={open}")])),
+            format!("{{\"a\": \"{open}")
+        );
+        // A value cut right after a `\u` escape short of its digits: no JSON prefix the crate's
+        // own judge takes (a strict reader reads four bytes past the text's end rather than
+        // refuse the quote), so a string holding its text.
+        let short = "[\"\\u1\"]";
+        assert_eq!(
+            arguments(&Ending::Stream.run(&[&format!("f(a={short}")])),
+            "{\"a\": \"[\\\"\\\\u1\\\"]"
+        );
     }
 
     /// Content with a `[name(` of its own: a name no tool declares is given back as content at its
@@ -1346,16 +1370,6 @@ mod tests {
         calls
     }
 
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
     /// no bytes counts here, where the joined text of [`malformed`] does not show it.
     fn words<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
@@ -1395,19 +1409,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         out.drain()
-    }
-
-    fn tool(name: &str, parameters: serde_json::Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
     }
 
     fn tools() -> Declared {

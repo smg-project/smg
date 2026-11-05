@@ -202,35 +202,14 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaContentPart;
-    use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerType};
+    use crate::worker::test_support::{grpc_worker, registry_with};
 
     const MODEL: &str = "vision-model";
 
     fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(MODEL))
-            .worker_type(WorkerType::Regular)
-            .runtime_type(runtime)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
+        grpc_worker(url, MODEL, runtime, labels)
     }
 
     fn limits(pairs: &[(Modality, usize)]) -> HashMap<Modality, usize> {

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
@@ -32,11 +32,12 @@ logger = logging.getLogger(__name__)
 class TestStreamingEventsLocal:
     """Streaming event tests against local gRPC backend."""
 
-    def test_output_item_event_emitted(self, model, api_client):
+    def test_output_item_event_emitted(self, model, api_client, mock_answers):
         """Test that output_index is zero-based in streaming responses.
 
         Verifies that the first output item has output_index: 0.
         """
+        mock_answers.enqueue("1, 2, 3.")
         resp = api_client.responses.create(
             model=model,
             input="Count from 1 to 3",
@@ -106,26 +107,28 @@ class TestStreamingEventsLocal:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStreamingEventsGptOss:
     """Streaming event tests against local gRPC backend with Harmony model."""
 
-    def test_output_item_event_emitted(self, model, api_client):
+    def test_output_item_event_emitted(self, model, api_client, mock_answers):
         """Test that output_index is zero-based in streaming responses.
 
         Verifies that the first output item has output_index: 0.
         """
+        # On the mock: a reasoning item, then the message.
+        mock_answers.enqueue_harmony(analysis="Three numbers.", final="1, 2, 3.")
         resp = api_client.responses.create(
             model=model,
             input="Count from 1 to 3",
             stream=True,
-            max_output_tokens=50,
+            max_output_tokens=512,
         )
 
         events = list(resp)
@@ -184,17 +187,18 @@ class TestStreamingEventsGptOss:
             "Number of output_item.added events should match output array length"
         )
 
-    def test_reasoning_content(self, model, api_client):
+    def test_reasoning_content(self, model, api_client, mock_answers):
         """Test that reasoning content has correct zero-based output_index.
 
         Specifically tests that reasoning item has output_index: 0
         and message item has output_index: 1.
         """
+        mock_answers.enqueue_harmony(analysis="The capital of France is Paris.", final="Paris.")
         resp = api_client.responses.create(
             model=model,
             input="What is the capital of France? Think step by step.",
             stream=True,
-            max_output_tokens=200,
+            max_output_tokens=1024,
         )
 
         events = list(resp)

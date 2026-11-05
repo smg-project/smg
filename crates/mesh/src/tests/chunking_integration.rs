@@ -28,13 +28,13 @@
 //!   touching the assembler. Asserted through the dispatch entry
 //!   point, not just the shape of `chunk_value`'s return.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
-    kv::{MeshKV, StreamConfig, StreamRouting},
+    kv::{MeshKV, StreamConfig, StreamNamespace, StreamRouting},
     service::gossip::StreamEntry,
     transport::{
         chunking::{build_stream_batches, chunk_value, next_generation},
@@ -73,10 +73,9 @@ fn flatten_payload(fragments: &[Bytes]) -> Vec<u8> {
     fragments.iter().flat_map(|b| b.iter().copied()).collect()
 }
 
-// ---- round-trip: single chunk ----
-
-#[tokio::test]
-async fn round_trip_single_chunk_fires_subscriber() {
+/// A receiver with the `td:` prefix configured as a 64 KiB broadcast stream:
+/// where the round-trip tests start.
+fn receiver_with_td_stream() -> (MeshKV, Arc<StreamNamespace>) {
     let mesh_kv = MeshKV::new("receiver".to_string());
     let ns = mesh_kv.configure_stream_prefix(
         "td:",
@@ -85,6 +84,14 @@ async fn round_trip_single_chunk_fires_subscriber() {
             routing: StreamRouting::Broadcast,
         },
     );
+    (mesh_kv, ns)
+}
+
+// ---- round-trip: single chunk ----
+
+#[tokio::test]
+async fn round_trip_single_chunk_fires_subscriber() {
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub = ns.subscribe("model-1");
 
     let value = Bytes::from_static(b"hello-tenant-delta");
@@ -118,14 +125,7 @@ async fn round_trip_single_chunk_fires_subscriber() {
 
 #[tokio::test]
 async fn round_trip_multi_chunk_reassembles_in_fragments() {
-    let mesh_kv = MeshKV::new("receiver".to_string());
-    let ns = mesh_kv.configure_stream_prefix(
-        "td:",
-        StreamConfig {
-            max_buffer_bytes: 64 * 1024,
-            routing: StreamRouting::Broadcast,
-        },
-    );
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub = ns.subscribe("model-big");
 
     // 3 chunks of TEST_MAX_CHUNK_BYTES each, plus a short tail.
@@ -166,14 +166,7 @@ async fn round_trip_multi_chunk_reassembles_in_fragments() {
 
 #[tokio::test]
 async fn partial_assembly_times_out_and_is_gcd() {
-    let mesh_kv = MeshKV::new("receiver".to_string());
-    let ns = mesh_kv.configure_stream_prefix(
-        "td:",
-        StreamConfig {
-            max_buffer_bytes: 64 * 1024,
-            routing: StreamRouting::Broadcast,
-        },
-    );
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub = ns.subscribe("stalled");
 
     let payload = vec![0u8; 2 * TEST_MAX_CHUNK_BYTES];
@@ -217,14 +210,7 @@ async fn partial_assembly_times_out_and_is_gcd() {
 
 #[tokio::test]
 async fn concurrent_generations_newer_wins_older_dropped() {
-    let mesh_kv = MeshKV::new("receiver".to_string());
-    let ns = mesh_kv.configure_stream_prefix(
-        "td:",
-        StreamConfig {
-            max_buffer_bytes: 64 * 1024,
-            routing: StreamRouting::Broadcast,
-        },
-    );
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub = ns.subscribe("racing");
 
     let old_value: Vec<u8> = (0u8..=255).cycle().take(2 * TEST_MAX_CHUNK_BYTES).collect();
@@ -295,14 +281,7 @@ async fn concurrent_generations_newer_wins_older_dropped() {
 
 #[tokio::test]
 async fn multi_key_parallel_reassembly_isolates_per_key() {
-    let mesh_kv = MeshKV::new("receiver".to_string());
-    let ns = mesh_kv.configure_stream_prefix(
-        "td:",
-        StreamConfig {
-            max_buffer_bytes: 64 * 1024,
-            routing: StreamRouting::Broadcast,
-        },
-    );
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub_a = ns.subscribe("model-A");
     let mut sub_b = ns.subscribe("model-B");
 
@@ -361,14 +340,7 @@ async fn multi_key_parallel_reassembly_isolates_per_key() {
 
 #[tokio::test]
 async fn same_key_from_two_peers_reassembles_independently() {
-    let mesh_kv = MeshKV::new("receiver".to_string());
-    let ns = mesh_kv.configure_stream_prefix(
-        "td:",
-        StreamConfig {
-            max_buffer_bytes: 64 * 1024,
-            routing: StreamRouting::Broadcast,
-        },
-    );
+    let (mesh_kv, ns) = receiver_with_td_stream();
     let mut sub = ns.subscribe("shared-key");
 
     // Both senders publish DIFFERENT payloads under the SAME key. The

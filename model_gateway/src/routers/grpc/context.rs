@@ -17,10 +17,12 @@ use openai_protocol::{
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_grpc_client::RequestDeadline;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -39,9 +41,12 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
-    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+    regular::{
+        stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+        symphony::{PromptReplay, Reading},
+    },
     spec::ResponseSpec,
-    utils::{ParserResolver, WorkerDecoding},
+    utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
@@ -49,13 +54,11 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
-        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
+        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, sse::SseSender},
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{
-        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-    },
+    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -79,10 +82,10 @@ pub(crate) struct RequestInput {
     /// Captured at construction so it survives the request drop at build.
     pub streaming: bool,
     pub tenant_request_meta: Option<TenantRequestMeta>,
-    /// Holds the reservation outcome for the whole request (settle on
-    /// success, denial check, streaming handoff). `None` for endpoints that
-    /// haven't opted into tenant rate limiting yet (Responses, embeddings,
-    /// classify).
+    /// Holds the reservation outcome for the whole logical request (settle on
+    /// success, denial check, streaming handoff): one per typed request, one
+    /// per iteration of a Responses request. `None` only where no caller set
+    /// one (a unit test's context).
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 
@@ -236,6 +239,39 @@ pub(crate) struct ProcessingState {
     /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
 
+    /// The parser names the request's model's cards set (its workers' labels), resolved once
+    /// in preparation (`reading::prepare`: one resolution, a walk over the model's workers per
+    /// name) and read by request building in its place (`reading::reasoning_decision`,
+    /// `reading::decide`, `backed_plan::build`), which hands them to the response spec
+    /// (`ChatResponseSpec::parser_names`, `MessagesResponseSpec::parser_names`) for the
+    /// response stages' two readers (`processor`, `streaming`): one resolution per request.
+    /// `None` on the endpoints whose preparation resolves no names; a read then resolves them
+    /// itself.
+    pub parser_names: Option<Names>,
+
+    /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
+    /// by the chat and Messages preparations and read by the later stages in place of a
+    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// response spec). `None` on the other endpoints; a read then derives it itself.
+    pub provider: Option<ProviderProfile>,
+    /// The table's replay of the rendered prompt, as preparation read it for the forced call's
+    /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
+    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
+    /// preparation reads no prompt); a decision then replays itself.
+    pub prompt_thought: Option<PromptReplay>,
+    /// The table decision for the request's model under its parser (`regular::symphony::reading`:
+    /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
+    /// preparations made it once for the replay, the constraint and the decoder's special tokens
+    /// (`reading::prepare`): request building's assignment reads it in its place
+    /// (`reading::decide`), so those four share one decision. The whole turn's grammar and the
+    /// `auto` tag still decide over the same inputs, shaped for the selected worker's start
+    /// (`regular::symphony::turn_constraint`, `AutoTag`). Transcription shares the chat
+    /// preparation and keeps the legacy decision it makes, which nothing reads. `None` on the
+    /// endpoints whose preparation decides nothing, and when the names refused (the constraint
+    /// carries the refusal); the assignment then decides itself.
+    pub reading: Option<Reading>,
+
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
     /// building `take()`s it for the prefill serialization.
@@ -336,10 +372,15 @@ impl WireConstraint {
                 requires_media_refs,
                 pipeline,
             },
-            // Disaggregated workers are gRPC-only.
-            WorkerSelection::Disaggregated { runtime_type, .. } => Self {
+            // The prefill side builds the request, so its transport is the
+            // plan's (a gRPC servicer, or a TokenSpeed engine's ZMQ wire).
+            WorkerSelection::Disaggregated {
+                prefill,
+                runtime_type,
+                ..
+            } => Self {
                 runtime: *runtime_type,
-                connection: ConnectionMode::Grpc,
+                connection: *prefill.connection_mode(),
                 requires_media_refs,
                 pipeline,
             },
@@ -688,8 +729,6 @@ pub(crate) enum PreparationOutput {
         tool_constraints: Option<(String, String)>,
         /// Request with response_format cleared (when converted to structural tag)
         modified_request: Option<Box<ChatCompletionRequest>>,
-        #[expect(dead_code, reason = "stored for future Harmony history tracking")]
-        harmony_messages: Vec<super::harmony::HarmonyMessage>,
         harmony_stop_ids: Vec<u32>,
     },
 }
@@ -1546,6 +1585,64 @@ pub(crate) enum ExecutionResult {
     },
 }
 
+impl ExecutionResult {
+    /// Every stream of the result read for the client at the receiving end
+    /// of `client`'s channel (see [`ProtoStream::until_client_gone`]): the
+    /// one worker's stream, both sides of a disaggregated pair (the prefill
+    /// side is drained in the streaming task, after the response began), each
+    /// result of a batch. An embedding has no stream.
+    #[must_use]
+    pub(crate) fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
+        match self {
+            Self::Single { stream } => Self::Single {
+                stream: stream.until_client_gone(client, request_id),
+            },
+            Self::PrefillDecode {
+                prefill,
+                decode,
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            } => Self::PrefillDecode {
+                prefill: prefill.until_client_gone(client, request_id),
+                decode: Box::new(decode.until_client_gone(client, request_id)),
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            },
+            Self::Embedding { .. } => self,
+            Self::Batch { results } => Self::Batch {
+                results: results
+                    .into_iter()
+                    .map(|result| result.until_client_gone(client, request_id))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Every stream of the result under the request's `deadline` (see
+    /// [`ProtoStream::apply_deadline`]), in place: the one worker's, both sides of a
+    /// disaggregated pair, each result of a batch. An embedding is one
+    /// answer, already in hand.
+    pub(crate) fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        match self {
+            Self::Single { stream } => stream.apply_deadline(deadline),
+            Self::PrefillDecode {
+                prefill, decode, ..
+            } => {
+                prefill.apply_deadline(deadline);
+                decode.apply_deadline(deadline);
+            }
+            Self::Embedding { .. } => {}
+            Self::Batch { results } => {
+                for result in results {
+                    result.apply_deadline(deadline);
+                }
+            }
+        }
+    }
+}
+
 /// Timing context threaded from PD execution into the streaming layer so the
 /// first decode token can be measured against the prefill and decode dispatch
 /// instants.
@@ -1635,6 +1732,61 @@ mod tests {
             Ok(_) => panic!("the output was there"),
             Err(failure) => failure,
         }
+    }
+
+    /// A disaggregated selection's wire is the prefill side's, which builds
+    /// the request: a direct-ZMQ prefill worker pins the plan to the ZMQ wire
+    /// of the pair's runtime whatever the decode side's transport, and a gRPC
+    /// prefill worker to gRPC.
+    #[test]
+    fn a_disaggregated_selections_wire_is_the_prefill_sides() {
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+        let worker = |url: &str, mode: ConnectionMode, role: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .worker_type(role)
+                    .build(),
+            )
+        };
+        let pair =
+            |prefill: Arc<dyn Worker>, decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode,
+                runtime_type: RuntimeType::TokenSpeed,
+            };
+
+        let zmq_prefill = pair(
+            worker(
+                "ipc:///tmp/prefill.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Prefill,
+            ),
+            worker("grpc://decode:1", ConnectionMode::Grpc, WorkerType::Decode),
+        );
+        let wire = WireConstraint::of(&zmq_prefill, false, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Zmq);
+        assert_eq!(wire.runtime, RuntimeType::TokenSpeed);
+        assert!(!wire.requires_media_refs);
+
+        let grpc_prefill = pair(
+            worker(
+                "grpc://prefill:1",
+                ConnectionMode::Grpc,
+                WorkerType::Prefill,
+            ),
+            worker(
+                "ipc:///tmp/decode.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Decode,
+            ),
+        );
+        let wire = WireConstraint::of(&grpc_prefill, true, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Grpc);
+        assert!(wire.requires_media_refs);
     }
 
     #[tokio::test]

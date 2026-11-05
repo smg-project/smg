@@ -1,7 +1,8 @@
-use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    profile::ProviderProfile,
 };
 use serde_json::json;
 
@@ -612,7 +613,7 @@ fn render_parts(parts: &[&str]) -> String {
         tokenizer.chat_template_content_format(),
         ChatTemplateContentFormat::OpenAI
     );
-    process_chat_messages_with_placeholders(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .unwrap()
         .0
         .text
@@ -747,7 +748,7 @@ fn render_through(
         llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
     tokenizer.set_chat_template(template.to_string()).unwrap();
     assert_eq!(tokenizer.chat_template_content_format(), format);
-    process_chat_messages_with_placeholders(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .map(|(processed, _)| processed.text)
 }
 
@@ -838,6 +839,47 @@ fn an_absent_assistant_content_is_the_engines_empty_content_in_the_templates_for
 }
 
 #[test]
+fn a_content_array_without_media_renders_the_same_under_either_order() {
+    // The order places media relative to text; with no media part there is
+    // nothing to place, so the resolver asks no registry for it (an empty
+    // plan returns before the lookups) and both orders must keep rendering
+    // alike: the text parts in their own order, joined as the engine joins
+    // them, under the string format; the parts as given under the other.
+    let messages = vec![ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "first".to_string(),
+            },
+            ContentPart::Text {
+                text: "second".to_string(),
+            },
+        ]),
+        name: None,
+    }];
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        let media_first =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::MediaFirst)
+                .unwrap();
+        let authored =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::Authored)
+                .unwrap();
+        assert_eq!(media_first, authored, "{format:?}");
+    }
+    let rendered = process_content_format_with_order(
+        &messages,
+        ChatTemplateContentFormat::String,
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .unwrap();
+    assert_eq!(rendered[0]["content"], "first\nsecond");
+}
+
+#[test]
 fn test_tml_preserves_authored_multipart_order_string() {
     let messages = vec![ChatMessage::User {
         ext: Default::default(),
@@ -897,9 +939,8 @@ fn a_named_tool_choice_renders_every_tool() {
     };
 
     let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
-    let plain = RendererCapabilities::default();
     assert_eq!(
-        names(&request_as_rendered(&named, plain)),
+        names(&request_as_rendered(&named)),
         ["get_weather", "get_time"]
     );
     assert_eq!(
@@ -915,11 +956,11 @@ fn a_named_tool_choice_renders_every_tool() {
         "type": "allowed_tools", "mode": "auto",
         "tools": [{"type": "function", "name": "get_time"}]
     }));
-    assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
+    assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
 
     let auto = request(json!("auto"));
     assert_eq!(
-        names(&request_as_rendered(&auto, plain)),
+        names(&request_as_rendered(&auto)),
         ["get_weather", "get_time"]
     );
 }
@@ -936,36 +977,31 @@ fn tool_choice_none_request() -> ChatCompletionRequest {
         .expect("chat request")
 }
 
-/// `tool_choice: none` renders no tool: the model is not offered a call
-/// it may not make, and the request's other fields render as sent.
+/// `tool_choice: none` renders the tools as `auto` renders them: the request
+/// renders as sent (borrowed, nothing narrowed), so the prompt is the one the
+/// engine's own server renders for it and the one the session's other turns
+/// rendered; the choice itself reaches the template as a kwarg.
 #[test]
-fn tool_choice_none_renders_no_tool() {
+fn tool_choice_none_renders_the_tools_as_auto_does() {
     let request = tool_choice_none_request();
-    let rendered = request_as_rendered(&request, RendererCapabilities::default());
-    assert!(rendered.tools.is_none());
-    assert_eq!(rendered.messages.len(), request.messages.len());
-    // The request itself keeps its tools for the rest of the pipeline.
-    assert!(request.tools.is_some());
-}
-
-/// A renderer that declares the tools under `tool_choice: none` itself
-/// (and forbids the call in the prompt, as its reference does) gets them:
-/// the request renders as sent.
-#[test]
-fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
-    let request = tool_choice_none_request();
-    let rendered = request_as_rendered(
-        &request,
-        RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        },
-    );
+    let rendered = request_as_rendered(&request);
     assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
     assert_eq!(
         rendered.tools.as_deref().map(<[_]>::len),
         Some(1),
-        "the tool declaration stays for the renderer to write"
+        "the tool declaration stays for the template to write"
+    );
+    let mut auto = request.clone();
+    auto.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    let under_auto = request_as_rendered(&auto);
+    assert_eq!(
+        serde_json::to_value(&under_auto.tools).expect("tools"),
+        serde_json::to_value(&rendered.tools).expect("tools"),
+        "the same tools render under none and under auto"
+    );
+    assert_eq!(
+        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
+        json!("none")
     );
 }
 
@@ -1049,24 +1085,24 @@ fn thinking_effort_overrides_top_level_effort_in_kwargs() {
 #[test]
 fn thinking_disabled_projects_params_thinking_false() {
     let request = thinking_request(json!({"type": "disabled"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
     // `adaptive` and an omitted `type` leave the template default in charge.
     for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
         assert_eq!(
-            resolve_template_thinking(&thinking_request(thinking, None)),
+            resolved_template_thinking(&thinking_request(thinking, None)),
             None
         );
     }
-    assert_eq!(resolve_template_thinking(&effort_request(None)), None);
+    assert_eq!(resolved_template_thinking(&effort_request(None)), None);
     assert_eq!(
-        resolve_template_thinking(&effort_request(Some("none"))),
+        resolved_template_thinking(&effort_request(Some("none"))),
         Some(false)
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off and an
-/// explicit effort outranks `thinking.disabled`; the request renders the
-/// template's default (thinking on, the model's own depth).
+/// Under the MiniMax profile no effort value switches thinking off: the
+/// request renders the template's default (thinking on, the model's own
+/// depth). An explicit `thinking.disabled` wins over the effort there too.
 #[test]
 fn minimax_effort_keeps_thinking_on() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
@@ -1077,22 +1113,22 @@ fn minimax_effort_keeps_thinking_on() {
     };
     for effort in ["none", "minimal", "high"] {
         assert_eq!(
-            resolve_template_thinking(&minimax(None, Some(effort))),
+            resolved_template_thinking(&minimax(None, Some(effort))),
             None,
             "{effort}"
         );
         assert_eq!(
-            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
-            None,
-            "{effort} outranks thinking.disabled"
+            resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
+            Some(false),
+            "{effort}: thinking.disabled wins"
         );
     }
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+        resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
         Some(false)
     );
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+        resolved_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
         Some(true)
     );
 }
@@ -1100,10 +1136,10 @@ fn minimax_effort_keeps_thinking_on() {
 #[test]
 fn thinking_enabled_beats_reasoning_effort_none() {
     let request = thinking_request(json!({"type": "enabled"}), Some("none"));
-    assert_eq!(resolve_template_thinking(&request), Some(true));
+    assert_eq!(resolved_template_thinking(&request), Some(true));
     // A `none` inside `thinking.effort` is the switch too when no type is given.
     let request = thinking_request(json!({"effort": "none"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
 }
 
 #[test]
@@ -1280,7 +1316,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn flat_renderer_joins_the_prefill_and_reports_from_text() {
     let tokenizer = llm_tokenizer::MockTokenizer::new();
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1318,13 +1354,9 @@ fn render_with(capabilities: RendererCapabilities, request: &ChatCompletionReque
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_renderer_capabilities(capabilities)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     // The default `apply_chat_template_with_encoding` appends the
     // assistant prefix after the rendered text, so a prefill that was
     // popped shows up as a suffix on the JSON document.
@@ -1340,7 +1372,6 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
@@ -1348,7 +1379,6 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 
@@ -1374,6 +1404,126 @@ fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing
     assert_eq!(native["assistant_prefix"], json!(""));
 }
 
+/// `add_generation_prompt: false` renders the conversation without a
+/// generation header; absent, the header is rendered as before. A continued
+/// final message keeps its own rule: no header natively, the emulation's
+/// header and prefix otherwise, whatever the field says.
+#[test]
+fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
+    let request = |fields: Value| -> ChatCompletionRequest {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let closed = render_with(
+        Default::default(),
+        &request(json!({"add_generation_prompt": false})),
+    );
+    assert_eq!(closed["add_generation_prompt"], json!(false));
+    assert_eq!(closed["messages"].as_array().unwrap().len(), 1);
+    let open = render_with(Default::default(), &request(json!({})));
+    assert_eq!(open["add_generation_prompt"], json!(true));
+
+    let pair = request(json!({
+        "continue_final_message": true,
+        "add_generation_prompt": false,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    }));
+    let emulated = render_with(Default::default(), &pair);
+    assert_eq!(emulated["add_generation_prompt"], json!(true));
+    assert_eq!(emulated["assistant_prefix"], json!("Sure"));
+    let native = render_with(NATIVE_CONTINUATION, &pair);
+    assert_eq!(native["add_generation_prompt"], json!(false));
+    assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+}
+
+/// Through a Jinja template: without the header the prompt ends at the last
+/// turn's end marker; with it (the field absent) the assistant header follows.
+/// The rendered prompt reports which, for the reasoning decisions. A
+/// `chat_template_kwargs` entry of that name does not override the request's
+/// field (the render context keeps the field's value), so the header stays
+/// and is reported as such.
+#[test]
+fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer
+        .set_chat_template(HEADER_TEMPLATE.to_string())
+        .unwrap();
+    let render = |add_generation_prompt: Value| {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "add_generation_prompt": add_generation_prompt
+        });
+        if let Some(kwargs) = add_generation_prompt.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+            body["add_generation_prompt"] = Value::Null;
+        }
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
+    };
+    let closed = render(json!(false));
+    assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
+    assert!(!closed.generation_prompt);
+    let open = render(Value::Null);
+    assert_eq!(
+        open.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(open.generation_prompt);
+    let by_kwargs = render(json!({"chat_template_kwargs": {"add_generation_prompt": false}}));
+    assert_eq!(
+        by_kwargs.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(by_kwargs.generation_prompt);
+}
+
+/// The rendered prompt reports whether it carries the generation header, as
+/// the reasoning decisions read it: the header the request asked for, none
+/// under `add_generation_prompt: false`, none for a natively continued
+/// message, and the emulation's header (the message's text after it)
+/// otherwise.
+#[test]
+fn the_rendered_prompt_reports_its_generation_header() {
+    let processed = |capabilities: RendererCapabilities, body: Value| -> ProcessedMessages {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
+    };
+    let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    assert!(processed(Default::default(), hello.clone()).generation_prompt);
+    let mut closed = hello;
+    closed["add_generation_prompt"] = json!(false);
+    assert!(!processed(Default::default(), closed).generation_prompt);
+    let pair = json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    });
+    let native = processed(NATIVE_CONTINUATION, pair.clone());
+    assert!(native.continued_final_message);
+    assert!(!native.generation_prompt);
+    let emulated = processed(Default::default(), pair);
+    assert!(!emulated.continued_final_message);
+    assert!(emulated.generation_prompt);
+}
+
 /// A text-rendered prompt reaches the tokenizer with each rendered marker
 /// already rewritten to its anchor; without placeholders it is left alone.
 /// The mock's JSON template writes no marker, so the one here is typed.
@@ -1394,7 +1544,7 @@ fn rendered_markers_are_anchored_before_tokenizing() {
     placeholders.insert(Modality::Video, "<SPECIAL_30>".to_string());
     placeholders.add_rendered_marker("<video>".to_string(), "<SPECIAL_30>".to_string());
     let render = |placeholders| {
-        process_chat_messages_with_placeholders(
+        process_with_derived_profile(
             &request,
             &tokenizer,
             placeholders,
@@ -1427,7 +1577,7 @@ fn jinja_template_continues_inside_the_assistant_turn() {
     tokenizer
         .set_chat_template(HEADER_TEMPLATE.to_string())
         .unwrap();
-    let (processed, _) = process_chat_messages_with_placeholders(
+    let (processed, _) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1460,13 +1610,9 @@ fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_content_format(ChatTemplateContentFormat::OpenAI)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        &request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     let (rendered, prefix) = processed
         .text
         .split_at(processed.text.rfind('}').unwrap() + 1);
@@ -1731,7 +1877,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_deferred_chat_ids(vec![7, 8, 9])
         .with_unbilled_prompt_tokens(3);
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1747,7 +1893,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
         processed.unbilled_prompt_tokens, 3,
         "the renderer's unbilled count rides along"
     );
-    let (flat, _) = process_chat_messages_with_placeholders(
+    let (flat, _) = process_with_derived_profile(
         &prefill_request(),
         &llm_tokenizer::MockTokenizer::new(),
         None,
@@ -1785,13 +1931,8 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
             "messages": [{"role": "user", "content": content}]
         }))
         .unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &*tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
     };
     let encode = |text: &str, encoding: PromptEncoding| {
         block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
@@ -1865,7 +2006,7 @@ async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after
         "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
     );
     for (failure, autoload, reason) in [
-        (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+        (&TokenizerLoadFailure::NoSource, true, "no tokenizer source"),
         (
             &TokenizerLoadFailure::Removed,
             true,
@@ -1920,4 +2061,74 @@ fn the_completion_finish_reason_is_one_table() {
             "local_stop={local_stop} engine={engine:?}"
         );
     }
+}
+
+/// `resolve_template_thinking` with the profile the request's model derives,
+/// as the preparation stage carries it.
+fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
+    resolve_template_thinking(request, ProviderProfile::for_model(&request.model))
+}
+
+/// The render reads the profile the stage carries, not one derived again
+/// from the model: a profile that reads an effort differently from the
+/// default one decides the toggle whatever the model id says, and a typed
+/// toggle wins under either.
+#[test]
+fn the_render_reads_the_carried_profile_not_the_model() {
+    // `none` switches thinking off under the default profile and leaves the
+    // template's default under MiniMax's.
+    let request = effort_request(Some("none"));
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Minimax),
+        None
+    );
+
+    // A MiniMax model id with the default profile carried: the carried
+    // profile decides, not the id.
+    let mut named = effort_request(Some("none"));
+    named.model = "MiniMax-M3".to_string();
+    assert_eq!(
+        ProviderProfile::for_model(&named.model),
+        ProviderProfile::Minimax
+    );
+    assert_eq!(
+        resolve_template_thinking(&named, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&named, ProviderProfile::Minimax),
+        None
+    );
+
+    // A typed toggle wins over either profile's reading of the effort.
+    let toggled = thinking_request(json!({"type": "disabled"}), Some("high"));
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Minimax),
+        Some(false)
+    );
+}
+
+/// `process_chat_messages_with_placeholders` with the profile the request's
+/// model derives, as the preparation stage carries it.
+fn process_with_derived_profile(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens,
+        media_order,
+        ProviderProfile::for_model(&request.model),
+    )
 }

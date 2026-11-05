@@ -1,22 +1,27 @@
 //! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
 //! tested once: the JSON spelling and the OpenAI-shape readers every one of
-//! them uses, the last-user index predicates, the quick-instruction task
-//! tokens, and the V4 family's message preprocessing (tool-message merging,
-//! tool-result sorting, drop-thinking, DSML argument rendering, the tools
-//! template), which V4 and V4.1 run with their own DSML tag strings (V4 bare
-//! `invoke`/`parameter`; V4.1 ` invoke`/` parameter` with a leading space).
+//! them uses, the message read (`Turn`), the last-user index predicates, the
+//! quick-instruction task tokens, the tools-and-response-format section of a
+//! system or developer turn, and the V4 family's message preprocessing
+//! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
+//! rendering, the tools template), which V4 and V4.1 run with their own DSML
+//! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
+//! with a leading space).
 //!
 //! V3.2's tool-message handling, drop-thinking role set, DSML argument
 //! rendering and tools template are different algorithms and texts under
 //! some of the same names; they stay in `deepseek_v32.rs`.
 
-use std::{borrow::Cow, sync::OnceLock};
+use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use super::marks::{self, control};
+use super::{
+    marks::{self, control},
+    truthy,
+};
 
 // ---------------------------------------------------------------------------
 // The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
@@ -193,7 +198,16 @@ pub(super) fn task_sp_token(task: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Preprocessing: merge tool messages and sort tool results.
 // ---------------------------------------------------------------------------
-pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
+/// What a user message's own `content_blocks` list means to a dialect's
+/// merge: V4's reference rebuilds every user message from its `content` (a
+/// list the message carries is dropped), V4.1's keeps the list it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IncomingBlocks {
+    Rebuilt,
+    Kept,
+}
+
+pub(super) fn merge_tool_messages(messages: &[Value], incoming: IncomingBlocks) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let msg = msg.clone();
@@ -230,9 +244,17 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 }));
             }
         } else if role == "user" {
-            let text_block = json!({
-                "type": "text",
-                "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+            let own = match incoming {
+                IncomingBlocks::Kept => {
+                    msg.get("content_blocks").and_then(Value::as_array).cloned()
+                }
+                IncomingBlocks::Rebuilt => None,
+            }
+            .unwrap_or_else(|| {
+                vec![json!({
+                    "type": "text",
+                    "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                })]
             });
             let merged_into_prev = if let Some(prev) = merged.last_mut() {
                 let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -243,7 +265,7 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                         .get_mut("content_blocks")
                         .and_then(|v| v.as_array_mut())
                     {
-                        blocks.push(text_block.clone());
+                        blocks.extend(own.iter().cloned());
                         true
                     } else {
                         false
@@ -255,13 +277,17 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 false
             };
             if !merged_into_prev {
-                let mut new_msg = json!({
-                    "role": "user",
-                    "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-                    "content_blocks": [text_block],
-                });
-                // Preserve extra fields (task, wo_eos, mask, etc.).
+                let mut new_msg = match incoming {
+                    // The reference keeps the message as written, its blocks set.
+                    IncomingBlocks::Kept => msg.clone(),
+                    IncomingBlocks::Rebuilt => json!({
+                        "role": "user",
+                        "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    }),
+                };
                 if let Some(obj) = new_msg.as_object_mut() {
+                    obj.insert("content_blocks".to_string(), Value::Array(own));
+                    // Preserve extra fields (task, wo_eos, mask, etc.).
                     for key in ["task", "wo_eos", "mask"] {
                         if let Some(v) = msg.get(key) {
                             obj.insert(key.to_string(), v.clone());
@@ -451,6 +477,72 @@ pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> 
         .collect()
 }
 
+/// One message as the family's renderers read it: the fields of the
+/// OpenAI-shape value every renderer reads, read once, with the tools and
+/// tool calls in the encoders' shape and empty lists dropped the way Python's
+/// truthiness drops them (`if tools:`), and `response_format` dropped the
+/// same way (`if response_format:`), so a renderer reads it only when its
+/// reference would render it. A field only some arms read is read on demand
+/// ([`Turn::wo_eos`]), so a renderer that never asks pays no lookup.
+pub(super) struct Turn<'m> {
+    pub(super) index: usize,
+    pub(super) msg: &'m Value,
+    pub(super) role: &'m str,
+    pub(super) content: &'m str,
+    pub(super) tools: Option<Vec<Value>>,
+    /// The turn's response format when the reference would render one: its
+    /// encoders test the field with Python's truthiness (see [`truthy`]).
+    pub(super) response_format: Option<&'m Value>,
+    pub(super) tool_calls: Option<Vec<Value>>,
+    /// The gateway's protocol takes the `reasoning` spelling as an alias of
+    /// `reasoning_content`, so a history assistant's reasoning renders under
+    /// either spelling for every renderer: a superset of the engines' copies
+    /// of these encoders, each of which reads one spelling alone.
+    pub(super) reasoning_content: &'m str,
+}
+
+impl<'m> Turn<'m> {
+    /// The message `msg` at `index` of its conversation (the renderer refuses
+    /// an index past the end in its own error type).
+    pub(super) fn read(index: usize, msg: &'m Value) -> Self {
+        let tools = msg
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|tools| tools_from_openai_format(tools))
+            .filter(|tools| !tools.is_empty());
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
+            .filter(|tool_calls| !tool_calls.is_empty());
+        Self {
+            index,
+            msg,
+            role: text(msg, "role"),
+            content: text(msg, "content"),
+            tools,
+            response_format: msg.get("response_format").filter(|v| truthy(v)),
+            tool_calls,
+            reasoning_content: text(msg, "reasoning_content"),
+        }
+    }
+
+    /// `wo_eos`: the message ends without the EOS token (read on demand by
+    /// the assistant arms of V4 and V4.1; V3.2 never asks).
+    pub(super) fn wo_eos(&self) -> bool {
+        self.msg
+            .get("wo_eos")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// A string field of a message, empty when absent or not a string, as the
+/// references' `msg.get(key, "")` reads it.
+pub(super) fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
+    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
 /// The tool schemas as the tools templates take them: each tool's JSON, one
 /// per line.
 pub(super) fn tool_schemas(tools: &[Value]) -> String {
@@ -502,6 +594,62 @@ Otherwise, output directly after {tend} with tool calls or final response.
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 "
     )
+}
+
+/// The tools template and the response format a system or developer turn
+/// carries, each after a blank line, when the turn has them; `render_tools`
+/// is the dialect's tools template.
+pub(super) fn push_tools_and_response_format(
+    prompt: &mut String,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    if let Some(tools) = tools {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(schema) = response_format {
+        prompt.push_str("\n\n");
+        let _ = write!(
+            prompt,
+            "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
+            to_json(schema)
+        );
+    }
+}
+
+/// The renderer-level pin the three renderers share: a history tool call
+/// whose `arguments` are already an object (the gateway parses the OpenAI
+/// string before a renderer runs) renders one DSML parameter per key through
+/// `encode`, spelled with the dialect's `parameter` tag. Dropping them once
+/// erased every historical call's parameters in multi-turn prompts.
+#[cfg(test)]
+pub(super) fn object_arguments_render_one_parameter_per_key_through<F, E>(
+    encode: F,
+    parameter: &str,
+) where
+    F: FnOnce(&[Value]) -> Result<String, E>,
+    E: std::fmt::Debug,
+{
+    let msgs = [
+        json!({ "role": "user", "content": "call my tool" }),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "search", "arguments": { "query": "deepseek", "limit": 5 } }
+            }]
+        }),
+    ];
+    let out = encode(&msgs).unwrap();
+    for line in [
+        format!("<{DSML_TOKEN}{parameter} name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}{parameter}>"),
+        format!("<{DSML_TOKEN}{parameter} name=\"limit\" string=\"false\">5</{DSML_TOKEN}{parameter}>"),
+    ] {
+        assert!(out.contains(&line), "{line} is not in {out}");
+    }
 }
 
 #[cfg(test)]
@@ -695,6 +843,58 @@ mod tests {
         assert_eq!(
             dsml(&json!("{oops"), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"true\">{oops</｜DSML｜ parameter>"
+        );
+    }
+
+    /// The reference encoders test an optional section with Python's
+    /// truthiness, so a turn's response format is nothing for every falsy
+    /// value and the value itself otherwise.
+    #[test]
+    fn a_turns_response_format_is_the_references_truthy_value_or_nothing() {
+        for falsy in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!(""),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(!truthy(&falsy), "{falsy}");
+            let msg = json!({ "role": "system", "content": "x", "response_format": falsy });
+            assert!(Turn::read(0, &msg).response_format.is_none(), "{msg}");
+        }
+        let schema = json!({ "type": "json_object" });
+        let msg = json!({ "role": "system", "content": "x", "response_format": schema });
+        assert_eq!(Turn::read(0, &msg).response_format, Some(&schema));
+        let bare = json!({ "role": "system", "content": "x" });
+        assert!(Turn::read(0, &bare).response_format.is_none());
+    }
+
+    /// V4's reference rebuilds every user message from its content; V4.1's
+    /// keeps a `content_blocks` list the message carries (and builds one from
+    /// the content when it carries none).
+    #[test]
+    fn a_user_messages_own_content_blocks_are_rebuilt_or_kept_by_dialect() {
+        let with_block = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "from the block" }],
+        })];
+        let rebuilt = merge_tool_messages(&with_block, IncomingBlocks::Rebuilt);
+        assert_eq!(
+            rebuilt[0]["content_blocks"],
+            json!([{ "type": "text", "text": "ignored" }])
+        );
+        let kept = merge_tool_messages(&with_block, IncomingBlocks::Kept);
+        assert_eq!(
+            kept[0]["content_blocks"],
+            json!([{ "type": "text", "text": "from the block" }])
+        );
+        assert_eq!(kept[0]["content"], json!("ignored"));
+        let without = [json!({ "role": "user", "content": "hello" })];
+        assert_eq!(
+            merge_tool_messages(&without, IncomingBlocks::Kept)[0]["content_blocks"],
+            json!([{ "type": "text", "text": "hello" }])
         );
     }
 }

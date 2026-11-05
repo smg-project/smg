@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import build_control_plane_auth_config, policy_from_str
+from smg.router import Router, build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -144,6 +144,13 @@ class TestRouterConfigValidation:
         assert args.worker_startup_check_interval == 30
         assert args.request_timeout_secs == 1800
         assert args.queue_timeout_secs == 60
+
+    def test_grpc_request_timeout_is_opt_in(self):
+        """The bound on a request to a gRPC worker is off (0) unless set."""
+        assert RouterArgs().grpc_request_timeout_secs == 0
+        args = RouterArgs(request_timeout_secs=1800, grpc_request_timeout_secs=30)
+        assert args.request_timeout_secs == 1800
+        assert args.grpc_request_timeout_secs == 30
 
     def test_retry_config_validation(self):
         """Test retry configuration validation."""
@@ -567,6 +574,27 @@ class TestRouterConstructorSignature:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestRouterParserChoice:
+    """The launcher reads with Symphony unless ``--parser legacy`` is given: ``RouterArgs.parser``
+    is what ``Router.from_args`` hands to ``_Router(...)``, by name, so the binding's own
+    signature default never decides for a launcher-started router. The binding stores the
+    name and checks it, like every other name, when the router starts."""
+
+    @staticmethod
+    def parser_handed_to_the_binding(args: RouterArgs) -> str:
+        with patch("smg.router._Router") as binding:
+            Router.from_args(args)
+        binding.assert_called_once()
+        return binding.call_args.kwargs["parser"]
+
+    def test_the_launcher_hands_its_default_symphony_to_the_binding(self):
+        assert RouterArgs().parser == "symphony"
+        assert self.parser_handed_to_the_binding(RouterArgs()) == "symphony"
+
+    def test_legacy_is_handed_to_the_binding_as_spelled(self):
+        assert self.parser_handed_to_the_binding(RouterArgs(parser="legacy")) == "legacy"
+
+
 class TestControlPlaneAuthHalfJwt:
     """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
 
@@ -631,3 +659,35 @@ class TestJwtConfigRoleClaim:
         assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
         auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
         assert auth.jwt.role_claim == "groups"
+
+
+class TestTheRouterRefusesWhatTheCliRefuses:
+    """The binary refuses these flag shapes at parse time; the Router refuses
+    the same values from ``start()`` with the same words, before anything binds."""
+
+    @staticmethod
+    def router(**kwargs) -> _Router:
+        return _Router(worker_urls=["http://worker:8000"], **kwargs)
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused(self):
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            self.router(prometheus_duration_buckets=[1.0, 0.5]).start()
+
+    @pytest.mark.parametrize("bound", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_a_bucket_bound_that_is_not_a_finite_number_above_zero_is_refused(self, bound):
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            self.router(prometheus_duration_buckets=[0.5, bound]).start()
+
+    def test_a_role_mapping_to_an_unknown_gateway_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"Gateway.Admin": "administrator"})
+        with pytest.raises(ValueError, match="the gateway role must be 'admin' or 'user'"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    def test_a_role_mapping_from_an_empty_idp_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"": "admin"})
+        with pytest.raises(ValueError, match="the IdP role must not be empty"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()

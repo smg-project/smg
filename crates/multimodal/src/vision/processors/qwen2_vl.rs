@@ -233,14 +233,14 @@ impl VisionPreProcessor for Qwen2VLProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -261,14 +261,13 @@ impl VisionPreProcessor for Qwen2VLProcessor {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::{
+        test_support::{assert_two_image_batch, create_test_image},
+        vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
+    };
 
     #[test]
     fn test_qwen2_vl_processor_default() {
@@ -396,7 +395,7 @@ mod tests {
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -436,7 +435,7 @@ mod tests {
         };
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
         let image = create_test_image(600, 400, Rgb([17, 128, 255]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
         let flat = result.encoder_input_flat();
         assert!(!flat.is_empty());
         assert!(flat
@@ -452,41 +451,16 @@ mod tests {
     #[test]
     fn test_qwen2_vl_preprocess_multiple() {
         let processor = Qwen2VLProcessor::new();
-        let images = vec![
+        let images = [
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
-        // Both images processed
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
-
-        // encoder_input is 2D [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
-
-        // Check grid_thw shape
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("image_grid_thw")
-        {
-            assert_eq!(shape, &[2, 3]); // 2 images, 3 values (T, H, W) each
-            assert_eq!(data.len(), 6);
-        } else {
-            panic!("Expected image_grid_thw to be IntTensor");
-        }
-
-        // Check patches_per_image
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("patches_per_image")
-        {
-            assert_eq!(shape, &[2]); // 2 images
-            assert_eq!(data.len(), 2);
-            let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.encoder_input.shape()[0]);
-        } else {
-            panic!("Expected patches_per_image to be IntTensor");
-        }
+        assert_two_image_batch(&result);
     }
 
     #[test]
@@ -557,7 +531,7 @@ mod tests {
             ..Default::default()
         };
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 616x616 -> grid (1, 44, 44) -> (44*44)/4 = 484 tokens, vs 1225 at the default.
         assert_eq!(result.feature_token_counts[0], 484);

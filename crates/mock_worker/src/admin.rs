@@ -131,8 +131,9 @@ async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response 
 
 /// Body: one scripted answer or an array of them ([`script::Answer::parse`]
 /// names the fields). Each goes to the end of the worker's queue (`all`: the
-/// queue every worker falls back to), or under its prompt's key when it has
-/// one. Answers the worker's script state.
+/// queue every worker falls back to), under its prompt's key when it has
+/// one, or under the text a prompt must hold (`prompt_contains`). Answers
+/// the worker's script state.
 async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> Response {
     let items: Vec<&Value> = match &body {
         Value::Array(items) => items.iter().collect(),
@@ -150,13 +151,14 @@ async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> 
     script_state(script::enqueue(&worker, answers))
 }
 
-/// The worker's queued answers, hits and misses, and the keyed answers of
-/// the process.
+/// The worker's queued answers, the ones filed under a text, its hits and
+/// misses, and the keyed answers of the process.
 async fn script_status(Path(worker): Path<String>) -> Response {
     script_state(script::status(&worker))
 }
 
-/// Drop the worker's queued answers (`all`: every queue); keyed answers stay.
+/// Drop the worker's queued answers and the ones filed under a text (`all`:
+/// every worker's); keyed answers stay.
 async fn script_clear(Path(worker): Path<String>) -> Response {
     script_state(script::clear(&worker))
 }

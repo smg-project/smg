@@ -768,6 +768,61 @@ impl FixedKernel {
     }
 }
 
+/// The computation the fixed-point passes replace, for the tests: per
+/// sample, the kernel's own taps summed in `i64`, width first then height,
+/// `(sum >> precision)` clamped to a byte.
+#[cfg(test)]
+pub(super) fn per_sample_reference(
+    data: &[u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    filter: PilResizeFilter,
+    quantization: KernelQuantization,
+) -> Vec<u8> {
+    fn clip(kernel: &FixedKernel, v: i64) -> u8 {
+        (v >> kernel.precision).clamp(0, 255) as u8
+    }
+    let mut mid = data.to_vec();
+    if in_w != out_w {
+        let k = FixedKernel::new(in_w, out_w, filter, quantization);
+        let half = 1_i64 << (k.precision - 1);
+        let mut out = vec![0u8; in_h * out_w * 3];
+        for y in 0..in_h {
+            for xx in 0..out_w {
+                let (x0, n) = k.bounds[xx];
+                for c in 0..3 {
+                    let mut s = half;
+                    for x in 0..n {
+                        s +=
+                            i64::from(data[(y * in_w + x0 + x) * 3 + c]) * i64::from(k.taps[xx][x]);
+                    }
+                    out[(y * out_w + xx) * 3 + c] = clip(&k, s);
+                }
+            }
+        }
+        mid = out;
+    }
+    if in_h == out_h {
+        return mid;
+    }
+    let k = FixedKernel::new(in_h, out_h, filter, quantization);
+    let half = 1_i64 << (k.precision - 1);
+    let mut out = vec![0u8; out_h * out_w * 3];
+    for yy in 0..out_h {
+        let (y0, n) = k.bounds[yy];
+        for x in 0..out_w * 3 {
+            let mut s = half;
+            for y in 0..n {
+                s += i64::from(mid[(y0 + y) * out_w * 3 + x]) * i64::from(k.taps[yy][y]);
+            }
+            out[yy * out_w * 3 + x] = clip(&k, s);
+        }
+    }
+    out
+}
+
 /// Number of threads to split an elementwise or row-banded preprocessing pass
 /// across. Each output row/element is independent, so banding work over threads
 /// yields BIT-IDENTICAL output: no shared accumulation and no inner-loop order
@@ -1574,6 +1629,7 @@ mod tests {
     use image::Rgba;
 
     use super::*;
+    use crate::test_support::{assert_same_bytes, create_test_image, gradient_rgb};
 
     #[test]
     fn catmull_rom_rgb_matches_image_resize() {
@@ -1656,10 +1712,6 @@ mod tests {
         ));
     }
 
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
-
     /// The raw-RGB torchvision `uint8` resizer must be byte-for-byte identical
     /// to the `DynamicImage` form the Qwen image path uses (the raw-RGB form
     /// serves `preprocess_video_rgb`).
@@ -1692,72 +1744,6 @@ mod tests {
         );
     }
 
-    /// A deterministic RGB pattern of the given size.
-    fn gradient(w: usize, h: usize, seed: usize) -> Vec<u8> {
-        let mut data = vec![0u8; w * h * 3];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 3;
-                data[i] = ((seed + x * 7 + y * 3) % 256) as u8;
-                data[i + 1] = ((seed + x * 5 + y * 11) % 256) as u8;
-                data[i + 2] = ((seed + x + y * 2) % 256) as u8;
-            }
-        }
-        data
-    }
-
-    /// The computation the 32-bit passes replace: per sample, the kernel's
-    /// own taps summed in `i64`, width first then height.
-    fn pil_reference(
-        data: &[u8],
-        in_w: usize,
-        in_h: usize,
-        out_w: usize,
-        out_h: usize,
-        filter: PilResizeFilter,
-    ) -> Vec<u8> {
-        fn clip(kernel: &FixedKernel, v: i64) -> u8 {
-            (v >> kernel.precision).clamp(0, 255) as u8
-        }
-        let mut mid = data.to_vec();
-        if in_w != out_w {
-            let k = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
-            let half = 1_i64 << (k.precision - 1);
-            let mut out = vec![0u8; in_h * out_w * 3];
-            for y in 0..in_h {
-                for xx in 0..out_w {
-                    let (x0, n) = k.bounds[xx];
-                    for c in 0..3 {
-                        let mut s = half;
-                        for x in 0..n {
-                            s += i64::from(data[(y * in_w + x0 + x) * 3 + c])
-                                * i64::from(k.taps[xx][x]);
-                        }
-                        out[(y * out_w + xx) * 3 + c] = clip(&k, s);
-                    }
-                }
-            }
-            mid = out;
-        }
-        if in_h == out_h {
-            return mid;
-        }
-        let k = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
-        let half = 1_i64 << (k.precision - 1);
-        let mut out = vec![0u8; out_h * out_w * 3];
-        for yy in 0..out_h {
-            let (y0, n) = k.bounds[yy];
-            for x in 0..out_w * 3 {
-                let mut s = half;
-                for y in 0..n {
-                    s += i64::from(mid[(y0 + y) * out_w * 3 + x]) * i64::from(k.taps[yy][y]);
-                }
-                out[yy * out_w * 3 + x] = clip(&k, s);
-            }
-        }
-        out
-    }
-
     /// Up- and downscales, identity axes, extreme aspects, row lengths that
     /// leave vector tails and a large image, bicubic and Lanczos: every byte
     /// of the 32-bit passes equals the per-sample `i64` computation.
@@ -1783,7 +1769,7 @@ mod tests {
             .enumerate()
         {
             for (seed, &(in_w, in_h, out_w, out_h)) in cases.iter().enumerate() {
-                let data = gradient(in_w, in_h, seed * 13 + f * 101);
+                let data = gradient_rgb(in_w, in_h, seed * 13 + f * 101);
                 let actual = resize_pil_bytes(
                     &data,
                     in_w as u32,
@@ -1793,23 +1779,20 @@ mod tests {
                     filter,
                     KernelQuantization::Pillow,
                 );
-                let expected = pil_reference(&data, in_w, in_h, out_w, out_h, filter);
-                assert_eq!(
-                    actual.len(),
-                    out_w * out_h * 3,
-                    "{in_w}x{in_h} -> {out_w}x{out_h}"
+                let expected = per_sample_reference(
+                    &data,
+                    in_w,
+                    in_h,
+                    out_w,
+                    out_h,
+                    filter,
+                    KernelQuantization::Pillow,
                 );
-                if actual != expected {
-                    let first = actual
-                        .iter()
-                        .zip(&expected)
-                        .position(|(a, b)| a != b)
-                        .unwrap_or(0);
-                    panic!(
-                        "filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}: first difference at byte {first}: {} vs {}",
-                        actual[first], expected[first]
-                    );
-                }
+                assert_same_bytes(
+                    &actual,
+                    &expected,
+                    &format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}"),
+                );
             }
         }
     }
@@ -1851,7 +1834,7 @@ mod tests {
             (48, 64, 476, 630),
             (100, 100, 546, 546),
         ] {
-            let data = gradient(w as usize, h as usize, 5);
+            let data = gradient_rgb(w as usize, h as usize, 5);
             let color = Rgb([127, 127, 127]);
             let actual = pad_to_size_pil_rgb(&data, w, h, out_w, out_h, color).unwrap();
 

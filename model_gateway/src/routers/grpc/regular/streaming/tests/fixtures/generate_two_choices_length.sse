@@ -1,0 +1,10 @@
+data: {"text":"left","output_ids":[108,101,102,116],"meta_info":{"id":"gen-bytes-0","finish_reason":null,"prompt_tokens":0,"weight_version":"v7","completion_tokens":4,"cached_tokens":0,"reasoning_tokens":0},"index":0}
+
+data: {"text":"right","output_ids":[114,105,103,104,116],"meta_info":{"id":"gen-bytes-1","finish_reason":null,"prompt_tokens":0,"weight_version":"v7","completion_tokens":5,"cached_tokens":0,"reasoning_tokens":0},"index":1}
+
+data: {"text":"left one","output_ids":[32,111,110,101],"meta_info":{"id":"gen-bytes-0","finish_reason":null,"prompt_tokens":0,"weight_version":"v7","completion_tokens":8,"cached_tokens":0,"reasoning_tokens":0},"index":0}
+
+data: {"text":"left one","output_ids":[],"meta_info":{"id":"gen-bytes-0","finish_reason":{"type":"length","length":12},"prompt_tokens":1,"weight_version":"v7","completion_tokens":8,"cached_tokens":0,"reasoning_tokens":0,"e2e_latency":0},"index":0}
+
+data: {"text":"right","output_ids":[],"meta_info":{"id":"gen-bytes-1","finish_reason":{"type":"length","length":12},"prompt_tokens":1,"weight_version":"v7","completion_tokens":5,"cached_tokens":0,"reasoning_tokens":0,"e2e_latency":0},"index":1}
+

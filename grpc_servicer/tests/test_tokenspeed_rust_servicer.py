@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.tokenspeed import rust
 
@@ -119,7 +120,10 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert (
+        rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "python"}) == "python"
+    )
     assert rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -145,7 +149,7 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
     assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == (
         "rust",
         "env",
@@ -158,7 +162,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
     assert environ == {"SMG_TOKENSPEED_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
 
 
@@ -232,7 +236,7 @@ def test_the_launcher_takes_the_flag_ahead_of_tokenspeeds_args(launcher, monkeyp
     assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
 
 
-def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkeypatch, caplog):
+def test_the_launcher_falls_back_to_the_environment_then_rust(launcher, monkeypatch, caplog):
     module, calls = launcher
     monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "rust")
     with caplog.at_level("INFO", logger=module.logger.name):
@@ -241,20 +245,26 @@ def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkey
     assert raised.value.code == 3 and calls["served"][0] == "rust"
     assert calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: rust (source=env)" in caplog.text
-    # `--servicer-impl python` overrides the exported `rust`, environment included.
+    assert "deprecated" not in caplog.text
+    # `--servicer-impl python` overrides the exported `rust`, environment
+    # included, and is announced as deprecated.
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
         module.main(["--servicer-impl=python", "--model", "org/m"])
     assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: python (source=flag)" in caplog.text
+    assert "The Python gRPC servicer is deprecated" in caplog.text
     assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
-    # Neither: the Python servicer, and the environment is left alone.
+    # Neither: the Rust servicer (the default), no deprecation line, and the
+    # environment is left alone.
     monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
-        module.main(["--model", "org/m"])
-    assert calls["served"][0] == "python"
-    assert "Servicer implementation: python (source=default)" in caplog.text
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--model", "org/m"])
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert "Servicer implementation: rust (source=default)" in caplog.text
+    assert "deprecated" not in caplog.text
     assert rust.SERVICER_IMPL_ENV not in os.environ
 
 
@@ -1092,7 +1102,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
     monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
-    monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless: "engine-handle")
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless, **_: "engine-handle")
 
     async def fake_supervise(server, engine, *, drain_secs, **kwargs):
         recorded["supervise_kwargs"] = kwargs
@@ -1120,10 +1130,12 @@ class _FakeBootstrapServer:
         self.closed += 1
 
 
-def _install_fake_pd_utils(monkeypatch) -> dict:
+def _install_fake_pd_utils(monkeypatch, *, hands_out_bootstrap_server: bool = True) -> dict:
     """``tokenspeed.runtime.pd.utils`` as the launcher reads it: the transfer
-    backend and class-type enums and the registry that hands out the
-    bootstrap server class; records what was asked for."""
+    backend enum and, on an engine before its Rust control plane, the
+    class-type enum and the registry that hands out the bootstrap server
+    class (an engine since then has neither: its headless launcher hosts the
+    server itself); records what was asked for."""
     import enum
 
     asked: dict = {}
@@ -1140,21 +1152,25 @@ def _install_fake_pd_utils(monkeypatch) -> dict:
         assert class_type is KVClassType.BOOTSTRAP_SERVER
         return _FakeBootstrapServer
 
+    registry = (
+        {"KVClassType": KVClassType, "get_kv_class": get_kv_class}
+        if hands_out_bootstrap_server
+        else {}
+    )
     _install(
-        monkeypatch,
-        "tokenspeed.runtime.pd.utils",
-        TransferBackend=TransferBackend,
-        KVClassType=KVClassType,
-        get_kv_class=get_kv_class,
+        monkeypatch, "tokenspeed.runtime.pd.utils", TransferBackend=TransferBackend, **registry
     )
     _FakeBootstrapServer.built = []
     return asked
 
 
-def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
+def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bool = True) -> dict:
     """``serve_rust`` for a launch in disaggregation ``mode`` against the
     recording fakes: when the ranks were launched relative to the bootstrap
-    server, and the supervisor's end."""
+    server, and the supervisor's end. With ``in_process`` the rank launch is
+    a fake standing for the start from this process; without it the real
+    launch runs and, on an engine without the in-process entry points, goes
+    to the (faked) spawned headless launcher."""
     recorded: dict = {"launched_with_servers": None}
 
     class FakeServer:
@@ -1177,9 +1193,9 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
-    def fake_launch(headless):
-        # The ranks register with the bootstrap server when they start: it
-        # must already be up.
+    def record_launch(headless):
+        # The ranks register with the bootstrap server when they start: what
+        # is up at the launch is what they find, whichever way they start.
         recorded["launched_with_servers"] = [
             (server.port, server.closed) for server in _FakeBootstrapServer.built
         ]
@@ -1189,7 +1205,10 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
         recorded["supervised"] = engine
         return 0
 
-    monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+    if in_process:
+        monkeypatch.setattr(rust, "launch_scheduler_ranks", record_launch)
+    else:
+        monkeypatch.setattr(rust, "launch_headless_scheduler", record_launch)
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     with caplog.at_level("INFO", logger=rust.logger.name):
         recorded["exit"] = asyncio.run(
@@ -1234,29 +1253,152 @@ def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
     assert "Bootstrap server started" not in caplog.text
 
 
-def test_an_encode_launch_is_refused_under_the_rust_path(launcher, monkeypatch, caplog):
-    """The EPD encode role takes its requests over the engine's in-process
-    channel, which this path does not build: such a launch under an explicit
-    rust is a configuration error before any scheduler starts (exit code 2,
-    one line naming the way out), never a servicer that reports SERVING and
-    encodes nothing. The prefill and decode roles pass."""
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
-        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode="encode"))
+@pytest.mark.parametrize(
+    "missing",
+    [None, "run_event_loop"],
+    ids=["every in-process entry point present", "one entry point missing"],
+)
+def test_a_prefill_launch_on_an_engine_whose_launcher_hosts_the_bootstrap_server_is_left_to_it(
+    monkeypatch, tmp_path, caplog, missing
+):
+    """Since the engine's Rust control plane its headless launcher brings the
+    prefill side's bootstrap server up itself, and its PD registry no longer
+    hands the server class out. A prefill launch on such an engine is left to
+    that launcher whatever entry points the engine has: ranks started from
+    this process would have no server to register with (the engine of today
+    lacks an entry point as well; one with every entry point is the launcher
+    follow-up's case). The servicer starts none and says so: no rank starts
+    here, no preparation call runs, the port is bound once."""
+    launch = _stub_rank_launch(monkeypatch, missing=missing)
+    asked = _install_fake_pd_utils(monkeypatch, hands_out_bootstrap_server=False)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert recorded["launched_with_servers"] == [] and _FakeBootstrapServer.built == []
+    assert asked == {} and _FakeRankProcess.started == [] and launch["calls"] == []
+    assert "Bootstrap server started" not in caplog.text
+    assert (
+        "left to TokenSpeed's headless launcher in a spawned process (it hosts the prefill "
+        "side's KV bootstrap server)" in caplog.text
+    )
+
+
+def test_a_prefill_launch_left_to_an_older_engines_launcher_hosts_the_bootstrap_server_here(
+    monkeypatch, tmp_path, caplog
+):
+    """An engine before its Rust control plane may lack an in-process entry
+    point as well (the one of 2026-10-06 has no ``_scheduler_ranks``), so its
+    ranks are left to its spawned headless launcher, which starts no
+    bootstrap server (that engine's frontend did). Its registry hands the
+    class out, so the servicer hosts the server here, up before the spawned
+    launch, and closes it at the end: the ownership follows the engine, not
+    the launch path."""
+    _stub_rank_launch(monkeypatch, missing="_scheduler_ranks")
+    asked = _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert recorded["launched_with_servers"] == [(8998, 0)]
+    assert asked["class_type"].value == "bootstrap_server"
+    (server,) = _FakeBootstrapServer.built
+    assert server.closed == 1
+    assert (
+        "Bootstrap server started for disaggregation mode on port 8998 (mooncake transfer)"
+        in caplog.text
+    )
+    assert "left to TokenSpeed's headless launcher in a spawned process" in caplog.text
+
+
+def test_an_encode_launch_runs_on_the_rust_path_with_its_rendezvous_fact(launcher, monkeypatch):
+    """The EPD encode role runs on the Rust path: the launch is not refused,
+    the facts carry the worker's own rendezvous address (the host every
+    encode request names, read the engine's way, next to the bootstrap port
+    the server args already carry) for the encode role only, and the
+    KV-events default stays off for it (a vision tower has no KV cache to
+    publish from), as the Python server leaves it."""
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust, "encode_bootstrap_host", lambda args: "10.0.0.9")
+    encode = FakeServerArgs(disaggregation_mode="encode", disaggregation_bootstrap_port=8998)
+    facts = rust.server_facts(encode)
+    args = json.loads(facts["server_args_json"])
+    assert args["encode_bootstrap_host"] == "10.0.0.9"
+    assert args["disaggregation_bootstrap_port"] == 8998
     for mode in ("null", "prefill", "decode"):
-        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode=mode))
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
-        asyncio.run(rust.serve_rust(FakeServerArgs(disaggregation_mode="encode")))
+        other = json.loads(
+            rust.server_facts(FakeServerArgs(disaggregation_mode=mode))["server_args_json"]
+        )
+        assert "encode_bootstrap_host" not in other
+    assert rust.TokenSpeedLauncher().kv_events_default(encode) is None
 
     module, calls = launcher
-    caplog.set_level(logging.ERROR)
-    monkeypatch.setattr(module, "serve_rust", rust.serve_rust)
+    served = {}
+
+    async def fake_serve_rust(server_args):
+        served["mode"] = server_args.disaggregation_mode
+        return 0
+
+    monkeypatch.setattr(module, "serve_rust", fake_serve_rust)
     with pytest.raises(SystemExit) as raised:
         module.main(
             ["--servicer-impl", "rust", "--model", "org/m", "--disaggregation-mode", "encode"]
         )
-    assert raised.value.code == 2 and calls["served"] is None
-    assert "does not serve the EPD encode role" in caplog.text
-    assert "--servicer-impl python" in caplog.text
+    assert raised.value.code == 0 and served == {"mode": "encode"}
+
+
+def test_the_rendezvous_host_is_the_engines_reading_or_empty(monkeypatch):
+    """The host is the engine's own reading (``get_local_ip_by_remote``); a
+    helper that yields nothing, or an engine that cannot be imported, gives
+    an empty host, which the Rust servicer refuses by name (never the
+    launch's ``--host``, an unspecified address no peer can reach)."""
+    import sys
+    import types
+
+    network = types.ModuleType("tokenspeed.runtime.utils.network")
+    network.get_local_ip_by_remote = lambda: "192.0.2.7"
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.network", network)
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="0.0.0.0")) == "192.0.2.7"
+    network.get_local_ip_by_remote = lambda: None
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == ""
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.utils.network")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils", None)
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == ""
+
+
+def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(monkeypatch):
+    """An engine before the encode request never dials the servicer's
+    handshake in the encode role, so the handshake-time refusal is
+    unreachable: the capability is read off the installed engine's wire
+    module before anything starts and the launch fails by name (a
+    configuration error, exit code 2 through ``main``). An engine whose
+    encode ranks register over the wire (its wire module builds the encode
+    role's READY response; the request type lives in its wire crate) passes,
+    as does a wire whose Python side carries the request type itself; the
+    other roles pass on either, an installed engine whose wire module does
+    not import is refused by name too, and only a missing engine is left to
+    the handshake-time check."""
+    wire = types.ModuleType("tokenspeed.runtime.engine.zmq_wire")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire", wire)
+    encode = FakeServerArgs(disaggregation_mode="encode")
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="carries no encode request"):
+        rust.refuse_encode_role_without_wire(encode)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="carries no encode request"):
+        asyncio.run(rust.serve_rust(encode))
+    for mode in ("null", "prefill", "decode"):
+        rust.refuse_encode_role_without_wire(FakeServerArgs(disaggregation_mode=mode))
+    wire.encode_ready_response = lambda **facts: facts
+    rust.refuse_encode_role_without_wire(encode)
+    del wire.encode_ready_response
+    wire.REQ_TYPE_ENCODE = b"\x03"
+    rust.refuse_encode_role_without_wire(encode)
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine", None)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="cannot read the EPD encode"):
+        rust.refuse_encode_role_without_wire(encode)
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine")
+
+    def no_engine(name):
+        raise ModuleNotFoundError("No module named 'tokenspeed'", name="tokenspeed")
+
+    monkeypatch.setattr(importlib, "import_module", no_engine)
+    rust.refuse_encode_role_without_wire(encode)
 
 
 def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
@@ -1521,7 +1663,7 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
-    def failing_launch(headless):
+    def failing_launch(headless, **_kwargs):
         raise RuntimeError("scheduler would not start")
 
     async def never_supervise(*_args, **_kwargs):
@@ -1614,3 +1756,34 @@ def test_mrope_positions_are_read_off_the_text_rope_config():
     assert rust.mrope_positions({"text_config": {"rope_scaling": {"mrope_section": [1]}}}) is True
     assert rust.mrope_positions(SimpleNamespace(model_type="x")) is None
     assert rust.mrope_positions(None) is None
+
+
+def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The xgrammar installed beside the engine predates the structural-tag
+    # nodes the Router writes (0.1.33 is the first release with them): the
+    # key says so under xgrammar, and under a backend the engine has not
+    # resolved yet (its default where a grammar runs at all); an explicit
+    # `none` and a current xgrammar leave no key.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    pinned = json.loads(
+        rust.server_facts(_GrammarServerArgs(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert pinned["structural_tag_vocabulary"] == "older"
+    unset = _GrammarServerArgs(grammar_backend="none")
+    unset._grammar_backend_unset = True
+    unset._beam_checkpoint = None
+    unresolved = json.loads(rust.server_facts(unset)["server_args_json"])
+    assert "grammar_backend" not in unresolved
+    assert unresolved["structural_tag_vocabulary"] == "older"
+    explicit_none = _GrammarServerArgs(grammar_backend="none")
+    explicit_none._grammar_backend_unset = False
+    assert "structural_tag_vocabulary" not in json.loads(
+        rust.server_facts(explicit_none)["server_args_json"]
+    )
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.8")
+    current = json.loads(
+        rust.server_facts(_GrammarServerArgs(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in current

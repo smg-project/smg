@@ -19,6 +19,8 @@ from smg.router_args import RouterArgs
 from smg.smg_rs import Router as _Router
 
 REGULAR = RouterArgs(worker_urls=["http://worker:8000"])
+# The Gemini provider route, which only the Rust binary could select before.
+GEMINI = RouterArgs(backend="gemini", worker_urls=["https://generativelanguage.googleapis.com"])
 PREFILL_DECODE = RouterArgs(
     worker_urls=[],
     pd_disaggregation=True,
@@ -82,11 +84,28 @@ def test_every_constructor_parameter_is_set_by_the_launcher():
 
 @pytest.mark.parametrize(
     "args",
-    [REGULAR, PREFILL_DECODE, FILE_DISCOVERY, SLURM_DISCOVERY, CONSUL_DISCOVERY],
-    ids=["regular", "prefill-decode", "file-discovery", "slurm-discovery", "consul-discovery"],
+    [REGULAR, PREFILL_DECODE, GEMINI, FILE_DISCOVERY, SLURM_DISCOVERY, CONSUL_DISCOVERY],
+    ids=[
+        "regular",
+        "prefill-decode",
+        "gemini",
+        "file-discovery",
+        "slurm-discovery",
+        "consul-discovery",
+    ],
 )
 def test_the_launcher_builds_the_real_router(args: RouterArgs):
     # The constructor only keeps the configuration (the file, Slurm and Consul
     # providers' mappings are parsed, no file read, no command run and no
     # request sent); nothing is bound.
     assert Router.from_args(args) is not None
+
+
+@pytest.mark.parametrize("settle", [None, 0, 30, 120])
+def test_shutdown_settle_reaches_native_constructor(settle):
+    """The optional propagation window reaches the native router unchanged."""
+    args = RouterArgs(worker_urls=["http://worker:8000"], shutdown_settle_secs=settle)
+    with patch("smg.router._Router") as constructor:
+        Router.from_args(args)
+    assert constructor.call_args.kwargs["shutdown_settle_secs"] == settle
+    assert isinstance(Router.from_args(args), Router)

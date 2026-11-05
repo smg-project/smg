@@ -43,8 +43,13 @@ enum ThinkingMode {
 }
 
 /// Which encoder recorded a case's text: the checkpoint's own `encoding.py`
-/// (`hf`) or the serving engine's port (`vllm_python`), used for the shapes the reference
-/// cannot render, such as a developer message it keeps.
+/// (`hf`) or the serving engine's port (`vllm_python`), for a shape the
+/// reference cannot render. A `developer` message is not one: the generator
+/// rewrote it as a system message before either encoder saw the conversation,
+/// which the engine's renderer does not (it hands the role to its encoder as
+/// written; the crate's unit tests pin what the shim renders for it), so the
+/// three developer cases describe the system path they were recorded on and
+/// the test hands the shim that path ([`as_the_generator_folded`]).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Oracle {
@@ -100,6 +105,22 @@ struct IdCase {
 struct IdFixtures {
     tokenizer_sha256: String,
     cases: Vec<IdCase>,
+}
+
+/// The generator's rewrite the three developer cases were recorded with: the
+/// developer message, first in each of them, as a system message (none has a
+/// second system message to merge with, nor developer `tools`).
+fn as_the_generator_folded(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if message["role"] == "developer" {
+                message["role"] = json!("system");
+            }
+            message
+        })
+        .collect()
 }
 
 /// The template kwargs the gateway forwards for a case. `reasoning_effort`
@@ -227,23 +248,22 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
                 panic!("case {name}: encoder_revision {revision} is neither revision nor current_revision")
             });
         let kwargs = template_kwargs(case);
+        let messages = as_the_generator_folded(&case.messages);
         let render = |kwargs: &HashMap<String, Value>| {
             let params = ChatTemplateParams {
                 // A case recorded with `wo_eos` on its final assistant message
-                // renders through `add_generation_prompt: false`, which the
-                // shim maps to `wo_eos` when the last message is an assistant
-                // turn (no EOS, no generation header). The gateway does not
-                // send that yet: it renders `continue_final_message` by
-                // popping the trailing assistant message and appending its
-                // content after the generation header; routing it through
-                // `add_generation_prompt: false` is a follow-up. Every other
-                // case appends the header.
+                // renders through `continue_final_message` with no generation
+                // header, the pair the gateway sends for a trailing assistant
+                // turn (`native_assistant_continuation`), which the shim maps
+                // to `wo_eos` (no EOS, no generation header). Every other case
+                // appends the header.
                 add_generation_prompt: !case.continue_final_message,
+                continue_final_message: case.continue_final_message,
                 tools: case.tools.as_deref(),
                 template_kwargs: Some(kwargs),
                 ..Default::default()
             };
-            tok.apply_chat_template_with_encoding(&case.messages, params, None)
+            tok.apply_chat_template_with_encoding(&messages, params, None)
                 .unwrap_or_else(|e| panic!("case {name}: render failed: {e}"))
         };
 

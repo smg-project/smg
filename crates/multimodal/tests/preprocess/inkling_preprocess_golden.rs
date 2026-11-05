@@ -13,6 +13,8 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 
+use super::{fnv1a_f32, fnv1a_update};
+
 #[derive(Deserialize)]
 struct GoldenDocument {
     audio_cases: Vec<AudioCase>,
@@ -68,14 +70,6 @@ fn make_seeded_image(width: u32, height: u32, seed: u32) -> DynamicImage {
     DynamicImage::ImageRgb8(img)
 }
 
-fn fnv1a_f32(values: &[f32]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for value in values {
-        hash = fnv1a_update(hash, &value.to_le_bytes());
-    }
-    format!("{hash:016x}")
-}
-
 fn make_audio_samples(count: usize, seed: u32, amplitude: f32) -> Vec<f32> {
     if seed == 0 {
         return vec![0.0; count];
@@ -96,14 +90,6 @@ fn tokens_per_item(result: &PreprocessedEncoderInputs) -> Vec<i64> {
         }
         value => panic!("expected tokens_per_item IntTensor, got {value:?}"),
     }
-}
-
-fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn fnv1a_i32(values: &[f32]) -> String {
@@ -136,7 +122,7 @@ fn inkling_audio_preprocess_matches_checked_in_golden() {
             sample_rate: case.sample_rate,
         };
         let result = processor
-            .preprocess_decoded_clips(vec![decoded])
+            .preprocess_decoded_clips(&[&decoded])
             .expect("Inkling audio preprocessing failed");
 
         assert_eq!(
@@ -186,7 +172,7 @@ fn inkling_vision_preprocess_matches_checked_in_golden() {
         let processor =
             InklingImageProcessor::from_preprocessor_config(&config).expect("valid config");
         let result = processor
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .expect("Inkling vision preprocessing failed");
 
         assert_eq!(

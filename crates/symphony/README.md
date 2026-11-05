@@ -58,7 +58,7 @@ the scanner and the token ledger are the engine's own.
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
 | `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |
-| `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. The call syntax is a family's, or a call given as data (`CallSyntax::Shaped`, a `shape::CallShape`) as a response template writes it. A table read from a response template has the rows its fields need as well: turn anchors, the state a turn starts in, framing whose text is dropped, stays trimmed as the template's fields are, a stop that closes a call, and the terminals that are stop tokens. A table whose template opens the turn after a user message only names the state a turn the prompt leaves unopened starts in (DeepSeek V4: the thought). Built with a small builder and checked by `Format::validate`. `Format::replay` cuts the prompt to the part the engine replays, and `Format::reasoning_open` says whether that replay leaves the model inside its thought; `Format::thinks_first` says the template writes the thought before every call and answer. |
+| `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. The call syntax is a family's, or a call given as data (`CallSyntax::Shaped`, a `shape::CallShape`) as a response template writes it. A table read from a response template has the rows its fields need as well: turn anchors, the state a turn starts in, framing whose text is dropped, stays trimmed as the template's fields are, a stop that closes a call, and the terminals that are stop tokens. A table whose template opens the turn after a user message only names the state a turn the prompt leaves unopened starts in (DeepSeek V4: the thought). Built with a small builder and checked by `Format::validate`. `Format::turn_opener` names the opener, `Format::replay` cuts the prompt to the part the engine replays, and `Format::reasoning_open` says whether that replay leaves the model inside its thought; `Format::thinks_first` says the template writes the thought before every call and answer. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `ValueRead`, `Inferred`, `Format::reads_values_with` | How a shaped call's values read: a tagged value's text by the template's parser (`shape::ValueParser`), typed by its parameter's schema; a member of JSON arguments held and typed where the reader says; a key written twice. A table names its reader; `Inferred`, the default, reads as the tagged tables do, and a crate that implements a template library's semantics gives its own. |
 | `shape::Layout`, `Format::with_layout` | How the model's chat template writes a turn where a response template's patterns leave the text open: the whitespace a `\s*` stands for, the text outside every field, each part of a call, the values, a thought and an answer, and which close the template writes for a region it closes more than one way. Whoever compiles the table learns it from a rendering, reading the call's shape through `Format::call_syntax` and the markers through `Format::terminal_texts`, and gives it to the table; `Layout::check` says whether it fits. Parsing does not read it; the structural tags of a shaped call are written from it. |
@@ -204,6 +204,9 @@ records it: SMG's CI runs the fixture test on every change to the crate against 
 commit pinned in `.github/versions/bellwether.ref`, which holds the hand-written sets only, so CI
 guards a ready group's set once the pin moves to a commit that holds it. **Replaying the set**
 means the table is on main and bellwether's `main` holds the set, and that run has not finished.
+A group bellwether recorded under another checkpoint's slug, because that checkpoint shares its
+tokenizer, template and generation config (the group's manifest names it), replays that recording
+under its own row.
 **Awaiting fixtures** means the table is on main and bellwether has not recorded the group's set
 yet; every such table was previewed against bellwether's scale run of 2026-10-06 with no
 difference. **Pending** means no table yet.
@@ -211,7 +214,7 @@ difference. **Pending** means no table yet.
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
-means passthrough, the output read as content. Under `--parser symphony`, a worker's parser labels
+means passthrough, the output read as content. Under `--parser symphony` (the gateway's default), a worker's parser labels
 decide for its model, else the registry's table for a model it knows, else the two flags, for the
 models the registry does not know: a table's name in them reads those models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
@@ -224,16 +227,16 @@ or renamed checkpoint is not listed: the flags, or its workers' labels, name its
 group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
 launcher's `muse` for `muse_spark`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
-its parser resolution), so a deployment's existing flags keep a working parser when the gateway's
-default parser changes; a legacy name no table answers to keeps the legacy parsers as a tool-call
+its parser resolution), so a deployment's existing flags keep a working parser under Symphony, the
+gateway's default parser; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
 three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has no
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-222 groups, 389 checkpoints, newest first.
-12 ready, 149 replaying a recorded set, 12 on main awaiting fixtures, 49 pending.
+224 groups, 397 checkpoints, newest first.
+12 ready, 159 replaying a recorded set, 4 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -247,7 +250,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-09-21 | [mimo-v2.6-flash-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-flash-rl) | XiaomiMiMo/MiMo-V2.6-Flash-RL |  | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-21 | [mimo-v2.6-pro-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-pro-rl) | XiaomiMiMo/MiMo-V2.6-Pro-RL | MiMo-V2.6-Flash-MOPD, MiMo-V2.6-Pro-MOPD | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-11 | [atria-dawn-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn-preview) | internlm/Atria-Dawn-Preview | Atria-Dawn-Preview-Ascend-w8a8 | `glm` | 503,273 | replaying the set | none |
-| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017 | `deepseek_v4.1` | 589,659 | replaying the set | `deepseek_v41`, `deepseek_v41` |
+| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017 | `deepseek_v4.1` | 589,671 | replaying the set | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | `minicpm5` | 589,277 | replaying the set | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B | K2-Horizon-32B, K2-Horizon-375B-A23B | `k2_horizon` | 12,814 | replaying the set | none |
 | 2026-09-01 | [nvidia-nemotronlabs-ai-for-media-sports-tennis](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotronlabs-ai-for-media-sports-tennis) | nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Tennis |  | — | 12,825 | pending | none |
@@ -274,7 +277,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-06-22 | [qwen-agentworld-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-agentworld-35b-a3b) | Qwen/Qwen-AgentWorld-35B-A3B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen`, `qwen3` |
 | 2026-06-16 | [glm-5.2](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.2) | zai-org/GLM-5.2 |  | `glm` | 492,389 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 |  | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
-| 2026-06-11 | [kimi-k2.7-code](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.7-code) | moonshotai/Kimi-K2.7-Code |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi` |
+| 2026-06-11 | [kimi-k2.7-code](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.7-code) | moonshotai/Kimi-K2.7-Code |  | `kimi_k2` | 10 | replaying the set | `kimik2`, `kimi` |
 | 2026-06-03 | [nvidia-nemotron-3-ultra-550b-a55b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-ultra-550b-a55b-bf16) | nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | Nemotron-3-Labs-Ultra-Math-RL, NVIDIA-Nemotron-Labs-Teacher-Chat, NVIDIA-Nemotron-Labs-Teacher-Competition-Coding, NVIDIA-Nemotron-Labs-Teacher-General-Reasoning, NVIDIA-Nemotron-Labs-Teacher-Instruction-Following, NVIDIA-Nemotron-Labs-Teacher-STEM | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 589,302 | replaying the set | `minimax_m3`, `minimax_m3` |
 | 2026-05-22 | [caprl-video-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-video-4b) | internlm/CapRL-Video-4B | inclusionAI/ArmorOCR | `qwen3` | 576,772 | replaying the set | none |
@@ -284,14 +287,14 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-05-01 | [apertus-v1.1-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-v1.1-4b-instruct) | swiss-ai/Apertus-v1.1-4B-Instruct | Apertus-v1.1-0.5B-Instruct, Apertus-v1.1-1.5B-Instruct | — | 184,972 | pending | none |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 | MiMo-V2.5-Base | `qwen3`, tagged calls, the value between the tags | 589,278 | replaying the set | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 490,452 | replaying the set | none |
-| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash |  | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
+| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash | DeepSeek-V4-Pro | `deepseek_v4` | 28 | replaying the set | `deepseek_v4`, `deepseek_v4` |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-19 | [bar-2x7b-base](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-base) | allenai/BAR-2x7B-Base |  | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-code](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-code) | allenai/BAR-2x7B-Code | BAR-2x7B-Code-SFT, BAR-2x7B-Safety, BAR-2x7B-Tool-Use, BAR-5x7B | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-math](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-math) | allenai/BAR-2x7B-Math | BAR-2x7B-Math-SFT | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-7b) | allenai/BAR-7B |  | — | 328,662 | pending | none |
 | 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
-| 2026-04-14 | [kimi-k2.6](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.6) | moonshotai/Kimi-K2.6 |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi` |
+| 2026-04-14 | [kimi-k2.6](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.6) | moonshotai/Kimi-K2.6 |  | `kimi_k2` | 6 | replaying the set | `kimik2`, `kimi` |
 | 2026-04-09 | [minimax-m2.7](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.7) | MiniMaxAI/MiniMax-M2.7 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b | granite-4.1-30b | `qwen2.5` | 576,772 | replaying the set | none |
 | 2026-04-04 | [exaone-4.5-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/exaone-4.5-33b) | LGAI-EXAONE/EXAONE-4.5-33B |  | `qwen3` | 503,634 | replaying the set | none |
@@ -328,7 +331,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-01-11 | [agentcpm-explore](https://github.com/smg-project/bellwether/tree/main/fixtures/agentcpm-explore) | openbmb/AgentCPM-Explore |  | `qwen3` | 583,086 | replaying the set | none |
 | 2026-01-06 | [ai21-jamba2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/ai21-jamba2-3b) | ai21labs/AI21-Jamba2-3B | AI21-Jamba2-Mini | `qwen2.5` | 576,772 | replaying the set | none |
 | 2026-01-06 | [lfm2.5-1.2b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm2.5-1.2b-instruct) | LiquidAI/LFM2.5-1.2B-Instruct | LFM2.5-1.2B-Thinking | `lfm2.5` | 589,657 | replaying the set | none |
-| 2026-01-01 | [kimi-k2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.5) | moonshotai/Kimi-K2.5 |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi_k25` |
+| 2026-01-01 | [kimi-k2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.5) | moonshotai/Kimi-K2.5 |  | `kimi_k2` | 5 | replaying the set | `kimik2`, `kimi_k25` |
 | 2025-12-26 | [k-exaone-236b-a23b](https://github.com/smg-project/bellwether/tree/main/fixtures/k-exaone-236b-a23b) | LGAI-EXAONE/K-EXAONE-236B-A23B |  | `qwen3` | 503,634 | replaying the set | none |
 | 2025-12-24 | [caprl-qwen3vl-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-qwen3vl-4b) | internlm/CapRL-Qwen3VL-4B | CapRL-Qwen3VL-2B | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
 | 2025-12-22 | [glm-4.7](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.7) | zai-org/GLM-4.7 |  | `glm` | 1,947 | replaying the set | `glm47_moe`, none |
@@ -338,12 +341,12 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-12-07 | [glm-4.6v](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6v) | zai-org/GLM-4.6V |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-12-07 | [glm-4.6v-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6v-flash) | zai-org/GLM-4.6V-Flash |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-12-04 | [nvidia-nemotron-3-nano-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-nano-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
-| 2025-12-01 | [deepseek-v3.2](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2) | deepseek-ai/DeepSeek-V3.2 | DeepSeek-V3.2-Speciale | `deepseek_v3.2` | — | awaiting fixtures | `deepseek32`, none |
+| 2025-12-01 | [deepseek-v3.2](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2) | deepseek-ai/DeepSeek-V3.2 | DeepSeek-V3.2-Speciale | `deepseek_v3.2` | 19 | replaying the set | `deepseek32`, none |
 | 2025-12-01 | [trinity-mini](https://github.com/smg-project/bellwether/tree/main/fixtures/trinity-mini) | arcee-ai/Trinity-Mini |  | — | — | pending | none |
 | 2025-11-28 | [devstral-2-123b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/devstral-2-123b-instruct-2512) | mistralai/Devstral-2-123B-Instruct-2512 |  | `mistral_v13` | 570,194 | replaying the set | none |
 | 2025-11-25 | [nemotron-orchestrator-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/nemotron-orchestrator-8b) | nvidia/Nemotron-Orchestrator-8B | IQuestLab/Fleming-R1-32B | `qwen3` | 583,086 | replaying the set | none |
 | 2025-11-19 | [olmo-3-7b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/olmo-3-7b-instruct) | allenai/Olmo-3-7B-Instruct |  | `olmo3` | 570,199 | replaying the set | none |
-| 2025-11-04 | [kimi-k2-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-thinking) | moonshotai/Kimi-K2-Thinking |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi_thinking` |
+| 2025-11-04 | [kimi-k2-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-thinking) | moonshotai/Kimi-K2-Thinking |  | `kimi_k2` | 5 | replaying the set | `kimik2`, `kimi_thinking` |
 | 2025-10-31 | [ministral-3-14b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-instruct-2512-bf16) | mistralai/Ministral-3-14B-Instruct-2512-BF16 |  | `mistral_v13` | 570,194 | replaying the set | none |
 | 2025-10-31 | [ministral-3-14b-reasoning-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-reasoning-2512) | mistralai/Ministral-3-14B-Reasoning-2512 | Ministral-3-3B-Reasoning-2512, Ministral-3-8B-Reasoning-2512 | `mistral_v13` | 583,079 | replaying the set | none |
 | 2025-10-31 | [ministral-3-3b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-3b-instruct-2512) | mistralai/Ministral-3-3B-Instruct-2512 |  | `mistral_v13` | 570,194 | replaying the set | none |
@@ -362,7 +365,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-10-01 | [llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad) | nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1-FP4-QAD |  | — | 328,662 | pending | `json`, `nano_v3` |
 | 2025-09-30 | [qwen3-4b-saferl](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-saferl) | Qwen/Qwen3-4B-SafeRL |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-vl-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-30b-a3b-instruct) | Qwen/Qwen3-VL-30B-A3B-Instruct | Qwen3-VL-235B-A22B-Instruct | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
-| 2025-09-29 | [deepseek-v3.2-exp](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2-exp) | deepseek-ai/DeepSeek-V3.2-Exp | DeepSeek-V3.2-Exp-Base | `deepseek_v3.1` | 184,972 | replaying the set | `deepseek31`, none |
+| 2025-09-29 | [deepseek-v3.2-exp](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2-exp) | deepseek-ai/DeepSeek-V3.2-Exp | DeepSeek-V3.2-Exp-Base | `deepseek_v3.2` | 184,988 | replaying the set | `deepseek32`, none |
 | 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 | GLM-4.5, GLM-4.5-Air | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-09-25 | [caprl-eval-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-eval-3b) | internlm/CapRL-Eval-3B |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-09-24 | [caprl-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-3b) | internlm/CapRL-3B |  | `qwen2.5` | 576,772 | replaying the set | none |
@@ -374,7 +377,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-09-09 | [qwen3-next-80b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-next-80b-a3b-instruct) | Qwen/Qwen3-Next-80B-A3B-Instruct |  | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
 | 2025-09-09 | [qwen3-next-80b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-next-80b-a3b-thinking) | Qwen/Qwen3-Next-80B-A3B-Thinking |  | `qwen3` | 554,276 | replaying the set | `qwen`, `qwen3` |
 | 2025-09-08 | [ernie-4.5-21b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/ernie-4.5-21b-a3b-thinking) | baidu/ERNIE-4.5-21B-A3B-Thinking |  | — | — | pending | none |
-| 2025-09-03 | [kimi-k2-instruct-0905](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-instruct-0905) | moonshotai/Kimi-K2-Instruct-0905 |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi` |
+| 2025-09-03 | [kimi-k2-instruct-0905](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-instruct-0905) | moonshotai/Kimi-K2-Instruct-0905 |  | `kimi_k2` | 5 | replaying the set | `kimik2`, `kimi` |
 | 2025-09-01 | [apertus-70b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-70b-instruct-2509) | swiss-ai/Apertus-70B-Instruct-2509 |  | — | 137,178 | pending | none |
 | 2025-08-30 | [hermes-4-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/hermes-4-14b) | NousResearch/Hermes-4-14B |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-08-21 | [deepseek-v3.1](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.1) | deepseek-ai/DeepSeek-V3.1 | DeepSeek-V3.1-Base, tencent/DeepSeek-V3.1-Terminus-W4AFP8 | `deepseek_v3.1` | 19,299 | replaying the set | `deepseek31`, `deepseek_v31` |
@@ -395,7 +398,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-07-25 | [llama-3-3-nemotron-super-49b-v1-5](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1-5) | nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 |  | `llama_nemotron` | 576,772 | replaying the set | `json`, `nano_v3` |
 | 2025-07-15 | [openreasoning-nemotron-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-1.5b) | nvidia/OpenReasoning-Nemotron-1.5B | OpenReasoning-Nemotron-32B, OpenReasoning-Nemotron-7B | — | 328,662 | pending | none |
 | 2025-07-15 | [openreasoning-nemotron-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-14b) | nvidia/OpenReasoning-Nemotron-14B |  | — | 328,662 | pending | none |
-| 2025-07-11 | [kimi-k2-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-instruct) | moonshotai/Kimi-K2-Instruct |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi` |
+| 2025-07-11 | [kimi-k2-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-instruct) | moonshotai/Kimi-K2-Instruct |  | `kimi_k2` | 5 | replaying the set | `kimik2`, `kimi` |
 | 2025-07-10 | [a.x-3.1-light](https://github.com/smg-project/bellwether/tree/main/fixtures/a.x-3.1-light) | skt/A.X-3.1-Light |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-07-02 | [a.x-4.0](https://github.com/smg-project/bellwether/tree/main/fixtures/a.x-4.0) | skt/A.X-4.0 |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-07-02 | [a.x-4.0-light](https://github.com/smg-project/bellwether/tree/main/fixtures/a.x-4.0-light) | skt/A.X-4.0-Light |  | `qwen2.5` | 576,772 | replaying the set | none |
@@ -453,9 +456,11 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-01-20 | [deepseek-r1-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-bf16) | arcee-ai/DeepSeek-R1-bf16 |  | `deepseek_v3` | 3,110 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-llama-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-llama-8b) | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | DeepSeek-R1-Distill-Llama-70B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-qwen-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-qwen-1.5b) | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | DeepSeek-R1-Distill-Qwen-7B, DeepSeek-R1-Distill-Qwen-14B, DeepSeek-R1-Distill-Qwen-32B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
+| 2024-11-26 | [llama-3.3-70b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-70b-instruct) | meta-llama/Llama-3.3-70B-Instruct |  | `json` | 14 | replaying the set | `json`, none |
 | 2024-09-18 | [llama-3.2-11b-vision-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-11b-vision-instruct) | meta-llama/Llama-3.2-11B-Vision-Instruct | Llama-3.2-90B-Vision-Instruct | `json` | 458,203 | replaying the set | `llama`, none |
 | 2024-09-18 | [llama-3.2-1b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-1b-instruct) | meta-llama/Llama-3.2-1B-Instruct | Llama-3.2-3B-Instruct | `json` | 458,185 | replaying the set | `llama`, none |
 | 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
+| 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct, Meta-Llama-3.1-8B-Instruct, Meta-Llama-3.1-70B-Instruct, Meta-Llama-3.1-405B-Instruct | `json` | 458,185 | replaying the set | `json`, none |
 | 2024-05-22 | [mistral-7b-instruct-v0.3](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-7b-instruct-v0.3) | mistralai/Mistral-7B-Instruct-v0.3 |  | `mistral` | — | awaiting fixtures | `mistral`, none |
 | 2023-12-30 | [tinyllama-1.1b-chat-v1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/tinyllama-1.1b-chat-v1.0) | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |  | `plain` | 27,865 | ready | `json`, none |
 | 2023-12-05 | [llava-1.5-7b-hf](https://github.com/smg-project/bellwether/tree/main/fixtures/llava-1.5-7b-hf) | llava-hf/llava-1.5-7b-hf |  | — | — | pending | none |

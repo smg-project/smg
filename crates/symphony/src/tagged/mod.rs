@@ -129,3 +129,72 @@ pub(super) fn held_text(carried: &str, start: usize, end: Option<usize>) -> &str
     debug_assert!(start <= end, "a value held past the carried bytes");
     carried.get(start..end).unwrap_or_default()
 }
+
+/// No fragment is empty and no `Malformed` or `Dropped` text is empty, but for the one event
+/// of no bytes that counts a refused run and stands right before its `Dropped {
+/// MalformedCall }`: any other empty report would claim a byte where none was.
+#[cfg(test)]
+pub(crate) fn nothing_empty(events: &[Event]) {
+    for (at, event) in events.iter().enumerate() {
+        match event {
+            Event::ToolCallArguments { json, .. } => assert!(!json.is_empty(), "{event:?}"),
+            Event::Malformed { text, .. } if text.text.is_empty() => assert!(
+                matches!(
+                    events.get(at + 1),
+                    Some(Event::Dropped { text, why: DropReason::MalformedCall })
+                        if !text.text.is_empty()
+                ),
+                "{event:?}: an empty report with no refused bytes after it"
+            ),
+            Event::Malformed { text, .. } | Event::Dropped { text, .. } => {
+                assert!(!text.text.is_empty(), "{event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The bytes dropped as the template's wrapper, in order: the whitespace around the syntax's
+/// tags, and for the attributed syntax a tag a marker cut short.
+#[cfg(test)]
+pub(crate) fn dropped(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Dropped {
+                text,
+                why: DropReason::Wrapper,
+            } => Some(text.text.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The bytes refused: the text of the `Dropped { MalformedCall }` events, which no adapter
+/// shows.
+#[cfg(test)]
+pub(crate) fn refused(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Dropped {
+                text,
+                why: DropReason::MalformedCall,
+            } => Some(text.text.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The content a chat client reads: every content and malformed text, in order, as the chat
+/// adapter folds it.
+#[cfg(test)]
+pub(crate) fn shown(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+            _ => None,
+        })
+        .collect()
+}

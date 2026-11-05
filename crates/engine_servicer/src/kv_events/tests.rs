@@ -27,6 +27,10 @@ impl RankLoads for FixedLoads {
     fn engine_link(&self) -> &EngineLink {
         &self.engine
     }
+
+    fn rank_count(&self) -> usize {
+        1
+    }
 }
 
 #[test]
@@ -192,6 +196,7 @@ async fn a_relay_that_gave_up_has_nothing_to_wait_for() {
         .subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
         .err()
         .expect("a down relay refuses");
@@ -760,6 +765,7 @@ impl Lab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 
@@ -772,6 +778,7 @@ impl Lab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: true,
+            loads_only: false,
         })
     }
 
@@ -1737,6 +1744,7 @@ impl RankLab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 }
@@ -2138,6 +2146,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
         let stream = relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         });
         (stream, started.elapsed())
     });
@@ -2340,4 +2349,38 @@ async fn a_subscriber_that_asks_gets_records_before_the_publishers_first_batch()
     let beat = read(&mut stream).await;
     assert!(load_only_marker(&beat));
     assert_eq!(beat.sequence_number, 0);
+}
+
+/// Input capacity appearance/expiry is immediate; small sample noise is not a push.
+#[test]
+fn prefill_capacity_changes_use_the_throughput_tolerance() {
+    let mut last = common::EngineLoad::default();
+    let mut current = last.clone();
+    assert!(!load_changed(&last, &current));
+    current.prefill_throughput = Some(1_000.0);
+    assert!(load_changed(&last, &current));
+    assert!(load_changed(&current, &last));
+    for (before, after, changed) in [
+        (1_000.0, 1_001.0, false),
+        (1_000.0, 1_049.0, false),
+        (10_000.0, 10_051.0, true),
+        (10.0, 11.0, true),
+    ] {
+        last.prefill_throughput = Some(before);
+        current.prefill_throughput = Some(after);
+        assert_eq!(load_changed(&last, &current), changed);
+        assert_eq!(load_changed(&current, &last), changed);
+    }
+}
+
+/// A running-count change alone must publish load in either direction.
+#[test]
+fn running_requests_alone_change_the_load_record() {
+    let idle = common::EngineLoad::default();
+    let running = common::EngineLoad {
+        running_requests: 1,
+        ..idle.clone()
+    };
+    assert!(load_changed(&idle, &running));
+    assert!(load_changed(&running, &idle));
 }

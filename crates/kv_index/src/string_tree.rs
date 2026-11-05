@@ -9,13 +9,12 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 
@@ -25,11 +24,15 @@ type NodeRef = Arc<Node>;
 /// Default DashMap uses num_cpus * 4 shards (e.g., 256 on 64-core machines).
 ///
 /// Root node uses higher shard count since ALL requests pass through it.
-/// Other nodes use lower count as traffic diverges through the tree.
+/// Other nodes use lower count as traffic diverges through the tree: their
+/// tenant and children maps hold a handful of entries, every shard a walk
+/// enters is one allocation (dashmap's iterator wraps each shard guard in an
+/// `Arc`), and every shard is a cache-padded lock in every node, so they take
+/// dashmap's minimum of two.
 ///
 /// This reduces memory by ~90% vs default while maintaining good concurrency.
 const ROOT_SHARD_COUNT: usize = 32;
-const NODE_SHARD_COUNT: usize = 8;
+const NODE_SHARD_COUNT: usize = 2;
 
 /// Create a children DashMap for non-root nodes
 #[inline]
@@ -235,11 +238,6 @@ impl Clone for NodeText {
     }
 }
 
-/// Global tenant string intern pool to avoid repeated allocations.
-/// Uses DashMap for concurrent access with minimal contention.
-static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, (), FxBuildHasher>> =
-    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
-
 /// Global epoch counter for LRU ordering.
 /// Uses a simple incrementing counter instead of wall clock time.
 ///
@@ -419,21 +417,6 @@ fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
         .zip(b.chars())
         .take_while(|(a_char, b_char)| a_char == b_char)
         .count()
-}
-
-/// Intern tenant ID to avoid repeated allocations.
-/// Returns cached `Arc<str>` if tenant was seen before.
-#[inline]
-fn intern_tenant(tenant: &str) -> TenantId {
-    // Fast path: check if already interned
-    if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
-        return Arc::clone(entry.key());
-    }
-
-    // Slow path: intern new tenant
-    let interned: Arc<str> = Arc::from(tenant);
-    TENANT_INTERN_POOL.insert(Arc::clone(&interned), ());
-    interned
 }
 
 impl Default for Tree {

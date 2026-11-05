@@ -39,6 +39,11 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             if state.model.log_stats == Some(true) {
                 client.note_reports_steps();
             }
+            // The stats tick logs the connector's KV-transfer figures
+            // (`info::log_engine_stats`): keep the samples from the first
+            // batch on.
+            client.keep_kv_transfer();
+            Ok(())
         },
     )
     .await;

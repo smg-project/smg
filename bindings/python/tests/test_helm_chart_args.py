@@ -22,6 +22,7 @@ The render checks need the ``helm`` binary and are skipped without it.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ from smg.router_args import RouterArgs
 REPO = Path(__file__).resolve().parents[3]
 CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
+SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
 # The gateway's Consul provider, which reads Consul's own variables.
 CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
@@ -834,3 +836,67 @@ def test_chart_workers_without_discovery_are_passed_as_worker_urls():
 def test_every_example_renders_arguments_the_launcher_parses(example):
     _, documents = render(files=(example,))
     launcher_args(router_container(documents)["args"])
+
+
+@needs_chart
+def test_the_schema_admits_the_policies_the_launcher_takes():
+    """``router.policy`` is rendered as the launcher's ``--policy``, so the
+    schema's enum is that option's choices: no fewer (a policy the gateway
+    runs could not be deployed through the value) and no more (helm would
+    render a pod whose launcher exits at argparse)."""
+    schema = json.loads(SCHEMA.read_text())
+    policy = schema["properties"]["router"]["properties"]["policy"]
+    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
+        "values.schema.json's router.policy enum differs from the launcher's --policy choices"
+    )
+
+
+@needs_helm
+@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
+    _, documents = render(f"router.policy={policy}")
+    args = router_container(documents)["args"]
+    assert has_run(args, ["--policy", policy]), f"the chart did not pass --policy {policy}"
+    assert launcher_args(args).policy == policy
+
+
+@needs_helm
+def test_a_prefill_only_policy_is_refused_by_the_schema():
+    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
+    schema refuses it where the launcher would, at render time."""
+    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+
+
+@needs_helm
+@pytest.mark.parametrize("value", [-1, 0, 4096])
+def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
+    """``router.maxConcurrentRequests`` is passed through as the launcher's
+    ``--max-concurrent-requests``, sentinels included: the gateway reads -1 as
+    the host-derived bound and 0 as no bound."""
+    _, documents = render(f"router.maxConcurrentRequests={value}")
+    assert launcher_args(router_container(documents)["args"]).max_concurrent_requests == value
+
+
+@needs_chart
+def test_the_schema_says_what_the_concurrency_sentinels_do():
+    """The schema describes the key with the gateway's rule for -1 and 0,
+    where the values comment used to say -1 meant unlimited."""
+    schema = json.loads(SCHEMA.read_text())
+    router = schema["properties"]["router"]["properties"]
+    description = router["maxConcurrentRequests"]["description"]
+    assert "-1 derives the bound from the host" in description, description
+    assert "0 lifts the bound" in description, description
+
+
+@needs_helm
+@pytest.mark.parametrize("settle", [None, 0, 5, 30])
+def test_shutdown_settle_window(settle):
+    """Omit the optional window by default and preserve explicit values, including zero."""
+    settings = () if settle is None else (f"router.shutdownSettleSeconds={settle}",)
+    _, documents = render(*settings)
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    flag = "--shutdown-settle-secs"
+    if settle is None:
+        assert flag not in args
+    else:
+        assert args[args.index(flag) + 1] == str(settle)

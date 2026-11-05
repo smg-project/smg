@@ -1,7 +1,8 @@
 """TokenSpeed gRPC servicer — wraps :class:`AsyncLLM` behind the gRPC wire.
 
-``--servicer-impl rust`` on the launcher (``python -m smg_grpc_servicer.tokenspeed``)
-or ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` serves the same contract from Rust; see
+The launcher (``python -m smg_grpc_servicer.tokenspeed``) serves the same contract
+from Rust by default; ``--servicer-impl python`` or
+``SMG_TOKENSPEED_SERVICER_IMPL=python`` selects this deprecated Python servicer; see
 :mod:`smg_grpc_servicer.tokenspeed.rust`.
 """
 

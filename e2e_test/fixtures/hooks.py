@@ -20,8 +20,7 @@ from infra import (
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
-    get_sglang_servicer_impl,
-    get_tokenspeed_servicer_impl,
+    get_servicer_impl,
     get_zmq_engine_count,
 )
 from infra.worker_pool import get_pool
@@ -122,7 +121,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
-    # re-imports act as hooks — so the collection-summary reporter is
+    # re-imports act as hooks — so the selection and passing-call reporter is
     # registered here as a plugin object instead.
     if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
         config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
@@ -248,15 +247,16 @@ def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list
     return kept, deselected
 
 
-_SGLANG_ZMQ_SKIPPED_MODULES = ("test_multimodal.py", "test_error_shapes.py")
+_SGLANG_ZMQ_SKIPPED_MODULES = ("test_error_shapes.py",)
 
 
 def _filter_sglang_zmq_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for the SGLang ZMQ lane: the
-    multimodal module stays on the gRPC lane until the wire carries media, and
-    the error-shape module tests SGLang's HTTP server's own validation."""
+    error-shape module tests SGLang's HTTP server's own validation, which this
+    wire has no counterpart of. The multimodal module runs: the wire carries
+    the preprocessed media to the scheduler as the Rust servicer's does."""
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
@@ -296,8 +296,7 @@ def _topology_mode(param) -> str | None:
 
 def _is_epd_topology(param) -> bool:
     """True when a ``setup_backend`` param asks for an encode-prefill-decode
-    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode), whose
-    encode role runs the Python servicer only."""
+    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode)."""
     return (_topology_mode(param) or "").startswith("epd")
 
 
@@ -317,16 +316,15 @@ def _filter_tokenspeed_rust_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for a TokenSpeed lane whose gRPC
-    workers run the Rust servicer.
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
 
-    The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries generate and abort only: no control messages, so the admin
-    operations (flush cache, profiling) stay with the Python servicer. The
-    prefill/decode topologies run on it (the request's bootstrap fields ride
-    the wire; the launcher starts the prefill side's bootstrap server); the
-    encode-prefill-decode topologies need the encode role, which stays with
-    the Python servicer, so their cases are dropped here rather than failing
-    on a known gap, as are the multi-worker fleets of plain workers.
+    The Rust servicer reaches the scheduler over the engine's msgpack wire,
+    whose handshake declares the control messages (flush cache, profiling),
+    the encode role and the logprob columns, so the admin operations, the
+    prefill/decode topologies and the encode-prefill-decode topologies all run
+    on it. Dropped here rather than failing on a known gap: the wires this
+    lane does not serve, and the multi-worker fleets of plain workers.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
@@ -334,15 +332,17 @@ def _filter_tokenspeed_rust_items(
         param = _setup_backend_param(item)
         workers = _workers_marker_kwargs(item)
         # A wire this lane does not serve: anything but the local wires and
-        # the prefill/decode topologies (an EPD topology is one of those).
+        # the prefill/decode and encode-prefill-decode topologies. The wire is
+        # the param's mode: a topology tuple may carry per-pool dicts, which
+        # no set membership can hash.
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_topology(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not (_is_pd_topology(param) or _is_epd_topology(param))
         )
-        admin_ops = "test_admin_ops.py" in item.nodeid
-        encode_workers = bool(workers.get("encode"))
         pd_workers = bool(workers.get("prefill") or workers.get("decode"))
         plain_fleet = (workers.get("count") or 1) > 1 and not pd_workers
-        if unserved_wire or _is_epd_topology(param) or encode_workers or plain_fleet or admin_ops:
+        if unserved_wire or plain_fleet:
             deselected.append(item)
         else:
             kept.append(item)
@@ -353,7 +353,8 @@ def _filter_sglang_rust_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for an SGLang lane whose gRPC
-    workers run the Rust servicer.
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
     runs no encode dispatch. The EPD topologies stay with the Python servicer,
@@ -367,8 +368,12 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         # The wires this servicer serves: the local ones and the
         # prefill/decode topologies; EPD and anything else stay with Python.
+        # The wire is the param's mode (a topology tuple may carry per-pool
+        # dicts, which no set membership can hash).
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not _is_pd_param(param)
         )
         if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)
@@ -476,12 +481,35 @@ def _format_selection_line(stats: dict) -> str:
 
 
 class _SelectionReporter:
-    """Terminal plugin printing the selection summary after collection.
+    """Report selection and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
 
     Lives on the plugin manager (registered in ``pytest_configure``) because
     ``hooks.py`` is not a conftest, so a module-level
     ``pytest_report_collectionfinish`` here would never be discovered.
     """
+
+    def __init__(self) -> None:
+        self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
+        self.passing_calls = 0
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.when == "call" and report.passed:
+            self.passing_calls += 1
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        if (
+            self.require_passing_call
+            and self.passing_calls == 0
+            and session.exitstatus == pytest.ExitCode.OK
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(
+                    "AMD_E2E_NO_PASSING_CALL: qualification incomplete; "
+                    "no test call passed (check prerequisite/infra skips)"
+                )
 
     def pytest_report_collectionfinish(self, config: pytest.Config) -> str | None:
         stats = config.stash.get(_SELECTION_STATS_KEY, None)
@@ -540,14 +568,16 @@ def pytest_collection_modifyitems(
             config.hook.pytest_deselected(items=deselected)
         items[:] = selected
 
-    if get_runtime() == "tokenspeed" and get_tokenspeed_servicer_impl() == "rust":
+    # The Rust-path filters key on the implementation the lane's workers run,
+    # whether the lane named it or the servicer package's default selects it.
+    if get_runtime() == "tokenspeed" and get_servicer_impl("tokenspeed") == "rust":
         kept, deselected = _filter_tokenspeed_rust_items(items)
         stats["by_tokenspeed_rust"] = len(deselected)
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
 
-    if get_runtime() == "sglang" and get_sglang_servicer_impl() == "rust":
+    if get_runtime() == "sglang" and get_servicer_impl("sglang") == "rust":
         kept, deselected = _filter_sglang_rust_items(items)
         stats["by_sglang_rust"] = len(deselected)
         if deselected:
@@ -561,10 +591,10 @@ def pytest_collection_modifyitems(
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
 
-        # Multimodal is not wired over the SGLang ZMQ wire yet (the adapter
-        # refuses mm inputs), and the error-shape cases exercise SGLang's own
-        # HTTP server, which this wire has no counterpart of; the gRPC and HTTP
-        # lanes keep covering those modules.
+        # The error-shape cases exercise SGLang's own HTTP server, which this
+        # wire has no counterpart of; the gRPC and HTTP lanes keep covering
+        # that module. The multimodal module runs here: the adapter carries
+        # the preprocessed media to the scheduler over this wire.
         if get_runtime() == "sglang":
             kept, deselected = _filter_sglang_zmq_items(items)
             stats["by_sglang_zmq"] = len(deselected)

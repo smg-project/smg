@@ -37,24 +37,16 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ),
     (
         "apertus-8b-instruct-2509",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
-    (
-        "deepseek-r1",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("deepseek-r1", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "deepseek-v3-0324",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
-    (
-        "deepseek-v3.1",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("deepseek-v3.1", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "deepseek-v4.1-flash",
         Hf(EncodePath::Native),
@@ -75,7 +67,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::V1),
     ),
-    ("glm-4.6", Hf(EncodePath::Tokenizers), Hf(EncodePath::V1)),
+    ("glm-4.6", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-4.7-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-5.3-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("granite-4.1-3b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
@@ -106,7 +98,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ),
     (
         "lfm2.5-1.2b-instruct",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -116,7 +108,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ),
     (
         "llama-xlam-2-8b-fc-r",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -127,8 +119,8 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("mimo-v2.5", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "minicpm5-2b",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
+        Hf(EncodePath::Native),
     ),
     ("minimax-m2", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("minimax-m2.7", Hf(EncodePath::Native), Hf(EncodePath::V1)),
@@ -140,7 +132,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ),
     (
         "muse-glimmer-30b",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -323,11 +315,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Native),
         Hf(EncodePath::Native),
     ),
-    (
-        "step-3.5-flash",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("step-3.5-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("step3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "tinyllama-1.1b-chat-v1.0",

@@ -9,7 +9,7 @@ use wfaas::{
 };
 
 use crate::{
-    worker::{ConnectionMode, Worker},
+    worker::{ConnectionMode, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
 
@@ -36,7 +36,7 @@ impl UpdatePoliciesStep {
                 "cache_aware policy for model {model_id} includes ZMQ worker {}: the ZMQ \
                  transport has no KV-event stream, so cache tracking for it falls back to the \
                  approximate prefix tree",
-                worker.url()
+                worker.redacted_url()
             );
         }
     }
@@ -156,11 +156,23 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                     .init_cache_aware_policy(&model_id, &all_workers);
             }
 
-            // Start KV event subscription for gRPC workers with cache_aware policy
-            if cache_aware {
+            // The worker's stream: its KV events into the model's index under
+            // a cache-aware policy, its load records alone otherwise, when
+            // the worker monitor wants loads at all (always by default; see
+            // `WorkerMonitor::loads_wanted`). Only gRPC workers stream.
+            if *worker.connection_mode() == ConnectionMode::Grpc {
                 if let Some(ref monitor) = app_context.kv_event_monitor {
-                    if *worker.connection_mode() == ConnectionMode::Grpc {
-                        monitor.on_worker_added(worker).await;
+                    let kind = if cache_aware {
+                        Some(SubscriptionKind::Events)
+                    } else {
+                        app_context
+                            .worker_monitor
+                            .as_ref()
+                            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
+                            .then_some(SubscriptionKind::Loads)
+                    };
+                    if let Some(kind) = kind {
+                        monitor.on_worker_added(worker, kind).await;
                     }
                 }
             }

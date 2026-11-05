@@ -21,6 +21,8 @@ pub const SGLANG_FIELDS: &[&str] = &[
     "no_stop_trim",
     "ignore_eos",
     "continue_final_message",
+    // the chat template's generation-header switch; no third-party API has it
+    "add_generation_prompt",
     "skip_special_tokens",
     "lora_path",
     "session_params",
@@ -44,7 +46,10 @@ pub const SGLANG_FIELDS: &[&str] = &[
 /// worker, which would otherwise silently apply its default.
 fn sglang_default(field: &str) -> Option<bool> {
     match field {
-        "separate_reasoning" | "stream_reasoning" | "skip_special_tokens" => Some(true),
+        "separate_reasoning"
+        | "stream_reasoning"
+        | "skip_special_tokens"
+        | "add_generation_prompt" => Some(true),
         "no_stop_trim" | "ignore_eos" | "continue_final_message" | "return_hidden_states" => {
             Some(false)
         }
@@ -101,6 +106,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The generation-header switch reaches an engine only when the client
+    /// turned it off (`true` is what an engine applies without it) and never
+    /// reaches a third-party API.
+    #[test]
+    fn add_generation_prompt_is_forwarded_only_when_false_and_never_to_providers() {
+        let mut on = json!({"model": "m", "add_generation_prompt": true});
+        strip_default_sglang_fields(&mut on);
+        assert_eq!(on.get("add_generation_prompt"), None);
+        let mut off = json!({"model": "m", "add_generation_prompt": false});
+        strip_default_sglang_fields(&mut off);
+        assert_eq!(off.get("add_generation_prompt"), Some(&json!(false)));
+        let mut provider = json!({"model": "m", "add_generation_prompt": false});
+        strip_sglang_fields(&mut provider);
+        assert_eq!(provider.get("add_generation_prompt"), None);
+    }
 
     #[test]
     fn strip_default_sglang_fields_removes_null_and_engine_default_values() {

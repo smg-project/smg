@@ -18,6 +18,30 @@ import pytest
 from smg.servicer import SglangGrpcServer, TokenSpeedGrpcServer, VllmGrpcServer
 
 SERVERS = [VllmGrpcServer, TokenSpeedGrpcServer, SglangGrpcServer]
+
+
+def test_sglang_native_media_requires_tokenizer_before_starting():
+    """Reject native preprocessing without a tokenizer before starting a server."""
+    with pytest.raises(ValueError, match="requires tokenizer_dir"):
+        SglangGrpcServer(
+            **GOOD,
+            smg_media_processor={"model_dir": "/nonexistent/model", "model_id": "model"},
+        )
+
+
+def test_sglang_native_media_refuses_overflowing_concurrency_before_loading():
+    """Reject semaphore overflow before attempting model loading."""
+    with pytest.raises(ValueError, match="exceeds the semaphore limit"):
+        SglangGrpcServer(
+            **GOOD,
+            smg_media_processor={
+                "model_dir": "/nonexistent/model",
+                "model_id": "model",
+                "max_inflight": 2**63,
+            },
+        )
+
+
 # The servicer's own parameters and the default every constructor gives them
 # (``inspect.Parameter.empty``: required).
 SHARED_DEFAULTS = {
@@ -31,6 +55,7 @@ SHARED_DEFAULTS = {
     "engine_silence_timeout_secs": None,
     "engine_prefill_tokens_per_sec": None,
     "metrics_bind_address": None,
+    "warmup_nonce": None,
 }
 # A call that passes the servicer's block and a model path only. The bad values
 # below are refused before anything is bound or dialled, so the endpoints need
@@ -78,6 +103,11 @@ REFUSED = [
         "metrics_bind_address",
         "nope",
         "invalid servicer config: metrics_bind_address must be host:port",
+    ),
+    (
+        "warmup_nonce",
+        "a-b",
+        "invalid servicer config: warmup_nonce must be ASCII letters and digits",
     ),
 ]
 

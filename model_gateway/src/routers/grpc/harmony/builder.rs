@@ -197,12 +197,12 @@ const BUILTIN_TOOLS: &[&str] = &[
 
 /// Trait for tool-like objects that can be converted to Harmony ToolDescription
 trait ToolLike {
-    /// Check if this is a built-in tool (should be skipped in developer message).
+    /// Whether this is a built-in tool (one the developer message skips).
     ///
-    /// Only exercised by tests today; once per-worker hosted-tool
-    /// capability flags land (R0 follow-up), production code will dispatch
-    /// on this to gate advertisement per model.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved for R0 follow-up"))]
+    /// Compiled for the tests alone: nothing in the pipeline reads it yet.
+    /// Once per-worker hosted-tool capability flags land, production code
+    /// dispatches on it to gate advertisement per model.
+    #[cfg(test)]
     fn is_builtin(&self) -> bool;
 
     /// Check if this is a custom tool (function or MCP)
@@ -219,6 +219,7 @@ trait ToolLike {
 
 /// Implement ToolLike for Chat Completion Tool
 impl ToolLike for Tool {
+    #[cfg(test)]
     fn is_builtin(&self) -> bool {
         matches!(
             self.tool_type.as_str(),
@@ -241,6 +242,7 @@ impl ToolLike for Tool {
 
 /// Implement ToolLike for Responses API Tool
 impl ToolLike for ResponseTool {
+    #[cfg(test)]
     fn is_builtin(&self) -> bool {
         matches!(
             self,
@@ -407,7 +409,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
     pub fn build_from_chat(
         &self,
         request: &ChatCompletionRequest,
@@ -427,12 +429,11 @@ impl HarmonyBuilder {
         let mut user_messages = self.convert_chat_messages(&request.messages);
         all_messages.append(&mut user_messages);
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
@@ -445,10 +446,6 @@ impl HarmonyBuilder {
             input_ids: token_ids,
             stop_token_ids,
             selection_text,
-            harmony_messages: all_messages
-                .into_iter()
-                .map(super::types::HarmonyMessage::from_openai_harmony)
-                .collect(),
         })
     }
 
@@ -460,7 +457,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
     pub fn build_from_responses(
         &self,
         request: &ResponsesRequest,
@@ -468,12 +465,11 @@ impl HarmonyBuilder {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
@@ -499,10 +495,6 @@ impl HarmonyBuilder {
             input_ids: token_ids,
             stop_token_ids,
             selection_text,
-            harmony_messages: all_messages
-                .into_iter()
-                .map(super::types::HarmonyMessage::from_openai_harmony)
-                .collect(),
         })
     }
 

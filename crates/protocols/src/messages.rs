@@ -112,8 +112,12 @@ pub struct OutputConfig {
 /// The thinking preference a prompt is rendered with: the `thinking` block,
 /// else the provider profile's reading of the effort (see
 /// [`crate::chat::ChatCompletionRequest::template_thinking`]).
-fn template_thinking(model: &str, thinking: Option<bool>, effort: Option<&str>) -> Option<bool> {
-    thinking.or_else(|| ProviderProfile::for_model(model).thinking_from_reasoning_effort(effort))
+fn template_thinking_for(
+    provider: ProviderProfile,
+    thinking: Option<bool>,
+    effort: Option<&str>,
+) -> Option<bool> {
+    thinking.or_else(|| provider.thinking_from_reasoning_effort(effort))
 }
 
 impl CreateMessageRequest {
@@ -165,7 +169,13 @@ impl CreateMessageRequest {
 
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
-        template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        template_thinking_for(provider, self.thinking_toggle(), self.reasoning_effort())
     }
 
     /// The field the request asks for a structured output format with,
@@ -414,8 +424,9 @@ pub enum Role {
     /// own template. See <https://github.com/smg-project/smg/issues/1795>. A
     /// renderer whose reference writes no turn for a system message past the
     /// leading run (`RendererCapabilities::leading_system_only`) gets such a
-    /// message as a user turn at its position instead, so the prompt keeps
-    /// its assistant header; the leading run is the system prompt and stays.
+    /// message as a user turn at its position instead, set off from the text
+    /// before it rather than glued to it; the leading run is the system
+    /// prompt and stays.
     System,
 }
 
@@ -1385,7 +1396,9 @@ pub struct OutputTokensDetails {
 
 impl Usage {
     /// The usage of a message served from a deployment of this gateway:
-    /// the counts, no cache hits, the standard tier, no geography.
+    /// the counts, the cache counters at zero until
+    /// [`Self::with_cache_read_input_tokens`] writes the engine's prefix-cache
+    /// hit, the standard tier, no geography.
     pub fn from_counts(input_tokens: u32, output_tokens: u32) -> Self {
         Self {
             input_tokens,
@@ -1403,6 +1416,20 @@ impl Usage {
     /// Report the thinking tokens of a turn that ran with thinking.
     pub fn with_thinking_tokens(mut self, thinking_tokens: u32) -> Self {
         self.output_tokens_details = Some(OutputTokensDetails { thinking_tokens });
+        self
+    }
+
+    /// Report the prompt tokens the engine served from its prefix cache as
+    /// `cache_read_input_tokens`, zero included: the key is always written and
+    /// the count says how much of the prompt was read from the cache.
+    /// `input_tokens` stays what [`Self::from_counts`] was given: on this wire
+    /// it is the input outside the cache and the prompt is the two counts
+    /// together, so a caller holding an engine's whole-prompt count passes the
+    /// prompt less the hit. `cache_creation_input_tokens` and its breakdown
+    /// stay zero: a deployment of this gateway writes no breakpoint-driven
+    /// cache entries of its own, so it measures no cache creation.
+    pub fn with_cache_read_input_tokens(mut self, cache_read_input_tokens: u32) -> Self {
+        self.cache_read_input_tokens = Some(cache_read_input_tokens);
         self
     }
 }
@@ -1628,8 +1655,14 @@ impl CountMessageTokensRequest {
 
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already.
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
         let thinking = self.thinking.as_ref().map(ThinkingConfig::enabled);
-        template_thinking(&self.model, thinking, self.reasoning_effort())
+        template_thinking_for(provider, thinking, self.reasoning_effort())
     }
 }
 
@@ -2476,6 +2509,38 @@ mod tests {
     use serde_json::{self, json};
 
     use super::*;
+
+    /// The usage of a message served here writes both cache counters as
+    /// integers: zero from the counts alone, the engine's prefix-cache hit
+    /// once it is reported beside the input outside the cache (a 945-token
+    /// prompt with 896 read from the cache), while the creation counter and
+    /// its breakdown stay zero either way.
+    #[test]
+    fn the_cache_read_counter_is_the_engines_hit_and_the_creation_counter_stays_zero() {
+        let plain = serde_json::to_value(Usage::from_counts(945, 12)).unwrap();
+        assert_eq!(plain["input_tokens"], 945);
+        assert_eq!(plain["cache_read_input_tokens"], 0);
+        assert_eq!(plain["cache_creation_input_tokens"], 0);
+
+        let hit =
+            serde_json::to_value(Usage::from_counts(49, 12).with_cache_read_input_tokens(896))
+                .unwrap();
+        assert_eq!(hit["input_tokens"], 49);
+        assert_eq!(hit["cache_read_input_tokens"], 896);
+        assert_eq!(hit["cache_creation_input_tokens"], 0);
+        assert_eq!(
+            hit["cache_creation"],
+            json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
+        );
+
+        let miss =
+            serde_json::to_value(Usage::from_counts(945, 12).with_cache_read_input_tokens(0))
+                .unwrap();
+        assert_eq!(
+            miss["cache_read_input_tokens"], 0,
+            "a miss is an integer zero, never null"
+        );
+    }
 
     /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
     /// Python SDK (thinking without a signature, or with a null one) parses, and

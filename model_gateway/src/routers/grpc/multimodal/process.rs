@@ -289,6 +289,7 @@ pub(crate) async fn process_multimodal_plan(
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
     let video_config = ctx.model_config.video_preprocessor_config.as_ref();
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
+        .with_drain_on_error(ctx.components.drain_fetches_on_error)
         .with_fetch_observer(
             Metrics::interned_model_label(ctx.model_id),
             Metrics::record_mm_fetch,
@@ -299,7 +300,23 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                 .video_frame_sampling_with(video_config)
                 .with_frame_budget(ctx.components.video_frame_budget),
         )
-        .with_image_transparency(ctx.transparency);
+        .with_image_transparency(ctx.transparency)
+        .with_minimax_sglang_resize(
+            ctx.spec.name() == "minimax_m3"
+                && ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
+        )
+        .with_minimax_image_resize(
+            ctx.spec.name() == "minimax_m3"
+                && !ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
+        );
 
     for part in plan.into_parts() {
         tracker
@@ -662,18 +679,15 @@ async fn preprocess_batch(
             ImageFrame::decode_all(&images)
                 .map_err(llm_multimodal::MultiModalError::Media)?;
             let processor = vision_processors.image()?;
-            // Decoded (and cloned) inside the blocking closure, off the async
-            // runtime.
-            let raw_images: Vec<image::DynamicImage> = images
+            // The frames' own pixels, borrowed from the cells `decode_all`
+            // just filled: no processor owns, consumes or mutates its input,
+            // so the batch costs one pointer per image instead of a deep copy
+            // of every decoded image.
+            let decoded: Vec<&image::DynamicImage> = images
                 .iter()
-                .map(|frame| {
-                    frame
-                        .image()
-                        .cloned()
-                        .map_err(llm_multimodal::MultiModalError::Media)
-                })
+                .map(|frame| frame.image().map_err(llm_multimodal::MultiModalError::Media))
                 .collect::<Result<_, _>>()?;
-            preprocess_images(processor.as_ref(), &raw_images, image_wire_dtype)
+            preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -823,17 +837,17 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images
+        // Borrowed from the frames' own cells, as the batch path borrows them.
+        let decoded: Vec<&image::DynamicImage> = images
             .iter()
             .map(|frame| {
                 frame
                     .image()
-                    .cloned()
                     .map_err(llm_multimodal::MultiModalError::Media)
             })
             .collect::<Result<_, _>>()?;
         let processor = vision_processors.image()?;
-        preprocess_images(processor.as_ref(), &raw_images, image_wire_dtype)
+        preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
@@ -844,7 +858,7 @@ async fn preprocess_image_batch(
 /// write otherwise. Both arms produce the same bytes on the wire.
 fn preprocess_images(
     processor: &dyn VisionPreProcessor,
-    images: &[image::DynamicImage],
+    images: &[&image::DynamicImage],
     wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     wire_dtype

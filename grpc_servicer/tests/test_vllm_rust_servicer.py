@@ -14,6 +14,7 @@ import dataclasses
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -21,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import rust
 
@@ -59,7 +61,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -80,13 +83,16 @@ def test_a_launcher_flag_decision_is_written_back_for_the_python_guard():
     rust.require_python_impl(environ=environ)
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.resolve_servicer_impl(environ=environ) == "python"
+    assert rust.resolve_servicer_impl(environ=environ) == "rust"
     assert environ == {}
 
 
 def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
-    rust.require_python_impl(environ={})
     rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
+    # Nothing exported: the default is the Rust servicer, so a Python servicer
+    # starting here ran without the switch; the guard names the explicit choice.
+    with pytest.raises(RuntimeError, match="the Rust servicer is the default"):
+        rust.require_python_impl(environ={})
     with pytest.raises(RuntimeError, match="never ran"):
         rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "rust"})
 
@@ -109,10 +115,25 @@ def test_upstream_hook_is_detected_in_the_launcher_source(tmp_path):
 
 def test_require_upstream_hook_names_the_fix(monkeypatch):
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: False)
-    with pytest.raises(RuntimeError, match="consults this package's flag"):
+    with pytest.raises(RuntimeError, match="consults this package's flag") as explicit:
         rust.require_upstream_hook()
+    # An explicit rust is refused under the variable's name; the default under
+    # its own, the operator having set nothing; the way out names the Python
+    # servicer's flag and variable in both.
+    assert str(explicit.value).startswith("SMG_VLLM_SERVICER_IMPL=rust needs")
+    with pytest.raises(RuntimeError, match="consults this package's flag") as default:
+        rust.require_upstream_hook(explicit=False)
+    assert str(default.value).startswith(
+        "the Rust servicer (the default; --servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust) needs"
+    )
+    for refusal in (explicit.value, default.value):
+        assert str(refusal).endswith(
+            "select the deprecated Python servicer with --servicer-impl python / "
+            "SMG_VLLM_SERVICER_IMPL=python."
+        )
     monkeypatch.setattr(rust, "upstream_hook_installed", lambda: True)
     rust.require_upstream_hook()
+    rust.require_upstream_hook(explicit=False)
 
 
 def test_launcher_switch_binds_serve_grpc_during_the_launchers_import(monkeypatch):
@@ -753,6 +774,7 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert info["pairing_protocol"] == "nixl"
     # No KV connector configured: the PD identity is empty, as in Python.
     assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == ("", "", "")
+    assert info["runs_mooncake"] is False
     assert info["block_size"] == 0 and info["model_dtype"] == ""
     # No KV-event publisher configured, backend unset, and the host's shm id.
     assert info["kv_events_endpoint"] == "" and info["kv_events_topic"] == ""
@@ -808,6 +830,77 @@ def test_model_info_names_the_mooncake_mover_the_rust_servicer_withholds_the_not
         "kv_consumer",
         "decode-engine",
     )
+    assert info["runs_mooncake"] is True
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        # a second P2P child beside it: the projection stays at the wrapper
+        [
+            {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+            {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+        ],
+        # an empty child engine id: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": ""}],
+        # a malformed sibling: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"}, "not a child"],
+        # a wrapper inside the wrapper (vLLM builds each child from its own dict):
+        # the Mooncake grandchild counts, the projection stays at the wrapper
+        [
+            {
+                "kv_connector": "MultiConnector",
+                "engine_id": "decode-engine",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+                        {"kv_connector": "SharedStorageConnector"},
+                    ]
+                },
+            },
+        ],
+    ],
+    ids=["second-p2p-child", "empty-engine-id", "malformed-sibling", "nested-wrapper"],
+)
+def test_model_info_flags_a_mooncake_child_the_projection_does_not_name(connectors):
+    """A Mooncake child under a wrapper whose projection stays at the wrapper,
+    at any depth, is flagged off the raw config: the Rust servicer withholds
+    the notice on the flag, not on the projected name it reports."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={"connectors": connectors},
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_engine_id"]) == ("MultiConnector", "eng-d")
+    assert info["runs_mooncake"] is True
+
+
+def test_model_info_leaves_the_mooncake_flag_off_without_a_mooncake_connector():
+    """A plain NIXL engine and a wrapper without a Mooncake child (NIXL beside
+    a store) keep the flag off: the notice stays on those paths."""
+    plain = _config()
+    plain.kv_transfer_config = SimpleNamespace(
+        kv_connector="NixlConnector", kv_role="kv_consumer", engine_id="eng-d"
+    )
+    assert rust.model_info_from_config(plain)["runs_mooncake"] is False
+    wrapper = _config()
+    wrapper.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+                {"kv_connector": "SharedStorageConnector"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(wrapper)
+    assert info["kv_connector"] == "NixlConnector"
+    assert info["runs_mooncake"] is False
 
 
 def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
@@ -1382,6 +1475,13 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     assert asyncio.run(rust.serve_rust(args)) == 0
     assert recorded["server"].events == ["ready:False"]
     assert callable(recorded["supervise_kwargs"]["warmup"])
+    # The server and the plan share the process's nonce: the hold admits the
+    # pass's own ids and nothing a client could spell.
+    nonce = recorded["server"].kwargs["warmup_nonce"]
+    assert re.fullmatch(r"[0-9a-z]+", nonce)
+    plan = recorded["supervise_kwargs"]["warmup"].args[0]
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(request_id.startswith(f"smg-warmup-{nonce}-") for request_id in ids)
 
     monkeypatch.setenv(rust.WARMUP_ENV, "off")
     assert asyncio.run(rust.serve_rust(args)) == 0
@@ -1930,7 +2030,7 @@ def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_
 
     from smg_grpc_servicer.vllm import launcher_switch
 
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
     refusal = "no block of 1 consecutive free ports for the KV event publishers"
 
@@ -1974,7 +2074,7 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
         served.append(args)
 
     switched = launcher_switch.with_servicer_switch(serve_grpc)
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
     # Nothing given: the launcher builds the engine from a namespace with the
     # publisher on (in whichever form the engine takes it: the typed one once
@@ -2037,3 +2137,24 @@ def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
     )
     assert options["fetch_timeout_ms"] == 60000
     assert options["video_fetch_timeout_ms"] == 120000
+
+
+def test_model_info_carries_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The Rust servicer advertises the vocabulary of structural-tag nodes the
+    # engine's xgrammar takes, read off the installed distribution: `older`
+    # below 0.1.33 (the first release with the optional, plus, star and token
+    # nodes) under `xgrammar` and under `auto`, which runs xgrammar for a
+    # structural tag; nothing for a current one or another backend.
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    info = rust.model_info_from_config(_config())
+    assert info["structured_outputs_backend"] == "auto"
+    assert info["structural_tag_vocabulary"] == "older"
+    config = _config()
+    config.structured_outputs_config = SimpleNamespace(backend="xgrammar", reasoning_parser="")
+    info = rust.model_info_from_config(config)
+    assert info["structured_outputs_backend"] == "xgrammar"
+    assert info["structural_tag_vocabulary"] == "older"
+    config.structured_outputs_config = SimpleNamespace(backend="guidance", reasoning_parser="")
+    assert rust.model_info_from_config(config)["structural_tag_vocabulary"] == ""
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.7")
+    assert rust.model_info_from_config(_config())["structural_tag_vocabulary"] == ""

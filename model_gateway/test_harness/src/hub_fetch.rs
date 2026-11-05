@@ -153,7 +153,7 @@ pub fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Duration {
 }
 
 /// The file at `url` cached at `path`: downloaded under the download lock
-/// unless it is there already, written beside it as `<file>.part` and renamed
+/// unless it is there already, written beside it as `<file>.<pid>.part` and renamed
 /// into place, so a download that fails leaves nothing a later test would
 /// trust. Panics when the answer past the rate limit and the retries is no
 /// success, the body is under `min_bytes`, or the cache cannot be written.
@@ -189,8 +189,11 @@ pub fn cached_download(
         "GET {url}: {} bytes, expected at least {min_bytes}",
         content.len()
     );
+    // Named for this process, as the fixture loaders name theirs: a second
+    // process fetching the same file into the same directory renames its own
+    // whole file into place.
     let mut part = path.as_os_str().to_owned();
-    part.push(".part");
+    part.push(format!(".{}.part", std::process::id()));
     let part = Path::new(&part);
     fs::write(part, &content)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", part.display()));

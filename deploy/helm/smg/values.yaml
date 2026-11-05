@@ -27,7 +27,10 @@ router:
   #    Deadlines). The mesh StatefulSet has no such field.
   progressDeadlineSeconds: 1920
 
-  # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
+  # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
+  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
+  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
+  #    --prefill-policy bucket through extraArgs.
   policy: cache_aware
 
   # -- Enable IGW (Inference Gateway) mode for multi-model support
@@ -145,7 +148,9 @@ router:
   # -- Request handling
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
-  maxConcurrentRequests: -1    # -1 = unlimited
+  grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
+  maxConcurrentRequests: -1    # in-flight requests admitted before shedding with 429 or 503;
+                               # -1 = the host-derived bound (1024 per available core, at least 4096), 0 = no bound
   queueSize: 100
   queueTimeoutSecs: 60
 
@@ -295,6 +300,9 @@ router:
   #    terminationGracePeriodSeconds is this plus terminationGraceMarginSeconds,
   #    so the drain is not cut short by the kubelet's default 30 s.
   shutdownGracePeriodSeconds: 180
+  # -- Listener propagation window; null retains the default 5 seconds.
+  #    Explicit seconds are capped at half the grace period; 0 skips the window.
+  shutdownSettleSeconds: null
   terminationGraceMarginSeconds: 30
 
   # -- Optional features
@@ -306,6 +314,12 @@ router:
     configPath: ""
   reasoningParser: ""
   toolCallParser: ""
+  # -- Which parser reads a chat completion's reasoning and tool calls: "symphony"
+  #    (one table per model family) or "legacy" (the older per-model parsers). Empty
+  #    renders no --parser, so the image's own default applies (Symphony from the
+  #    release after 1.13.0 on, the older parsers on 1.13.0). A set value needs an
+  #    image of 1.13.0 or later and applies to gRPC and ZMQ workers only.
+  parser: ""
 
 # =============================================================================
 # HuggingFace Configuration
@@ -490,11 +504,13 @@ workers: []
 #       repository: smg-project/smg     # default: the path the engine images are published under
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
+#     servicerImpl: ""                  # gRPC mode only: "" runs the launcher's default, the Rust
+#                                       # servicer; "python" the deprecated Python servicer (kept for
+#                                       # the deprecation window); "rust" names the default explicitly
 #     metrics:                          # the engine pod's Prometheus endpoint (gRPC mode only)
-#       enabled: false                  # true: the worker runs the Rust servicer, which serves
-#                                       # GET /metrics (smg_servicer_*); the Python servicer has no
-#                                       # endpoint, and the SGLang Rust servicer serves neither
-#                                       # PD/EPD disaggregation nor image/video input yet
+#       enabled: false                  # true: the Rust servicer's listener serves GET /metrics
+#                                       # (smg_servicer_*); the Python servicer has no endpoint, so
+#                                       # the launcher refuses metrics with servicerImpl "python"
 #       port: 29100                     # the metrics listener's port; must differ from `port`
 #     resources: {}
 #     extraArgs: []                     # extra engine CLI args

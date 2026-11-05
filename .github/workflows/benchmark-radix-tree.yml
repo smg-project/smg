@@ -10,7 +10,7 @@ on:
       - '!crates/kv_index/**/*_test.rs'
       - '!crates/kv_index/**/test_*.rs'
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths:
       - 'model_gateway/benches/radix_tree_benchmark.rs'
       - 'crates/kv_index/**'
@@ -24,10 +24,6 @@ on:
 concurrency:
   group: benchmark-radix-tree-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read

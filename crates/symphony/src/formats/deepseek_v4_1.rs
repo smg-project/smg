@@ -57,7 +57,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, calls, content, reasoning},
+        testing::{arguments_of, bytes, calls, content, dropped, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -120,13 +120,6 @@ mod tests {
         out.into_owned().drain()
     }
 
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
-    }
-
     #[test]
     fn a_recorded_output_gives_its_two_calls_with_their_types_and_every_byte() {
         let events = run("<｜Assistant｜><think>", &[OUTPUT]);
@@ -187,7 +180,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

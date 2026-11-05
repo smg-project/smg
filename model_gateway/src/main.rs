@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -24,43 +24,25 @@ use smg::observability::metrics::SERVER_MALLOC_CONF;
 pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
-use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, validate_mesh_server_name, AccessLogField, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
-        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
-        PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
-        ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
-        TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
-    mesh_discovery::MeshDiscoveryConfig,
-    observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
-    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
+    observability::metrics::register_jemalloc_as_global_allocator,
     server::{self, posture::SecretSources, ServerConfig},
-    service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{ConnectionMode, RuntimeType},
 };
-use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::{MTLSConfig, MeshServerConfig};
 
 mod cli;
 
 use cli::{
-    secrets::{
-        process_env, EnvLookup, API_KEY_SETTING, POSTGRES_DB_URL_SETTING, REDIS_URL_SETTING,
-        TENANT_API_KEYS_SETTING,
-    },
+    secrets::process_env,
     url_port::CommandLine,
     value::{
-        parse_access_log_field, parse_control_plane_api_key, parse_job_queue_capacity,
-        parse_job_queue_concurrency, parse_kv_index, parse_mm_processing, parse_mm_turbojpeg,
-        parse_model_alias, parse_model_id_from, parse_positive_usize,
-        parse_power_of_two_load_metric, parse_role_mapping, parse_routing_key_header,
-        parse_tenant_api_key, parse_transport_mode, parse_unit_fraction,
+        parse_access_log_field, parse_job_queue_capacity, parse_job_queue_concurrency,
+        parse_mm_processing, parse_mm_turbojpeg, parse_model_alias, parse_model_id_from,
+        parse_positive_usize, parse_power_of_two_load_metric, parse_routing_key_header,
+        parse_transport_mode, parse_unit_fraction,
     },
 };
 
@@ -84,16 +66,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Backend::Sglang => "sglang",
-            Backend::Vllm => "vllm",
-            Backend::Trtllm => "trtllm",
-            Backend::Tokenspeed => "tokenspeed",
-            Backend::Openai => "openai",
-            Backend::Anthropic => "anthropic",
-            Backend::Gemini => "gemini",
-        };
-        write!(f, "{s}")
+        write_flag_value(self, f)
     }
 }
 
@@ -110,15 +83,23 @@ pub enum DiscoveryProvider {
     Consul,
 }
 
-impl DiscoveryProvider {
-    /// The spelling `--discovery-provider` takes for this provider.
-    fn flag_value(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::File => "file",
-            Self::Slurm => "slurm",
-            Self::Consul => "consul",
-        }
+impl std::fmt::Display for DiscoveryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_flag_value(self, f)
+    }
+}
+
+/// A value's spelling on the command line is its one spelling: `Display` writes
+/// the name clap parses, so a message that names a flag's value prints what the
+/// flag takes. A variant clap skips has no command-line name and prints as its
+/// `Debug` form, so a formatter that has not failed never reports an error.
+fn write_flag_value<V: ValueEnum + std::fmt::Debug>(
+    value: &V,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match value.to_possible_value() {
+        Some(name) => f.write_str(name.get_name()),
+        None => write!(f, "{value:?}"),
     }
 }
 
@@ -300,8 +281,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
-    /// worker whose handshake awaits this many engines on one socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
+    /// grouped worker whose handshake awaits this many engines on one socket set
+    /// (default: as many as the first engine to dial declares, one for an
+    /// engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -324,6 +307,18 @@ struct RoutingArgs {
     /// `http_pool.http2` on a worker spec pins the version instead.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
+
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "Worker Configuration")]
+    worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "Worker Configuration")]
+    worker_startup_delay: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "Worker Configuration")]
+    worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -422,7 +417,9 @@ struct RoutingArgs {
     /// --worker-overload-shed asks for a 503 instead. Unless
     /// --worker-overload-shed is set, a cache-aware prefill pool of gRPC and
     /// HTTP prefill/decode pair placement is not steered by them: its spill
-    /// gate balances it. Evaluated once per load report, never per request. Per-worker `overload` blocks on a
+    /// gate balances it; nor is a regular request that consistent_hashing
+    /// places by its routing key, which stays on its ring owner.
+    /// Evaluated once per load report, never per request. Per-worker `overload` blocks on a
     /// WorkerSpec override the gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
@@ -452,7 +449,8 @@ struct RoutingArgs {
     /// Refuse a request with a 503 (worker_overload_protection_shed,
     /// Retry-After the load poll interval) when every worker it could use is
     /// overloaded, instead of routing it to the least-loaded one (or, for a
-    /// cache-aware prefill pool, by its policy); also sheds a worker that
+    /// cache-aware prefill pool or a regular request that consistent_hashing
+    /// places by its routing key, by its policy); also sheds a worker that
     /// crossed a threshold between selection and dispatch. Off by default:
     /// steering never turns a load signal into an outage
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -570,12 +568,6 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
-    /// waiting requests (plus dispatches since their last poll) have reached
-    /// this count; 0 disables. Set below the engine's max batch size
-    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
-    least_load_max_waiting_requests: u32,
-
     /// What power_of_two compares: expected_wait (default), requests or least_requests
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
@@ -622,7 +614,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
-    /// Enable minimum tokens scheduler for data parallel group
+    /// Choose a data-parallel rank per request from the ranks' reported token
+    /// loads: the HTTP prefill-decode router, for an engine registered as one
+    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
+    /// pick among them is the rank choice, so this flag chooses nothing there
+    /// (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
@@ -658,26 +654,6 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
-
-    /// Deprecated and ignored: the TTL prune of the positional indexer, which
-    /// the chain index replaced. The chain index holds what the engines report
-    /// and shrinks with their removals, so it has no prune; the flag is still
-    /// accepted so that existing launch lines keep working, and goes in a
-    /// later release.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_ttl_secs: Option<u64>,
-
-    /// Deprecated and ignored: the capacity ceiling of the positional
-    /// indexer's prune; see --kv-indexer-ttl-secs.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_max_entries: Option<usize>,
-
-    /// Deprecated: the chain index is the only KV index behind cache-aware
-    /// routing, so this takes `chain` only and does nothing; the flag goes in
-    /// a later release. `positional` names the index that was removed and is
-    /// refused.
-    #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
-    kv_index: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -739,18 +715,6 @@ struct WorkerArgs {
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
 
-    /// Timeout in seconds for worker startup and registration
-    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
-    worker_startup_timeout_secs: u64,
-
-    /// Grace period in seconds before the first worker startup check
-    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
-    worker_startup_delay: u64,
-
-    /// Interval in seconds between worker startup checks
-    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
-    worker_startup_check_interval: u64,
-
     // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
@@ -769,7 +733,8 @@ struct WorkerArgs {
     /// prompts may still need in prefill, up to 120 seconds. The pile is the
     /// streaming gRPC generations in flight; HTTP workers, PD sides and
     /// non-streaming generations give no signal and never form one. The
-    /// same bound, read per request, is how long a prefill side of a
+    /// same bound, read per request with twice the prefill time its prompt
+    /// needs behind the worker's backlog, is how long a prefill side of a
     /// disaggregated dispatch may produce nothing, with its worker answering
     /// no other side either, before its request fails over to another
     /// prefill worker (or fails, when there is none); a side queued on a
@@ -1167,9 +1132,28 @@ struct ServingArgs {
     )]
     tenant_header_name: String,
 
-    /// Request timeout in seconds
+    /// Request timeout in seconds.
+    ///
+    /// Bounds the read of a request's body overall (a 408 past it), and each
+    /// attempt at an HTTP worker from its dispatch to its last message: an
+    /// attempt the worker has not finished within it ends with the gateway's
+    /// 504 (`call_upstream_timeout`; on a stream, the error event that ends
+    /// it). That 504 is the request's answer, not replayed. A worker's own
+    /// `timeout_secs` in its HTTP pool configuration takes this value's
+    /// place, on an HTTP worker and on a ZMQ worker's link, whose streams
+    /// carry the same bound. A request to a gRPC worker is bounded by
+    /// --grpc-request-timeout-secs instead.
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+
+    /// Seconds a request to a gRPC worker may take, from its dispatch to its
+    /// last message: an attempt the worker has not finished within it ends
+    /// with the gateway's 504 (`call_upstream_timeout`; on a stream, the error
+    /// event that ends it) and the call to the worker is dropped, which
+    /// cancels the request on the worker; that 504 is the request's answer,
+    /// not replayed. 0 arms no deadline (the default): the bound is opt-in.
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    grpc_request_timeout_secs: u64,
 
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
@@ -1190,6 +1174,11 @@ struct ServingArgs {
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
 
+    /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
+    /// the window is capped at half the shutdown grace period.
+    #[arg(long, help_heading = "Request Handling")]
+    shutdown_settle_secs: Option<u64>,
+
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
@@ -1200,9 +1189,11 @@ struct ServingArgs {
     /// WASM request hooks, missing Content-Length, PD/batch backends) always
     /// buffers, bounded by max-payload-size; an eligible request buffers up
     /// to this many bytes when router retries are enabled, and otherwise
-    /// streams to the worker verbatim — forfeiting router-level retries,
-    /// with JSON validation deferring to the worker. 0 never buffers for
-    /// retries
+    /// streams to the worker verbatim — forfeiting router-level retries. A
+    /// streamed request reaches the worker as the client sent it: JSON
+    /// validation defers to the worker, and the provider profile's request
+    /// normalization (which the buffered path applies) is skipped. 0 never
+    /// buffers for retries
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 
@@ -1308,7 +1299,9 @@ struct ServingArgs {
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
-    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
@@ -1377,7 +1370,9 @@ struct ServingArgs {
     health_failure_threshold: u32,
 
     /// Consecutive probe successes before a worker returns to rotation (at
-    /// least 1)
+    /// least 1): a pending worker's reads are an interval apart, a demoted
+    /// worker's a probe timeout apart (or an interval, if that is shorter)
+    /// once one passes
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
@@ -1496,18 +1491,19 @@ struct ModelArgs {
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
-    /// Which parser reads a chat completion's reasoning and tool calls: the
-    /// per-model parsers (legacy) or Symphony. With Symphony, a model's
-    /// worker labels decide, else Symphony's registry for a model it knows,
-    /// else --tool-call-parser and --reasoning-parser: a Symphony table's
-    /// name reads with that table, and so does a legacy parser's name whose
-    /// format a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the
-    /// table's aliases, so existing flags keep a working parser); any other
-    /// legacy parser's name keeps the legacy parsers (the Symphony crate lists
-    /// each with the reason, passthrough among them), and no name leaves the
-    /// legacy parsers to detect. A request's X-SMG-Parser header overrides
-    /// the flag for that request.
-    #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
+    /// Which parser reads a chat completion's reasoning and tool calls:
+    /// Symphony (the default) or the per-model parsers (legacy). With
+    /// Symphony, a model's worker labels decide, else Symphony's registry
+    /// for a model it knows, else --tool-call-parser and
+    /// --reasoning-parser: a Symphony table's name reads with that table,
+    /// and so does a legacy parser's name whose format a table reads (qwen
+    /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
+    /// existing flags keep a working parser); any other legacy parser's
+    /// name keeps the legacy parsers (the Symphony crate lists each with
+    /// the reason, passthrough among them), and no name leaves the legacy
+    /// parsers to detect. A request's X-SMG-Parser header overrides the
+    /// flag for that request.
+    #[arg(long, default_value = "symphony", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
 
     /// Path to MCP server configuration file
@@ -1851,1369 +1847,6 @@ struct IntegrationArgs {
     runtime_worker_threads: Option<usize>,
 }
 
-enum OracleConnectSource {
-    Dsn { descriptor: String },
-    Wallet { path: String, alias: String },
-}
-
-impl CliArgs {
-    /// Phase 1b, resolve: the secrets the environment or a file may give in
-    /// the command line's place, read into the flag fields so the phases
-    /// after this one read flags alone; where each came from is kept for
-    /// the start-up record. One rule for every secret: the command line
-    /// beats the environment, and a value from either together with a file
-    /// is refused rather than ranked. A store URL is read for the selected
-    /// history backend alone, as its flag is. The environment lookup is a
-    /// parameter so a test need not touch the process environment.
-    fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
-        let mut sources = SecretSources::default();
-        if let Some((value, source)) = API_KEY_SETTING.resolve_value(
-            self.integrations.api_key.as_deref(),
-            self.integrations.api_key_file.as_deref(),
-            env,
-        )? {
-            self.integrations.api_key = Some(value);
-            sources.api_key = Some(source);
-        }
-        if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
-            &self.integrations.tenant_api_keys,
-            self.integrations.tenant_api_keys_file.as_deref(),
-            env,
-        )? {
-            sources.tenant_api_keys = Some((source, entries.len()));
-            self.integrations.tenant_api_keys = entries;
-        }
-        if self.model.history_backend == "postgres" {
-            if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
-                self.integrations.postgres_db_url.as_deref(),
-                self.integrations.postgres_db_url_file.as_deref(),
-                env,
-            )? {
-                self.integrations.postgres_db_url = Some(value);
-                sources.postgres_db_url = Some(source);
-            }
-        }
-        if self.model.history_backend == "redis" {
-            if let Some((value, source)) = REDIS_URL_SETTING.resolve_value(
-                self.integrations.redis_url.as_deref(),
-                self.integrations.redis_url_file.as_deref(),
-                env,
-            )? {
-                self.integrations.redis_url = Some(value);
-                sources.redis_url = Some(source);
-            }
-        }
-        self.integrations.secret_sources = sources;
-        Ok(())
-    }
-}
-
-impl CliArgs {
-    /// Preserve legacy readiness unless a role threshold was explicitly configured.
-    fn pd_readiness_config(&self) -> Option<PdReadinessConfig> {
-        let configured = self.routing.readiness_prefill_expected_workers.is_some()
-            || self.routing.readiness_prefill_min_healthy_workers.is_some()
-            || self.routing.readiness_prefill_min_healthy_percent.is_some()
-            || self.routing.readiness_decode_min_healthy_workers.is_some()
-            || self.routing.readiness_decode_expected_workers.is_some()
-            || self.routing.readiness_decode_min_healthy_percent.is_some();
-        configured.then(|| PdReadinessConfig {
-            prefill: ReadinessRoleConfig {
-                expected_workers: self.routing.readiness_prefill_expected_workers,
-                min_healthy_workers: self
-                    .routing
-                    .readiness_prefill_min_healthy_workers
-                    .unwrap_or(1),
-                min_healthy_percent: self.routing.readiness_prefill_min_healthy_percent,
-            },
-            decode: ReadinessRoleConfig {
-                expected_workers: self.routing.readiness_decode_expected_workers,
-                min_healthy_workers: self
-                    .routing
-                    .readiness_decode_min_healthy_workers
-                    .unwrap_or(1),
-                min_healthy_percent: self.routing.readiness_decode_min_healthy_percent,
-            },
-        })
-    }
-
-    /// Build control plane authentication configuration from CLI args. A
-    /// configuration that asks for authentication but cannot be honoured
-    /// (a malformed key entry, an issuer without an audience or the reverse)
-    /// is an error: silently dropping it would start the control plane open.
-    fn build_control_plane_auth_config(&self) -> ConfigResult<ControlPlaneAuthConfig> {
-        // Build JWT config if issuer and audience are provided
-        let jwt = match (
-            &self.integrations.jwt_issuer,
-            &self.integrations.jwt_audience,
-        ) {
-            (Some(issuer), Some(audience)) => {
-                // One malformed mapping refuses the start: dropped, it could widen access
-                let role_mapping = self
-                    .integrations
-                    .jwt_role_mapping
-                    .iter()
-                    .map(|m| parse_role_mapping(m))
-                    .collect::<ConfigResult<HashMap<String, Role>>>()?;
-
-                let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
-                jwt_config
-                    .role_claim
-                    .clone_from(&self.integrations.jwt_role_claim);
-                jwt_config.role_mapping = role_mapping;
-                if let Some(jwks_uri) = &self.integrations.jwt_jwks_uri {
-                    jwt_config.jwks_uri = Some(jwks_uri.clone());
-                }
-                Some(jwt_config)
-            }
-            (Some(_), None) => {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--jwt-issuer requires --jwt-audience (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
-                });
-            }
-            (None, Some(_)) => {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--jwt-audience requires --jwt-issuer (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
-                });
-            }
-            (None, None) => None,
-        };
-
-        // Build API keys from CLI args; one malformed entry refuses the start
-        let api_keys = self
-            .integrations
-            .control_plane_api_keys
-            .iter()
-            .map(|k| parse_control_plane_api_key(k))
-            .collect::<ConfigResult<Vec<ApiKeyEntry>>>()?;
-
-        Ok(ControlPlaneAuthConfig {
-            jwt,
-            api_keys,
-            audit_enabled: !self.integrations.disable_audit_logging,
-        })
-    }
-
-    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
-        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
-        worker_urls
-            .iter()
-            .find_map(|url| match ConnectionMode::from_url(url) {
-                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
-                _ => None,
-            })
-            .unwrap_or(ConnectionMode::Http)
-    }
-
-    /// The worker discovery provider selected by either spelling:
-    /// `--service-discovery` is `--discovery-provider kubernetes`.
-    fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
-        if self.discovery.service_discovery {
-            Some(DiscoveryProvider::Kubernetes)
-        } else {
-            self.discovery.discovery_provider
-        }
-    }
-
-    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
-    /// Returns whether this call turned it on.
-    fn enable_igw_for_discovery(&mut self) -> bool {
-        let enable = self.selected_discovery_provider().is_some() && !self.routing.enable_igw;
-        self.routing.enable_igw |= enable;
-        enable
-    }
-
-    fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        for item in selector_list {
-            if let Some(eq_pos) = item.find('=') {
-                let key = item[..eq_pos].to_string();
-                let value = item[eq_pos + 1..].to_string();
-                map.insert(key, value);
-            }
-        }
-        map
-    }
-
-    /// The metrics bind host: `--prometheus-host`, or the unspecified address
-    /// of `--host`'s family when it is not given.
-    fn metrics_host(&self) -> String {
-        self.serving
-            .prometheus_host
-            .clone()
-            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.routing.host))
-    }
-
-    fn parse_mesh_socket_addr(
-        host: &str,
-        port: u16,
-        field: &str,
-    ) -> ConfigResult<std::net::SocketAddr> {
-        bind_socket_addr(host, port).map_err(|e| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value: host.to_string(),
-            reason: format!("invalid mesh socket address: {e}"),
-        })
-    }
-
-    /// Build mesh settings from the integration flags, validating addresses and TLS pairs.
-    fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
-        if !self.integrations.enable_mesh {
-            return Ok(None);
-        }
-
-        let self_name = if let Some(name) = &self.integrations.mesh_server_name {
-            validate_mesh_server_name(name)?;
-            name.to_string()
-        } else {
-            let mut rng = rand::rng();
-            let random_string: String = (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
-            format!("Mesh_{random_string}")
-        };
-
-        let peer = self
-            .integrations
-            .mesh_peer_urls
-            .first()
-            .map(|url| {
-                url.parse::<std::net::SocketAddr>()
-                    .map_err(|e| ConfigError::InvalidValue {
-                        field: "mesh_peer_urls".to_string(),
-                        value: url.clone(),
-                        reason: format!("invalid socket address: {e}"),
-                    })
-            })
-            .transpose()?;
-
-        // Port 0 parses fine as a socket address, but it is meaningless as an
-        // advertised one: peers gossip this port and cannot dial an ephemeral
-        // bind. It would also reach router discovery as the fallback mesh port
-        // for Pods whose annotation is missing or invalid, publishing `IP:0`
-        // peers into the cluster state.
-        if self.integrations.mesh_port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "mesh_port".to_string(),
-                value: self.integrations.mesh_port.to_string(),
-                reason: "mesh port cannot be 0; peers dial the advertised port, \
-                         so it must be a fixed, routable one"
-                    .to_string(),
-            });
-        }
-
-        // The mesh port against the other listeners' is checked in
-        // `server::startup`, for every way the server configuration is built.
-        let bind_addr = Self::parse_mesh_socket_addr(
-            &self.integrations.mesh_host,
-            self.integrations.mesh_port,
-            "mesh_host",
-        )?;
-        let (advertise_host, advertise_field) =
-            if let Some(host) = self.integrations.mesh_advertise_host.as_deref() {
-                (host, "mesh_advertise_host")
-            } else {
-                (self.integrations.mesh_host.as_str(), "mesh_host")
-            };
-        let advertise_addr = Self::parse_mesh_socket_addr(
-            advertise_host,
-            self.integrations.mesh_port,
-            advertise_field,
-        )?;
-
-        if advertise_addr.ip().is_unspecified() {
-            return Err(ConfigError::InvalidValue {
-                field: advertise_field.to_string(),
-                value: advertise_host.to_string(),
-                reason:
-                    "mesh advertise address cannot be unspecified; set --mesh-advertise-host to a routable node IP".to_string(),
-            });
-        }
-
-        Ok(Some(MeshServerConfig {
-            self_name,
-            bind_addr,
-            advertise_addr,
-            init_peer: peer,
-            mtls_config: self.mesh_mtls_config()?,
-        }))
-    }
-
-    /// The mesh mTLS configuration from `--mesh-tls-ca-cert`, `--mesh-tls-cert`
-    /// and `--mesh-tls-key` (all three or none, which the parser enforces);
-    /// each file has to be readable at start-up, not at the first dial.
-    fn mesh_mtls_config(&self) -> ConfigResult<Option<MTLSConfig>> {
-        let (Some(ca), Some(cert), Some(key)) = (
-            &self.integrations.mesh_tls_ca_cert,
-            &self.integrations.mesh_tls_cert,
-            &self.integrations.mesh_tls_key,
-        ) else {
-            return Ok(None);
-        };
-        for (field, path) in [
-            ("mesh_tls_ca_cert", ca),
-            ("mesh_tls_cert", cert),
-            ("mesh_tls_key", key),
-        ] {
-            std::fs::metadata(path).map_err(|e| ConfigError::InvalidValue {
-                field: field.to_string(),
-                value: path.clone(),
-                reason: format!("cannot read the file: {e}"),
-            })?;
-        }
-        Ok(Some(MTLSConfig {
-            ca_cert_path: ca.into(),
-            server_cert_path: cert.into(),
-            server_key_path: key.into(),
-            ..MTLSConfig::default()
-        }))
-    }
-
-    /// Build a routing policy with the same per-policy defaults as the CLI flags.
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
-        match policy_str {
-            "random" => PolicyConfig::Random,
-            "round_robin" => PolicyConfig::RoundRobin,
-            "passthrough" => PolicyConfig::Passthrough,
-            "cache_aware" => PolicyConfig::CacheAware {
-                cache_threshold: self.routing.cache_threshold,
-                balance_abs_threshold: self.routing.balance_abs_threshold,
-                balance_rel_threshold: self.routing.balance_rel_threshold,
-                eviction_interval_secs: self.routing.eviction_interval,
-                max_tree_size: self.routing.max_tree_size,
-                block_size: self.routing.block_size,
-                balance_token_usage_threshold: self.routing.balance_token_usage_threshold,
-                overload_token_usage_threshold: self.routing.overload_token_usage_threshold,
-                overlap_decay: self.routing.overlap_decay,
-                selection_temperature: self.routing.selection_temperature,
-                cache_index: Self::parse_cache_index(&self.routing.cache_index),
-                cache_ttl_secs: self.routing.cache_ttl_secs,
-                cache_boundaries: self.routing.cache_boundaries.clone(),
-                selection_policy: (self.routing.selection_policy != DEFAULT_SELECTION_POLICY)
-                    .then(|| self.routing.selection_policy.clone()),
-                selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
-                balance_prefix_margin_tokens: self.routing.balance_prefix_margin_tokens,
-                balance_uncached_credit: self.routing.balance_uncached_credit,
-            },
-            "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_metric: self.routing.power_of_two_load_metric,
-            },
-            "least_load" => PolicyConfig::LeastLoad {
-                kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
-                mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
-                default_throughput: self.routing.least_load_default_throughput,
-                max_waiting_requests: self.routing.least_load_max_waiting_requests,
-            },
-            "bucket" => PolicyConfig::Bucket {
-                balance_abs_threshold: self.routing.balance_abs_threshold,
-                balance_rel_threshold: self.routing.balance_rel_threshold,
-                bucket_adjust_interval_secs: self.routing.bucket_adjust_interval_secs,
-            },
-            "prefix_hash" => PolicyConfig::PrefixHash {
-                prefix_token_count: self.routing.prefix_token_count,
-                load_factor: self.routing.prefix_hash_load_factor,
-                balance_abs_threshold: self.routing.prefix_hash_balance_abs_threshold,
-                cache_boundaries: self.routing.cache_boundaries.clone(),
-            },
-            "consistent_hashing" => PolicyConfig::ConsistentHashing,
-            "manual" => PolicyConfig::Manual {
-                eviction_interval_secs: self.routing.eviction_interval,
-                max_idle_secs: self.routing.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(
-                    self.routing.assignment_mode.as_deref(),
-                    ManualAssignmentMode::Random,
-                ),
-            },
-            _ => PolicyConfig::RoundRobin,
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "unreachable: clap value_parser restricts valid cache index kinds"
-    )]
-    fn parse_cache_index(kind: &str) -> CacheIndexKind {
-        match kind {
-            "tree" => CacheIndexKind::Tree,
-            "hash" => CacheIndexKind::Hash,
-            other => panic!("Unknown cache index: {other}"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "unreachable: clap value_parser restricts valid assignment modes"
-    )]
-    fn parse_assignment_mode(
-        mode: Option<&str>,
-        default: ManualAssignmentMode,
-    ) -> ManualAssignmentMode {
-        let Some(mode) = mode else { return default };
-        match mode {
-            "random" => ManualAssignmentMode::Random,
-            "min_load" => ManualAssignmentMode::MinLoad,
-            "min_group" => ManualAssignmentMode::MinGroup,
-            "delegate" => ManualAssignmentMode::Delegate,
-            other => panic!("Unknown assignment mode: {other}"),
-        }
-    }
-
-    /// Load the optional storage schema, reporting file and YAML errors as configuration errors.
-    fn load_schema_config(&self) -> ConfigResult<Option<SchemaConfig>> {
-        match &self.model.schema_config {
-            Some(path) => {
-                let content =
-                    std::fs::read_to_string(path).map_err(|e| ConfigError::ValidationFailed {
-                        reason: format!("Failed to read schema config file '{path}': {e}"),
-                    })?;
-                let schema: SchemaConfig =
-                    serde_yaml::from_str(&content).map_err(|e| ConfigError::ValidationFailed {
-                        reason: format!("Failed to parse schema config file '{path}': {e}"),
-                    })?;
-                Ok(Some(schema))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Prefer an explicit Oracle DSN; otherwise require both wallet path and TNS alias.
-    fn resolve_oracle_connect_details(&self) -> ConfigResult<OracleConnectSource> {
-        if let Some(dsn) = self.integrations.oracle_dsn.clone() {
-            return Ok(OracleConnectSource::Dsn { descriptor: dsn });
-        }
-
-        let wallet_path = self
-            .integrations
-            .oracle_wallet_path
-            .clone()
-            .ok_or_else(|| ConfigError::MissingRequired {
-                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
-            })?;
-
-        let tns_alias = self.integrations.oracle_tns_alias.clone().ok_or_else(|| {
-            ConfigError::MissingRequired {
-                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
-            }
-        })?;
-
-        Ok(OracleConnectSource::Wallet {
-            path: wallet_path,
-            alias: tns_alias,
-        })
-    }
-
-    /// Build Oracle storage settings after validating authentication and pool bounds.
-    fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
-        let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
-            OracleConnectSource::Dsn { descriptor } => (None, descriptor),
-            OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
-        };
-        let (username, password) = if self.integrations.oracle_external_auth {
-            (
-                self.integrations.oracle_user.clone().unwrap_or_default(),
-                self.integrations
-                    .oracle_password
-                    .clone()
-                    .unwrap_or_default(),
-            )
-        } else {
-            (
-                self.integrations.oracle_user.clone().ok_or_else(|| {
-                    ConfigError::MissingRequired {
-                        field: "oracle_user or ATP_USER".to_string(),
-                    }
-                })?,
-                self.integrations.oracle_password.clone().ok_or_else(|| {
-                    ConfigError::MissingRequired {
-                        field: "oracle_password or ATP_PASSWORD".to_string(),
-                    }
-                })?,
-            )
-        };
-
-        let pool_min = self
-            .integrations
-            .oracle_pool_min
-            .unwrap_or_else(OracleConfig::default_pool_min);
-        let pool_max = self
-            .integrations
-            .oracle_pool_max
-            .unwrap_or_else(OracleConfig::default_pool_max);
-
-        if pool_min == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle_pool_min".to_string(),
-                value: pool_min.to_string(),
-                reason: "pool minimum must be at least 1".to_string(),
-            });
-        }
-
-        if pool_max < pool_min {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle_pool_max".to_string(),
-                value: pool_max.to_string(),
-                reason: "pool maximum must be greater than or equal to minimum".to_string(),
-            });
-        }
-
-        let pool_timeout_secs = self
-            .integrations
-            .oracle_pool_timeout_secs
-            .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
-
-        Ok(OracleConfig {
-            wallet_path,
-            connect_descriptor,
-            external_auth: self.integrations.oracle_external_auth,
-            username,
-            password,
-            pool_min,
-            pool_max,
-            pool_timeout_secs,
-            schema,
-        })
-    }
-
-    /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
-    fn build_postgres_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<PostgresConfig> {
-        let db_url = self
-            .integrations
-            .postgres_db_url
-            .clone()
-            .unwrap_or_default();
-        let pool_max = self
-            .integrations
-            .postgres_pool_max_size
-            .unwrap_or_else(PostgresConfig::default_pool_max);
-        let pcf = PostgresConfig {
-            db_url,
-            pool_max,
-            op_timeout_secs: self
-                .integrations
-                .postgres_op_timeout_secs
-                .unwrap_or_else(PostgresConfig::default_op_timeout_secs),
-            schema,
-        };
-        pcf.validate().map_err(|e| ConfigError::ValidationFailed {
-            reason: e.to_string(),
-        })?;
-        Ok(pcf)
-    }
-
-    /// Build Redis storage settings, requiring a URL and a nonzero pool size.
-    fn build_redis_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<RedisConfig> {
-        let url = self.integrations.redis_url.clone().unwrap_or_default();
-        let pool_max = self.integrations.redis_pool_max_size.unwrap_or(16);
-
-        let retention_days = match self.integrations.redis_retention_days {
-            Some(-1) => None, // Persistent
-            // A retention of 0 days would expire every record as it is
-            // written; -1 is the one spelling of persistent records.
-            Some(d) if d <= 0 => {
-                return Err(ConfigError::InvalidValue {
-                    field: "redis_retention_days".to_string(),
-                    value: d.to_string(),
-                    reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
-                });
-            }
-            Some(d) => Some(d as u64),
-            None => Some(30), // Default 30 days
-        };
-
-        let rcf = RedisConfig {
-            url,
-            pool_max,
-            op_timeout_secs: self
-                .integrations
-                .redis_op_timeout_secs
-                .unwrap_or_else(RedisConfig::default_op_timeout_secs),
-            retention_days,
-            schema,
-        };
-        rcf.validate().map_err(|e| ConfigError::ValidationFailed {
-            reason: e.to_string(),
-        })?;
-        Ok(rcf)
-    }
-
-    /// The flags whose value has a required shape and whose raw form never
-    /// reaches `RouterConfig`, refused by name when the shape is wrong: a
-    /// wrong shape used to be dropped or passed on in silence. The shapes of
-    /// the fields `RouterConfig` carries (the CORS origins, the health-check
-    /// endpoint, the request-id header names, the storage-context header
-    /// names, an empty API key) are checked by `ConfigValidator`, on every
-    /// construction path.
-    fn validate_flag_formats(&self) -> ConfigResult<()> {
-        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value: value.to_string(),
-            reason: reason.to_string(),
-        };
-        // `cors_allowed_origins`, the health-check endpoint, the request-id
-        // header names and an empty API key are checked by the shared
-        // `ConfigValidator`, which every construction path runs (this CLI
-        // through `builder.build()`).
-        let buckets = &self.serving.prometheus_duration_buckets;
-        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &bad.to_string(),
-                "every bucket bound must be a finite number above 0",
-            ));
-        }
-        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &format!("{} {}", pair[0], pair[1]),
-                "bucket bounds must ascend strictly",
-            ));
-        }
-        for entry in &self.serving.storage_context_headers {
-            if !entry.contains('=') {
-                return Err(invalid(
-                    "storage_context_headers",
-                    entry,
-                    "expected 'header-name=context-key'",
-                ));
-            }
-        }
-        for mapping in &self.integrations.jwt_role_mapping {
-            match mapping.split_once('=') {
-                Some((idp_role, gateway_role))
-                    if !idp_role.is_empty()
-                        && matches!(
-                            gateway_role.to_ascii_lowercase().as_str(),
-                            "admin" | "user"
-                        ) => {}
-                _ => {
-                    return Err(invalid(
-                        "jwt_role_mapping",
-                        mapping,
-                        "expected 'idp_role=admin' or 'idp_role=user'",
-                    ))
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The flags that only act with a companion, named when the companion is
-    /// absent: each used to be ignored in silence. One row per warning, in
-    /// the order they are printed: when it applies, and its text.
-    fn ignored_companions(
-        &self,
-        prefill_urls: &[(String, Option<u16>)],
-        encode_urls: &[(String, Option<u16>)],
-    ) -> Vec<String> {
-        const PD: &str = "without --pd-disaggregation (or --epd-disaggregation)";
-        const EPD: &str = "without --epd-disaggregation";
-        let pd = self.workers.pd_disaggregation || self.workers.epd_disaggregation;
-        let epd = self.workers.epd_disaggregation;
-        // The selectors select Kubernetes pods: another provider ignores them
-        // as the absence of any does.
-        let provider = self.selected_discovery_provider();
-        let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
-        let selectors = match provider {
-            None => "without --service-discovery".to_string(),
-            Some(provider) => format!(
-                "under --discovery-provider {}: it selects Kubernetes pods",
-                provider.flag_value()
-            ),
-        };
-        // Two worker sources are both honoured, which is worth a line of its
-        // own, naming the source as it was given.
-        let source = if self.discovery.service_discovery {
-            "--service-discovery".to_string()
-        } else {
-            provider.map_or_else(String::new, |provider| {
-                format!("--discovery-provider {}", provider.flag_value())
-            })
-        };
-        let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
-        let warnings = [
-            (!prefill_urls.is_empty() && !pd, ignored("--prefill", PD)),
-            (
-                !self.workers.decode.is_empty() && !pd,
-                ignored("--decode", PD),
-            ),
-            (
-                self.workers.prefill_policy.is_some() && !pd,
-                ignored("--prefill-policy", PD),
-            ),
-            (
-                self.workers.decode_policy.is_some() && !pd,
-                ignored("--decode-policy", PD),
-            ),
-            (!encode_urls.is_empty() && !epd, ignored("--encode", EPD)),
-            (
-                self.workers.encode_policy.is_some() && !epd,
-                ignored("--encode-policy", EPD),
-            ),
-            (
-                !self.discovery.selector.is_empty() && !kubernetes,
-                ignored("--selector", selectors.as_str()),
-            ),
-            (
-                !self.discovery.prefill_selector.is_empty() && !kubernetes,
-                ignored("--prefill-selector", selectors.as_str()),
-            ),
-            (
-                !self.discovery.decode_selector.is_empty() && !kubernetes,
-                ignored("--decode-selector", selectors.as_str()),
-            ),
-            (
-                !self.discovery.encode_selector.is_empty() && !kubernetes,
-                ignored("--encode-selector", selectors.as_str()),
-            ),
-            (
-                !self.discovery.router_selector.is_empty() && !kubernetes,
-                ignored("--router-selector", selectors.as_str()),
-            ),
-            (
-                provider.is_some() && !self.routing.worker_urls.is_empty(),
-                format!(
-                    "--worker-urls and {source} are both given: both are worker sources, \
-                     the listed workers register first and the discovered ones join them"
-                ),
-            ),
-            (
-                self.serving.priority_scheduler_config.is_some()
-                    && !self.serving.priority_scheduler_enabled,
-                ignored(
-                    "--priority-scheduler-config",
-                    "without --priority-scheduler-enabled",
-                ),
-            ),
-        ];
-        warnings
-            .into_iter()
-            .filter_map(|(applies, warning)| applies.then_some(warning))
-            .collect()
-    }
-
-    /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
-    /// line each on stderr: the logger is not up when the flags are read.
-    #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
-    fn warn_ignored_companions(
-        &self,
-        prefill_urls: &[(String, Option<u16>)],
-        encode_urls: &[(String, Option<u16>)],
-    ) {
-        for ignored in self.ignored_companions(prefill_urls, encode_urls) {
-            eprintln!("WARNING: {ignored}");
-        }
-    }
-
-    /// The routing mode the flags select. A vendor backend (`--backend
-    /// openai|anthropic|gemini`) routes to that vendor whatever else is set;
-    /// otherwise `--epd-disaggregation` wins over `--pd-disaggregation`, and
-    /// neither is the regular mode over `--worker-urls`. IGW mode does not
-    /// change the routing mode: it only affects router initialization.
-    fn routing_mode(
-        &self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        encode_urls: Vec<(String, Option<u16>)>,
-    ) -> RoutingMode {
-        let policy = |name: Option<&String>| name.map(|p| self.parse_policy(p));
-        match (
-            self.model.backend,
-            self.workers.epd_disaggregation,
-            self.workers.pd_disaggregation,
-        ) {
-            (Some(Backend::Openai), _, _) => RoutingMode::OpenAI {
-                worker_urls: self.routing.worker_urls.clone(),
-            },
-            (Some(Backend::Anthropic), _, _) => RoutingMode::Anthropic {
-                worker_urls: self.routing.worker_urls.clone(),
-            },
-            (Some(Backend::Gemini), _, _) => RoutingMode::Gemini {
-                worker_urls: self.routing.worker_urls.clone(),
-            },
-            (_, true, _) => RoutingMode::EncodePrefillDecode {
-                encode_urls,
-                prefill_urls,
-                decode_urls: self.workers.decode.clone(),
-                encode_policy: policy(self.workers.encode_policy.as_ref()),
-                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
-                decode_policy: policy(self.workers.decode_policy.as_ref()),
-            },
-            (_, false, true) => RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls: self.workers.decode.clone(),
-                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
-                decode_policy: policy(self.workers.decode_policy.as_ref()),
-            },
-            (_, false, false) => RoutingMode::Regular {
-                worker_urls: self.routing.worker_urls.clone(),
-            },
-        }
-    }
-
-    /// The discovery configuration of the selected provider, or none. The
-    /// Kubernetes flags are ignored under another provider, as they always
-    /// were without discovery; the file, Slurm and Consul flags have no other
-    /// use, so giving them without their provider is an error, as is any of
-    /// those providers without what it cannot run without. The interval applies to whichever
-    /// provider is selected.
-    fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
-        let provider = self.selected_discovery_provider();
-        let incompatible = |reason: &str| {
-            Err(ConfigError::IncompatibleConfig {
-                reason: reason.to_string(),
-            })
-        };
-        if provider != Some(DiscoveryProvider::File) && self.discovery.discovery_file.is_some() {
-            return incompatible("--discovery-file applies only to --discovery-provider file");
-        }
-        if provider.is_none() && self.discovery.discovery_check_interval_secs.is_some() {
-            return incompatible("--discovery-check-interval-secs needs a discovery provider");
-        }
-        if provider != Some(DiscoveryProvider::Slurm) && self.has_slurm_flags() {
-            return incompatible("The --slurm-* flags apply only to --discovery-provider slurm");
-        }
-        if provider != Some(DiscoveryProvider::Consul) && self.has_consul_flags() {
-            return incompatible("The --consul-* flags apply only to --discovery-provider consul");
-        }
-        let interval = self
-            .discovery
-            .discovery_check_interval_secs
-            .unwrap_or(DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS);
-        Ok(match provider {
-            None => None,
-            Some(DiscoveryProvider::Kubernetes) => {
-                Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
-                    namespace: self.discovery.service_discovery_namespace.clone(),
-                    port: self.discovery.service_discovery_port,
-                    check_interval_secs: interval,
-                    selector: Self::parse_selector(&self.discovery.selector),
-                    encode_selector: Self::parse_selector(&self.discovery.encode_selector),
-                    prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
-                    decode_selector: Self::parse_selector(&self.discovery.decode_selector),
-                    bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                    worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                    kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
-                    kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
-                    router_selector: Self::parse_selector(&self.discovery.router_selector),
-                    router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                    model_id_source: self.discovery.model_id_from.clone(),
-                }))
-            }
-            Some(DiscoveryProvider::File) => Some(DiscoveryConfig::File(FileDiscoveryConfig {
-                path: self.discovery.discovery_file.clone().ok_or_else(|| {
-                    ConfigError::MissingRequired {
-                        field: "--discovery-file".to_string(),
-                    }
-                })?,
-                check_interval_secs: interval,
-            })),
-            Some(DiscoveryProvider::Slurm) => Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
-                job_names: self.discovery.slurm_job_name.clone(),
-                encode_job_names: self.discovery.slurm_encode_job_name.clone(),
-                prefill_job_names: self.discovery.slurm_prefill_job_name.clone(),
-                decode_job_names: self.discovery.slurm_decode_job_name.clone(),
-                port: self
-                    .discovery
-                    .slurm_port
-                    .ok_or_else(|| ConfigError::MissingRequired {
-                        field: "--slurm-port".to_string(),
-                    })?,
-                bootstrap_port: self.discovery.slurm_bootstrap_port,
-                user: self.discovery.slurm_user.clone(),
-                account: self.discovery.slurm_account.clone(),
-                partition: self.discovery.slurm_partition.clone(),
-                check_interval_secs: interval,
-            })),
-            Some(DiscoveryProvider::Consul) => {
-                Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
-                    service: self.discovery.consul_service.clone().ok_or_else(|| {
-                        ConfigError::MissingRequired {
-                            field: "--consul-service".to_string(),
-                        }
-                    })?,
-                    address: self.discovery.consul_address.clone(),
-                    datacenter: self.discovery.consul_datacenter.clone(),
-                    check_interval_secs: interval,
-                }))
-            }
-        })
-    }
-
-    /// Whether any `--consul-*` flag was given.
-    fn has_consul_flags(&self) -> bool {
-        self.discovery.consul_service.is_some()
-            || self.discovery.consul_address.is_some()
-            || self.discovery.consul_datacenter.is_some()
-    }
-
-    /// Whether any `--slurm-*` flag was given.
-    fn has_slurm_flags(&self) -> bool {
-        [
-            &self.discovery.slurm_job_name,
-            &self.discovery.slurm_encode_job_name,
-            &self.discovery.slurm_prefill_job_name,
-            &self.discovery.slurm_decode_job_name,
-        ]
-        .iter()
-        .any(|names| !names.is_empty())
-            || self.discovery.slurm_port.is_some()
-            || self.discovery.slurm_bootstrap_port.is_some()
-            || self.discovery.slurm_user.is_some()
-            || self.discovery.slurm_account.is_some()
-            || self.discovery.slurm_partition.is_some()
-    }
-
-    /// Every worker url the mode starts with, in the order the flags list
-    /// them (encode, prefill, decode for the disaggregated modes): the first
-    /// url that declares a wire protocol decides the connection mode.
-    fn startup_worker_urls(mode: &RoutingMode) -> Vec<String> {
-        match mode {
-            RoutingMode::Regular { worker_urls }
-            | RoutingMode::OpenAI { worker_urls }
-            | RoutingMode::Anthropic { worker_urls }
-            | RoutingMode::Gemini { worker_urls } => worker_urls.clone(),
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => prefill_urls
-                .iter()
-                .map(|(url, _)| url.clone())
-                .chain(decode_urls.iter().cloned())
-                .collect(),
-            RoutingMode::EncodePrefillDecode {
-                encode_urls,
-                prefill_urls,
-                decode_urls,
-                ..
-            } => encode_urls
-                .iter()
-                .chain(prefill_urls.iter())
-                .map(|(url, _)| url.clone())
-                .chain(decode_urls.iter().cloned())
-                .collect(),
-        }
-    }
-
-    /// `--backend` normally only steers the routing mode. Over ZMQ it
-    /// additionally pins the startup workers' runtime: the shared EngineCore
-    /// handshake carries no engine identity, so the wire protocol cannot be
-    /// probed and must be declared. HTTP/gRPC keep auto-detection (None).
-    fn startup_worker_runtime_type(&self, connection_mode: ConnectionMode) -> Option<RuntimeType> {
-        if connection_mode != ConnectionMode::Zmq {
-            return None;
-        }
-        match self.model.backend {
-            Some(Backend::Vllm) => Some(RuntimeType::Vllm),
-            Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
-            Some(Backend::Sglang) => Some(RuntimeType::Sglang),
-            _ => None,
-        }
-    }
-
-    /// The `--model-alias` entries as a map. clap validated each entry's
-    /// shape; here only the same alias naming two different canonical models
-    /// is refused, which would make the routing outcome depend on argument
-    /// order.
-    fn model_aliases(entries: &[String]) -> ConfigResult<HashMap<String, String>> {
-        let mut model_aliases: HashMap<String, String> = HashMap::new();
-        for entry in entries {
-            let Some((alias, canonical)) = entry.split_once('=') else {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_alias".to_string(),
-                    value: entry.clone(),
-                    reason: "Expected: <alias>=<canonical>".to_string(),
-                });
-            };
-            if let Some(previous) = model_aliases.insert(alias.to_string(), canonical.to_string()) {
-                if previous != canonical {
-                    return Err(ConfigError::InvalidValue {
-                        field: "model_alias".to_string(),
-                        value: alias.to_string(),
-                        reason: format!("Alias maps to both '{previous}' and '{canonical}'"),
-                    });
-                }
-            }
-        }
-        Ok(model_aliases)
-    }
-
-    /// The router configuration of the flags. A refusal is raised in this
-    /// order: the flag shapes, the discovery flags, the schema file, the
-    /// tenant keys, the history store, the model aliases, and last the
-    /// shared validator over the built configuration, which the builder
-    /// runs.
-    fn to_router_config(
-        &self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        encode_urls: Vec<(String, Option<u16>)>,
-    ) -> ConfigResult<RouterConfig> {
-        self.validate_flag_formats()?;
-        self.warn_ignored_companions(&prefill_urls, &encode_urls);
-
-        let mode = self.routing_mode(prefill_urls, encode_urls);
-        let policy = self.parse_policy(&self.routing.policy);
-        let discovery = self.discovery_config()?;
-        let metrics = Some(MetricsConfig {
-            port: self.serving.prometheus_port,
-            host: self.metrics_host(),
-        });
-        let trace_config = Some(TraceConfig {
-            enable_trace: self.integrations.enable_trace,
-            otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
-        });
-        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
-        let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
-        let history_backend = match self.model.history_backend.as_str() {
-            "none" => HistoryBackend::None,
-            "oracle" => HistoryBackend::Oracle,
-            "postgres" => HistoryBackend::Postgres,
-            "redis" => HistoryBackend::Redis,
-            _ => HistoryBackend::Memory,
-        };
-        let schema = self.load_schema_config()?;
-        let tenant_api_keys = self
-            .integrations
-            .tenant_api_keys
-            .iter()
-            .map(|k| parse_tenant_api_key(k))
-            .collect::<ConfigResult<Vec<_>>>()?;
-        let (oracle, postgres, redis) = match history_backend {
-            HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
-            HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
-            HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
-            _ => (None, None, None),
-        };
-        let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
-
-        let builder = RouterConfig::builder()
-            .mode(mode)
-            .policy(policy)
-            .cache_boundaries(self.routing.cache_boundaries.clone())
-            .connection_mode(connection_mode)
-            .startup_worker_runtime_type(startup_worker_runtime_type)
-            .zmq_engine_count(self.routing.zmq_engine_count)
-            .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
-            .host(&self.routing.host)
-            .port(self.routing.port)
-            .pd_readiness(self.pd_readiness_config())
-            .health_check_port(self.routing.health_check_port)
-            .admin_port(self.routing.admin_port)
-            .admin_host(self.routing.admin_host.clone())
-            .runtime_worker_threads(self.integrations.runtime_worker_threads)
-            .max_payload_size(self.serving.max_payload_size)
-            .max_buffered_request_bytes(self.serving.max_buffered_request_bytes)
-            .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
-            .header_read_timeout_secs(self.serving.header_read_timeout_secs)
-            .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
-            .max_connections(self.serving.max_connections)
-            .request_timeout_secs(self.serving.request_timeout_secs)
-            .sse_keepalive_secs(self.serving.sse_keepalive_secs)
-            .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.workers.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
-            .job_queue_capacity(self.routing.job_queue_capacity)
-            .job_queue_concurrency(self.routing.job_queue_concurrency)
-            .load_monitor_interval_secs(self.workers.load_monitor_interval)
-            .worker_stall_secs(self.workers.worker_stall_secs)
-            .worker_wedge_secs(self.workers.worker_wedge_secs)
-            .worker_stale_secs(self.workers.worker_stale_secs)
-            .worker_warmup(
-                self.routing.worker_warmup_secs,
-                self.routing.worker_warmup_share,
-                self.routing.worker_warmup_blocks,
-                self.routing.worker_warmup_thin_ratio,
-                self.routing.worker_warmup_divert_every,
-            )
-            .pd_admission_wait_secs(self.workers.pd_admission_wait_secs)
-            .disable_load_monitoring(self.workers.disable_load_monitoring)
-            .worker_overload_protection(
-                self.routing.worker_overload_protection
-                    && !self.routing.disable_worker_overload_protection,
-            )
-            .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
-            .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
-            .worker_overload_shed(self.routing.worker_overload_shed)
-            .kv_indexer_ttl_secs(self.routing.kv_indexer_ttl_secs)
-            .kv_indexer_max_entries(self.routing.kv_indexer_max_entries)
-            .kv_index(self.routing.kv_index.clone())
-            .engine_metrics(self.workers.engine_metrics)
-            .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
-            .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
-            .multimodal_max_inflight_bytes(self.workers.multimodal_max_inflight_bytes)
-            .mm_per_request_image_limit(self.workers.mm_per_request_image_limit.map(|v| v as usize))
-            .mm_processing(self.workers.mm_processing)
-            .mm_pixel_cache_mb(self.workers.mm_pixel_cache_mb)
-            .mm_pixel_rdma(self.workers.mm_pixel_rdma)
-            .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
-            .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
-            .mm_turbojpeg(self.workers.mm_turbojpeg)
-            .mm_video_fetch_timeout_ms(self.workers.mm_video_fetch_timeout_ms)
-            .mm_fetch_timeout_ms(self.workers.mm_fetch_timeout_ms)
-            .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
-            .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
-            .log_mm_timing(self.workers.log_mm_timing)
-            .max_concurrent_requests(self.serving.max_concurrent_requests)
-            .queue_size(self.serving.queue_size)
-            .queue_timeout_secs(self.serving.queue_timeout_secs)
-            .prefill_max_inflight_requests_per_worker(
-                self.workers.prefill_max_inflight_requests_per_worker,
-            )
-            .prefill_queue_size(self.workers.prefill_queue_size)
-            .prefill_queue_timeout_secs(self.workers.prefill_queue_timeout_secs)
-            .priority_scheduler_enabled(self.serving.priority_scheduler_enabled)
-            .priority_scheduler_default_max_class(
-                self.serving.priority_scheduler_default_max_class.clone(),
-            )
-            .priority_scheduler_config(self.serving.priority_scheduler_config.clone())
-            .priority_scheduler_tenant_metric_top_n(
-                self.serving.priority_scheduler_tenant_metric_top_n,
-            )
-            .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
-            .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
-            .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
-            .retry_config(RetryConfig {
-                max_retries: self.serving.retry_max_retries,
-                initial_backoff_ms: self.serving.retry_initial_backoff_ms,
-                max_backoff_ms: self.serving.retry_max_backoff_ms,
-                backoff_multiplier: self.serving.retry_backoff_multiplier,
-                jitter_factor: self.serving.retry_jitter_factor,
-            })
-            .circuit_breaker_config(CircuitBreakerConfig {
-                failure_threshold: self.serving.cb_failure_threshold,
-                success_threshold: self.serving.cb_success_threshold,
-                timeout_duration_secs: self.serving.cb_timeout_duration_secs,
-                window_duration_secs: self.serving.cb_window_duration_secs,
-            })
-            .health_check_config(HealthCheckConfig {
-                failure_threshold: self.serving.health_failure_threshold,
-                success_threshold: self.serving.health_success_threshold,
-                timeout_secs: self.serving.health_check_timeout_secs,
-                check_interval_secs: self.serving.health_check_interval_secs,
-                endpoint: self.serving.health_check_endpoint.clone(),
-                disable_health_check: self.serving.disable_health_check,
-                // Kept unresolved: the server resolves it against the
-                // discovery the configuration selects.
-                remove_unhealthy_workers: self.serving.remove_unhealthy_workers,
-                drain_settle_secs: self.serving.drain_settle_secs,
-            })
-            .tokenizer_cache(TokenizerCacheConfig {
-                enable_l0: self.model.tokenizer_cache_enable_l0,
-                l0_max_entries: self.model.tokenizer_cache_l0_max_entries,
-                l0_max_memory: self.model.tokenizer_cache_l0_max_memory,
-                enable_l1: self.model.tokenizer_cache_enable_l1,
-                l1_max_memory: self.model.tokenizer_cache_l1_max_memory,
-            })
-            .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
-            .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
-            .history_backend(history_backend)
-            .memory_config(MemoryConfig {
-                max_responses: self.model.history_memory_max_responses,
-                max_items: self.model.history_memory_max_items,
-                retention_secs: (self.model.history_memory_retention_secs > 0)
-                    .then_some(self.model.history_memory_retention_secs),
-            })
-            .log_level(&self.serving.log_level)
-            .access_log_fields(self.serving.access_log_fields.clone())
-            .maybe_api_key(self.integrations.api_key.as_ref())
-            .tenant_api_keys(tenant_api_keys)
-            .maybe_discovery(discovery)
-            .maybe_metrics(metrics)
-            .maybe_trace(trace_config)
-            .maybe_log_dir(self.serving.log_dir.as_ref())
-            .maybe_jemalloc_prof_dir(self.serving.jemalloc_prof_dir.as_ref())
-            .maybe_request_id_headers(
-                (!self.serving.request_id_headers.is_empty())
-                    .then(|| self.serving.request_id_headers.clone()),
-            )
-            .maybe_storage_context_headers(
-                (!self.serving.storage_context_headers.is_empty())
-                    .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
-            )
-            .trust_tenant_header(self.serving.trust_tenant_header)
-            .tenant_header_name(&self.serving.tenant_header_name)
-            .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
-            .max_background_responses(self.serving.max_background_responses)
-            .maybe_model_path(self.model.model_path.as_ref())
-            .maybe_tokenizer_path(self.model.tokenizer_path.as_ref())
-            .maybe_chat_template(self.model.chat_template.as_ref())
-            .model_aliases(model_aliases)
-            .maybe_oracle(oracle)
-            .maybe_postgres(postgres)
-            .maybe_redis(redis)
-            .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
-            .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
-            .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
-            .dp_aware(self.routing.dp_aware)
-            .pd_pairing_mode(
-                PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
-            )
-            .routing_key_override(RoutingKeyOverrideConfig {
-                enabled: self.routing.routing_key_override,
-                eviction_interval_secs: self.routing.eviction_interval,
-                max_idle_secs: self.routing.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(
-                    self.routing.assignment_mode.as_deref(),
-                    ManualAssignmentMode::Delegate,
-                ),
-                headers: self.routing.routing_key_headers.clone(),
-            })
-            .retries(!self.serving.disable_retries)
-            .upstream_http2(self.routing.upstream_http2)
-            .circuit_breaker(!self.serving.disable_circuit_breaker)
-            .enable_wasm(self.model.enable_wasm)
-            .maybe_storage_hook_wasm_path(self.model.storage_hook_wasm_path.as_deref())
-            .igw(self.routing.enable_igw)
-            .rl(smg_rl::RlConfig {
-                enabled: self.workers.enable_rl,
-                control_timeout_secs: self.workers.rl_control_timeout_secs,
-                fanout_concurrency: self.workers.rl_fanout_concurrency,
-            })
-            .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
-            .maybe_client_cert_and_key(
-                self.integrations.client_cert_path.as_ref(),
-                self.integrations.client_key_path.as_ref(),
-            )
-            .add_ca_certificates(self.integrations.ca_cert_paths.clone())
-            .maybe_server_cert_and_key(
-                self.integrations.tls_cert_path.as_ref(),
-                self.integrations.tls_key_path.as_ref(),
-            );
-
-        builder.build()
-    }
-
-    /// Combine validated router settings with listener, discovery, and authentication flags.
-    fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
-        let service_discovery_config = router_config
-            .discovery
-            .as_ref()
-            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
-            .transpose()?;
-        let mesh_discovery_config = router_config
-            .discovery
-            .as_ref()
-            .and_then(MeshDiscoveryConfig::from_discovery);
-
-        let prometheus_config = Some(PrometheusConfig {
-            port: self.serving.prometheus_port,
-            host: self.metrics_host(),
-            duration_buckets: if self.serving.prometheus_duration_buckets.is_empty() {
-                None
-            } else {
-                Some(self.serving.prometheus_duration_buckets.clone())
-            },
-        });
-
-        // Build control plane auth config
-        let control_plane_auth = {
-            let config = self.build_control_plane_auth_config()?;
-            if config.is_enabled() {
-                Some(config)
-            } else {
-                None
-            }
-        };
-
-        // ==================== Mesh Server ====================
-        let mesh_server_config = self.build_mesh_server_config()?;
-
-        Ok(ServerConfig {
-            host: self.routing.host.clone(),
-            port: self.routing.port,
-            health_check_port: self.routing.health_check_port,
-            runtime_worker_threads: self.integrations.runtime_worker_threads,
-            router_config,
-            max_payload_size: self.serving.max_payload_size,
-            log_dir: self.serving.log_dir.clone(),
-            log_level: Some(self.serving.log_level.clone()),
-            log_json: self.serving.log_json,
-            service_discovery_config,
-            mesh_discovery_config,
-            prometheus_config,
-            request_timeout_secs: self.serving.request_timeout_secs,
-            request_id_headers: if self.serving.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.serving.request_id_headers.clone())
-            },
-            shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
-            control_plane_auth,
-            mesh_server_config,
-            webrtc_bind_addr: self.integrations.webrtc_bind_addr,
-            webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
-            secret_sources: self.integrations.secret_sources,
-        })
-    }
-
-    /// The mode label of the start-up banner. It follows the flags, not the
-    /// built [`RoutingMode`]: IGW first, then the OpenAI and Anthropic
-    /// backends, then the disaggregated modes, then the backend's name
-    /// (`--backend gemini` is labelled `Regular (gemini)`, as it always was).
-    fn banner_mode(&self) -> String {
-        if self.routing.enable_igw {
-            "IGW (Inference Gateway)".to_string()
-        } else if matches!(self.model.backend, Some(Backend::Openai)) {
-            "OpenAI Backend".to_string()
-        } else if matches!(self.model.backend, Some(Backend::Anthropic)) {
-            "Anthropic Backend".to_string()
-        } else if self.workers.epd_disaggregation {
-            "EPD Disaggregated".to_string()
-        } else if self.workers.pd_disaggregation {
-            "PD Disaggregated".to_string()
-        } else if let Some(backend) = &self.model.backend {
-            format!("Regular ({backend})")
-        } else {
-            "Regular".to_string()
-        }
-    }
-
-    /// Phase 2, announce: the banner and the lines under it, printed before
-    /// the configuration is built so an operator sees what was asked for
-    /// even when it is refused; nothing is changed. The logger is not up
-    /// yet: this is plain stdout.
-    #[expect(
-        clippy::print_stdout,
-        reason = "pre-logger startup output: the banner and the flags' summary"
-    )]
-    fn announce(
-        &self,
-        igw_enabled_for_discovery: bool,
-        prefill_urls: &[(String, Option<u16>)],
-        encode_urls: &[(String, Option<u16>)],
-    ) {
-        if igw_enabled_for_discovery {
-            println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-        }
-        version::print_banner(&self.routing.host, self.routing.port, &self.banner_mode());
-        if self.routing.enable_igw {
-            return;
-        }
-        println!("Policy: {}", self.routing.policy);
-        if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
-        }
-        if self.workers.epd_disaggregation {
-            println!("Encode nodes: {encode_urls:?}");
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
-        }
-    }
-
-    /// Phase 3, configure: the router configuration, validated, wrapped in
-    /// the server configuration. Every refusal is a [`ConfigError`] naming
-    /// the flag; nothing has been bound or spawned when one is raised.
-    fn configure(
-        &self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        encode_urls: Vec<(String, Option<u16>)>,
-    ) -> ConfigResult<ServerConfig> {
-        let router_config = self.to_router_config(prefill_urls, encode_urls)?;
-        router_config.validate()?;
-        self.to_server_config(router_config)
-    }
-}
-
 /// The text a version flag prints, read before anything else is parsed so a
 /// command line with an error elsewhere still answers `--version`.
 fn version_flag(args: &[String]) -> Option<String> {
@@ -3248,7 +1881,7 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 /// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = match server_config.runtime_worker_threads {
+    let runtime = match server_config.router_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
             .enable_all()
@@ -3285,7 +1918,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::path::Path;
 
-    use smg::{config::UnhealthyRemovalScope, server::posture::SecretSource};
+    use smg::{
+        config::{
+            CacheIndexKind, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
+            FileDiscoveryConfig, ManualAssignmentMode, ParserChoice, PolicyConfig,
+            SlurmDiscoveryConfig, UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+        },
+        server::posture::SecretSource,
+        service_discovery::RuntimeDiscoveryConfig,
+        worker::{ConnectionMode, RuntimeType},
+    };
+    use smg_auth::Role;
 
     use super::*;
 
@@ -3313,7 +1956,6 @@ mod tests {
                         args.resolve_secret_sources(&|_| Ok(None)).unwrap();
                         let router = args.to_router_config(vec![], vec![]).unwrap();
                         let server = args.to_server_config(router).unwrap();
-                        assert_eq!(server.port, 31000);
                         assert_eq!(server.router_config.port, 31000);
                     }
                 })
@@ -3581,6 +2223,34 @@ mod tests {
         cli_args_from(&["--cors-allowed-origins", "*"])
             .to_router_config(vec![], vec![])
             .expect("a lone '*' is the open policy");
+    }
+
+    /// The names `--backend` and `--discovery-provider` accept are the ones
+    /// their values print, so a message that names a value spells it as the
+    /// flag takes it.
+    #[test]
+    fn a_backend_and_a_discovery_provider_print_the_names_their_flags_accept() {
+        let backends: Vec<String> = Backend::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            backends,
+            [
+                "sglang",
+                "vllm",
+                "trtllm",
+                "tokenspeed",
+                "openai",
+                "anthropic",
+                "gemini"
+            ]
+        );
+        let providers: Vec<String> = DiscoveryProvider::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(providers, ["kubernetes", "file", "slurm", "consul"]);
     }
 
     /// A flag that only acts with a companion is named when the companion is
@@ -4176,52 +2846,27 @@ mod tests {
         }
     }
 
-    /// The deprecated indexer prune flags are still accepted and flow into
-    /// `RouterConfig`, where nothing reads them but the startup warning.
+    /// The deprecated `--kv-index`, `--kv-indexer-ttl-secs` and
+    /// `--kv-indexer-max-entries` flags went with the positional indexer they
+    /// configured: a launch line that still carries one is refused at parse
+    /// time as an unknown argument, not accepted and ignored.
     #[test]
-    fn kv_indexer_prune_flags_flow_into_router_config() {
-        let cli = cli_args_from(&[
-            "--kv-indexer-ttl-secs",
-            "600",
-            "--kv-indexer-max-entries",
-            "500000",
-        ]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_indexer_ttl_secs, Some(600));
-        assert_eq!(router_config.kv_indexer_max_entries, Some(500_000));
-
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_indexer_ttl_secs, None);
-        assert_eq!(defaults.kv_indexer_max_entries, None);
-    }
-
-    /// `--kv-index` is deprecated: the chain index is the only KV index, so
-    /// `chain` is accepted (and flows into `RouterConfig` for the startup
-    /// warning), the removed `positional` index is refused with the reason,
-    /// and any other spelling is an invalid value.
-    #[test]
-    fn kv_index_flag_takes_chain_only() {
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, None);
-
-        let cli = cli_args_from(&["--kv-index", "Chain"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index.as_deref(), Some("chain"));
-        router_config.validate().unwrap();
-
-        let err = Cli::try_parse_from(["smg", "--kv-index", "positional"])
-            .expect_err("the removed positional index is refused");
-        let text = err.to_string();
-        assert!(
-            text.contains("positional KV index was removed") && text.contains("--kv-index"),
-            "the refusal names the removal and the flag: {text}"
-        );
-        for value in ["run", "tree"] {
-            let err = Cli::try_parse_from(["smg", "--kv-index", value])
-                .expect_err("only chain is accepted");
+    fn removed_kv_index_flags_are_refused_at_parse_time() {
+        for argv in [
+            ["smg", "--kv-index", "chain"],
+            ["smg", "--kv-indexer-ttl-secs", "600"],
+            ["smg", "--kv-indexer-max-entries", "500000"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("a removed flag is refused");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{}: {err}",
+                argv[1]
+            );
             assert!(
-                err.to_string().contains("takes chain only"),
-                "{value}: {err}"
+                err.to_string().contains(argv[1]),
+                "the refusal names the flag: {err}"
             );
         }
     }
@@ -5052,13 +3697,11 @@ mod tests {
         );
     }
 
-    /// `--health-check-port` must flow into BOTH conversion paths
-    /// (`to_router_config` and `to_server_config`), mirroring the main
-    /// listener `--port` field exactly. This is the two-path config-plumbing
-    /// guard: wiring only one path would let the flag be silently ignored on
-    /// the other.
+    /// `--health-check-port` reaches `RouterConfig`, the one home of the
+    /// listener settings, which the server configuration nests: there is no
+    /// second copy for a wiring to miss.
     #[test]
-    fn health_check_port_flows_into_both_configs() {
+    fn health_check_port_flows_into_the_router_config() {
         let cli = cli_args_from(&["--health-check-port", "8081"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -5069,24 +3712,20 @@ mod tests {
         );
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.health_check_port,
-            Some(8081),
-            "health_check_port must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.health_check_port, Some(8081));
     }
 
     /// Unset `--health-check-port` means the dedicated probe listener is off:
-    /// `None` propagates through both conversions (backward-compatible default).
+    /// `None` reaches the server configuration (backward-compatible default).
     #[test]
-    fn health_check_port_defaults_to_none_in_both_configs() {
+    fn health_check_port_defaults_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.health_check_port, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.health_check_port, None);
+        assert_eq!(server_config.router_config.health_check_port, None);
     }
 
     /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
@@ -5576,6 +4215,30 @@ mod tests {
         assert!(!server_config.router_config.engine_metrics);
     }
 
+    /// Symphony is the default parser in both conversions; `--parser legacy`
+    /// selects the per-model parsers, and any other name is refused by clap.
+    #[test]
+    fn parser_defaults_to_symphony_and_legacy_selects_the_legacy_parsers() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.parser, ParserChoice::Symphony);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.parser, ParserChoice::Symphony);
+
+        let cli = cli_args_from(&["--parser", "legacy"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.parser, ParserChoice::Legacy);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.parser, ParserChoice::Legacy);
+
+        let cli = cli_args_from(&["--parser", "symphony"]);
+        assert_eq!(
+            cli.to_router_config(vec![], vec![]).unwrap().parser,
+            ParserChoice::Symphony
+        );
+        assert!(Cli::try_parse_from(["smg", "--parser", "fast"]).is_err());
+    }
+
     /// clap rejects out-of-range probe ports at parse time (the `u16`
     /// value_parser), matching `--port` validation — no runtime crash.
     #[test]
@@ -5587,35 +4250,30 @@ mod tests {
         );
     }
 
-    /// The `--runtime-worker-threads` override must flow into BOTH conversion
-    /// paths (`to_router_config` and `to_server_config`); wiring only one path
-    /// would let the flag be silently ignored on the other (the two-path footgun).
+    /// The `--runtime-worker-threads` override reaches `RouterConfig`, from
+    /// which `serve` sizes the runtime; the server configuration nests it.
     #[test]
-    fn runtime_worker_threads_flows_into_both_configs() {
+    fn runtime_worker_threads_flows_into_the_router_config() {
         let cli = cli_args_from(&["--runtime-worker-threads", "3"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, Some(3));
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.runtime_worker_threads,
-            Some(3),
-            "runtime_worker_threads must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.runtime_worker_threads, Some(3));
     }
 
-    /// Unset, the flag propagates as `None` through both conversions, so the
+    /// Unset, the flag reaches the server configuration as `None`, so the
     /// runtime uses tokio's container-aware default.
     #[test]
-    fn runtime_worker_threads_default_to_none_in_both_configs() {
+    fn runtime_worker_threads_default_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.runtime_worker_threads, None);
+        assert_eq!(server_config.router_config.runtime_worker_threads, None);
     }
 
     /// Both values the validator bounds are checked on the command line's own
@@ -6424,5 +5082,121 @@ mod tests {
             assert!(help.contains(named), "{named} missing from the help");
         }
         assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
+    }
+
+    /// The three start-up bounds hold for every worker the gateway starts
+    /// with, so the help lists them with the worker settings and not under
+    /// the disaggregation heading.
+    #[test]
+    fn the_worker_start_up_bounds_are_listed_under_worker_configuration() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for id in [
+            "worker_startup_timeout_secs",
+            "worker_startup_delay",
+            "worker_startup_check_interval",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert_eq!(
+                arg.get_help_heading(),
+                Some("Worker Configuration"),
+                "{id} is listed under another heading"
+            );
+        }
+    }
+
+    /// The listener settings the server reads (the bind host and port, the
+    /// probe port, the body limit, the request timeout, the request-id
+    /// headers, the runtime size) live on the router configuration the
+    /// server configuration nests: the value the validator checked is the
+    /// one the listeners bind.
+    #[test]
+    fn the_server_configuration_reads_its_listener_settings_from_the_router_configuration() {
+        let cli = cli_args_from(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "31234",
+            "--health-check-port",
+            "31235",
+            "--max-payload-size",
+            "4096",
+            "--request-timeout-secs",
+            "7",
+            "--request-id-headers",
+            "x-trace-id",
+            "--runtime-worker-threads",
+            "2",
+        ]);
+        let server_config = cli.configure(vec![], vec![]).expect("configures");
+        let listener = &server_config.router_config;
+        assert_eq!(
+            (listener.host.as_str(), listener.port),
+            ("127.0.0.1", 31234)
+        );
+        assert_eq!(listener.health_check_port, Some(31235));
+        assert_eq!(listener.max_payload_size, 4096);
+        assert_eq!(listener.request_timeout_secs, 7);
+        assert_eq!(
+            listener.request_id_headers.as_deref(),
+            Some(&["x-trace-id".to_string()][..])
+        );
+        assert_eq!(listener.runtime_worker_threads, Some(2));
+    }
+
+    /// `configure` validates the configuration once, through the builder's
+    /// `build()`: a second pass over the same value repeats every file read
+    /// of the validators (the scheduler YAML, the log-directory probe) for no
+    /// second opinion. An inotify watch on the scheduler file counts the
+    /// read-only opens `configure` closes; the count does not depend on
+    /// timing, since the events queue until they are read. The watch takes
+    /// the opens as well: the kernel folds two identical queued events into
+    /// one, and the open between two closes keeps them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        use std::mem::MaybeUninit;
+
+        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = dir.path().join("scheduler.yaml");
+        std::fs::write(&scheduler, "{}\n").unwrap();
+        let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(
+            &watch,
+            &scheduler,
+            WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
+        )
+        .unwrap();
+
+        let cli = cli_args_from(&[
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            scheduler.to_str().unwrap(),
+        ]);
+        cli.configure(vec![], vec![]).expect("configures");
+
+        // Every read-only open `configure` made has closed by now; the
+        // non-blocking read drains what queued and stops at an empty queue.
+        let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut events = inotify::Reader::new(&watch, &mut buf);
+        let mut reads = 0;
+        loop {
+            match events.next() {
+                Ok(event) => {
+                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                        reads += 1;
+                    }
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => break,
+                Err(error) => panic!("reading the inotify events: {error}"),
+            }
+        }
+        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
     }
 }

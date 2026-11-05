@@ -89,6 +89,12 @@ pub struct VllmModelInfo {
     pub kv_connector: String,
     pub kv_role: String,
     pub kv_engine_id: String,
+    /// Whether a Mooncake connector runs in the engine at all, as the
+    /// launcher reads it off the raw `kv_transfer_config` (the top-level
+    /// connector or any child a wrapper lists, whatever `kv_connector`
+    /// projects): a PD decode side's KV-transfer rejection notice is
+    /// withheld there (see `generate.rs`).
+    pub runs_mooncake: bool,
     /// PD pairing facts the Router matches before a handoff: requested KV
     /// cache dtype and attention backend (empty when auto), and the model
     /// dtype / block size the handshake confirms (these two are fallbacks
@@ -146,6 +152,13 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub constrained_decoding_start: String,
+    /// The vocabulary of structural-tag nodes the engine's grammar compiler
+    /// takes, as the launcher read it off the xgrammar installed beside the
+    /// engine (`structural_tag_vocabulary` label): `older` for one that
+    /// predates the `optional`, `plus`, `star` and `token` nodes and refuses
+    /// a tag that carries one; empty for a current one, another backend, or
+    /// nothing known.
+    pub structural_tag_vocabulary: String,
     /// Whether the engine's scheduler statistics are on (vLLM's
     /// `--disable-log-stats` not given), as the launcher started it: such an
     /// engine's wire reports every scheduler step, and the pushed load record
@@ -194,9 +207,10 @@ impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let response = info::loads(self).ok()?;
         let load = match dp_rank {
-            // A rank the report has no entry for (it has not reported a
-            // scheduler step while another rank has) gets no record rather
-            // than another rank's figures, as under the Python servicer.
+            // A connected rank reads its own entry (zero-filled until its
+            // first scheduler step, whichever rank reported first), never
+            // another rank's figures; a rank past the connected ones gets
+            // no record.
             Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
             None => response
                 .loads
@@ -215,6 +229,10 @@ impl crate::kv_events::RankLoads for State {
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
     }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
+    }
 }
 
 pub(super) struct State {
@@ -222,9 +240,6 @@ pub(super) struct State {
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
-    /// Queued token-work, generation throughput and hit rate from the
-    /// requests this servicer forwards, per rank, for `GetLoads`.
-    pub(super) loads: crate::load_tracker::LoadTracker,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
     pub(super) tokenizer: TokenizerSlot,
@@ -303,8 +318,12 @@ impl VllmServicerServer {
         )?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
-            loads: crate::load_tracker::LoadTracker::default(),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             tokenizer: TokenizerSlot::new(),
             media: config.media_processor.map(MediaGate::new),
         });
@@ -381,7 +400,8 @@ impl VllmServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

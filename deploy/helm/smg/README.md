@@ -68,7 +68,11 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
+`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.extraArgs`), not for `--policy`.
+
+### Admission Bound
+
+`router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
 
 ### Workers
 
@@ -126,16 +130,37 @@ labelled `model`, `rank` and `wire`; it binds beside the gRPC listener before
 the engine connects, so a scrape during start-up answers
 `smg_servicer_state{state="starting"} 1`.
 
-Off (the default), nothing changes: the launcher's own servicer choice stands
-and the pod exposes no metrics port. The Python servicer has no endpoint, so
-`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
-is refused by the launcher before the engine starts. The SGLang Rust servicer
-serves neither PD/EPD disaggregation nor image and video input yet (it
-advertises no vision support, so the gateway refuses media for that worker at
-its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
-A `metrics.port` equal to the serving port is refused when the chart renders.
+Off (the default), the pod exposes no metrics port and the launcher's own
+servicer choice stands: the Rust servicer, its default, unless the worker's
+`servicerImpl` is `"python"` (the deprecated Python servicer, kept for the
+deprecation window; the pod then gets `SMG_<ENGINE>_SERVICER_IMPL=python`).
+The Python servicer has no metrics endpoint, so `servicerImpl: "python"` (or
+`extraArgs: ["--servicer-impl", "python"]`) together with `metrics.enabled`
+is refused by the launcher before the engine starts. A `metrics.port` equal to
+the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
+
+#### Parser
+
+`router.parser` picks the parser that reads a chat completion's reasoning and
+tool calls: `symphony` (one table per model family, the gateway's default from
+the release after 1.13.0 on) or `legacy` (the older per-model parsers). Empty,
+the default, renders no `--parser`, so the image's own default applies and the
+value is safe on every image. A set value needs a gateway image of 1.13.0 or
+later: the flag arrived in 1.13.0 (with `legacy` as its default there), and an
+earlier image rejects it and exits at startup. The choice applies to gRPC and
+ZMQ workers; an HTTP worker's engine parses its own output, so the value changes
+nothing there. A deployment that set `--parser` through `router.extraArgs` removes
+it there when it sets this value: the gateway refuses the flag twice and exits at
+startup. A request's `X-SMG-Parser` header overrides the flag for that
+request. `router.toolCallParser` and `router.reasoningParser` are read
+differently by each parser: under Symphony, a model the registry knows keeps
+its own table and the flags apply only to models it does not know; under
+`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
+and a Symphony-only name (`muse`, for one) are refused at startup, while a
+name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
+one) keeps that parser.
 
 #### Worker Discovery
 
@@ -244,6 +269,15 @@ requests themselves.
 A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls`, `router.serviceDiscovery` or `router.discovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
+
+During shutdown, readiness fails immediately while listeners stay open for
+`min(router.shutdownGracePeriodSeconds / 2, 5 seconds)` by default.
+Set `router.shutdownSettleSeconds` (`--shutdown-settle-secs`) to adjust this
+propagation window; the effective window is the smaller of this value and half
+the grace. For example, a 180-second grace and a 30-second window leaves
+150 seconds for draining existing requests. Longer windows also delay idle
+shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
+(mesh departure still shares the total grace budget).
 
 #### Dashboard and Alerts
 

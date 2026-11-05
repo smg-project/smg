@@ -147,14 +147,14 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -262,7 +262,7 @@ mod tests {
     fn empty_config_uses_omni_half_normalization() {
         let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
         let output = Qwen3OmniVisionProcessor::new()
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
 
         assert!(output

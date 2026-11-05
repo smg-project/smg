@@ -11,28 +11,44 @@
 //! 1. added tokens are cut out of the text the way `AddedVocabulary` does it
 //!    (leftmost-longest, the non-normalized set on the raw text first, the
 //!    normalized set after normalization);
-//! 2. normalization is NFC or nothing; NFC is applied only as a check: the
-//!    text must already be in NFC (the quick check says so for most prompts
-//!    and normalizing settles the rest, so marks-heavy scripts stay on this
-//!    path when they are in NFC) and anything else goes back to `tokenizers`;
+//! 2. normalization is NFC or nothing, read from the tables `tokenizers`
+//!    normalizes with (the crate `unicode-normalization-alignments`, every
+//!    NFC read of this module: a newer crate's tables know marks and
+//!    compositions the library's do not and would compose other text); a
+//!    text already in NFC (its ASCII stretches are not read at all, the
+//!    quick check answers for most of the rest and normalizing settles what
+//!    it cannot, so marks-heavy scripts cost no copy) is used as it is, any
+//!    other text is normalized gap by gap between its raw added tokens, as
+//!    `tokenizers` normalizes it, and encoded from those buffers;
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
-//!    engine `tokenizers` uses, producing byte ranges instead of strings;
-//! 4. each piece is mapped to the byte-level alphabet and tokenized by the
-//!    tokenizer's own BPE model (so `ignore_merges` and the rest keep their
-//!    meaning), through a small per-thread cache from piece bytes to ids.
+//!    engine `tokenizers` uses, producing byte ranges instead of strings (a
+//!    chain of three stages of one known shape runs as one scan instead,
+//!    see [`chain`]);
+//! 4. each piece is tokenized behind two tables from piece bytes to ids
+//!    (`short_pieces`): a small per-thread cache of the pieces the thread
+//!    has met, filled on a first sight from the vocabulary's own pieces,
+//!    built at load and shared by every thread; a piece neither table
+//!    holds is merged over the model's own merges by [`merge::MergeTable`]
+//!    (the model's `tokenize` without its strings; `ignore_merges` looks
+//!    the whole piece up in the model's vocabulary first), or by the model
+//!    itself for a vocabulary the table declines (see `merge`);
+//! 5. a request for special tokens gets the frame the post-processor puts
+//!    around one sequence (none, or a `TemplateProcessing`'s single template:
+//!    the ids of its special tokens before and after the `$A` sequence, read
+//!    once at load) written around the ids.
 //!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
-//! supported subset, a post-processor that adds tokens, truncation or
-//! padding, added tokens with `single_word`/`lstrip`/`rstrip`) simply has no
-//! native path. Since no post-processor the path accepts adds tokens, a
-//! request for special tokens gets the same ids and is served by the path
-//! as well.
+//! supported subset, a post-processor other than `ByteLevel` or a template
+//! of that shape, truncation or padding, added tokens with
+//! `single_word`/`lstrip`/`rstrip`) simply has no native path.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -42,12 +58,17 @@ use serde::Serialize;
 use serde_json::Value;
 use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization_alignments::UnicodeNormalization;
 
+mod chain;
+mod merge;
 mod pattern;
+mod short_pieces;
 mod unicode;
 
+use merge::MergeTable;
 use pattern::Pattern;
+use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
 
 use crate::{
     encode_path::{Declined, Fallback},
@@ -60,8 +81,10 @@ const BYTE_LEVEL_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
 /// Pieces up to this many bytes are cached per thread by their count (see
-/// `PIECE_CACHE_CAPACITY`); longer ones, up to `LONG_PIECE_MAX_BYTES`, by
-/// the bytes they take (see `LONG_PIECE_BYTES_CAPACITY`).
+/// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
+/// packed table, the longer ones in a map; longer pieces still, up to
+/// `LONG_PIECE_MAX_BYTES`, by the bytes they take (see
+/// `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// Longest piece cached at all (a clause of some 80 characters in a script
 /// without word spaces, 256 of ASCII): a longer piece is rare and tokenized
@@ -70,16 +93,23 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
-/// cost of its lookups, one with more at first-pass cost on every pass, since
-/// the clear takes the pieces that recur with the rest (the crate bench
+/// cost of its lookups, one with more at first-sight cost on every pass,
+/// since the clear takes the pieces that recur with the rest (the crate bench
 /// `encode_volume` shows both, and that the cost of text no pass has seen
-/// does not depend on how much a thread encoded before).
+/// does not depend on how much a thread encoded before); a first sight of a
+/// vocabulary word costs a read of the encoder's seed, of another piece the
+/// model's merges.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`), so the piece caches of one
-/// tokenizer stay under about 40 MB however many runtime and blocking threads
-/// encode with it, and they are freed with the encoder.
+/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
+/// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
+/// the slots for its cap (33 bytes a slot: 1 MiB at the full cap), and is
+/// made anew for a smaller cap when it is cleared, so a thread that encodes
+/// little holds little and the packed tables of one tokenizer stay under
+/// about 24 MiB however many runtime and blocking threads encode with it
+/// (the maps of the longer pieces share the count); they are freed with the
+/// encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -112,10 +142,39 @@ const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
 
-/// One thread's cache of the pieces it tokenized with one encoder.
+/// The ids of one vocabulary entry while the seed is built, in a fixed slot
+/// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
+/// the vocabulary allocates one list rather than one per entry.
+#[derive(Clone, Copy, Default)]
+struct SeededIds {
+    count: u8,
+    ids: [u32; SHORT_PIECE_MAX_BYTES],
+}
+
+impl SeededIds {
+    /// Takes one more id; `None` when the slot is full.
+    fn push(&mut self, id: u32) -> Option<()> {
+        *self.ids.get_mut(usize::from(self.count))? = id;
+        self.count += 1;
+        Some(())
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.ids[..usize::from(self.count)]
+    }
+}
+
+/// One thread's cache of the pieces it met with one encoder, each with the
+/// ids the encoder's seed or the model gave it.
 #[derive(Default)]
 struct PieceCache {
-    /// Pieces of up to `CACHED_PIECE_MAX_BYTES`, bounded by their count.
+    /// Pieces of up to `SHORT_PIECE_MAX_BYTES`, packed; made at the first
+    /// such piece with the fewest slots and grown with the pieces the thread
+    /// meets, up to its share. Bounded by count together with `short`.
+    packed: Option<ShortPieceTable>,
+    /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
+    /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
+    /// `packed`.
     short: PieceIds,
     /// Longer pieces, up to `LONG_PIECE_MAX_BYTES`, bounded by their bytes.
     long: PieceIds,
@@ -124,7 +183,21 @@ struct PieceCache {
 }
 
 impl PieceCache {
-    /// The ids cached for `piece`, if any.
+    /// Entries of the tiers bounded by count, `packed` and `short`.
+    fn short_entries(&self) -> usize {
+        self.packed.as_ref().map_or(0, ShortPieceTable::len) + self.short.len()
+    }
+
+    /// Forgets the tiers bounded by count; the packed table keeps its slots
+    /// unless `share` fell below them.
+    fn clear_short(&mut self, share: usize) {
+        if let Some(packed) = &mut self.packed {
+            packed.clear(share);
+        }
+        self.short.clear();
+    }
+
+    /// The ids cached for a piece longer than the packed tier keys, if any.
     fn get(&self, piece: &[u8]) -> Option<&[u32]> {
         let tier = if piece.len() <= CACHED_PIECE_MAX_BYTES {
             &self.short
@@ -148,17 +221,122 @@ fn escape_literal(literal: &str) -> String {
     out
 }
 
-/// Whether `text` is already in NFC. The quick check answers for most text;
-/// where it cannot (marks that might compose or reorder: Indic vowel signs
-/// and nuktas, an acute after a letter, Hangul jamo, ...) the text is
-/// normalized and compared, which costs far less than the encode it keeps on
-/// the native path.
-fn is_nfc(text: &str) -> bool {
-    match is_nfc_quick(text.chars()) {
-        IsNormalized::Yes => true,
-        IsNormalized::No => false,
-        IsNormalized::Maybe => text.nfc().eq(text.chars()),
+/// The offset of the first byte of `bytes` outside ASCII, read eight bytes
+/// at a time.
+fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    let (words, _) = bytes.as_chunks::<8>();
+    let at = 8 * words
+        .iter()
+        .position(|word| u64::from_ne_bytes(*word) & HIGH_BITS != 0)
+        .unwrap_or(words.len());
+    bytes[at..]
+        .iter()
+        .position(|byte| !byte.is_ascii())
+        .map(|i| at + i)
+}
+
+/// The length of the run of CJK ideographs at the start of `bytes`: the
+/// characters U+4000..=U+9FFF, each a lead byte E4..=E9 and two continuation
+/// bytes in UTF-8 (E4 80 80 is U+4000, E9 BF BF is U+9FFF; the kana under E3
+/// and the Hangul syllables under EA..=ED are not in it). Every one of them
+/// has combining class 0, no canonical decomposition and no part in any
+/// canonical composition (`the_ideograph_range_is_settled_by_the_crates_own_tables`
+/// walks the range against the crate's tables), so a run of them is in NFC
+/// and either side of it is a cut, like an ASCII stretch.
+fn ideograph_run(bytes: &[u8]) -> usize {
+    let mut at = 0;
+    while at + 3 <= bytes.len() && matches!(bytes[at], 0xE4..=0xE9) {
+        at += 3;
     }
+    at
+}
+
+/// The length of the run of non-ASCII bytes at the start of `bytes`, short
+/// of its first ideograph (a continuation byte never reads as a lead byte,
+/// so the first E4..=E9 byte starts one): one pass that ends at the first
+/// ASCII or ideograph lead byte, so a line of ideographs and full-width
+/// punctuation is read once however many pieces it splits into.
+fn checked_run(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|byte| byte.is_ascii() || matches!(byte, 0xE4..=0xE9))
+        .unwrap_or(bytes.len())
+}
+
+/// The stretches of `text` that normalization reads on their own, each with
+/// its byte offset and whether it is settled: ASCII, or CJK ideographs. An
+/// ASCII stretch is in NFC in every version of Unicode and no normalization
+/// changes it; so is a run of ideographs (see [`ideograph_run`]), and
+/// nothing composes with an ideograph on either side. A run of other
+/// non-ASCII characters goes with the ASCII character before it, the letter
+/// an accent at its start composes with; nothing else crosses a cut: no
+/// composition has an ASCII character or an ideograph as its second
+/// element, no decomposition reaches across one, and both are starters, so
+/// the canonical order of marks never spans one.
+fn stretches(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let start = at;
+        let rest = &bytes[start..];
+        let (len, settled) = match rest.first() {
+            None => return None,
+            Some(first) if first.is_ascii() => match first_non_ascii(rest) {
+                None => (rest.len(), true),
+                // The whole ASCII stretch: the run after it starts with
+                // ideographs, which compose with nothing before them.
+                Some(run) if ideograph_run(&rest[run..]) > 0 => (run, true),
+                // The ASCII stretch, short of the character before the run.
+                Some(run) if run > 1 => (run - 1, true),
+                // That character and the run after it, up to its first
+                // ideograph.
+                Some(run) => (run + checked_run(&rest[run..]), false),
+            },
+            // A run at the start of the text: ideographs on their own, the
+            // other characters up to the first ideograph.
+            Some(_) => match ideograph_run(rest) {
+                0 => (checked_run(rest), false),
+                run => (run, true),
+            },
+        };
+        at = start + len;
+        Some((start, &text[start..at], settled))
+    })
+}
+
+/// Whether `text` is in NFC by the tables `tokenizers` normalizes with: the
+/// crate's check on each stretch that is not settled (the quick check
+/// answers for most text; where it cannot, marks that might compose or
+/// reorder, the stretch is normalized and compared), none on the ASCII and
+/// ideograph ones.
+fn is_nfc(text: &str) -> bool {
+    stretches(text)
+        .all(|(_, stretch, settled)| settled || unicode_normalization_alignments::is_nfc(stretch))
+}
+
+/// `text` in NFC by the tables `tokenizers` normalizes with, borrowed when
+/// it is in NFC already: only a stretch that is not settled and not in NFC
+/// goes through the crate's normalizer (its iterator reports a byte-offset
+/// shift with each character, which this path has no use for), the other
+/// stretches are copied.
+fn nfc(text: &str) -> Cow<'_, str> {
+    let mut owned: Option<String> = None;
+    for (start, stretch, settled) in stretches(text) {
+        if settled || unicode_normalization_alignments::is_nfc(stretch) {
+            if let Some(out) = &mut owned {
+                out.push_str(stretch);
+            }
+        } else {
+            let out = owned.get_or_insert_with(|| {
+                let mut out = String::with_capacity(text.len() + 16);
+                out.push_str(&text[..start]);
+                out
+            });
+            out.extend(stretch.nfc().map(|(ch, _)| ch));
+        }
+    }
+    owned.map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
 /// GPT-2's `bytes_to_unicode`: the alphabet character for each byte.
@@ -252,6 +430,33 @@ enum Segment<'t> {
     Added(u32),
 }
 
+/// A raw added token, or a text between raw added tokens in NFC: borrowed
+/// where it was in NFC already, owned where normalizing changed it (see
+/// [`NativeEncoder::nfc_gaps`]).
+enum Gap<'t> {
+    Text(Cow<'t, str>),
+    Added(u32),
+}
+
+/// The special-token ids the post-processor puts around the one sequence
+/// of an encode when special tokens are requested: a `TemplateProcessing`'s
+/// single template, read at load (see [`NativeEncoder::frame_from`]); empty
+/// for a post-processor that adds none.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Frame {
+    before: Vec<u32>,
+    after: Vec<u32>,
+}
+
+/// A `TemplateProcessing` read for its frame: the ids, and whether its
+/// single template has special-token pieces at all (a piece whose id list
+/// is empty adds no id, but the library still makes an encoding of it, see
+/// [`NativeEncoder::frame_from`]).
+struct Template {
+    frame: Frame,
+    special_pieces: bool,
+}
+
 /// The native encode path of one tokenizer; see the module documentation.
 pub(crate) struct NativeEncoder {
     normalizer: Normalizer,
@@ -260,7 +465,21 @@ pub(crate) struct NativeEncoder {
     /// Added tokens matched after normalization (`normalized: true`).
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
+    /// The one-pass matcher of the stages, when they are a chain it covers
+    /// (the stages stay for the cut checks and as the matcher of record).
+    chain: Option<chain::Scanner>,
+    /// What a request for special tokens adds around the ids.
+    frame: Frame,
     alphabet: [char; 256],
+    /// The vocabulary's own pieces with their ids, read once the model's word
+    /// cache is bounded and consulted by a thread for a piece its own cache
+    /// has not met, before the piece is merged (see
+    /// [`Self::seed_vocabulary`]).
+    seed: ShortPieceTable,
+    /// The model's merges as a table a piece neither the thread's cache nor
+    /// the seed holds is merged over; `None` for a model the table cannot
+    /// stand in for, whose such pieces the model itself tokenizes.
+    merges: Option<MergeTable>,
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
@@ -274,6 +493,10 @@ impl std::fmt::Debug for NativeEncoder {
         f.debug_struct("NativeEncoder")
             .field("normalizer", &self.normalizer)
             .field("stages", &self.stages.len())
+            .field("seeded_pieces", &self.seed.len())
+            .field("native_merge", &self.merges.is_some())
+            .field("chain", &self.chain.is_some())
+            .field("frame", &self.frame)
             .finish()
     }
 }
@@ -295,7 +518,8 @@ fn type_of<'v>(what: &str, component: &'v Value) -> Result<&'v str, Declined> {
 
 impl NativeEncoder {
     /// This path's encoder for `tokenizer`, or why it declines: a shape
-    /// outside what the module documentation lists.
+    /// outside what the module documentation lists. Its seed is empty until
+    /// [`Self::seed_vocabulary`] reads the vocabulary.
     pub(crate) fn from_tokenizer<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
     ) -> Result<Self, Declined> {
@@ -312,17 +536,39 @@ impl NativeEncoder {
             Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
         let stages =
             Self::stages_from(&serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?)?;
-        Self::post_processor_check(&serialized(
+        let frame = Self::frame_from(&serialized(
             "post-processor",
             tokenizer.get_post_processor(),
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
+        let merges = match MergeTable::from_model(tokenizer.get_model().wrapper()) {
+            Ok(table) => {
+                tracing::debug!(
+                    merges = table.merges(),
+                    bytes = table.bytes(),
+                    "the native encode path merges its piece-cache misses itself"
+                );
+                Some(table)
+            }
+            Err(declined) => {
+                tracing::info!(
+                    %declined,
+                    "the native encode path hands its piece-cache misses to the model's own merge"
+                );
+                None
+            }
+        };
+        let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
             stages,
+            chain,
+            frame,
             alphabet: bytes_char(),
+            seed: ShortPieceTable::for_entries(0),
+            merges,
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
@@ -354,18 +600,139 @@ impl NativeEncoder {
         }
     }
 
-    /// Only a post-processor that leaves the ids alone passes: none, or
-    /// `ByteLevel`, which reshapes offsets.
-    fn post_processor_check(post_processor: &Value) -> Result<(), Declined> {
+    /// What the post-processor adds around the ids on request: nothing for
+    /// none or `ByteLevel` (which reshapes offsets), a `TemplateProcessing`'s
+    /// single template ([`Self::template_frame`]), and for a `Sequence` of
+    /// those the one template among its members with special-token pieces:
+    /// `ByteLevel` members add nothing in any position, a template of the
+    /// `$A` sequence alone passes the one encoding through, and any template
+    /// after one with pieces declines, since `Sequence::process_encodings`
+    /// hands that one's pieces on unmerged (a piece with an empty id list
+    /// included): two of them take the next template's pair form, more hit
+    /// a `todo!()` in the library. A sequence inside a sequence and any
+    /// other kind decline.
+    fn frame_from(post_processor: &Value) -> Result<Frame, Declined> {
         if post_processor.is_null() {
-            return Ok(());
+            return Ok(Frame::default());
         }
         match type_of("post-processor", post_processor)? {
-            "ByteLevel" => Ok(()),
+            "ByteLevel" => Ok(Frame::default()),
+            "TemplateProcessing" => {
+                Self::template_frame(post_processor).map(|template| template.frame)
+            }
+            "Sequence" => {
+                let items = post_processor
+                    .get("processors")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| Declined::from("a post-processor sequence without a list"))?;
+                let mut frame = Frame::default();
+                let mut special_pieces = false;
+                for item in items {
+                    match type_of("post-processor", item)? {
+                        "ByteLevel" => {}
+                        "TemplateProcessing" if special_pieces => {
+                            return Err(Declined::from(
+                                "a post-processor sequence with a template after one with \
+                                 special-token pieces",
+                            ));
+                        }
+                        "TemplateProcessing" => {
+                            let template = Self::template_frame(item)?;
+                            frame = template.frame;
+                            special_pieces = template.special_pieces;
+                        }
+                        "Sequence" => {
+                            return Err(Declined::from(
+                                "a post-processor sequence inside a sequence",
+                            ));
+                        }
+                        other => {
+                            return Err(Declined::from(format!(
+                                "post-processor {other} in a sequence (only ByteLevel or \
+                                 TemplateProcessing)"
+                            )));
+                        }
+                    }
+                }
+                Ok(frame)
+            }
             other => Err(Declined::from(format!(
-                "post-processor {other} (only ByteLevel or none)"
+                "post-processor {other} (only ByteLevel, TemplateProcessing or none)"
             ))),
         }
+    }
+
+    /// The frame of a `TemplateProcessing`: the special-token pieces of its
+    /// single template before the `$A` sequence and after it, each the ids
+    /// its entry of `special_tokens` lists (the pair template is never
+    /// applied to one sequence), and whether it has such pieces at all. A
+    /// template the library's builder would refuse but its file reader
+    /// takes as it is (no `$A`, two of them, a `$B`, a token missing from
+    /// the map) declines, whatever the library makes of it.
+    fn template_frame(post_processor: &Value) -> Result<Template, Declined> {
+        let single = post_processor
+            .get("single")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Declined::from("a TemplateProcessing without a single template"))?;
+        let tokens = post_processor.get("special_tokens");
+        let mut frame = Frame::default();
+        let mut special_pieces = false;
+        let mut sequences = 0;
+        for piece in single {
+            if let Some(sequence) = piece.get("Sequence") {
+                if sequence.get("id").and_then(Value::as_str) != Some("A") {
+                    return Err(Declined::from(
+                        "a TemplateProcessing single template with a $B sequence",
+                    ));
+                }
+                sequences += 1;
+                continue;
+            }
+            let name = piece
+                .get("SpecialToken")
+                .and_then(|token| token.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Declined::from(
+                        "a TemplateProcessing piece neither a sequence nor a special token",
+                    )
+                })?;
+            special_pieces = true;
+            let ids = tokens
+                .and_then(|tokens| tokens.get(name))
+                .and_then(|token| token.get("ids"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    Declined::from(format!(
+                        "a TemplateProcessing special token {name:?} missing from its map"
+                    ))
+                })?;
+            let side = if sequences == 0 {
+                &mut frame.before
+            } else {
+                &mut frame.after
+            };
+            for id in ids {
+                side.push(
+                    id.as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .ok_or_else(|| {
+                            Declined::from(format!(
+                                "a TemplateProcessing special token {name:?} with an id that is not a u32"
+                            ))
+                        })?,
+                );
+            }
+        }
+        if sequences != 1 {
+            return Err(Declined::from(
+                "a TemplateProcessing single template without one $A sequence",
+            ));
+        }
+        Ok(Template {
+            frame,
+            special_pieces,
+        })
     }
 
     /// The added tokens the path cuts out itself, those matched on the raw
@@ -391,7 +758,7 @@ impl NativeEncoder {
             if token.normalized {
                 let content = match normalizer {
                     Normalizer::None => token.content.clone(),
-                    Normalizer::Nfc => token.content.nfc().collect(),
+                    Normalizer::Nfc => nfc(&token.content).into_owned(),
                 };
                 normalized.push((content, id));
             } else {
@@ -401,6 +768,72 @@ impl NativeEncoder {
         raw.sort();
         normalized.sort();
         Ok((raw, normalized))
+    }
+
+    /// The vocabulary's own pieces with their ids, the table every thread
+    /// reads before its own cache: each entry of the model's vocabulary whose
+    /// spelling maps back from the byte-level alphabet to 1..=15 raw bytes,
+    /// with the ids the model gives that spelling, exactly what a cache miss
+    /// on the piece computes (its own id under `ignore_merges`, else the
+    /// merge result, which is several ids for an entry the merges do not
+    /// reach). An entry with a character outside the alphabet is no
+    /// byte-level piece; one the model declines, or whose ids the table
+    /// cannot hold, is left to the miss path. A model with merge dropout
+    /// tokenizes at random and gets no seed. The entries are read by id, on
+    /// the thread pool, without a copy of the vocabulary.
+    ///
+    /// Called once the model's word cache is bounded (see `word_cache`): the
+    /// words the seed merges would otherwise fill that cache on every thread
+    /// of the pool, and the crate never clears a thread's cache of a dropped
+    /// model.
+    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
+        self.seed = Self::vocabulary_seed(model, &self.alphabet);
+    }
+
+    /// The table [`Self::seed_vocabulary`] reads.
+    fn vocabulary_seed(model: &ModelWrapper, alphabet: &[char; 256]) -> ShortPieceTable {
+        let ModelWrapper::BPE(bpe) = model else {
+            return ShortPieceTable::for_entries(0);
+        };
+        if bpe.dropout.is_some_and(|dropout| dropout > 0.0) {
+            return ShortPieceTable::for_entries(0);
+        }
+        let started = Instant::now();
+        // The byte each alphabet character stands for, by character.
+        let mut byte_of = vec![None; alphabet.iter().map(|&c| c as usize).max().unwrap_or(0) + 1];
+        for (byte, &c) in alphabet.iter().enumerate() {
+            byte_of[c as usize] = Some(byte as u8);
+        }
+        let seeded: Vec<(ShortPieceKey, SeededIds)> = (0..bpe.get_vocab_size() as u32)
+            .into_par_iter()
+            .with_min_len(2048)
+            .filter_map(|id| {
+                let entry = bpe.id_to_token(id)?;
+                let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                let mut len = 0;
+                for c in entry.chars() {
+                    *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
+                    len += 1;
+                }
+                let key = ShortPieceKey::of(&piece[..len])?;
+                let mut ids = SeededIds::default();
+                for token in &model.tokenize(&entry).ok()? {
+                    ids.push(token.id)?;
+                }
+                Some((key, ids))
+            })
+            .collect();
+        let mut table = ShortPieceTable::for_entries(seeded.len());
+        for (key, ids) in &seeded {
+            table.insert(*key, ids.as_slice(), seeded.len());
+        }
+        tracing::debug!(
+            entries = table.len(),
+            slots = table.slots(),
+            ms = started.elapsed().as_millis() as u64,
+            "the native encoder's vocabulary pieces"
+        );
+        table
     }
 
     /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
@@ -491,29 +924,38 @@ impl NativeEncoder {
         Ok(Stage { pattern, keep_gaps })
     }
 
-    /// The ids of `text` (the same whether special tokens were requested or
-    /// not: no post-processor the path accepts adds any), or why this text
-    /// goes through `tokenizers` instead, for the caller to count: not in
-    /// NFC under an NFC normalizer, found before any work, or a piece the
-    /// model declines, found after the pieces before it were tokenized, so
-    /// that the error surfaces from the `tokenizers` encode. A long input is
+    /// The ids of `text`, framed by the post-processor's special tokens when
+    /// `add_special_tokens` is set, or why this text goes through
+    /// `tokenizers` instead, for the caller to count: a piece the model
+    /// declines, found after the pieces before it were tokenized, so that
+    /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
     /// the same code per unit.
-    pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Result<Vec<u32>, Fallback> {
-        self.encode_with(model, text, text.len() >= PARALLEL_MIN_BYTES)
+    pub(crate) fn encode(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, Fallback> {
+        self.encode_with(
+            model,
+            text,
+            text.len() >= PARALLEL_MIN_BYTES,
+            add_special_tokens,
+        )
     }
 
-    /// The ids of `text` with no added token cut out of it: every spelling
-    /// in it, a special token's included, goes through the stages and the
-    /// model as text. The plain segments of a prompt rendered by segments
-    /// are encoded this way (see `encoders::marks`); otherwise as
-    /// [`Self::encode`].
+    /// The ids of `text` with no added token cut out of it and no frame:
+    /// every spelling in it, a special token's included, goes through the
+    /// stages and the model as text. The plain segments of a prompt
+    /// rendered by segments are encoded this way (see `encoders::marks`);
+    /// otherwise as [`Self::encode`].
     pub(crate) fn encode_plain(
         &self,
         model: &ModelWrapper,
         text: &str,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(model, text, text.len() >= PARALLEL_MIN_BYTES, false)
+        self.encode_units(model, text, text.len() >= PARALLEL_MIN_BYTES, false, false)
     }
 
     /// [`Self::encode`] with the thread pool used or not; the ids are the
@@ -524,40 +966,64 @@ impl NativeEncoder {
         model: &ModelWrapper,
         text: &str,
         parallel: bool,
+        add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(model, text, parallel, true)
+        self.encode_units(model, text, parallel, true, add_special_tokens)
     }
 
     /// The encode behind [`Self::encode_with`] and [`Self::encode_plain`]:
-    /// `added` says whether the added tokens are cut out of the text first.
+    /// `added` says whether the added tokens are cut out of the text first,
+    /// `framed` whether the post-processor's frame goes around the ids.
     fn encode_units(
         &self,
         model: &ModelWrapper,
         text: &str,
         parallel: bool,
         added: bool,
+        framed: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
-            return Err(Fallback::NotNfc);
-        }
-        let units = self.units(text, parallel, added);
+        // Text not in NFC under the NFC normalizer (by the library's tables,
+        // as every NFC read here) is normalized gap by gap first; the units
+        // then borrow from those gaps.
+        let gaps = (self.normalizer == Normalizer::Nfc && !is_nfc(text))
+            .then(|| self.nfc_gaps(text, added));
+        let units = match &gaps {
+            Some(gaps) => self.units_of(gaps, parallel, added),
+            None => self.units(text, parallel, added),
+        };
+        let (before, after): (&[u32], &[u32]) = if framed {
+            (&self.frame.before, &self.frame.after)
+        } else {
+            (&[], &[])
+        };
         if parallel && units.len() >= 2 {
-            let encoded: Result<Vec<Vec<u32>>, Fallback> = units
+            let parts: Vec<Vec<u32>> = units
                 .par_iter()
                 .map(|unit| {
                     let mut ids = Vec::new();
                     let mut mapped = String::new();
-                    self.encode_unit(model, unit, &mut mapped, &mut ids)
+                    let mut cache = self.thread_piece_cache().borrow_mut();
+                    self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)
                         .map(|()| ids)
                 })
-                .collect();
-            return encoded.map(|parts| parts.concat());
+                .collect::<Result<_, _>>()?;
+            let body: usize = parts.iter().map(Vec::len).sum();
+            let mut ids = Vec::with_capacity(before.len() + body + after.len());
+            ids.extend_from_slice(before);
+            for part in &parts {
+                ids.extend_from_slice(part);
+            }
+            ids.extend_from_slice(after);
+            return Ok(ids);
         }
-        let mut ids = Vec::with_capacity(text.len() / 3 + 8);
+        let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
+        ids.extend_from_slice(before);
         let mut mapped = String::new();
+        let mut cache = self.thread_piece_cache().borrow_mut();
         for unit in &units {
-            self.encode_unit(model, unit, &mut mapped, &mut ids)?;
+            self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)?;
         }
+        ids.extend_from_slice(after);
         Ok(ids)
     }
 
@@ -571,37 +1037,79 @@ impl NativeEncoder {
     /// token is cut out: the whole text is text.
     fn units<'t>(&self, text: &'t str, chunked: bool, added: bool) -> Vec<Segment<'t>> {
         let mut units = Vec::new();
-        let push_text = |text: &'t str, units: &mut Vec<Segment<'t>>| {
-            let mut rest = text;
-            while chunked && rest.len() > 2 * PARALLEL_CHUNK_BYTES {
-                let Some(cut) = self.stable_cut(rest, PARALLEL_CHUNK_BYTES) else {
-                    break;
-                };
-                units.push(Segment::Text(&rest[..cut]));
-                rest = &rest[cut..];
-            }
-            units.push(Segment::Text(rest));
-        };
-        let push_normalized =
-            |text: &'t str, units: &mut Vec<Segment<'t>>| match &self.normalized_added {
-                Some(added) => added.split(text, |segment| match segment {
-                    Segment::Added(id) => units.push(Segment::Added(id)),
-                    Segment::Text(text) => push_text(text, units),
-                }),
-                None => push_text(text, units),
-            };
         if !added {
-            push_text(text, &mut units);
+            self.push_text(text, chunked, &mut units);
             return units;
         }
         match &self.raw_added {
-            Some(added) => added.split(text, |segment| match segment {
+            Some(raw) => raw.split(text, |segment| match segment {
                 Segment::Added(id) => units.push(Segment::Added(id)),
-                Segment::Text(text) => push_normalized(text, &mut units),
+                Segment::Text(text) => self.push_normalized(text, chunked, &mut units),
             }),
-            None => push_normalized(text, &mut units),
+            None => self.push_normalized(text, chunked, &mut units),
         }
         units
+    }
+
+    /// [`Self::units`] over the gaps of a text that was not in NFC
+    /// ([`Self::nfc_gaps`]): the raw cut is done and every text is in NFC,
+    /// what remains is the cut after normalization and the chunking.
+    fn units_of<'g>(&self, gaps: &'g [Gap<'_>], chunked: bool, added: bool) -> Vec<Segment<'g>> {
+        let mut units = Vec::with_capacity(gaps.len());
+        for gap in gaps {
+            match gap {
+                Gap::Added(id) => units.push(Segment::Added(*id)),
+                Gap::Text(text) if added => self.push_normalized(text, chunked, &mut units),
+                Gap::Text(text) => self.push_text(text, chunked, &mut units),
+            }
+        }
+        units
+    }
+
+    /// The text cut at its raw added tokens (not at all with `added` off),
+    /// each text between them in NFC: as it is where it was, normalized
+    /// into an owned buffer where it was not. `tokenizers` normalizes each
+    /// such text on its own, after the raw cut and before the cut after
+    /// normalization: a mark right after a raw token has nothing to compose
+    /// with, and a token's spelling is never matched across what
+    /// normalization changed.
+    fn nfc_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
+        let mut gaps = Vec::new();
+        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text)));
+        match self.raw_added.as_ref().filter(|_| added) {
+            Some(raw) => raw.split(text, |segment| match segment {
+                Segment::Added(id) => gaps.push(Gap::Added(id)),
+                Segment::Text(text) => push(text, &mut gaps),
+            }),
+            None => push(text, &mut gaps),
+        }
+        gaps
+    }
+
+    /// Appends the units of a text between raw added tokens: the added
+    /// tokens matched after normalization and the texts between them.
+    fn push_normalized<'t>(&self, text: &'t str, chunked: bool, units: &mut Vec<Segment<'t>>) {
+        match &self.normalized_added {
+            Some(added) => added.split(text, |segment| match segment {
+                Segment::Added(id) => units.push(Segment::Added(id)),
+                Segment::Text(text) => self.push_text(text, chunked, units),
+            }),
+            None => self.push_text(text, chunked, units),
+        }
+    }
+
+    /// Appends a text as one unit, or for the thread pool (`chunked`) as
+    /// several, cut at stable boundaries ([`Self::stable_cut`]).
+    fn push_text<'t>(&self, text: &'t str, chunked: bool, units: &mut Vec<Segment<'t>>) {
+        let mut rest = text;
+        while chunked && rest.len() > 2 * PARALLEL_CHUNK_BYTES {
+            let Some(cut) = self.stable_cut(rest, PARALLEL_CHUNK_BYTES) else {
+                break;
+            };
+            units.push(Segment::Text(&rest[..cut]));
+            rest = &rest[cut..];
+        }
+        units.push(Segment::Text(rest));
     }
 
     /// A byte offset at or past `from` where the stages' pieces can be cut
@@ -687,21 +1195,36 @@ impl NativeEncoder {
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
     /// (the pieces after it are tokenized all the same, as in the whole-text
-    /// encode).
+    /// encode). `cache` is the encoding thread's piece cache
+    /// ([`Self::thread_piece_cache`]), borrowed by the caller for the unit.
     fn encode_unit(
         &self,
         model: &ModelWrapper,
         unit: &Segment<'_>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
-            self.pieces(0, segment, &mut |piece| {
-                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids) {
+            let mut per_piece = |piece: &str| {
+                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
                     fallback = Some(declined);
                 }
-            });
+            };
+            match &self.chain {
+                // The chain's pieces come back through the stage walk's leaf,
+                // so that `per_piece` is called from one place only and the
+                // work it carries is compiled into the walk, as it is without
+                // a chain (a second caller left it out of line: measured).
+                Some(chain) => {
+                    let leaf = self.stages.len();
+                    chain.pieces(segment, &mut |piece| {
+                        self.pieces(leaf, piece, &mut per_piece);
+                    });
+                }
+                None => self.pieces(0, segment, &mut per_piece),
+            }
         };
         match *unit {
             Segment::Added(id) => ids.push(id),
@@ -733,55 +1256,111 @@ impl NativeEncoder {
         }
     }
 
-    /// Appends the ids of one piece, from the thread's cache or from the
-    /// model over the piece's byte-level alphabet form;
-    /// [`Fallback::PieceDeclined`] when the model declines the piece.
+    /// Appends the ids of one piece: from the thread's cache, else from the
+    /// encoder's seed, else merged over the model's merges (the whole piece
+    /// looked up first under `ignore_merges`), else, for a model the merge
+    /// table declined, from the model itself over the piece's byte-level
+    /// alphabet form; remembered in the thread's cache whichever answered;
+    /// [`Fallback::PieceDeclined`] when the model declines the piece. The
+    /// thread's cache comes first because it is small and hot: the pieces of
+    /// the prompts a thread encodes, a few hundred KB, where the seed is
+    /// several MB of lines a warm encode would read at random (measured:
+    /// the seed first cost a warm prose encode a tenth more). `cache` is the
+    /// thread's own ([`Self::thread_piece_cache`]), looked up and borrowed by
+    /// the encode once rather than here once per piece (measured: 4 % of the
+    /// instructions per token of a warm encode on a 151k byte-level
+    /// vocabulary).
     fn tokenize_piece(
         &self,
         model: &ModelWrapper,
         piece: &str,
         mapped: &mut String,
         ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
+        let key = ShortPieceKey::of(bytes);
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        let cache = self.piece_cache.get_or(|| {
-            self.threads.fetch_add(1, Ordering::Relaxed);
-            RefCell::default()
-        });
-        if cacheable {
-            if let Some(found) = cache.borrow().get(bytes) {
+        if let Some(key) = key {
+            if let Some(packed) = &cache.packed {
+                if packed.ids_into(key, ids) {
+                    return Ok(());
+                }
+            }
+        } else if cacheable {
+            if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
             }
         }
-        mapped.clear();
-        mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
         let start = ids.len();
-        match model.tokenize(mapped) {
-            Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
-            Err(_) => return Err(Fallback::PieceDeclined),
-        }
-        if bytes.len() <= CACHED_PIECE_MAX_BYTES {
-            let mut pieces = cache.borrow_mut();
-            if pieces.short.len() >= self.piece_cache_share() {
-                pieces.short.clear();
+        // A piece this thread has not met: the encoder's seed has it when it
+        // is a vocabulary word, else it is merged, by the table or by the
+        // model for a table that declined.
+        if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
+            if let Some(table) = &self.merges {
+                let whole = if table.ignore_merges {
+                    model.token_to_id(self.mapped(bytes, mapped))
+                } else {
+                    None
+                };
+                match whole {
+                    Some(id) => ids.push(id),
+                    None => table.merge(bytes, ids),
+                }
+            } else {
+                match model.tokenize(self.mapped(bytes, mapped)) {
+                    Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
+                    Err(_) => return Err(Fallback::PieceDeclined),
+                }
             }
-            pieces.short.insert(bytes.into(), ids[start..].into());
+        }
+        if let Some(key) = key {
+            let share = self.piece_cache_share();
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
+            }
+            cache
+                .packed
+                .get_or_insert_with(ShortPieceTable::new)
+                .insert(key, &ids[start..], share);
+        } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
+            let share = self.piece_cache_share();
+            if cache.short_entries() >= share {
+                cache.clear_short(share);
+            }
+            cache.short.insert(bytes.into(), ids[start..].into());
         } else if cacheable {
             let entry = LONG_PIECE_ENTRY_BYTES + bytes.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
             if entry <= share {
-                let mut pieces = cache.borrow_mut();
-                if pieces.long_bytes + entry > share {
-                    pieces.long.clear();
-                    pieces.long_bytes = 0;
+                if cache.long_bytes + entry > share {
+                    cache.long.clear();
+                    cache.long_bytes = 0;
                 }
-                pieces.long_bytes += entry;
-                pieces.long.insert(bytes.into(), ids[start..].into());
+                cache.long_bytes += entry;
+                cache.long.insert(bytes.into(), ids[start..].into());
             }
         }
         Ok(())
+    }
+
+    /// The calling thread's piece cache for this encoder, made at the
+    /// thread's first encode with it (from then on the thread counts toward
+    /// every thread's share, see [`Self::piece_cache_share`]).
+    fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
+        self.piece_cache.get_or(|| {
+            self.threads.fetch_add(1, Ordering::Relaxed);
+            RefCell::default()
+        })
+    }
+
+    /// The piece in the byte-level alphabet, the form the model's vocabulary
+    /// is keyed by, written into `mapped`.
+    fn mapped<'m>(&self, bytes: &[u8], mapped: &'m mut String) -> &'m str {
+        mapped.clear();
+        mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
+        mapped
     }
 
     /// Entries one thread's piece cache may hold: the total shared among the

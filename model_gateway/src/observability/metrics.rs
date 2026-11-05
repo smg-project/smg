@@ -20,7 +20,10 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
-use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
+use crate::{
+    config::{ConfigError, ConfigResult},
+    routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -54,19 +57,23 @@ pub(crate) fn interner_size() -> usize {
 }
 
 /// Per-worker caches of the handles the gateway's per-request records go
-/// through: the HTTP layer's, the stream-timing set's and the per-worker
-/// request counters' and gauges'. The helpers, the installed flag and the router's
-/// request and duration caches are the external router crate's
+/// through: the HTTP layer's, the stream-timing set's, the per-worker
+/// request counters' and gauges', the breaker's outcomes', the selection's,
+/// the cache-aware decision's, the admission gauges' and the body path's.
+/// The helpers, the installed flag and the router's request and duration
+/// caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
 /// same way.
 mod handles {
     use std::{
         cell::{OnceCell, RefCell},
         collections::HashMap,
+        hash::Hash,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc,
         },
+        thread::LocalKey,
     };
 
     use metrics::{Counter, Gauge, Histogram};
@@ -89,6 +96,14 @@ mod handles {
         pub(super) router_type: &'static str,
         pub(super) backend_type: &'static str,
         pub(super) endpoint: &'static str,
+    }
+
+    /// The static labels of `smg_worker_selection_total`.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct SelectionLabels {
+        pub(super) worker_type: &'static str,
+        pub(super) connection_mode: &'static str,
+        pub(super) policy: &'static str,
     }
 
     /// The handles of one label set of the stream-timing set, each built
@@ -158,21 +173,56 @@ mod handles {
         }
     }
 
+    impl<V: Default> ByWorker<V> {
+        /// The kept handles under `worker_url`, created on first sight.
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut V {
+            nested(self.current(), worker_url)
+        }
+    }
+
     /// `smg_worker_requests_total`: by worker URL, then the model label as
     /// the interner gave it.
     pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
 
-    impl WorkerRequests {
-        /// The handles by model for `worker_url`.
-        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
-            nested(self.current(), worker_url)
-        }
-    }
+    /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
+    pub(super) type WorkerOutcomes = ByWorker<HashMap<&'static str, Counter>>;
 
     /// A per-worker gauge set on every request (the active-request count,
     /// the circuit breaker's consecutive outcomes): set through its kept
     /// handle, not through a key built and looked up per call.
     pub(super) type WorkerGauges = ByWorker<Gauge>;
+
+    /// Uses the one handle of a series with no dynamic label: this thread's
+    /// kept handle, built on first use, or a key built per call when handles
+    /// are not kept.
+    pub(super) fn with_single<H>(
+        kept: &'static LocalKey<RefCell<Option<H>>>,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if !keep_handles() {
+            use_handle(&build());
+            return;
+        }
+        kept.with_borrow_mut(|slot| use_handle(slot.get_or_insert_with(build)));
+    }
+
+    /// Uses the handle under a static label (or a tuple of them): this
+    /// thread's kept handle, built on the label's first sight, or a key
+    /// built per call when handles are not kept. A static label set is
+    /// finite, so the map needs no cap.
+    pub(super) fn with_static<K: Copy + Eq + Hash, H>(
+        kept: &'static LocalKey<RefCell<HashMap<K, H>>>,
+        label: K,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if !keep_handles() {
+            use_handle(&build());
+            return;
+        }
+        kept.with_borrow_mut(|map| use_handle(map.entry(label).or_insert_with(build)));
+    }
 
     thread_local! {
         /// `smg_http_requests_total`.
@@ -195,6 +245,24 @@ mod handles {
         pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_consecutive_successes`.
         pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_outcomes_total`.
+        pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
+        /// `smg_worker_selection_total` by its static labels, then the model.
+        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_cache_aware_policy_branch_total` by branch.
+        pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_cache_aware_match_ratio`: one series.
+        pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
+        /// `smg_routing_key_source_total` by source.
+        pub(super) static ROUTING_KEY_SOURCES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_admission_queue_depth`: one series.
+        pub(super) static ADMISSION_QUEUE_DEPTH: RefCell<Option<Gauge>> = const { RefCell::new(None) };
+        /// `smg_admission_inflight`: one series.
+        pub(super) static ADMISSION_INFLIGHT: RefCell<Option<Gauge>> = const { RefCell::new(None) };
+        /// `smg_router_request_body_path_total` by path, then reason.
+        pub(super) static REQUEST_BODY_PATHS: RefCell<HashMap<(&'static str, &'static str), Counter>> = RefCell::new(HashMap::new());
+        /// `smg_router_request_buffers_released_early_bytes_total`: one series.
+        pub(super) static REQUEST_BUFFERS_RELEASED_EARLY: RefCell<Option<Counter>> = const { RefCell::new(None) };
     }
 
     #[cfg(test)]
@@ -210,6 +278,15 @@ mod handles {
         WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
+        WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
+        CACHE_AWARE_MATCH_RATIO.set(None);
+        ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
+        ADMISSION_QUEUE_DEPTH.set(None);
+        ADMISSION_INFLIGHT.set(None);
+        REQUEST_BODY_PATHS.with_borrow_mut(HashMap::clear);
+        REQUEST_BUFFERS_RELEASED_EARLY.set(None);
     }
 
     #[cfg(test)]
@@ -309,6 +386,32 @@ impl Default for PrometheusConfig {
             host: "0.0.0.0".to_string(),
             duration_buckets: None,
         }
+    }
+}
+
+impl PrometheusConfig {
+    /// Refuses a duration bucket list the exporter would render wrongly: a
+    /// bound that is not a finite number above 0, or bounds that do not
+    /// ascend strictly (the `le` labels of every duration histogram would
+    /// come out of order). The one check for every construction path, so
+    /// the CLI and the Python binding refuse the same list with the same
+    /// words.
+    pub fn validate_duration_buckets(buckets: &[f64]) -> ConfigResult<()> {
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                bad,
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(ConfigError::invalid_value(
+                "prometheus_duration_buckets",
+                format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -470,7 +573,7 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content; not such a marker in an output the request ran past the model's own end with ignore_eos, which counts as nothing), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
@@ -483,6 +586,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         symphony_telemetry::CALLS_SUPPRESSED,
         "Tool calls after the first that a Symphony table read and the gateway dropped under parallel_tool_calls: false, by table"
+    );
+    describe_counter!(
+        symphony_telemetry::CALLS_FORBIDDEN,
+        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
@@ -500,7 +607,7 @@ pub(crate) fn init_metrics() {
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
     describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
     describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
-    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: not_nfc (text not in NFC under an NFC normalizer) or piece_declined (the model declined a piece)");
+    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: piece_declined (the model declined a piece)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -535,7 +642,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_connections_active",
-        "Currently active HTTP connections"
+        "HTTP requests in flight at the edge layer, not open connections: an idle keep-alive connection carries no request and one HTTP/2 connection carries many"
     );
     describe_counter!(
         "smg_http_connection_timeouts_total",
@@ -754,7 +861,8 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_batches_total",
-        "KV event batches by worker and disposition (applied, stale, snapshot, load_only)"
+        "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
+         other_rank, not_indexed: a batch of events on a stream opened for load records alone)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -893,7 +1001,8 @@ pub(crate) fn init_metrics() {
         "smg_worker_overload_fallback_total",
         "Requests placed although every worker they could use is overloaded and shedding is \
          off, by stage: routed to the least-loaded worker, or, for a cache-aware prefill pool \
-         of a prefill/decode pair, placed by that policy"
+         of a prefill/decode pair or a regular request that consistent_hashing places by \
+         its routing key, placed by that policy"
     );
     describe_counter!(
         "smg_worker_liveness_fallback_total",
@@ -1694,17 +1803,15 @@ impl Metrics {
         });
     }
 
-    /// Set active HTTP connections count
+    /// Set `smg_http_connections_active`: the count of HTTP requests in flight
+    /// at the edge layer (the callers pass the in-flight request tracker's
+    /// count), not of open connections.
     pub fn set_http_connections_active(count: usize) {
-        if !handles::keep_handles() {
-            gauge!("smg_http_connections_active").set(count as f64);
-            return;
-        }
-        handles::HTTP_CONNECTIONS_ACTIVE.with_borrow_mut(|gauge| {
-            gauge
-                .get_or_insert_with(|| gauge!("smg_http_connections_active"))
-                .set(count as f64);
-        });
+        handles::with_single(
+            &handles::HTTP_CONNECTIONS_ACTIVE,
+            || gauge!("smg_http_connections_active"),
+            |active| active.set(count as f64),
+        );
     }
 
     /// Record HTTP response.
@@ -1754,24 +1861,30 @@ impl Metrics {
 
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
-        let build = || counter!("smg_http_rate_limit_total", "result" => result);
-        if !handles::keep_handles() {
-            build().increment(1);
-            return;
-        }
-        handles::HTTP_RATE_LIMITS.with_borrow_mut(|by_result| {
-            by_result.entry(result).or_insert_with(build).increment(1);
-        });
+        handles::with_static(
+            &handles::HTTP_RATE_LIMITS,
+            result,
+            || counter!("smg_http_rate_limit_total", "result" => result),
+            |count| count.increment(1),
+        );
     }
 
     /// Track a request entering the admission queue.
     pub fn record_admission_queue_entered() {
-        gauge!("smg_admission_queue_depth").increment(1.0);
+        handles::with_single(
+            &handles::ADMISSION_QUEUE_DEPTH,
+            || gauge!("smg_admission_queue_depth"),
+            |depth| depth.increment(1.0),
+        );
     }
 
     /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
     pub fn record_admission_queue_exited() {
-        gauge!("smg_admission_queue_depth").decrement(1.0);
+        handles::with_single(
+            &handles::ADMISSION_QUEUE_DEPTH,
+            || gauge!("smg_admission_queue_depth"),
+            |depth| depth.decrement(1.0),
+        );
     }
 
     /// Record a request rejected at admission.
@@ -1785,12 +1898,20 @@ impl Metrics {
 
     /// Track acquisition of an admission token.
     pub fn record_admission_inflight_acquired() {
-        gauge!("smg_admission_inflight").increment(1.0);
+        handles::with_single(
+            &handles::ADMISSION_INFLIGHT,
+            || gauge!("smg_admission_inflight"),
+            |inflight| inflight.increment(1.0),
+        );
     }
 
     /// Track release of an admission token.
     pub fn record_admission_inflight_released() {
-        gauge!("smg_admission_inflight").decrement(1.0);
+        handles::with_single(
+            &handles::ADMISSION_INFLIGHT,
+            || gauge!("smg_admission_inflight"),
+            |inflight| inflight.decrement(1.0),
+        );
     }
 
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
@@ -1839,7 +1960,6 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
     }
 
-    /// Record where a multimodal request's media is processed and why.
     /// Count a Responses stream whose terminal event was `response.failed`.
     ///
     /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
@@ -1865,6 +1985,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record where a multimodal request's media is processed and why.
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -1960,18 +2081,28 @@ impl Metrics {
 
     /// Record one per-request body-path decision with its dominant reason.
     pub fn record_request_body_path(path: &'static str, reason: &'static str) {
-        counter!(
-            "smg_router_request_body_path_total",
-            "path" => path,
-            "reason" => reason
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::REQUEST_BODY_PATHS,
+            (path, reason),
+            || {
+                counter!(
+                    "smg_router_request_body_path_total",
+                    "path" => path,
+                    "reason" => reason
+                )
+            },
+            |count| count.increment(1),
+        );
     }
 
     /// Record request buffers freed at dispatch (retries disabled), sized by
     /// the serialized upstream body.
     pub fn record_request_buffers_released_early(bytes: usize) {
-        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
+        handles::with_single(
+            &handles::REQUEST_BUFFERS_RELEASED_EARLY,
+            || counter!("smg_router_request_buffers_released_early_bytes_total"),
+            |total| total.increment(bytes as u64),
+        );
     }
 
     /// Record upstream backend response.
@@ -2414,15 +2545,32 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_worker_selection_total",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "policy" => policy
-        )
-        .increment(1);
+        let build = |model: Arc<str>| {
+            counter!(
+                "smg_worker_selection_total",
+                "worker_type" => worker_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "policy" => policy
+            )
+        };
+        if !handles::keep_handles() {
+            build(intern_model_label(model_id)).increment(1);
+            return;
+        }
+        let labels = handles::SelectionLabels {
+            worker_type,
+            connection_mode,
+            policy,
+        };
+        handles::WORKER_SELECTIONS.with_borrow_mut(|by_labels| {
+            handles::with_model_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                build,
+                |count| count.increment(1),
+            );
+        });
     }
 
     /// Record worker error
@@ -2459,8 +2607,9 @@ impl Metrics {
 
     /// Record a request placed although every worker it could use is
     /// overloaded and shedding is off: steered to the least-loaded worker,
-    /// or, for a cache-aware prefill pool of a prefill/decode pair, placed by
-    /// that policy (which counts the pick as a selection too).
+    /// or, for a cache-aware prefill pool of a prefill/decode pair or a
+    /// regular request that consistent_hashing places by its routing key,
+    /// placed by that policy (which counts the pick as a selection too).
     pub fn record_worker_overload_fallback(stage: &'static str) {
         counter!(
             "smg_worker_overload_fallback_total",
@@ -2496,11 +2645,12 @@ impl Metrics {
 
     /// Record which source supplied the sticky routing key for a keyed request
     pub fn record_routing_key_source(source: &'static str) {
-        counter!(
-            "smg_routing_key_source_total",
-            "source" => source
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::ROUTING_KEY_SOURCES,
+            source,
+            || counter!("smg_routing_key_source_total", "source" => source),
+            |count| count.increment(1),
+        );
     }
 
     /// Set cache-aware string-tree cached characters for a model
@@ -2529,11 +2679,12 @@ impl Metrics {
 
     /// Record cache-aware policy execution branch for tree-mode routing decisions
     pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_cache_aware_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::CACHE_AWARE_BRANCHES,
+            branch,
+            || counter!("smg_cache_aware_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Record a cache-aware affinity pick that the spill gate's swing-sized
@@ -2557,7 +2708,11 @@ impl Metrics {
     /// decision: the tree's best prefix match in tree mode, the chosen
     /// worker's overlap over the request's blocks in event mode.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
-        histogram!("smg_cache_aware_match_ratio").record(ratio);
+        handles::with_single(
+            &handles::CACHE_AWARE_MATCH_RATIO,
+            || histogram!("smg_cache_aware_match_ratio"),
+            |ratios| ratios.record(ratio),
+        );
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
@@ -2578,7 +2733,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Set running requests per worker
     /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
@@ -2822,7 +2976,6 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
-    /// Count a KV event batch by what the subscriber did with it.
     /// One load-monitor tick decision for a worker (see `PollMode`).
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
@@ -2833,6 +2986,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Count a KV event batch by what the subscriber did with it.
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
@@ -3010,15 +3164,28 @@ impl Metrics {
         .absolute(0);
     }
 
-    /// Record circuit breaker outcome
+    /// Record circuit breaker outcome: through this thread's kept handle
+    /// for the worker and outcome (dropped when the worker set changes, as
+    /// every kept per-worker handle is), or through a key built per call
+    /// when handles are not kept.
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
-        let worker_interned = intern_string(worker);
-        counter!(
-            "smg_worker_cb_outcomes_total",
-            "worker" => worker_interned,
-            "outcome" => outcome
-        )
-        .increment(1);
+        let build = || {
+            counter!(
+                "smg_worker_cb_outcomes_total",
+                "worker" => intern_string(worker),
+                "outcome" => outcome
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::WORKER_CB_OUTCOMES.with_borrow_mut(|kept| {
+            kept.for_worker(worker)
+                .entry(outcome)
+                .or_insert_with(build)
+                .increment(1);
+        });
     }
 
     /// Record an open circuit breaker put on trial (half-open) by the
@@ -3289,11 +3456,15 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out `smg_engine_*` series for a removed worker.
-    ///
-    /// metrics-rs cannot delete series, so per the `remove_worker_metrics`
-    /// convention we set each to -1 (an impossible value for these gauges, whose
-    /// 0 is meaningful) until <https://github.com/metrics-rs/metrics/issues/653>.
+    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
+    /// ended while its URL stays registered: its status left `Ready`, or a
+    /// same-URL replacement has not yet published its own load (see
+    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
+    /// those series, so the last load would read as live. Each gauge is set
+    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// worker needs no sentinel: the store drops every `worker`-labelled
+    /// series with the registration ([`Self::remove_worker_metrics`]) and
+    /// no-ops the writes that follow, this one included.
     /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
     /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
     /// label set must exactly match `record_engine_load` (including `model` and

@@ -147,7 +147,7 @@ fn run_golden_test(mode: &str, image_name: &str) {
         _ => panic!("Unknown test mode: {mode}"),
     };
 
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     let diff = max_diff(&golden, &result.encoder_input.as_f32());
     println!("{mode} - {image_name} image - Max difference: {diff:.6}");
@@ -339,7 +339,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -488,7 +488,7 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -623,8 +623,8 @@ fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
     .expect("Shape conversion failed")
 }
 
-/// Load image_sizes from Phi3-Vision npz file (2D tensor [batch, 2])
-fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
+/// Load image_sizes from a Phi-Vision golden npz file (2D tensor [batch, 2])
+fn load_image_sizes(path: &Path) -> Vec<(i64, i64)> {
     let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
@@ -637,8 +637,8 @@ fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// Load num_img_tokens from Phi3-Vision npz file
-fn load_phi3_num_img_tokens(path: &Path) -> Vec<usize> {
+/// Load num_img_tokens from a Phi-Vision golden npz file
+fn load_num_img_tokens(path: &Path) -> Vec<usize> {
     let reader = npz_member(path, "num_img_tokens");
 
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -724,13 +724,13 @@ fn run_phi3_vision_golden_test(image_name: &str) {
 
     // Load golden values
     let golden_pixels = load_golden_npz_5d(&npz_path);
-    let golden_image_sizes = load_phi3_image_sizes(&npz_path);
-    let golden_num_tokens = load_phi3_num_img_tokens(&npz_path);
+    let golden_image_sizes = load_image_sizes(&npz_path);
+    let golden_num_tokens = load_num_img_tokens(&npz_path);
 
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -862,28 +862,6 @@ fn test_phi3_vision_golden_grayscale() {
 // Phi4-Vision tests
 // ============================================================================
 
-/// Load num_img_tokens from Phi4-Vision npz file
-fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
-    let reader = npz_member(path, "num_img_tokens");
-
-    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
-    data.into_iter().map(|v| v as usize).collect()
-}
-
-/// Load image_sizes from Phi4-Vision npz file (2D tensor [batch, 2])
-fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
-    let reader = npz_member(path, "image_sizes");
-
-    let shape = reader.shape().to_vec();
-    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
-
-    // Reshape to pairs
-    let num_images = shape[0] as usize;
-    (0..num_images)
-        .map(|i| (data[i * 2], data[i * 2 + 1]))
-        .collect()
-}
-
 /// Run a Phi4-Vision golden test for a specific image.
 ///
 /// This test validates:
@@ -914,13 +892,13 @@ fn run_phi4_vision_golden_test(image_name: &str) {
 
     // Load golden values
     let golden_pixels = load_golden_npz_5d(&npz_path);
-    let golden_image_sizes = load_phi4_image_sizes(&npz_path);
-    let golden_num_tokens = load_phi4_num_img_tokens(&npz_path);
+    let golden_image_sizes = load_image_sizes(&npz_path);
+    let golden_num_tokens = load_num_img_tokens(&npz_path);
 
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -1113,7 +1091,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check aspect_ratios
     let rust_aspect_ratios: Vec<(i64, i64)> = match result.model_specific.get("aspect_ratios") {
@@ -1291,7 +1269,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = PixtralProcessor::from_preprocessor_config(&config);
-    let result = processor.preprocess(&[image]).expect("Processing failed");
+    let result = processor.preprocess(&[&image]).expect("Processing failed");
 
     // Check image_sizes from model_specific
     let rust_image_sizes: Vec<(usize, usize)> = match result.model_specific.get("image_sizes") {

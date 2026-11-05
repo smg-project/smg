@@ -300,7 +300,7 @@ pub(crate) enum Transition {
 /// not revive the response), whichever gateway wrote it. The record is read
 /// to build the moved object and written with one conditional write, which
 /// the store refuses if the record was closed in between, on any gateway.
-pub(crate) async fn set_stored_status(
+async fn set_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
@@ -461,7 +461,7 @@ fn retire_unstored(
 /// inside the window, with a store that outlives the process. Returns how
 /// many records went. A store that keeps no query over the stored object
 /// answers 0 (see `ResponseStorage::delete_unstored_older_than`).
-pub(crate) async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
+async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
     let window =
         chrono::Duration::seconds(i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap_or(i64::MAX));
     match storage
@@ -511,7 +511,7 @@ pub(crate) fn spawn_unstored_sweeper(
 /// answers with an error: the write that ends a background run is not given up
 /// on a store blip. The first failure is logged once; the outcome is the
 /// caller's to log.
-pub(crate) async fn set_stored_status_retrying(
+async fn set_stored_status_retrying(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
@@ -760,7 +760,7 @@ pub(crate) async fn drive<F>(
 
 /// [`drive`] with the interval the stored record is read at while the work
 /// runs.
-pub(crate) async fn drive_watching<F>(
+async fn drive_watching<F>(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
     slot: BackgroundSlot,
@@ -1001,7 +1001,7 @@ pub(crate) async fn cancel(
 }
 
 /// [`cancel`] over the registry and the store it works on.
-pub(crate) async fn cancel_with(
+async fn cancel_with(
     registry: &BackgroundResponses,
     storage: &Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
@@ -1120,6 +1120,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::routers::grpc::common::responses::test_support::completed_response;
 
     fn request() -> ResponsesRequest {
         serde_json::from_value(json!({
@@ -1189,6 +1190,21 @@ mod tests {
                 let _ = tx.send(());
             }
         }
+    }
+
+    /// Work that never ends on its own; the receiver fires when it is dropped.
+    fn pending_work() -> (
+        impl Future<Output = Result<(), Value>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        (work, dropped_rx)
     }
 
     /// A memory store that counts its writes.
@@ -1879,13 +1895,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1909,13 +1919,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1980,13 +1984,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         // The in_progress write fails: the record stays queued and the run
         // starts without having seen it.
         flaky.fail_next(1);
@@ -2164,13 +2162,7 @@ mod tests {
         let owner = Arc::new(BackgroundResponses::new(4));
         let other = Arc::new(BackgroundResponses::new(4));
         let slot = owner.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -2294,25 +2286,6 @@ mod tests {
             "max_output_tokens": 64
         }))
         .unwrap()
-    }
-
-    /// The terminal object of `request` with one output message.
-    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
-        let message = serde_json::from_value(json!({
-            "type": "message",
-            "id": "msg_1",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
-        }))
-        .unwrap();
-        ResponsesResponse::builder(id, &request.model)
-            .copy_from_request(request)
-            .created_at(chrono::Utc::now().timestamp())
-            .completed_at(chrono::Utc::now().timestamp())
-            .status(ResponseStatus::Completed)
-            .add_output(message)
-            .build()
     }
 
     /// With background mode off the sweeper still runs once at start-up, for

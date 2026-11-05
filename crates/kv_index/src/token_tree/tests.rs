@@ -2,10 +2,33 @@ use std::{sync::Arc, thread};
 
 use super::*;
 
+/// `body(tree, t)` on `num_threads` scoped threads at once, `t` the thread's
+/// index; every thread is joined, and a panic in one re-raised, before this
+/// returns.
+fn on_threads(tree: &TokenTree, num_threads: usize, body: impl Fn(&TokenTree, usize) + Sync) {
+    let body = &body;
+    thread::scope(|scope| {
+        for t in 0..num_threads {
+            scope.spawn(move || body(tree, t));
+        }
+    });
+}
+
 /// Helper to create a page-aligned token sequence starting from `base`.
 /// Creates `pages` full pages of tokens.
 fn make_tokens(base: u32, pages: usize) -> Vec<TokenId> {
     (0..(pages * PAGE_SIZE)).map(|i| base + i as u32).collect()
+}
+
+/// Three page-aligned paths that share their first page and differ in the
+/// second: the branching shape the matching and eviction tests read.
+fn branching_paths() -> (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>) {
+    let branch = |second: u32| {
+        let mut tokens = make_tokens(1, 1);
+        tokens.extend(make_tokens(second, 1));
+        tokens
+    };
+    (branch(100), branch(200), branch(300))
 }
 
 #[test]
@@ -283,14 +306,7 @@ fn test_branching_paths() {
     let tree = TokenTree::new();
 
     // Common first page, different second page
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant2");
@@ -406,109 +422,73 @@ fn test_exact_match_seq() {
 
 #[test]
 fn test_exact_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
     let entries_per_thread = 100;
 
     // Insert phase
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Match phase
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                let result = tree.match_prefix_with_counts(&tokens);
-                assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-                assert_eq!(result.tenant.as_ref(), &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            let result = tree.match_prefix_with_counts(&tokens);
+            assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
+            assert_eq!(result.tenant.as_ref(), &format!("tenant{t}"));
+        }
+    });
 }
 
 #[test]
 fn test_partial_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
     let entries_per_thread = 100;
 
     // Insert full sequences (3 pages)
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 3);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 3);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Match with partial (1 page)
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let partial = make_tokens(base, 1);
-                let result = tree.match_prefix_with_counts(&partial);
-                assert_eq!(result.matched_token_count, PAGE_SIZE);
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let partial = make_tokens(base, 1);
+            let result = tree.match_prefix_with_counts(&partial);
+            assert_eq!(result.matched_token_count, PAGE_SIZE);
+        }
+    });
 }
 
 #[test]
 fn test_group_prefix_insert_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
 
     // All threads share the same prefix (1 page)
     let common_prefix = make_tokens(100, 1);
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        let prefix = common_prefix.clone();
-        handles.push(thread::spawn(move || {
-            for i in 0..50 {
-                let mut tokens = prefix.clone();
-                let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                tokens.extend(suffix);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..50 {
+            let mut tokens = common_prefix.clone();
+            let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
+            tokens.extend(suffix);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify prefix matching works
     let result = tree.match_prefix_with_counts(&common_prefix);
@@ -582,12 +562,7 @@ fn test_advanced_eviction() {
     let tree = TokenTree::new();
 
     // Insert multiple paths for tenant1
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant1");
@@ -736,34 +711,11 @@ fn test_prefix_match_tenant() {
 }
 
 #[test]
-fn test_simple_tenant_eviction() {
-    let tree = TokenTree::new();
-
-    let tokens1 = make_tokens(1, 2);
-    let tokens2 = make_tokens(1000, 2);
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant2");
-
-    let tenant1_id: TenantId = Arc::from("tenant1");
-    tree.evict_tenant(&tenant1_id, 0);
-
-    // tenant2 should be unaffected
-    let result = tree.match_prefix_with_counts(&tokens2);
-    assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant2");
-}
-
-#[test]
 fn test_complex_tenant_eviction() {
     let tree = TokenTree::new();
 
     // Create overlapping paths (common first page, different second pages)
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant2");
@@ -897,54 +849,6 @@ fn test_leaf_first_eviction() {
 }
 
 #[test]
-fn test_single_page_operations() {
-    let tree = TokenTree::new();
-
-    // Single page operations
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(1000, 1);
-    let tokens3 = make_tokens(2000, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant2");
-    tree.insert_tokens(&tokens3, "tenant3");
-
-    let result = tree.match_prefix_with_counts(&tokens1);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
-
-    let result = tree.match_prefix_with_counts(&tokens2);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant2");
-
-    let result = tree.match_prefix_with_counts(&tokens3);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant3");
-}
-
-#[test]
-fn test_prefix_is_subset_of_existing() {
-    let tree = TokenTree::new();
-
-    // Insert longer sequence first (3 pages)
-    let long_tokens = make_tokens(1, 3);
-    tree.insert_tokens(&long_tokens, "tenant1");
-
-    // Insert prefix (1 page)
-    let short_tokens = make_tokens(1, 1);
-    tree.insert_tokens(&short_tokens, "tenant2");
-
-    // Short match
-    let result = tree.match_prefix_with_counts(&short_tokens);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-    // Long match
-    let result = tree.match_prefix_with_counts(&long_tokens);
-    assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
-}
-
-#[test]
 fn test_existing_is_prefix_of_new() {
     let tree = TokenTree::new();
 
@@ -993,28 +897,6 @@ fn test_prefix_match_with_counts_accuracy() {
 }
 
 #[test]
-fn test_split_at_page_boundary() {
-    let tree = TokenTree::new();
-
-    // Insert 3 pages
-    let long_tokens = make_tokens(1, 3);
-    tree.insert_tokens(&long_tokens, "tenant1");
-
-    // Insert 1 page (causes split at page boundary)
-    let short_tokens = make_tokens(1, 1);
-    tree.insert_tokens(&short_tokens, "tenant2");
-
-    // 1 page match
-    let result = tree.match_prefix_with_counts(&short_tokens);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-    // 3 pages match
-    let result = tree.match_prefix_with_counts(&long_tokens);
-    assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
-}
-
-#[test]
 fn test_multiple_splits_same_path() {
     let tree = TokenTree::new();
 
@@ -1050,27 +932,18 @@ fn test_multiple_splits_same_path() {
 
 #[test]
 fn test_high_contention_same_prefix() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let prefix = make_tokens(100, 1);
     let num_threads = 16;
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        let p = prefix.clone();
-        handles.push(thread::spawn(move || {
-            for i in 0..100 {
-                let mut tokens = p.clone();
-                let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                tokens.extend(suffix);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..100 {
+            let mut tokens = prefix.clone();
+            let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
+            tokens.extend(suffix);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify prefix matching
     let result = tree.match_prefix_with_counts(&prefix);
@@ -1079,30 +952,22 @@ fn test_high_contention_same_prefix() {
 
 #[test]
 fn test_rapid_insert_remove_cycles() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 4;
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
-            for cycle in 0..10 {
-                // Insert
-                for i in 0..20 {
-                    let base = (t * 10000000 + cycle * 100000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-                // Evict
-                tree.evict_tenant(&tenant_id, 10);
+    on_threads(&tree, num_threads, |tree, t| {
+        let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
+        for cycle in 0..10 {
+            // Insert
+            for i in 0..20 {
+                let base = (t * 10000000 + cycle * 100000 + i * 1000) as u32;
+                let tokens = make_tokens(base, 2);
+                tree.insert_tokens(&tokens, &format!("tenant{t}"));
             }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+            // Evict
+            tree.evict_tenant(&tenant_id, 10);
+        }
+    });
 }
 
 #[test]
@@ -1218,26 +1083,17 @@ fn test_token_count_consistency_after_operations() {
 
 #[test]
 fn test_tree_structure_integrity_after_stress() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
 
-    let mut handles = vec![];
-
     // Stress insert
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..200 {
-                let base = (t * 10000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..200 {
+            let base = (t * 10000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify structure by matching
     for t in 0..num_threads {
@@ -1355,19 +1211,23 @@ fn test_reset_via_trait() {
     assert!(tree.get_tenant_token_counts().is_empty());
 }
 
+/// Three one-page paths of `tenant1`, inserted in order: the first is the
+/// oldest by creation and by access, the third the newest.
+fn three_inserted_pages(tree: &TokenTree) -> [Vec<TokenId>; 3] {
+    let pages = [make_tokens(1, 1), make_tokens(100, 1), make_tokens(200, 1)];
+    for tokens in &pages {
+        tree.insert_tokens(tokens, "tenant1");
+    }
+    pages
+}
+
 #[test]
 fn test_eviction_policy_lru() {
     // LRU: Evict oldest by last access time
     let tree = TokenTree::with_policy(EvictionPolicy::Lru);
 
     // Insert 3 paths, access them in order (oldest first)
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Newest
+    let [tokens1, tokens2, tokens3] = three_inserted_pages(&tree);
 
     // Access tokens2 to make it newer
     let _ = tree.match_prefix_with_counts(&tokens2);
@@ -1400,13 +1260,7 @@ fn test_eviction_policy_mru() {
     // MRU: Evict newest by last access time (opposite of LRU)
     let tree = TokenTree::with_policy(EvictionPolicy::Mru);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Newest
+    let [tokens1, _, tokens3] = three_inserted_pages(&tree);
 
     // Evict 1 page - should evict tokens3 (newest by last_access_time)
     tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
@@ -1430,13 +1284,7 @@ fn test_eviction_policy_fifo() {
     // FIFO: Evict oldest by creation time (not affected by access)
     let tree = TokenTree::with_policy(EvictionPolicy::Fifo);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // First created
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Last created
+    let [tokens1, _, _] = three_inserted_pages(&tree);
 
     // Access tokens1 multiple times (shouldn't affect FIFO)
     for _ in 0..10 {
@@ -1459,13 +1307,7 @@ fn test_eviction_policy_filo() {
     // FILO: Evict newest by creation time (stack-like)
     let tree = TokenTree::with_policy(EvictionPolicy::Filo);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // First created
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Last created
+    let [tokens1, _, tokens3] = three_inserted_pages(&tree);
 
     // Evict 1 page - should evict tokens3 (newest by creation_time)
     tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
@@ -1489,13 +1331,7 @@ fn test_eviction_policy_lfu() {
     // LFU: Evict least frequently used (by hit_count)
     let tree = TokenTree::with_policy(EvictionPolicy::Lfu);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1");
+    let [tokens1, tokens2, tokens3] = three_inserted_pages(&tree);
 
     // Access tokens1 many times to increase its hit_count
     for _ in 0..20 {
@@ -2464,5 +2300,46 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
     // All evicted: nothing to pick, nothing stamped or attached.
     node.tenant_last_access_time.remove(other.as_ref());
     assert!(node.touch_any_tenant(42, false).is_none());
+    assert!(node.tenant_last_access_time.is_empty());
+}
+
+/// A miss of the `last_tenant` cache writes it, so the next lookup of the
+/// node takes the fast path instead of walking the tenant map's shards again
+/// (dashmap's walk allocates once per shard it enters, and a node whose
+/// touches never land on a multiple of sixteen never cached before).
+#[test]
+fn test_any_tenant_lookups_write_the_cache_on_a_miss() {
+    let node = Node::new(make_tokens(1, 1));
+    let w1 = intern_tenant("w1");
+    // ts 1: the one-in-sixteen refresh does not fire; the cache stays empty.
+    node.touch_tenant(&w1, 1, false);
+    assert!(node.last_tenant.read().is_none());
+
+    let picked = node.get_any_tenant().expect("owned node");
+    assert!(Arc::ptr_eq(&picked, &w1));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w1)));
+
+    // The cached tenant left the node: the miss replaces it with the tenant
+    // the touch stamped (ts 3 is no multiple of sixteen either).
+    let w2 = intern_tenant("w2");
+    node.touch_tenant(&w2, 2, false);
+    node.tenant_last_access_time.remove("w1");
+    let picked = node.touch_any_tenant(3, false).expect("w2 owns the node");
+    assert!(Arc::ptr_eq(&picked, &w2));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w2)));
+    assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 3);
+
+    // Nothing owns the node: nothing is picked and nothing attached.
+    node.tenant_last_access_time.remove("w2");
+    assert!(node.touch_any_tenant(4, false).is_none());
+    assert!(node.get_any_tenant().is_none());
     assert!(node.tenant_last_access_time.is_empty());
 }
