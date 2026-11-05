@@ -864,7 +864,8 @@ fn encode_piece(
         let encoded = if allow_special {
             native.encode(None, piece, false)
         } else {
-            native.encode_plain(None, piece)
+            // The start flag is the sentencepiece front's; no front on this path.
+            native.encode_plain(None, piece, false)
         };
         match encoded {
             Ok(ids_of_piece) => {

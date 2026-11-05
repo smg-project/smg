@@ -408,7 +408,7 @@ impl EncoderCore {
     /// passed by.
     fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
         if let Some(native) = &self.native {
-            match native.encode_plain(Some(self.tokenizer.get_model()), text) {
+            match native.encode_plain(Some(self.tokenizer.get_model()), text, at_start) {
                 Ok(plain) => {
                     ids.extend(plain);
                     return Ok(());

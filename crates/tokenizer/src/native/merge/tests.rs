@@ -12,7 +12,8 @@ use tokenizers::{
 };
 
 use super::{
-    super::bytes_char, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
+    super::bytes_char, ByteTokens, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS,
+    SHORT_PIECE_TINY,
 };
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
@@ -63,7 +64,8 @@ fn model_ids(bpe: &BPE, table: &[char; 256], piece: &[u8]) -> Vec<u32> {
 }
 
 fn table_of(bpe: &BPE) -> MergeTable {
-    MergeTable::from_model(&ModelWrapper::BPE(bpe.clone())).expect("the table loads")
+    MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Alphabet)
+        .expect("the table loads")
 }
 
 fn table_ids(table: &MergeTable, piece: &[u8]) -> Vec<u32> {
@@ -628,7 +630,7 @@ fn a_vocabulary_without_merges_leaves_the_bytes() {
 #[test]
 fn models_the_table_cannot_stand_in_for_decline() {
     let declined = |bpe: BPE| {
-        MergeTable::from_model(&ModelWrapper::BPE(bpe))
+        MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Alphabet)
             .err()
             .expect("declined")
             .to_string()
@@ -681,12 +683,104 @@ fn models_the_table_cannot_stand_in_for_decline() {
     // Not BPE at all.
     let word_level = ModelWrapper::WordLevel(WordLevel::default());
     assert_eq!(
-        MergeTable::from_model(&word_level)
+        MergeTable::from_model(&word_level, ByteTokens::Alphabet)
             .err()
             .expect("declined")
             .to_string(),
         "the model is not BPE"
     );
+}
+
+/// A vocabulary whose byte tokens are sentencepiece's `<0xHH>`: the table
+/// loads with that spelling, and merges a piece's symbols of any kind, a
+/// character's token or a byte's, as the model merges that word.
+#[test]
+fn a_byte_fallback_vocabulary_merges_its_symbols_as_the_model_does() {
+    let mut vocab = Vocab::default();
+    let add = |vocab: &mut Vocab, token: String| {
+        if !vocab.contains_key(&token) {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
+    };
+    add(&mut vocab, "<unk>".to_owned());
+    for byte in 0..=255u8 {
+        add(&mut vocab, format!("<0x{byte:02X}>"));
+    }
+    for c in "▁thequickbrownfoxé中".chars() {
+        add(&mut vocab, c.to_string());
+    }
+    let merges = [
+        ("t", "h"),
+        ("th", "e"),
+        ("▁", "the"),
+        ("q", "u"),
+        ("qu", "i"),
+        ("c", "k"),
+        ("qui", "ck"),
+        ("▁", "qu"),
+        ("é", "é"),
+        ("中", "中"),
+        ("▁", "é"),
+    ];
+    let mut list = Merges::new();
+    for (a, b) in merges {
+        add(&mut vocab, format!("{a}{b}"));
+        list.push((a.to_owned(), b.to_owned()));
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, list)
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("a byte-fallback BPE");
+    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Hex)
+        .expect("the table loads with hex byte tokens");
+    assert_eq!(table.merges(), merges.len());
+    // The symbols of a word as `merge_word` makes them: a character's token,
+    // else its bytes' tokens.
+    let symbols = |word: &str| -> Vec<u32> {
+        let mut symbols = Vec::new();
+        for c in word.chars() {
+            match bpe.token_to_id(&c.to_string()) {
+                Some(id) => symbols.push(id),
+                None => {
+                    let mut utf8 = [0u8; 4];
+                    for byte in c.encode_utf8(&mut utf8).bytes() {
+                        symbols.push(
+                            bpe.token_to_id(&format!("<0x{byte:02X}>"))
+                                .expect("a byte token"),
+                        );
+                    }
+                }
+            }
+        }
+        symbols
+    };
+    for word in [
+        "▁the",
+        "▁thequick",
+        "▁quick▁the",
+        "éé",
+        "中中中",
+        "▁éé",
+        "thethe",
+        "▁thé",
+        "x",
+        "😀",
+        "▁😀the",
+        "▁the▁quick▁brown▁fox▁the▁quick▁brown▁fox▁the▁quick▁brown▁fox",
+    ] {
+        let mut ids = Vec::new();
+        table.merge_symbols(&symbols(word), &mut ids);
+        let expected: Vec<u32> = bpe
+            .tokenize(word)
+            .expect("the model tokenizes the word")
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        assert_eq!(ids, expected, "word {word:?}");
+    }
 }
 
 #[test]

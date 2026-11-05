@@ -150,6 +150,16 @@ impl Bucket {
     const EMPTY: Self = Self([Entry::EMPTY; BUCKET]);
 }
 
+/// Which tokens stand for the bytes a byte-level piece starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ByteTokens {
+    /// GPT-2's alphabet: a character per byte.
+    Alphabet,
+    /// Sentencepiece's `<0xHH>` tokens (a piece of such a vocabulary starts
+    /// from character symbols instead, see [`MergeTable::merge_symbols`]).
+    Hex,
+}
+
 /// The merges of one byte-level BPE model; see the module documentation.
 pub(super) struct MergeTable {
     /// The id of each byte's token.
@@ -183,9 +193,10 @@ pub(super) struct MergeTable {
 struct SerializedMerges<'a>(#[serde(borrow)] Vec<(Cow<'a, str>, Cow<'a, str>)>);
 
 impl MergeTable {
-    /// The table of `model`'s merges, or why the model's own merge stays in
-    /// place for the path's misses.
-    pub(super) fn from_model(model: &ModelWrapper) -> Result<Self, Declined> {
+    /// The table of `model`'s merges, with `tokens` as the spelling of its
+    /// byte tokens, or why the model's own merge stays in place for the
+    /// path's misses.
+    pub(super) fn from_model(model: &ModelWrapper, tokens: ByteTokens) -> Result<Self, Declined> {
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -202,8 +213,12 @@ impl MergeTable {
         let mut byte_ids = [0u32; 256];
         let mut utf8 = [0u8; 4];
         for (byte, alphabet) in super::bytes_char().into_iter().enumerate() {
+            let spelling = match tokens {
+                ByteTokens::Alphabet => Cow::Borrowed(&*alphabet.encode_utf8(&mut utf8)),
+                ByteTokens::Hex => Cow::Owned(format!("<0x{byte:02X}>")),
+            };
             byte_ids[byte] = model
-                .token_to_id(alphabet.encode_utf8(&mut utf8))
+                .token_to_id(&spelling)
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
         // The merges alone, through the model's `Serialize` (see `serialized`):
@@ -332,6 +347,12 @@ impl MergeTable {
         size_of::<Self>() + size_of_val(&*self.byte_grid) + size_of_val(&*self.buckets)
     }
 
+    /// The id of `byte`'s token.
+    #[inline(always)]
+    pub(super) fn byte_id(&self, byte: u8) -> u32 {
+        self.byte_ids[usize::from(byte)]
+    }
+
     /// Pairs the table was built from (one per merge of a model; one per
     /// split of a token into two tokens of a tiktoken vocabulary, the splits
     /// of one token sharing its rank).
@@ -433,6 +454,23 @@ impl MergeTable {
         }
     }
 
+    /// Appends the ids `symbols` merge to under the table: initial symbols
+    /// of any kind, a character's token or a byte's, as the model's
+    /// `merge_word` makes them for a vocabulary with byte fallback (see
+    /// `sentencepiece`). The first round's pairs are looked up in the bucket
+    /// table (the byte grid is by byte); the merge is the one of a piece.
+    #[inline(never)]
+    pub(super) fn merge_symbols(&self, symbols: &[u32], ids: &mut Vec<u32>) {
+        if symbols.is_empty() {
+            return;
+        }
+        if symbols.len() <= SHORT_PIECE_SYMBOLS {
+            self.merge_short_symbols(symbols, ids);
+        } else {
+            self.merge_long_symbols(symbols, ids);
+        }
+    }
+
     /// The merge of a short piece (`1..=SHORT_PIECE_SYMBOLS` bytes) as a
     /// [`ShortMerge`] on stack arrays, the smaller ones for a piece that fits
     /// them.
@@ -447,6 +485,20 @@ impl MergeTable {
         }
     }
 
+    /// The merge of `1..=SHORT_PIECE_SYMBOLS` initial symbols
+    /// ([`Self::merge_symbols`]) on the arrays of [`Self::merge_short`].
+    fn merge_short_symbols(&self, symbols: &[u32], ids: &mut Vec<u32>) {
+        let n = symbols.len();
+        let initial = symbols.iter().copied();
+        if n <= SHORT_PIECE_TINY {
+            ShortMerge::<SHORT_PIECE_TINY>::of(initial, n).run_symbols(self, symbols, ids);
+        } else if n <= SHORT_PIECE_SMALL {
+            ShortMerge::<SHORT_PIECE_SMALL>::of(initial, n).run_symbols(self, symbols, ids);
+        } else {
+            ShortMerge::<SHORT_PIECE_SYMBOLS>::of(initial, n).run_symbols(self, symbols, ids);
+        }
+    }
+
     /// The merge of a long piece, the model's own loop: a linked list of
     /// symbols and a min-heap of `(rank, position)` candidates, an entry
     /// taken only when the pair at its position is still the pair it was
@@ -454,7 +506,7 @@ impl MergeTable {
     /// the pair produces, which comes to the same, see the module docs).
     fn merge_long(&self, piece: &[u8], ids: &mut Vec<u32>) {
         let last = piece.len() - 1;
-        let mut symbols: Vec<Symbol> = piece
+        let symbols: Vec<Symbol> = piece
             .iter()
             .enumerate()
             .map(|(i, &byte)| Symbol {
@@ -463,12 +515,46 @@ impl MergeTable {
                 next: if i == last { NONE } else { i as u32 + 1 },
             })
             .collect();
-        let mut candidates: BinaryHeap<Reverse<(u32, u32)>> = (0..last)
+        let candidates: BinaryHeap<Reverse<(u32, u32)>> = (0..last)
             .filter_map(|i| {
                 let merge = self.byte_pair(piece[i], piece[i + 1]);
                 (merge != Merge::NONE).then_some(Reverse((merge.rank(), i as u32)))
             })
             .collect();
+        self.merge_long_from(symbols, candidates, ids);
+    }
+
+    /// The merge of more initial symbols than a short merge's arrays hold
+    /// ([`Self::merge_symbols`]): the loop of [`Self::merge_long`], the first
+    /// round's pairs from the bucket table (the byte grid is by byte).
+    fn merge_long_symbols(&self, initial: &[u32], ids: &mut Vec<u32>) {
+        let last = initial.len() - 1;
+        let symbols: Vec<Symbol> = initial
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| Symbol {
+                id,
+                prev: if i == 0 { NONE } else { i as u32 - 1 },
+                next: if i == last { NONE } else { i as u32 + 1 },
+            })
+            .collect();
+        let candidates: BinaryHeap<Reverse<(u32, u32)>> = (0..last)
+            .filter_map(|i| {
+                let merge = self.merge_of(initial[i], initial[i + 1]);
+                (merge != Merge::NONE).then_some(Reverse((merge.rank(), i as u32)))
+            })
+            .collect();
+        self.merge_long_from(symbols, candidates, ids);
+    }
+
+    /// Merges `symbols` from the first round's `candidates` until none is
+    /// left, and appends the ids to `ids`.
+    fn merge_long_from(
+        &self,
+        mut symbols: Vec<Symbol>,
+        mut candidates: BinaryHeap<Reverse<(u32, u32)>>,
+        ids: &mut Vec<u32>,
+    ) {
         while let Some(Reverse((rank, pos))) = candidates.pop() {
             let at = pos as usize;
             let Symbol { id, prev, next } = symbols[at];
@@ -565,6 +651,26 @@ impl<const N: usize> ShortMerge<N> {
             let merge = table.byte_pair(pair[0], pair[1]);
             self.set_pair(at, merge);
         }
+        self.settle(table, pairs, ids);
+    }
+
+    /// As [`Self::run`] for a list made of `symbols` that are tokens of any
+    /// kind ([`MergeTable::merge_symbols`]): the first round's pairs are
+    /// looked up in the bucket table, the grid being by byte.
+    #[inline(always)]
+    fn run_symbols(mut self, table: &MergeTable, symbols: &[u32], ids: &mut Vec<u32>) {
+        let pairs = self.n.saturating_sub(1);
+        for (at, pair) in symbols.windows(2).enumerate().take(pairs) {
+            let merge = table.merge_of(pair[0], pair[1]);
+            self.set_pair(at, merge);
+        }
+        self.settle(table, pairs, ids);
+    }
+
+    /// Merges from the `pairs` of the first round until no live pair is a
+    /// merge, and appends the ids to `ids`.
+    #[inline(always)]
+    fn settle(mut self, table: &MergeTable, pairs: usize, ids: &mut Vec<u32>) {
         let mut best = self.least(pairs);
         while best != NO_KEY {
             best = self.merge_at(table, (best & SHORT_KEY_MASK) as usize);

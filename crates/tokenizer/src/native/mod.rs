@@ -38,6 +38,13 @@
 //!    the ids of its special tokens before and after the `$A` sequence, read
 //!    once at load) written around the ids.
 //!
+//! A vocabulary with byte fallback (sentencepiece-style: Gemma, Llama 2 and
+//! their kin) has no `ByteLevel` stage and no stages here at all: the text
+//! between two added tokens is one word of the model, which the module
+//! [`sentencepiece`] cuts into pieces no merge crosses, with the word marker
+//! for the text's spaces and, by the `Metaspace` scheme, before it; the
+//! pieces take the same cache, seed and merge table, from character symbols.
+//!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
 //! supported subset, a post-processor other than `ByteLevel` or a template
@@ -73,12 +80,14 @@ mod merge;
 mod nfc;
 mod pattern;
 mod scan;
+mod sentencepiece;
 mod short_pieces;
 mod unicode;
 
-use merge::MergeTable;
+use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
+use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
 use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
 
 use crate::{
@@ -231,6 +240,9 @@ struct PieceCache {
     long: PieceIds,
     /// What `long` holds: each entry's piece, ids and slot.
     long_bytes: usize,
+    /// The initial symbols of a piece being merged on the sentencepiece
+    /// path: a scratch list of the thread.
+    symbols: Vec<u32>,
 }
 
 impl PieceCache {
@@ -607,6 +619,10 @@ pub(crate) struct NativeEncoder {
     /// the seed holds is merged over; `None` for a model the table cannot
     /// stand in for, whose such pieces the model itself tokenizes.
     merges: Option<MergeTable>,
+    /// The tables of the sentencepiece path, for a vocabulary with byte
+    /// fallback (see [`sentencepiece`]): the stages are empty and `merges`
+    /// is `None` then, the pieces come from character symbols.
+    chars: Option<CharSymbols>,
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
@@ -623,6 +639,7 @@ impl std::fmt::Debug for NativeEncoder {
             .field("stages", &self.stages.len())
             .field("seeded_pieces", &self.seed.len())
             .field("native_merge", &self.merges.is_some())
+            .field("sentencepiece", &self.chars.is_some())
             .field("chain", &self.chain.is_some())
             .field("frame", &self.frame)
             .finish()
@@ -657,19 +674,28 @@ impl NativeEncoder {
         if tokenizer.get_padding().is_some() {
             return Err(Declined::from("padding is configured"));
         }
-        if !matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
+        let ModelWrapper::BPE(bpe) = tokenizer.get_model().wrapper() else {
             return Err(Declined::from("the model is not BPE"));
+        };
+        let pre_tokenizer = serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?;
+        // A vocabulary with byte fallback and no `ByteLevel` stage is a
+        // sentencepiece-style one; a byte-level vocabulary whose file sets
+        // the flag keeps the byte-level path.
+        if bpe.byte_fallback && !Self::ends_in_byte_level(&pre_tokenizer) {
+            return Self::sentencepiece_from(tokenizer, &pre_tokenizer);
         }
         let normalizer =
             Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
-        let stages =
-            Self::stages_from(&serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?)?;
+        let stages = Self::stages_from(&pre_tokenizer)?;
         let frame = Self::frame_from(&serialized(
             "post-processor",
             tokenizer.get_post_processor(),
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
-        let merges = match MergeTable::from_model(tokenizer.get_model().wrapper()) {
+        let merges = match MergeTable::from_model(
+            tokenizer.get_model().wrapper(),
+            ByteTokens::Alphabet,
+        ) {
             Ok(table) => {
                 tracing::debug!(
                     merges = table.merges(),
@@ -699,9 +725,135 @@ impl NativeEncoder {
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
             merges,
+            chars: None,
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
+    }
+
+    /// This path's encoder for a vocabulary with byte fallback (see
+    /// [`sentencepiece`]), or why it declines: the spaces of the text become
+    /// the word marker by a `Replace` normalizer alone (a `Split` on the
+    /// space behind it cuts nothing then, and is accepted) or by the
+    /// `Metaspace` pre-tokenizer of the Llama class with no normalizer, whose
+    /// prepend scheme places the marker; anything else declines, as does an
+    /// added token matched after the `Replace` with a space or a marker in
+    /// it (matched on the raw text here, its spelling would not be the one
+    /// `tokenizers` matches after the normalizer).
+    fn sentencepiece_from<M: Model + ModelView>(
+        tokenizer: &TokenizerOf<M>,
+        pre_tokenizer: &Value,
+    ) -> Result<Self, Declined> {
+        let normalizer = serialized("normalizer", tokenizer.get_normalizer())?;
+        let (marker, replaces) = Self::marker_from(&normalizer, pre_tokenizer)?;
+        let frame = Self::frame_from(&serialized(
+            "post-processor",
+            tokenizer.get_post_processor(),
+        )?)?;
+        let (raw, normalized) = Self::added_tokens_of(tokenizer, Normalizer::None)?;
+        if replaces
+            && normalized
+                .iter()
+                .any(|(content, _)| content.contains([' ', WORD_MARKER]))
+        {
+            return Err(Declined::from(
+                "a byte-fallback vocabulary with an added token matched after the Replace \
+                 normalizer that holds a space or the word marker",
+            ));
+        }
+        let chars = CharSymbols::from_model(tokenizer.get_model().wrapper(), marker)?;
+        tracing::debug!(
+            merges = chars.merges(),
+            bytes = chars.bytes(),
+            ?marker,
+            "the native encode path takes the byte-fallback vocabulary from character symbols"
+        );
+        Ok(Self {
+            normalizer: Normalizer::None,
+            nfc_quick: None,
+            raw_added: AddedTokens::build(&raw)?,
+            normalized_added: AddedTokens::build(&normalized)?,
+            stages: Vec::new(),
+            chain: None,
+            frame,
+            alphabet: bytes_char(),
+            seed: ShortPieceTable::for_entries(0),
+            seed_covers_short_entries: false,
+            merges: None,
+            chars: Some(chars),
+            piece_cache: ThreadLocal::new(),
+            threads: AtomicUsize::new(0),
+        })
+    }
+
+    /// Whether a pre-tokenizer (serialized) ends in a `ByteLevel` stage, the
+    /// shape of the byte-level path ([`Self::stages_from`]).
+    fn ends_in_byte_level(pre_tokenizer: &Value) -> bool {
+        let last = match pre_tokenizer.get("pretokenizers").and_then(Value::as_array) {
+            Some(items) => items.last(),
+            None => Some(pre_tokenizer),
+        };
+        last.and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("ByteLevel")
+    }
+
+    /// Where the word marker comes from on a byte-fallback vocabulary, and
+    /// whether a `Replace` normalizer puts it for the spaces (true in the
+    /// answer; the `Metaspace` pre-tokenizer does so itself): `Never` under
+    /// the normalizer, the scheme of the pre-tokenizer without one; or why
+    /// the pipeline declines.
+    fn marker_from(normalizer: &Value, pre_tokenizer: &Value) -> Result<(Marker, bool), Declined> {
+        let replace = serde_json::json!(
+            {"type": "Replace", "pattern": {"String": " "}, "content": WORD_MARKER.to_string()}
+        );
+        let replaces = *normalizer == replace;
+        if !(normalizer.is_null() || replaces) {
+            return Err(Declined::from(
+                "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) \
+                 or none",
+            ));
+        }
+        if pre_tokenizer.is_null() {
+            return if replaces {
+                Ok((Marker::Never, true))
+            } else {
+                Err(Declined::from(
+                    "a byte-fallback vocabulary with neither a Replace normalizer nor a Metaspace \
+                     pre-tokenizer",
+                ))
+            };
+        }
+        let field = |name: &str| pre_tokenizer.get(name);
+        match type_of("pre-tokenizer", pre_tokenizer)? {
+            // No space is left after the normalizer: the split cuts nothing.
+            "Split"
+                if replaces
+                    && field("pattern") == Some(&serde_json::json!({"String": " "}))
+                    && field("behavior").and_then(Value::as_str) == Some("MergedWithPrevious")
+                    && field("invert").and_then(Value::as_bool) == Some(false) =>
+            {
+                Ok((Marker::Never, true))
+            }
+            "Metaspace"
+                if !replaces
+                    && field("replacement").and_then(Value::as_str) == Some("\u{2581}")
+                    && field("split").and_then(Value::as_bool) == Some(false) =>
+            {
+                match field("prepend_scheme").and_then(Value::as_str) {
+                    Some("never") => Ok((Marker::Never, false)),
+                    Some("first") => Ok((Marker::First, false)),
+                    Some("always") => Ok((Marker::Always, false)),
+                    other => Err(Declined::from(format!(
+                        "a Metaspace pre-tokenizer with the prepend scheme {other:?}"
+                    ))),
+                }
+            }
+            other => Err(Declined::from(format!(
+                "a byte-fallback vocabulary with the pre-tokenizer {other} (only none or a Split \
+                 on the space after the Replace normalizer, or Metaspace without split)"
+            ))),
+        }
     }
 
     /// The normalizer this path applies: none, or NFC alone.
@@ -917,12 +1069,19 @@ impl NativeEncoder {
     /// of the pool, and the crate never clears a thread's cache of a dropped
     /// model.
     pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
-        (self.seed, self.seed_covers_short_entries) = Self::vocabulary_seed(model, &self.alphabet);
+        (self.seed, self.seed_covers_short_entries) =
+            Self::vocabulary_seed(model, &self.alphabet, self.chars.is_some());
     }
 
     /// The table [`Self::seed_vocabulary`] reads, and whether every id of
     /// `0..vocab_size` was an entry (so the table holds every short entry).
-    fn vocabulary_seed(model: &ModelWrapper, alphabet: &[char; 256]) -> (ShortPieceTable, bool) {
+    /// On the sentencepiece path (`chars`) an entry's spelling is its own
+    /// text: its key is its bytes.
+    fn vocabulary_seed(
+        model: &ModelWrapper,
+        alphabet: &[char; 256],
+        chars: bool,
+    ) -> (ShortPieceTable, bool) {
         let ModelWrapper::BPE(bpe) = model else {
             return (ShortPieceTable::for_entries(0), false);
         };
@@ -943,13 +1102,17 @@ impl NativeEncoder {
             .filter_map(|id| {
                 let entry = bpe.id_to_token(id)?;
                 let seeded = (|| {
-                    let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
-                    let mut len = 0;
-                    for c in entry.chars() {
-                        *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
-                        len += 1;
-                    }
-                    let key = ShortPieceKey::of(&piece[..len])?;
+                    let key = if chars {
+                        ShortPieceKey::of(entry.as_bytes())?
+                    } else {
+                        let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                        let mut len = 0;
+                        for c in entry.chars() {
+                            *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
+                            len += 1;
+                        }
+                        ShortPieceKey::of(&piece[..len])?
+                    };
                     let mut ids = SeededIds::default();
                     for token in &model.tokenize(&entry).ok()? {
                         ids.push(token.id)?;
@@ -1041,6 +1204,7 @@ impl NativeEncoder {
             seed: Self::ranks_seed(ranks),
             seed_covers_short_entries: false,
             merges: Some(merges),
+            chars: None,
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
@@ -1174,14 +1338,24 @@ impl NativeEncoder {
     /// The ids of `text` with no added token cut out of it and no frame:
     /// every spelling in it, a special token's included, goes through the
     /// stages and the model as text. The plain segments of a prompt
-    /// rendered by segments are encoded this way (see `encoders::marks`);
-    /// otherwise as [`Self::encode`].
+    /// rendered by segments are encoded this way (see `encoders::marks`),
+    /// `at_start` for the one that starts the prompt (a segment after a
+    /// control is not, which the sentencepiece path's `First` marker scheme
+    /// reads); otherwise as [`Self::encode`].
     pub(crate) fn encode_plain(
         &self,
         model: Option<&ModelWrapper>,
         text: &str,
+        at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(model, text, text.len() >= PARALLEL_MIN_BYTES, false, false)
+        self.encode_units(
+            model,
+            text,
+            text.len() >= PARALLEL_MIN_BYTES,
+            false,
+            false,
+            at_start,
+        )
     }
 
     /// [`Self::encode`] with the thread pool used or not; the ids are the
@@ -1194,12 +1368,14 @@ impl NativeEncoder {
         parallel: bool,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(model, text, parallel, true, add_special_tokens)
+        self.encode_units(model, text, parallel, true, add_special_tokens, true)
     }
 
     /// The encode behind [`Self::encode_with`] and [`Self::encode_plain`]:
     /// `added` says whether the added tokens are cut out of the text first,
-    /// `framed` whether the post-processor's frame goes around the ids.
+    /// `framed` whether the post-processor's frame goes around the ids,
+    /// `at_start` whether the text starts the input (see
+    /// [`Self::marker_before`]).
     fn encode_units(
         &self,
         model: Option<&ModelWrapper>,
@@ -1207,6 +1383,7 @@ impl NativeEncoder {
         parallel: bool,
         added: bool,
         framed: bool,
+        at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
         // Text not in NFC under the NFC normalizer (by the library's tables,
         // as every NFC read here) is normalized gap by gap first; the units
@@ -1240,10 +1417,12 @@ impl NativeEncoder {
             units
                 .par_iter()
                 .zip(parts.par_iter_mut())
-                .try_for_each(|(unit, ids)| {
+                .enumerate()
+                .try_for_each(|(index, (unit, ids))| {
+                    let marker = self.marker_before(units, index, at_start);
                     let mut mapped = String::new();
                     let mut cache = self.piece_cache_for_call();
-                    self.encode_unit(model, unit, &mut mapped, ids, &mut cache)
+                    self.encode_unit(model, unit, marker, &mut mapped, ids, &mut cache)
                 })?;
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
@@ -1258,8 +1437,9 @@ impl NativeEncoder {
         ids.extend_from_slice(before);
         let mut mapped = String::new();
         let mut cache = self.piece_cache_for_call();
-        for unit in units {
-            self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)?;
+        for (index, unit) in units.iter().enumerate() {
+            let marker = self.marker_before(units, index, at_start);
+            self.encode_unit(model, unit, marker, &mut mapped, &mut ids, &mut cache)?;
         }
         ids.extend_from_slice(after);
         Ok(ids)
@@ -1284,6 +1464,19 @@ impl NativeEncoder {
             Some(quick) => quick.is_nfc(text),
             None => is_nfc(text),
         }
+    }
+
+    /// Whether the sentencepiece path's word marker goes before the unit at
+    /// `index` of `units`: a text that starts a text between added tokens
+    /// (the first unit, or one after an added token; the further chunks of a
+    /// text cut for the thread pool do not), and under the `First` scheme
+    /// only the one that starts the input (`at_start`). Never on the
+    /// byte-level path.
+    fn marker_before(&self, units: &[Segment<'_>], index: usize, at_start: bool) -> bool {
+        self.chars.as_ref().is_some_and(|chars| {
+            let starts_text = index == 0 || matches!(units[index - 1], Segment::Added(_));
+            chars.prepends(starts_text, index == 0 && at_start)
+        })
     }
 
     /// The input as the units its encode is made of: the added tokens
@@ -1384,6 +1577,12 @@ impl NativeEncoder {
     /// only the byte scan and the search goes on past it, a text whose
     /// candidates keep failing stays one unit after that many checks.
     fn stable_cut(&self, text: &str, from: usize) -> Option<usize> {
+        // The sentencepiece path: any point between two characters that no
+        // vocabulary token joins, read on the raw text.
+        if let Some(chars) = &self.chars {
+            let bytes = text.as_bytes();
+            return (from.max(1)..text.len()).find(|&p| chars.raw_cut_ok(bytes, p));
+        }
         if self.stages.is_empty() {
             return None;
         }
@@ -1454,12 +1653,15 @@ impl NativeEncoder {
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
     /// (the pieces after it are tokenized all the same, as in the whole-text
-    /// encode). `cache` is the encoding thread's piece cache
-    /// ([`Self::thread_piece_cache`]), borrowed by the caller for the unit.
+    /// encode). `marker` says the sentencepiece path's word marker goes
+    /// before the text ([`Self::marker_before`]). `cache` is the encoding
+    /// thread's piece cache ([`Self::thread_piece_cache`]), borrowed by the
+    /// caller for the unit.
     fn encode_unit(
         &self,
         model: Option<&ModelWrapper>,
         unit: &Segment<'_>,
+        marker: bool,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
@@ -1471,6 +1673,14 @@ impl NativeEncoder {
                     fallback = Some(declined);
                 }
             };
+            if let Some(chars) = &self.chars {
+                // An empty text gets no marker: `tokenizers` drops an empty
+                // split before the pre-tokenizer runs.
+                if !segment.is_empty() {
+                    chars.pieces(&CharSymbols::marked(segment, marker), &mut per_piece);
+                }
+                return;
+            }
             match &self.chain {
                 // The chain's pieces come back through the stage walk's leaf,
                 // so that `per_piece` is called from one place only and the
@@ -1517,9 +1727,10 @@ impl NativeEncoder {
 
     /// Appends the ids of one piece: from the thread's cache, else from the
     /// encoder's seed, else merged over the model's merges (the whole piece
-    /// looked up first under `ignore_merges`), else, for a model the merge
-    /// table declined, from the model itself over the piece's byte-level
-    /// alphabet form; remembered in the thread's cache whichever answered;
+    /// looked up first under `ignore_merges`; from character symbols on the
+    /// sentencepiece path), else, for a model the merge table declined, from
+    /// the model itself over the piece's byte-level alphabet form;
+    /// remembered in the thread's cache whichever answered;
     /// [`Fallback::PieceDeclined`] when the model declines the piece (or
     /// there is none to ask: a vocabulary read from ranks has a complete
     /// table and never gets here). The
@@ -1559,7 +1770,9 @@ impl NativeEncoder {
         // is a vocabulary word, else it is merged, by the table or by the
         // model for a table that declined.
         if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
-            if let Some(table) = &self.merges {
+            if let Some(chars) = &self.chars {
+                chars.merge(piece, &mut cache.symbols, ids);
+            } else if let Some(table) = &self.merges {
                 // Under `ignore_merges` a piece that is an entry is that entry:
                 // the model's map is asked, except for a short piece the seed,
                 // holding every short entry, has just missed, which is none
