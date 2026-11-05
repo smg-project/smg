@@ -476,6 +476,20 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+/// The two effort fields of a request, `reasoning_effort` and
+/// `thinking.effort`, when they are present. A profile that maps effort
+/// names to its levels writes the levels through this.
+fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
+    [
+        req.reasoning_effort.as_mut(),
+        req.thinking
+            .as_mut()
+            .and_then(|thinking| thinking.effort.as_mut()),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 /// Whether the model id names one of OpenAI's own hosted models: `gpt-*`
 /// (but not the open-weight `gpt-oss-*`), `chatgpt-*`, `codex-*`, the
 /// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, or a model behind

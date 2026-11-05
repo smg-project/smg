@@ -2,7 +2,9 @@
 //! against GLM-5.3-Flash and docs.z.ai.
 //!
 //! The GLM-5.3 series cannot switch thinking off and takes efforts
-//! low/high/max; other GLM generations keep their thinking switch and the
+//! low/high/max. The names minimal, medium and xhigh are read as low, high
+//! and max, as z.ai reads them; `none` is refused. Other GLM generations
+//! keep their thinking switch and the
 //! documented wider set (GLM-5-Next is not pinned: its contract is not
 //! recorded, and the registry's media grouping says nothing about it). The
 //! sampling defaults go to the models docs.z.ai lists them for. Everything
@@ -32,9 +34,6 @@ const DEFAULTS_MARKERS: [&str; 5] = ["glm-5", "glm5", "glm_5", "glm-4.6", "glm-4
 /// The GLM-5.3 series, the one that cannot switch thinking off, in the
 /// spellings the multimodal registry matches too (`registry/glm53_flash.rs`).
 const GLM53_MARKERS: [&str; 5] = ["glm-5.3", "glm5.3", "glm_5.3", "glm-5-3", "glm5-3"];
-
-/// The effort levels the GLM-5.3 series accepts.
-const GLM53_EFFORTS: [&str; 3] = ["low", "high", "max"];
 
 /// The effort levels docs.z.ai documents for the other GLM generations.
 const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -76,10 +75,32 @@ fn is_glm53(model: &str) -> bool {
     is_series(model, &GLM53_MARKERS)
 }
 
+/// The GLM-5.3 level for an effort name. A level names itself. The names
+/// z.ai maps to a level name that level: minimal is low, medium is high,
+/// xhigh is max. Any other name, `none` included, names no level: the
+/// series cannot switch thinking off.
+fn glm53_level(effort: &str) -> Option<&'static str> {
+    match effort {
+        "low" | "minimal" => Some("low"),
+        "high" | "medium" => Some("high"),
+        "max" | "xhigh" => Some("max"),
+        _ => None,
+    }
+}
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     if is_series(&req.model, &DEFAULTS_MARKERS) {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
+    }
+    if is_glm53(&req.model) {
+        // Each effort spelling is written as its level, so the engine and
+        // an upstream z.ai see a level only.
+        for effort in super::effort_fields(req) {
+            if let Some(level) = glm53_level(effort) {
+                *effort = level.into();
+            }
+        }
     }
     if let Some(clear) = req.thinking.as_ref().and_then(|t| t.clear_thinking) {
         req.chat_template_kwargs
@@ -95,11 +116,15 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     validate_thinking_type(req, glm53)?;
     if glm53 {
         validate_thinking_enabled(req)?;
-        validate_efforts(req, &GLM53_EFFORTS, "low, high or max")?;
+        validate_efforts(
+            req,
+            |effort| glm53_level(effort).is_some(),
+            "low, high or max, or minimal, medium or xhigh",
+        )?;
     } else {
         validate_efforts(
             req,
-            &REASONING_EFFORTS,
+            |effort| REASONING_EFFORTS.contains(&effort),
             "none, minimal, low, medium, high, xhigh or max",
         )?;
     }
@@ -151,12 +176,12 @@ fn validate_thinking_enabled(
     Ok(())
 }
 
-/// The effort must be one the model takes, in each spelling the request
-/// carries: both are forwarded, so a bad value hidden behind the preferred
-/// one still counts.
+/// The effort must be one the model takes (`takes` says which names it
+/// takes), in each spelling the request carries: both are forwarded, so a
+/// bad value hidden behind the preferred one still counts.
 fn validate_efforts(
     req: &ChatCompletionRequest,
-    allowed: &[&str],
+    takes: impl Fn(&str) -> bool,
     hint: &str,
 ) -> Result<(), validator::ValidationError> {
     let efforts = [
@@ -167,7 +192,7 @@ fn validate_efforts(
         ("reasoning_effort", req.reasoning_effort.as_deref()),
     ];
     for (field, effort) in efforts {
-        if effort.is_some_and(|effort| !allowed.contains(&effort)) {
+        if effort.is_some_and(|effort| !takes(effort)) {
             return Err(pinned("reasoning_effort_not_allowed", field, hint));
         }
     }
@@ -284,8 +309,11 @@ mod tests {
         assert_eq!(validate(&request(json!({}))), Ok(()));
     }
 
+    /// The three levels pass as they are. The names z.ai maps to them pass
+    /// too, and normalization writes the level in both spellings. `none`
+    /// and unknown names are refused.
     #[test]
-    fn only_low_high_and_max_efforts_are_accepted() {
+    fn glm53_takes_its_three_levels_and_the_names_zai_maps_to_them() {
         for effort in ["low", "high", "max"] {
             assert_eq!(
                 validate(&request(json!({"reasoning_effort": effort}))),
@@ -297,25 +325,54 @@ mod tests {
                 Ok(()),
                 "thinking.effort {effort}"
             );
+            let mut req = request(json!({"reasoning_effort": effort}));
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some(effort), "{effort}");
         }
-        for effort in ["none", "minimal", "medium", "xhigh", "ultra", "turbo"] {
+        for (name, level) in [("minimal", "low"), ("medium", "high"), ("xhigh", "max")] {
+            // Validation takes the name as sent, with no normalization first.
+            assert_eq!(
+                validate(&request(json!({"reasoning_effort": name}))),
+                Ok(()),
+                "{name}"
+            );
+            assert_eq!(
+                validate(&request(json!({"thinking": {"effort": name}}))),
+                Ok(()),
+                "thinking.effort {name}"
+            );
+            let mut req = request(json!({
+                "reasoning_effort": name,
+                "thinking": {"type": "enabled", "effort": name}
+            }));
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some(level), "{name}");
+            assert_eq!(
+                req.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+                Some(level),
+                "thinking.effort {name}"
+            );
+            assert_eq!(validate(&req), Ok(()), "{name} after normalization");
+        }
+        for effort in ["none", "ultra", "turbo"] {
             assert_eq!(
                 validate(&request(json!({"reasoning_effort": effort}))),
                 Err("reasoning_effort_not_allowed".into()),
                 "{effort}"
             );
+            assert_eq!(
+                validate(&request(
+                    json!({"thinking": {"type": "enabled", "effort": effort}})
+                )),
+                Err("reasoning_effort_not_allowed".into()),
+                "thinking.effort {effort}"
+            );
         }
-        assert_eq!(
-            validate(&request(
-                json!({"thinking": {"type": "enabled", "effort": "medium"}})
-            )),
-            Err("reasoning_effort_not_allowed".into())
-        );
         // Both spellings are forwarded, so the shadowed one is checked too.
         assert_eq!(
             validate(&request(json!({
                 "thinking": {"type": "enabled", "effort": "low"},
-                "reasoning_effort": "medium"
+                "reasoning_effort": "none"
             }))),
             Err("reasoning_effort_not_allowed".into())
         );
@@ -440,6 +497,19 @@ mod tests {
             let mut req = with_model(model, json!({"tool_stream": true}));
             ProviderProfile::Zai.normalize_chat(&mut req);
             assert!(!req.other.contains_key(TOOL_STREAM), "{model}");
+            // The GLM-5.3 name mapping is that series' own: the name sent
+            // stays as sent here.
+            let mut req = with_model(
+                model,
+                json!({"reasoning_effort": "medium", "thinking": {"effort": "xhigh"}}),
+            );
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some("medium"), "{model}");
+            assert_eq!(
+                req.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+                Some("xhigh"),
+                "{model}"
+            );
         }
         assert_eq!(
             validate(&with_model(
@@ -529,7 +599,7 @@ mod tests {
         );
         assert_eq!(
             validate(&request(
-                json!({"model": ALIAS, "reasoning_effort": "medium"})
+                json!({"model": ALIAS, "reasoning_effort": "none"})
             )),
             Err("reasoning_effort_not_allowed".into())
         );
@@ -539,6 +609,9 @@ mod tests {
             )),
             Ok(())
         );
+        let mut req = request(json!({"model": ALIAS, "reasoning_effort": "medium"}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -561,9 +634,12 @@ mod tests {
         );
         assert_eq!(
             validate(&request(
-                json!({"model": ALIAS, "reasoning_effort": "medium"})
+                json!({"model": ALIAS, "reasoning_effort": "none"})
             )),
             Err("reasoning_effort_not_allowed".into())
         );
+        let mut req = request(json!({"model": ALIAS, "reasoning_effort": "medium"}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     }
 }

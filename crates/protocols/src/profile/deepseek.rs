@@ -57,22 +57,9 @@ fn vendor_alias(effort: &str) -> Option<&'static str> {
     }
 }
 
-/// The request's effort spellings, the top-level field and `thinking.effort`,
-/// whichever are present.
-fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
-    [
-        req.reasoning_effort.as_mut(),
-        req.thinking
-            .as_mut()
-            .and_then(|thinking| thinking.effort.as_mut()),
-    ]
-    .into_iter()
-    .flatten()
-}
-
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let is_v41 = is_v41_model(&req.model);
-    for effort in effort_fields(req) {
+    for effort in super::effort_fields(req) {
         // V4.1 accepts medium and xhigh natively (its renderer gives each
         // the budget of the checkpoint's own table).
         if is_v41 && matches!(effort.as_str(), "medium" | "xhigh") {
@@ -101,7 +88,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 /// sent, as it always did (those encoders have it), and a chat-template kwarg
 /// is the client's word to the upstream's template and goes out as sent.
 pub(super) fn alias_effort_for_upstream(req: &mut ChatCompletionRequest) {
-    for effort in effort_fields(req).filter(|effort| effort.as_str() == "medium") {
+    for effort in super::effort_fields(req).filter(|effort| effort.as_str() == "medium") {
         if let Some(level) = vendor_alias(effort) {
             *effort = level.into();
         }

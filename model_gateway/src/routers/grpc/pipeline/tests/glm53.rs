@@ -346,3 +346,42 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
         "{body}"
     );
 }
+
+/// A `medium` effort on a GLM-5.3 model is rendered as the `high` level
+/// z.ai maps it to (issue #5181), through the normal chat preparation.
+#[tokio::test]
+async fn glm53_medium_effort_is_rendered_as_high() {
+    use openai_protocol::validated::Normalizable;
+
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    register_worker_with_labels(&registry, port, WorkerType::Regular, LANGUAGE_MODEL_ONLY);
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).unwrap();
+    let components = glm53_components(registry).await;
+    let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "zai-org/GLM-5.3",
+        "max_tokens": 8,
+        "reasoning_effort": "medium",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    request.normalize();
+    assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+    let mut ctx = RequestContext::for_chat(Arc::new(request), None, MODEL.into(), components);
+    pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
+    let Some(PreparationOutput::Chat {
+        processed_messages, ..
+    }) = ctx.state.preparation.as_ref()
+    else {
+        panic!("chat preparation")
+    };
+    let prompt = &processed_messages.text;
+    assert!(prompt.contains("Reasoning Effort: High"), "{prompt}");
+}
