@@ -2294,6 +2294,18 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"
     );
+    assert_eq!(
+        declined(
+            &ranks,
+            KIMI_K2_PATTERN,
+            &[
+                ("<|b|>".to_owned(), 300),
+                ("<|a|>".to_owned(), 301),
+                ("<|a|>x".to_owned(), 302),
+            ]
+        ),
+        "special token \"<|a|>\" is a prefix of \"<|a|>x\""
+    );
     let mut incomplete = ranks.clone();
     incomplete.remove([0x7Fu8].as_slice());
     assert_eq!(

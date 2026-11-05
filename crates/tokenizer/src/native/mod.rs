@@ -866,7 +866,8 @@ impl NativeEncoder {
     /// lists them, `pattern` the file's regex and `specials` its special
     /// tokens, or why it declines: a pattern outside the engine's subset, a
     /// rank set that gives no complete merge table (see
-    /// [`MergeTable::from_ranks`]). The file's encoder cuts the specials out
+    /// [`MergeTable::from_ranks`]), a special token that is a prefix of
+    /// another. The file's encoder cuts the specials out
     /// of the raw text, runs the pattern over the text between them and
     /// encodes each match: no normalizer, one stage whose matches alone are
     /// pieces, no frame. The seed is ready at once: every token of a
@@ -884,6 +885,24 @@ impl NativeEncoder {
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
+            )));
+        }
+        // The file's own encoder matches its special tokens through an
+        // alternation in no fixed order, leftmost-first; this path matches
+        // leftmost-longest. The two agree unless one special is a prefix of
+        // another (in sorted order, right after it).
+        let mut contents: Vec<&str> = specials
+            .iter()
+            .map(|(content, _)| content.as_str())
+            .collect();
+        contents.sort_unstable();
+        if let Some(pair) = contents
+            .windows(2)
+            .find(|pair| pair[1].starts_with(pair[0]))
+        {
+            return Err(Declined::from(format!(
+                "special token {:?} is a prefix of {:?}",
+                pair[0], pair[1]
             )));
         }
         let merges = MergeTable::from_ranks(ranks)?;

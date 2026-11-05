@@ -185,7 +185,9 @@ impl MergeTable {
         let ranks_end = ranks.values().max().map_or(0, |&rank| rank as usize + 1);
         // The rank ids are a dense table (`new_ids`), bounded as the decode
         // table of such a file is: ranks reaching far past the token count
-        // keep the file on its own encoder.
+        // keep the file on its own encoder. The bound must also stay within
+        // what a short merge's key carries of a rank.
+        const _: () = assert!(MAX_BYTE_LEVEL_TABLE_IDS <= MAX_RANKS);
         if ranks_end > MAX_BYTE_LEVEL_TABLE_IDS {
             return Err(Declined::from(format!(
                 "ranks up to {ranks_end} on a table bounded at {MAX_BYTE_LEVEL_TABLE_IDS}"
