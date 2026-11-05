@@ -172,6 +172,37 @@ fn distinct(steps: &[usize]) -> BTreeSet<usize> {
     steps.iter().copied().collect()
 }
 
+/// A first sight of a piece of up to 128 bytes merges on the stack. What
+/// the encode allocates is its list of units, its ids (the list, grown once
+/// past its guess) and the thread's cache entry for a piece longer than the
+/// packed table keys (the piece and its ids, two boxes): five calls. What
+/// moves it: a merge that returns to the heap (the linked list and the
+/// candidate heap of the long merge were two more calls), a cache tier that
+/// copies differently. The opt-in v1 pipeline, when its feature is compiled
+/// in, takes a BPE tokenizer in front of the direct path, so this pin of the
+/// direct path's merge is built without that feature.
+#[cfg(not(feature = "tokenizers-v1"))]
+#[test]
+fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
+    let tokenizer = byte_level();
+    // The thread's cache and its map tier exist and have room: the pieces
+    // below settle both before the measured piece.
+    for letter in ["a", "b", "c", "d", "e", "f"] {
+        let settled = letter.repeat(40);
+        tokenizer.encode(&settled, false).expect("an encode");
+    }
+    // One piece of forty bytes under the byte-level split, with merges in it.
+    let piece = "hello".repeat(8);
+    let (encoding, calls) = allocations_during(|| tokenizer.encode(&piece, false));
+    let encoding = encoding.expect("an encode");
+    assert_eq!(encoding.token_ids().len(), 24, "h e llo, eight times");
+    assert_eq!(
+        calls, 5,
+        "a first sight of a 40-byte piece allocated {calls} times: the units, the ids and the \
+         cache entry are five, the merge itself none"
+    );
+}
+
 #[test]
 fn a_decode_step_on_a_byte_level_vocabulary_allocates_nothing() {
     let tokenizer = byte_level();
