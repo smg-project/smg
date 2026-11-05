@@ -283,14 +283,22 @@ impl MappedGenerateStream for VllmGenerateStream {
                 }
             }
         }
-        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
-            token_logprobs: tick_logprobs_val.clone(),
-            token_ids: tick_logprobs_idx.clone(),
-            top_logprobs: tick_top_logprobs.clone(),
+        // The tick's columns go into the chunk as they are; the history the
+        // terminal `Complete` drains is extended from them.
+        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then_some(vllm::OutputLogProbs {
+            token_logprobs: tick_logprobs_val,
+            token_ids: tick_logprobs_idx,
+            top_logprobs: tick_top_logprobs,
         });
-        state.output_logprobs_val.extend(tick_logprobs_val);
-        state.output_logprobs_idx.extend(tick_logprobs_idx);
-        state.output_top_logprobs.extend(tick_top_logprobs);
+        if let Some(tick) = &chunk_logprobs {
+            state
+                .output_logprobs_val
+                .extend_from_slice(&tick.token_logprobs);
+            state.output_logprobs_idx.extend_from_slice(&tick.token_ids);
+            state
+                .output_top_logprobs
+                .extend(tick.top_logprobs.iter().cloned());
+        }
 
         // Prompt logprobs accumulate the same way (chunked prefill delivers
         // them incrementally); entry 0 per position is the actual prompt

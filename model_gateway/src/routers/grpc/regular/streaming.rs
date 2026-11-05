@@ -1005,7 +1005,7 @@ impl StreamingProcessor {
 
                     // Handle output logprobs by the stream's chunk semantics:
                     // cumulative chunks replace, delta chunks accumulate.
-                    if let Some(ref output_logprobs) = chunk.output_logprobs() {
+                    if let Some(output_logprobs) = chunk.output_logprobs() {
                         let converted = utils::convert_generate_output_logprobs(output_logprobs);
                         if chunk.chunk_semantics().is_delta() {
                             // Delta - extend existing logprobs
@@ -3068,7 +3068,7 @@ impl<'a> ChatStream<'a> {
 
     /// The logprobs of an engine chunk, in the public API's shape.
     fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
-        chunk.output_logprobs().map(|ref proto_logprobs| {
+        chunk.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 &self.tokenizer,

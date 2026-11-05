@@ -196,7 +196,7 @@ impl ResponseProcessor {
         // token are in the list like the content: a client reads the
         // model's margin at every position of the output, and the list's
         // length is the completion's token count on both sides.
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        let logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -265,7 +265,7 @@ impl ResponseProcessor {
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The output's logprobs as the engine reports them, one entry per generated token, as
         // on the older path: a message without content keeps them like any other.
-        choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        choice.logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -709,7 +709,6 @@ impl ResponseProcessor {
             let output_token_logprobs = if request_logprobs {
                 complete
                     .output_logprobs()
-                    .as_ref()
                     .map(utils::convert_generate_output_logprobs)
             } else {
                 None

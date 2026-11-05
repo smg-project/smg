@@ -24,7 +24,7 @@ use crate::{
     protocol::{
         kv_transfer::KvTransferStats,
         vllm::{
-            logprobs::{Logprobs, WireLogprobs},
+            logprobs::{Logprobs, LogprobsFields, WireLogprobs},
             pooling::PoolingOutput,
             stats::{PrefillStats, SchedulerStats},
         },
@@ -259,11 +259,11 @@ impl WireEngineCoreOutput {
             new_token_ids: self.new_token_ids,
             new_logprobs: self
                 .new_logprobs
-                .map(|value| value.resolve(frames, "new_logprobs"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_LOGPROBS))
                 .transpose()?,
             new_prompt_logprobs_tensors: self
                 .new_prompt_logprobs_tensors
-                .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_PROMPT_LOGPROBS_TENSORS))
                 .transpose()?,
             pooling_output: self
                 .pooling_output

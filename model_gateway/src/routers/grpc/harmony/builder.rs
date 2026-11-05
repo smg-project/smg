@@ -149,13 +149,14 @@ mod own_thread_tests {
     }
 }
 
-/// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format using Harmony's tokenizer.
 ///
 /// Delegates to the shared `convert_proto_logprobs` with Harmony's built-in tokenizer
 /// for token ID decoding.
 pub(crate) fn convert_harmony_logprobs(
     encoding: &HarmonyEncoding,
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
     utils::convert_proto_logprobs(proto_logprobs, |token_id| {
