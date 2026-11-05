@@ -392,6 +392,38 @@ impl GossipController {
         Some(entry.clone())
     }
 
+    /// The answer a relay brought back: recorded (`true`) when it is the
+    /// probed peer's own, refused (`false`) when it is not. A relay answers
+    /// for the node it reached, so an answer named for another member (a
+    /// stale address another node holds now) must not mark the peer
+    /// reachable or move its entry; the join peer's placeholder is the one
+    /// name the answer may supply. The peer's own answer goes into the table
+    /// as a direct answer's does, so a member held `Suspected` after an
+    /// earlier break is `Alive` again on the first relay that reaches it, as
+    /// long as it still holds itself `Alive` (a verdict that reached it
+    /// through a peer is what it answers with). No sync stream is started
+    /// here: the direct probe has just failed on this node's link to the
+    /// peer, and the stream would dial that same link.
+    pub(crate) fn record_relayed_answer(
+        state: &ClusterState,
+        peer_name: &str,
+        relay_address: &str,
+        node_update: &NodeUpdate,
+    ) -> bool {
+        if !is_join_peer(peer_name) && node_update.name != peer_name {
+            log::warn!(
+                "The relay through {} answered for {}, not {}: a stale address, next relay",
+                relay_address,
+                node_update.name,
+                peer_name
+            );
+            return false;
+        }
+        log::info!("Received NodeUpdate through the relay: {:?}", node_update);
+        Self::record_in_table(state, node_update);
+        true
+    }
+
     /// Record a peer's answer to a direct probe: its status and address
     /// (`record_in_table`), and for an `Alive` member the sync stream,
     /// started at the freshest address over the link that has just answered.
@@ -465,18 +497,14 @@ impl GossipController {
                         )
                         .await;
                     if let Ok(node_update) = relayed {
-                        // The peer's own answer, brought back by the relay:
-                        // its status and address go into the table as a
-                        // direct answer's do, so a member held `Suspected`
-                        // after an earlier break is `Alive` again on the
-                        // first relay that reaches it, as long as it still
-                        // holds itself `Alive` (a verdict that reached it
-                        // through a peer is what it answers with). No sync
-                        // stream is started here: the direct probe has just
-                        // failed on this node's link to the peer, and the
-                        // stream would dial that same link.
-                        log::info!("Received NodeUpdate through the relay: {:?}", node_update);
-                        Self::record_in_table(&self.state, &node_update);
+                        if !Self::record_relayed_answer(
+                            &self.state,
+                            &peer_name,
+                            &node.address,
+                            &node_update,
+                        ) {
+                            continue;
+                        }
                         reachable = true;
                         break;
                     }

@@ -1197,6 +1197,79 @@ mod tests {
         handler_c.shutdown();
     }
 
+    /// A relay answers for the node it reached. A table holds C at an
+    /// address X answers at now: B's relayed probe to that address brings
+    /// back X's answer, which is not C's. It is refused, C's entry stays as
+    /// held and nothing of X enters the table; C's own answer through B is
+    /// recorded and C is `Alive` again.
+    #[tokio::test]
+    async fn a_relayed_answer_from_a_stale_address_is_not_the_peers() {
+        init();
+        let (addr_b, handler_b) = plain_node("B").await;
+        let (addr_c, handler_c) = plain_node("C").await;
+        let (addr_x, handler_x) = plain_node("X").await;
+        let stale = NodeState {
+            status: NodeStatus::Suspected as i32,
+            version: 3,
+            ..node_state("C", addr_x)
+        };
+        let table: ClusterState = Arc::new(RwLock::new(BTreeMap::from([(
+            "C".to_string(),
+            stale.clone(),
+        )])));
+        let dialer = Dialer::new(None);
+
+        let answer = dialer
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(stale),
+                })),
+            )
+            .await
+            .expect("B relayed the probe to the stale address");
+        assert_eq!(
+            answer.name, "X",
+            "the node at the stale address answers as itself"
+        );
+        assert!(
+            !GossipController::record_relayed_answer(&table, "C", &addr_b.to_string(), &answer),
+            "X's answer was taken as C's"
+        );
+        {
+            let table = table.read();
+            let c = table.get("C").expect("the table still holds C");
+            assert_eq!(
+                (c.status, c.address.clone(), c.version),
+                (NodeStatus::Suspected as i32, addr_x.to_string(), 3),
+                "C's entry moved on X's answer"
+            );
+            assert!(!table.contains_key("X"), "X's answer entered the table");
+        }
+
+        let answer = dialer
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(node_state("C", addr_c)),
+                })),
+            )
+            .await
+            .expect("B relayed the probe to C");
+        assert!(
+            GossipController::record_relayed_answer(&table, "C", &addr_b.to_string(), &answer),
+            "C's own answer was refused"
+        );
+        assert_eq!(
+            table.read().get("C").map(|c| c.status),
+            Some(NodeStatus::Alive as i32),
+            "C is not Alive after its own answer through B"
+        );
+        handler_b.shutdown();
+        handler_c.shutdown();
+        handler_x.shutdown();
+    }
+
     /// Two members that cannot reach each other stay `Alive` on each other
     /// through the member that reaches both. A's certificate comes from a
     /// CA that B trusts and C does not, and C's from the CA A and B trust:
