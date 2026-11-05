@@ -8,7 +8,10 @@ use std::io;
 
 use bytes::BytesMut;
 use openai_protocol::{
-    chat::{ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef},
+    chat::{
+        ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef,
+        DEFAULT_SERVICE_TIER,
+    },
     common::{ToolCallDelta, ToolChoice, Usage},
     completion::CompletionStreamChoice,
 };
@@ -74,6 +77,8 @@ impl ChatChunkFrame {
         push_json(&mut head, &created);
         head.extend_from_slice(b",\"model\":");
         push_json(&mut head, model);
+        head.extend_from_slice(b",\"service_tier\":");
+        push_json(&mut head, DEFAULT_SERVICE_TIER);
         if let Some(system_fingerprint) = system_fingerprint {
             head.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut head, system_fingerprint);

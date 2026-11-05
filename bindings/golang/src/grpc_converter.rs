@@ -762,6 +762,7 @@ impl GrpcResponseConverterHandle {
             object: "chat.completion.chunk".to_string(),
             created: self.created,
             model: self.model.clone(),
+            service_tier: openai_protocol::chat::DEFAULT_SERVICE_TIER.to_string(),
             system_fingerprint: self.system_fingerprint.clone(),
             choices: vec![ChatStreamChoice {
                 index,
@@ -1875,56 +1876,56 @@ mod tests {
             // a character held until its bytes are complete, then the choice ends
             vec![
                 serde_json::json!(null),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant","content":"é"},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"é"},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // an empty chunk keeps its counts; the engine's empty finish reason is stop and the output ids count
             vec![
                 serde_json::json!(null),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a choice that never streamed: the request's prompt count, a blank finish reason
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a stop decoder that finds no stop: the engine's finish reason, its matched token and the usage details
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant","content":"t"},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length","matched_stop":99}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":4}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"t"},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length","matched_stop":99}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":4}}}),
             ],
             // a stop the decoder finds beats the engine's finish reason and matched stop
             vec![
                 serde_json::json!(null),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop","matched_stop":"é"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop","matched_stop":"é"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // the engine's matched stop string
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop","matched_stop":"END"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop","matched_stop":"END"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a call in one chunk: deltas with the call, the choice finishes on tool_calls
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a call under a length finish keeps the engine's reason
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a brace the parser holds to the end is content at Complete
             vec![
                 serde_json::json!(null),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","content":"{"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"{"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // tool choice none: the call's text is content
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","content":"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}"},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}"},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a second choice has its own index and state
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":1,"delta":{"role":"assistant","content":"s"},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","choices":[{"index":1,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":1,"delta":{"role":"assistant","content":"s"},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"byte-fallback-test","service_tier":"default","choices":[{"index":1,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a message without a body
             vec![serde_json::json!(null)],
