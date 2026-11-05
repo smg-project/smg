@@ -254,6 +254,11 @@ trait PdRoute: GenerationRequest {
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
         (Some(self.extract_text_for_routing()), None)
     }
+
+    /// Whether [`Self::routing_inputs`] reads a batch's first prompt or
+    /// sequence alone, so that a batch's prompt count comes from the body
+    /// instead; the default routing text covers the whole request.
+    const ROUTING_READS_FIRST_OF_BATCH: bool = false;
 }
 
 impl PdRoute for GenerateRequest {
@@ -277,6 +282,8 @@ impl PdRoute for GenerateRequest {
             None => (self.text.as_deref().map(str::to_string), None),
         }
     }
+
+    const ROUTING_READS_FIRST_OF_BATCH: bool = true;
 }
 
 impl PdRoute for ChatCompletionRequest {
@@ -336,6 +343,8 @@ impl PdRoute for CompletionRequest {
         };
         (text, None)
     }
+
+    const ROUTING_READS_FIRST_OF_BATCH: bool = true;
 }
 
 impl PdRoute for RerankRequest {
@@ -612,6 +621,34 @@ impl PDRouter {
             .map(ToOwned::to_owned)
     }
 
+    /// The prompt's length, which sizes the prefill side's silence bound and
+    /// its booking, counted once: the request's token ids when it carries
+    /// them, else the rate limiter's estimate of its input, which comes back
+    /// beside the length for the tenant reservation, so a charged request
+    /// counts its words once. On the routes whose routing reads a batch's
+    /// first sequence or prompt alone (`PdRoute::ROUTING_READS_FIRST_OF_BATCH`)
+    /// the prefill side still works through the whole batch, so a batch is
+    /// counted whole from the body; everywhere else the routing text covers
+    /// the request and the estimate reads it, as the reservation's own read
+    /// would. Not counted when nothing reads it (`counted` false: the rule
+    /// off and no tenant to charge).
+    fn prompt_token_count<R: PdRoute + TenantCharge>(
+        body: &R,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        counted: bool,
+    ) -> (u64, Option<u32>) {
+        let whole_batch = R::ROUTING_READS_FIRST_OF_BATCH && body.batch_size().is_some();
+        match tokens {
+            Some(ids) if !whole_batch => (ids.len() as u64, None),
+            _ if tokens.is_some() || counted => {
+                let estimate = body.estimated_input_tokens(if whole_batch { None } else { text });
+                (u64::from(estimate), Some(estimate))
+            }
+            _ => (0, None),
+        }
+    }
+
     /// Every PD route: the routing derivatives and the request context from
     /// the request, then the dual dispatch under the tenant's reservation
     /// (`tenant_meta`: the routes that charge a tenant).
@@ -627,23 +664,13 @@ impl PDRouter {
         } else {
             (None, None)
         };
-        // The prompt's length, which sizes the prefill side's silence bound,
-        // counted once: the request's token ids when it carries them, else
-        // the rate limiter's estimate of its input, which the tenant
-        // reservation takes as well when it is the body's own, so a charged
-        // request counts its words once; not counted when nothing reads it
-        // (the rule off and no tenant to charge).
         let reserves = self.rate_limit_manager.is_some() && tenant_meta.is_some();
-        let (prompt_tokens, estimate) = match &tokens {
-            Some(ids) => (ids.len() as u64, None),
-            None if reserves || pd_silence::applies() => {
-                let estimate = body.estimated_input_tokens(text.as_deref());
-                // Routing's text is a batch's first prompt alone; the
-                // reservation charges every prompt and counts the body itself.
-                (u64::from(estimate), text.is_none().then_some(estimate))
-            }
-            None => (0, None),
-        };
+        let (prompt_tokens, estimate) = Self::prompt_token_count(
+            &body,
+            text.as_deref(),
+            tokens.as_deref(),
+            reserves || pd_silence::applies(),
+        );
         let routing = RoutingDerivatives {
             tokens,
             text,
@@ -710,11 +737,11 @@ impl PDRouter {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        // The estimate reads the body, not the routing text: a text-reading
-        // policy routes a completions batch on its first prompt alone
-        // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
-        // `route_pd` counted the body's own for the silence bound where it
-        // could, and hands it on.
+        // `route_pd` counted the request's input once for the silence bound
+        // (the whole batch from the body where a text-reading policy routes
+        // on a batch's first prompt alone, `PdRoute::routing_inputs`) and
+        // hands the estimate on; the reservation reads the body itself only
+        // when the bound took the request's own ids instead.
         let (reservation, denial) = tenant_rate_limit::reserve(
             self.rate_limit_manager.as_deref(),
             tenant_meta,
@@ -3320,6 +3347,74 @@ mod tests {
             (None, false, false)
         );
         assert_eq!(rerank.routing_inputs(), (Some("q".to_string()), None));
+    }
+
+    /// Routing reads a batch's first prompt or sequence alone; the prefill
+    /// side's silence bound and booking size the whole batch.
+    #[test]
+    fn pd_prompt_tokens_count_a_batch_whole_where_routing_reads_its_first_prompt() {
+        fn req<T: serde::de::DeserializeOwned>(v: Value) -> T {
+            serde_json::from_value(v).unwrap()
+        }
+        let batch: CompletionRequest =
+            req(json!({"model": "m", "prompt": ["a b c", "d e f g h i j k l m n o p"]}));
+        let (text, tokens) = batch.routing_inputs();
+        assert_eq!(text.as_deref(), Some("a b c"));
+        let whole = u64::from(batch.estimated_input_tokens(None));
+        let first = u64::from(batch.estimated_input_tokens(text.as_deref()));
+        assert!(first < whole, "{first} {whole}");
+        let (prompt_tokens, estimate) =
+            PDRouter::prompt_token_count(&batch, text.as_deref(), tokens.as_deref(), true);
+        assert_eq!(prompt_tokens, whole);
+        assert_eq!(
+            estimate,
+            Some(whole as u32),
+            "the reservation takes the body's own count"
+        );
+
+        let sequences: GenerateRequest = req(json!({"input_ids": [[1, 2], [3, 4, 5]]}));
+        let (text, tokens) = sequences.routing_inputs();
+        assert_eq!(tokens.as_deref(), Some(&[1, 2][..]));
+        let (prompt_tokens, estimate) =
+            PDRouter::prompt_token_count(&sequences, text.as_deref(), tokens.as_deref(), false);
+        assert_eq!((prompt_tokens, estimate), (5, Some(5)));
+
+        let sequence: GenerateRequest = req(json!({"input_ids": [7, 8, 9]}));
+        let (text, tokens) = sequence.routing_inputs();
+        assert_eq!(
+            PDRouter::prompt_token_count(&sequence, text.as_deref(), tokens.as_deref(), false),
+            (3, None),
+            "a single sequence's ids count as they are"
+        );
+
+        let prompt: CompletionRequest = req(json!({"model": "m", "prompt": "x y z"}));
+        let (text, tokens) = prompt.routing_inputs();
+        let own = prompt.estimated_input_tokens(text.as_deref());
+        assert_eq!(
+            PDRouter::prompt_token_count(&prompt, text.as_deref(), tokens.as_deref(), true),
+            (u64::from(own), Some(own)),
+            "a single prompt's routing text is its own; the count is handed on"
+        );
+        assert_eq!(
+            PDRouter::prompt_token_count(&prompt, text.as_deref(), tokens.as_deref(), false),
+            (0, None),
+            "nothing reads the count"
+        );
+
+        let samples: ChatCompletionRequest = req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "p q r"}], "n": 2
+        }));
+        let (text, tokens) = samples.routing_inputs();
+        assert_eq!(
+            text.as_deref(),
+            Some(samples.extract_text_for_routing().as_str())
+        );
+        let own = samples.estimated_input_tokens(text.as_deref());
+        assert_eq!(
+            PDRouter::prompt_token_count(&samples, text.as_deref(), tokens.as_deref(), true),
+            (u64::from(own), Some(own)),
+            "a chat request of n samples routes on its whole text: counted once, handed on"
+        );
     }
 
     /// Ceiling on a real HTTP round trip in these tests: a guard against a
