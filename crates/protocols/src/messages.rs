@@ -1674,7 +1674,10 @@ pub struct CountMessageTokensResponse {
 // Model Info Types
 // ============================================================================
 
-/// Model information
+/// A model entry of the Anthropic-shaped inventory, the public API's
+/// `ModelInfo`: every field of the contract, the ones a served model has no
+/// value for as `null` (the vendor's catalogue fields `capabilities`, `line`,
+/// `deprecated_at`, `retires_at`).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelInfo {
     /// Object type (always "model")
@@ -1689,25 +1692,161 @@ pub struct ModelInfo {
 
     /// When the model was created
     pub created_at: String,
+
+    /// The model's lifecycle stage, `active`, `deprecated` or `retired`: the
+    /// retirement signal the contract tells clients to read. Every model the
+    /// gateway serves itself is `active`; an upstream's entry keeps the stage
+    /// the upstream says.
+    #[serde(default = "ModelInfo::active")]
+    pub lifecycle: String,
+
+    /// The capability map of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+
+    /// The model line of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub line: Option<String>,
+
+    /// The largest `max_tokens` the model takes: its context length, when the
+    /// card carries one (the gateway caps the output by nothing else).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+
+    /// The model's context window in tokens, when the card carries one.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
+
+    /// When the model was deprecated; `null` while it is `active`.
+    #[serde(default)]
+    pub deprecated_at: Option<String>,
+
+    /// When the model is scheduled to retire; `null` while it is `active`.
+    #[serde(default)]
+    pub retires_at: Option<String>,
 }
 
 impl ModelInfo {
     /// The entry a self-hosted model card makes in the Anthropic-shaped
     /// inventory. The display name falls back to the id; a card carries no
     /// creation time, so `created_at` is the epoch, the counterpart of the
-    /// OpenAI-shaped list's `created: 0`.
+    /// OpenAI-shaped list's `created: 0`; the token limits are the card's
+    /// context length.
     pub fn from_model_card(card: &ModelCard) -> Self {
         Self {
             model_type: "model".to_owned(),
             id: card.id.clone(),
             display_name: card.display_name.clone().unwrap_or_else(|| card.id.clone()),
             created_at: UNKNOWN_CREATED_AT.to_owned(),
+            lifecycle: Self::active(),
+            capabilities: None,
+            line: None,
+            max_tokens: card.context_length,
+            max_input_tokens: card.context_length,
+            deprecated_at: None,
+            retires_at: None,
         }
+    }
+
+    /// The lifecycle stage of every served model.
+    fn active() -> String {
+        "active".to_owned()
     }
 }
 
 /// `created_at` of a model whose creation time nobody recorded.
 const UNKNOWN_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+/// The query of `GET /v1/models` in the Anthropic shape: `limit` (1 to 1000,
+/// 20 by default), one of the cursors `after_id` and `before_id` (the id of
+/// an entry; the page is the one after or before it), and the `lifecycle`
+/// to keep (`active`, `deprecated` or `retired`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListModelsQuery {
+    pub limit: Option<u32>,
+    pub after_id: Option<String>,
+    pub before_id: Option<String>,
+    pub lifecycle: Option<String>,
+}
+
+impl ListModelsQuery {
+    /// The page size when the query names none.
+    pub const DEFAULT_LIMIT: u32 = 20;
+    /// The largest page the public API serves.
+    pub const MAX_LIMIT: u32 = 1000;
+
+    /// The query of a request's URI (`None` or empty: the defaults); a value
+    /// the contract does not take is the refusal's message, naming the
+    /// parameter. Parameters the contract does not name are ignored.
+    pub fn parse(query: Option<&str>) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+            match &*key {
+                "limit" => {
+                    let limit = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=Self::MAX_LIMIT).contains(limit))
+                        .ok_or_else(|| {
+                            format!(
+                                "limit: Input should be an integer from 1 to {}, got {value:?}",
+                                Self::MAX_LIMIT
+                            )
+                        })?;
+                    parsed.limit = Some(limit);
+                }
+                "after_id" => parsed.after_id = Some(value.into_owned()),
+                "before_id" => parsed.before_id = Some(value.into_owned()),
+                "lifecycle" => {
+                    if !["active", "deprecated", "retired"].contains(&&*value) {
+                        return Err(format!(
+                            "lifecycle: Input should be 'active', 'deprecated' or 'retired', got {value:?}"
+                        ));
+                    }
+                    parsed.lifecycle = Some(value.into_owned());
+                }
+                _ => {}
+            }
+        }
+        if parsed.after_id.is_some() && parsed.before_id.is_some() {
+            return Err("after_id and before_id: only one cursor can be given".to_owned());
+        }
+        Ok(parsed)
+    }
+
+    /// The page size asked for, or the default.
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(Self::DEFAULT_LIMIT) as usize
+    }
+
+    /// Whether the query narrows the list, by a cursor or a lifecycle: then
+    /// an empty page is the list's answer (nothing past the cursor, nothing
+    /// in that stage), where an empty page of the plain list, under any
+    /// `limit`, is an empty inventory.
+    pub fn narrows(&self) -> bool {
+        self.after_id.is_some() || self.before_id.is_some() || self.lifecycle.is_some()
+    }
+
+    /// The query as a URI carries it, the parameters the contract names and
+    /// the request gave alone (empty for the defaults): what an upstream
+    /// answering a caller's own credential is asked for.
+    pub fn to_query_string(&self) -> String {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(limit) = self.limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        for (name, value) in [
+            ("after_id", &self.after_id),
+            ("before_id", &self.before_id),
+            ("lifecycle", &self.lifecycle),
+        ] {
+            if let Some(value) = value {
+                query.append_pair(name, value);
+            }
+        }
+        query.finish()
+    }
+}
 
 /// List of models response
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1719,21 +1858,60 @@ pub struct ListModelsResponse {
 }
 
 impl ListModelsResponse {
-    /// The whole inventory in one page, deduplicated by model id (the first
-    /// card of an id wins), with the page markers the public list carries.
-    pub fn from_model_cards(cards: impl IntoIterator<Item = ModelCard>) -> Self {
+    /// The page `query` asks of the inventory, deduplicated by model id (the
+    /// first card of an id wins) in the order given: the first `limit`
+    /// entries, the ones after the `after_id` entry or the ones just before
+    /// the `before_id` entry, with the page markers the public list carries;
+    /// `has_more` says whether the inventory goes on past the page in the
+    /// direction read. Every served model is `active`, so another
+    /// `lifecycle` keeps nothing. A cursor that names no entry is the
+    /// refusal's message.
+    pub fn from_model_cards(
+        cards: impl IntoIterator<Item = ModelCard>,
+        query: &ListModelsQuery,
+    ) -> Result<Self, String> {
         let mut seen = HashSet::new();
-        let data: Vec<ModelInfo> = cards
+        let entries: Vec<ModelInfo> = cards
             .into_iter()
             .filter(|card| seen.insert(card.id.clone()))
+            .filter(|_| {
+                query
+                    .lifecycle
+                    .as_deref()
+                    .is_none_or(|stage| stage == "active")
+            })
             .map(|card| ModelInfo::from_model_card(&card))
             .collect();
-        Self {
+        let position = |field: &str, id: &str| {
+            entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| format!("{field}: no model {id:?} in the list"))
+        };
+        let limit = query.limit();
+        let (start, end, has_more) = match (&query.after_id, &query.before_id) {
+            (Some(after), _) => {
+                let start = position("after_id", after)? + 1;
+                let end = entries.len().min(start + limit);
+                (start, end, end < entries.len())
+            }
+            (None, Some(before)) => {
+                let end = position("before_id", before)?;
+                let start = end.saturating_sub(limit);
+                (start, end, start > 0)
+            }
+            (None, None) => {
+                let end = entries.len().min(limit);
+                (0, end, end < entries.len())
+            }
+        };
+        let data: Vec<ModelInfo> = entries.into_iter().skip(start).take(end - start).collect();
+        Ok(Self {
             first_id: data.first().map(|m| m.id.clone()),
             last_id: data.last().map(|m| m.id.clone()),
-            has_more: false,
+            has_more,
             data,
-        }
+        })
     }
 }
 
@@ -3471,11 +3649,11 @@ mod tests {
     fn anthropic_model_list_is_built_from_model_cards() {
         let mut named = ModelCard::new("m1");
         named.display_name = Some("Model One".to_owned());
-        let list = ListModelsResponse::from_model_cards(vec![
-            named,
-            ModelCard::new("m2"),
-            ModelCard::new("m1"),
-        ]);
+        let list = ListModelsResponse::from_model_cards(
+            vec![named, ModelCard::new("m2"), ModelCard::new("m1")],
+            &ListModelsQuery::default(),
+        )
+        .expect("a page");
         let v = serde_json::to_value(&list).unwrap();
         assert_eq!(v["has_more"], false);
         assert_eq!(v["first_id"], "m1");
@@ -3491,7 +3669,14 @@ mod tests {
                 "type": "model",
                 "id": "m1",
                 "display_name": "Model One",
-                "created_at": "1970-01-01T00:00:00Z"
+                "created_at": "1970-01-01T00:00:00Z",
+                "lifecycle": "active",
+                "capabilities": null,
+                "line": null,
+                "max_tokens": null,
+                "max_input_tokens": null,
+                "deprecated_at": null,
+                "retires_at": null
             })
         );
         assert_eq!(
@@ -3648,5 +3833,116 @@ mod tests {
             ]}
         ]);
         assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The query an upstream is asked for is the request's, the contract's
+    /// parameters alone, in the URI's form; the defaults ask for nothing.
+    #[test]
+    fn the_model_list_query_is_rewritten_for_an_upstream_as_the_contract_names_it() {
+        let query = ListModelsQuery::parse(Some("foo=bar&limit=5&after_id=a%20b&lifecycle=active"))
+            .expect("parses");
+        assert_eq!(
+            query.to_query_string(),
+            "limit=5&after_id=a+b&lifecycle=active"
+        );
+        assert!(query.narrows());
+        assert_eq!(ListModelsQuery::default().to_query_string(), "");
+        assert!(!ListModelsQuery::default().narrows());
+        assert!(!ListModelsQuery::parse(Some("limit=5"))
+            .expect("parses")
+            .narrows());
+        assert_eq!(
+            ListModelsQuery::parse(Some("before_id=m1"))
+                .expect("parses")
+                .to_query_string(),
+            "before_id=m1"
+        );
+    }
+
+    /// The Messages-shaped list pages over the deduplicated inventory as its
+    /// query asks: `limit` entries from the start, after a cursor or just
+    /// before one, `has_more` for the rest; every served model is `active`,
+    /// so another lifecycle keeps nothing. A limit outside 1 to 1000, both
+    /// cursors, an unknown lifecycle or a cursor naming no entry are refused
+    /// naming the parameter. The entry carries every field of the contract,
+    /// the card's context length as both token limits.
+    #[test]
+    fn the_model_list_pages_as_its_query_asks() {
+        let cards = || {
+            ["a", "b", "c", "d", "b"].into_iter().map(|id| {
+                let mut card = ModelCard::new(id);
+                card.context_length = Some(8192);
+                card
+            })
+        };
+        let ids = |list: &ListModelsResponse| {
+            list.data
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let page = |query: &str| {
+            ListModelsResponse::from_model_cards(
+                cards(),
+                &ListModelsQuery::parse(Some(query)).expect("a query the contract takes"),
+            )
+            .expect("a page")
+        };
+
+        let whole = page("");
+        assert_eq!(ids(&whole), ["a", "b", "c", "d"]);
+        assert!(!whole.has_more);
+        assert_eq!(
+            (whole.first_id.as_deref(), whole.last_id.as_deref()),
+            (Some("a"), Some("d"))
+        );
+        assert_eq!(
+            serde_json::to_value(&whole.data[0]).expect("serializes"),
+            json!({
+                "type": "model", "id": "a", "display_name": "a",
+                "created_at": "1970-01-01T00:00:00Z", "lifecycle": "active",
+                "capabilities": null, "line": null,
+                "max_tokens": 8192, "max_input_tokens": 8192,
+                "deprecated_at": null, "retires_at": null
+            })
+        );
+
+        let first = page("limit=2");
+        assert_eq!(ids(&first), ["a", "b"]);
+        assert!(first.has_more);
+        let next = page("after_id=b&limit=2");
+        assert_eq!(ids(&next), ["c", "d"]);
+        assert!(!next.has_more);
+        let back = page("before_id=d&limit=2");
+        assert_eq!(ids(&back), ["b", "c"]);
+        assert!(back.has_more);
+        let start = page("before_id=b&limit=5");
+        assert_eq!(ids(&start), ["a"]);
+        assert!(!start.has_more);
+        let none = page("lifecycle=retired");
+        assert!(none.data.is_empty() && !none.has_more && none.first_id.is_none());
+        assert_eq!(
+            ListModelsQuery::parse(Some("foo=bar&limit=1000"))
+                .expect("parses")
+                .limit(),
+            1000
+        );
+
+        for query in [
+            "limit=0",
+            "limit=1001",
+            "limit=x",
+            "lifecycle=bogus",
+            "after_id=a&before_id=b",
+        ] {
+            assert!(ListModelsQuery::parse(Some(query)).is_err(), "{query}");
+        }
+        let unknown = ListModelsQuery::parse(Some("after_id=nope")).expect("parses");
+        assert_eq!(
+            ListModelsResponse::from_model_cards(cards(), &unknown)
+                .expect_err("no such entry")
+                .as_str(),
+            "after_id: no model \"nope\" in the list"
+        );
     }
 }
