@@ -1163,12 +1163,39 @@ mod tests {
             .collect()
     }
 
+    /// The pieces the gateway's per-stream decoder emits for `ids`, then what
+    /// its finish releases.
+    fn stream_then_finish(
+        tokenizer: &Arc<dyn Tokenizer>,
+        ids: &[TokenIdType],
+        skip: bool,
+    ) -> (Vec<String>, String) {
+        let mut sequence = Sequence::new_with_options(Arc::clone(tokenizer), skip);
+        let pieces = ids
+            .iter()
+            .map(|&id| sequence.append_token(id).unwrap())
+            .collect();
+        (pieces, sequence.finish().unwrap())
+    }
+
+    /// Ranks `a`, `b`, the lead byte C3, the continuation byte A9 and the three
+    /// bytes of a literal U+FFFD: a character can end a stream unfinished.
+    const PARTIAL_BYTE_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\nww== 2\nqQ== 3\n77+9 4\n";
+
     fn write_minimal_tiktoken_dir(
         tokenizer_config: &str,
         model_config: Option<&str>,
     ) -> tempfile::TempDir {
+        write_tiktoken_dir(MINIMAL_TIKTOKEN_MODEL, tokenizer_config, model_config)
+    }
+
+    fn write_tiktoken_dir(
+        model: &str,
+        tokenizer_config: &str,
+        model_config: Option<&str>,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tiktoken.model"), MINIMAL_TIKTOKEN_MODEL).unwrap();
+        std::fs::write(dir.path().join("tiktoken.model"), model).unwrap();
         std::fs::write(dir.path().join("tokenizer_config.json"), tokenizer_config).unwrap();
         if let Some(model_config) = model_config {
             std::fs::write(dir.path().join("config.json"), model_config).unwrap();
@@ -1606,6 +1633,85 @@ mod tests {
         assert_eq!(sequence.append_token(2).unwrap(), "[BOS]");
         let err = sequence.append_token(4).unwrap_err();
         assert!(err.to_string().contains("unknown token id"), "{err}");
+    }
+
+    /// A stream that ends while the per-stream decoder holds bytes (a lead byte,
+    /// a lone continuation byte, a literal replacement character, a byte before
+    /// a skipped special token): its finish releases what the full decode
+    /// renders for them, and the pieces before it hold as they did.
+    #[test]
+    fn stream_end_releases_the_bytes_it_holds() {
+        let dir = write_tiktoken_dir(
+            PARTIAL_BYTE_TIKTOKEN_MODEL,
+            r#"{"added_tokens_decoder": {"5": {"content": "[EOS]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_some());
+        let cases: [(&[TokenIdType], bool, &str); 6] = [
+            (&[2], false, "\u{FFFD}"),
+            (&[0, 1, 3], false, "ab\u{FFFD}"),
+            (&[4], false, "\u{FFFD}"),
+            (&[2, 3], false, "é"),
+            (&[3, 5], true, "\u{FFFD}"),
+            (&[3, 5], false, "\u{FFFD}[EOS]"),
+        ];
+        for (ids, skip, expected) in cases {
+            assert_eq!(
+                tokenizer.decode(ids, skip).unwrap(),
+                expected,
+                "ids={ids:?}"
+            );
+            let (pieces, finish) = stream_then_finish(&tokenizer, ids, skip);
+            assert_eq!(
+                pieces.concat() + &finish,
+                expected,
+                "ids={ids:?} skip={skip}: pieces {pieces:?}, finish {finish:?}"
+            );
+        }
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
+        assert_eq!(pieces, ["a", "b", ""]);
+        assert_eq!(finish, "\u{FFFD}");
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[3, 5], true);
+        assert_eq!(pieces, ["", ""]);
+        assert_eq!(finish, "\u{FFFD}");
+    }
+
+    /// The same end through the generic decoder (no per-id table because an
+    /// added token sits far beyond the ranks): the window's held bytes are
+    /// released as the full decode renders them.
+    #[test]
+    fn stream_end_releases_the_bytes_it_holds_on_the_generic_path() {
+        let dir = write_tiktoken_dir(
+            PARTIAL_BYTE_TIKTOKEN_MODEL,
+            r#"{"added_tokens_decoder": {"100000000": {"content": "[FAR]", "special": true}}}"#,
+            None,
+        );
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
+        assert!(tokenizer.incremental_decoder(false).is_none());
+        let cases: [(&[TokenIdType], &str); 3] = [
+            (&[2], "\u{FFFD}"),
+            (&[0, 1, 3], "ab\u{FFFD}"),
+            (&[2, 3], "é"),
+        ];
+        for (ids, expected) in cases {
+            assert_eq!(
+                tokenizer.decode(ids, false).unwrap(),
+                expected,
+                "ids={ids:?}"
+            );
+            let (pieces, finish) = stream_then_finish(&tokenizer, ids, false);
+            assert_eq!(
+                pieces.concat() + &finish,
+                expected,
+                "ids={ids:?}: pieces {pieces:?}, finish {finish:?}"
+            );
+        }
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
+        assert_eq!(pieces, ["a", "b", ""]);
+        assert_eq!(finish, "\u{FFFD}");
     }
 
     #[test]

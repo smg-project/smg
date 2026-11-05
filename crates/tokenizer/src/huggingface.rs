@@ -1990,7 +1990,12 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> Result<DecodeStep> {
-        if !self.has_byte_fallback {
+        if !self.has_byte_fallback && ids.len() <= *prefix_index {
+            // Nothing held past the emitted text: a window without byte runs
+            // holds only while its decode ends in an incomplete character.
+            ids.clear();
+            prefix.clear();
+            *prefix_index = 0;
             return Ok(DecodeStep::default());
         }
         if prefix.is_empty() && ids.len() == *prefix_index {

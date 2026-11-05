@@ -239,8 +239,16 @@ impl Sequence {
         Ok(step)
     }
 
-    /// Finish incremental decoding without inventing an extra token.
+    /// Finish incremental decoding without inventing an extra token: the
+    /// text the decoder still holds (an incomplete trailing character, a
+    /// replacement character waiting for text after it), rendered as the
+    /// full decode renders the end of the same ids.
     pub fn finish(&mut self) -> Result<String> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let mut text = String::new();
+            decoder.finish_into(&mut text)?;
+            return Ok(text);
+        }
         let step = self.tokenizer.finish_decode(
             &mut self.token_ids,
             &mut self.cached_prefix,
