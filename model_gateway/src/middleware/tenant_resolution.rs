@@ -21,7 +21,7 @@ use axum::{
 use futures_util::future::{ready, Either, Ready};
 use tower::{Layer, Service};
 
-use super::{logging::AccessLogRecord, request_id::RequestId, request_start::RequestStarted};
+use super::{logging::AccessLogRecord, request_id::RequestId};
 use crate::{
     config::{RouterConfig, TenantResolutionConfig},
     routers::error,
@@ -31,12 +31,12 @@ use crate::{
     },
 };
 
-/// When the gateway took the request in: the edge's entry stamp (see
-/// `request_start`), put on the route request meta as it is built, and
-/// stamped again when an admission permit is granted after a wait in the
-/// admission queue ([`restamp_accepted_at`]), so the bound on the wait ahead
-/// of worker selection measures the time after admission, not the admission
-/// queue's own, bounded wait. Read once: the first worker selection of a request
+/// When the gateway accepted the request: stamped as the route request meta
+/// is built (after the serving auth and the wasm hooks, so their time is not
+/// the request's wait), and stamped again when an admission permit is granted
+/// after a wait in the admission queue ([`restamp_accepted_at`]), so the bound
+/// on the wait ahead of worker selection measures the time after admission,
+/// not the admission queue's own, bounded wait. Read once: the first worker selection of a request
 /// takes the stamp ([`Self::take_for_selection`]); a later pipeline run of the
 /// same request (the Responses tool loops run the pipeline once per iteration
 /// with the same meta) finds it spent and is not bounded by it.
@@ -169,12 +169,8 @@ pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,
 ) -> Result<RouteRequestMeta, Response> {
-    // The acceptance is the edge's entry stamp when the request carries one
-    // (the metrics layer put it there): one clock read for the edge.
-    let accepted =
-        RequestStarted::of(request.extensions()).map_or_else(AcceptedAt::now, AcceptedAt::at);
-    let meta =
-        RouteRequestMeta::new(resolve_raw_tenant_key(state, request)?).with_extension(accepted);
+    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request)?)
+        .with_extension(AcceptedAt::now());
     // Carry the middleware request id so backend request ids derive from it
     // (RequestIdLayer runs outside this middleware).
     Ok(match request.extensions().get::<RequestId>() {
@@ -469,24 +465,6 @@ mod tests {
             .extension::<AcceptedAt>()
             .expect("the meta carries when the gateway accepted the request");
         assert!(accepted.instant() >= before && accepted.instant() <= Instant::now());
-    }
-
-    /// The acceptance is the edge's entry stamp when the request carries one
-    /// (the metrics layer's): the one clock read for the request's entry.
-    #[tokio::test]
-    async fn request_meta_takes_the_edge_s_entry_stamp_as_its_acceptance() {
-        let state = resolution_state();
-        let earlier = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(5))
-            .expect("the clock has been running for five seconds");
-        let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
-        request.extensions_mut().insert(RequestStarted::at(earlier));
-
-        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
-        let accepted = request_meta
-            .extension::<AcceptedAt>()
-            .expect("the meta carries when the gateway accepted the request");
-        assert_eq!(accepted.instant(), earlier);
     }
 
     /// The first selection takes the stamp; a later pipeline run of the same

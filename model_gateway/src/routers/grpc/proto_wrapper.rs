@@ -974,13 +974,6 @@ pub struct TrackedStream {
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
     replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
-    /// When the request was dispatched, for a stream booked at its dispatch
-    /// (see [`DispatchBooking::book_at`]): the one instant the dispatch read,
-    /// shared with its deadline and its prefill booking, and the origin of
-    /// the generation's duration ([`ProtoStream::dispatched_at`]). A side of
-    /// a disaggregated dispatch carries none: its timing rides with the
-    /// dispatch.
-    dispatched_at: Option<Instant>,
 }
 
 /// What [`ProtoStream::first_response_within`] found as the stream's first
@@ -1130,9 +1123,6 @@ impl Drop for PrefillTicket {
 pub(crate) struct DispatchBooking {
     prefill: Option<PrefillTicket>,
     progress: Option<ProgressTicket>,
-    /// When the request was dispatched: the booking's stamp, handed on to
-    /// the stream (see [`TrackedStream::dispatched_at`]).
-    dispatched_at: Instant,
 }
 
 impl DispatchBooking {
@@ -1142,7 +1132,7 @@ impl DispatchBooking {
 
     /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
     /// instant the dispatch read, which its deadline runs from too, stamps
-    /// the prefill booking and rides with the stream.
+    /// the prefill booking.
     pub(crate) fn book_at(
         worker: &Arc<dyn Worker>,
         prompt_tokens: u64,
@@ -1163,7 +1153,6 @@ impl DispatchBooking {
                 liveness::ms_at(dispatched_at),
             ),
             progress,
-            dispatched_at,
         }
     }
 }
@@ -1557,26 +1546,6 @@ mod tracked_tests {
         drop(booking);
         assert_eq!(books(&worker), none);
     }
-
-    #[test]
-    fn a_stream_booked_at_its_dispatch_carries_the_dispatch_instant() {
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
-        let dispatched_at = std::time::Instant::now();
-        let booking = DispatchBooking::book_at(&worker, 4_096, true, dispatched_at);
-        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_booked(Arc::clone(&worker), booking);
-        assert_eq!(stream.dispatched_at(), Some(dispatched_at));
-        // The instant rides along when the stream is wrapped again.
-        assert_eq!(
-            stream.defer_abort_until_first_item().dispatched_at(),
-            Some(dispatched_at)
-        );
-        // A side of a disaggregated dispatch carries none: its timing rides
-        // with the dispatch.
-        let side = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&worker), 4_096);
-        assert_eq!(side.dispatched_at(), None);
-    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -1624,11 +1593,7 @@ impl ProtoStream {
     /// response, and the request has been in the pile since the dispatch.
     #[must_use]
     pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
-        let DispatchBooking {
-            prefill,
-            progress,
-            dispatched_at,
-        } = booking;
+        let DispatchBooking { prefill, progress } = booking;
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
@@ -1637,7 +1602,6 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
-            dispatched_at: Some(dispatched_at),
         }))
     }
 
@@ -1672,7 +1636,6 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
-            dispatched_at: None,
         }))
     }
 
@@ -1758,21 +1721,6 @@ impl ProtoStream {
             Self::DecodeSide(side) => side.inner.worker(),
             Self::Ahead(ahead) => ahead.inner.worker(),
             Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::worker),
-            _ => None,
-        }
-    }
-
-    /// When the request was dispatched, for a stream booked at its dispatch
-    /// (see [`DispatchBooking::book_at`]): the origin of the generation's
-    /// duration, read once at the dispatch. `None` for a stream that was not
-    /// (a side of a disaggregated dispatch, whose timing rides with the
-    /// dispatch; a transport stream on its own).
-    pub fn dispatched_at(&self) -> Option<Instant> {
-        match self {
-            Self::Tracked(tracked) => tracked
-                .dispatched_at
-                .or_else(|| tracked.inner.dispatched_at()),
-            Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::dispatched_at),
             _ => None,
         }
     }
@@ -2079,7 +2027,6 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
-                    dispatched_at,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_until_first_item(),
@@ -2089,7 +2036,6 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
-                    dispatched_at,
                 }))
             }
             Self::DecodeSide(side) => {

@@ -244,19 +244,6 @@ mod tests {
     /// to report: `message.refusal`, `message.content`, `choices[].logprobs`,
     /// `service_tier` and the two usage detail objects with all their
     /// counters. Typed clients read them without a presence check.
-    /// `created` is the time of the build unless the caller set the
-    /// request's own stamp: the clock is read only when nobody did.
-    #[test]
-    fn created_is_the_build_time_unless_set() {
-        let before = now_unix_seconds();
-        let built = ChatCompletionResponseBuilder::new("chatcmpl_1", "m").build();
-        assert!((before..=now_unix_seconds()).contains(&built.created));
-        let set = ChatCompletionResponseBuilder::new("chatcmpl_1", "m")
-            .created(1_700_000_000)
-            .build();
-        assert_eq!(set.created, 1_700_000_000);
-    }
-
     #[test]
     fn completion_object_carries_the_always_present_fields() {
         let response = ChatCompletionResponse::builder("chatcmpl_1", "m")
@@ -307,6 +294,19 @@ mod tests {
                 "rejected_prediction_tokens": 0
             })
         );
+    }
+
+    /// `created` is the time of the build unless the caller set the
+    /// request's own stamp: the clock is read only when nobody did.
+    #[test]
+    fn created_is_the_build_time_unless_set() {
+        let before = now_unix_seconds();
+        let built = ChatCompletionResponseBuilder::new("chatcmpl_1", "m").build();
+        assert!((before..=now_unix_seconds()).contains(&built.created));
+        let set = ChatCompletionResponseBuilder::new("chatcmpl_1", "m")
+            .created(1_700_000_000)
+            .build();
+        assert_eq!(set.created, 1_700_000_000);
     }
 
     /// Counters a backend did report survive the fill.

@@ -22,7 +22,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{body::Body, extract::Request, http::StatusCode, response::Response};
@@ -33,7 +33,6 @@ use tokio::time::Sleep;
 use tower::{Layer, Service};
 use tracing::warn;
 
-use super::request_start::RequestStarted;
 use crate::{config::types::RouterConfig, routers::error::create_error};
 
 /// Error code of a body whose client made no progress for the stall timeout.
@@ -85,17 +84,12 @@ impl RequestBodyTimeouts {
 /// is written to.
 fn timed(request: Request<Body>, timeouts: RequestBodyTimeouts) -> (Request<Body>, Arc<AtomicU8>) {
     let outcome = Arc::new(AtomicU8::new(READING));
-    // The request timeout counts from the edge's entry stamp when the request
-    // carries one (see `request_start`): the same bound, no clock read here.
-    let started = RequestStarted::of(request.extensions());
-    let request = request.map(|body| {
-        Body::new(TimedBody::new(
-            body,
-            timeouts,
-            Arc::clone(&outcome),
-            started,
-        ))
-    });
+    // The request timeout counts from here, inside the admission layers: a
+    // wait for a permit is bounded by its own timeout and is not time the
+    // client had to send its body, so the deadline is read at this layer,
+    // not taken from the edge's entry stamp.
+    let request =
+        request.map(|body| Body::new(TimedBody::new(body, timeouts, Arc::clone(&outcome))));
     (request, outcome)
 }
 
@@ -242,25 +236,12 @@ struct TimedBody {
 }
 
 impl TimedBody {
-    fn new(
-        inner: Body,
-        timeouts: RequestBodyTimeouts,
-        outcome: Arc<AtomicU8>,
-        started: Option<Instant>,
-    ) -> Self {
-        // The deadline from the request's entry stamp when it has one, else
-        // from now; a total the clock cannot add never passes.
-        let deadline = started
-            .and_then(|started| tokio::time::Instant::from_std(started).checked_add(timeouts.total))
-            .map_or_else(
-                || tokio::time::sleep(timeouts.total),
-                tokio::time::sleep_until,
-            );
+    fn new(inner: Body, timeouts: RequestBodyTimeouts, outcome: Arc<AtomicU8>) -> Self {
         Self {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
-            deadline: Box::pin(deadline),
+            deadline: Box::pin(tokio::time::sleep(timeouts.total)),
             outcome,
             ended: false,
         }
@@ -339,7 +320,7 @@ mod tests {
     use tokio::time::Instant;
     use tower::ServiceExt;
 
-    use super::*;
+    use super::{super::request_start::RequestStarted, *};
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
@@ -428,11 +409,12 @@ mod tests {
         );
     }
 
-    /// The request timeout runs from the edge's entry stamp when the request
-    /// carries one: a body whose request was taken in 15 s ago has 5 s of a
-    /// 20 s timeout left.
+    /// The deadline is armed where this layer is reached, inside the
+    /// admission layers: time the request spent before it (a wait for a
+    /// permit; here an entry stamp 15 s in the past) is not the client's
+    /// budget, which stays the whole request timeout.
     #[tokio::test(start_paused = true)]
-    async fn the_request_timeout_runs_from_the_edge_s_entry_stamp() {
+    async fn time_before_this_layer_leaves_the_request_timeout_whole() {
         let started = Instant::now();
         let earlier = started
             .into_std()
@@ -445,8 +427,8 @@ mod tests {
         assert_eq!(error_code(response).await, REQUEST_BODY_TIMEOUT);
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_secs(5) && waited < Duration::from_secs(7),
-            "ended after {waited:?}, expected the 5 s left of the 20 s request timeout"
+            waited >= Duration::from_secs(20) && waited < Duration::from_secs(22),
+            "ended after {waited:?}, expected the whole 20 s request timeout from this layer"
         );
     }
 

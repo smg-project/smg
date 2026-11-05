@@ -2,15 +2,15 @@
 //! request comes in, which the layers inside share instead of reading the
 //! clock again. The metrics layer, the outermost layer with a clock, takes
 //! it and puts it on the request's extensions; the access log counts its
-//! latency from it, the in-flight tracker ages the request from it, the
-//! tenant layer stamps the acceptance with it and the body watchdog counts
-//! the request timeout from it. Each keeps a read of its own for a request
-//! that reaches it without the stamp (a bare stack in a test).
+//! latency from it and the in-flight guard ages the request from it. Each
+//! keeps a read of its own for a request that reaches it without the stamp
+//! (a bare stack in a test). The stamps inside the admission layers (the
+//! acceptance at tenant resolution, the request-body deadline) stay reads of
+//! their own: a wait for a permit sits between the edge and them.
 //!
 //! The stamp is on the runtime's clock ([`clock_now`]): the wall clock in
-//! production, the paused clock of a test that advances time itself, so a
-//! bound read on the runtime's clock later (the queue timeout ahead of
-//! worker selection) measures from the clock it was stamped on.
+//! production, the paused clock of a test that advances time itself, which
+//! is also the clock the acceptance stamp is read on.
 
 use std::time::Instant;
 

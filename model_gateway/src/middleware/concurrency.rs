@@ -194,9 +194,9 @@ where
         if let Ok(permit) = TokenPermit::try_acquire(Arc::clone(token_bucket), 1.0) {
             debug!("Acquired token immediately");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-            // Granted at once: the bound ahead of worker selection counts from
-            // the acceptance already stamped on the request (no wait in the
-            // queue to leave out, no second clock read).
+            // Granted at once: the acceptance stamped at tenant resolution a
+            // moment ago stands (no wait in the queue to leave out, no second
+            // clock read).
             return ConcurrencyLimitFuture::Admitted {
                 inner: self.inner.call(request),
                 permit: Some(permit),
