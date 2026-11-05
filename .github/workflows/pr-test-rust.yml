@@ -2052,7 +2052,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 471 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 487 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2065,8 +2065,10 @@ jobs:
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the
           # mock's tokenizer turns a scripted answer's channel markers into
-          # the special tokens)
-          E2E_MIN_SELECTED: "447"
+          # the special tokens), and the scheduler-wire classes (a chat, a
+          # streamed and a tool-call turn through the gateway on each of the
+          # three gRPC protos the mock serves)
+          E2E_MIN_SELECTED: "462"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
