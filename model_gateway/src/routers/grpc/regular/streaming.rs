@@ -1668,8 +1668,8 @@ impl StreamingProcessor {
     /// `buffer`: the constant text as literals (`delta_head` is the delta's type and key, the
     /// `text_delta` one [`Self::TEXT_DELTA_HEAD`]) and serde for the index and the text, so the
     /// frame costs the escape of its text. The bytes are those of the serialized event, which
-    /// `tests::messages_delta_frames_write_the_bytes_of_the_serialized_event` and
-    /// `tests::the_direct_text_delta_frame_writes_the_bytes_of_the_serialized_event` pin.
+    /// `tests::messages_delta_frames_write_the_bytes_of_the_serialized_event` pins; the lane's
+    /// end-to-end bytes are the `messages_symphony_text` scenario of `tests::messages_bytes`.
     #[inline]
     fn format_string_delta_frame_into(
         buffer: &mut BytesMut,

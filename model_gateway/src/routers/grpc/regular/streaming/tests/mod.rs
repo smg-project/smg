@@ -428,45 +428,6 @@ fn serialized_messages_event(event: &MessageStreamEvent) -> Vec<u8> {
     bytes
 }
 
-/// The direct `text_delta` frame, written from a borrowed text with no owned event (the steady
-/// state of a Symphony Messages stream), is the serialized event's frame byte for byte, over the
-/// same texts and indices as the one-pass frames.
-#[test]
-fn the_direct_text_delta_frame_writes_the_bytes_of_the_serialized_event() {
-    let texts = [
-        "",
-        "Hello",
-        "say \"hi\"",
-        "back\\slash",
-        "tab\tnewline\ncarriage\r",
-        "\u{1f}control\u{7f}",
-        "caf\u{e9} \u{1f600} \u{2028}",
-    ];
-    for index in [0u32, 1, 7, 1234, u32::MAX] {
-        for text in texts {
-            let mut buffer = BytesMut::with_capacity(64);
-            StreamingProcessor::format_string_delta_frame_into(
-                &mut buffer,
-                index,
-                StreamingProcessor::TEXT_DELTA_HEAD,
-                text,
-            )
-            .expect("the frame formats");
-            let event = MessageStreamEvent::ContentBlockDelta {
-                index,
-                delta: ContentBlockDelta::TextDelta {
-                    text: text.to_string(),
-                },
-            };
-            assert_eq!(
-                buffer.to_vec(),
-                serialized_messages_event(&event),
-                "index {index}, text {text:?}"
-            );
-        }
-    }
-}
-
 /// The one-pass `content_block_delta` frames write exactly the bytes of the
 /// serialized event, so the literal head can never drift from serde's walk of
 /// the two tagged enums: every string delta variant, several block indices and
