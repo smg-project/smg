@@ -63,6 +63,7 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            pd_admission::{self, PdAdmissionGuard},
             pd_failure::{PdSide, SidePhase},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
@@ -97,10 +98,33 @@ use crate::{
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
 /// The load one admitted PD request holds. The Prefill guard is released
-/// when the Prefill phase ends; the Decode guard rides on the response body.
+/// when the Prefill phase ends; the Decode guard rides on the response body,
+/// and with it the room the attempt claimed in the decode engine's running
+/// window (`None` until the attempt claims it, or when the engine reports no
+/// window; see `pd_admission::admit_decode`).
 struct PdLoadGuards {
     prefill: PrefillLoadGuard,
     decode: WorkerLoadGuard,
+    admission: Option<PdAdmissionGuard>,
+}
+
+/// What the decode side holds until the response body is dropped: the
+/// worker's load, and the room its admission claimed in the decode engine's
+/// running window, as the gRPC pipeline binds its claim to its load guards
+/// (`LoadGuards::admitted`), so the room is released on every path the
+/// request can end on and never before the engine is done with it.
+struct DecodeGuard {
+    _load: WorkerLoadGuard,
+    _admission: Option<PdAdmissionGuard>,
+}
+
+impl DecodeGuard {
+    fn new(load: WorkerLoadGuard, admission: Option<PdAdmissionGuard>) -> Self {
+        Self {
+            _load: load,
+            _admission: admission,
+        }
+    }
 }
 
 /// What every dispatch body sets up before its first side goes out: the two
@@ -111,7 +135,7 @@ struct PdSetup {
     prefill_body: Bytes,
     decode_body: Bytes,
     prefill_guard: PrefillLoadGuard,
-    decode_guard: WorkerLoadGuard,
+    decode_guard: DecodeGuard,
     headers_with_trace: HeaderMap,
     runtime: &'static str,
 }
@@ -127,6 +151,7 @@ impl PdSetup {
         let PdLoadGuards {
             prefill: prefill_guard,
             decode: decode_guard,
+            admission,
         } = guards;
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -134,7 +159,7 @@ impl PdSetup {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            decode_guard: DecodeGuard::new(decode_guard, admission),
             headers_with_trace,
             runtime: prefill.metadata().spec.runtime_type.as_str(),
         }
@@ -814,7 +839,7 @@ impl PDRouter {
                 sticky_key,
             )
             .await;
-        let ((prefill, decode), guards) = match selected {
+        let ((prefill, decode), mut guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
                 return self
@@ -840,6 +865,24 @@ impl PDRouter {
         {
             return shed;
         }
+
+        // The decode engine's running window, as the gRPC pipeline's
+        // `execute_plan` claims it before anything else of the attempt: a
+        // room per bootstrap room the dispatch posts, waited for within the
+        // admission wait and shed with the overload 503 past it (a batch
+        // wider than the window at once); a worker that reports no window
+        // leaves admission to its engine. The claim rides with the decode
+        // side's load guard into the response body.
+        guards.admission = match pd_admission::admit_decode(
+            &decode,
+            context.model_id,
+            context.batch_size.unwrap_or(1),
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(shed) => return shed,
+        };
 
         let raw_body_len = header_utils::content_length(headers);
 
@@ -1202,7 +1245,7 @@ impl PDRouter {
         decode_response: reqwest::Response,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: DecodeGuard,
         runtime: &'static str,
         dispatch_start: Instant,
     ) -> Response {
@@ -2046,7 +2089,7 @@ impl PDRouter {
         status: StatusCode,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: DecodeGuard,
         prefill_body: Option<Bytes>,
     ) -> Response {
         if context.is_stream {
@@ -2138,6 +2181,7 @@ impl PDRouter {
         let guards = PdLoadGuards {
             prefill: prefill_guard,
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+            admission: None,
         };
         Ok(((prefill, decode), guards))
     }
@@ -2241,7 +2285,7 @@ impl PDRouter {
         return_logprob: bool,
         source: RelaySource,
         headers: Option<HeaderMap>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: DecodeGuard,
     ) -> Response {
         // The same rule as the regular relay: a successful stream with no
         // content type is relayed as SSE. Read from the decode side's own
@@ -6345,7 +6389,7 @@ mod tests {
                 Arc::clone(&decode),
             ),
             None,
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            DecodeGuard::new(WorkerLoadGuard::new(Arc::clone(&decode), None), None),
         );
 
         // The head is out and the relay has not run: the success is recorded.
@@ -6597,7 +6641,8 @@ mod tests {
             let prefill_guard = PrefillLoadGuard::Unbounded {
                 _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
             };
-            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
+            let decode_guard =
+                DecodeGuard::new(WorkerLoadGuard::new(decode_ref.clone(), None), None);
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
@@ -7322,6 +7367,154 @@ mod tests {
         assert!(line.ends_with(" 1"), "{line}");
     }
 
+    /// An engine's server that holds each request for `hold` before it
+    /// answers `{}`, recording when each request arrived.
+    async fn spawn_timed_stub(
+        hold: std::time::Duration,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Instant>>>) {
+        let arrivals: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
+        let log = Arc::clone(&arrivals);
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            let log = Arc::clone(&log);
+            async move {
+                log.lock().unwrap().push(Instant::now());
+                tokio::time::sleep(hold).await;
+                axum::Json(json!({}))
+            }
+        }));
+        (spawn_stub(app).await, arrivals)
+    }
+
+    /// A prefill-decode pair on the concurrent shape, the decode worker
+    /// reporting `window` running requests (the label discovery writes from
+    /// the engine's own figure) or no window; both ready and registered. The
+    /// pair's workers, prefill first.
+    fn window_pair(
+        router: &PDRouter,
+        prefill_url: String,
+        decode_url: String,
+        window: Option<&str>,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let mut pair = Vec::new();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Sglang);
+            if worker_type == WorkerType::Decode {
+                if let Some(window) = window {
+                    builder = builder.label("max_num_seqs", window);
+                }
+            }
+            let worker = builder.build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            let worker: Arc<dyn Worker> = Arc::new(worker);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&worker));
+            pair.push(worker);
+        }
+        let decode = pair.pop().unwrap();
+        (pair.pop().unwrap(), decode)
+    }
+
+    /// On the HTTP prefill-decode router the decode engine's running window
+    /// admits one dispatch per room, as the gRPC pipeline's admission gate
+    /// does: a second request arriving while the first holds the one room
+    /// waits for it (within the admission wait) and reaches the engines once
+    /// the first answered, instead of being posted to an engine that cannot
+    /// run it yet; a decode worker that reports no window is not gated, and
+    /// both go at once, as dispatch always did.
+    #[tokio::test]
+    async fn a_decode_window_of_one_admits_one_dispatch_at_a_time_on_the_pair() {
+        const HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+        const HEAD_START: std::time::Duration = std::time::Duration::from_millis(200);
+        for window in [Some("1"), None] {
+            let (prefill_url, _) = spawn_timed_stub(HOLD).await;
+            let (decode_url, decode_arrivals) = spawn_timed_stub(HOLD).await;
+            let router = create_test_pd_router();
+            let (prefill, decode) = window_pair(&router, prefill_url, decode_url, window);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let request = || -> GenerateRequest {
+                serde_json::from_value(json!({"text": "hi", "stream": false}))
+                    .expect("valid generate request")
+            };
+            let case = format!("window {window:?}");
+
+            let first = router.route_generate(None, &tenant, request(), UNKNOWN_MODEL_ID);
+            let second = async {
+                tokio::time::sleep(HEAD_START).await;
+                router
+                    .route_generate(None, &tenant, request(), UNKNOWN_MODEL_ID)
+                    .await
+            };
+            let (first, second) =
+                tokio::time::timeout(HANG_GUARD, async { tokio::join!(first, second) })
+                    .await
+                    .expect("both requests answered");
+
+            assert_eq!(
+                first.status(),
+                StatusCode::OK,
+                "{case}: {}",
+                error::extract_error_code_from_response(&first)
+            );
+            assert_eq!(
+                second.status(),
+                StatusCode::OK,
+                "{case}: {}",
+                error::extract_error_code_from_response(&second)
+            );
+            let arrivals = decode_arrivals.lock().unwrap().clone();
+            assert_eq!(arrivals.len(), 2, "{case}: both decode sides sent");
+            let gap = arrivals[1].saturating_duration_since(arrivals[0]);
+            match window {
+                Some(_) => assert!(
+                    gap >= HOLD - std::time::Duration::from_millis(100),
+                    "{case}: the second decode side waits for the room the first holds: {gap:?}"
+                ),
+                None => assert!(gap < HOLD / 2, "{case}: no window, no wait: {gap:?}"),
+            }
+            assert_eq!((prefill.load(), decode.load()), (0, 0), "{case}");
+        }
+    }
+
+    /// A request that posts more bootstrap rooms than the decode window
+    /// holds (a batch of two prompts on a window of one) can never be
+    /// admitted: it is shed at once with the overload 503, before either
+    /// side is contacted, and leaves no load on the pair.
+    #[tokio::test]
+    async fn a_batch_wider_than_the_decode_window_is_shed_before_either_side_is_contacted() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = window_pair(&router, prefill_url, decode_url, Some("1"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"input_ids": [[1, 2, 3], [4, 5, 6]], "stream": false}))
+                .expect("valid generate request");
+
+        let response = tokio::time::timeout(
+            HANG_GUARD,
+            router.route_generate(None, &tenant, request, UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("shed at once");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "worker_overload_protection_shed"
+        );
+        assert!(
+            taken(&prefill_seen).is_empty() && taken(&decode_seen).is_empty(),
+            "neither side is contacted"
+        );
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+    }
+
     /// What every dispatch body takes from the setup: the sides and the
     /// guards as given (the guards keep both workers loaded until the setup
     /// is dropped), the request headers kept under the trace injection, the
@@ -7345,6 +7538,7 @@ mod tests {
                 _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
             },
             decode: WorkerLoadGuard::new(Arc::clone(&decode), None),
+            admission: None,
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         let mut headers = HeaderMap::new();

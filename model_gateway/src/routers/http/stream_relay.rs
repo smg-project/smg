@@ -68,8 +68,10 @@ impl ChunkMode {
     }
 }
 
-/// The relay of one streaming answer.
-pub(crate) struct Relay {
+/// The relay of one streaming answer. `G` is what the body holds for the
+/// worker until it is dropped: its load guard, and on the disaggregated
+/// router the decode side's admission claim with it.
+pub(crate) struct Relay<G = WorkerLoadGuard> {
     /// The head's status, answered as it came.
     pub(crate) status: StatusCode,
     /// Whether the upstream body is SSE (the worker said so, or a successful
@@ -78,8 +80,8 @@ pub(crate) struct Relay {
     pub(crate) upstream_sse: bool,
     /// Where the body comes from, for the accounting of a cut.
     pub(crate) source: RelaySource,
-    /// The worker's load, released when the body is dropped.
-    pub(crate) guard: WorkerLoadGuard,
+    /// What the body holds for the worker, released when the body is dropped.
+    pub(crate) guard: G,
     /// The response headers, prepared by the caller.
     pub(crate) headers: HeaderMap,
     /// How each chunk is read before it is sent.
@@ -89,9 +91,10 @@ pub(crate) struct Relay {
 /// Relay `stream` to the client as the response's body. The head's success
 /// is recorded before the task starts; the task runs under the request's
 /// span; the response carries the head-success mark the callers read.
-pub(crate) fn relay_streaming_body<S>(stream: S, relay: Relay) -> Response
+pub(crate) fn relay_streaming_body<S, G>(stream: S, relay: Relay<G>) -> Response
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    G: Send + Unpin + 'static,
 {
     let Relay {
         status,
