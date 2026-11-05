@@ -5,6 +5,8 @@
 //! of named fields, not a bag of server args: the width is
 //! `data_parallel_size`, a role is `kv_role` behind `kv_connector`), loads
 //! and KV-event subscription.
+//! The admin fan-out's flush and profile RPCs are answered by the core, the
+//! same on every wire.
 
 use std::pin::Pin;
 
@@ -96,21 +98,23 @@ impl VllmEngine for MockScheduler {
         &self,
         _request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(self.flush_cache_response()))
     }
 
     async fn start_profile(
         &self,
-        _request: Request<common::StartProfileRequest>,
+        request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(
+            self.start_profile_response(request.into_inner()),
+        ))
     }
 
     async fn stop_profile(
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(self.stop_profile_response()))
     }
 
     async fn abort(

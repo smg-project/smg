@@ -33,6 +33,7 @@ use tonic_health::pb::{
 };
 
 use crate::{
+    admin_ops::{AdminOps, ProfileOptions},
     config::{Config, Role, SchedulerWire},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
@@ -103,6 +104,7 @@ pub async fn serve_with_listener_until(
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
     script::register(&name);
+    let ops = AdminOps::register(&name);
     let ranks = Rank::spawn_all(&cfg, &name);
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset:
     // its one rank's (the publisher ports are per worker, not per rank, so
@@ -161,6 +163,7 @@ pub async fn serve_with_listener_until(
         in_flight: WorkerInFlight::default(),
         overrides,
         bootstrap_port,
+        ops,
     };
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
@@ -302,6 +305,8 @@ struct MockScheduler {
     /// The requests this worker is serving: what its load report counts as
     /// running on a canned worker, which runs no engine simulation.
     in_flight: WorkerInFlight,
+    /// The flush and profile operations the gateway fans out, and their counts.
+    ops: Arc<AdminOps>,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,
@@ -677,6 +682,43 @@ impl MockScheduler {
 
     /// Every wire's `HealthCheck` answer: healthy unless the admin API set
     /// the worker not serving, with the message each proto carries.
+    /// The admin fan-out's flush: every rank's cache cleared at once, whatever
+    /// is in flight (the request's wait for an idle scheduler is not
+    /// simulated), answered with success; a canned worker has no cache and
+    /// answers the same. One answer for the three wires, which all carry the
+    /// common proto's messages.
+    pub(crate) fn flush_cache_response(&self) -> common::FlushCacheResponse {
+        let message = self.ops.flush(self.ranks.iter().map(|rank| &rank.engine));
+        common::FlushCacheResponse {
+            success: true,
+            message,
+        }
+    }
+
+    /// A profiling run starts with the request's options; a second start
+    /// while one runs answers `success: false`, as an engine's profiler does.
+    pub(crate) fn start_profile_response(
+        &self,
+        request: common::StartProfileRequest,
+    ) -> common::ProfileResponse {
+        let options = ProfileOptions {
+            output_dir: request.output_dir,
+            start_step: request.start_step,
+            num_steps: request.num_steps,
+            activities: request.activities,
+            with_stack: request.with_stack,
+            record_shapes: request.record_shapes,
+            profile_by_stage: request.profile_by_stage,
+        };
+        profile_response(self.ops.start_profile(options))
+    }
+
+    /// The run ends with one trace file in its output directory; no run in
+    /// progress answers `success: false`.
+    pub(crate) fn stop_profile_response(&self) -> common::ProfileResponse {
+        profile_response(self.ops.stop_profile())
+    }
+
     pub(crate) fn health(&self) -> (bool, &'static str) {
         let serving = self.overrides.serving();
         (serving, if serving { "ok" } else { "not serving" })
@@ -883,6 +925,7 @@ impl MockScheduler {
             in_flight: WorkerInFlight::default(),
             overrides: crate::overrides::for_port(port),
             bootstrap_port: cfg.bootstrap_base_port,
+            ops: AdminOps::register(&name),
             name,
             cfg,
         };
@@ -1624,6 +1667,21 @@ fn with_load_records(
     }))
 }
 
+/// A profile call's answer: the engines report a refused call as
+/// `success: false` with the reason, not as a status.
+fn profile_response(result: Result<String, String>) -> common::ProfileResponse {
+    match result {
+        Ok(message) => common::ProfileResponse {
+            success: true,
+            message,
+        },
+        Err(message) => common::ProfileResponse {
+            success: false,
+            message,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
@@ -1869,6 +1927,130 @@ mod tests {
             .find(|record| record.request_id == request_id)
             .unwrap_or_else(|| panic!("{request_id} was admitted"))
             .worker
+    }
+
+    /// The admin fan-out's three RPCs on a canned worker, over the wire: the
+    /// flush answers success, a profiling run ends with one trace file in the
+    /// requested directory, a stop with no run in progress is `success:
+    /// false`, and the admin operations count them.
+    #[tokio::test]
+    async fn the_admin_fan_out_rpcs_answer_on_a_canned_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server serves until the test process exits"
+        )]
+        let _server = tokio::spawn(serve_with_listener(Arc::new(Config::default()), listener));
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut scheduler = TokenSpeedSchedulerClient::new(channel);
+
+        let flushed = scheduler
+            .flush_cache(common::FlushCacheRequest { timeout_s: 0.0 })
+            .await
+            .expect("flush")
+            .into_inner();
+        assert!(flushed.success, "{}", flushed.message);
+        assert!(
+            flushed.message.ends_with("cache cleared on 0 engine(s)"),
+            "{}",
+            flushed.message
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let started = scheduler
+            .start_profile(common::StartProfileRequest {
+                output_dir: Some(traces.display().to_string()),
+                num_steps: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("start")
+            .into_inner();
+        assert!(started.success, "{}", started.message);
+        let stopped = scheduler
+            .stop_profile(common::StopProfileRequest {})
+            .await
+            .expect("stop")
+            .into_inner();
+        assert!(stopped.success, "{}", stopped.message);
+        let files: Vec<_> = std::fs::read_dir(&traces)
+            .expect("the output directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(files.len(), 1, "{}", stopped.message);
+        assert!(stopped.message.ends_with(&files[0].display().to_string()));
+
+        let again = scheduler
+            .stop_profile(common::StopProfileRequest {})
+            .await
+            .expect("stop")
+            .into_inner();
+        assert!(!again.success, "a stop with no run in progress is refused");
+        let status = AdminOps::find(&format!("grpc:{}", addr.port()))
+            .expect("the worker's operations")
+            .status();
+        assert_eq!(status["flushes"], 1);
+        assert_eq!(status["profiles_started"], 1);
+        assert_eq!(status["profiles_stopped"], 1);
+    }
+
+    /// On a realistic worker the flush clears every rank's cache: the blocks
+    /// a request stored are gone once the engines have run the reset pass.
+    #[tokio::test]
+    async fn a_flush_clears_every_rank_s_cache_on_a_realistic_worker() {
+        let (service, _stop) = scheduler_with_ranks(2, 65_103);
+        for (id, rank) in [("flush-r0", 0), ("flush-r1", 1)] {
+            // A prompt of four blocks: a shorter one stores nothing to clear.
+            let mut request = generate_request(id, Some(rank), 2);
+            request.tokenized = Some(ts::TokenizedInput {
+                input_ids: vec![3; 64],
+                ..Default::default()
+            });
+            let mut stream = service
+                .generate(Request::new(request))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while stream.next().await.is_some() {}
+        }
+        let cached = |service: &MockScheduler| -> Vec<usize> {
+            service
+                .ranks
+                .iter()
+                .map(|rank| rank.engine.cache_keys().len())
+                .collect()
+        };
+        assert!(
+            cached(&service).iter().all(|blocks| *blocks > 0),
+            "both ranks cached the prompt: {:?}",
+            cached(&service)
+        );
+        let flushed = service
+            .flush_cache(Request::new(common::FlushCacheRequest { timeout_s: 0.0 }))
+            .await
+            .expect("flush")
+            .into_inner();
+        assert!(flushed.success, "{}", flushed.message);
+        assert!(
+            flushed.message.ends_with("cache cleared on 2 engine(s)"),
+            "{}",
+            flushed.message
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cached(&service).iter().any(|blocks| *blocks > 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the caches did not clear: {:?}",
+                cached(&service)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A pinned request runs on its rank's engine; a pin past the worker's

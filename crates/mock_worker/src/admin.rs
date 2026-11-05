@@ -13,6 +13,9 @@
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
+//! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
+//!   the worker: its flushes, its profiling runs and the last trace written
+//!   (`all`: every worker).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
@@ -49,6 +52,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::{
+    admin_ops::AdminOps,
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
     script,
@@ -79,6 +83,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/pause", post(fault_pause))
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
+        .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
         .route(
@@ -453,6 +458,18 @@ async fn reset_one(Path(worker): Path<String>) -> Response {
             Json(json!({ "reset": names })).into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The flush and profile operations the gateway fanned out to the worker.
+async fn ops_status(Path(worker): Path<String>) -> Response {
+    if worker == "all" {
+        let workers: Vec<Value> = AdminOps::all().iter().map(|ops| ops.status()).collect();
+        return Json(json!({ "workers": workers })).into_response();
+    }
+    match AdminOps::find(&worker) {
+        Some(ops) => Json(ops.status()).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown worker").into_response(),
     }
 }
 
