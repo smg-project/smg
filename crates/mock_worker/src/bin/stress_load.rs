@@ -90,6 +90,9 @@ enum Mode {
     /// `POST /generate` (the engine-native route) with the prompt as its
     /// `text`; a streamed answer repeats the whole text so far in every frame.
     Generate,
+    /// `POST /v1/completions` with the prompt as its `prompt`; a streamed
+    /// answer is one `text` delta per frame.
+    Completion,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -428,6 +431,13 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
                 "text": prompt(args, i),
                 "sampling_params": {"max_new_tokens": args.max_tokens},
                 "stream": args.stream,
+            }),
+            Mode::Completion => json!({
+                "model": args.model,
+                "prompt": prompt(args, i),
+                "max_tokens": args.max_tokens,
+                "stream": args.stream,
+                "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
             }),
             Mode::Tools => json!({
                 "model": args.model,
@@ -1019,6 +1029,7 @@ async fn run(args: Args) -> Result<Summary> {
         Mode::Messages => "/v1/messages",
         Mode::Embeddings => "/v1/embeddings",
         Mode::Generate => "/generate",
+        Mode::Completion => "/v1/completions",
         _ => "/v1/chat/completions",
     };
     let url = format!("{}{}", args.gateway.trim_end_matches('/'), path);
@@ -1205,6 +1216,19 @@ mod tests {
         assert_eq!(v["sampling_params"]["max_new_tokens"], 8);
         assert_eq!(v["stream"], true);
         assert!(v.get("messages").is_none());
+
+        let mut c = args(Mode::Completion);
+        c.stream = true;
+        let c = build_bodies(&c).unwrap();
+        let v: Value = serde_json::from_slice(&c[3]).unwrap();
+        assert!(v["prompt"].as_str().unwrap().contains("[session 3]"));
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert!(v.get("messages").is_none());
+        let v: Value =
+            serde_json::from_slice(&build_bodies(&args(Mode::Completion)).unwrap()[0]).unwrap();
+        assert!(v["stream_options"].is_null());
 
         let mut c = args(Mode::Chat);
         c.json_schema = true;

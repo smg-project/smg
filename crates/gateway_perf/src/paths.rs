@@ -143,6 +143,22 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             label: "generate stream, 300 frames of one token, the whole text in every frame",
         },
         PathSpec {
+            name: "completion_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "completion",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "109",
+            ],
+            answer: words(300),
+            finish: "length",
+            label: "completion stream, 300 deltas of one token",
+        },
+        PathSpec {
             name: "generate_stream_long",
             rate: 16.0,
             client: &[
