@@ -135,15 +135,6 @@ async fn free_port() -> u16 {
         .port()
 }
 
-/// Wait for `done`, within `bound`.
-async fn wait_until(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
-    let started = Instant::now();
-    while !done() {
-        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 #[expect(
     clippy::expect_used,
     reason = "test helper: a malformed fixture request fails the fixture"
@@ -266,7 +257,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     let (router, worker, mut manager) = build_router(port, 1, None).await;
 
     // Pending until the first probe passes; then it serves.
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
@@ -282,7 +273,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
         let _ = request_status(router.as_ref()).await;
     }
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
-    wait_until("the worker's demotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's demotion", RECOVERY_BOUND, || {
         worker.status() != WorkerStatus::Ready
     })
     .await;
@@ -338,7 +329,7 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
 
     // Two passing probes an interval apart: the registration's promotion.
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
@@ -347,7 +338,7 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     // The engine dies; the next probe demotes the worker, and the engine is
     // back right after it.
     engine.kill().await;
-    wait_until("the worker's demotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's demotion", RECOVERY_BOUND, || {
         worker.status() != WorkerStatus::Ready
     })
     .await;
@@ -491,7 +482,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
         }),
     )
     .await;
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
