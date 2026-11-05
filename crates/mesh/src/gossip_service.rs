@@ -126,6 +126,13 @@ pub struct GossipService {
     mesh_kv: Option<Arc<crate::kv::MeshKV>>,
 }
 
+/// The HTTP/2 flow-control credit one stream on an accepted connection may
+/// hold (the server default).
+const STREAM_WINDOW_BYTES: u32 = 1 << 20;
+/// The credit of the whole accepted connection: the sync stream from a peer
+/// and that peer's probes share it, so it is four streams' worth, not one.
+const CONNECTION_WINDOW_BYTES: u32 = 4 << 20;
+
 impl GossipService {
     pub fn new(
         state: ClusterState,
@@ -184,7 +191,17 @@ impl GossipService {
     /// manager reads, so material that exists but cannot be used fails here,
     /// not where the server is polled.
     async fn server_builder(&self) -> Result<Server> {
-        let mut server = Server::builder();
+        // The sync stream a peer dials runs on the channel its probes use,
+        // so the two share this connection's flow-control window. The
+        // server default gives the connection no more credit than one
+        // stream may take (1 MiB each), and a stream whose reader is busy
+        // with a large batch or a full reply queue would hold the whole
+        // window while the peer's probe waits for credit, until its deadline
+        // marked this node Suspected. The connection gets four times what a
+        // stream may take, so the probes keep their headroom.
+        let mut server = Server::builder()
+            .initial_stream_window_size(STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(CONNECTION_WINDOW_BYTES);
         if let Some(mtls_manager) = self.dialer.mtls_manager() {
             let tls = mtls_manager
                 .server_tls_config()

@@ -9,9 +9,13 @@
 //! suspicion and at every status change. A [`Channel`] connects on its first
 //! request and reconnects by itself after a failure, so one per peer address
 //! carries every dial to that peer, and a peer that restarts on its address
-//! answers again through the same channel. The sync streams keep their own
-//! connections: a stream is one long request, and the probes' request
-//! deadline is not for it.
+//! answers again through the same channel. The sync stream to a peer runs
+//! on the same channel: a stream is one long request, and the request
+//! deadline bounds the wait for its response head only, not the frames
+//! after it, so a pair of members holds one connection per direction. The
+//! stream and the probes then share the connection's flow-control window
+//! on the accepting side, which is why the listener gives a connection more
+//! credit than one stream may hold (see the service's server builder).
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
@@ -70,8 +74,7 @@ impl Dialer {
         })
     }
 
-    /// The node's TLS identity, for the dials that keep a connection of
-    /// their own (the sync streams).
+    /// The node's TLS identity, for the listener's server configuration.
     pub(crate) fn mtls_manager(&self) -> Option<&Arc<MTLSManager>> {
         self.mtls_manager.as_ref()
     }
@@ -103,8 +106,13 @@ impl Dialer {
 
     /// The channel to `addr`: the one kept, or a new one that connects on
     /// its first request. Two dials racing for a new address keep the first
-    /// channel made, so an address never has two.
-    async fn channel(&self, peer_name: &str, addr: SocketAddr) -> Result<Channel, tonic::Status> {
+    /// channel made, so an address never has two. The dials in this module
+    /// and the sync stream to the peer at `addr` share it.
+    pub(crate) async fn channel(
+        &self,
+        peer_name: &str,
+        addr: SocketAddr,
+    ) -> Result<Channel, tonic::Status> {
         if let Some(channel) = self.channels.lock().get(&addr) {
             return Ok(channel.clone());
         }

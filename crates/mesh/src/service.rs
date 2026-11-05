@@ -513,7 +513,10 @@ macro_rules! mesh_run {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        sync::Once,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Once,
+        },
     };
 
     use rustls::crypto::ring;
@@ -1049,6 +1052,92 @@ mod tests {
 
         assert!(result.is_err(), "a foreign CA must be refused: {result:?}");
         handler_a.shutdown();
+    }
+
+    /// The dialing end of a pair opens one connection to its peer: the
+    /// channel the probes keep carries the sync stream too. B advertises a
+    /// counting proxy in front of its listener, A joins through it, and once
+    /// a value put on A has reached B over the stream, the proxy has
+    /// accepted one connection from A. (Before, the stream dialed a
+    /// connection of its own: two.)
+    #[tokio::test]
+    async fn the_sync_stream_runs_on_the_channel_the_probes_keep() {
+        init();
+        let (listener_b, bind_b) = bind_node().await;
+        let (proxy_b, accepted) = counting_proxy(bind_b).await;
+        let (server_b, handler_b) =
+            MeshServerBuilder::new("B".to_string(), bind_b, proxy_b, None).build();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test node runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            if let Err(e) = server_b.start_with_listener(listener_b).await {
+                tracing::error!("Mesh node B failed: {e}");
+            }
+        });
+        let (listener_a, addr_a) = bind_node().await;
+        let handler_a = mesh_run!("A", listener_a, addr_a, Some(proxy_b));
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "A and B see each other",
+        )
+        .await;
+        handler_a
+            .mesh_kv()
+            .configs()
+            .put("config:shared", b"channel".to_vec());
+        wait_for(
+            || {
+                handler_b
+                    .mesh_kv()
+                    .configs()
+                    .get("config:shared")
+                    .as_deref()
+                    == Some(b"channel".as_slice())
+            },
+            Duration::from_secs(20),
+            "A's value reaches B over the sync stream",
+        )
+        .await;
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "A opened more than one connection to B: the stream did not run on the probes' channel"
+        );
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// A loopback proxy in front of `target`: it counts the connections it
+    /// accepts and copies bytes both ways.
+    async fn counting_proxy(target: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test proxy runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "one proxied connection, copied until either end closes"
+                )]
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        (addr, accepted)
     }
 
     /// A plain mesh node on an ephemeral loopback port, listening.
