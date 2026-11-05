@@ -9,11 +9,14 @@ on:
       - 'scripts/bench_gate.py'
       - 'model_gateway/benches/request_processing.rs'
       - 'model_gateway/src/routers/**'
-      - 'model_gateway/src/core/**'
-      - 'model_gateway/src/middleware.rs'
+      - 'model_gateway/src/worker/**'
+      - 'crates/protocols/**'
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
+      - '!crates/protocols/**/tests/**'
+      - '!crates/protocols/**/*_test.rs'
+      - '!crates/protocols/**/test_*.rs'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -22,11 +25,14 @@ on:
       - 'scripts/bench_gate.py'
       - 'model_gateway/benches/request_processing.rs'
       - 'model_gateway/src/routers/**'
-      - 'model_gateway/src/core/**'
-      - 'model_gateway/src/middleware.rs'
+      - 'model_gateway/src/worker/**'
+      - 'crates/protocols/**'
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
+      - '!crates/protocols/**/tests/**'
+      - '!crates/protocols/**/*_test.rs'
+      - '!crates/protocols/**/test_*.rs'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
