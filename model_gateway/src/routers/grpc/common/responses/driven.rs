@@ -129,7 +129,13 @@ impl Stream for DrivenBody {
                 Poll::Ready(()) => {}
                 // The reading parked, on the engine or on the channel, with
                 // this task's waker registered where it parked; what it
-                // wrote before parking goes out now.
+                // wrote before parking is handed to the connection now. The
+                // connection writes it before the reading runs on only after
+                // the body's first frame (`yield_once`): after any later
+                // frame the connection pulls again at once and the reading
+                // runs on; a reading that needs such a frame written first
+                // yields twice itself (the packed engine read's first token,
+                // `StreamingProcessor::next_packed`).
                 Poll::Pending => {
                     this.reading = Some(reading);
                     return match this.rx.try_recv() {

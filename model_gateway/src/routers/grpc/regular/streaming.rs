@@ -1583,9 +1583,17 @@ impl StreamingProcessor {
     /// registers the reader's wake where the message will come from; `next`
     /// resumes it after the flush. `first_token_out` turns true once that
     /// frame has left (`first_token_seen`: the stream has produced its first
-    /// token); the yield there hands the frame to the body driving this
-    /// reading, which writes it to the connection before the reading resumes
-    /// (see `DrivenBody`). A failed flush is the channel's end.
+    /// token); the two yields there hand the frame to the connection through
+    /// the body driving this reading (see `DrivenBody`): the first lets the
+    /// body hand the frame out, the second lets the body answer the
+    /// connection's next pull with pending, so the connection writes the
+    /// frame before the reading runs on. With one yield the connection pulls
+    /// the reading's next frame first, and under a burst of engine messages
+    /// that frame comes only when the burst has been read: the first token
+    /// would reach the client behind the burst, as it did on the Messages
+    /// stream (whose first frame, `message_start`, is not the first token's;
+    /// the chat stream's first frame is, and the body yields after the first
+    /// frame on its own). A failed flush is the channel's end.
     async fn next_packed(
         grpc_stream: &mut ProtoStream,
         tx: &SseSender,
@@ -1606,6 +1614,7 @@ impl StreamingProcessor {
                 Self::flush_chunks(tx, buffer).await?;
                 if frame_out && !*first_token_out && first_token_seen {
                     *first_token_out = true;
+                    tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                 }
                 Ok(next.await)
