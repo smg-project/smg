@@ -120,9 +120,9 @@ impl fmt::Display for Panicked {
 /// A plain function returning the combinator, not an `async fn`: an `async
 /// fn` keeps its argument in the prefix of its future after the argument
 /// has moved into the combinator that lives across the `await`, so its
-/// future holds the reading's state twice. The streaming paths spawn the
-/// guarded reading as a task, whose allocation is its future's size: the
-/// guard adds a few words to it, not a second copy
+/// future holds the reading's state twice. The streaming paths box the
+/// guarded reading for the response body that drives it, an allocation of
+/// its future's size: the guard adds a few words to it, not a second copy
 /// (`the_guard_holds_the_readings_future_once`).
 pub(crate) fn isolated<F: Future>(work: F) -> impl Future<Output = Result<F::Output, Panicked>> {
     AssertUnwindSafe(work)

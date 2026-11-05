@@ -2,6 +2,7 @@
 
 pub(crate) mod background;
 pub(crate) mod context;
+pub(crate) mod driven;
 pub(crate) mod handlers;
 pub(crate) mod history;
 pub(crate) mod streaming;
@@ -10,11 +11,11 @@ pub(crate) mod utils;
 // Re-export commonly used items
 pub(crate) use background::{spawn_unstored_sweeper, BackgroundResponses, BackgroundStream};
 pub(crate) use context::ResponsesContext;
+pub(crate) use driven::{build_sse_response_driven, driven_channel, DrivenBody, Reading};
 pub(crate) use history::load_history;
 pub(crate) use streaming::{
     await_stream_startup, body_guards, build_sse_response, build_sse_response_from_stream,
-    build_sse_response_guarded, naming_parser, signal_stream_startup, stream_startup_channel,
-    StreamStartupSender,
+    naming_parser, signal_stream_startup, stream_startup_channel, StreamStartupSender,
 };
 pub(crate) use utils::{
     ensure_mcp_connection, persist_response_if_needed, previous_response_chain, stored_foreground,

@@ -2,7 +2,8 @@
 //!
 //! Stage 7 for the `/v1/completions` pipeline
 //!
-//! - For streaming: spawns background task and returns SSE response (early exit)
+//! - For streaming: builds the reading of the engine's answer and returns the SSE response
+//!   whose body drives it (early exit)
 //! - For non-streaming: collects the backend response, converts it to
 //!   `CompletionResponse`, and stores it as `FinalResponse::Completion`.
 
