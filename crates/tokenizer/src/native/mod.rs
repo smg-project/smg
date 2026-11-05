@@ -1224,14 +1224,15 @@ impl NativeEncoder {
             (&[], &[])
         };
         if parallel && units.len() >= 2 {
-            // One Vec per unit, sized for its text up front and filled in
-            // place, then joined: a unit's ids grow once, not by doubling,
-            // and the pool's collection makes no list of its own (measured
-            // by the crate's encode_cost bench: a 32k-token encode made
-            // 60-125 allocations this way before, 6-49 after; what remains
-            // is per unit, the mapping buffer below growing to its first
-            // piece and the ids growing past their estimate on denser
-            // text). The join copies each id once, as it did.
+            // One Vec per unit, reserved for its text's estimate up front
+            // (see `ids_capacity`: a denser unit grows past it by doubling)
+            // and filled in place, then joined; the pool's collection makes
+            // no list of its own (measured by the crate's encode_cost bench:
+            // a 32k-token encode made 60-125 allocations this way before,
+            // 6-49 after; what remains is per unit, the mapping buffer below
+            // growing to its first piece and the ids growing past their
+            // estimate on denser text). The join copies each id once, as it
+            // did.
             let mut parts: Vec<Vec<u32>> = units
                 .iter()
                 .map(|unit| Vec::with_capacity(Self::ids_capacity(unit)))
