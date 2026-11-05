@@ -358,28 +358,6 @@ struct BootstrapFields {
     room: Box<RawValue>,
 }
 
-/// A prefill side's streamed answer with the side's booking riding on it
-/// (see [`PrefillTicket`]): the first chunk is the side's answer (the head
-/// of a streamed answer leaves the engine's server before its handler
-/// produced anything), so the booking is released there, as answered; a
-/// body that ends, fails or is dropped before any chunk gives it back
-/// unanswered.
-fn answered_at_first_chunk<S>(
-    body: S,
-    mut booking: Option<PrefillTicket>,
-) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin
-where
-    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
-{
-    body.inspect(move |chunk| {
-        if chunk.is_ok() {
-            if let Some(mut ticket) = booking.take() {
-                ticket.first_response(0);
-            }
-        }
-    })
-}
-
 impl PDRouter {
     async fn proxy_to_first_prefill_worker(
         &self,
@@ -1490,8 +1468,8 @@ impl PDRouter {
                 // its head is the engine's server starting the response
                 // before its handler produced anything: the side's answer is
                 // the first body chunk, awaited under the bound (the gRPC
-                // pipeline's `first_response` phase); the booking rides on
-                // the body and is released there.
+                // pipeline's `first_response` phase), which releases the
+                // booking.
                 let mut chunks = resp.bytes_stream();
                 let first = {
                     let next = chunks.next();
@@ -1516,10 +1494,16 @@ impl PDRouter {
                         }
                     }
                 };
-                let body = answered_at_first_chunk(
-                    futures_util::stream::iter(first).chain(chunks),
-                    prefill_ticket.take(),
-                );
+                // The first chunk is the side's answer: the booking is released
+                // here, on the spot (a drain task may never be polled when the
+                // decode side fails in the same poll), and anything else gives
+                // it back unanswered when the ticket drops.
+                if let Some(mut ticket) = prefill_ticket.take() {
+                    if matches!(first, Some(Ok(_))) {
+                        ticket.first_response(0);
+                    }
+                }
+                let body = futures_util::stream::iter(first).chain(chunks);
                 if !context.return_logprob {
                     let prefill = Arc::clone(&prefill);
                     let model_id = context.model_id.to_string();
