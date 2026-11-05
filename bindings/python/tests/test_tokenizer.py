@@ -1173,17 +1173,20 @@ def test_a_child_forked_during_a_call_renders_with_the_inherited_tokenizer(
 def test_os_fork_waits_until_the_call_in_flight_ends(tokenizer: Tokenizer) -> None:
     # A thread decodes with the GIL released while this one forks: the fork
     # starts only once the decode has ended. The decode runs inline, and
-    # takes as long here as it took alone before. The call must still be
-    # running when the fork starts, 10 ms in, whatever the decode's speed
-    # (the byte-level table decodes a few million ids in tens of
-    # milliseconds): the ids double until a decode alone takes a tenth of a
-    # second, within a bound on their count.
+    # takes as long here as it took alone before. The fork waits only for
+    # the detached part of the call: the id list's extraction and the text's
+    # conversion run with the GIL held and count in `alone` too (roughly
+    # half of it in a measured run). That part must still be running, by a
+    # wide margin, when the fork starts 10 ms in, whatever the decode's
+    # speed (the byte-level table decodes a few million ids in tens of
+    # milliseconds): the ids double until a decode alone takes a quarter of
+    # a second, within a bound on their count.
     ids = [HELLO, WORLD] * 1_000_000
     while True:
         start = time.perf_counter()
         tokenizer.decode(ids)
         alone = time.perf_counter() - start
-        if alone >= 0.1 or len(ids) >= 16_000_000:
+        if alone >= 0.25 or len(ids) >= 16_000_000:
             break
         ids = ids * 2
     calling = threading.Event()
