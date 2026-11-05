@@ -95,10 +95,13 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
 /// model's failed call, which the families' own parsers drop whole; a client shown it saw the
 /// format's tags inside the answer. For the attributed syntax inside an invoke the same (a word
 /// between tags, a tag out of its place or cut short, a tail the tag has no place for, an
-/// invoke that named no call). A call that started keeps the pairs it read; the attributed
-/// assembler then closes no object for it, since the call is no whole call
-/// (`attributed::Assembler::close`), the keyed one still does. Nothing is pushed for no bytes;
-/// the engine renames `UnterminatedRegion` here as anywhere.
+/// invoke that named no call). A call that started keeps the pairs it read, and no assembler
+/// closes its object for it, since the call is no whole call (`attributed::Assembler::close`,
+/// and the keyed, Qwen and XML assemblers' alike; those three read a bare closing tag between
+/// members, one that names nothing open and so carries no member the client could lose, as
+/// costing the call nothing).
+/// Nothing is pushed for no bytes; the engine
+/// renames `UnterminatedRegion` here as anywhere.
 pub(crate) fn refuse(text: String, why: MalformedReason, out: &mut Events) {
     if text.is_empty() {
         return;
