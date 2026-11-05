@@ -4,8 +4,9 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
+    media::FrameSampling,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
-    types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
 
@@ -13,6 +14,17 @@ use crate::{
 /// token the expansion repeats; `image_token_id` in the config names its id.
 /// Qwen3-Omni (`super::qwen3_omni`) answers the same spelling.
 pub(super) const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+
+/// The video placeholder the chat template writes once per video, the one
+/// token the expansion repeats; `video_token_id` in the config names its id.
+const VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
+
+/// Frames per temporal group of the family's vision encoder, the default of
+/// its processor configs.
+const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+
+/// The most frames the family's own video loader hands its processor.
+const LOADER_MAX_FRAMES: usize = 768;
 
 pub(super) struct QwenVLVisionSpec;
 
@@ -23,6 +35,24 @@ impl QwenVLVisionSpec {
             .map(|v| v as TokenId)
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
                 field: "image_token_id".to_string(),
+            })
+    }
+
+    /// A checkpoint serves video when its config names the video placeholder's
+    /// id; one that names none keeps video unsupported on every surface.
+    fn names_a_video_token(config: &Value) -> bool {
+        config
+            .get("video_token_id")
+            .and_then(Value::as_u64)
+            .is_some()
+    }
+
+    fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+        metadata
+            .config_u32(&["video_token_id"])
+            .map(|v| v as TokenId)
+            .ok_or_else(|| ModelRegistryError::MissingConfigField {
+                field: "video_token_id".to_string(),
             })
     }
 }
@@ -51,6 +81,40 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         Self::pad_token_id(metadata)
     }
 
+    fn placeholder_token_for(
+        &self,
+        metadata: &ModelMetadata,
+        modality: Modality,
+    ) -> RegistryResult<String> {
+        match modality {
+            Modality::Image => self.placeholder_token(metadata),
+            Modality::Video if Self::names_a_video_token(metadata.config) => {
+                Ok(VIDEO_PAD_TOKEN.to_string())
+            }
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
+    fn placeholder_token_id_for(
+        &self,
+        metadata: &ModelMetadata,
+        modality: Modality,
+    ) -> RegistryResult<TokenId> {
+        match modality {
+            Modality::Image => Self::pad_token_id(metadata),
+            Modality::Video if Self::names_a_video_token(metadata.config) => {
+                Self::video_pad_token_id(metadata)
+            }
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     /// The family sets no per-request image count of its own: its serving
     /// engines read the image count as unlimited (the family's processing
     /// info declares `image: None`), the checkpoints' processor configs bound
@@ -58,24 +122,34 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     /// the practical bound. Images stay declared (an undeclared modality is
     /// refused as unsupported) without a bound of the spec's, so the effective
     /// limit is the engine's advertised one, else the deployment's
-    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`.
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. A checkpoint
+    /// whose config names a video token serves video too, one clip per
+    /// request as the spec's declared default.
     fn modality_limits(
         &self,
-        _metadata: &ModelMetadata,
+        metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, usize::MAX)]))
+        let mut limits = HashMap::from([(Modality::Image, usize::MAX)]);
+        if Self::names_a_video_token(metadata.config) {
+            limits.insert(Modality::Video, 1);
+        }
+        Ok(limits)
     }
 
     fn vision_processor(
         &self,
-        _model_config: &Value,
+        model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image => Ok(Box::new(Qwen2VLProcessor::from_preprocessor_config(
+            Modality::Image => Ok(Box::new(Qwen2VLProcessor::from_config_for(
                 preprocessor_config,
+                modality,
             ))),
+            Modality::Video if Self::names_a_video_token(model_config) => Ok(Box::new(
+                Qwen2VLProcessor::from_config_for(preprocessor_config, modality),
+            )),
             _ => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
@@ -100,10 +174,86 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         ))
     }
 
+    /// A video's `<|video_pad|>` expands to one pad token per merged patch
+    /// of its grid, as the serving engine's own prompt update does
+    /// (`grid_t x grid_h x grid_w / merge_size^2`, the processor's token
+    /// count per clip); the chat template wraps it in the vision markers
+    /// already, and the family's prompt carries no frame stamps.
+    fn prompt_replacements_for(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        match modality {
+            Modality::Image => self.prompt_replacements(metadata, preprocessed),
+            Modality::Video if Self::names_a_video_token(metadata.config) => {
+                Ok(PromptReplacement::repeated_per_item(
+                    Modality::Video,
+                    VIDEO_PAD_TOKEN,
+                    Self::video_pad_token_id(metadata)?,
+                    &preprocessed.feature_token_counts,
+                ))
+            }
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
+    /// The family's own video loader samples a clip before its processor sees
+    /// it: `total / fps x 2` frames clamped to [4, 768] in whole temporal
+    /// groups, at a constant step from the first frame
+    /// ([`FrameSampling::SteppedGroups`]).
+    fn video_frame_sampling(&self) -> FrameSampling {
+        FrameSampling::SteppedGroups {
+            temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
+            max_frames: LOADER_MAX_FRAMES,
+        }
+    }
+
+    /// The temporal group is the processor config's `temporal_patch_size`
+    /// where the checkpoint states one.
+    fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
+        FrameSampling::SteppedGroups {
+            temporal_patch_size: config
+                .and_then(|config| config.temporal_patch_size)
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+            max_frames: LOADER_MAX_FRAMES,
+        }
+    }
+
+    /// One layout per modality for the gateway's assembly: a video batch
+    /// carries `patches_per_video` and `video_grid_thw` and no image tensor,
+    /// so its patches are sliced by its own sizes key; the image batch keeps
+    /// the image layout. The legacy map below answers every modality with the
+    /// image layout, which fails assembly for every video.
+    fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
+        match modality {
+            Modality::Video => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_video"),
+                HashMap::from([
+                    ("video_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_video".to_string(), FieldLayout::Batched),
+                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+            _ => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([
+                    ("image_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_image".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+        }
+    }
+
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // encoder_input is patchified: [total_patches, patch_features].
         // patches_per_image tells how many patches belong to each image.
-        // image_grid_thw is [num_images, 3].
+        // image_grid_thw is [num_images, 3]; the video fields follow the same
+        // shapes per clip, and video_second_per_grid is one value per clip.
         HashMap::from([
             (
                 "pixel_values".to_string(),
@@ -111,11 +261,14 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             ),
             ("image_grid_thw".to_string(), FieldLayout::Batched),
             ("patches_per_image".to_string(), FieldLayout::Batched),
+            ("video_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_video".to_string(), FieldLayout::Batched),
+            ("video_second_per_grid".to_string(), FieldLayout::Batched),
         ])
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
-        vec!["image_grid_thw".to_string()]
+        vec!["image_grid_thw".to_string(), "video_grid_thw".to_string()]
     }
 }
 
@@ -167,8 +320,8 @@ mod tests {
     /// The family bounds its images by context, not by count: the spec
     /// declares the modality without a limit of its own (the ten it carried
     /// was the first registry's default, never a count of the family's), so
-    /// a deployment knob is the only router-side bound and video stays
-    /// unsupported.
+    /// a deployment knob is the only router-side bound; a config that names
+    /// no video token keeps video unsupported.
     #[test]
     fn qwen_vl_declares_images_without_a_count_of_its_own() {
         use std::collections::HashMap;
@@ -216,6 +369,125 @@ mod tests {
             spec.validate_media_request(&metadata, &[(Modality::Video, 1)]),
             Err(ModelRegistryError::UnsupportedModality {
                 modality: Modality::Video,
+                ..
+            })
+        ));
+    }
+
+    /// A checkpoint whose config names a video token serves video: one clip
+    /// per request, the clip's `<|video_pad|>` expanded to the processor's
+    /// token count, the family's own loader rule for the frames, and the
+    /// video tensors declared beside the image ones.
+    #[test]
+    fn qwen_vl_serves_video_when_the_config_names_a_video_token() {
+        use std::collections::HashMap;
+
+        use crate::{
+            media::FrameSampling,
+            registry::{ModelProcessorSpec, ModelRegistryError},
+            types::{FieldLayout, Modality},
+            vision::PreProcessorConfig,
+        };
+
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655), ("<|video_pad|>", 151656)]);
+        let config = json!({
+            "model_type": "qwen2_5_vl",
+            "vision_start_token_id": 151652,
+            "vision_token_id": 151654,
+            "image_token_id": 151655,
+            "video_token_id": 151656
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen2.5-VL-7B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::QwenVLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, 1)])
+        );
+        spec.validate_media_request(&metadata, &[(Modality::Video, 1)])
+            .expect("one clip per request");
+        assert_eq!(
+            spec.validate_media_request(&metadata, &[(Modality::Video, 2)]),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen_vl",
+                modality: Modality::Video,
+                limit: 1,
+                requested: 2,
+            })
+        );
+        assert_eq!(
+            spec.placeholder_token_for(&metadata, Modality::Video)
+                .unwrap(),
+            "<|video_pad|>"
+        );
+        assert_eq!(
+            spec.placeholder_token_id_for(&metadata, Modality::Video)
+                .unwrap(),
+            151656
+        );
+        // A clip whose grid is 2 x 4 x 4 at merge size 2 is 8 tokens.
+        let replacements = spec
+            .prompt_replacements_for(
+                &metadata,
+                &test_preprocessed_with_tokens(&[ImageSize::new(56, 56)], &[8]),
+                Modality::Video,
+            )
+            .unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].tokens, vec![151656; 8]);
+        assert_eq!(
+            spec.video_frame_sampling(),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 2,
+                max_frames: 768,
+            }
+        );
+        let config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..PreProcessorConfig::default()
+        };
+        assert_eq!(
+            spec.video_frame_sampling_with(Some(&config)),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 4,
+                max_frames: 768,
+            }
+        );
+        spec.vision_processor(
+            metadata.config,
+            &PreProcessorConfig::default(),
+            Modality::Video,
+        )
+        .expect("the family's processor serves a clip");
+        assert_eq!(
+            spec.encoder_field_layouts_for(Modality::Video)
+                .encoder_input,
+            FieldLayout::flat("patches_per_video")
+        );
+        assert_eq!(
+            spec.encoder_field_layouts_for(Modality::Image)
+                .encoder_input,
+            FieldLayout::flat("patches_per_image")
+        );
+        let layouts = spec.field_layouts();
+        for key in [
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert!(layouts.contains_key(key), "{key}");
+        }
+        assert!(spec
+            .keep_on_cpu_keys()
+            .contains(&"video_grid_thw".to_string()));
+        assert!(matches!(
+            spec.placeholder_token_for(&metadata, Modality::Audio),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Audio,
                 ..
             })
         ));

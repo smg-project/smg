@@ -208,6 +208,18 @@ pub enum FrameSampling {
         frame_factor: usize,
         max_frames: usize,
     },
+    /// `total / fps x rate` frames, at least `min_frames`, at most
+    /// `max_frames` aligned down to a multiple of `temporal_patch_size` and
+    /// never more than the clip has, the count aligned down to that multiple
+    /// as well, at the positions of `torch.arange(0, total, total / count)`
+    /// truncated to integers (`stepped_group_frame_indices`): the rule of the
+    /// Qwen2-VL line's own video loader, which samples a clip before its
+    /// processor sees it and refuses a clip whose rate it does not know. The
+    /// picks start at the first frame and never reach the last one.
+    SteppedGroups {
+        temporal_patch_size: usize,
+        max_frames: usize,
+    },
 }
 
 impl FrameSampling {
@@ -253,7 +265,10 @@ impl FrameSampling {
     pub(crate) fn follows_the_loader(self) -> bool {
         matches!(
             self,
-            Self::UpTo { .. } | Self::UpToThenRate { .. } | Self::RateWalk { .. }
+            Self::UpTo { .. }
+                | Self::UpToThenRate { .. }
+                | Self::RateWalk { .. }
+                | Self::SteppedGroups { .. }
         )
     }
 }
@@ -1610,7 +1625,12 @@ where
         })?
         .into_bytes();
     let source_fps = (fps.is_finite() && fps > 0.0).then_some(fps);
-    let sample_fps = effective_sample_fps(source_fps.map(|fps| total_frames as f64 / fps), cfg);
+    let sample_fps = match (cfg.sampling, source_fps) {
+        (FrameSampling::SteppedGroups { .. }, Some(source_fps)) => {
+            loader_sampled_fps(frame_indices.len(), total_frames, source_fps)
+        }
+        _ => effective_sample_fps(source_fps.map(|fps| total_frames as f64 / fps), cfg),
+    };
     // `frame_indices` keeps its duplicates, so it lines up with `frames` one to one.
     let sampling = source_fps.map(|source_fps| VideoSamplingInfo {
         source_fps,
@@ -1763,6 +1783,17 @@ pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfi
             max_frames,
             temporal_patch_size,
         ),
+        FrameSampling::SteppedGroups {
+            temporal_patch_size,
+            max_frames,
+        } => stepped_group_frame_indices(
+            total_frames,
+            fps,
+            cfg.sample_fps,
+            cfg.min_frames,
+            temporal_patch_size,
+            max_frames,
+        ),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
@@ -1805,6 +1836,49 @@ fn temporal_group_frame_indices(
     let count = by_rate.min(max_frames).min(total_frames);
     let count = (count / factor * factor).max(factor).min(total_frames);
     torch_linspace_indices(total_frames, count)
+}
+
+/// The Qwen2-VL line's own video loader sampling at `sample_fps` (capped at
+/// 30, as that loader caps it): `total / fps x rate` frames, at least
+/// `min_frames`, at most `max_frames` (and the loader's own 768) aligned
+/// down to a multiple of `temporal_patch_size` and never more than the clip
+/// has, the count aligned down to that multiple as well; the positions are
+/// `torch.arange(0, total, total / count).int()` as torch's CPU kernel
+/// computes them, `i x step` in double stored as float32 and truncated
+/// toward zero, over `ceil(total / step)` steps, which the float error can
+/// put one past the count: such a tail is the last frame, as the loader
+/// clamps it. Empty when the rate is unknown (that loader refuses the clip)
+/// or the clip is shorter than one temporal group.
+fn stepped_group_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    sample_fps: f64,
+    min_frames: usize,
+    temporal_patch_size: usize,
+    max_frames: usize,
+) -> Vec<usize> {
+    const LOADER_MAX_FRAMES: usize = 768;
+    const LOADER_MAX_FPS: f64 = 30.0;
+    if !(fps.is_finite() && fps > 0.0) || total_frames == 0 {
+        return Vec::new();
+    }
+    let factor = temporal_patch_size.max(1);
+    let max_frames = max_frames.min(LOADER_MAX_FRAMES).min(total_frames) / factor * factor;
+    let by_rate = total_frames as f64 / fps * sample_fps.min(LOADER_MAX_FPS);
+    let count = by_rate
+        .max(min_frames as f64)
+        .min(max_frames as f64)
+        .min(total_frames as f64);
+    let count = (count / factor as f64).floor() as usize * factor;
+    if count == 0 {
+        return Vec::new();
+    }
+    let step = total_frames as f64 / count as f64;
+    let steps = (total_frames as f64 / step).ceil() as usize;
+    let last = total_frames - 1;
+    (0..steps)
+        .map(|index| (((index as f64 * step) as f32) as usize).min(last))
+        .collect()
 }
 
 /// `torch.linspace(0, total_frames - 1, count).long()` as torch's CPU kernel
@@ -1894,6 +1968,21 @@ fn loader_frames(
                 cfg.sample_fps,
                 max_frames,
                 temporal_patch_size,
+            ),
+            claimed,
+            visible,
+        ),
+        FrameSampling::SteppedGroups {
+            temporal_patch_size,
+            max_frames,
+        } => read_before_the_end(
+            stepped_group_frame_indices(
+                total_frames,
+                fps,
+                cfg.sample_fps,
+                cfg.min_frames,
+                temporal_patch_size,
+                max_frames,
             ),
             claimed,
             visible,
@@ -2246,15 +2335,22 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
 
 /// Why a probed clip is refused before any decode: the rate walk picks no
 /// frame of a clip shorter than one sampling interval, `1 / rate` s (nor of
-/// a container claiming no frames at a low rate), and the engine's own
-/// loader hands its processor no frame of such a clip either, so the generic
-/// resampler must not stand in for the family's rule. `None` under any other
-/// rule, when the probe stated no rate, and whenever the rule picks a frame.
+/// a container claiming no frames at a low rate), the stepped groups pick
+/// none of a clip shorter than one temporal group and none of a clip whose
+/// rate the probe did not state, and the engine's own loader hands its
+/// processor no frame of such a clip either, so the generic resampler must
+/// not stand in for the family's rule. `None` under any other rule, when the
+/// probe stated no rate for the rate walk, and whenever the rule picks a
+/// frame.
 fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<String> {
-    if !matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
-        return None;
-    }
-    let source_fps = metadata.source_fps?;
+    let needs_a_rate = match cfg.sampling {
+        FrameSampling::RateWalk { .. } => false,
+        FrameSampling::SteppedGroups { .. } => true,
+        _ => return None,
+    };
+    let Some(source_fps) = metadata.source_fps else {
+        return needs_a_rate.then(|| the_familys_rule_needs_a_rate(metadata));
+    };
     let claimed = metadata.container_frames.unwrap_or(0);
     let visible = metadata.total_frames.unwrap_or(claimed);
     let (total_frames, picks) = loader_frames(claimed, visible, source_fps, cfg);
@@ -2263,18 +2359,46 @@ fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -
         .then(|| the_familys_rule_picks_nothing(total_frames, source_fps, cfg))
 }
 
-/// The refusal's text: the clip, and the length the rule needs, `1 / rate` s
-/// at the rule's rate, so the client can see how long a clip has to be.
+/// The refusal's text: the clip, and the length the rule needs (`1 / rate` s
+/// at the rule's rate, or one temporal group), so the client can see how
+/// long a clip has to be; a container that states no frame count under the
+/// stepped-groups rule is told to state it, since no length would do.
 fn the_familys_rule_picks_nothing(
     total_frames: usize,
     source_fps: f64,
     cfg: VideoFetchConfig,
 ) -> String {
+    if let FrameSampling::SteppedGroups {
+        temporal_patch_size,
+        ..
+    } = cfg.sampling
+    {
+        if total_frames == 0 {
+            return format!(
+                "the model's video sampling needs the clip's frame count, which the container \
+                 does not state ({source_fps} fps)"
+            );
+        }
+        return format!(
+            "the model's video sampling picks no frame of a clip of {total_frames} frames at \
+             {source_fps} fps: shorter than one temporal group of {temporal_patch_size} frames"
+        );
+    }
     let rate = cfg.sample_fps;
     format!(
         "the model's video sampling picks no frame of a clip of {total_frames} frames at \
          {source_fps} fps: shorter than one sampling interval at {rate} frames a second ({:.3} s)",
         1.0 / rate
+    )
+}
+
+/// The refusal's text for a clip whose rate the probe did not state, under a
+/// rule whose loader refuses such a clip rather than guess a rate.
+fn the_familys_rule_needs_a_rate(metadata: VideoMetadata) -> String {
+    format!(
+        "the model's video sampling needs the clip's frame rate, which the container does not \
+         state ({} frames claimed)",
+        metadata.container_frames.unwrap_or(0)
     )
 }
 
@@ -2330,7 +2454,7 @@ async fn decode_video_with_ffmpeg(
                 );
                 return Ok(DecodedVideoFrames::Rgb {
                     video,
-                    sample_fps: effective_sample_fps(probed.duration_seconds, cfg),
+                    sample_fps: clip_sample_fps(Some(&selection), probed.duration_seconds, cfg),
                     sampling: Some(selection.sampling_info()),
                 });
             }
@@ -2471,7 +2595,7 @@ async fn decode_video_with_ffmpeg_runners(
             )
             .await;
         }
-        let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
+        let sample_fps = clip_sample_fps(selection, metadata.duration_seconds, cfg);
         let mut started = Instant::now();
         let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
         if metadata.from_container && headed.as_ref().is_err_and(is_frame_size_mismatch) {
@@ -3034,7 +3158,7 @@ async fn decode_video_with_ffmpeg_png(
     let (frame_args, sample_fps) = match selection.zip(metadata) {
         Some((selection, metadata)) => (
             FfmpegFrameArgs::selected(selection).await,
-            effective_sample_fps(metadata.duration_seconds, cfg),
+            clip_sample_fps(Some(selection), metadata.duration_seconds, cfg),
         ),
         None => {
             let (fps_filter, sample_fps) = sampling_filter_for_video(input_path, cfg).await;
@@ -3577,6 +3701,37 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
         .unwrap_or(cfg.sample_fps)
 }
 
+/// The rate the decoded frames stand for, which the processor turns into the
+/// seconds per temporal group: under the stepped groups the rate the engine's
+/// loader reports for its picks ([`loader_sampled_fps`]; the clamps and the
+/// group alignment move it off the target rate on short and long clips),
+/// under every other rule the target rate bounded by the clip
+/// ([`effective_sample_fps`]).
+fn clip_sample_fps(
+    selection: Option<&FrameSelection>,
+    duration_seconds: Option<f64>,
+    cfg: VideoFetchConfig,
+) -> f64 {
+    match (cfg.sampling, selection) {
+        (FrameSampling::SteppedGroups { .. }, Some(selection)) => loader_sampled_fps(
+            selection.frame_indices.len(),
+            selection.total_frames,
+            selection.source_fps,
+        ),
+        _ => effective_sample_fps(duration_seconds, cfg),
+    }
+}
+
+/// `picks / total x source rate`, in that order of operations: the rate the
+/// engine's loader reports for the frames it picked (its metadata's sampled
+/// rate), and the source rate itself for a clip with no frames.
+fn loader_sampled_fps(picks: usize, total_frames: usize, source_fps: f64) -> f64 {
+    if total_frames == 0 {
+        return source_fps;
+    }
+    picks as f64 / total_frames as f64 * source_fps
+}
+
 /// Past this many distinct frames the selection is described by a fixed-size
 /// spread expression (plus at most [`FFMPEG_SPREAD_EXTRA_TERMS`] explicit
 /// frames) when one reproduces it, instead of a list that grows with the clip:
@@ -3663,8 +3818,12 @@ impl FrameSelection {
         if frame_indices.is_empty() {
             // A probe that decoded no frame at all says nothing about the clip's length: the
             // decode goes on as before and reports its own errors; only a visible clip the
-            // rate walk picks nothing of is empty.
-            return if visible > 0 && matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+            // rate walk or the stepped groups pick nothing of is empty.
+            return if visible > 0
+                && matches!(
+                    cfg.sampling,
+                    FrameSampling::RateWalk { .. } | FrameSampling::SteppedGroups { .. }
+                ) {
                 Resized::Empty { total_frames }
             } else {
                 Resized::Unchanged

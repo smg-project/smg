@@ -337,6 +337,46 @@ fn rate_walk_picks_what_the_familys_loader_picks() {
     assert!(!FrameSampling::EvenRounded.follows_the_loader());
 }
 
+/// Under the stepped-groups rule a container that states a rate but no
+/// frame count is told to state its count, not to lengthen the clip; a
+/// counted clip too short for one temporal group keeps the group sentence,
+/// and a clip the rule samples passes.
+#[test]
+fn a_rate_without_a_frame_count_names_the_missing_count() {
+    let probed = |fps, frames| VideoMetadata {
+        width: 64,
+        height: 48,
+        duration_seconds: None,
+        source_fps: fps,
+        total_frames: frames,
+        container_frames: frames,
+        from_container: false,
+    };
+    let cfg = VideoFetchConfig {
+        sampling: FrameSampling::SteppedGroups {
+            temporal_patch_size: 2,
+            max_frames: 768,
+        },
+        ..VideoFetchConfig::default()
+    };
+    assert_eq!(
+        refused_by_the_familys_rule(probed(Some(30.0), None), cfg).as_deref(),
+        Some(
+            "the model's video sampling needs the clip's frame count, which the container does \
+             not state (30 fps)"
+        )
+    );
+    let short = refused_by_the_familys_rule(probed(Some(30.0), Some(1)), cfg).expect("refused");
+    assert!(
+        short.contains("1 frames at 30 fps: shorter than one temporal group of 2 frames"),
+        "{short}"
+    );
+    assert_eq!(
+        refused_by_the_familys_rule(probed(Some(30.0), Some(30)), cfg),
+        None
+    );
+}
+
 /// A clip the family's rule picks nothing of is refused before any
 /// decode, with the clip's numbers in the reason; a clip it samples, a
 /// clip whose rate the probe did not state, and any other rule pass.
