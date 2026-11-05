@@ -924,6 +924,15 @@ impl WorkerRuntime {
         self.revision.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Raise the revision to at least `floor`; it never goes down. A claim
+    /// of a mesh import publishes the worker's key at this revision, which
+    /// restarts at zero with the process, and a peer follows a publication
+    /// only above the version it recorded, so the claim raises it past that
+    /// version first (see `WorkerRegistry::replace_inner`).
+    pub fn raise_revision_to(&self, floor: u64) {
+        self.revision.fetch_max(floor, Ordering::AcqRel);
+    }
+
     // ── Health-check counters ───────────────────────────────────────
 
     pub fn consecutive_failures_increment(&self) -> usize {
