@@ -5,9 +5,10 @@ streaming, and serves every `ByteLevel` vocabulary in every build (it was
 opt-in behind `tokenizers-v1` when the results below were recorded; that
 feature now enables the v1 encoder only). It does not invoke the RC decoder,
 allocate a second vocabulary, or change incremental decoding. Non-ByteLevel
-decoders retain tokenizers 0.23. The runner below compares the default and the
-opt-in build of one source; with the decode path shared by both, its decode
-rows measure the same code and only the loads differ.
+decoders take the piece table when the chain has one (byte fallback), else
+tokenizers 0.23. The runner below compares the default and the opt-in build of
+one source; with the decode path shared by both, its decode rows measure the
+same code and only the loads differ.
 
 ## Reproduce
 

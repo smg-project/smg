@@ -1180,12 +1180,19 @@ def test_os_fork_waits_until_the_call_in_flight_ends(tokenizer: Tokenizer) -> No
     # wide margin, when the fork starts 10 ms in, whatever the decode's
     # speed (the byte-level table decodes a few million ids in tens of
     # milliseconds): the ids double until a decode alone takes a quarter of
-    # a second, within a bound on their count.
-    ids = [HELLO, WORLD] * 1_000_000
-    while True:
+    # a second, within a bound on their count. Each size's figure is the
+    # minimum of three decodes: `alone` is the reference the fork's wait is
+    # held to, and one sample inflated by a descheduling on a loaded runner
+    # would otherwise stop the doubling at a size whose decode is far
+    # shorter and overstate that reference, a false failure.
+    def decode_alone(ids: list[int]) -> float:
         start = time.perf_counter()
         tokenizer.decode(ids)
-        alone = time.perf_counter() - start
+        return time.perf_counter() - start
+
+    ids = [HELLO, WORLD] * 1_000_000
+    while True:
+        alone = min(decode_alone(ids) for _ in range(3))
         if alone >= 0.25 or len(ids) >= 16_000_000:
             break
         ids = ids * 2
