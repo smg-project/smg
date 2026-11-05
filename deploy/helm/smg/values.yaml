@@ -443,7 +443,11 @@ grafana:
 #     p99 above five seconds for ten minutes means queues are building in
 #     front of the engines (set it to the SLO once there is one).
 #   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
-#     overlap of a rolling restart.
+#     overlap of a rolling restart. The alert also fires when the gateway has
+#     no worker series at all while its scrape is up (none registered yet, or
+#     every one removed): a fresh install pages from its first minute until
+#     its first engine reports healthy, which for a large checkpoint is tens of
+#     minutes (README, Readiness Deadlines); silence it for a planned bring-up.
 #   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
 #     preempts and recomputes; sustained, the fleet is undersized.
 #   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that

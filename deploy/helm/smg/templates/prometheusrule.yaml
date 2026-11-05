@@ -23,14 +23,17 @@ spec:
           annotations:
             summary: "A gateway stopped answering its metrics scrape, or has no scrape target"
             description: "The scrape target {{ `{{ $labels.instance }}` }} has been down for {{ $a.scrapeMissingFor }}, or no target matches the release's job selector at all: the pod is gone, not ready, unreachable on its metrics port, or the selector names no Service."
+        {{- /* smg_worker_health is a per-worker series that leaves the scrape with its registration, so a gateway with no worker at all (none registered yet, or every one removed: a pod deleted, scaled away or no longer published) has no series and an empty sum, which `== 0` does not match. The absent() leg covers it while the gateway's own scrape is up; a gateway that is down is SmgGatewayDown's. */}}
         - alert: SmgNoHealthyWorker
-          expr: sum by (namespace, job) (max by (namespace, job, worker) (smg_worker_health{ {{ $job }} })) == 0
+          expr: |
+            sum by (namespace, job) (max by (namespace, job, worker) (smg_worker_health{ {{ $job }} })) == 0
+              or (absent(smg_worker_health{ {{ $job }} }) and on () (up{ {{ $job }} } == 1))
           for: {{ $a.noHealthyWorkerFor }}
           labels:
             severity: critical
           annotations:
             summary: "No healthy worker behind the gateway"
-            description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes for {{ $a.noHealthyWorkerFor }}; requests are refused until one returns."
+            description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes, or none is registered at all, for {{ $a.noHealthyWorkerFor }}; requests are refused until a healthy one is registered."
         {{- /* The ratio reads client traffic alone: the probe routes (/health, /readiness, /liveness) are the kubelet's polls, answered 503 for the whole of an engine's bring-up with no client in sight, and 200 every few seconds once the fleet serves, where they would dilute the share of failing client responses. The access log demotes the same three routes. */}}
         - alert: SmgHighErrorRatio
           expr: |
