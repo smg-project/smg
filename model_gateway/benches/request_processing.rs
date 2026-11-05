@@ -226,7 +226,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
             content: Some(MessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
         });
     }
 

@@ -1,6 +1,6 @@
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
@@ -51,10 +51,10 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (an engine extension); another
-        /// engine's `reasoning` spelling is accepted on input.
-        #[serde(alias = "reasoning")]
-        reasoning_content: Option<String>,
+        /// Reasoning content for O1-style models (an engine extension), read
+        /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
+        #[serde(flatten)]
+        reasoning: AssistantReasoning,
         #[serde(flatten)]
         #[schemars(skip)]
         ext: KimiAssistantExt,
@@ -82,6 +82,93 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
     },
+}
+
+/// The reasoning text of an assistant message on input. It is read from
+/// `reasoning_content` (the key this crate writes) or from `reasoning` (the key
+/// of vLLM and OpenRouter). Agent clients send some messages with both keys.
+/// One key, or both keys with the same text, gives that text. Both keys with
+/// different text are refused as a value (`invalid_value`): the gateway cannot
+/// know which text the model produced. An empty text does not count and cannot
+/// disagree. A serde alias between the two keys refused a message with both as
+/// a duplicate field (#5092).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct AssistantReasoning {
+    /// Reasoning content for O1-style models (an engine extension). The
+    /// `reasoning` key is accepted on input too.
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Reads each key by its own name, with no alias between them.
+/// `deserialize_struct` names the two keys. Under `#[serde(flatten)]` serde then
+/// gives this reader only those keys; the provider extension keeps its own.
+impl<'de> Deserialize<'de> for AssistantReasoning {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["reasoning_content", "reasoning"];
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            ReasoningContent,
+            Reasoning,
+            #[serde(other)]
+            Other,
+        }
+
+        struct ReasoningVisitor;
+
+        impl<'de> de::Visitor<'de> for ReasoningVisitor {
+            type Value = AssistantReasoning;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an assistant message's reasoning")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut reasoning_content: Option<Option<String>> = None;
+                let mut reasoning: Option<Option<String>> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::ReasoningContent => {
+                            if reasoning_content.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning_content"));
+                            }
+                            reasoning_content = Some(map.next_value()?);
+                        }
+                        Field::Reasoning => {
+                            if reasoning.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning"));
+                            }
+                            reasoning = Some(map.next_value()?);
+                        }
+                        Field::Other => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let text = match (reasoning_content.flatten(), reasoning.flatten()) {
+                    (Some(content), Some(alias))
+                        if !content.is_empty() && !alias.is_empty() && content != alias =>
+                    {
+                        // Opens with serde's words, so the public code is `invalid_value`.
+                        return Err(de::Error::custom(
+                            "invalid value: `reasoning_content` and `reasoning` disagree; \
+                             send one of them, or the same text in both",
+                        ));
+                    }
+                    (Some(content), Some(alias)) => {
+                        Some(if content.is_empty() { alias } else { content })
+                    }
+                    (Some(text), None) | (None, Some(text)) => Some(text),
+                    (None, None) => None,
+                };
+                Ok(AssistantReasoning { text })
+            }
+        }
+
+        deserializer.deserialize_struct("AssistantReasoning", FIELDS, ReasoningVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -552,14 +639,14 @@ pub(crate) fn deserialize_reasoning_effort<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
         Some(Value::Number(value)) => Ok(Some(value.to_string())),
-        Some(_) => Err(serde::de::Error::custom(
+        Some(_) => Err(de::Error::custom(
             "reasoning_effort must be a string, number, or null",
         )),
     }
@@ -1009,9 +1096,7 @@ impl GenerationRequest for ChatCompletionRequest {
                     }
                 }
                 ChatMessage::Assistant {
-                    content,
-                    reasoning_content,
-                    ..
+                    content, reasoning, ..
                 } => {
                     // Append main content
                     if let Some(c) = content {
@@ -1023,12 +1108,12 @@ impl GenerationRequest for ChatCompletionRequest {
                         }
                     }
                     // Append reasoning content
-                    if let Some(reasoning) = reasoning_content {
-                        if !reasoning.is_empty() {
+                    if let Some(text) = &reasoning.text {
+                        if !text.is_empty() {
                             if has_content {
                                 buffer.push(' ');
                             }
-                            buffer.push_str(reasoning);
+                            buffer.push_str(text);
                             has_content = true;
                         }
                     }
