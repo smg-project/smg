@@ -178,7 +178,10 @@ fn distinct(steps: &[usize]) -> BTreeSet<usize> {
 /// packed table keys (the piece and its ids, two boxes): five calls. What
 /// moves it: a merge that returns to the heap (the linked list and the
 /// candidate heap of the long merge were two more calls), a cache tier that
-/// copies differently.
+/// copies differently. The opt-in v1 pipeline, when its feature is compiled
+/// in, takes a BPE tokenizer in front of the direct path, so this pin of the
+/// direct path's merge is built without that feature.
+#[cfg(not(feature = "tokenizers-v1"))]
 #[test]
 fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
     let tokenizer = byte_level();
