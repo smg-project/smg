@@ -24,6 +24,7 @@ SERVER_MALLOC_CONF = (
     '"dirty_decay_ms":10000',
     '"muzzy_decay_ms":0',
     '"narenas":16',
+    '"oversize_threshold":33554432',
 )
 
 

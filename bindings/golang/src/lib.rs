@@ -31,7 +31,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 
 // Re-export error types
 // Re-export client stream function (defined in client.rs but used by stream)

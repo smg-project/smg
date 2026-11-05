@@ -546,11 +546,25 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 /// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
 /// the fixed count is more arenas than the default, a few mostly empty slabs.
 ///
+/// Allocations of `oversize_threshold` bytes or more bypass the arenas'
+/// dirty-page cache: jemalloc serves them from a dedicated arena and returns
+/// their pages to the OS the moment they are freed, so the next one is
+/// faulted in page by page and zeroed by the kernel. Its default is 8 MiB.
+/// An image request's pixel tensor rides in one gRPC message, which the
+/// codec encodes into one contiguous buffer per call: 9 MiB for a 1024x768
+/// image in bfloat16, 24 MiB for 1920x1080, twice that in float32. Under the
+/// default every such request took ~2,300 minor faults (the whole encode
+/// buffer) and a fifth of its CPU in the fault path; with the threshold at
+/// 32 MiB those buffers recycle through the dirty cache like everything else:
+/// 75 faults and 20 % less CPU per 1024x768 request, for ~30 MB more peak
+/// resident memory at 8 threads. Messages of 32 MiB and more (float32 tensors
+/// of 1080p-class grids and larger) keep the default behaviour.
+///
 /// This is jemalloc's application-provided `malloc_conf` string under the
 /// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
 /// variable is read after it and overrides it entry by entry.
-pub const SERVER_MALLOC_CONF: &[u8; 72] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
+pub const SERVER_MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
