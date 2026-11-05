@@ -418,6 +418,10 @@ pub(crate) struct DispatchContext {
     /// boundary.
     pub dispatch_model: String,
     pub streaming: bool,
+    /// The request's wall-clock second (the `created` its responses report):
+    /// the request's one wall-clock read, taken when its charge id was minted
+    /// at the edge (see `helpers::request_wall_clock`).
+    pub created: u64,
     pub headers: Option<HeaderMap>,
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
@@ -1103,6 +1107,8 @@ impl RequestContext {
         let request_id =
             super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
                 .map(str::to_owned);
+        let (created, _) =
+            super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
         Ok(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
@@ -1118,6 +1124,7 @@ impl RequestContext {
             model_id,
             dispatch_model,
             streaming,
+            created,
             headers,
             rate_limit_cell,
             routing,

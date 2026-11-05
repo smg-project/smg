@@ -628,7 +628,14 @@ pub fn budgets() -> Budgets {
 /// Milliseconds since the gateway started: the clock behind the workers'
 /// contact and progress stamps.
 pub(crate) fn now_ms() -> u64 {
-    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    ms_at(Instant::now())
+}
+
+/// `at` on the gateway clock ([`now_ms`]'s), for a stamp read once and shared
+/// by several notes.
+pub(crate) fn ms_at(at: Instant) -> u64 {
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(at.saturating_duration_since(epoch).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether a gRPC status code is one the connection produces rather than
@@ -807,9 +814,11 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
     }
 }
 
-/// A token or a completion from the worker: progress clears any veto.
-pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
-    worker.note_token_progress();
+/// A token or a completion from the worker at `now_ms` on the gateway clock
+/// (a stamp the caller read once for this note and the others of the same
+/// message): progress clears any veto.
+pub(crate) fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
+    worker.note_token_progress_at(now_ms);
     if worker.stall_reason().is_some() {
         set(worker, None, "progress");
     }
@@ -1089,6 +1098,11 @@ mod tests {
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
+    }
+
+    /// Progress stamped now, for the tests that need no particular instant.
+    fn on_token_progress(worker: &Arc<dyn Worker>) {
+        on_token_progress_at(worker, now_ms());
     }
 
     /// The expectation the three callers share, for every gRPC code: the

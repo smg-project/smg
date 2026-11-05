@@ -35,6 +35,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
     task::{ready, Context, Poll},
+    time::Instant,
 };
 
 use axum::{
@@ -72,6 +73,9 @@ pub(crate) struct BodyDuties {
     pub(crate) permit: Option<Box<dyn Permit>>,
     /// The SSE keep-alive: a frame after an interval of silence.
     pub(crate) keep_alive: Option<KeepAlive>,
+    /// When the response head left the handler: the access-log layer's
+    /// stamp, which the metrics layer's duration reads instead of the clock.
+    pub(crate) head_at: Option<Instant>,
     /// The request span, open until the body ends, with the client-close
     /// line the access log owes if the body is dropped first.
     pub(crate) span: Option<SpanDuty>,
