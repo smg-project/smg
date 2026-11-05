@@ -1188,6 +1188,245 @@ data:
             "x": 16,
             "y": 119
           }
+        },
+        {
+          "title": "Prefill-decode",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 127
+          },
+          "panels": []
+        },
+        {
+          "title": "PD time to first token p99 by phase",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_prefill_duration_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "prefill"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_kv_transfer_duration_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "relay"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_decode_ttft_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "decode first token"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_ttft_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "whole"
+            }
+          ],
+          "description": "The gateway's phase split of a prefill-decode request's time to first token: prefill dispatch to the prefill response drained, the relay between the sides (gateway work alone, under sequential dispatch; the engines' KV transfer runs inside the decode phase), decode dispatch to the first decode token, and the whole. Under sequential dispatch the three phases add up to the whole; under parallel dispatch the decode phase is the whole.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 128
+          }
+        },
+        {
+          "title": "PD time to first token p99 by model",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_pd_ttft_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "{{ "{{" }}model{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 128
+          }
+        },
+        {
+          "title": "PD failures",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (leg, phase) (rate(smg_pd_rendezvous_failures_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "rendezvous {{ "{{" }}leg{{ "}}" }} {{ "{{" }}phase{{ "}}" }}"
+            },
+            {
+              "expr": "sum(rate(smg_pd_bootstrap_failures_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "bootstrap injection"
+            },
+            {
+              "expr": "sum(rate(smg_pd_kv_transfer_failures_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "KV transfer"
+            }
+          ],
+          "description": "Rendezvous failures by the side whose rendezvous failed and the phase (a bootstrap port that refused the registration probe, the probe run on a decode failure, the engines' bootstrap or transfer reports), bootstrap injection failures, and KV transfers that failed at the decode handoff.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 128
+          }
+        },
+        {
+          "title": "Prefill admission: in flight and queued",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (worker) (smg_pd_prefill_admission_inflight{namespace=~\"$namespace\", job=~\"$job\"})",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            },
+            {
+              "expr": "sum(smg_pd_prefill_admission_queued{namespace=~\"$namespace\", job=~\"$job\"})",
+              "legendFormat": "queued"
+            }
+          ],
+          "description": "Prefill requests the gateway admitted, per prefill worker, and the requests waiting in its prefill admission queue.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 136
+          }
+        },
+        {
+          "title": "Prefill admission: rejections, waits and sheds",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (reason) (rate(smg_pd_prefill_admission_rejections_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "rejected {{ "{{" }}reason{{ "}}" }}"
+            },
+            {
+              "expr": "sum(rate(smg_pd_admission_waits_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "waited for a decode slot"
+            },
+            {
+              "expr": "sum(rate(smg_pd_admission_sheds_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "shed: no decode slot in time"
+            }
+          ],
+          "description": "Prefill admission rejections by reason; dispatches that waited for a decode admission slot, and those shed because none freed in time.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 136
+          }
+        },
+        {
+          "title": "Prefill admission wait",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_pd_prefill_admission_wait_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_prefill_admission_wait_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "legendFormat": "p99"
+            }
+          ],
+          "description": "Time a request spent in the prefill admission queue.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 136
+          }
+        },
+        {
+          "title": "PD admission window per decode worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_pd_admission_window{namespace=~\"$namespace\", job=~\"$job\"})",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "The running window the admission gate bounds a decode worker by; 0 when the engine reports none and admission is off for that worker.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 144
+          }
+        },
+        {
+          "title": "KV connector mode decisions",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (mode) (rate(smg_pd_kv_connector_mode_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "{{ "{{" }}mode{{ "}}" }}"
+            }
+          ],
+          "description": "Which KV connector mode each prefill-decode dispatch was given.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 144
+          }
         }
       ],
       "schemaVersion": 39,
