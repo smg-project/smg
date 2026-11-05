@@ -24,7 +24,8 @@ use crate::{
         join_segments,
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
-            self, apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, RenderedXtml,
+            apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, KimiXtml,
+            RenderedXtml,
         },
         PromptSegment, RendererProfile, TemplateAnswers,
     },
@@ -41,9 +42,9 @@ use crate::{
 enum Renderer {
     Jinja,
     KimiK25Tools,
-    /// Kimi-K3 renders its prompt entirely in the native XTML encoder (no Jinja
-    /// chat template). See [`crate::encoders::kimi_k3_xtml`].
-    KimiK3Xtml,
+    /// Kimi-K3 and Kimi-K3.1 render their prompt entirely in the native XTML
+    /// encoder (no Jinja chat template). See [`crate::encoders::kimi_k3_xtml`].
+    KimiXtml(KimiXtml),
 }
 
 impl Renderer {
@@ -52,7 +53,7 @@ impl Renderer {
     fn profile(self) -> Option<RendererProfile> {
         match self {
             Self::Jinja | Self::KimiK25Tools => None,
-            Self::KimiK3Xtml => Some(kimi_k3_xtml::PROFILE),
+            Self::KimiXtml(model) => Some(model.profile()),
         }
     }
 }
@@ -416,7 +417,7 @@ impl TiktokenTokenizer {
             checkpoint_pieces: kimi,
             tools_key_sorted: match renderer {
                 Renderer::KimiK25Tools => true,
-                Renderer::KimiK3Xtml => false,
+                Renderer::KimiXtml(_) => false,
                 Renderer::Jinja => kimi,
             },
         })
@@ -515,8 +516,8 @@ impl TiktokenTokenizer {
             // This is the layer the checkpoint's own `apply_chat_template` sits
             // at, so it applies that wrapper's `thinking_effort` default. K3 does
             // not continue a final message (its prefill is the assistant prefix).
-            Renderer::KimiK3Xtml => Ok((
-                apply_kimi_k3_xtml_with_effort_default(messages, &params)?,
+            Renderer::KimiXtml(model) => Ok((
+                apply_kimi_k3_xtml_with_effort_default(model, messages, &params)?,
                 false,
             )),
         }
@@ -941,7 +942,7 @@ impl TokenizerTrait for TiktokenTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        if !matches!(self.renderer, Renderer::KimiK3Xtml) {
+        let Renderer::KimiXtml(model) = self.renderer else {
             let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
             let (mut text, continued_final_message) =
                 self.apply_with_continuation(messages, params)?;
@@ -955,14 +956,14 @@ impl TokenizerTrait for TiktokenTokenizer {
                 continued_final_message,
                 generation_prompt: generation_prompt_unless_continued && !continued_final_message,
             });
-        }
+        };
         // K3's ids are not a function of the flat text: render the reference's
         // segments and hand the caller the piecewise encode to run where it
         // would have encoded the text. The renderer reads none of
         // `params.special_tokens`, so the injection `apply_chat_template`
         // performs is a no-op here.
         let RenderedXtml { segments, pending } =
-            render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
+            render_kimi_k3_xtml_prompt(model, messages, &params, assistant_prefix)?;
         let text = join_segments(&segments);
         // Piecewise encoding makes the stub's own count its share of the full
         // encode: its ids, encoded once here for the count, are kept for the
@@ -1080,7 +1081,11 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
         .unwrap_or_default();
     if arch_strs.contains(&"KimiK3ForConditionalGeneration") {
         tracing::debug!(?path, "selected KimiK3Xtml chat-template renderer");
-        return Renderer::KimiK3Xtml;
+        return Renderer::KimiXtml(KimiXtml::K3);
+    }
+    if arch_strs.contains(&"KimiK31ForConditionalGeneration") {
+        tracing::debug!(?path, "selected KimiK31Xtml chat-template renderer");
+        return Renderer::KimiXtml(KimiXtml::K31);
     }
     if arch_strs.contains(&"KimiK25ForConditionalGeneration") {
         tracing::debug!(?path, "selected KimiK25Tools chat-template renderer");
@@ -1093,7 +1098,11 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
     match value.get("model_type").and_then(|v| v.as_str()) {
         Some("kimi_k3") => {
             tracing::debug!(?path, "selected KimiK3Xtml renderer via model_type");
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        }
+        Some("kimi_k31") => {
+            tracing::debug!(?path, "selected KimiK31Xtml renderer via model_type");
+            Renderer::KimiXtml(KimiXtml::K31)
         }
         Some("kimi_k25") => {
             tracing::debug!(?path, "selected KimiK25Tools renderer via model_type");
@@ -1223,7 +1232,16 @@ mod tests {
         );
         assert!(matches!(
             detect_renderer_from_config(k3.path()),
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        ));
+
+        let k31 = write_minimal_tiktoken_dir(
+            "{}",
+            Some(r#"{"architectures": ["KimiK31ForConditionalGeneration"]}"#),
+        );
+        assert!(matches!(
+            detect_renderer_from_config(k31.path()),
+            Renderer::KimiXtml(KimiXtml::K31)
         ));
 
         let k25 = write_minimal_tiktoken_dir(
@@ -1254,7 +1272,14 @@ mod tests {
         let k3_model_type = write_minimal_tiktoken_dir("{}", Some(r#"{"model_type": "kimi_k3"}"#));
         assert!(matches!(
             detect_renderer_from_config(k3_model_type.path()),
-            Renderer::KimiK3Xtml
+            Renderer::KimiXtml(KimiXtml::K3)
+        ));
+
+        let k31_model_type =
+            write_minimal_tiktoken_dir("{}", Some(r#"{"model_type": "kimi_k31"}"#));
+        assert!(matches!(
+            detect_renderer_from_config(k31_model_type.path()),
+            Renderer::KimiXtml(KimiXtml::K31)
         ));
 
         let k25_model_type =
@@ -1817,7 +1842,7 @@ mod tests {
         let ids = job.run().unwrap();
         let expected = encode_segments(
             &tokenizer.tokenizer,
-            &render_kimi_k3_xtml_prompt(&messages, &params(), None)
+            &render_kimi_k3_xtml_prompt(KimiXtml::K3, &messages, &params(), None)
                 .unwrap()
                 .segments,
             tokenizer.checkpoint_pieces,
