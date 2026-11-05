@@ -2038,6 +2038,16 @@ mod tool_choice_tests {
                 None,
             ),
             (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+                       "tools": [{"type": "function", "function": {"name": "get_weather"}}]}}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                       "tools": [{"type": "function", "function": {"name": "get_time"}}]}}),
+                Some("tool_choice_tool_not_found"),
+            ),
+            (
                 json!({"type": "allowed_tools", "mode": "sometimes",
                        "tools": [{"type": "function", "name": "get_weather"}]}),
                 Some("tool_choice_invalid_mode"),
