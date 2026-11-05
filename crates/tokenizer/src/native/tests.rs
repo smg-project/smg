@@ -2542,15 +2542,16 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
 /// `BELLWETHER_FIXTURES` names an unpacked one: the reference text of every
 /// render and parse case (`<model>/render/*.jsonl`, `<model>/parse/*.jsonl`).
 /// Empty without the variable, so the tests that read them hold the scanners
-/// against the fuzz inputs alone.
+/// against the fuzz inputs alone; with it, a tree that cannot be read, a line
+/// that is not a JSON case or a tree without texts fails the test instead of
+/// passing it on the fuzz inputs alone.
 fn fixture_texts() -> Vec<String> {
     let Ok(root) = std::env::var("BELLWETHER_FIXTURES") else {
         return Vec::new();
     };
     let mut texts = Vec::new();
-    let Ok(models) = std::fs::read_dir(&root) else {
-        return texts;
-    };
+    let models =
+        std::fs::read_dir(&root).unwrap_or_else(|e| panic!("BELLWETHER_FIXTURES={root}: {e}"));
     for model in models.flatten() {
         for kind in ["render", "parse"] {
             let Ok(files) = std::fs::read_dir(model.path().join(kind)) else {
@@ -2561,13 +2562,19 @@ fn fixture_texts() -> Vec<String> {
                 if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for line in content.lines() {
-                    let Ok(case) = serde_json::from_str::<Value>(line) else {
+                let content = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                for (number, line) in content.lines().enumerate() {
+                    if line.trim().is_empty() {
                         continue;
-                    };
+                    }
+                    let case: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                        panic!(
+                            "{} line {}: not a JSON case: {e}",
+                            path.display(),
+                            number + 1
+                        )
+                    });
                     if let Some(text) = case
                         .get("reference")
                         .and_then(|reference| reference.get("text"))
@@ -2581,16 +2588,22 @@ fn fixture_texts() -> Vec<String> {
             }
         }
     }
+    assert!(
+        !texts.is_empty(),
+        "BELLWETHER_FIXTURES={root}: no render or parse case with a text under it"
+    );
     texts
 }
 
 /// How many fuzz inputs the scanner differentials draw: `SCANNER_FUZZ_ROUNDS`
-/// when set (the long runs are opt-in), else three thousand.
+/// when set (the long runs are opt-in; it must be a count), else three
+/// thousand.
 fn fuzz_rounds() -> usize {
-    std::env::var("SCANNER_FUZZ_ROUNDS")
-        .ok()
-        .and_then(|rounds| rounds.parse().ok())
-        .unwrap_or(3000)
+    std::env::var("SCANNER_FUZZ_ROUNDS").map_or(3000, |rounds| {
+        rounds
+            .parse()
+            .unwrap_or_else(|e| panic!("SCANNER_FUZZ_ROUNDS={rounds}: not a count: {e}"))
+    })
 }
 
 /// A random code point: ASCII a quarter of the time, the Basic Multilingual
