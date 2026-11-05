@@ -2589,7 +2589,7 @@ impl StreamingProcessor {
 /// token or changing the shared Chat response type. A populated usage field
 /// is serialized only by `chunk`, so there is never a duplicate JSON key.
 #[derive(Serialize)]
-struct ChatChunkWithUsage<'a> {
+pub(crate) struct ChatChunkWithUsage<'a> {
     #[serde(flatten)]
     chunk: &'a ChatCompletionStreamResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2597,7 +2597,7 @@ struct ChatChunkWithUsage<'a> {
 }
 
 impl<'a> ChatChunkWithUsage<'a> {
-    fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
+    pub(crate) fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
         Self {
             chunk,
             usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),

@@ -52,6 +52,7 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
+            regular::streaming::ChatChunkWithUsage,
             utils,
         },
     },
@@ -435,7 +436,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -462,7 +466,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&role_chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &role_chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -490,7 +497,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -1863,6 +1873,16 @@ impl Default for HarmonyStreamingProcessor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether the chunks before the usage-only one carry the `usage: null`
+/// placeholder the public API writes under `stream_options.include_usage`
+/// (the regular chat stream's rule, applied to this pipeline's chunks).
+fn placeholder_usage(request: &ChatCompletionRequest) -> bool {
+    request
+        .stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage.unwrap_or(false))
 }
 
 #[cfg(test)]

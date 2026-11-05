@@ -20,10 +20,11 @@
 //! is forwarded as it came, after any buffered text so the order never
 //! changes: comments, `[DONE]`, malformed frames, events with several
 //! choices, events carrying `logprobs` or fields this module does not know.
-//! A `usage: null` placeholder on the event a slice came from (what a stream
-//! under `include_usage` writes on every chunk before the usage-only one)
-//! rides each synthesized slice, after its choices, so the re-sliced stream
-//! keeps the public shape.
+//! A `usage: null` placeholder on the latest event (what a stream under
+//! `include_usage` writes on every chunk before the usage-only one; a closing
+//! event's usage object leaves the earlier text's placeholder in place) rides
+//! each synthesized slice, after its choices, so the re-sliced stream keeps
+//! the public shape.
 //!
 //! The HTTP relay drives [`SseRechunker`] inline; the gRPC pipeline wraps
 //! its own channel in `rechunk_stream`.
@@ -87,8 +88,9 @@ pub struct SseRechunker<O = NoopObserver> {
     /// serialized as the start of an object (`{"id":"x",`), so synthesized
     /// events look like the upstream ones.
     envelope: Vec<u8>,
-    /// The latest event carried the `usage: null` placeholder: every slice
-    /// synthesized from it writes the placeholder after its choices.
+    /// The latest text-bearing event carried the `usage: null` placeholder
+    /// (a usage object, which closes the stream, leaves the flag as it was):
+    /// every synthesized slice writes the placeholder after its choices.
     usage_null: bool,
     scratch: Vec<u8>,
     fields: [Pending; PAYLOAD_FIELDS.len()],
@@ -500,17 +502,20 @@ impl<O: DeltaObserver> SseRechunker<O> {
         }
     }
 
-    /// Keeps the envelope, and the placeholder flag, in step with the latest event.
+    /// Keeps the envelope, and the placeholder flag, in step with the latest
+    /// event. A usage object leaves the flag as it was: that event closes the
+    /// stream and goes out whole after the flush, so the flag keeps describing
+    /// the text buffered before it.
     fn update_envelope(&mut self, event: &RawObject<'_>) {
         self.scratch.clear();
         self.scratch.push(b'{');
-        self.usage_null = false;
+        let mut usage_null = Some(false);
         for (key, value) in &event.entries {
             if key == "choices" {
                 continue;
             }
             if key == "usage" {
-                self.usage_null = is_null(value);
+                usage_null = is_null(value).then_some(true);
                 continue;
             }
             write_json(&mut self.scratch, key.as_ref());
@@ -520,6 +525,9 @@ impl<O: DeltaObserver> SseRechunker<O> {
         }
         if self.scratch != self.envelope {
             std::mem::swap(&mut self.scratch, &mut self.envelope);
+        }
+        if let Some(usage_null) = usage_null {
+            self.usage_null = usage_null;
         }
     }
 
@@ -1528,6 +1536,21 @@ mod tests {
         let evs = events(&run(&[plain; 30]));
         assert!(evs.len() > 1, "{evs:?}");
         assert!(evs.iter().all(|e| e.get("usage").is_none()), "{evs:?}");
+
+        // A closing event with a usage object: the text buffered before it
+        // keeps its placeholder, the closing event keeps its object.
+        let closing = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"end\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":5}}\n\n";
+        let mut frames = vec![text; 30];
+        frames.push(closing);
+        let evs = events(&run(&frames));
+        let (last, earlier) = evs.split_last().expect("events");
+        assert!(earlier.len() > 1, "{evs:?}");
+        assert!(
+            earlier.iter().all(|e| e.get("usage") == Some(&Value::Null)),
+            "{evs:?}"
+        );
+        assert_eq!(last["usage"]["total_tokens"], Value::from(5), "{last}");
+        assert_eq!(last["choices"][0]["finish_reason"], Value::from("stop"));
     }
 
     #[test]
