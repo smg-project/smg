@@ -881,6 +881,47 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` of an id the servicer does not hold, never seen or already
+/// finished, is reported as not found, as the Python servicer and the other
+/// wires report it, not as a success.
+#[tokio::test]
+async fn abort_of_an_unknown_or_finished_id_is_reported_not_found() {
+    let mut h = harness(model_info(), None).await;
+    let abort = |request_id: &str| ts::AbortRequest {
+        request_id: request_id.to_string(),
+        reason: String::new(),
+    };
+    let unknown = h.client.abort(abort("nobody")).await.unwrap().into_inner();
+    assert!(!unknown.success, "{unknown:?}");
+    assert_eq!(unknown.message, "Request nobody not found");
+
+    let mut stream = h
+        .client
+        .generate(generate_request("r5", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r5", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The stream's end releases the registration (the entry leaves the map
+    // after the active count drops: read the map, which the abort reads);
+    // an abort after it finds nothing to end.
+    wait_until(|| h.server.state.shared.registry.len() == 0).await;
+    let finished = h.client.abort(abort("r5")).await.unwrap().into_inner();
+    assert!(!finished.success, "{finished:?}");
+    assert_eq!(finished.message, "Request r5 not found");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `Abort` ends the stream with an `abort` Complete and reaches the
 /// scheduler. The caller's own abort stays a completion (the scheduler's own
 /// terminal abort frame for it, which arrives after, reaches no stream and
