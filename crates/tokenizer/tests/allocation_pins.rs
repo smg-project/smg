@@ -18,7 +18,8 @@ use common::counting_alloc::{calls, Counting};
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
     traits::{Encoder, PromptEncoding, Tokenizer},
-    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence, TiktokenTokenizer,
+    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence, StopRules, StopSequenceConfig,
+    StopSequenceDecoder, TiktokenTokenizer,
 };
 use tokenizers::{
     decoders::{
@@ -451,5 +452,88 @@ fn a_prefix_cache_entry_costs_its_shared_ids_and_an_eviction_round_nothing() {
          {steady}: an eviction round draws its samples from the key index, reads them and removes \
          one without allocating; a sample list per round moves this up by one, an iterator over \
          a map per sample by one for every shard of that map it crosses"
+    );
+}
+
+/// A request's stop rules: four stop strings and two stop token ids, as an
+/// agent's request carries them.
+fn stop_config() -> StopSequenceConfig {
+    StopSequenceConfig::default()
+        .with_stop_sequence("\n\nHuman:")
+        .with_stop_sequence("</s>")
+        .with_stop_sequence("###")
+        .with_stop_sequence("Observation:")
+        .with_stop_token(2)
+        .with_stop_token(50_256)
+}
+
+/// A request's stop rules are built once and copied into each of its choices'
+/// decoders: the copy allocates nothing (the patterns and the automaton share
+/// their tables behind reference counts, the ids live inline or behind one
+/// more), so a decoder over the copy allocates its own decode state alone,
+/// where one built from the request's parameters pays the automaton's build
+/// and the ids' sort again; and a stream's first choice, whose decoder is made
+/// over the rules built for the request, pays the build and its state, as a
+/// decoder from the parameters did.
+#[test]
+fn a_choices_stop_decoder_copies_the_requests_rules_instead_of_building_them() {
+    let tokenizer = byte_level();
+    let (rules, build) = allocations_during(|| StopRules::new(stop_config()));
+    let (_, copying) = allocations_during(|| rules.clone());
+    assert_eq!(
+        copying, 0,
+        "a copy of the rules of four stop strings allocated {copying} times: the patterns and the \
+         automaton share their tables, the ids live inline"
+    );
+    assert!(
+        build > copying,
+        "the build allocated {build} times and the copy {copying}: the automaton's build and the \
+         ids' sort are paid once"
+    );
+    let many = (0..12u32).fold(stop_config(), |config, i| config.with_stop_token(1_000 + i));
+    let (rules_many, _) = allocations_during(|| StopRules::new(many));
+    let (_, copying_many) = allocations_during(|| rules_many.clone());
+    assert_eq!(
+        copying_many, 0,
+        "a copy of the rules of fourteen stop token ids allocated {copying_many} times: a set past \
+         the inline room is shared behind a reference count"
+    );
+    let (none, no_copy) = allocations_during(|| StopRules::new(StopSequenceConfig::default()));
+    let (_, copying_none) = allocations_during(|| none.clone());
+    assert_eq!(
+        (no_copy, copying_none),
+        (0, 0),
+        "the rules of no stops allocate nothing to build ({no_copy}) and nothing to copy \
+         ({copying_none})"
+    );
+    let (_, state_only) =
+        allocations_during(|| StopSequenceDecoder::with_rules(Arc::clone(&tokenizer), none, false));
+    let (_, from_copy) = allocations_during(|| {
+        StopSequenceDecoder::with_rules(Arc::clone(&tokenizer), rules.clone(), false)
+    });
+    let (_, from_config) = allocations_during(|| {
+        StopSequenceDecoder::new(Arc::clone(&tokenizer), stop_config(), false)
+    });
+    assert_eq!(
+        from_copy,
+        state_only + copying,
+        "a decoder over a copy of the rules allocated {from_copy} times: the copy ({copying}) and \
+         its own decode state ({state_only})"
+    );
+    assert!(
+        from_config > from_copy,
+        "a decoder built from the request's parameters allocated {from_config} times, one over a \
+         copy of its rules {from_copy}"
+    );
+    let (_, first_choice) = allocations_during(|| {
+        let rules = StopRules::new(stop_config());
+        StopSequenceDecoder::with_rules(Arc::clone(&tokenizer), rules.clone(), false)
+    });
+    assert_eq!(
+        first_choice,
+        build + state_only,
+        "a stream's first choice, its decoder over the rules built for the request, allocated \
+         {first_choice} times: the build ({build}) and its state ({state_only}), what a decoder \
+         from the parameters pays ({from_config}); the copy adds nothing"
     );
 }

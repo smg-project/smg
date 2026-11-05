@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Instant};
 
 use bytes::BytesMut;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, StopRules, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -87,7 +87,9 @@ pub(super) struct CompletionStream<'a> {
     /// Dispatch metadata, for consistent response fields.
     dispatch: &'a context::DispatchMetadata,
     tokenizer: Arc<dyn Tokenizer>,
-    stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+    /// The request's stop rules, built once; each choice's decoder copies them.
+    stop_rules: StopRules,
+    skip_special_tokens: bool,
     spec: &'a CompletionResponseSpec,
     prompt_text: &'a str,
     index_offset: u32,
@@ -217,10 +219,19 @@ impl<'a> CompletionStream<'a> {
             Some(_) if spec.echo => u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX),
             _ => 0,
         };
+        let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
+        let stop_rules = utils::stop_rules(
+            &tokenizer,
+            stop.as_ref(),
+            stop_token_ids.as_ref(),
+            no_stop_trim,
+            ignore_eos,
+        );
         Self {
             dispatch,
             tokenizer,
-            stop_params,
+            stop_rules,
+            skip_special_tokens,
             spec,
             prompt_text,
             index_offset,
@@ -304,15 +315,10 @@ impl<'a> CompletionStream<'a> {
         self.total_completion.record_chunk(&chunk);
 
         let stop_decoder = choice.stop_decoder.get_or_insert_with(|| {
-            let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
-                self.stop_params;
-            utils::create_stop_decoder(
-                &self.tokenizer,
-                stop.as_ref(),
-                stop_token_ids.as_ref(),
-                skip_special_tokens,
-                no_stop_trim,
-                ignore_eos,
+            StopSequenceDecoder::with_rules(
+                self.tokenizer.clone(),
+                self.stop_rules.clone(),
+                self.skip_special_tokens,
             )
         });
 

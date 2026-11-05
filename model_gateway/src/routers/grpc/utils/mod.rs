@@ -23,7 +23,7 @@ pub(crate) use chat_utils::{
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
-    request_as_rendered,
+    request_as_rendered, stop_rules,
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,

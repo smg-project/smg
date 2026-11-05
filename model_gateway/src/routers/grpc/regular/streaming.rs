@@ -14,7 +14,7 @@ use axum::response::Response;
 use bytes::{Bytes, BytesMut};
 use futures::future::try_join_all;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, StopRules, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -2808,7 +2808,9 @@ struct ChatStream<'a> {
     dispatch: &'a context::DispatchMetadata,
     tx: &'a SseSender,
     tokenizer: Arc<dyn Tokenizer>,
-    stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+    /// The request's stop rules, built once; each choice's decoder copies them.
+    stop_rules: StopRules,
+    skip_special_tokens: bool,
     pd_timing: Option<context::PdTiming>,
 
     // Metrics timing
@@ -2900,6 +2902,14 @@ impl<'a> ChatStream<'a> {
     ) -> Self {
         let start_time = Instant::now();
         let model = &dispatch.model;
+        let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
+        let stop_rules = utils::stop_rules(
+            &tokenizer,
+            stop.as_ref(),
+            stop_token_ids.as_ref(),
+            no_stop_trim,
+            ignore_eos,
+        );
 
         let deepseek_usage = spec.provider == ProviderProfile::DeepSeek;
         let include_usage = spec
@@ -2988,7 +2998,8 @@ impl<'a> ChatStream<'a> {
             tx,
             think_in_prefill: tokenizer.think_in_prefill(),
             tokenizer,
-            stop_params,
+            stop_rules,
+            skip_special_tokens,
             pd_timing,
             start_time,
             first_token_time: None,
@@ -3237,8 +3248,9 @@ impl<'a> ChatStream<'a> {
 
         self.open_choice(index).await?;
 
-        // The choice's stop decoder, made on its first chunk, and the fields
-        // the step records into.
+        // The choice's stop decoder, made on its first chunk as a copy of the
+        // request's rules with a decode state of its own, and the fields the
+        // step records into.
         let ChoiceState {
             stop_decoder,
             reader,
@@ -3252,15 +3264,10 @@ impl<'a> ChatStream<'a> {
             ..
         } = &mut self.choices[index as usize];
         let stop_decoder = stop_decoder.get_or_insert_with(|| {
-            let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
-                self.stop_params;
-            utils::create_stop_decoder(
-                &self.tokenizer,
-                stop.as_ref(),
-                stop_token_ids.as_ref(),
-                skip_special_tokens,
-                no_stop_trim,
-                ignore_eos,
+            StopSequenceDecoder::with_rules(
+                self.tokenizer.clone(),
+                self.stop_rules.clone(),
+                self.skip_special_tokens,
             )
         });
 

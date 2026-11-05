@@ -16,9 +16,8 @@ use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
-    stop::StopSequenceDecoderBuilder,
     traits::{Encoding, PromptEncoding, Tokenizer},
-    StopSequenceDecoder,
+    StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -970,33 +969,28 @@ pub(crate) fn process_chat_messages_with_placeholders(
     ))
 }
 
-/// Create a StopSequenceDecoder from stop parameters
-pub fn create_stop_decoder(
+/// The stop rules of a request, built once: its stop strings (visible when `no_stop_trim`,
+/// hidden otherwise), the tokenizer's end-of-sequence ids (unless `ignore_eos`) and its stop
+/// token ids. A stream whose request asks several choices copies them into each choice's
+/// decoder ([`StopSequenceDecoder::with_rules`]) instead of compiling them per choice.
+pub fn stop_rules(
     tokenizer: &Arc<dyn Tokenizer>,
     stop: Option<&StringOrArray>,
     stop_token_ids: Option<&Vec<u32>>,
-    skip_special_tokens: bool,
     no_stop_trim: bool,
     ignore_eos: bool,
-) -> StopSequenceDecoder {
-    // Extract stop sequences
+) -> StopRules {
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
         Some(StringOrArray::Array(arr)) => arr.clone(),
         None => vec![],
     };
-
-    // Build stop sequence decoder
-    let mut builder =
-        StopSequenceDecoderBuilder::new(tokenizer.clone()).skip_special_tokens(skip_special_tokens);
-
-    // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
-    for seq in stop_sequences {
-        builder = if no_stop_trim {
-            builder.visible_stop_sequence(seq)
-        } else {
-            builder.stop_sequence(seq)
-        };
+    let mut config = StopSequenceConfig::default();
+    // The stop strings are visible when no_stop_trim is set, hidden otherwise.
+    if no_stop_trim {
+        config.visible_stop_sequences = stop_sequences;
+    } else {
+        config.stop_sequences = stop_sequences;
     }
 
     // Collect stop token IDs: EOS from tokenizer (unless ignore_eos) + user-provided.
@@ -1012,14 +1006,30 @@ pub fn create_stop_decoder(
         .iter()
         .chain(stop_token_ids.map(|ids| ids.as_slice()).unwrap_or_default())
     {
-        builder = if no_stop_trim {
-            builder.visible_stop_token(token_id)
+        config = if no_stop_trim {
+            config.with_visible_stop_token(token_id)
         } else {
-            builder.stop_token(token_id)
+            config.with_stop_token(token_id)
         };
     }
+    StopRules::new(config)
+}
 
-    builder.build()
+/// Create a StopSequenceDecoder from stop parameters: the request's rules
+/// ([`stop_rules`]) and a decode state of its own.
+pub fn create_stop_decoder(
+    tokenizer: &Arc<dyn Tokenizer>,
+    stop: Option<&StringOrArray>,
+    stop_token_ids: Option<&Vec<u32>>,
+    skip_special_tokens: bool,
+    no_stop_trim: bool,
+    ignore_eos: bool,
+) -> StopSequenceDecoder {
+    StopSequenceDecoder::with_rules(
+        tokenizer.clone(),
+        stop_rules(tokenizer, stop, stop_token_ids, no_stop_trim, ignore_eos),
+        skip_special_tokens,
+    )
 }
 
 /// With parallel tool calls turned off (`parallel_tool_calls: false`, or
