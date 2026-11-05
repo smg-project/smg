@@ -67,10 +67,12 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization_alignments::UnicodeNormalization;
 
+mod cased;
 mod chain;
 mod merge;
 mod nfc;
 mod pattern;
+mod scan;
 mod short_pieces;
 mod unicode;
 

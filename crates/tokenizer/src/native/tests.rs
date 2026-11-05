@@ -43,6 +43,9 @@ const DIGITS: &str = r"\p{N}{1,3}";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The cased template without the clitic group and with one digit at a
+/// time.
+const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 const POOL: &[char] = &[
     'a',
@@ -2533,4 +2536,199 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         "byte 0x7f has no token"
     );
     assert!(NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &[]).is_ok());
+}
+
+/// The texts of the fixture tree the repository's fixture tests read, when
+/// `BELLWETHER_FIXTURES` names an unpacked one: the reference text of every
+/// render and parse case (`<model>/render/*.jsonl`, `<model>/parse/*.jsonl`).
+/// Empty without the variable, so the tests that read them hold the scanners
+/// against the fuzz inputs alone.
+fn fixture_texts() -> Vec<String> {
+    let Ok(root) = std::env::var("BELLWETHER_FIXTURES") else {
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    let Ok(models) = std::fs::read_dir(&root) else {
+        return texts;
+    };
+    for model in models.flatten() {
+        for kind in ["render", "parse"] {
+            let Ok(files) = std::fs::read_dir(model.path().join(kind)) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in content.lines() {
+                    let Ok(case) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    if let Some(text) = case
+                        .get("reference")
+                        .and_then(|reference| reference.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        if !text.is_empty() {
+                            texts.push(text.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    texts
+}
+
+/// How many fuzz inputs the scanner differentials draw: `SCANNER_FUZZ_ROUNDS`
+/// when set (the long runs are opt-in), else three thousand.
+fn fuzz_rounds() -> usize {
+    std::env::var("SCANNER_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|rounds| rounds.parse().ok())
+        .unwrap_or(3000)
+}
+
+/// A random code point: ASCII a quarter of the time, the Basic Multilingual
+/// Plane half of it, any plane the rest.
+fn random_code_point(state: &mut u64) -> char {
+    loop {
+        let roll = pseudo_random(state);
+        let code = match roll % 4 {
+            0 => (roll >> 2) % 0x80,
+            1 | 2 => (roll >> 2) % 0x1_0000,
+            _ => (roll >> 2) % 0x11_0000,
+        };
+        if let Some(c) = char::from_u32(code as u32) {
+            return c;
+        }
+    }
+}
+
+/// A fuzz input for the scanners: pool text, random code points of every
+/// plane, or a window of a fixture text with one character changed.
+fn fuzz_text(state: &mut u64, fixtures: &[String]) -> String {
+    let roll = pseudo_random(state);
+    match roll % 3 {
+        1 => {
+            let len = 1 + (roll / 3) as usize % 24;
+            (0..len).map(|_| random_code_point(state)).collect()
+        }
+        2 if !fixtures.is_empty() => {
+            let chars: Vec<char> = fixtures[(roll / 3) as usize % fixtures.len()]
+                .chars()
+                .collect();
+            let start = pseudo_random(state) as usize % chars.len();
+            let end = (start + 1 + pseudo_random(state) as usize % 64).min(chars.len());
+            let mut window = chars[start..end].to_vec();
+            let at = pseudo_random(state) as usize % window.len();
+            window[at] = random_code_point(state);
+            window.into_iter().collect()
+        }
+        _ => random_text(state, 1 + (roll / 3) as usize % 48, &[]),
+    }
+}
+
+/// The pieces of `stages` applied in turn by their match ranges, as byte
+/// ranges: the walk the encoder made before the scanners.
+fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
+    fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
+        if text.is_empty() {
+            return;
+        }
+        let Some((stage, rest)) = stages.split_first() else {
+            out.push((offset, offset + text.len()));
+            return;
+        };
+        let mut cursor = 0;
+        for (start, end) in stage.pattern.find_iter(text) {
+            if stage.keep_gaps && cursor < start {
+                walk(rest, &text[cursor..start], offset + cursor, out);
+            }
+            walk(rest, &text[start..end], offset + start, out);
+            cursor = end;
+        }
+        if stage.keep_gaps && cursor < text.len() {
+            walk(rest, &text[cursor..], offset + cursor, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(stages, text, 0, &mut out);
+    out
+}
+
+/// Holds the scanner of each of `patterns` against the pattern's program:
+/// the same match ranges on every fixture text and on the fuzz inputs.
+fn scanner_differential(patterns: &[&str]) {
+    let fixtures = fixture_texts();
+    let rounds = fuzz_rounds();
+    let mut state = 0x7F4A_7C15_9E37_79B9u64;
+    for pattern in patterns {
+        let parsed = Pattern::parse(pattern).expect("parses");
+        assert!(parsed.has_scanner(), "{pattern}");
+        let program = parsed.program_only();
+        let check = |text: &str| {
+            assert_eq!(
+                parsed.find_iter(text).collect::<Vec<_>>(),
+                program.find_iter(text).collect::<Vec<_>>(),
+                "pattern {pattern:?} text {text:?}"
+            );
+        };
+        for text in &fixtures {
+            check(text);
+        }
+        for _ in 0..rounds {
+            check(&fuzz_text(&mut state, &fixtures));
+        }
+    }
+}
+
+#[test]
+fn the_gpt4_template_scanner_cuts_the_fixture_and_fuzz_texts_as_its_program_does() {
+    scanner_differential(&[CL100K, QWEN35]);
+}
+
+#[test]
+fn the_cased_template_scanner_cuts_the_fixture_and_fuzz_texts_as_its_program_does() {
+    scanner_differential(&[CASED, TEKKEN]);
+}
+
+#[test]
+fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() {
+    let stages: Vec<Stage> = [DIGITS, CJK, DEEPSEEK]
+        .iter()
+        .map(|pattern| Stage {
+            pattern: Pattern::parse(pattern).expect("parses"),
+            keep_gaps: true,
+        })
+        .collect();
+    let scanner = chain::Scanner::recognize(&stages).expect("the chain takes the scanner");
+    let programs: Vec<Stage> = stages
+        .iter()
+        .map(|stage| Stage {
+            pattern: stage.pattern.program_only(),
+            keep_gaps: stage.keep_gaps,
+        })
+        .collect();
+    let fixtures = fixture_texts();
+    let rounds = fuzz_rounds();
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let check = |text: &str| {
+        let mut ours = Vec::new();
+        scanner.pieces(text, &mut |piece: &str| {
+            let start = piece.as_ptr() as usize - text.as_ptr() as usize;
+            ours.push((start, start + piece.len()));
+        });
+        assert_eq!(ours, staged(&programs, text), "text {text:?}");
+    };
+    for text in &fixtures {
+        check(text);
+    }
+    for _ in 0..rounds {
+        check(&fuzz_text(&mut state, &fixtures));
+    }
 }
