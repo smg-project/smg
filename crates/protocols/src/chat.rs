@@ -65,9 +65,11 @@ pub enum ChatMessage {
         tool_call_id: String,
     },
     /// The deprecated function result: its content is a string or null, as
-    /// the public API has it.
+    /// the public API has it, and the key is required there, so a `null`
+    /// stays on the wire when the request is written back for an upstream.
     #[serde(rename = "function")]
     Function {
+        #[serialize_always]
         content: Option<String>,
         name: String,
     },
@@ -1884,7 +1886,7 @@ mod request_contract_tests {
     use serde_json::{json, Value};
     use validator::Validate;
 
-    use super::ChatCompletionRequest;
+    use super::{ChatCompletionRequest, ChatMessage};
 
     fn request(extra: Value) -> ChatCompletionRequest {
         let mut value = json!({
@@ -1931,6 +1933,29 @@ mod request_contract_tests {
             "model": "m", "messages": [{"role": "user", "content": "hi"}], "verbosity": 3
         }))
         .is_err());
+    }
+
+    /// The deprecated function message's content is required and nullable
+    /// on the public API: a `null` reads as none and writes back as `null`,
+    /// not as an absent key, so a request forwarded to an upstream keeps the
+    /// client's shape.
+    #[test]
+    fn a_function_message_without_content_keeps_the_null_on_the_wire() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": null}))
+                .expect("a function message");
+        assert!(matches!(&message, ChatMessage::Function { content: None, name } if name == "f"));
+        assert_eq!(
+            serde_json::to_value(&message).expect("json"),
+            json!({"role": "function", "name": "f", "content": null})
+        );
+        let with_text: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": "result"}))
+                .expect("a function message");
+        assert_eq!(
+            serde_json::to_value(&with_text).expect("json"),
+            json!({"role": "function", "name": "f", "content": "result"})
+        );
     }
 
     #[test]
