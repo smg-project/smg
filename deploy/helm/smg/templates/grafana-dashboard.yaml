@@ -88,11 +88,11 @@ data:
               "legendFormat": "5xx (edge)"
             },
             {
-              "expr": "sum(rate(smg_router_request_errors_total{namespace=~\"$namespace\", job=~\"$job\"}[5m])) / sum(rate(smg_router_requests_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "expr": "sum(rate(smg_router_request_errors_total{namespace=~\"$namespace\", job=~\"$job\", error_type!~\"validation_error|no_workers|rate_limit_error|constraint_error\"}[5m])) / sum(rate(smg_router_requests_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
               "legendFormat": "router errors"
             }
           ],
-          "description": "Server-side failures over every response but the probe routes' (/health, /readiness, /liveness), as the SmgHighErrorRatio alert reads them, and the router's failed share of its requests, as SmgHighRouterErrorRatio reads it: a stream that fails after its first token is a 200 at the edge and a router error; both alerts fire above prometheusRule.alerts.errorRatio.",
+          "description": "Server-side failures over every response but the probe routes' (/health, /readiness, /liveness), as the SmgHighErrorRatio alert reads them, and the router's server-side failed share of its requests, as SmgHighRouterErrorRatio reads it (the client's own refusals left out): a stream that fails after its first token is a 200 at the edge and a router error; both alerts fire above prometheusRule.alerts.errorRatio.",
           "fieldConfig": {
             "defaults": {
               "unit": "percentunit",

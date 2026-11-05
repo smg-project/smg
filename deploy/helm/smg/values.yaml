@@ -439,9 +439,11 @@ grafana:
 #     out of the ratio: the readiness probe answers 503 for the whole of an
 #     engine's bring-up with no client in sight, and once the fleet serves the
 #     probes' 200s would dilute the share of failing client responses.
-#     The same threshold and window bound the router's failed share of its
-#     requests (SmgHighRouterErrorRatio), which sees the stream that fails
-#     after its first token: a 200 at the edge, a router error.
+#     The same threshold and window bound the router's server-side failed
+#     share of its requests (SmgHighRouterErrorRatio), which sees the stream
+#     that fails after its first token: a 200 at the edge, a router error. The
+#     client's own refusals (a malformed request, a model nobody serves, a
+#     tenant over its limit, a grammar of its own) are not counted there.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
 #     front of the engines (set it to the SLO once there is one).

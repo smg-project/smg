@@ -290,7 +290,7 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 | `SmgGatewayDown` | critical | the router's scrape target is down, or no target matches the selector, for `scrapeMissingFor` |
 | `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
 | `SmgHighErrorRatio` | critical | the 5xx share of responses, the probe routes (`/health`, `/readiness`, `/liveness`) excluded, exceeds `errorRatio` for `errorRatioFor` |
-| `SmgHighRouterErrorRatio` | critical | the router's failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s) exceeds `errorRatio` for `errorRatioFor` |
+| `SmgHighRouterErrorRatio` | critical | the router's server-side failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s; the client's own refusals are not counted) exceeds `errorRatio` for `errorRatioFor` |
 | `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
 | `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
 | `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker is open or half-open for `circuitBreakerOpenFor` (a worker failing requests while passing its probes cycles between the two) |
