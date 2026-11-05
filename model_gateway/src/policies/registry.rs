@@ -2478,7 +2478,7 @@ mod tests {
 
         use smg_mesh::MeshKV;
 
-        use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
+        use crate::{mesh::MeshAdapters, policies::PolicyRegistration, worker::WorkerRegistry};
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
@@ -2488,9 +2488,13 @@ mod tests {
         let _adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             Arc::new(RwLock::new(BTreeMap::new())),
-            Arc::clone(&registry),
+            PolicyRegistration {
+                policy_registry: Arc::clone(&registry),
+                worker_registry: Arc::new(WorkerRegistry::new()),
+                kv_event_monitor: None,
+                worker_monitor: None,
+            },
         );
 
         let prefill = cache_aware_policy();
