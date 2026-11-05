@@ -47,7 +47,7 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use tokenizers::{models::ModelWrapper, Model};
 
-use crate::encode_path::Declined;
+use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS};
 
 mod serialized;
 
@@ -183,8 +183,13 @@ impl MergeTable {
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
         let ranks_end = ranks.values().max().map_or(0, |&rank| rank as usize + 1);
-        if ranks_end >= MAX_RANKS {
-            return Err(Declined::from("more ranks than a short merge's keys carry"));
+        // The rank ids are a dense table (`new_ids`), bounded as the decode
+        // table of such a file is: ranks reaching far past the token count
+        // keep the file on its own encoder.
+        if ranks_end > MAX_BYTE_LEVEL_TABLE_IDS {
+            return Err(Declined::from(format!(
+                "ranks up to {ranks_end} on a table bounded at {MAX_BYTE_LEVEL_TABLE_IDS}"
+            )));
         }
         // Every split of every token into two tokens, at the token's rank.
         let mut splits = Vec::with_capacity(ranks.len() * 2);

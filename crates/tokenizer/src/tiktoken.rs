@@ -377,6 +377,12 @@ impl TiktokenTokenizer {
         let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &config.added_tokens);
         let native = Self::native_encoder(&encoder, pattern, &config.added_tokens);
         let tokenizer = Arc::new(CoreBPE::new(encoder, special_tokens_encoder, pattern)?);
+        // Counted and announced once the file's own encoder has loaded too:
+        // a load that fails is a load of no path.
+        if native.is_some() {
+            encode_path::note_load(EncodePath::Native);
+            tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
+        }
 
         // 5. Load chat template — propagate errors for explicit paths,
         //    silently fall back for auto-discovery
@@ -449,11 +455,7 @@ impl TiktokenTokenizer {
             .collect();
         specials.sort();
         match NativeEncoder::from_ranks(ranks, pattern, &specials) {
-            Ok(native) => {
-                encode_path::note_load(EncodePath::Native);
-                tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
-                Some(Arc::new(native))
-            }
+            Ok(native) => Some(Arc::new(native)),
             Err(declined) => {
                 tracing::info!(
                     native_declined = %declined,
@@ -628,8 +630,9 @@ fn build_vocab_maps(
 /// ranks plus the specials); a `tokenizer_config.json` whose added-token ids
 /// lie far beyond the ranks would otherwise cost about nine bytes and one
 /// BPE lookup per id up to the largest one, so such a vocabulary keeps the
-/// generic per-stream decoder instead.
-const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
+/// generic per-stream decoder instead. The direct encoder's table of rank
+/// ids over such a file is bounded the same way.
+pub(crate) const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
 
 /// The bytes every id decodes to, read back from the BPE: a rank's byte
 /// string, a special token's text. Every id up to the largest rank or special

@@ -425,6 +425,16 @@ fn a_rank_set_the_table_cannot_stand_in_for_declines() {
     // The same set without that token is complete.
     ranks.remove(b"abcd".as_slice());
     assert!(MergeTable::from_ranks(&ranks).is_ok());
+    // A rank far past the token count: the table of rank ids is dense and
+    // bounded, as the decode table of such a file is.
+    ranks.insert(b"ab".to_vec(), 1 << 30);
+    assert_eq!(
+        MergeTable::from_ranks(&ranks)
+            .err()
+            .expect("declined")
+            .to_string(),
+        "ranks up to 1073741825 on a table bounded at 4194304"
+    );
 }
 
 #[test]

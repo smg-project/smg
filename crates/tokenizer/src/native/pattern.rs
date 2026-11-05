@@ -1460,7 +1460,12 @@ impl Parser<'_> {
                 // An intersection with a negated property class closes the
                 // class: `[...&&[^\p{Han}]]`. Nested classes, other
                 // intersections and POSIX brackets are not supported.
-                '&' if !first && self.chars.peek() == Some(&'&') => {
+                '&' if self.chars.peek() == Some(&'&') => {
+                    // Nothing before the intersection would be the empty
+                    // set: declined, as every other shape of it is.
+                    if first {
+                        return None;
+                    }
                     self.chars.next();
                     class.without = self.parse_subtracted_properties()?;
                     if self.chars.next()? != ']' {
@@ -1528,6 +1533,8 @@ fn escaped_literal(c: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashMap;
+    use tiktoken_rs::CoreBPE;
     use tokenizers::utils::SysRegex;
 
     use super::*;
@@ -1772,6 +1779,8 @@ mod tests {
             r"[\p{L}&&[^a]]",
             r"[\p{L}&&[^\p{Han}]a]",
             r"[&&[^\p{Han}]]",
+            r"[&&a]",
+            r"[^&&a]",
             r"[\p{L}&&[^]]",
             r"\d+",
             r"(?=a)",
@@ -1836,6 +1845,49 @@ mod tests {
                 let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
                 let theirs = engine.find_iter(&buf).next() == Some((0, buf.len()));
                 assert_eq!(ours, theirs, "{pattern} at U+{code:04X}");
+            }
+        }
+    }
+
+    /// The classes of the tiktoken templates the direct path reads, checked
+    /// code point by code point against the file's own encoder (a `CoreBPE`
+    /// whose pattern is the class alone encodes a code point it matches and
+    /// drops one it does not): the two engines' Unicode tables agree today,
+    /// and a version apart between them would show here.
+    #[test]
+    fn the_tiktoken_template_classes_agree_with_the_files_own_encoder() {
+        let ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+        let classes = [
+            r"[\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\r\n\p{L}\p{N}]",
+            r"\p{L}",
+            r"\p{N}",
+            r"[^\s\p{L}\p{N}]",
+            r"\s",
+        ];
+        let codes = (0u32..0x1_0000)
+            .chain(
+                unicode::HAN
+                    .iter()
+                    .flat_map(|&(start, end)| start.max(0x1_0000)..=end),
+            )
+            .chain((0x1_0000..=0x10_FFFF).step_by(97));
+        let mut buf = String::new();
+        for class in classes {
+            let parsed = Pattern::parse(class).expect("parses");
+            let own = CoreBPE::new(ranks.clone(), FxHashMap::default(), class)
+                .expect("the file's own encoder compiles the class");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = !own.encode_ordinary(&buf).is_empty();
+                assert_eq!(ours, theirs, "{class} at U+{code:04X}");
             }
         }
     }
