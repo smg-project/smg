@@ -82,15 +82,16 @@ fn manager(dir: &std::path::Path) -> Arc<RateLimitManager> {
         .expect("the limiter is enabled")
 }
 
-/// One logical request's reservation and settlement, as the routers do it;
-/// a denial comes back with its retry-after seconds.
+/// One logical request's reservation under `charge_id` and its settlement,
+/// as the routers do it; a denial comes back with its retry-after seconds.
 async fn reserve_and_settle(
     manager: &RateLimitManager,
+    charge_id: Uuid,
     tenant: &TenantKey,
     model: &str,
 ) -> Result<(), u64> {
     let request = ReserveRequest {
-        request_charge_id: Uuid::now_v7(),
+        request_charge_id: charge_id,
         tenant_key: tenant.clone(),
         model_id: Some(model),
         estimated_input_tokens: 40,
@@ -111,9 +112,16 @@ async fn reserve_and_settle(
 }
 
 /// A reservation that takes the tenant-global bucket and a model rule's,
-/// settled: the charge id's entry in the active map, the tenant key's two
-/// scope keys and the rule's, the handle, and the runtime's own per-call
-/// work; nothing per bucket beyond its key.
+/// settled: the boxed futures of the backend's reserve and settle calls and
+/// the handle, plus the rule's scope key (its rule id) when a rule matches;
+/// nothing per bucket beyond its key.
+///
+/// The map of active reservations is sharded, and a shard allocates its
+/// table on its first insert; which shard a charge id lands in follows the
+/// process's hash seed, so a reservation under a fresh id grows the map or
+/// not by chance (the more shards, the more often). Each measured
+/// reservation therefore reuses a charge id a warm-up reservation settled:
+/// its shard has its table, and the count is the reserve path's own.
 #[test]
 fn a_reservation_with_a_model_rule_allocates_this_much() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -127,23 +135,46 @@ fn a_reservation_with_a_model_rule_allocates_this_much() {
         manager(dir.path())
     };
     let tenant = TenantKey::new("auth:team-red");
-    // Warm: the buckets exist and the maps have their room.
+    let ruled_id = Uuid::now_v7();
+    let plain_id = Uuid::now_v7();
+    // Warm: the buckets exist, and each measured charge id has been through
+    // the active map once.
     for _ in 0..8 {
         runtime
-            .block_on(reserve_and_settle(&manager, &tenant, "ruled-model"))
+            .block_on(reserve_and_settle(
+                &manager,
+                Uuid::now_v7(),
+                &tenant,
+                "ruled-model",
+            ))
+            .expect("admitted under an ample budget");
+    }
+    for (charge_id, model) in [(ruled_id, "ruled-model"), (plain_id, "other-model")] {
+        runtime
+            .block_on(reserve_and_settle(&manager, charge_id, &tenant, model))
             .expect("admitted under an ample budget");
     }
     let (admitted, ruled) = allocations_during(|| {
-        runtime.block_on(reserve_and_settle(&manager, &tenant, "ruled-model"))
+        runtime.block_on(reserve_and_settle(
+            &manager,
+            ruled_id,
+            &tenant,
+            "ruled-model",
+        ))
     });
     admitted.expect("admitted under an ample budget");
     let (admitted, plain) = allocations_during(|| {
-        runtime.block_on(reserve_and_settle(&manager, &tenant, "other-model"))
+        runtime.block_on(reserve_and_settle(
+            &manager,
+            plain_id,
+            &tenant,
+            "other-model",
+        ))
     });
     admitted.expect("admitted under an ample budget");
     eprintln!(
         "allocation calls per reservation: with a model rule {ruled}, tenant-global alone {plain}"
     );
-    assert_eq!(ruled, 5, "with a model rule");
-    assert_eq!(plain, 4, "tenant-global alone");
+    assert_eq!(ruled, 4, "with a model rule");
+    assert_eq!(plain, 3, "tenant-global alone");
 }
