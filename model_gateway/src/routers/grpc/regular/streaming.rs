@@ -4,7 +4,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::Arc,
+    task::Poll,
     time::Instant,
 };
 
@@ -33,7 +35,6 @@ use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, Re
 use serde::Serialize;
 use serde_json::{json, Value};
 use symphony::{adapt, EngineFinish, Event, Events};
-use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn, Instrument, Span};
 
@@ -45,7 +46,7 @@ use crate::{
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::{
-            sse::{sse_channel, SseEncoder, SseSender},
+            sse::{SseEncoder, SseSender},
             sse_rechunk,
         },
         grpc::{
@@ -55,7 +56,8 @@ use crate::{
                     chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
                 },
                 responses::{
-                    body_guards, build_sse_response_from_stream, build_sse_response_guarded,
+                    body_guards, build_sse_response_driven, build_sse_response_from_stream,
+                    driven_channel, DrivenBody, Reading,
                 },
             },
             context,
@@ -348,6 +350,10 @@ impl StreamingProcessor {
     /// response body, released when it is dropped: at the stream's end or
     /// the client's disconnect.
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     pub async fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -376,30 +382,29 @@ impl StreamingProcessor {
         // frames itself, so the channel is re-chunked on its way out.
         let rechunk = chat_request.provider == ProviderProfile::Minimax;
 
-        // Create SSE channel
-        let (tx, rx) = sse_channel();
+        // The body's channel: the reading parks on it until the body took
+        // the frame before (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
-        // Spawn background task based on execution mode
-        match execution_result {
+        // The reading of the engine's answer, by execution mode; the response
+        // body drives it (see `DrivenBody`), so its frames reach the
+        // connection from the task that polls the body.
+        let reading: Reading = match execution_result {
             context::ExecutionResult::Single { stream } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = chat_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
-                // task runs outside it.
+                // reading runs outside it.
                 let span = Span::current();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
+                Box::pin(async move {
                     // The request's reading, isolated: a panic in it ends
                     // this response with an error event and `[DONE]`, not
-                    // the task (see `utils::isolation`).
+                    // the task polling the body (see `utils::isolation`).
                     let result = isolated(processor.process_streaming_chunks(
                         stream,
                         dispatch_clone,
@@ -419,7 +424,7 @@ impl StreamingProcessor {
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                });
+                })
             }
             context::ExecutionResult::PrefillDecode {
                 prefill,
@@ -433,11 +438,7 @@ impl StreamingProcessor {
                 let tokenizer_clone = tokenizer.clone();
                 let table = chat_request.symphony.as_ref().map(Assignment::table);
                 let span = Span::current();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
+                Box::pin(async move {
                     let result = isolated(processor.process_prefill_decode_streaming_chunks(
                         prefill,
                         *decode,
@@ -460,9 +461,9 @@ impl StreamingProcessor {
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                });
+                })
             }
-            context::ExecutionResult::Embedding { .. } => {
+            context::ExecutionResult::Embedding { .. } => Box::pin(async move {
                 utils::send_error_sse(
                     &tx,
                     "Embeddings not supported in streaming mode",
@@ -470,9 +471,9 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-            }
+            }),
             // Batch results exist only on the completions pipeline.
-            context::ExecutionResult::Batch { .. } => {
+            context::ExecutionResult::Batch { .. } => Box::pin(async move {
                 utils::send_error_sse(
                     &tx,
                     "Batched results not supported in chat streaming",
@@ -480,11 +481,11 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-            }
-        }
+            }),
+        };
 
         // Return SSE response; its body holds the guards for as long as it lives.
-        let stream = GuardedStream::new(ReceiverStream::new(rx), guards);
+        let stream = GuardedStream::new(DrivenBody::new(reading, rx), guards);
         if rechunk {
             build_sse_response_from_stream(sse_rechunk::rechunk_stream(
                 stream,
@@ -637,6 +638,10 @@ impl StreamingProcessor {
     /// response body, released when it is dropped: at the stream's end or
     /// the client's disconnect.
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     pub async fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -649,13 +654,13 @@ impl StreamingProcessor {
     ) -> Response {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
-        // Create SSE channel
-        let (tx, rx) = sse_channel();
+        // The body's channel (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
-        // Build context once, clone for spawned task
+        // Build context once, for the reading
         let ctx = GenerateStreamContext {
             request_id: dispatch.request_id.clone(),
             weight_version: dispatch
@@ -668,25 +673,31 @@ impl StreamingProcessor {
             expected_choices: generate_request.expected_choices,
         };
 
-        // Spawn background task based on execution mode
-        match execution_result {
+        // The reading of the engine's answer, by execution mode; the response
+        // body drives it (see `DrivenBody`).
+        let reading: Reading = match execution_result {
             context::ExecutionResult::Single { stream } => {
                 let tokenizer = tokenizer.clone();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
-                    let result =
-                        Self::process_generate_streaming(tokenizer, stream, ctx, &tx, reservation)
-                            .await;
+                Box::pin(async move {
+                    // The request's reading, isolated: a panic in it ends
+                    // this response with an error event and `[DONE]`, not
+                    // the task polling the body (see `utils::isolation`).
+                    let result = isolated(Self::process_generate_streaming(
+                        tokenizer,
+                        stream,
+                        ctx,
+                        &tx,
+                        reservation,
+                    ))
+                    .await
+                    .unwrap_or_else(|panicked| Err(panicked.into()));
 
                     if let Err(failure) = result {
                         utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                });
+                })
             }
             context::ExecutionResult::PrefillDecode {
                 prefill,
@@ -697,12 +708,8 @@ impl StreamingProcessor {
             } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
-                    let result = Self::process_generate_prefill_decode_streaming(
+                Box::pin(async move {
+                    let result = isolated(Self::process_generate_prefill_decode_streaming(
                         tokenizer,
                         prefill,
                         *decode,
@@ -712,17 +719,18 @@ impl StreamingProcessor {
                         prefill_input_logprobs,
                         prefill_guards,
                         reservation,
-                    )
-                    .await;
+                    ))
+                    .await
+                    .unwrap_or_else(|panicked| Err(panicked.into()));
 
                     if let Err(failure) = result {
                         utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                });
+                })
             }
-            context::ExecutionResult::Embedding { .. } => {
+            context::ExecutionResult::Embedding { .. } => Box::pin(async move {
                 utils::send_error_sse(
                     &tx,
                     "Embeddings not supported in streaming generate",
@@ -730,9 +738,9 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-            }
+            }),
             // Batch results exist only on the completions pipeline.
-            context::ExecutionResult::Batch { .. } => {
+            context::ExecutionResult::Batch { .. } => Box::pin(async move {
                 utils::send_error_sse(
                     &tx,
                     "Batched results not supported in streaming generate",
@@ -740,11 +748,11 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-            }
-        }
+            }),
+        };
 
         // Return SSE response
-        build_sse_response_guarded(rx, guards)
+        build_sse_response_driven(reading, rx, guards)
     }
 
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
@@ -1452,8 +1460,9 @@ impl StreamingProcessor {
 
     /// Write one chat chunk carrying `choice` into `buffer`. The buffer goes
     /// to the channel as one frame, without a copy, by [`Self::flush_chunks`]
-    /// once the engine has nothing more ready, or here once it holds
-    /// [`CHUNK_FLUSH_BYTES`].
+    /// once the engine has nothing more ready (the chat loop's
+    /// `read_engine`: the messages ready at one poll share a frame, after the
+    /// first token's), or here once it holds [`CHUNK_FLUSH_BYTES`].
     async fn push_chunk<C: Serialize>(
         tx: &SseSender,
         buffer: &mut BytesMut,
@@ -1911,6 +1920,10 @@ impl StreamingProcessor {
     /// `load_guards` (and the reservation's safety net) ride in the response
     /// body, released when it is dropped.
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -1934,28 +1947,27 @@ impl StreamingProcessor {
             false, // ignore_eos — not available in Messages API
         );
 
-        let (tx, rx) = sse_channel();
+        // The body's channel (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
-        match execution_result {
+        // The reading of the engine's answer, by execution mode; the response
+        // body drives it (see `DrivenBody`).
+        let reading: Reading = match execution_result {
             context::ExecutionResult::Single { stream } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = messages_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
-                // task runs outside it.
+                // reading runs outside it.
                 let span = Span::current();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
+                Box::pin(async move {
                     // The request's reading, isolated: a panic in it ends
-                    // this message with an error event, not the task (see
-                    // `utils::isolation`).
+                    // this message with an error event, not the task polling
+                    // the body (see `utils::isolation`).
                     let result = isolated(processor.process_messages_streaming_chunks(
                         stream,
                         dispatch_clone,
@@ -1980,7 +1992,7 @@ impl StreamingProcessor {
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
-                });
+                })
             }
             context::ExecutionResult::PrefillDecode {
                 prefill,
@@ -1993,11 +2005,7 @@ impl StreamingProcessor {
                 let tokenizer_clone = tokenizer.clone();
                 let table = messages_request.symphony.as_ref().map(Assignment::table);
                 let span = Span::current();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
+                Box::pin(async move {
                     let result =
                         isolated(processor.process_prefill_decode_messages_streaming_chunks(
                             prefill,
@@ -2030,9 +2038,9 @@ impl StreamingProcessor {
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
-                });
+                })
             }
-            context::ExecutionResult::Embedding { .. } => {
+            context::ExecutionResult::Embedding { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
                     error: messages::ErrorResponse {
                         error_type: "invalid_request_error".to_string(),
@@ -2041,9 +2049,9 @@ impl StreamingProcessor {
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
-            }
+            }),
             // Batch results exist only on the completions pipeline.
-            context::ExecutionResult::Batch { .. } => {
+            context::ExecutionResult::Batch { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
                     error: messages::ErrorResponse {
                         error_type: "invalid_request_error".to_string(),
@@ -2052,10 +2060,10 @@ impl StreamingProcessor {
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
-            }
-        }
+            }),
+        };
 
-        build_sse_response_guarded(rx, guards)
+        build_sse_response_driven(reading, rx, guards)
     }
 
     /// Process Messages API streaming chunks from a single stream.
@@ -2196,6 +2204,10 @@ impl StreamingProcessor {
     /// metrics record, and `[DONE]`. The `load_guards` (and the reservation's
     /// safety net) ride in the response body, released when it is dropped.
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     pub async fn process_completion_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -2208,7 +2220,8 @@ impl StreamingProcessor {
     ) -> Response {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
-        let (tx, rx) = sse_channel();
+        // The body's channel (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
@@ -2216,18 +2229,18 @@ impl StreamingProcessor {
         let units = match Self::completion_stream_units(execution_result) {
             Ok(units) => units,
             Err(message) => {
-                utils::send_error_sse(&tx, message, "invalid_request_error").await;
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                return build_sse_response_guarded(rx, guards);
+                let reading = async move {
+                    utils::send_error_sse(&tx, message, "invalid_request_error").await;
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                };
+                return build_sse_response_driven(Box::pin(reading), rx, guards);
             }
         };
 
         let processor = self;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "streaming task is fire-and-forget; client disconnect terminates it"
-        )]
-        tokio::spawn(async move {
+        // The reading of the units' answers; the response body drives it
+        // (see `DrivenBody`).
+        let reading = async move {
             let start_time = Instant::now();
             // In PD mode this task only starts once the decode streams exist --
             // for sequential PD that is after prefill completes, with the first
@@ -2247,8 +2260,11 @@ impl StreamingProcessor {
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
             let completion_request = &completion_request;
-            let outcomes =
-                try_join_all(units.into_iter().enumerate().map(|(prompt_index, unit)| {
+            // The units' reading, isolated: a panic in it ends this response
+            // with an error event and `[DONE]`, not the task polling the
+            // body (see `utils::isolation`).
+            let outcomes = isolated(try_join_all(units.into_iter().enumerate().map(
+                |(prompt_index, unit)| {
                     let stop_params = (
                         completion_request.stop.clone(),
                         completion_request.stop_token_ids.clone(),
@@ -2316,8 +2332,10 @@ impl StreamingProcessor {
                             }
                         }
                     }
-                }))
-                .await;
+                },
+            )))
+            .await
+            .unwrap_or_else(|panicked| Err(panicked.into()));
 
             match outcomes {
                 Err(failure) => {
@@ -2414,9 +2432,9 @@ impl StreamingProcessor {
             }
 
             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-        });
+        };
 
-        build_sse_response_guarded(rx, guards)
+        build_sse_response_driven(Box::pin(reading), rx, guards)
     }
 
     /// Split an execution result into per-prompt stream units, in prompt order.
@@ -2864,6 +2882,11 @@ struct ChatStream<'a> {
     /// the channel instead of being copied.
     chunk_frame: ChatChunkFrame,
     sse_buffer: BytesMut,
+    /// The frame carrying the stream's first token has left. Until then the
+    /// buffer leaves before the engine is polled again, so the first token
+    /// waits for nothing; after it, the engine messages ready at one poll
+    /// share a frame (see [`Self::read_engine`]).
+    first_token_out: bool,
 }
 
 impl<'a> ChatStream<'a> {
@@ -2996,6 +3019,7 @@ impl<'a> ChatStream<'a> {
             sse_encoder: SseEncoder::new(),
             chunk_frame,
             sse_buffer: BytesMut::with_capacity(4096),
+            first_token_out: false,
         }
     }
 
@@ -3077,12 +3101,13 @@ impl<'a> ChatStream<'a> {
         })
     }
 
-    /// Phase 2: the main loop. The engine stream is polled once per message
-    /// and every message reaches the client as its own frame as soon as it is
-    /// processed; the text a message releases goes through the one emission
-    /// below, so nothing reaches the client without being parsed. After the
-    /// engine's end the loop keeps turning until every choice's decoder and
-    /// parsers have flushed.
+    /// Phase 2: the main loop. The engine stream is polled once in place
+    /// before the chunks written so far leave as a frame, so the messages
+    /// ready at one poll leave as one frame, after the first token's, which
+    /// leaves alone; the text a message releases goes through the one
+    /// emission below, so nothing reaches the client without being parsed.
+    /// After the engine's end the loop keeps turning until every choice's
+    /// decoder and parsers have flushed.
     async fn read_engine(
         &mut self,
         grpc_stream: &mut ProtoStream,
@@ -3096,12 +3121,42 @@ impl<'a> ChatStream<'a> {
                 self.engine_outlived = true;
             }
             let response = if self.final_indices.is_none() && !self.engine_outlived {
-                // The chunks written so far leave as a frame before the
-                // engine is polled, so every engine message reaches the
-                // client as its own frame as soon as it is processed; the
-                // engine stream is polled once per message.
-                StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                let item = grpc_stream.next().await;
+                // The engine is polled once in place before the chunks
+                // written so far leave: a message it has ready joins the
+                // frame being written, so the messages ready at one poll
+                // leave as one frame; when it has none ready, the frame
+                // leaves before the reader parks, so no text waits for the
+                // engine. The frame carrying the first token leaves before
+                // the engine is polled again, whatever is ready behind it:
+                // the client's first token waits for nothing. The one poll
+                // registers the reader's wake where the message will come
+                // from; `next` resumes it after the flush.
+                let item = {
+                    let mut next = std::pin::pin!(grpc_stream.next());
+                    let ready = if self.first_token_out {
+                        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+                    } else {
+                        Poll::Pending
+                    };
+                    match ready {
+                        Poll::Ready(item) => item,
+                        Poll::Pending => {
+                            let frame_out = !self.sse_buffer.is_empty();
+                            StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                            if frame_out && !self.first_token_out && self.first_token_time.is_some()
+                            {
+                                self.first_token_out = true;
+                                // The first token's frame reaches the
+                                // connection before the engine is read
+                                // again: the body driving this reading
+                                // hands it out on this yield and writes it
+                                // (see `DrivenBody`).
+                                tokio::task::yield_now().await;
+                            }
+                            next.await
+                        }
+                    }
+                };
                 if item.is_none() && grpc_stream.client_left() {
                     // The client's departure ends the read here: text the
                     // decoder or a parser still holds can reach nobody, and
@@ -5259,6 +5314,11 @@ impl<'a> MessagesStream<'a> {
         });
     }
 }
+
+// The stream tests drive the stages over a channel of their own and read
+// its frames directly.
+#[cfg(test)]
+use crate::routers::common::sse::sse_channel;
 
 #[cfg(test)]
 pub(crate) mod tests;

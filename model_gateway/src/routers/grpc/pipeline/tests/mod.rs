@@ -2243,6 +2243,22 @@ async fn cancelled_grpc_stream_reports_the_completion_during_prefill() {
     drop(hold);
 }
 
+/// `response`'s body read by a client of its own, as a connection reads it:
+/// a streamed body's reading runs when the body is polled (see
+/// `DrivenBody`), so a response held unread would hold the engine's stream
+/// unread too. Aborting the client's task drops the body, as the client's
+/// leaving does.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test client reading the body; aborting it is the client's leaving"
+)]
+fn read_body(response: Response) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut body = response.into_body().into_data_stream();
+        while body.next().await.is_some() {}
+    })
+}
+
 /// Wait until the processor has read the first response of `worker`'s
 /// one stream: the stream's output ticket is open from that response on
 /// (see `Worker::output_silence`), and the processor waits on the engine
@@ -2304,6 +2320,7 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&worker).await;
     assert!(
         scheduler
@@ -2315,7 +2332,8 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     );
     assert_eq!(worker.load(), 1);
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&scheduler, deadline).await;
@@ -2347,6 +2365,7 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&decode).await;
     assert!(
         decode_scheduler
@@ -2357,7 +2376,8 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
         "nothing is aborted while the client reads"
     );
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&decode_scheduler, deadline).await;

@@ -34,17 +34,18 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
-            sse::{sse_channel, SseEncoder, SseSender},
+            sse::{SseEncoder, SseSender},
         },
         grpc::{
             common::{
                 response_collection::drain_prefill,
                 response_formatting::{CompletionTokenTracker, TokenCounts},
                 responses::{
-                    body_guards, build_sse_response_guarded,
+                    body_guards, build_sse_response_driven, driven_channel,
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
+                    Reading,
                 },
             },
             context,
@@ -131,11 +132,11 @@ impl HarmonyStreamingProcessor {
     /// The `load_guards` (and the reservation's safety net) ride in the
     /// response body, released when it is dropped: at the stream's end or
     /// the client's disconnect.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming tasks are fire-and-forget by design; client disconnect terminates them"
-    )]
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
@@ -151,86 +152,92 @@ impl HarmonyStreamingProcessor {
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         let guards = body_guards(load_guards, reservation.as_ref());
-        // Create SSE channel
-        let (tx, rx) = sse_channel();
+        // The body's channel (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
-        // Spawn background task based on execution mode
-        match execution_result {
-            context::ExecutionResult::Single { stream } => {
-                tokio::spawn(async move {
-                    let result = Self::process_single_stream(
-                        stream,
-                        dispatch,
-                        chat_request,
-                        &tx,
-                        router_stop_strings,
-                        reservation,
-                    )
-                    .await;
+        // The reading of the engine's answer, by execution mode; the response
+        // body drives it (see `DrivenBody`).
+        let reading: Reading = match execution_result {
+            context::ExecutionResult::Single { stream } => Box::pin(async move {
+                // The request's reading, isolated: a panic in it ends this
+                // response with an error event and `[DONE]`, not the task
+                // polling the body (see `utils::isolation`).
+                let result = utils::isolation::isolated(Self::process_single_stream(
+                    stream,
+                    dispatch,
+                    chat_request,
+                    &tx,
+                    router_stop_strings,
+                    reservation,
+                ))
+                .await
+                .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
-                    }
+                if let Err(failure) = result {
+                    utils::send_stream_failure(&tx, &failure, &source).await;
+                }
 
-                    let _ = tx.send(Ok(SseEncoder::done())).await;
-                });
-            }
+                let _ = tx.send(Ok(SseEncoder::done())).await;
+            }),
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
                 prefill_guards,
                 pd_timing,
                 ..
-            } => {
-                tokio::spawn(async move {
-                    let result = Self::process_prefill_decode_stream(
-                        prefill,
-                        *decode,
-                        dispatch,
-                        chat_request,
-                        &tx,
-                        router_stop_strings,
-                        pd_timing,
-                        prefill_guards,
-                        reservation,
-                    )
-                    .await;
+            } => Box::pin(async move {
+                let result = utils::isolation::isolated(Self::process_prefill_decode_stream(
+                    prefill,
+                    *decode,
+                    dispatch,
+                    chat_request,
+                    &tx,
+                    router_stop_strings,
+                    pd_timing,
+                    prefill_guards,
+                    reservation,
+                ))
+                .await
+                .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
-                    }
+                if let Err(failure) = result {
+                    utils::send_stream_failure(&tx, &failure, &source).await;
+                }
 
-                    let _ = tx.send(Ok(SseEncoder::done())).await;
-                });
-            }
+                let _ = tx.send(Ok(SseEncoder::done())).await;
+            }),
             context::ExecutionResult::Embedding { .. } => {
                 error!("Harmony streaming not supported for embeddings");
-                utils::send_error_sse(
-                    &tx,
-                    "Embeddings not supported in Harmony streaming",
-                    "invalid_request_error",
-                )
-                .await;
-                let _ = tx.send(Ok(SseEncoder::done())).await;
+                Box::pin(async move {
+                    utils::send_error_sse(
+                        &tx,
+                        "Embeddings not supported in Harmony streaming",
+                        "invalid_request_error",
+                    )
+                    .await;
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
+                })
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
                 error!("Harmony streaming not supported for batched results");
-                utils::send_error_sse(
-                    &tx,
-                    "Batched results not supported in Harmony streaming",
-                    "invalid_request_error",
-                )
-                .await;
-                let _ = tx.send(Ok(SseEncoder::done())).await;
+                Box::pin(async move {
+                    utils::send_error_sse(
+                        &tx,
+                        "Batched results not supported in Harmony streaming",
+                        "invalid_request_error",
+                    )
+                    .await;
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
+                })
             }
-        }
+        };
 
         // Return SSE response
-        build_sse_response_guarded(rx, guards)
+        build_sse_response_driven(reading, rx, guards)
     }
 
     /// Process streaming chunks from a single stream
