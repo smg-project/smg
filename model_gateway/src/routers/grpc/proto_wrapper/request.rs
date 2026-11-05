@@ -35,6 +35,14 @@ impl ProtoRequest {
             Self::Embed(req) => req.request_id(),
         }
     }
+
+    /// The prompt's token ids from either variant (empty for a text input).
+    pub fn token_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(req) => req.token_ids(),
+            Self::Embed(req) => req.token_ids(),
+        }
+    }
 }
 
 /// Unified GenerateRequest that works with all backends
@@ -421,32 +429,39 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Prompt tokens the engine has to prefill for this request: the
-    /// tokenized input's length (zero for a text input, which the engine
-    /// tokenizes itself).
-    pub fn prompt_len(&self) -> usize {
+    /// The prompt's token ids: the tokenized input's (empty for a text
+    /// input, which the engine tokenizes itself). A retry's re-selection
+    /// routes by them, so the routing snapshot keeps no copy.
+    pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[], |input| input.input_ids.as_slice()),
             Self::Vllm(req) => match &req.input {
-                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(vllm::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::Trtllm(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_token_ids.len()),
+                .map_or(&[], |input| input.input_token_ids.as_slice()),
             Self::Mlx(req) => match &req.input {
-                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(mlx::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::TokenSpeed(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[], |input| input.input_ids.as_slice()),
         }
+    }
+
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        self.token_ids().len()
     }
 
     /// Attach media references for worker-side multimodal processing.

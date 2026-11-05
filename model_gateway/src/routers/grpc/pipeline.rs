@@ -594,7 +594,10 @@ impl RequestPipeline {
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
-            self.stages.worker_selection.reselect(dctx).await?;
+            self.stages
+                .worker_selection
+                .reselect(dctx, plan.as_ref().ok_or_else(consumed)?)
+                .await?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
