@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -132,6 +132,7 @@ impl TrtllmServiceClient {
         multimodal_input: Option<proto::MultimodalInput>,
         constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
 
@@ -528,6 +529,7 @@ impl TrtllmServiceClient {
         original_text: String,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
         let sampling_config = Self::build_sampling_config_from_completion(body);
         let output_config = proto::OutputConfig {
             logprobs: body.logprobs.map(|v| v.min(20) as i32),
@@ -634,6 +636,20 @@ impl TrtllmServiceClient {
     }
 }
 
+/// The engine's wire carries a bias over the whole vocabulary as a dense
+/// vector sized by the engine (`embedding_bias`), not the request's sparse
+/// map, and the gateway does not know that size; a request that carries a
+/// bias is refused rather than served without it.
+fn refuse_logit_bias(bias: Option<&HashMap<String, f32>>) -> Result<(), String> {
+    match bias {
+        Some(bias) if !bias.is_empty() => Err("logit_bias is not supported on this worker: the \
+             engine takes a dense bias over its whole vocabulary, which the gateway does not \
+             build from the request's map"
+            .to_string()),
+        _ => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Proto → protocol type conversions (load metrics)
 // ---------------------------------------------------------------------------
@@ -678,6 +694,57 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request with a `logit_bias` is refused: the wire has no sparse map.
+    /// (The completion builder keeps a receiver, and a lazy channel needs the
+    /// runtime.)
+    #[tokio::test]
+    async fn a_logit_bias_is_refused_on_this_wire() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": {"1": -100}
+        }))
+        .expect("a chat request");
+        let error = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1],
+            None,
+            OutputConstraint::default(),
+        )
+        .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
+        }))
+        .expect("a completion request");
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+        };
+        let error = client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &completion,
+                "hi".to_string(),
+                vec![1],
+            )
+            .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let plain: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "prompt": "hi"}))
+                .expect("a request");
+        assert!(client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &plain,
+                "hi".to_string(),
+                vec![1]
+            )
+            .is_ok());
+    }
     use crate::channel::testing::refused_endpoint;
 
     /// A poll's answer reaches the worker's report rank for rank, the

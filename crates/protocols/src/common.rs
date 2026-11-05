@@ -310,7 +310,8 @@ pub(crate) fn on_field(
 /// Validates `logit_bias` as the public API bounds it: every key a
 /// non-negative integer token id, every bias within -100..=100 (a bias of
 /// -100 bans the token, 100 forces it). Used by the chat and the completion
-/// request; the engines take the map as validated.
+/// request; the serving path bounds the ids by the model's vocabulary before
+/// the map reaches an engine.
 pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
     for (key, bias) in bias {
         if !key.parse::<i32>().is_ok_and(|id| id >= 0) {

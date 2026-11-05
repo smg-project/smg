@@ -19,6 +19,7 @@ use crate::routers::{
             ExecutionPlanKind, PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
+        regular::stages::token_ids,
         spec::{HarmonyResponseSpec, ResponseSpec},
         zmq_client::ZmqDialect,
     },
@@ -145,6 +146,31 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 ));
             }
         };
+
+        // The engine builders lay a chat request's `logit_bias` on the wire,
+        // past the engine front ends that bound its ids, so the ids are judged
+        // here first, as a pretokenized prompt's are.
+        if let HarmonyBody::Chat(request) = &body {
+            match ctx.tokenizer_arc() {
+                Some(tokenizer) => token_ids::validate_logit_bias_token_ids(
+                    request.logit_bias.as_ref(),
+                    tokenizer.as_ref(),
+                    || {
+                        token_ids::reported_embedding_rows(
+                            &ctx.components.worker_registry,
+                            &ctx.input.model_id,
+                        )
+                    },
+                ),
+                None if request.logit_bias.as_ref().is_some_and(|bias| !bias.is_empty()) => Err(
+                    "logit_bias cannot be checked against the model's vocabulary: no tokenizer \
+                     is registered for the model"
+                        .to_string(),
+                ),
+                None => Ok(()),
+            }
+            .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
+        }
 
         let mut proto_request = build_harmony_proto(
             builder_client,

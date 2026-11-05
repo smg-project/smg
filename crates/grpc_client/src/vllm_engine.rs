@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint,
-        stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint, stop_strings,
+        ConstraintKind, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };

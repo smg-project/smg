@@ -1,6 +1,9 @@
-//! The vocabulary bound of a pre-tokenized prompt: an id that can reach no row of the
-//! engine's embedding table is refused at the gateway, on `/generate`'s `input_ids` and on
-//! `/v1/completions`' prompt of ids alike, before any worker is spoken to.
+//! The vocabulary bound of the token ids a request names: an id that can reach no row of the
+//! engine's embedding table is refused at the gateway, on `/generate`'s `input_ids`, on
+//! `/v1/completions`' prompt of ids and on a `logit_bias` map's keys alike, before any worker
+//! is spoken to.
+
+use std::collections::HashMap;
 
 use llm_tokenizer::traits::Tokenizer;
 
@@ -39,8 +42,17 @@ fn known_to(tokenizer: &dyn Tokenizer, base_vocab: usize, id: u32) -> bool {
     usize::try_from(id).is_ok_and(|id| id < base_vocab) || tokenizer.id_to_token(id).is_some()
 }
 
-/// Refuses the first id that can reach no row of the engine's embedding table, naming its
-/// position, its value and the bound it missed.
+/// An id a request named that is not a token of the model: its position among the ids
+/// given, its value, and the bound it missed, worded for a refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnknownTokenId {
+    pub(crate) index: usize,
+    pub(crate) id: u32,
+    pub(crate) bound: String,
+}
+
+/// The first id that can reach no row of the engine's embedding table, with the bound it
+/// missed; `None` when every id is a token of the model.
 ///
 /// An id below the tokenizer's base vocabulary is known by its range alone; one above it is an
 /// added token (the special tokens live there) and is resolved by lookup, so the common id costs
@@ -52,7 +64,43 @@ fn known_to(tokenizer: &dyn Tokenizer, base_vocab: usize, id: u32) -> bool {
 /// table size the model's workers report (`embedding_rows`, read once, only then): below it the
 /// id passes, as it would on the engine. When no worker reports a table the tokenizer's ids are
 /// the bound, the one case where the gateway is stricter than the engine; a tokenizer that
-/// reports no vocabulary either skips the bound rather than refusing every pretokenized prompt.
+/// reports no vocabulary either skips the bound rather than refusing every id.
+pub(crate) fn first_unknown_token_id(
+    tokenizer: &dyn Tokenizer,
+    ids: &[u32],
+    embedding_rows: impl FnOnce() -> Option<usize>,
+) -> Option<UnknownTokenId> {
+    let base_vocab = tokenizer.vocab_size();
+    let known = |id: u32| known_to(tokenizer, base_vocab, id);
+    let first_unknown = if base_vocab == 0 {
+        // Without a vocabulary every id would be a lookup: the table alone judges them.
+        0
+    } else {
+        ids.iter().position(|&id| !known(id))?
+    };
+    match embedding_rows() {
+        Some(rows) => {
+            let inside = |id: u32| usize::try_from(id).is_ok_and(|id| id < rows);
+            let offset = ids[first_unknown..]
+                .iter()
+                .position(|&id| !inside(id) && !known(id))?;
+            Some(UnknownTokenId {
+                index: first_unknown + offset,
+                id: ids[first_unknown + offset],
+                bound: format!("its embedding table holds {rows} rows"),
+            })
+        }
+        None if base_vocab == 0 => None,
+        None => Some(UnknownTokenId {
+            index: first_unknown,
+            id: ids[first_unknown],
+            bound: format!("its vocabulary holds {base_vocab} tokens plus its added tokens"),
+        }),
+    }
+}
+
+/// Refuses the first id of a prompt that can reach no row of the engine's embedding table
+/// ([`first_unknown_token_id`]), naming its position, its value and the bound it missed.
 /// `field` names the request field in the refusal: `input_ids`, `prompt`, or `prompt[b]` for
 /// one list of a batch.
 pub(crate) fn reject_unknown_token_id(
@@ -61,38 +109,32 @@ pub(crate) fn reject_unknown_token_id(
     field: &str,
     embedding_rows: impl FnOnce() -> Option<usize>,
 ) -> Result<(), String> {
-    let base_vocab = tokenizer.vocab_size();
-    let known = |id: u32| known_to(tokenizer, base_vocab, id);
-    let first_unknown = if base_vocab == 0 {
-        // Without a vocabulary every id would be a lookup: the table alone judges them.
-        0
-    } else {
-        match ids.iter().position(|&id| !known(id)) {
-            None => return Ok(()),
-            Some(index) => index,
-        }
+    match first_unknown_token_id(tokenizer, ids, embedding_rows) {
+        None => Ok(()),
+        Some(UnknownTokenId { index, id, bound }) => Err(format!(
+            "{field}[{index}] = {id} is not a token of this model: {bound}"
+        )),
+    }
+}
+
+/// Refuses a `logit_bias` key that is no token of the model, judged as a pretokenized
+/// prompt's ids are ([`first_unknown_token_id`]). Request validation proved the keys
+/// non-negative integers; the engines' own front ends check them against the model, and the
+/// gateway's engine connections bypass those front ends, so an unchecked id would reach the
+/// sampler as an out-of-range index.
+pub(crate) fn validate_logit_bias_token_ids(
+    logit_bias: Option<&HashMap<String, f32>>,
+    tokenizer: &dyn Tokenizer,
+    embedding_rows: impl FnOnce() -> Option<usize>,
+) -> Result<(), String> {
+    let Some(bias) = logit_bias.filter(|bias| !bias.is_empty()) else {
+        return Ok(());
     };
-    match embedding_rows() {
-        Some(rows) => {
-            let inside = |id: u32| usize::try_from(id).is_ok_and(|id| id < rows);
-            match ids[first_unknown..]
-                .iter()
-                .position(|&id| !inside(id) && !known(id))
-            {
-                None => Ok(()),
-                Some(offset) => Err(format!(
-                    "{field}[{}] = {} is not a token of this model: its embedding table holds \
-                     {rows} rows",
-                    first_unknown + offset,
-                    ids[first_unknown + offset]
-                )),
-            }
-        }
-        None if base_vocab == 0 => Ok(()),
-        None => Err(format!(
-            "{field}[{first_unknown}] = {} is not a token of this model: its vocabulary holds \
-             {base_vocab} tokens plus its added tokens",
-            ids[first_unknown]
+    let ids: Vec<u32> = bias.keys().filter_map(|key| key.parse().ok()).collect();
+    match first_unknown_token_id(tokenizer, &ids, embedding_rows) {
+        None => Ok(()),
+        Some(UnknownTokenId { id, bound, .. }) => Err(format!(
+            "Invalid key in 'logit_bias': '{id}' is not a token of this model: {bound}"
         )),
     }
 }
@@ -323,5 +365,40 @@ mod tests {
             error.starts_with(&format!("prompt[1][2] = {unknown} ")),
             "{error}"
         );
+    }
+
+    /// A `logit_bias` key at or beyond the vocabulary is refused before any
+    /// engine wire; the last token id, an empty map and no map pass.
+    #[test]
+    fn logit_bias_keys_are_judged_as_a_pretokenized_prompts_ids_are() {
+        let tokenizer = tokenizer();
+        let base = tokenizer.vocab_size() as u32;
+        let bias = |id: u32| Some(HashMap::from([(id.to_string(), -100.0f32)]));
+        let no_table = || -> Option<usize> { panic!("the table is read only after an unknown id") };
+        // A key inside the base vocabulary, or an added token above it, passes without a table read.
+        assert!(
+            validate_logit_bias_token_ids(bias(base - 1).as_ref(), &tokenizer, no_table).is_ok()
+        );
+        assert!(validate_logit_bias_token_ids(bias(50_000).as_ref(), &tokenizer, no_table).is_ok());
+        // A key the tokenizer does not know is refused when no worker reports a table...
+        let unknown = base + 7;
+        let error =
+            validate_logit_bias_token_ids(bias(unknown).as_ref(), &tokenizer, || None).unwrap_err();
+        assert!(
+            error.starts_with(&format!("Invalid key in 'logit_bias': '{unknown}' ")),
+            "{error}"
+        );
+        assert!(error.contains(&format!("holds {base} tokens")), "{error}");
+        // ...passes inside the table the workers report, and is refused past it naming the table.
+        assert!(
+            validate_logit_bias_token_ids(bias(unknown).as_ref(), &tokenizer, || Some(2_000))
+                .is_ok()
+        );
+        let error = validate_logit_bias_token_ids(bias(2_000).as_ref(), &tokenizer, || Some(2_000))
+            .unwrap_err();
+        assert!(error.contains("embedding table holds 2000 rows"), "{error}");
+        // Nothing to judge without a map.
+        assert!(validate_logit_bias_token_ids(Some(&HashMap::new()), &tokenizer, no_table).is_ok());
+        assert!(validate_logit_bias_token_ids(None, &tokenizer, no_table).is_ok());
     }
 }
