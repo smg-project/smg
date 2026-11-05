@@ -789,14 +789,7 @@ fn a_long_selection_is_described_rather_than_listed() {
 #[tokio::test]
 async fn the_selection_picks_the_same_frames_through_ffmpeg() {
     use std::process::{Command as Sync, Stdio};
-    let have = |tool: &str| {
-        Sync::new(tool)
-            .arg("-version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    };
-    if !have("ffmpeg") {
+    if !crate::test_support::video_tools_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1036,14 +1029,7 @@ fn rotate_first_track(path: &Path) {
 /// `None` where the tools are not installed.
 fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
     use std::process::Command as Sync;
-    let have = |tool: &str| {
-        Sync::new(tool)
-            .arg("-version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    };
-    if !have("ffmpeg") || !have("ffprobe") {
+    if !crate::test_support::video_tools_available() {
         return None;
     }
     let path = dir.join(name);
