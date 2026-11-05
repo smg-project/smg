@@ -207,6 +207,104 @@ async fn submit_streams_tokens_until_finish() {
     assert!(stream.next().await.is_none());
 }
 
+/// The engine's last output as the servicers' deep health probe reads it:
+/// `None` before the first batch, set by any batch (a stats-only step
+/// included), moved forward by the next, and never by a dispatch, which
+/// only restarts the silence counted for a request reported every step.
+#[tokio::test]
+async fn last_output_at_follows_the_engines_batches_and_not_the_dispatches() {
+    let (client, mut engine, _ns) = connect().await;
+    assert_eq!(client.last_output_at(), None, "nothing received yet");
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+    assert_eq!(client.last_output_at(), None, "a dispatch is not an output");
+    assert!(
+        client.output_silence().is_some(),
+        "though the silence of the request it dispatched counts from it"
+    );
+
+    let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        scheduler_stats: Some(SchedulerStats {
+            num_running_reqs: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&stats_only).unwrap())])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let first = loop {
+        if let Some(at) = client.last_output_at() {
+            break at;
+        }
+        assert!(Instant::now() < deadline, "stats never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(first <= Instant::now(), "stamped when it was routed");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "req-1".into(),
+                new_token_ids: vec![11],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().unwrap().finished());
+    let second = client
+        .last_output_at()
+        .expect("the terminal batch is an output too");
+    assert!(
+        second >= first + Duration::from_millis(15),
+        "moved forward by the next batch: {first:?} then {second:?}"
+    );
+    assert_eq!(client.output_silence(), None, "nothing in flight again");
+}
+
+/// On a wire whose outputs-less batches carry a load tail (a stats-only
+/// step report), one without a tail is the engine's bare liveness signal: an
+/// output, stamped as one, and no step report.
+#[tokio::test]
+async fn an_outputs_less_batch_without_a_load_tail_is_an_output_and_no_step_report() {
+    use crate::protocol::sglang::{output::BatchTokenIDSlimOutput, SglangProtocol};
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
+    assert_eq!(client.last_output_at(), None, "nothing received yet");
+    let signal = BatchTokenIDSlimOutput::default();
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&signal).unwrap())])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while client.last_output_at().is_none() {
+        assert!(Instant::now() < deadline, "the signal never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!client.reports_steps(), "no load tail: no step report");
+
+    // The same batch with a load tail is a stats-only step report.
+    let step = BatchTokenIDSlimOutput {
+        num_running: 1,
+        kv_total_tokens: 100,
+        ..BatchTokenIDSlimOutput::default()
+    };
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&step).unwrap())])
+        .await
+        .unwrap();
+    while !client.reports_steps() {
+        assert!(Instant::now() < deadline, "the step never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// The silence the servicer reports for a frozen engine: nothing while
 /// idle, counted from the dispatch, reset by any output batch (a
 /// stats-only step included), gone with the last in-flight request.

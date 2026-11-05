@@ -16,8 +16,8 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack, OpaqueValue},
     mock_engine::{
-        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
-        MOCK_DEADLINE,
+        connect_to_frontend, default_ready_response, hello, MockEngine, MockEngineInput,
+        MockEngineOutput, MOCK_DEADLINE,
     },
     protocol::sglang::{
         output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
@@ -214,6 +214,13 @@ fn batch(
     }
 }
 
+/// The plugin's relay of the scheduler's bare health signal (its answer to
+/// a probe it did not queue, busy with a long prefill): a token batch with
+/// no columns and no load tail.
+fn health_signal() -> BatchTokenIDSlimOutput {
+    BatchTokenIDSlimOutput::default()
+}
+
 async fn send(engine_out: &mut MockEngineOutput, batch: &BatchTokenIDSlimOutput) {
     engine_out
         .send_frames(vec![Bytes::from(encode_msgpack(batch).unwrap())])
@@ -237,6 +244,23 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
         Some(SglangRequestType::Abort)
     );
     decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+/// The mock scheduler's step for the health probe the servicer sends: its
+/// one token, finished, so nothing lingers.
+async fn answer_probe(engine: &mut MockEngine) {
+    let frames = engine.recv_request().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let probe: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+    let step = batch(&probe.rid, vec![7], 1, Some("length"), None);
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&step).unwrap())])
+        .await
+        .unwrap();
 }
 
 fn generate_request(id: &str, stream: bool, stops: Vec<String>) -> sg::GenerateRequest {
@@ -470,7 +494,7 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
     assert!(!before.healthy);
     assert_eq!(before.message, "Engine is starting");
 
-    let _engine = connect_to_frontend(
+    let mut engine = connect_to_frontend(
         &handshake,
         EngineId::from_engine_index(0),
         default_ready_response(),
@@ -482,6 +506,14 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         status(health.check(check.clone()).await.unwrap().into_inner()),
         ServingStatus::Serving as i32
     );
+    // SERVING: the wire's answer is the scheduler's step for the probe.
+    let (probed, ()) = tokio::join!(
+        client.health_check(sg::HealthCheckRequest {}),
+        answer_probe(&mut engine)
+    );
+    let probed = probed.unwrap().into_inner();
+    assert!(probed.healthy);
+    assert_eq!(probed.message, "Health check passed");
     // Readiness held alone (the lifecycle owner's planned warm-up): health
     // answers NOT_SERVING with its own message while admission stays open to
     // the warm-up's own requests only, then the release restores SERVING and
@@ -518,14 +550,11 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         .register("held-probe")
         .expect("the release admits every request");
     drop(admitted);
-    assert!(
-        client
-            .health_check(sg::HealthCheckRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .healthy
+    let (released, ()) = tokio::join!(
+        client.health_check(sg::HealthCheckRequest {}),
+        answer_probe(&mut engine)
     );
+    assert!(released.unwrap().into_inner().healthy);
 
     server.set_serving(false);
     assert_eq!(
@@ -543,6 +572,191 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         "the drain closes admission"
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The deep probe, as the Python servicer sends it: a scheduler that never
+/// steps is unhealthy at the bound (the request on the wire is one token
+/// from `[0]` at temperature zero, not streamed, under a `HEALTH_CHECK_`
+/// id, and it is aborted when the wait ends); a scheduler that steps for
+/// anything while the next probe is out is healthy before it answers the
+/// probe itself.
+#[tokio::test]
+async fn health_probes_the_scheduler_and_reads_any_step_as_alive() {
+    let mut h = harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let started = Instant::now();
+    let (frozen, probe) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(1)),
+        recv_add(engine_in)
+    );
+    assert!(!frozen.healthy);
+    assert_eq!(frozen.message, "Health check timeout after 1s");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+    assert_eq!(probe.input_ids, vec![0]);
+    assert_eq!(probe.sampling_params.max_new_tokens, Some(1));
+    assert!(probe.sampling_params.temperature.abs() < f64::EPSILON);
+    assert!(!probe.stream);
+    // The wait's end dropped the probe's stream: the scheduler is told.
+    assert_eq!(recv_abort(engine_in).await, vec![probe.rid]);
+
+    let (alive, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let second = recv_add(engine_in).await;
+            assert!(second.rid.starts_with("HEALTH_CHECK_"), "{}", second.rid);
+            // A step for some other request, not the probe's own output.
+            send(engine_out, &batch("other", vec![9], 1, Some("stop"), None)).await;
+        }
+    );
+    assert!(alive.healthy, "{}", alive.message);
+    assert_eq!(alive.message, "Health check passed");
+}
+
+/// A model without generation is probed with an embedding request, as the
+/// Python servicer probes it; its one vector is the answer.
+#[tokio::test]
+async fn health_probes_an_embedding_model_with_an_embedding_request() {
+    let mut h = harness(SglangModelInfo {
+        is_generation: false,
+        ..model_info()
+    })
+    .await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (answer, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let frames = engine_in.recv_frames().await.unwrap();
+            assert_eq!(
+                SglangRequestType::from_frame(frames[0].as_ref()),
+                Some(SglangRequestType::Add)
+            );
+            let probe: TokenizedEmbeddingReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+            assert_eq!(probe.input_ids, vec![0]);
+            let vector = BatchEmbeddingSlimOutput {
+                rids: vec![probe.rid],
+                embeddings: vec![vec![0.5]],
+                prompt_tokens: vec![1],
+                cached_tokens: vec![0],
+                finished_reasons: vec!["stop".to_string()],
+                finished_messages: vec![None],
+                finished_status: vec![None],
+                ..Default::default()
+            };
+            engine_out
+                .send_frames(vec![Bytes::from(encode_msgpack(&vector).unwrap())])
+                .await
+                .unwrap();
+        }
+    );
+    assert!(answer.healthy);
+    assert_eq!(answer.message, "Health check passed");
+}
+
+/// A scheduler busy with a long chunked prefill never queues the probe and
+/// answers it with a bare health signal, which the plugin relays as a token
+/// batch with no columns and no load tail: the scheduler spoke since the
+/// probe started, so it is healthy before the bound, and the wire is not
+/// thereby read as one that reports every step (that reading is an
+/// outputs-less batch with a load tail).
+#[tokio::test]
+async fn health_reads_the_schedulers_bare_signal_as_alive_and_not_as_a_step_report() {
+    let mut h = harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (alive, probe) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let probe = recv_add(engine_in).await;
+            send(engine_out, &health_signal()).await;
+            probe
+        }
+    );
+    assert!(alive.healthy, "{}", alive.message);
+    assert_eq!(alive.message, "Health check passed");
+    assert!(
+        !state.shared.engine().expect("engine").reports_steps(),
+        "the signal is no step report"
+    );
+    // The verdict dropped the probe's stream: the scheduler is told.
+    assert_eq!(recv_abort(engine_in).await, vec![probe.rid]);
+}
+
+/// The probe is the servicer's own, not a client's: its one token goes into
+/// neither the request metrics (no request counted by its finish, no prompt
+/// or generation total) nor the load tracker (nothing queued, no
+/// servicer-clock prefill sample on the idle rank it meets, no hit-rate
+/// sample), where a quiet worker probed every interval would otherwise read
+/// as serving a stream of one-token requests.
+#[tokio::test]
+async fn a_health_probe_is_counted_neither_as_a_request_nor_as_load() {
+    let mut h = metrics_harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (answer, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let probe = recv_add(engine_in).await;
+            // Answered after more than the tracker's millisecond of
+            // validity: a counted probe would leave a prefill sample.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            send(
+                engine_out,
+                &batch(&probe.rid, vec![7], 1, Some("length"), None),
+            )
+            .await;
+        }
+    );
+    assert!(answer.healthy, "{}", answer.message);
+    let loads = &state.shared.loads;
+    assert_eq!((loads.pending(), loads.prefill_samples(0)), (0, 0));
+    let estimate = loads.estimate(0, 0);
+    assert_eq!(
+        (estimate.cache_hit_rate, estimate.gen_throughput),
+        (0.0, 0.0),
+        "no hit-rate sample, no generation of the rank's"
+    );
+    let metrics = &state.shared.metrics;
+    assert_eq!(
+        (
+            metrics.prompt_tokens_total(),
+            metrics.generation_tokens_total()
+        ),
+        (0, 0)
+    );
+    let body = scrape(&h.server);
+    for reason in ["stop", "length", "abort", "cut", "error"] {
+        assert_eq!(
+            sample(
+                &body,
+                "smg_servicer_requests_total",
+                &format!("finish_reason=\"{reason}\""),
+            ),
+            0.0,
+            "no request ended as {reason}"
+        );
+    }
+}
+
+/// A disaggregated role is answered healthy without a probe: its requests
+/// pair with a peer, so a lone one would not reach the scheduler.
+#[tokio::test]
+async fn a_disaggregated_role_answers_health_without_a_probe() {
+    let mut h = harness(SglangModelInfo {
+        server_args_json: r#"{"disaggregation_mode":"decode"}"#.to_string(),
+        ..model_info()
+    })
+    .await;
+    let shallow = info::health_check_with(&h.server.state, Duration::from_secs(1)).await;
+    assert!(shallow.healthy);
+    assert_eq!(
+        shallow.message,
+        "Health check passed (disaggregation worker; shallow probe)"
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
 }
 
 /// Readiness held for the lifecycle owner's planned warm-up: a request that
@@ -2685,6 +2899,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
         &h.server.state,
         generate_request("r12", true, Vec::new()),
         None,
+        servicer::RequestOrigin::Client,
     )
     .await
     .expect("generate");
