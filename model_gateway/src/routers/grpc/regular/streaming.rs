@@ -2655,7 +2655,10 @@ struct ChatStream<'a> {
     first_token_time: Option<Instant>,
 
     /// DeepSeek always reports aggregate usage on the final finish chunk;
-    /// `include_usage` controls null placeholders on earlier chunks only.
+    /// the public dialect ends the stream with a usage-only chunk when
+    /// `include_usage` asks for one. Under `include_usage` every chunk that
+    /// carries no usage writes the `usage: null` placeholder, as the public
+    /// API does (`emit_usage_null`).
     deepseek_usage: bool,
     include_usage: bool,
     emit_usage_null: bool,
@@ -2773,7 +2776,7 @@ impl<'a> ChatStream<'a> {
             .stream_options
             .as_ref()
             .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-        let emit_usage_null = deepseek_usage && include_usage;
+        let emit_usage_null = include_usage;
         let mut continuous_usage = spec
             .stream_options
             .as_ref()
