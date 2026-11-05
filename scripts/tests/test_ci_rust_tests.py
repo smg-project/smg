@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -282,6 +283,58 @@ class ShardTableTests(unittest.TestCase):
     def test_check_mode_accepts_the_table(self):
         out = script("check")
         self.assertIn(": OK", out.strip().splitlines()[-1])
+
+
+class RunModeTests(unittest.TestCase):
+    """`run <shard>` runs every invocation of the shard and fails at the end if any did."""
+
+    def run_tokenizer(
+        self, failing_calls: set[int]
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """The tokenizer shard (two invocations, no metadata read) under a cargo stub on PATH that
+        records each call's arguments and exits 101 on the calls numbered in ``failing_calls``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs = Path(tmp) / "bin"
+            stubs.mkdir()
+            calls = Path(tmp) / "calls"
+            calls.write_text("")
+            stub = stubs / "cargo"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >> "$CARGO_STUB_CALLS"\n'
+                'n=$(wc -l < "$CARGO_STUB_CALLS")\n'
+                'case " $CARGO_STUB_FAIL " in *" $n "*) exit 101 ;; esac\n'
+                "exit 0\n"
+            )
+            stub.chmod(0o755)
+            done = subprocess.run(
+                ["bash", str(SCRIPT), "run", "tokenizer"],
+                capture_output=True,
+                text=True,
+                cwd=REPO,
+                env={
+                    "PATH": f"{stubs}:/usr/bin:/bin",
+                    "CARGO_STUB_CALLS": str(calls),
+                    "CARGO_STUB_FAIL": " ".join(str(n) for n in sorted(failing_calls)),
+                },
+            )
+            return done, calls.read_text().splitlines()
+
+    def test_a_red_invocation_does_not_stop_the_ones_after_it_and_the_shard_still_fails(self):
+        done, calls = self.run_tokenizer(failing_calls={1})
+        self.assertEqual(
+            calls,
+            [
+                "test --no-fail-fast -p llm-tokenizer",
+                "test --no-fail-fast -p llm-tokenizer --features tokenizers-v1",
+            ],
+        )
+        self.assertEqual(done.returncode, 101, done.stderr)
+
+    def test_a_shard_whose_invocations_all_pass_exits_0(self):
+        done, calls = self.run_tokenizer(failing_calls=set())
+        self.assertEqual(len(calls), 2, done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
 
 
 if __name__ == "__main__":
