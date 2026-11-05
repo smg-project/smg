@@ -64,9 +64,6 @@ const DEFAULT_VIDEO_FPS: f64 = 2.0;
 /// The reference video processor class's stamp (`frame_timestamp_format`);
 /// the released checkpoints write two decimals.
 const DEFAULT_FRAME_TIMESTAMP_FORMAT: &str = "Time: {timestamp:.1f}s";
-/// Images per request; raise or lower deployment-wide with
-/// `SMG_IMAGE_MAX_COUNT`. The context length is the practical bound.
-const MAX_IMAGES_PER_REQUEST: usize = 10;
 /// Videos per request (`SMG_VIDEO_MAX_COUNT`).
 const MAX_VIDEOS_PER_REQUEST: usize = 1;
 /// Audio clips per request (`SMG_AUDIO_MAX_COUNT`).
@@ -456,13 +453,22 @@ impl ModelProcessorSpec for MuseSparkSpec {
         self.placeholder_token_id_for(metadata, Modality::Image)
     }
 
+    /// The family sets no per-request image count of its own: its reference
+    /// serving stack has no per-request media count, the checkpoint's
+    /// processor config bounds an image's tokens, not the number of images,
+    /// and the context length is the practical bound. Images stay declared
+    /// (an undeclared modality is refused as unsupported) without a bound of
+    /// the spec's, so the effective limit is the engine's advertised one,
+    /// else the deployment's `--mm-per-request-image-limit` /
+    /// `SMG_IMAGE_MAX_COUNT`. The video and audio counts keep the spec's
+    /// declared defaults.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         let mut limits = HashMap::new();
         if metadata.config_u32(&["image_token_id"]).is_some() {
-            limits.insert(Modality::Image, MAX_IMAGES_PER_REQUEST);
+            limits.insert(Modality::Image, usize::MAX);
         }
         if metadata.config_u32(&["video_token_id"]).is_some() {
             limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
@@ -751,6 +757,47 @@ mod tests {
         assert_eq!(spec.encoder_input_key_for(Modality::Image), None);
     }
 
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten it carried
+    /// was the registry's default for other families, never a count of the
+    /// family's), so a deployment knob is the only router-side bound and a
+    /// text-and-image checkpoint keeps video unsupported.
+    #[test]
+    fn muse_spark_declares_images_without_a_count_of_its_own() {
+        let tokenizer = tokenizer();
+        let text_and_image = json!({"model_type": "muse_spark", "image_token_id": PATCH_ID});
+        let metadata = metadata(&tokenizer, &text_and_image);
+        let spec = MuseSparkSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "muse_spark",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Video, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Video,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn limits_follow_the_config_tokens() {
         let tokenizer = tokenizer();
@@ -758,7 +805,7 @@ mod tests {
         let limits = MuseSparkSpec
             .modality_limits(&metadata(&tokenizer, &config))
             .unwrap();
-        assert_eq!(limits.get(&Modality::Image), Some(&MAX_IMAGES_PER_REQUEST));
+        assert_eq!(limits.get(&Modality::Image), Some(&usize::MAX));
         assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
         let text_and_image = json!({"model_type": "muse_spark", "image_token_id": PATCH_ID});
         let limits = MuseSparkSpec
