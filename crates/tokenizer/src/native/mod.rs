@@ -98,19 +98,28 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// `encode_volume` shows both, and that the cost of text no pass has seen
 /// does not depend on how much a thread encoded before); a first sight of a
 /// vocabulary word costs a read of the encoder's seed, of another piece the
-/// model's merges.
-const PIECE_CACHE_CAPACITY: usize = 16_384;
+/// model's merges. The bound holds the distinct pieces of a document of
+/// several hundred thousand tokens, so a long document, and a batch of many
+/// prompts, warm on a second pass as a short prompt does (at 16,384 a text
+/// of 32k tokens cleared the cache on every pass, and documents of 128k and
+/// 500k tokens encoded as slowly warm as cold: measured). Memory: a thread's
+/// table grows with use (see `short_pieces`), so a thread that encodes
+/// little holds a few KB; at the full bound it has 524,288 slots of 33
+/// bytes, 16.5 MiB (measured on one thread after a corpus of 7,015 prompts:
+/// 6 to 14 MB more than at the old bound).
+const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
 /// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
 /// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
-/// the slots for its cap (33 bytes a slot: 1 MiB at the full cap), and is
-/// made anew for a smaller cap when it is cleared, so a thread that encodes
-/// little holds little and the packed tables of one tokenizer stay under
-/// about 24 MiB however many runtime and blocking threads encode with it
-/// (the maps of the longer pieces share the count); they are freed with the
-/// encoder.
-const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
+/// the slots for its cap, and is made anew for a smaller cap when it is
+/// cleared, so a thread that encodes little holds little and the packed
+/// tables of one tokenizer stay under 352 MiB however many runtime and
+/// blocking threads encode with it (sixteen threads at the full bound hold
+/// 264 MiB; more threads share the total, each table rounded up to a power
+/// of two slots, at most eight thirds of the total in slots; the maps of
+/// the longer pieces share the count); they are freed with the encoder.
+const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
 /// `LONG_PIECE_BYTES_TOTAL`.

@@ -34,6 +34,9 @@ pub(super) struct Class {
     ranges: Vec<(u32, u32)>,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
+    /// Membership of U+0000..=U+FFFF, resolved once (empty until
+    /// [`Class::finish`]).
+    plane: PlaneSet,
 }
 
 /// A set of ASCII characters as a membership table, one entry per code
@@ -76,6 +79,58 @@ impl AsciiSet {
             *mine |= theirs;
         }
         self
+    }
+}
+
+/// Words of a [`PlaneSet`]: one bit per code point of the Basic
+/// Multilingual Plane.
+const PLANE_WORDS: usize = 0x1_0000 / 64;
+
+/// A set of characters of the Basic Multilingual Plane as a bitmap, 8 KiB.
+/// A class test on a character beyond ASCII was a binary search over the
+/// range table of each of the class's categories, once per character per
+/// class test (measured: half of a warm encode of prose with a sixth of its
+/// bytes outside ASCII); a bit test is one load. The planes above keep the
+/// tables: rare in prompts, and a bit per code point of them would be 136
+/// KiB per class.
+#[derive(Clone)]
+struct PlaneSet(Box<[u64; PLANE_WORDS]>);
+
+impl Default for PlaneSet {
+    fn default() -> Self {
+        Self(Box::new([0; PLANE_WORDS]))
+    }
+}
+
+impl std::fmt::Debug for PlaneSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members: u32 = self.0.iter().map(|word| word.count_ones()).sum();
+        f.debug_tuple("PlaneSet").field(&members).finish()
+    }
+}
+
+impl PlaneSet {
+    /// Membership of `code`, which the caller has checked is below U+10000.
+    #[inline]
+    fn contains(&self, code: u32) -> bool {
+        debug_assert!(code < 0x1_0000);
+        (self.0[(code >> 6) as usize & (PLANE_WORDS - 1)] >> (code & 63)) & 1 != 0
+    }
+
+    /// Inserts every code point of `ranges` that is in the plane.
+    fn insert_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] |= 1 << (code & 63);
+            }
+        }
+    }
+
+    /// The complement within the plane.
+    fn negate(&mut self) {
+        for word in self.0.iter_mut() {
+            *word = !*word;
+        }
     }
 }
 
@@ -126,7 +181,25 @@ impl Class {
             }
         }
         self.ascii = ascii;
+        self.plane = self.plane_set();
         self
+    }
+
+    /// The members of the class in the Basic Multilingual Plane: the class's
+    /// own ranges and the tables of its categories, the complement for a
+    /// negated class (the `hit != negated` of [`Class::contains_slow`]).
+    fn plane_set(&self) -> PlaneSet {
+        let mut plane = PlaneSet::default();
+        plane.insert_ranges(&self.ranges);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                plane.insert_ranges(table);
+            }
+        }
+        if self.negated {
+            plane.negate();
+        }
+        plane
     }
 
     fn contains_slow(&self, code: u32) -> bool {
@@ -144,6 +217,8 @@ impl Class {
         let code = u32::from(c);
         if code < 128 {
             self.ascii.contains(code)
+        } else if code < 0x1_0000 {
+            self.plane.contains(code)
         } else {
             self.contains_slow(code)
         }
@@ -1988,5 +2063,69 @@ mod tests {
         worker
             .join()
             .expect("the matcher must not overflow a small stack");
+    }
+
+    /// The plane bitmap of a class answers as its range and category tables
+    /// do: every category table over the whole plane, a negated class with
+    /// ranges and categories over the whole plane, and every class of every
+    /// pattern over a stride of the plane, the pool and the planes above.
+    #[test]
+    fn the_plane_bitmap_agrees_with_the_tables() {
+        let plane = || (0u32..0x1_0000).filter_map(char::from_u32);
+        for &(bit, table) in &CATEGORY_TABLES {
+            let class = Class {
+                categories: bit,
+                ..Class::default()
+            }
+            .finish();
+            for c in plane() {
+                let code = u32::from(c);
+                assert_eq!(
+                    class.contains(c),
+                    in_ranges(table, code),
+                    "category {bit:#x} at U+{code:04X}"
+                );
+            }
+        }
+        let negated = Class {
+            negated: true,
+            categories: CAT_LETTER | CAT_MARK,
+            ranges: vec![(0x80, 0x9F), (0x3000, 0x303F), (0x1F600, 0x1F64F)],
+            ..Class::default()
+        }
+        .finish();
+        for c in plane() {
+            let code = u32::from(c);
+            assert_eq!(
+                negated.contains(c),
+                negated.contains_slow(code),
+                "the negated class at U+{code:04X}"
+            );
+        }
+        let beyond = [
+            '\u{1F600}',
+            '\u{1F3FD}',
+            '\u{20000}',
+            '\u{E0001}',
+            '\u{10FFFF}',
+        ];
+        for pattern in PATTERNS {
+            let parsed = Pattern::parse(pattern).expect("the pattern parses");
+            for (i, class) in parsed.classes().iter().enumerate() {
+                let sample = (0u32..0x1_0000)
+                    .step_by(7)
+                    .filter_map(char::from_u32)
+                    .chain(POOL.iter().copied())
+                    .chain(beyond);
+                for c in sample {
+                    let code = u32::from(c);
+                    assert_eq!(
+                        class.contains(c),
+                        class.contains_slow(code),
+                        "{pattern}: class {i} at U+{code:04X}"
+                    );
+                }
+            }
+        }
     }
 }
