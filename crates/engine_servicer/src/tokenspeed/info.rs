@@ -116,6 +116,21 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 /// wire's load tail does not carry, each rank's own.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
+    if state.encode_role.is_some() {
+        // An encode worker has no scheduler: its engine runs the vision
+        // tower alone, with no running batch, no waiting queue and no KV
+        // cache, and its encode path feeds no load figure. The answer is
+        // the Python servicer's: no rank, an empty aggregate; the load
+        // record the relay and the records-only stream read from here is
+        // then none, so nothing is pushed for the role either.
+        return Ok(ts::GetLoadsResponse {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            version: "tokenspeed".to_string(),
+            dp_rank_count: 0,
+            loads: Vec::new(),
+            aggregate: Some(ts::AggregateMetrics::default()),
+        });
+    }
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let max_running_requests = state
         .shared
