@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use rand::RngExt;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{draw_eligible, get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// Random selection policy
 ///
-/// Selects workers randomly with uniform distribution among healthy workers.
+/// Selects workers randomly with uniform distribution among healthy workers:
+/// a pick draws by rejection over the pool (`draw_eligible`), reading the
+/// eligibility of the drawn workers alone and allocating nothing; a pool
+/// mostly vetoed is walked once instead.
 #[derive(Debug, Default)]
 pub struct RandomPolicy;
 
@@ -21,16 +24,12 @@ impl RandomPolicy {
 
 impl LoadBalancingPolicy for RandomPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers, info);
-
-        if healthy_indices.is_empty() {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let random_idx = rng.random_range(0..healthy_indices.len());
-
-        Some(healthy_indices[random_idx])
+        draw_eligible(workers, info, None).or_else(|| {
+            // The draw gave up: few eligible workers, or none. Walk the pool once.
+            let healthy_indices = get_healthy_worker_indices(workers, info);
+            (!healthy_indices.is_empty())
+                .then(|| healthy_indices[rand::rng().random_range(0..healthy_indices.len())])
+        })
     }
 
     fn name(&self) -> &'static str {

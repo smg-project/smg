@@ -5,6 +5,8 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use rand::RngExt as _;
+
 use crate::{
     config::CacheIndexKind,
     worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
@@ -315,14 +317,9 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter routable workers and return their indices.
-///
-/// [`Worker::is_available`] folds the absolute overload veto into the health +
-/// circuit-breaker test it already performed, under the same guards and with
-/// the same short-circuit order — the veto is one more test on a word already
-/// in hand, never a second walk. A selection whose caller lifted that veto
-/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
-/// ([`RoutingState::eligible_ignoring_overload`]).
+/// Helper function to filter routable workers and return their indices: one
+/// [`SelectWorkerInfo::admits`] read per worker of the pool and one list, for the
+/// policies that need the whole eligible set (a rotation, an argmin).
 pub(crate) fn get_healthy_worker_indices(
     workers: &[Arc<dyn Worker>],
     info: &SelectWorkerInfo,
@@ -330,15 +327,41 @@ pub(crate) fn get_healthy_worker_indices(
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| {
-            if info.overload_lifted {
-                w.routing_state().eligible_ignoring_overload()
-            } else {
-                w.is_available()
-            }
-        })
+        .filter(|(_, w)| info.admits(w.routing_state()))
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Draws a sampled pick makes before it gives the draw up and walks the pool
+/// instead. The second draw of a pair also rejects the first's index, so the
+/// odds depend on the pool: a large pool half eligible fails a draw of two
+/// about once in 30,000 picks, a pool of four with two eligible about once in
+/// a hundred; a pool mostly vetoed walks, at the price of one list. The walk
+/// is uniform too, so the pick's distribution does not depend on which path
+/// made it.
+const ELIGIBLE_DRAWS: u32 = 16;
+
+/// One index drawn uniformly over the workers `info` admits, other than
+/// `taken`, by rejection over the whole slice: an index drawn uniformly from
+/// `0..workers.len()` is kept when its worker is eligible, so a kept draw is
+/// uniform over the eligible workers without listing them, and the pick reads
+/// the eligibility of the drawn workers alone. `None` after `ELIGIBLE_DRAWS`
+/// rejections, which a pool with too few eligible workers for the pick
+/// always reaches: the caller walks the pool then. A pool too small to hold
+/// the pick (empty, or one worker when one is taken) answers without drawing.
+pub(crate) fn draw_eligible(
+    workers: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
+    taken: Option<usize>,
+) -> Option<usize> {
+    if workers.len() <= usize::from(taken.is_some()) {
+        return None;
+    }
+    let mut rng = rand::rng();
+    (0..ELIGIBLE_DRAWS).find_map(|_| {
+        let idx = rng.random_range(0..workers.len());
+        (taken != Some(idx) && info.admits(workers[idx].routing_state())).then_some(idx)
+    })
 }
 
 /// Helper function to normalize model_id to a key for policy lookups.
@@ -693,5 +716,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Four workers, the second not ready: the draw never returns it, never
+    /// the taken index, and returns every other worker over enough draws. A
+    /// draw may give up (sixteen rejections at one chance in two: once in
+    /// 65,536 calls), which is the function's contract, not a failure here.
+    #[test]
+    fn the_draw_skips_the_vetoed_workers_and_the_taken_index() {
+        let workers = test_support::make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        workers[1].set_status(WorkerStatus::NotReady);
+        let info = SelectWorkerInfo::default();
+        let mut seen = [0usize; 4];
+        for _ in 0..2_000 {
+            let Some(idx) = draw_eligible(&workers, &info, Some(3)) else {
+                continue;
+            };
+            seen[idx] += 1;
+        }
+        assert_eq!(seen[1], 0, "a not-ready worker was drawn: {seen:?}");
+        assert_eq!(seen[3], 0, "the taken index was drawn: {seen:?}");
+        assert!(
+            seen[0] > 700 && seen[2] > 700,
+            "the two eligible workers share the draws evenly: {seen:?}"
+        );
+    }
+
+    /// A pool without two eligible workers ends the draw with nothing: the
+    /// caller walks it. An empty pool the same, without drawing.
+    #[test]
+    fn the_draw_gives_up_on_a_pool_without_an_eligible_worker_to_draw() {
+        let workers = test_support::make_workers(&["http://w1:8000"]);
+        let info = SelectWorkerInfo::default();
+        assert_eq!(draw_eligible(&workers, &info, None), Some(0));
+        assert_eq!(draw_eligible(&workers, &info, Some(0)), None);
+        workers[0].set_status(WorkerStatus::NotReady);
+        assert_eq!(draw_eligible(&workers, &info, None), None);
+        assert_eq!(draw_eligible(&[], &info, None), None);
     }
 }

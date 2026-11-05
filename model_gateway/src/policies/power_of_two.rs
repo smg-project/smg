@@ -1,10 +1,13 @@
 //! Power-of-two choices load balancing policy
 
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use rand::RngExt;
 
-use super::{get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    draw_eligible, get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy,
+    SelectWorkerInfo,
+};
 use crate::{
     config::PowerOfTwoLoadMetric,
     worker::{load_state::LoadReceiver, Worker},
@@ -14,8 +17,14 @@ use crate::{
 /// and route to the one with the lower expected wait, scored exactly like
 /// [`LeastLoadPolicy`] — `(queued_tokens + in-flight credit) / throughput`
 /// plus the convex KV-pressure barrier. Least-load restricted to a random
-/// pair: near-least-load quality at O(1) load reads per pick, without the
-/// full-fleet scan.
+/// pair: near-least-load quality at a cost that does not grow with the pool.
+///
+/// A pick draws its pair by rejection over the pool (`draw_eligible`): the
+/// eligibility of the drawn workers alone is read, the pair's two loads are
+/// scored, and nothing is allocated. A pool too thin for the draw (fewer
+/// than two eligible workers, or most of them vetoed) is walked once instead,
+/// which lists the eligible workers. The `LeastRequests` metric reads every
+/// eligible worker's in-flight count by definition, so it walks every pick.
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Expected-wait scorer shared with least-load: the load feed, the
@@ -37,6 +46,16 @@ impl PowerOfTwoPolicy {
     }
 }
 
+/// The pair members with the fewest router in-flight requests: one of them,
+/// or both when they tie. Each count is read once.
+fn fewest_of_pair<'a>(workers: &[Arc<dyn Worker>], pair: &'a [usize; 2]) -> &'a [usize] {
+    match workers[pair[0]].load().cmp(&workers[pair[1]].load()) {
+        Ordering::Less => &pair[..1],
+        Ordering::Greater => &pair[1..],
+        Ordering::Equal => &pair[..],
+    }
+}
+
 /// The candidates with the fewest router in-flight requests. Each count is read
 /// once, so concurrent dispatches cannot empty the result.
 fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<usize> {
@@ -52,37 +71,51 @@ fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<us
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers, info);
-
-        if healthy.is_empty() {
-            return None;
-        }
-        if healthy.len() == 1 {
-            return Some(healthy[0]);
-        }
-
         if self.load_metric == PowerOfTwoLoadMetric::LeastRequests {
-            let fewest = fewest_in_flight(workers, &healthy);
-            return self
-                .scorer
-                .select_min_expected_wait(workers, &fewest, info, self.name());
+            let healthy = get_healthy_worker_indices(workers, info);
+            return match healthy.as_slice() {
+                [] => None,
+                [only] => Some(*only),
+                _ => {
+                    let fewest = fewest_in_flight(workers, &healthy);
+                    self.scorer
+                        .select_min_expected_wait(workers, &fewest, info, self.name())
+                }
+            };
         }
 
-        // Select two distinct workers - use offset to guarantee different
-        // selection in O(1).
-        let mut rng = rand::rng();
-        let idx1 = rng.random_range(0..healthy.len());
-        let idx2 = (idx1 + 1 + rng.random_range(0..healthy.len() - 1)) % healthy.len();
-        let pair = [healthy[idx1], healthy[idx2]];
+        let drawn = draw_eligible(workers, info, None).and_then(|first| {
+            draw_eligible(workers, info, Some(first)).map(|second| [first, second])
+        });
+        let pair = match drawn {
+            Some(pair) => pair,
+            // The draw gave up: fewer than two eligible workers, or most of
+            // the pool vetoed. Walk it once; a lone eligible worker is the
+            // pick, and the pair comes from the list with an offset that
+            // keeps the two apart.
+            None => {
+                let healthy = get_healthy_worker_indices(workers, info);
+                match healthy.as_slice() {
+                    [] => return None,
+                    [only] => return Some(*only),
+                    _ => {
+                        let mut rng = rand::rng();
+                        let idx1 = rng.random_range(0..healthy.len());
+                        let idx2 =
+                            (idx1 + 1 + rng.random_range(0..healthy.len() - 1)) % healthy.len();
+                        [healthy[idx1], healthy[idx2]]
+                    }
+                }
+            }
+        };
 
-        if self.load_metric == PowerOfTwoLoadMetric::Requests {
-            let fewest = fewest_in_flight(workers, &pair);
-            return self
-                .scorer
-                .select_min_expected_wait(workers, &fewest, info, self.name());
-        }
+        let candidates: &[usize] = if self.load_metric == PowerOfTwoLoadMetric::Requests {
+            fewest_of_pair(workers, &pair)
+        } else {
+            &pair
+        };
         self.scorer
-            .select_min_expected_wait(workers, &pair, info, self.name())
+            .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
     fn name(&self) -> &'static str {
