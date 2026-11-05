@@ -230,6 +230,7 @@ def test_an_unanswered_memory_query_fails_the_guard(guard: Guard) -> None:
 def test_deadline_crossing_after_print_requires_a_new_memory_read(
     guard: Guard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Re-read after crossing the deadline and report the terminal sample time."""
     guard.busy()
     guard.listed_app(0, 4242)
     guard.listed_app(1, 4243)
@@ -248,6 +249,12 @@ echo() {
             if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_CLOCK_ADVANCED" -eq 0 ]; then
                 SMG_TEST_CLOCK_ADVANCED=1
                 SECONDS=1
+            fi
+            ;;
+        "gpu guard: 1s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_CLOCK_ADVANCED" -eq 1 ]; then
+                SMG_TEST_CLOCK_ADVANCED=2
+                SECONDS=2
             fi
             ;;
     esac
@@ -279,6 +286,79 @@ echo() {
     )
     (error,) = error_lines(result.stdout)
     assert error.startswith(f"::error::GPU not clean on node '{NODE}' after ")
+    verdict_time = re.search(r" after (\d+)s,", error)
+    assert verdict_time is not None, error
+    assert int(verdict_time.group(1)) == int(readings[-1][0]), result.stdout
+    assert error.endswith(
+        ", held by a process outside this job's view (another pid namespace: "
+        "a previous job's engine still exiting, or a leaked context):"
+    )
+    lines = result.stdout.splitlines()
+    assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
+
+
+def test_poll_sleep_is_capped_by_the_remaining_window(
+    guard: Guard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cap a polling sleep after processing has consumed part of the window."""
+    guard.busy()
+    guard.listed_app(0, 4242)
+    guard.listed_app(1, 4243)
+    guard.container("0123abcd bench:latest bench-1 up 3 hours")
+    startup_sleeps = tmp_path / "startup-sleeps"
+    poll_sleeps = tmp_path / "poll-sleeps"
+    hook = tmp_path / "guard-capped-sleep-clock.sh"
+    hook.write_text(
+        """unset SECONDS
+SECONDS=0
+SMG_TEST_READING_SEEN=0
+sleep() {
+    if [ "$SMG_TEST_READING_SEEN" -eq 0 ]; then
+        builtin printf '%s\\n' "$*" >> "$SMG_TEST_STARTUP_SLEEP_LOG"
+    else
+        builtin printf '%s\\n' "$*" >> "$SMG_TEST_POLL_SLEEP_LOG"
+        SECONDS=3
+    fi
+}
+echo() {
+    builtin echo "$@"
+    local smg_echo_status=$?
+    case "${1-}" in
+        "gpu guard: 0s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_READING_SEEN" -eq 0 ]; then
+                SMG_TEST_READING_SEEN=1
+                SECONDS=1
+            fi
+            ;;
+    esac
+    return "$smg_echo_status"
+}
+"""
+    )
+    # The startup grace is recorded separately; only a sleep after a reading polls.
+    monkeypatch.setenv("SMG_TEST_STARTUP_SLEEP_LOG", str(startup_sleeps))
+    monkeypatch.setenv("SMG_TEST_POLL_SLEEP_LOG", str(poll_sleeps))
+    monkeypatch.setenv("BASH_ENV", str(hook))
+    result = guard.run(wait=3, poll=5)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert startup_sleeps.read_text().splitlines() == ["2"]
+    assert poll_sleeps.read_text().splitlines() == ["2"]
+    readings = READING.findall(result.stdout)
+    assert [int(second) for second, _ in readings] == [0, 3], result.stdout
+    calls = (guard.state / "calls").read_text()
+    assert calls.count("--query-gpu=index,memory.used") == 2, calls
+    assert result.stdout.count(REPORT_HEADER) == 2, result.stdout
+    for card, pid in ((0, 4242), (1, 4243)):
+        assert (
+            f"gpu guard: GPU {card}: pid {pid} (/usr/bin/python3) holds 80327 MiB; "
+            "not in this job's pid namespace" in result.stdout
+        )
+    assert (
+        "gpu guard: containers of this runner's docker: 0123abcd bench:latest bench-1 up 3 hours"
+        in result.stdout
+    )
+    (error,) = error_lines(result.stdout)
+    assert error.startswith(f"::error::GPU not clean on node '{NODE}' after 3s, ")
     assert error.endswith(
         ", held by a process outside this job's view (another pid namespace: "
         "a previous job's engine still exiting, or a leaked context):"
