@@ -13,6 +13,7 @@ exits, and the options in effect are their ``opt`` section.
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -25,7 +26,6 @@ SERVER_MALLOC_CONF = (
     '"dirty_decay_ms":10000',
     '"muzzy_decay_ms":0',
     '"narenas":16',
-    '"oversize_threshold":33554432',
 )
 
 
@@ -46,11 +46,21 @@ def jemalloc_options(malloc_conf: str) -> str:
     return stats[start : stats.index("}", start)]
 
 
+def option_number(options: str, name: str) -> int:
+    """A numeric option's value in the ``opt`` section, whole: a substring
+    check would also accept a longer number with the same leading digits."""
+    match = re.search(rf'"{name}":(\d+)', options)
+    assert match, f"{name} not in the options: {options}"
+    return int(match.group(1))
+
+
 @pytest.mark.unit
 def test_extension_applies_the_server_malloc_conf():
     options = jemalloc_options("stats_print:true,stats_print_opts:J")
     for expected in SERVER_MALLOC_CONF:
         assert expected in options, f"{expected} not in effect: {options}"
+    threshold = option_number(options, "oversize_threshold")
+    assert threshold == 32 << 20, f"oversize_threshold not in effect: {options}"
 
 
 @pytest.mark.unit

@@ -34,6 +34,18 @@ fn opt_section(stats: &str) -> Option<&str> {
     Some(&stats[start..end])
 }
 
+/// A numeric option's value in the `"opt"` object, whole: a substring check
+/// would also accept a longer number with the same leading digits.
+fn option_number(opt: &str, name: &str) -> Option<u64> {
+    let key = format!("\"{name}\":");
+    let start = opt.find(&key)? + key.len();
+    let digits: String = opt[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 #[test]
 fn smg_binary_uses_global_jemalloc() {
     let stats = jemalloc_stats("stats_print:true,stats_print_opts:J")
@@ -68,13 +80,17 @@ fn smg_binary_applies_the_server_malloc_conf() {
         "\"dirty_decay_ms\":10000",
         "\"muzzy_decay_ms\":0",
         "\"narenas\":16",
-        "\"oversize_threshold\":33554432",
     ] {
         assert!(
             opt.contains(expected),
             "jemalloc did not take the executable's malloc_conf ({expected} missing): {opt}"
         );
     }
+    assert_eq!(
+        option_number(opt, "oversize_threshold"),
+        Some(32 << 20),
+        "jemalloc did not take the executable's oversize_threshold: {opt}"
+    );
 }
 
 #[test]
