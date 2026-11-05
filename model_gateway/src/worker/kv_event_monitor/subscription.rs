@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
-    KvBlockSize, KvEventMonitor,
+    KvBlockSize, KvEventMonitor, SubscriptionKind,
 };
 use crate::{
     observability::metrics::Metrics,
@@ -180,14 +180,35 @@ impl Backoff {
     }
 }
 
+/// What a worker's stream feeds: the model's index (its KV events, with the
+/// load records that ride them), or the worker monitor alone (its load
+/// records, asked for with `loads_only`; a servicer that predates the field
+/// streams its events too, which are dropped).
+#[derive(Clone, Copy)]
+enum Role<'a> {
+    Index {
+        worker_id: u32,
+        indexer: &'a KvIndex,
+        block_sizes: &'a DashMap<String, KvBlockSize>,
+    },
+    Loads,
+}
+
+impl Role<'_> {
+    fn kind(self) -> SubscriptionKind {
+        match self {
+            Self::Index { .. } => SubscriptionKind::Events,
+            Self::Loads => SubscriptionKind::Loads,
+        }
+    }
+}
+
 /// What one worker's subscription task holds for its whole life, borrowed by
-/// every round: the worker, its index handles and its contact source.
+/// every round: the worker, what its stream feeds and its contact source.
 struct WorkerSubscription<'a> {
     worker: &'a Arc<dyn Worker>,
     worker_url: &'a str,
-    worker_id: u32,
-    indexer: &'a KvIndex,
-    block_sizes: &'a DashMap<String, KvBlockSize>,
+    role: Role<'a>,
     model_id: &'a str,
     load_sink: Option<&'a Weak<WorkerMonitor>>,
     wake: Option<&'a Arc<tokio::sync::Notify>>,
@@ -213,8 +234,9 @@ async fn sleep_or_shutdown(
     }
 }
 
-/// Subscribe to the worker's KV events from `start_seq`, with `deadline` on
-/// the server's answer. A live server answers a subscription with headers
+/// Subscribe to the worker's KV events from `start_seq` (`Events`), or to
+/// its load records alone (`Loads`), with `deadline` on the server's answer.
+/// A live server answers a subscription with headers
 /// at once; one that does not within the deadline is unreachable (a
 /// half-open connection behind a partition), and must not hang the loop. A
 /// contact with the worker on another path (a poll, a probe) while the call
@@ -224,15 +246,19 @@ async fn sleep_or_shutdown(
 async fn subscribe_with_deadline(
     backend_client: &BackendClient,
     start_seq: u64,
+    kind: SubscriptionKind,
     wake: Option<&Arc<tokio::sync::Notify>>,
     shutdown_rx: &mut oneshot::Receiver<()>,
     deadline: Duration,
 ) -> Subscribed {
+    let call = async {
+        match kind {
+            SubscriptionKind::Events => backend_client.subscribe_kv_events(start_seq).await,
+            SubscriptionKind::Loads => backend_client.subscribe_load_records().await,
+        }
+    };
     tokio::select! {
-        attempt = tokio::time::timeout(
-            deadline,
-            backend_client.subscribe_kv_events(start_seq),
-        ) => match attempt {
+        attempt = tokio::time::timeout(deadline, call) => match attempt {
             Ok(Ok(stream)) => Subscribed::Stream(stream),
             Ok(Err(status)) => Subscribed::Refused(status),
             Err(_) => Subscribed::Refused(tonic::Status::unavailable(format!(
@@ -346,33 +372,46 @@ impl KvEventMonitor {
 
     /// Main subscription loop for a single worker.
     ///
-    /// Owns the worker's index state and takes its blocks out of the index on
-    /// exit. Exits when `shutdown_rx` fires or the backend returns
-    /// `Unimplemented`. Each round ([`Self::subscription_round`]) gets the
-    /// backend client, subscribes under the deadline and drains one stream,
-    /// then says what comes next; this loop is the one place that sleeps the
-    /// reconnect backoff and the one place that ends the task.
+    /// With an `indexer` (an events subscription) it owns the worker's index
+    /// state and takes its blocks out of the index on exit; without one it
+    /// streams the worker's load records alone. Exits when `shutdown_rx`
+    /// fires or the backend returns `Unimplemented`. Each round
+    /// ([`Self::subscription_round`]) gets the backend client, subscribes
+    /// under the deadline and drains one stream, then says what comes next;
+    /// this loop is the one place that sleeps the reconnect backoff and the
+    /// one place that ends the task.
     pub(super) async fn subscription_loop(
         worker: Arc<dyn Worker>,
         worker_url: String,
-        indexer: Arc<KvIndex>,
+        indexer: Option<Arc<KvIndex>>,
         block_sizes: Arc<DashMap<String, KvBlockSize>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<WorkerMonitor>>,
     ) {
-        let worker_id = match indexer.intern_worker(&worker_url) {
-            Ok(id) => id,
-            Err(e) => {
-                error!(
-                    worker_url = %Endpoint::redacted_str(&worker_url),
-                    error = %e,
-                    "Failed to intern worker; KV events from this worker will \
-                     not feed cache-aware routing"
-                );
-                Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
-                return;
-            }
+        let index = match &indexer {
+            Some(indexer) => match indexer.intern_worker(&worker_url) {
+                Ok(worker_id) => Some((indexer, worker_id)),
+                Err(e) => {
+                    error!(
+                        worker_url = %Endpoint::redacted_str(&worker_url),
+                        error = %e,
+                        "Failed to intern worker; KV events from this worker will \
+                         not feed cache-aware routing"
+                    );
+                    Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let role = match index {
+            Some((indexer, worker_id)) => Role::Index {
+                worker_id,
+                indexer: Arc::as_ref(indexer),
+                block_sizes: &block_sizes,
+            },
+            None => Role::Loads,
         };
         let mut state = WorkerStreamState::of_rank(worker.dp_rank());
         // A contact with the worker (a poll answered, a probe passed) ends the
@@ -382,9 +421,7 @@ impl KvEventMonitor {
         let subscription = WorkerSubscription {
             worker: &worker,
             worker_url: &worker_url,
-            worker_id,
-            indexer: &indexer,
-            block_sizes: &block_sizes,
+            role,
             model_id: &model_id,
             load_sink: load_sink.as_ref(),
             wake: wake.as_ref(),
@@ -411,9 +448,13 @@ impl KvEventMonitor {
                 Round::Unsupported => break true,
             }
         };
-        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, &worker_url, state.index)
-            .await;
-        if unsupported {
+        if let Some((indexer, worker_id)) = index {
+            Self::remove_indexer_worker(Arc::clone(indexer), worker_id, &worker_url, state.index)
+                .await;
+        }
+        // The gauge is the index's: a loads-only subscription a backend refuses
+        // leaves the worker on the poll, which is the designed fallback.
+        if unsupported && index.is_some() {
             Metrics::set_kv_events_unavailable(&worker_url, true);
         }
     }
@@ -456,6 +497,7 @@ impl KvEventMonitor {
         let subscribed = subscribe_with_deadline(
             &backend_client,
             start_seq,
+            sub.role.kind(),
             sub.wake,
             shutdown_rx,
             SUBSCRIBE_DEADLINE,
@@ -483,12 +525,20 @@ impl KvEventMonitor {
                 // If the backend doesn't implement SubscribeKvEvents (some engines don't),
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
-                    warn!(
-                        worker_url = %Endpoint::redacted_str(worker_url),
-                        "Backend does not implement SubscribeKvEvents, \
-                         disabling KV event subscription for this worker; \
-                         cache-aware routing sees nothing of its cache"
-                    );
+                    match sub.role {
+                        Role::Index { .. } => warn!(
+                            worker_url = %Endpoint::redacted_str(worker_url),
+                            "Backend does not implement SubscribeKvEvents, \
+                             disabling KV event subscription for this worker; \
+                             cache-aware routing sees nothing of its cache"
+                        ),
+                        Role::Loads => info!(
+                            worker_url = %Endpoint::redacted_str(worker_url),
+                            "Backend does not implement SubscribeKvEvents, \
+                             disabling the load stream for this worker; its load \
+                             stays polled"
+                        ),
+                    }
                     return Round::Unsupported;
                 }
                 if e.code() == tonic::Code::OutOfRange {
@@ -497,13 +547,18 @@ impl KvEventMonitor {
                         start_seq,
                         "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
                     );
-                    Self::reset_worker(
-                        sub.indexer,
-                        sub.worker_id,
-                        state,
-                        worker_url,
-                        ResyncReason::OutOfRange,
-                    );
+                    if let Role::Index {
+                        worker_id, indexer, ..
+                    } = sub.role
+                    {
+                        Self::reset_worker(
+                            indexer,
+                            worker_id,
+                            state,
+                            worker_url,
+                            ResyncReason::OutOfRange,
+                        );
+                    }
                     backoff.reset();
                     return Round::Again;
                 }
@@ -556,13 +611,18 @@ impl KvEventMonitor {
                         resume_from = state.resume_sequence(),
                         "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
                     );
-                    Self::reset_worker(
-                        sub.indexer,
-                        sub.worker_id,
-                        state,
-                        worker_url,
-                        ResyncReason::DataLoss,
-                    );
+                    if let Role::Index {
+                        worker_id, indexer, ..
+                    } = sub.role
+                    {
+                        Self::reset_worker(
+                            indexer,
+                            worker_id,
+                            state,
+                            worker_url,
+                            ResyncReason::DataLoss,
+                        );
+                    }
                     backoff.reset();
                     return Round::Again;
                 }
@@ -593,10 +653,29 @@ impl KvEventMonitor {
         }
     }
 
-    /// Drain `stream` to its end: each batch applied to the index (a batch
-    /// the index applied is the stream working), each batch's load record
-    /// forwarded to the monitor only if its rank belongs to this worker; the
-    /// worker's removal ends the stream at once.
+    /// The load record on a batch is a poll of this worker, received now:
+    /// forwarded to the monitor only if its rank belongs to this worker.
+    fn forward_record(sub: &WorkerSubscription<'_>, batch: &KvEventBatch, load: &EngineLoad) {
+        let dp_rank = batch.dp_rank.unwrap_or(0);
+        if dp_rank < 0
+            || sub
+                .worker
+                .dp_rank()
+                .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+        {
+            return;
+        }
+        liveness::on_contact(sub.worker);
+        if let Some(monitor) = sub.load_sink.and_then(Weak::upgrade) {
+            monitor.apply_pushed_load(sub.worker, dp_rank, load, Instant::now());
+        }
+    }
+
+    /// Drain `stream` to its end: on an events subscription each batch is
+    /// applied to the index (a batch the index applied is the stream
+    /// working) and each batch's load record forwarded; on a loads-only one
+    /// every batch is the stream working, its record forwarded and its
+    /// events, if any, dropped. The worker's removal ends the stream at once.
     async fn drain_stream(
         sub: &WorkerSubscription<'_>,
         stream: tonic::Streaming<KvEventBatch>,
@@ -604,34 +683,67 @@ impl KvEventMonitor {
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Drained {
         let mut applied = false;
-        let on_batch = |batch: &KvEventBatch| {
-            applied = true;
-            liveness::on_contact(sub.worker);
-            Self::learn_block_size(sub.block_sizes, sub.model_id, batch);
-        };
-        // The load record on a batch is a poll of this worker, received now.
-        let on_load = |batch: &KvEventBatch, load: &EngineLoad| {
-            let dp_rank = batch.dp_rank.unwrap_or(0);
-            if dp_rank < 0
-                || sub
-                    .worker
-                    .dp_rank()
-                    .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
-            {
-                return;
+        let on_load =
+            |batch: &KvEventBatch, load: &EngineLoad| Self::forward_record(sub, batch, load);
+        let result = match sub.role {
+            Role::Index {
+                worker_id,
+                indexer,
+                block_sizes,
+            } => {
+                let on_batch = |batch: &KvEventBatch| {
+                    applied = true;
+                    liveness::on_contact(sub.worker);
+                    Self::learn_block_size(block_sizes, sub.model_id, batch);
+                };
+                tokio::select! {
+                    result = Self::process_stream(
+                        stream, sub.worker_url, worker_id, indexer, state, on_batch, on_load,
+                    ) => result,
+                    _ = &mut *shutdown_rx => return Drained::Shutdown,
+                }
             }
-            liveness::on_contact(sub.worker);
-            if let Some(monitor) = sub.load_sink.and_then(Weak::upgrade) {
-                monitor.apply_pushed_load(sub.worker, dp_rank, load, Instant::now());
+            Role::Loads => {
+                let on_batch = |_: &KvEventBatch| applied = true;
+                tokio::select! {
+                    result = Self::process_records(stream, sub.worker_url, on_batch, on_load) => result,
+                    _ = &mut *shutdown_rx => return Drained::Shutdown,
+                }
             }
-        };
-        let result = tokio::select! {
-            result = Self::process_stream(
-                stream, sub.worker_url, sub.worker_id, sub.indexer, state, on_batch, on_load,
-            ) => result,
-            _ = &mut *shutdown_rx => return Drained::Shutdown,
         };
         Drained::Ended { result, applied }
+    }
+
+    /// Drain a loads-only stream: every record to `on_load`; a batch of
+    /// events (a servicer that predates `loads_only`) is dropped, counted
+    /// `not_indexed`. Nothing is admitted and no gap is looked for: the
+    /// stream has no cursor.
+    async fn process_records(
+        mut stream: tonic::Streaming<KvEventBatch>,
+        worker_url: &str,
+        mut on_batch: impl FnMut(&KvEventBatch),
+        mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
+    ) -> StreamResult {
+        use tokio_stream::StreamExt;
+
+        while let Some(result) = stream.next().await {
+            let batch = match result {
+                Ok(batch) => batch,
+                Err(e) => return StreamResult::Error(e),
+            };
+            on_batch(&batch);
+            if let Some(load) = &batch.load {
+                on_load(&batch, load);
+            }
+            let disposition = if Self::is_load_only(&batch) {
+                "load_only"
+            } else {
+                "not_indexed"
+            };
+            Metrics::record_kv_event_batch(worker_url, disposition);
+        }
+
+        StreamResult::Ended
     }
 
     /// Process batches from a single stream connection.
@@ -692,7 +804,11 @@ mod tests {
     use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
-    use crate::worker::{basic::StallReason, BasicWorkerBuilder};
+    use crate::{
+        config::types::PolicyConfig,
+        policies::PolicyRegistry,
+        worker::{basic::StallReason, BasicWorkerBuilder, WorkerRegistry, UNKNOWN_MODEL_ID},
+    };
 
     /// One batch of stored events, one block per event, `(hash, block_size)` each.
     fn stored_batch(blocks: &[(i64, usize)]) -> KvEventBatch {
@@ -913,6 +1029,22 @@ mod tests {
         )
     }
 
+    /// A rank worker of a data-parallel engine at `addr`: rank `rank` of `size`.
+    fn rank_worker(addr: SocketAddr, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .dp_config(rank, size)
+                .build(),
+        )
+    }
+
     /// The test scheduler served on a free port, listening.
     async fn serve(behaviour: Subscribe) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let port = portpicker::pick_unused_port().expect("a free port");
@@ -956,6 +1088,7 @@ mod tests {
         let Subscribed::Refused(status) = subscribe_with_deadline(
             &client,
             0,
+            SubscriptionKind::Events,
             wake.as_ref(),
             &mut shutdown_rx,
             Duration::from_millis(100),
@@ -985,6 +1118,7 @@ mod tests {
             subscribe_with_deadline(
                 &client,
                 0,
+                SubscriptionKind::Events,
                 wake.as_ref(),
                 &mut shutdown_rx,
                 Duration::from_secs(5)
@@ -1000,6 +1134,7 @@ mod tests {
             subscribe_with_deadline(
                 &client,
                 0,
+                SubscriptionKind::Events,
                 wake.as_ref(),
                 &mut shutdown_rx,
                 Duration::from_secs(5)
@@ -1012,9 +1147,15 @@ mod tests {
         let (addr, server) = serve(Subscribe::Unimplemented).await;
         let (_worker, client) = connected(addr).await;
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let Subscribed::Refused(status) =
-            subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
-                .await
+        let Subscribed::Refused(status) = subscribe_with_deadline(
+            &client,
+            0,
+            SubscriptionKind::Events,
+            None,
+            &mut shutdown_rx,
+            Duration::from_secs(5),
+        )
+        .await
         else {
             panic!("the server's refusal is passed through");
         };
@@ -1050,18 +1191,26 @@ mod tests {
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
-                worker_id,
-                indexer: &indexer,
-                block_sizes: &block_sizes,
+                role: Role::Index {
+                    worker_id,
+                    indexer: &indexer,
+                    block_sizes: &block_sizes,
+                },
                 model_id: "m",
                 load_sink: None,
                 wake: wake.as_ref(),
             };
             let mut state = WorkerStreamState::default();
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-            let Subscribed::Stream(stream) =
-                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
-                    .await
+            let Subscribed::Stream(stream) = subscribe_with_deadline(
+                &client,
+                0,
+                SubscriptionKind::Events,
+                None,
+                &mut shutdown_rx,
+                Duration::from_secs(5),
+            )
+            .await
             else {
                 panic!("case {which}: the server answers with a stream");
             };
@@ -1118,6 +1267,155 @@ mod tests {
         }
     }
 
+    /// A loads-only stream: every record of the worker's own rank reaches the
+    /// worker monitor as a pushed load (another rank's is dropped), a batch of events from a
+    /// servicer that predates the request field is dropped rather than
+    /// indexed, and any batch counts as the stream working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loads_only_stream_feeds_the_monitor_and_drops_events() {
+        let record = |running: u32, rank: Option<i32>, load_only: bool| KvEventBatch {
+            sequence_number: 7,
+            dp_rank: rank,
+            events: if load_only {
+                Vec::new()
+            } else {
+                stored_batch(&[(1, 16)]).events
+            },
+            load: Some(EngineLoad {
+                running_requests: running,
+                load_only,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = vec![
+            Ok(record(3, Some(0), true)),
+            // An old servicer's event batch: its record is read, its events are not.
+            Ok(record(5, Some(0), false)),
+            // Another rank's record is not this worker's.
+            Ok(record(9, Some(1), true)),
+        ];
+        let (addr, server) = serve(Subscribe::Stream(script)).await;
+        let worker = rank_worker(addr, 0, 2);
+        let client = worker
+            .get_backend_client()
+            .await
+            .expect("a backend client")
+            .expect("a gRPC worker has one");
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::clone(&worker));
+        let monitor = Arc::new(WorkerMonitor::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            1,
+            false,
+            false,
+        ));
+        let sink = Arc::downgrade(&monitor);
+        let wake = worker.contact_wake();
+        let sub = WorkerSubscription {
+            worker: &worker,
+            worker_url: worker.url(),
+            role: Role::Loads,
+            model_id: "m",
+            load_sink: Some(&sink),
+            wake: wake.as_ref(),
+        };
+        let mut state = WorkerStreamState::default();
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let Subscribed::Stream(stream) = subscribe_with_deadline(
+            &client,
+            0,
+            SubscriptionKind::Loads,
+            None,
+            &mut shutdown_rx,
+            Duration::from_secs(5),
+        )
+        .await
+        else {
+            panic!("the server answers with a stream");
+        };
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+        )
+        .await
+        .expect("the drain ends");
+        assert!(
+            matches!(
+                drained,
+                Drained::Ended {
+                    result: StreamResult::Ended,
+                    applied: true
+                }
+            ),
+            "a loads-only stream that delivered is the stream working"
+        );
+        monitor.flush_pushed();
+        let snapshot = monitor.load_snapshot();
+        let report = snapshot
+            .get(worker.url())
+            .expect("the worker's pushed report is in the snapshot");
+        assert_eq!(report.version, "pushed");
+        // A rank worker keeps its own rank's records (the event batch carried
+        // rank 0's newer one); another rank's record is not its own.
+        let ranks: Vec<(i32, i32)> = report
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect();
+        assert_eq!(
+            ranks,
+            vec![(0, 5)],
+            "rank 0's newer record from the event batch; rank 1's dropped"
+        );
+        assert_eq!(
+            state.index.counters,
+            WorkerIndexCounters::default(),
+            "nothing was admitted on a loads-only stream"
+        );
+        server.abort();
+    }
+
+    /// A loads-only subscription asks the servicer for its records alone,
+    /// from the subscription on, and creates no index for the model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loads_only_subscription_asks_for_records_alone_and_keeps_no_index() {
+        let seen = Arc::new(Mutex::new(None));
+        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
+        let worker = grpc_worker(addr);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request = loop {
+            if let Some(request) = *seen.lock().unwrap() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the subscribe call never reached the scheduler"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(request.loads_only, "{request:?}");
+        assert!(request.load_records_before_first_batch, "{request:?}");
+        assert_eq!(request.start_sequence_number, 0);
+        assert!(
+            monitor.get_indexer(worker.model_id()).is_none()
+                && monitor.get_indexer(UNKNOWN_MODEL_ID).is_none(),
+            "a loads-only subscription builds no index"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            monitor.on_worker_removed(worker.url()),
+        )
+        .await
+        .expect("removal returns while the subscribe call hangs");
+        server.abort();
+    }
+
     /// Load-only batches contact only their eligible rank, while KV events
     /// still contact the subscriber even when their rank is foreign (another
     /// rank's batch is the stream working; it is not indexed, see
@@ -1159,17 +1457,25 @@ mod tests {
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
-                worker_id,
-                indexer: &indexer,
-                block_sizes: &block_sizes,
+                role: Role::Index {
+                    worker_id,
+                    indexer: &indexer,
+                    block_sizes: &block_sizes,
+                },
                 model_id: "m",
                 load_sink: None,
                 wake: None,
             };
             let (_keep, mut shutdown_rx) = oneshot::channel();
-            let Subscribed::Stream(stream) =
-                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
-                    .await
+            let Subscribed::Stream(stream) = subscribe_with_deadline(
+                &client,
+                0,
+                SubscriptionKind::Events,
+                None,
+                &mut shutdown_rx,
+                Duration::from_secs(5),
+            )
+            .await
             else {
                 panic!("the server answers with a stream");
             };
@@ -1234,17 +1540,25 @@ mod tests {
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
-                worker_id,
-                indexer: &indexer,
-                block_sizes: &block_sizes,
+                role: Role::Index {
+                    worker_id,
+                    indexer: &indexer,
+                    block_sizes: &block_sizes,
+                },
                 model_id: "m",
                 load_sink: None,
                 wake: None,
             };
             let (_keep, mut shutdown_rx) = oneshot::channel();
-            let Subscribed::Stream(stream) =
-                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
-                    .await
+            let Subscribed::Stream(stream) = subscribe_with_deadline(
+                &client,
+                0,
+                SubscriptionKind::Events,
+                None,
+                &mut shutdown_rx,
+                Duration::from_secs(5),
+            )
+            .await
             else {
                 panic!("the server answers with a stream");
             };
@@ -1298,7 +1612,9 @@ mod tests {
 
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
-        monitor.on_worker_added(&worker).await;
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
         // Let the task connect and park in the subscribe call.
         tokio::time::sleep(Duration::from_millis(500)).await;
         // The worker keeps being heard from on other paths; every contact
@@ -1351,7 +1667,9 @@ mod tests {
         wait_until_listening(addr).await;
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
-        monitor.on_worker_added(&worker).await;
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
         let deadline = Instant::now() + Duration::from_secs(5);
         let request = loop {
             if let Some(request) = *seen.lock().unwrap() {
@@ -1410,7 +1728,9 @@ mod tests {
                 wait_until_listening(addr).await;
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();
-                monitor.on_worker_added(&worker).await;
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
                 tokio::time::sleep(Duration::from_millis(1_900)).await;
                 monitor.on_worker_removed(worker.url()).await;
                 server.abort();
@@ -1497,7 +1817,9 @@ mod tests {
 
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();
-                monitor.on_worker_added(&worker).await;
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
                 for _ in 0..500 {
                     if gauge(&handle, worker.url()) == Some(1.0) {
                         break;

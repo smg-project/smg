@@ -2,7 +2,8 @@
 //!
 //! Built once at startup from the optional `--tenant-rate-limit-config`
 //! YAML. `Ok(None)` when disabled; `Err` when enabled but the YAML is
-//! invalid — callers must fail startup on `Err`, not run unlimited.
+//! invalid (or there is no Tokio runtime for the in-memory backend's idle
+//! sweep) — callers must fail startup on `Err`, not run unlimited.
 
 use std::sync::Arc;
 
@@ -69,11 +70,11 @@ impl RateLimitManager {
             }
         }
         let compiled = CompiledPolicySet::compile(&yaml).map_err(|e| e.to_string())?;
-        let backend: Arc<dyn RateLimitBackend> = Arc::new(LocalRateLimitBackend::new(compiled));
+        let backend: Arc<dyn RateLimitBackend> = LocalRateLimitBackend::start(compiled)?;
         Ok(Self::new(backend))
     }
 
-    pub async fn reserve(&self, request: ReserveRequest) -> Reservation {
+    pub async fn reserve(&self, request: ReserveRequest<'_>) -> Reservation {
         let request_charge_id = request.request_charge_id;
         match self.backend.reserve(request).await {
             ReserveOutcome::Admitted => Reservation::Admitted(Arc::new(
@@ -114,7 +115,7 @@ mod tests {
         RateLimitManager::new(backend)
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest {
+    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
         ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new(tenant),
@@ -186,8 +187,8 @@ mod tests {
         assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
-    #[test]
-    fn enabled_with_valid_policy_succeeds() {
+    #[tokio::test]
+    async fn enabled_with_valid_policy_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(
@@ -198,6 +199,23 @@ mod tests {
 
         let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
         assert!(matches!(RateLimitManager::from_config(&rc), Ok(Some(_))));
+    }
+
+    /// The in-memory backend's idle sweep needs a runtime to run on: a
+    /// valid policy built outside one fails startup rather than panicking
+    /// or running without the sweep.
+    #[test]
+    fn enabled_outside_a_runtime_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
+        )
+        .unwrap();
+
+        let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
+        assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
     #[test]
@@ -220,8 +238,8 @@ mod tests {
         assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
-    #[test]
-    fn header_tenant_key_with_trust_tenant_header_succeeds() {
+    #[tokio::test]
+    async fn header_tenant_key_with_trust_tenant_header_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(

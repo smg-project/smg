@@ -8,8 +8,9 @@ use tonic::Status;
 
 use super::{State, HEALTHY};
 use crate::{
-    load_report::{rank_ids, Aggregate, RankFigures, RankLoad},
+    load_report::rank_entries,
     proto_json::{insert_capacity, struct_from_json},
+    servicer::proto_token_ids,
 };
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
@@ -24,13 +25,7 @@ pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
 /// as the fallback for a launcher that reported none.
 pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
     let model = &state.model;
-    let ready = state.shared.ready();
-    let mut max_context_length = model.max_context_length;
-    if max_context_length == 0 {
-        if let Some(ready) = ready {
-            max_context_length = i32::try_from(ready.max_model_len).unwrap_or(i32::MAX);
-        }
-    }
+    let max_context_length = state.shared.context_window(model.max_context_length);
     let max_req_input_len = if model.max_req_input_len > 0 {
         model.max_req_input_len
     } else {
@@ -47,11 +42,7 @@ pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
         vocab_size: model.vocab_size,
         supports_vision: model.supports_vision,
         model_type: model.model_type.clone(),
-        eos_token_ids: model
-            .eos_token_ids
-            .iter()
-            .map(|&id| i32::try_from(id).unwrap_or(i32::MAX))
-            .collect(),
+        eos_token_ids: proto_token_ids(&model.eos_token_ids),
         pad_token_id: model.pad_token_id,
         bos_token_id: model.bos_token_id,
         max_req_input_len,
@@ -120,20 +111,27 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape the Python servicer derives from the scheduler's load
-/// snapshots. The `include` sections have no source on this wire.
+/// snapshots, with the servicer's own bookkeeping ([`crate::load_tracker`])
+/// for the queued token-work, the prefill and generation throughput and the
+/// hit rate this wire's load tail does not carry, each rank's own. The
+/// `include` sections have no source on this wire.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let max_running_requests = state
         .shared
         .running_window(state.model.max_running_requests);
-    let snapshot = client.get_loads();
-    let mut loads: Vec<sg::SchedulerLoad> = snapshot
-        .loads
-        .into_iter()
-        .filter(|load| dp_rank.is_none_or(|rank| rank == load.dp_rank))
-        .map(|load| {
-            let figures = RankFigures::of(&load, max_total_num_tokens);
+    let ranks = state.shared.rank_count(state.model.data_parallel_size);
+    let (loads, aggregate) = rank_entries(
+        client.get_loads().loads,
+        max_total_num_tokens,
+        ranks,
+        dp_rank,
+        |load, figures| {
+            let estimate = state
+                .shared
+                .loads
+                .estimate(load.dp_rank, load.num_waiting_reqs);
             sg::SchedulerLoad {
                 dp_rank: figures.dp_rank,
                 num_running_reqs: figures.running,
@@ -143,28 +141,27 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
                 max_total_num_tokens,
                 max_running_requests,
                 token_usage: figures.usage,
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
                 ..Default::default()
             }
-        })
-        .collect();
-    if loads.is_empty() && dp_rank.is_none() {
-        // No output batch has carried a snapshot yet: a zero-filled entry per
-        // rank, as the Python servicer reports an idle scheduler.
-        let ranks = state.shared.rank_count(state.model.data_parallel_size);
-        loads = rank_ids(ranks)
-            .map(|dp_rank| sg::SchedulerLoad {
+        },
+        |dp_rank| {
+            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+            sg::SchedulerLoad {
                 dp_rank,
                 max_running_requests,
                 max_total_num_tokens,
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
                 ..Default::default()
-            })
-            .collect();
-    }
-    let aggregate = Aggregate::of(loads.iter().map(|load| RankLoad {
-        running: load.num_running_reqs,
-        waiting: load.num_waiting_reqs,
-        usage: load.token_usage,
-    }));
+            }
+        },
+    );
     Ok(sg::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: state

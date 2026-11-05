@@ -358,7 +358,13 @@ pub async fn create_tokenizer_async(
 ///   text-davinci-003, code-davinci-002, davinci,
 ///   text-curie-001, curie, text-babbage-001, babbage,
 ///   text-ada-001, text-embedding-ada-002, ada
-fn is_likely_openai_model(name: &str) -> bool {
+///
+/// `pub` so that a caller that resolves a Hub model id itself (the Python
+/// binding, which keeps the snapshot directory it loads) tries tiktoken on
+/// the names the factory tries it on. The guess alone does not say which
+/// names tiktoken loads: the factory downloads a name it accepts that
+/// tiktoken does not know (`org/gpt-2-small`) like any other Hub id.
+pub fn is_likely_openai_model(name: &str) -> bool {
     let bare = name.rsplit('/').next().unwrap_or(name);
 
     // GPT family: gpt-4*, gpt-3.5*, chatgpt-*

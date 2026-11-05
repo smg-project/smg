@@ -296,11 +296,21 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         }
     }
 
+    /// The family sets no per-request image count of its own: its serving
+    /// engines read the image count as unlimited (the processing info of the
+    /// Qwen2-VL line, which the Qwen3-VL and Qwen3.5 infos inherit, declares
+    /// `image: None`), the checkpoints' processor configs bound an image's
+    /// pixels, not the number of images, and the context length is the
+    /// practical bound. Images stay declared (an undeclared modality is
+    /// refused as unsupported) without a bound of the spec's, so the
+    /// effective limit is the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. One video per
+    /// request stays the spec's declared default.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        let mut limits = HashMap::from([(Modality::Image, 10)]);
+        let mut limits = HashMap::from([(Modality::Image, usize::MAX)]);
         if metadata.config_u32(&["video_token_id"]).is_some() {
             limits.insert(Modality::Video, 1);
         }
@@ -698,6 +708,55 @@ mod tests {
         let spec = registry.lookup(&metadata).expect("should match qwen3");
         // Must match qwen3_vl spec, not qwen_vl
         assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten it carried
+    /// was the first registry's default, never a count of the family's), so
+    /// a deployment knob is the only router-side bound; the single video
+    /// stays declared and audio stays unsupported.
+    #[test]
+    fn qwen3_vl_declares_images_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
+        let config = video_config("qwen3_vl");
+        let metadata = ModelMetadata {
+            model_id: "Qwen3-VL-8B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::Qwen3VLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, 1)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen3_vl",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Audio, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Audio,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -10,18 +10,19 @@
 use std::sync::Arc;
 
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
+    chat::{
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent,
+    },
     common::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
-        ToolCall, ToolChoice, ToolChoiceValue, UsageInfo,
+        ToolCall, ToolChoice, ToolChoiceValue, Usage,
     },
     profile::ProviderProfile,
     responses::{
-        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
-        IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
-        TextFormat,
+        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, ResponseContentPart,
+        ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseReasoningContent::ReasoningText, ResponseUsage, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
 };
@@ -30,9 +31,9 @@ use tracing::warn;
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
     utils::{
-        custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-        extract_tools_from_response_tools, function_call_status, generation_failure_error,
-        resolve_function_identity,
+        custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
+        encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
+        generation_failure_error, resolve_function_identity, response_status,
     },
 };
 
@@ -42,8 +43,13 @@ use crate::routers::grpc::common::responses::{
 /// - `input` (text/items) → `messages` (chat messages)
 /// - `instructions` → system message (prepended)
 /// - `max_output_tokens` → `max_completion_tokens`
+/// - `stop` → `stop` (the engine's stop list and the gateway's own trim of a
+///   matched sequence both read it from the chat request)
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
+/// - the sampling knobs (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
+///   request keeps as plain values cross only when set
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     responses_to_chat_with_tools(req, None)
@@ -380,6 +386,15 @@ fn chat_request(
         messages,
         model,
         temperature: req.temperature,
+        // The chat twins of these five knobs are `Option`s whose `None` lets
+        // the model's own defaults fill the knob; three of them are plain
+        // values with serde defaults on the Responses request and cross only
+        // when set, or every request would carry the sentinels.
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        top_k: req.top_k_if_set(),
+        min_p: req.min_p_if_set(),
+        repetition_penalty: req.repetition_penalty_if_set(),
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
         // Preserve caller-provided stream_options (e.g. `include_obfuscation: false`
@@ -397,6 +412,9 @@ fn chat_request(
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
+        // The engine's stop list and the gateway's own trim of a matched
+        // sequence both read the chat request's `stop`, on every turn.
+        stop: req.stop.clone(),
         skip_special_tokens: true,
         tools,
         tool_choice,
@@ -648,122 +666,26 @@ pub(crate) fn chat_to_responses(
         .first()
         .ok_or_else(|| "Chat response contains no choices".to_string())?;
 
-    // Convert assistant message to output items. Reasoning comes first (OpenAI
+    // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
+    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
+    output.extend(message_output_item(choice, &chat_resp.id));
+    // The cut-call read comes before the calls become items: a custom tool's
+    // item carries no status.
+    let cut = cut_call(
+        choice.finish_reason.as_deref(),
+        choice
+            .message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| call.function.arguments.as_deref().unwrap_or_default()),
+    );
+    push_tool_call_output_items(&mut output, choice, original_req);
 
-    if let Some(reasoning) = &choice.message.reasoning_content {
-        if !reasoning.is_empty() {
-            let id = format!("reasoning_{}", chat_resp.id);
-            let content = vec![ReasoningText {
-                text: reasoning.clone(),
-            }];
-            let status = Some("completed".to_string());
-            let include_encrypted = original_req
-                .include
-                .as_deref()
-                .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
-            output.push(if include_encrypted {
-                ResponseOutputItem::new_reasoning_encrypted(
-                    id,
-                    vec![],
-                    content,
-                    encode_reasoning_content(reasoning),
-                    status,
-                )
-            } else {
-                ResponseOutputItem::new_reasoning(id, vec![], content, status)
-            });
-        }
-    }
-
-    // Convert message content to output item
-    if let Some(content) = &choice.message.content {
-        if !content.is_empty() {
-            output.push(ResponseOutputItem::Message {
-                id: format!("msg_{}", chat_resp.id),
-                role: "assistant".to_string(),
-                content: vec![ResponseContentPart::OutputText {
-                    text: content.clone(),
-                    annotations: vec![],
-                    logprobs: choice.logprobs.clone(),
-                }],
-                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                }
-                .to_string(),
-                phase: None,
-            });
-        }
-    }
-
-    // Convert tool calls if present. Calls to downgraded custom tools map back
-    // to `custom_tool_call` items.
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
-    if let Some(tool_calls) = &choice.message.tool_calls {
-        for tool_call in tool_calls {
-            let (name, namespace) =
-                resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
-            if custom_names.contains(&tool_call.function.name) {
-                output.push(ResponseOutputItem::CustomToolCall {
-                    call_id: tool_call.id.clone(),
-                    input: custom_tool_input(
-                        tool_call.function.arguments.as_deref().unwrap_or_default(),
-                    ),
-                    name,
-                    id: Some(tool_call.id.clone()),
-                    namespace,
-                });
-                continue;
-            }
-            output.push(ResponseOutputItem::FunctionToolCall {
-                id: Some(tool_call.id.clone()),
-                call_id: tool_call.id.clone(),
-                name,
-                namespace,
-                arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                output: None, // Tool execution belongs to the next turn.
-                status: function_call_status(
-                    choice.finish_reason.as_deref(),
-                    tool_call.function.arguments.as_deref().unwrap_or_default(),
-                )
-                .to_string(),
-            });
-        }
-    }
-
-    // Determine response status based on finish_reason. "length" is a
-    // max_output_tokens truncation, which the Responses contract reports as
-    // status=incomplete with incomplete_details.
-    let (status, incomplete_details) = match choice.finish_reason.as_deref() {
-        Some("stop") => (ResponseStatus::Completed, None),
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(IncompleteDetails {
-                reason: IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("tool_calls") => (ResponseStatus::Completed, None),
-        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-        _ => (ResponseStatus::Completed, None), // Default to completed
-    };
-
-    // Convert usage from Usage to UsageInfo, then wrap in ResponsesUsage
-    let usage = chat_resp.usage.as_ref().map(|u| {
-        let usage_info = UsageInfo {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            reasoning_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: u.prompt_tokens_details.clone(),
-        };
-        ResponsesUsage::Modern(usage_info.to_response_usage())
-    });
+    let (status, incomplete_details) = response_status(choice.finish_reason.as_deref(), cut);
+    let usage = chat_resp.usage.as_ref().map(responses_usage);
 
     // Generate response
     let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
@@ -783,11 +705,117 @@ pub(crate) fn chat_to_responses(
     Ok(builder.build())
 }
 
+/// The assistant's reasoning as the turn's first output item, when it
+/// reasoned: with the opaque encrypted copy when the request asked for it.
+fn reasoning_output_item(
+    choice: &ChatChoice,
+    chat_id: &str,
+    original_req: &ResponsesRequest,
+) -> Option<ResponseOutputItem> {
+    let reasoning = choice.message.reasoning_content.as_ref()?;
+    if reasoning.is_empty() {
+        return None;
+    }
+    let id = format!("reasoning_{chat_id}");
+    let content = vec![ReasoningText {
+        text: reasoning.clone(),
+    }];
+    let status = Some("completed".to_string());
+    let include_encrypted = original_req
+        .include
+        .as_deref()
+        .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
+    Some(if include_encrypted {
+        ResponseOutputItem::new_reasoning_encrypted(
+            id,
+            vec![],
+            content,
+            encode_reasoning_content(reasoning),
+            status,
+        )
+    } else {
+        ResponseOutputItem::new_reasoning(id, vec![], content, status)
+    })
+}
+
+/// The assistant's text as a message item, when it said any; a generation
+/// that failed leaves the message in progress.
+fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+    let content = choice.message.content.as_ref()?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(ResponseOutputItem::Message {
+        id: format!("msg_{chat_id}"),
+        role: "assistant".to_string(),
+        content: vec![ResponseContentPart::OutputText {
+            text: content.clone(),
+            annotations: vec![],
+            logprobs: choice.logprobs.clone(),
+        }],
+        status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
+            "in_progress"
+        } else {
+            "completed"
+        }
+        .to_string(),
+        phase: None,
+    })
+}
+
+/// The assistant's tool calls as output items, in their order; a call to a
+/// downgraded custom tool maps back to a `custom_tool_call` item.
+fn push_tool_call_output_items(
+    output: &mut Vec<ResponseOutputItem>,
+    choice: &ChatChoice,
+    original_req: &ResponsesRequest,
+) {
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
+    let Some(tool_calls) = &choice.message.tool_calls else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let (name, namespace) =
+            resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
+        if custom_names.contains(&tool_call.function.name) {
+            output.push(ResponseOutputItem::CustomToolCall {
+                call_id: tool_call.id.clone(),
+                input: custom_tool_input(
+                    tool_call.function.arguments.as_deref().unwrap_or_default(),
+                ),
+                name,
+                id: Some(tool_call.id.clone()),
+                namespace,
+            });
+            continue;
+        }
+        output.push(ResponseOutputItem::FunctionToolCall {
+            id: Some(tool_call.id.clone()),
+            call_id: tool_call.id.clone(),
+            name,
+            namespace,
+            arguments: tool_call.function.arguments.clone().unwrap_or_default(),
+            output: None, // Tool execution belongs to the next turn.
+            status: function_call_status(
+                choice.finish_reason.as_deref(),
+                tool_call.function.arguments.as_deref().unwrap_or_default(),
+            )
+            .to_string(),
+        });
+    }
+}
+
+/// The chat usage as the Responses API reports it, through the protocol's
+/// one conversion: the streamed object reads it here as well.
+pub(super) fn responses_usage(usage: &Usage) -> ResponsesUsage {
+    ResponsesUsage::Modern(ResponseUsage::from(usage))
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
-        chat::{ChatChoice, ChatCompletionMessage},
-        common::{StreamOptions, Usage},
+        chat::ChatCompletionMessage,
+        common::{StreamOptions, StringOrArray},
         responses::ReasoningEffort,
     };
 
@@ -904,6 +932,45 @@ mod tests {
         assert_eq!(
             body["usage"]["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
+    /// The assistant's reasoning is the turn's first output item, ahead of
+    /// its message, and carries the opaque encrypted copy only when the
+    /// request asked for it.
+    #[test]
+    fn a_reasoning_turn_leads_the_output_and_carries_its_encrypted_copy_only_when_asked() {
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"done",
+                "reasoning_content":"because"},"finish_reason":"stop"}]
+        }))
+        .unwrap();
+
+        let plain = serde_json::to_value(
+            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain["output"][0]["type"], "reasoning");
+        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert_eq!(plain["output"][0]["content"][0]["text"], "because");
+        assert!(
+            plain["output"][0]["encrypted_content"].is_null(),
+            "the encrypted copy comes only when asked for"
+        );
+        assert_eq!(plain["output"][1]["type"], "message");
+        assert_eq!(plain["output"][1]["content"][0]["text"], "done");
+
+        let asking = ResponsesRequest {
+            include: Some(vec![IncludeField::ReasoningEncryptedContent]),
+            ..Default::default()
+        };
+        let encrypted =
+            serde_json::to_value(chat_to_responses(&chat, &asking, None).unwrap()).unwrap();
+        assert_eq!(encrypted["output"][0]["content"][0]["text"], "because");
+        assert!(
+            encrypted["output"][0]["encrypted_content"].is_string(),
+            "the request asked for the encrypted copy"
         );
     }
 
@@ -1074,6 +1141,42 @@ mod tests {
         assert_eq!(chat_req.temperature, Some(0.7));
     }
 
+    /// The stop sequences a Responses request sets are the chat request's, in
+    /// the string form and in the list form: the engine's stop list and the
+    /// gateway's own trim of a matched sequence both read them there.
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_chat_request_in_both_forms() {
+        let as_string = ResponsesRequest {
+            input: ResponseInput::Text("Count from 1 to 10.".to_string()),
+            model: "local-model".to_string(),
+            stop: Some(StringOrArray::String(",".to_string())),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&as_string).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::String(",".to_string())),
+            "a stop string is the chat request's stop"
+        );
+
+        let as_list = ResponsesRequest {
+            stop: Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string(),
+            ])),
+            ..as_string
+        };
+        let chat = responses_to_chat(&as_list).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string()
+            ])),
+            "a stop list is the chat request's stop"
+        );
+    }
+
     #[test]
     fn test_reasoning_effort_flows_through() {
         use openai_protocol::responses::ResponseReasoningParam;
@@ -1125,6 +1228,62 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.reasoning_effort, None);
+    }
+
+    /// The five sampling knobs a Responses request sets are the chat
+    /// request's. Three of them are plain values with serde defaults on the
+    /// Responses request (`top_k` -1, `min_p` 0, `repetition_penalty` 1) and
+    /// cross only when set: an unset knob stays `None`, so the model's own
+    /// defaults still fill it.
+    #[test]
+    fn a_responses_request_s_sampling_knobs_reach_the_chat_request_only_when_set() {
+        let unset = ResponsesRequest {
+            input: ResponseInput::Text("What is 2+2?".to_string()),
+            model: "local-model".to_string(),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&unset).unwrap();
+        assert_eq!(chat.frequency_penalty, None, "no frequency_penalty was set");
+        assert_eq!(chat.presence_penalty, None, "no presence_penalty was set");
+        assert_eq!(
+            chat.top_k, None,
+            "the serde default -1 is not a top_k the client set"
+        );
+        assert_eq!(
+            chat.min_p, None,
+            "the serde default 0 is not a min_p the client set"
+        );
+        assert_eq!(
+            chat.repetition_penalty, None,
+            "the serde default 1 is not a repetition_penalty the client set"
+        );
+
+        let set = ResponsesRequest {
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            top_k: 40,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
+            ..unset
+        };
+        let chat = responses_to_chat(&set).unwrap();
+        assert_eq!(
+            chat.frequency_penalty,
+            Some(0.5),
+            "frequency_penalty crosses as set"
+        );
+        assert_eq!(
+            chat.presence_penalty,
+            Some(0.3),
+            "presence_penalty crosses as set"
+        );
+        assert_eq!(chat.top_k, Some(40), "top_k crosses as set");
+        assert_eq!(chat.min_p, Some(0.05), "min_p crosses as set");
+        assert_eq!(
+            chat.repetition_penalty,
+            Some(1.1),
+            "repetition_penalty crosses as set"
+        );
     }
 
     #[test]
@@ -1486,6 +1645,31 @@ mod tests {
         }
     }
 
+    /// A call the parser did not read whole, delivered under `tool_calls` with arguments that
+    /// are no JSON value (a tagged syntax that refused bytes inside the call writes no close for
+    /// it): the item is `incomplete`, and so is the response, with no stated reason, as a call
+    /// cut by an abort leaves it.
+    #[test]
+    fn a_generated_call_the_parser_did_not_read_whole_leaves_the_response_incomplete() {
+        let request = ResponsesRequest::default();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_add","type":"function","function":{"name":"add_integers","arguments":""}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(
+            wire["incomplete_details"],
+            serde_json::Value::Null,
+            "{wire}"
+        );
+        assert_eq!(wire["output"][0]["type"], "function_call", "{wire}");
+        assert_eq!(wire["output"][0]["status"], "incomplete", "{wire}");
+        assert_eq!(wire["output"][0]["arguments"], "", "{wire}");
+    }
+
     #[test]
     fn failed_generation_does_not_complete_partial_messages_or_tool_calls() {
         for finish_reason in ["failed", "error"] {
@@ -1551,6 +1735,65 @@ mod tests {
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["output"][0]["status"], "completed");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_cut_call_under_a_finish_other_than_length_leaves_the_response_incomplete() {
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire = serde_json::to_value(
+                chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_custom_tool_call_leaves_the_response_incomplete_too() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire =
+                serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["type"], "custom_tool_call",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+        }
     }
 
     /// The MCP tool loop's conversion: the request's function tools and the

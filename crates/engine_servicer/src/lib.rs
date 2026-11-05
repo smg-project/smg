@@ -24,6 +24,7 @@
 //! already passes, on a listener of their own.
 
 mod admin;
+mod embed;
 pub mod engine_hash;
 mod engine_link;
 mod error;
@@ -33,10 +34,12 @@ pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
 mod load_report;
+mod load_stream;
 mod load_tracker;
 mod metrics;
 mod proto_json;
 mod requests;
+mod rpc;
 mod server;
 mod servicer;
 mod servicer_config;

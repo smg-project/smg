@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
-    json::PartialJson,
+    json::{PartialJson, Prefix},
     CallIds, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
     Input, MalformedReason, Parser,
 };
@@ -280,7 +280,7 @@ pub fn declared() -> Declared {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -653,9 +653,30 @@ fn closed_structure(text: &str) -> bool {
     open.is_empty() && !inside
 }
 
-/// Whether `text` is a JSON prefix the prefix parser takes whole.
-fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+/// The breach in the arguments so far, when the crate's own judge of a JSON prefix ([`Prefix`])
+/// refuses them, which it does at the first byte a strict reader refuses and from the backslash
+/// of an escape no continuation completes: `json-prefix` when the partial parser refuses them too
+/// (nesting past the bound, bytes after the value, a word that is no literal, a surrogate without
+/// its other half), and `tolerated-json` when that parser takes them whole, the shapes JSON
+/// refuses and it tolerates (a value left out, a trailing comma, an escape JSON lacks, a `\u`
+/// escape short of its digits before its string's closing quote, which it reads as unfinished
+/// and the quote as the string's text, whitespace outside JSON's, a number or a word cut short
+/// before a delimiter), the name the call's end gives the same shapes, so that a run's allowance
+/// means one thing at a cut and at a close. The judge lets a raw control character inside a
+/// string through, as the fragment that carries one writes it as its escape; a number's range is
+/// the client's, as [`whole_json`] says.
+fn prefix_breach(so_far: &str) -> Option<&'static str> {
+    // Where the judge refused, if it did: where it did not, there is no breach.
+    Prefix::default().feed(so_far)?;
+    let tolerated = matches!(
+        PartialJson::default().parse(so_far, true),
+        Ok((_, consumed)) if consumed == so_far.len()
+    );
+    Some(if tolerated {
+        "tolerated-json"
+    } else {
+        "json-prefix"
+    })
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.
@@ -765,10 +786,10 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                                 place()
                             )
                         });
-                    } else {
-                        breach("json-prefix", valid_json_prefix(so_far), || {
+                    } else if let Some(name) = prefix_breach(so_far) {
+                        breach(name, false, || {
                             format!(
-                                "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                                "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
                                 place()
                             )
                         });
@@ -796,9 +817,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     // Three names for one promise, so that a run allows a class already
                     // reported and still catches the others: a call that ended with no fragment
                     // at all; a value whose shape closed but whose tokens JSON refuses (what the
-                    // prefix judge tolerates: a value left out, a trailing comma, an escape JSON
-                    // lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
-                    // short); and the rest, the committed prefix of a value that never closed.
+                    // partial parser tolerates: a value left out, a trailing comma, an escape
+                    // JSON lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
+                    // short, the shapes [`prefix_breach`] names the same way at the fragment
+                    // that brings them); and the rest, the committed prefix of a value that
+                    // never closed.
                     if so_far.is_empty() {
                         breach("empty-arguments", false, || {
                             format!(
@@ -1583,12 +1606,17 @@ mod tests {
             breach_in(Table::Qwen3, events)
         };
         assert_eq!(ended_with("").as_deref(), Some("empty-arguments"));
+        // A shape that closed with a value left out, a trailing comma or an escape JSON lacks
+        // is named at the fragment that brings it, by the judge of every fragment
+        // ([`prefix_breach`]); a scalar cut short passes that judge at every fragment and is
+        // named at the call's end. One name for both, since an allowance is by shape.
         for tolerated in [
             "{\"city\": \"Paris\", \"days\": ,}",
             "{\"a\": 1,}",
+            "\"\\h\"",
             "0e",
             "n",
-            "\"\\h\"",
+            "1.",
         ] {
             assert_eq!(
                 ended_with(tolerated).as_deref(),
@@ -1613,6 +1641,47 @@ mod tests {
         }
         assert!(closed_structure("{\"a\": \"}\"}") && !closed_structure("{\"a\": \"}\""));
         assert!(!closed_structure("}") && !closed_structure("{]") && !closed_structure("  "));
+    }
+
+    /// The judge of every fragment names a refusal by what the partial parser makes of the text,
+    /// so that the scheduled run's allowance of `tolerated-json` hides no `json-prefix`: what
+    /// both refuse is `json-prefix`, what the judge refuses and the parser takes whole is
+    /// `tolerated-json`, at the fragment that brings it, and what the judge takes is no breach.
+    #[test]
+    fn a_fragments_breach_is_named_by_what_the_partial_parser_makes_of_it() {
+        let past_the_bound = format!("{{\"a\": {}", "[".repeat(33));
+        for (so_far, name) in [
+            // Nesting past the bound, and bytes after the closed object: both refuse.
+            (past_the_bound.as_str(), "json-prefix"),
+            ("{\"a\": 1}x", "json-prefix"),
+            // The short escape at a cut, and a trailing comma: the parser tolerates both.
+            ("{\"a\": [\"\\u1\"]", "tolerated-json"),
+            ("{\"a\": [1,]", "tolerated-json"),
+        ] {
+            assert_eq!(prefix_breach(so_far), Some(name), "{so_far:?}");
+            // The same text as the one fragment of a call, on the stream's own path.
+            let events = vec![
+                start(0),
+                arguments(0, so_far, so_far),
+                end(0, "</tool_call>"),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Qwen3, events).as_deref(),
+                Some(name),
+                "{so_far:?}"
+            );
+        }
+        for taken in [
+            "{\"a\": [1,",
+            "{\"a\": \"\\u1",
+            "{\"a\": 1.",
+            "{\"a\": -",
+            "",
+            "  ",
+        ] {
+            assert_eq!(prefix_breach(taken), None, "{taken:?}");
+        }
     }
 
     #[test]

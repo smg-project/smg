@@ -84,11 +84,32 @@ pub struct Scanned<'a> {
 }
 
 impl<'a> Scanned<'a> {
-    /// The pieces, in order: text that cannot be part of a marker, and the markers found.
-    pub fn pieces(&self) -> impl Iterator<Item = Piece<'_>> {
-        let text = self.text();
+    /// The pieces, in order: text that cannot be part of a marker, and the markers found. A text
+    /// piece is a slice of the scan, of the bytes fed or of the join, so a caller that reads it as
+    /// text copies nothing; [`Self::pieces_of_delta`] for one that keeps it as long as the delta.
+    pub fn pieces(&self) -> impl Iterator<Item = Piece<'_>> + '_ {
+        let bytes: &'a str = self.bytes;
+        let joined = (!self.joined.is_empty()).then_some(self.joined.as_str());
         self.spans.iter().map(move |span| match *span {
-            Span::Text { start, end } => Piece::Text(Cow::Borrowed(&text[start..end])),
+            Span::Text { start, end } => Piece::Text(Cow::Borrowed(match joined {
+                None => &bytes[start..end],
+                Some(joined) => &joined[start..end],
+            })),
+            Span::Marker(index) => Piece::Marker(index),
+        })
+    }
+
+    /// [`Self::pieces`], with a text piece bound to the delta rather than to the scan: a slice of
+    /// the bytes fed when nothing was held before them, so a caller keeps it as long as the bytes;
+    /// a copy of its part of the join when something was held.
+    pub fn pieces_of_delta(&self) -> impl Iterator<Item = Piece<'a>> + '_ {
+        let bytes: &'a str = self.bytes;
+        let joined = (!self.joined.is_empty()).then_some(self.joined.as_str());
+        self.spans.iter().map(move |span| match *span {
+            Span::Text { start, end } => Piece::Text(match joined {
+                None => Cow::Borrowed(&bytes[start..end]),
+                Some(joined) => Cow::Owned(joined[start..end].to_owned()),
+            }),
             Span::Marker(index) => Piece::Marker(index),
         })
     }
@@ -103,15 +124,6 @@ impl<'a> Scanned<'a> {
             }
             [Span::Text { start, end }] => Some(Cow::Owned(self.joined[start..end].to_owned())),
             _ => None,
-        }
-    }
-
-    /// What the pieces are slices of.
-    fn text(&self) -> &str {
-        if self.joined.is_empty() {
-            self.bytes
-        } else {
-            &self.joined
         }
     }
 }
@@ -690,9 +702,17 @@ mod tests {
     }
 
     #[test]
-    fn the_pieces_of_a_feed_after_a_hold_are_read_from_the_join_and_the_buffers_come_back() {
+    fn a_piece_borrows_the_scan_always_and_the_delta_only_while_nothing_was_held() {
         let mut scanner = Scanner::new(QWEN);
-        assert_eq!(fed(&mut scanner, "a<"), vec![Piece::Text("a".into())]);
+        let scanned = scanner.feed("a<");
+        assert!(
+            matches!(
+                scanned.pieces_of_delta().collect::<Vec<_>>().as_slice(),
+                [Piece::Text(Cow::Borrowed("a"))]
+            ),
+            "with nothing held, a piece is a slice of the bytes fed, kept as long as they are"
+        );
+        scanner.reclaim(scanned);
         let scanned = scanner.feed("b<tool_call>c<");
         let pieces: Vec<Piece<'_>> = scanned.pieces().collect();
         assert_eq!(
@@ -706,7 +726,13 @@ mod tests {
         );
         assert!(
             matches!(&pieces[0], Piece::Text(Cow::Borrowed(_))),
-            "a slice, not a copy"
+            "a slice of the join, which goes back to the scanner at reclaim"
+        );
+        let of_delta: Vec<Piece<'_>> = scanned.pieces_of_delta().collect();
+        assert_eq!(of_delta, pieces, "the same pieces, bound to the delta");
+        assert!(
+            matches!(&of_delta[0], Piece::Text(Cow::Owned(_))),
+            "bound to the delta, the join's part is a copy"
         );
         assert_eq!(scanner.held(), "<");
         assert_eq!(scanned.pieces().count(), 3, "read as often as wanted");

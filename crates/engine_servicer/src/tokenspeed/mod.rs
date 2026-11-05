@@ -287,15 +287,21 @@ pub struct TokenSpeedServicerConfig {
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let response = info::loads(self, dp_rank).ok()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(
-            response.loads.first()?,
-        ))
+        let load = response.loads.first()?;
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::loads`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -382,7 +388,12 @@ impl TokenSpeedServicerServer {
         let encode_role = encode_role(&config.model)?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             tokenizer: TokenizerSlot::new(),
             encode_role,
         });
@@ -465,7 +476,8 @@ impl TokenSpeedServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

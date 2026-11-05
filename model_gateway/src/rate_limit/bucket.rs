@@ -6,7 +6,7 @@
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, MutexGuard};
@@ -34,9 +34,9 @@ pub(crate) struct ScopeBucket {
     request_capacity: f64,
     request_refill_per_sec: f64,
     created_at: Instant,
-    /// Nanoseconds since `created_at`, updated on every `lock()` without
-    /// taking `state`'s lock — lets a future idle-eviction sweep read it
-    /// without contending with the hot path. No reaper exists yet.
+    /// Nanoseconds since `created_at`, updated on every lock without
+    /// taking `state`'s lock — lets the backend's idle sweep read it
+    /// without contending with the hot path.
     last_touched_ns: AtomicU64,
 }
 
@@ -59,33 +59,73 @@ impl ScopeBucket {
         }
     }
 
+    /// The tests' lock: the touch and the guard, the refill left to the
+    /// caller.
+    #[cfg(test)]
     pub fn lock(&self) -> MutexGuard<'_, BucketState> {
-        self.touch();
+        self.touch_at(Instant::now());
         self.state.lock()
     }
 
-    fn touch(&self) {
-        let now_ns = u64::try_from(self.created_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    /// The hot path's lock: the bucket refilled to now under it, the touch
+    /// and the refill stamped from one clock read taken under the lock, so
+    /// a reader that waited behind a later one never stamps an earlier time.
+    /// `dry_run`, `debit` and `settle_tokens` follow under the guard.
+    pub fn lock_and_refill(&self) -> MutexGuard<'_, BucketState> {
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        self.touch_at(now);
+        self.refill_at(&mut state, now);
+        state
+    }
+
+    fn touch_at(&self, now: Instant) {
+        let now_ns = u64::try_from(now.saturating_duration_since(self.created_at).as_nanos())
+            .unwrap_or(u64::MAX);
         self.last_touched_ns.store(now_ns, Ordering::Relaxed);
     }
 
-    /// Nanoseconds since `created_at` as of the last `lock()`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no eviction sweep reads this yet; exercised by this module's own tests"
-        )
-    )]
+    /// Nanoseconds since `created_at` as of the last lock.
     pub fn last_touched_ns(&self) -> u64 {
         self.last_touched_ns.load(Ordering::Relaxed)
     }
 
+    /// How long the bucket had gone without a lock (or since creation,
+    /// if never locked) as of `now`; zero if it was touched after `now`.
+    pub fn idle_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.created_at)
+            .saturating_sub(Duration::from_nanos(self.last_touched_ns()))
+    }
+
+    /// Whether both counters, refilled to now, are at capacity — the state
+    /// a freshly created bucket starts in, so dropping this one and
+    /// recreating it later loses nothing. A bucket in settlement debt is
+    /// not full until the refill has paid the debt off.
+    ///
+    /// Takes `state`'s lock directly rather than through `lock()`, so
+    /// asking doesn't count as a touch.
+    pub fn is_full(&self) -> bool {
+        let mut state = self.state.lock();
+        self.refill(&mut state);
+        state.available_tokens >= self.token_capacity
+            && state.available_requests >= self.request_capacity
+    }
+
     /// Refill both counters based on elapsed time since the last refill.
-    /// Must be called under the lock before `dry_run`/`debit`.
+    /// Must be called under the lock before `dry_run`/`debit`
+    /// ([`Self::lock_and_refill`] does both).
     pub fn refill(&self, state: &mut BucketState) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        self.refill_at(state, Instant::now());
+    }
+
+    /// A `now` behind the last refill credits nothing and leaves the stamp
+    /// where it is: moving it back would pay the same stretch of time out
+    /// twice at the next refill.
+    fn refill_at(&self, state: &mut BucketState, now: Instant) {
+        let Some(elapsed) = now.checked_duration_since(state.last_refill) else {
+            return;
+        };
+        let elapsed = elapsed.as_secs_f64();
         state.available_tokens =
             (state.available_tokens + elapsed * self.token_refill_per_sec).min(self.token_capacity);
         state.available_requests = (state.available_requests
@@ -218,6 +258,27 @@ mod tests {
     }
 
     #[test]
+    fn a_refill_stamped_before_the_last_one_credits_nothing_and_keeps_the_stamp() {
+        let bucket = ScopeBucket::new(limits(600, 10));
+        let mut guard = bucket.lock();
+        bucket.refill(&mut guard);
+        bucket.debit(&mut guard, 300.0, 5.0);
+        let last = guard.last_refill;
+
+        // A clock read taken ahead of the lock, behind a later refill.
+        let earlier = last.checked_sub(Duration::from_secs(10)).unwrap_or(last);
+        bucket.refill_at(&mut guard, earlier);
+        assert_eq!(guard.available_tokens, 300.0);
+        assert_eq!(guard.available_requests, 5.0);
+        assert_eq!(guard.last_refill, last);
+
+        // The next refill credits from the kept stamp: 10 s at 10 tokens/s.
+        bucket.refill_at(&mut guard, last + Duration::from_secs(10));
+        assert_eq!(guard.available_tokens, 400.0);
+        assert_eq!(guard.last_refill, last + Duration::from_secs(10));
+    }
+
+    #[test]
     fn settle_can_push_negative_debt_but_not_above_capacity() {
         let bucket = ScopeBucket::new(limits(600, 10));
         let mut guard = bucket.lock();
@@ -247,5 +308,50 @@ mod tests {
         drop(bucket.lock());
 
         assert!(bucket.last_touched_ns() > touched);
+    }
+
+    #[tokio::test]
+    async fn idle_at_counts_from_the_last_lock_and_is_full_is_not_a_touch() {
+        let bucket = ScopeBucket::new(limits(600, 10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bucket.idle_at(Instant::now()) >= Duration::from_millis(50));
+
+        assert!(bucket.is_full());
+        assert!(bucket.idle_at(Instant::now()) >= Duration::from_millis(50));
+
+        let before_touch = Instant::now();
+        drop(bucket.lock());
+        assert!(bucket.idle_at(Instant::now()) < Duration::from_millis(50));
+        // Touched after `before_touch`: idle as of then reads zero.
+        assert_eq!(bucket.idle_at(before_touch), Duration::ZERO);
+    }
+
+    #[test]
+    fn is_full_only_at_capacity_on_both_counters() {
+        let bucket = ScopeBucket::new(limits(600, 10));
+        assert!(bucket.is_full());
+
+        // 1 token/request short of capacity takes ~100ms/~6s to refill.
+        let mut guard = bucket.lock();
+        bucket.debit(&mut guard, 1.0, 0.0);
+        drop(guard);
+        assert!(!bucket.is_full());
+
+        let bucket = ScopeBucket::new(limits(600, 10));
+        let mut guard = bucket.lock();
+        bucket.debit(&mut guard, 0.0, 1.0);
+        drop(guard);
+        assert!(!bucket.is_full());
+    }
+
+    #[test]
+    fn a_bucket_in_debt_is_not_full() {
+        let bucket = ScopeBucket::new(limits(600, 10));
+        let mut guard = bucket.lock();
+        // Usage beyond the whole capacity: a full refill window later the
+        // bucket is still short, so it must not read as full.
+        bucket.settle_tokens(&mut guard, 1200.0);
+        drop(guard);
+        assert!(!bucket.is_full());
     }
 }

@@ -122,7 +122,7 @@ fn inkling_audio_preprocess_matches_checked_in_golden() {
             sample_rate: case.sample_rate,
         };
         let result = processor
-            .preprocess_decoded_clips(vec![decoded])
+            .preprocess_decoded_clips(&[&decoded])
             .expect("Inkling audio preprocessing failed");
 
         assert_eq!(
@@ -172,7 +172,7 @@ fn inkling_vision_preprocess_matches_checked_in_golden() {
         let processor =
             InklingImageProcessor::from_preprocessor_config(&config).expect("valid config");
         let result = processor
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .expect("Inkling vision preprocessing failed");
 
         assert_eq!(

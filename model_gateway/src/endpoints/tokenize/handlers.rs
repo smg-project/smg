@@ -111,7 +111,7 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
             }
         };
 
-        let token_ids: Vec<u32> = encoding.token_ids().to_vec();
+        let token_ids: Vec<u32> = encoding.into_token_ids();
         let count = token_ids.len() as i32;
 
         all_tokens.push(token_ids);

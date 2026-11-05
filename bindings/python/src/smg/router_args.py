@@ -424,7 +424,6 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
-    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
@@ -656,7 +655,8 @@ class RouterArgs:
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one (or, for a cache-aware
-    # prefill pool of a prefill/decode pair, by its policy)
+    # prefill pool of a prefill/decode pair or a regular request that
+    # consistent_hashing places by its routing key, by its policy)
     worker_overload_shed: bool = False
     # Absolute per-worker overload thresholds (token usage, waiting requests), as
     # the Rust CLI defaults them; None switches one signal off
@@ -884,6 +884,27 @@ class RouterArgs:
             default=RouterArgs.admin_host,
             help="Bind host of the admin listener (needs --admin-port). Defaults to --host.",
         )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.worker_startup_timeout_secs,
+            help=(
+                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
+                " Large models can take significant time to load into GPU memory."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-delay",
+            type=int,
+            default=RouterArgs.worker_startup_delay,
+            help="Grace period in seconds before the first worker startup check (default: 0)",
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-startup-check-interval",
+            type=int,
+            default=RouterArgs.worker_startup_check_interval,
+            help="Interval in seconds between checks for worker startup",
+        )
 
         # Routing policy configuration
         routing_group.add_argument(
@@ -988,16 +1009,6 @@ class RouterArgs:
             help=(
                 "Mean prefill tokens for least_load's in-flight estimate when a"
                 " request's token count is unknown at routing"
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}least-load-max-waiting-requests",
-            type=int,
-            default=RouterArgs.least_load_max_waiting_requests,
-            help=(
-                "Per-worker waiting-queue cap for least_load: skip workers whose"
-                " reported waiting requests (plus dispatches since their last"
-                " poll) have reached this count; 0 disables"
             ),
         )
         routing_group.add_argument(
@@ -1116,7 +1127,9 @@ class RouterArgs:
                 " request goes to the least-loaded one (see"
                 " --worker-overload-shed). Unless --worker-overload-shed is"
                 " set, a cache-aware prefill pool of a prefill/decode pair is"
-                " not steered by the thresholds: its spill gate balances it."
+                " not steered by the thresholds: its spill gate balances it;"
+                " nor is a regular request that consistent_hashing places by"
+                " its routing key, which stays on its ring owner."
                 " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
@@ -1170,7 +1183,9 @@ class RouterArgs:
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
                 " use is overloaded, instead of routing it to the least-loaded one"
-                " (or, for a cache-aware prefill pool, by its policy); also sheds"
+                " (or, for a cache-aware prefill pool or a regular request that"
+                " consistent_hashing places by its routing key, by its policy);"
+                " also sheds"
                 " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
             ),
@@ -1568,27 +1583,6 @@ class RouterArgs:
                 "Maximum time in seconds a request may wait for Prefill admission."
                 " Defaults to 60 when Prefill admission is enabled."
             ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-timeout-secs",
-            type=int,
-            default=RouterArgs.worker_startup_timeout_secs,
-            help=(
-                "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
-                " Large models can take significant time to load into GPU memory."
-            ),
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-delay",
-            type=int,
-            default=RouterArgs.worker_startup_delay,
-            help="Grace period in seconds before the first worker startup check (default: 0)",
-        )
-        pd_group.add_argument(
-            f"--{prefix}worker-startup-check-interval",
-            type=int,
-            default=RouterArgs.worker_startup_check_interval,
-            help="Interval in seconds between checks for worker startup",
         )
         parser.add_argument(
             f"--{prefix}job-queue-capacity",
@@ -2302,7 +2296,11 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
-            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+            help=(
+                "Cap on the distinct tenants the scheduler's clamp and unknown-priority "
+                "counters keep as tenant series of their own (the first N seen; the remainder "
+                'bucket under tenant="other").'
+            ),
         )
 
         # Tenant rate limit configuration
@@ -2631,11 +2629,12 @@ class RouterArgs:
             f"--{prefix}runtime",
             type=str,
             default=RouterArgs.backend,
-            choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
+            choices=["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"],
             help=(
                 "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
                 "workers' engine and pins the wire protocol (it cannot be auto-detected): "
-                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers. "
+                "openai, anthropic and gemini select that provider's route"
             ),
         )
         backend_group.add_argument(

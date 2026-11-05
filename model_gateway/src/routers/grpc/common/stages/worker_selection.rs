@@ -10,6 +10,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use openai_protocol::profile::ProviderProfile;
 use tracing::{debug, error, warn};
 
 use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
@@ -345,13 +346,14 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
+        provider: Option<ProviderProfile>,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new(prep, &input.request_type)
+            ContextRequirements::new_for(prep, &input.request_type, provider)
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
@@ -489,6 +491,7 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
+            ctx.state.provider,
         );
         ctx.state.sticky_key = self
             .policy_registry
@@ -2172,7 +2175,7 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
-        observability::logging::test_support::test_subscriber,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{
@@ -2188,16 +2191,10 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
+            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+            PrefillReservation, WorkerLoadGuard,
         },
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn retry_after(response: &Response) -> Option<&str> {
         response
@@ -6192,28 +6189,6 @@ mod tests {
     }
 
     // ---- the refusal line of a drained pool -------------------------------------------------
-
-    /// Counts, on this thread's subscriber, the ERROR events and the stage's
-    /// refusal lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
 
     /// A model whose only worker is down is refused with the
     /// `no_available_workers` 503, marked as reported for the loggers

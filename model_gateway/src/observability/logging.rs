@@ -752,7 +752,10 @@ where
 /// Logging helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use tracing::{subscriber::DefaultGuard, Dispatch, Level};
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
@@ -827,6 +830,30 @@ pub(crate) mod test_support {
                 .lock()
                 .expect("lines")
                 .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    /// Counts, on this thread's subscriber, the ERROR events and the refusal
+    /// lines (the events carrying a `suppressed` field): what a router's tests
+    /// read to prove a refusal is written at WARN within the allowance, never
+    /// at ERROR.
+    pub(crate) struct RefusalLineCounter {
+        pub(crate) errors: Arc<AtomicUsize>,
+        pub(crate) refusal_lines: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for RefusalLineCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == Level::ERROR {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if event.metadata().fields().field("suppressed").is_some() {
+                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }

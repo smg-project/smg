@@ -316,12 +316,17 @@ pub(crate) trait LoadSource: Send + Sync {
 /// differs by wire; [`LoadFromState`] adds the half every wire shares.
 pub(crate) trait RankLoads: Send + Sync {
     /// The record for `dp_rank` (`None`: a publisher that names no rank)
-    /// without the engine link's liveness fields, or `None` while the engine
-    /// has reported nothing.
+    /// without the engine link's liveness fields: a connected rank's last
+    /// figures, zero-filled until its first batch; `None` while the engine
+    /// is not connected or for a rank past the connected ones.
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
 
     /// The engine link whose liveness the record carries.
     fn engine_link(&self) -> &EngineLink;
+
+    /// The data-parallel ranks the servicer serves now (`Shared::rank_count`):
+    /// how many records a records-only stream reports per tick.
+    fn rank_count(&self) -> usize;
 }
 
 /// The relay's load source over a servicer state, held weakly (the relay
@@ -345,9 +350,15 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: any queue, running or window change, KV usage by half a percent,
-/// the rate by 5 % or 50 tokens per second.
-fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.running_requests != current.running_requests
+/// either throughput by 5 % or 50 tokens per second, or measured input
+/// capacity appearing/disappearing.
+pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+    let prefill_changed = match (last.prefill_throughput, current.prefill_throughput) {
+        (Some(last), Some(current)) => throughput_changed(last, current),
+        (None, None) => false,
+        _ => true,
+    };
+    prefill_changed || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
@@ -356,15 +367,18 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             - current.active_token_usage.unwrap_or(current.token_usage))
         .abs()
             > 0.005
-        || {
-            let delta = (last.gen_throughput - current.gen_throughput).abs();
-            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
-        }
+        || throughput_changed(last.gen_throughput, current.gen_throughput)
         // A growing engine silence goes out once a second, so a subscriber's
         // wedge bound is met within a second of the engine crossing it.
         || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
         || last.engine_reports_steps != current.engine_reports_steps
         || last.prefill_pending_tokens != current.prefill_pending_tokens
+}
+
+/// Ignore rate noise while publishing meaningful absolute or relative movement.
+fn throughput_changed(last: f64, current: f64) -> bool {
+    let delta = (last - current).abs();
+    delta > 50.0 || delta > 0.05 * last.max(current)
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
@@ -1102,7 +1116,7 @@ enum SnapshotPhase {
 }
 
 /// Seconds since the Unix epoch, the way the engines stamp their batches.
-fn unix_seconds() -> f64 {
+pub(crate) fn unix_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())

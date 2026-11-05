@@ -144,18 +144,27 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
+    /// Decode the batch and retain its engine timestamp on each local output.
     fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
-                outputs: batch.outputs,
+                outputs: batch
+                    .outputs
+                    .into_iter()
+                    .map(|mut output| {
+                        output.batch_timestamp = Some(batch.timestamp);
+                        output
+                    })
+                    .collect(),
                 finished_request_ids: batch
                     .finished_requests
                     .map(|ids| ids.into_iter().collect())
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(EngineLoad::from),
+                kv_transfer: batch.kv_transfer,
                 wave: None,
                 utility: None,
             }),

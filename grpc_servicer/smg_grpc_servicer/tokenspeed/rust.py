@@ -1,27 +1,34 @@
-"""The Rust request path of the TokenSpeed gRPC servicer, behind one flag.
+"""The Rust request path of the TokenSpeed gRPC servicer, the launcher's default.
 
-``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) serves
+``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) served
 ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` from Python over TokenSpeed's
-in-process ``AsyncLLM``. With ``--servicer-impl rust`` (this package's flag on
-that launcher, see :func:`add_servicer_impl_argument`;
-``SMG_TOKENSPEED_SERVICER_IMPL=rust`` is the fallback the flag overrides) the
-same entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM``
-or a Python gRPC server exists: the contract is served by the Rust
+in-process ``AsyncLLM``. Unless ``--servicer-impl python`` (this package's flag
+on that launcher, see :func:`add_servicer_impl_argument`;
+``SMG_TOKENSPEED_SERVICER_IMPL`` is the fallback the flag overrides) selects
+that path, the same entrypoint hands the process to :func:`serve_rust` before
+an ``AsyncLLM`` or a Python gRPC server exists: the contract is served by the Rust
 :class:`smg.servicer.TokenSpeedGrpcServer` on a Rust-owned thread, and the
 scheduler rank processes are started from this same process (the way
 TokenSpeed's own ``launch_scheduler_headless``, what ``ts serve --headless``
 runs, starts them), dialing the servicer's same-host msgpack ZMQ handshake.
 Python keeps the lifecycle only. The Router cannot tell the two
-implementations apart.
+implementations apart. This path is the default; the Python servicer is
+selected with ``--servicer-impl python`` / ``SMG_TOKENSPEED_SERVICER_IMPL=python``
+and is deprecated (the launcher logs its deprecation when it is chosen).
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling ride the wire's control call on a
 scheduler whose handshake declares its control reply, and answer UNIMPLEMENTED
-on one that does not; ranked ``top_logprobs`` and prompt logprobs are refused.
+on one that does not; ranked ``top_logprobs`` and prompt logprobs each ride to
+schedulers whose handshakes all declare that one's output columns, and are
+refused otherwise.
 Prefill/decode disaggregation is served: the request's bootstrap fields ride
 the wire as the Python servicer forwards them, and a prefill launch starts the
-engine's KV bootstrap server here as the engine's own frontend does
-(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way,
+engine's KV bootstrap server here, ahead of the ranks, on an engine whose PD
+registry hands the server class out (:func:`kv_bootstrap_server`); on an
+engine whose headless launcher hosts its own, the prefill launch is left to
+that launcher (:func:`prefill_bootstrap_server_is_the_launchers`). The EPD
+prefill side is served the same way,
 and the EPD encode role on an engine whose handshake lists the encode
 request: the Rust servicer mounts the encoder service and hands each
 ``Encode`` to the worker over the wire, the launcher adds the worker's own
@@ -127,9 +134,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     return _add_servicer_impl_argument(
         parser,
         help=(
-            "Which implementation serves the gRPC contract: the Python servicer (default) "
-            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
-            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            "Which implementation serves the gRPC contract: the Rust servicer (default; "
+            "smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) headless) or the "
+            f"deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust."
         ),
     )
 
@@ -149,7 +156,7 @@ def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when
     the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
-    python."""
+    rust."""
     return servicer_impl_source(args, environ)[0]
 
 
@@ -459,9 +466,10 @@ def _run_headless(server_args: Any) -> None:
 def launch_headless_scheduler(server_args: Any) -> EngineProcess:
     """Start TokenSpeed's headless launcher in a spawned child: a fresh
     interpreter that inherits no Rust thread and never consults the servicer
-    switch. Only the cases :func:`launch_scheduler_ranks` cannot serve go
-    this way: the child is a second full Python/torch process per engine
-    pod."""
+    switch. Only the cases :func:`launch_scheduler_ranks` cannot serve, and a
+    prefill launch whose KV bootstrap server the engine's launcher hosts
+    (:func:`prefill_bootstrap_server_is_the_launchers`), go this way: the
+    child is a second full Python/torch process per engine pod."""
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_run_headless, args=(server_args,), name="smg-headless-scheduler"
@@ -490,8 +498,11 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
     group's own handler takes its place and the servicer drains and exits
     through :func:`supervise`. The spawned launcher child is kept for a
     TokenSpeed that lacks these entry points (they are the launcher's own
-    internals) and for a caller off the main thread, where no handler can be
-    installed.
+    internals), for a caller off the main thread, where no handler can be
+    installed, and for a prefill launch whose KV bootstrap server the
+    engine's launcher hosts, which :meth:`TokenSpeedLauncher.launch` leaves
+    to that launcher before this function is reached
+    (:func:`prefill_bootstrap_server_is_the_launchers`).
     """
     if threading.current_thread() is not threading.main_thread():
         logger.info(
@@ -590,26 +601,51 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def prefill_bootstrap_server_is_the_launchers(server_args: Any) -> bool:
+    """Whether a prefill launch's KV bootstrap server is the engine's own
+    headless launcher's to host: the role is prefill and the engine's PD
+    registry hands no bootstrap server class out. Since the engine's Rust
+    control plane its launcher brings the server up itself ahead of the
+    ranks, and the registry lost the class at the same commit; before that
+    the registry hands the class out and no launcher hosts one. The
+    registry's class is the capability read, so neither kind of engine is
+    mistaken for the other."""
+    args = EngineConfigView(server_args).server_args
+    if args.disaggregation_mode != "prefill":
+        return False
+    pd_utils = importlib.import_module("tokenspeed.runtime.pd.utils")
+    return getattr(getattr(pd_utils, "KVClassType", None), "BOOTSTRAP_SERVER", None) is None
+
+
 def kv_bootstrap_server(server_args: Any) -> Any | None:
     """Start the engine's KV bootstrap server for a prefill launch and return
-    it; ``None`` for any other role.
+    it; ``None`` for any other role, and on an engine whose own headless
+    launcher hosts it (:func:`prefill_bootstrap_server_is_the_launchers`).
 
     Under prefill/decode disaggregation the prefill side hosts the rendezvous
     the decode side discovers its KV at (``--disaggregation-bootstrap-port``).
-    The engine's own frontend starts it when it is built, which the Python
-    servicer inherits; this path builds no frontend, so the launcher starts
-    the same class (the transfer backend's, through the engine's registry).
-    It must be up before the prefill ranks start: each rank registers with
-    it once, and a rank that misses it is a prefill no decode can find. The
-    server runs on its own thread and binds the port on every interface;
-    the launcher closes it when it ends."""
+    Who starts it is the engine's contract, not this launcher's launch path.
+    Since the engine's Rust control plane its headless launcher brings the
+    server up itself, and :meth:`TokenSpeedLauncher.launch` leaves a prefill
+    launch on such an engine to that launcher: one started here too would
+    bind the port twice. Before that the engine's frontend started it (which
+    the Python servicer inherits), a headless launch had none, and the
+    registry hands the class out: this launcher starts it, whichever way the
+    ranks start (from this process or through the engine's spawned launcher).
+    It must be up before the prefill ranks start: each rank registers with it
+    once, and a rank that misses it is a prefill no decode can find. The
+    server runs on its own thread and binds the port on every interface; the
+    launcher closes it when it ends."""
     args = EngineConfigView(server_args).server_args
-    if args.disaggregation_mode != "prefill":
+    if args.disaggregation_mode != "prefill" or prefill_bootstrap_server_is_the_launchers(
+        server_args
+    ):
         return None
-    from tokenspeed.runtime.pd.utils import KVClassType, TransferBackend, get_kv_class
-
-    backend = TransferBackend(args.disaggregation_transfer_backend)
-    server = get_kv_class(backend, KVClassType.BOOTSTRAP_SERVER)(args.disaggregation_bootstrap_port)
+    pd_utils = importlib.import_module("tokenspeed.runtime.pd.utils")
+    backend = pd_utils.TransferBackend(args.disaggregation_transfer_backend)
+    server = pd_utils.get_kv_class(backend, pd_utils.KVClassType.BOOTSTRAP_SERVER)(
+        args.disaggregation_bootstrap_port
+    )
     logger.info(
         "Bootstrap server started for disaggregation mode on port %s (%s transfer)",
         args.disaggregation_bootstrap_port,
@@ -639,12 +675,16 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
     engine that lists no encode request is never reached: the worker would
     wait in silence past its scheduler-startup bound (the engine rank's own
     start counts as its sign of life), SERVING nothing. The capability is read
-    off the installed engine (``zmq_wire.REQ_TYPE_ENCODE``,
-    the request-type byte the wire gained with the encode request). The other
-    roles pass; an engine that is not installed (the launcher's unit tests) is
-    left to the handshake-time check, while an installed engine whose wire
-    module does not import is refused by name (a broken engine would otherwise
-    wait in silence too)."""
+    off the installed engine's wire module: the encode role's own READY
+    builder (``zmq_wire.encode_ready_response``, the registration an encode
+    rank dials in with on an engine whose ranks run its Rust control plane,
+    where the encode request type lives in the wire crate, not in the Python
+    module), or the request-type byte of a wire whose Python side carries the
+    encode request itself (``zmq_wire.REQ_TYPE_ENCODE``). The other roles
+    pass; an engine that is not installed (the launcher's unit tests) is left
+    to the handshake-time check, while an installed engine whose wire module
+    does not import is refused by name (a broken engine would otherwise wait
+    in silence too)."""
     if EngineConfigView(server_args).server_args.disaggregation_mode != "encode":
         return
     try:
@@ -653,18 +693,19 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
         if getattr(error, "name", None) == "tokenspeed":
             return  # no engine installed (the launcher's unit tests)
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust cannot read the EPD encode capability off this engine "
-            f"build ({error}): its wire module does not import; run this worker on the Python "
-            f"servicer (unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
+            f"The Rust servicer cannot read the EPD encode capability off this engine "
+            f"build ({error}): its wire module does not import; run this worker on the "
+            f"deprecated Python servicer (--servicer-impl python / {SERVICER_IMPL_ENV}=python)"
         ) from None
-    if getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
+    registers_encode_role = getattr(zmq_wire, "encode_ready_response", None) is not None
+    if not registers_encode_role and getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
+            "The Rust servicer does not serve the EPD encode role on this engine build "
             "(disaggregation_mode='encode'): its direct msgpack wire carries no encode request, "
             "so the encode rank would never dial the servicer's handshake and the worker would "
             "wait in silence, serving nothing; run an engine whose wire carries the encode "
-            f"request, or this worker on the Python servicer (unset {SERVICER_IMPL_ENV} or pass "
-            "--servicer-impl python)"
+            "request, or this worker on the deprecated Python servicer (--servicer-impl python / "
+            f"{SERVICER_IMPL_ENV}=python)"
         )
 
 
@@ -717,7 +758,9 @@ class TokenSpeedLauncher(RustLauncher):
     # layer labels off it, the facts the rest.
     _cached_model_config: Any = None
     # The prefill side's KV bootstrap server (:func:`kv_bootstrap_server`),
-    # started right before the ranks and closed when the launcher ends.
+    # started before the ranks and closed when the launcher ends; ``None``
+    # for the other roles and on an engine whose headless launcher hosts its
+    # own.
     _bootstrap_server: Any = None
 
     def model_config(self, args: Any) -> Any:
@@ -743,9 +786,22 @@ class TokenSpeedLauncher(RustLauncher):
         return tokenizer_dir_for(args)
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
-        # Before the ranks: a prefill rank registers with the server once.
+        headless = headless_server_args(args, handshake_port=handshake_port)
+        if prefill_bootstrap_server_is_the_launchers(args):
+            # The engine's headless launcher hosts the prefill side's KV
+            # bootstrap server, so it starts the ranks, whatever entry points
+            # the engine has: ranks started from this process would have no
+            # server to register with. An in-process start on such an engine
+            # brings the engine's own server up first (the launcher follow-up).
+            logger.info(
+                "Scheduler launch left to TokenSpeed's headless launcher in a spawned process "
+                "(it hosts the prefill side's KV bootstrap server)"
+            )
+            return launch_headless_scheduler(headless)
+        # Before the ranks, whichever way they start: a prefill rank registers
+        # with the server once (``None`` for the other roles).
         self._bootstrap_server = kv_bootstrap_server(args)
-        return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+        return launch_scheduler_ranks(headless)
 
     async def serve(self, args: Any) -> int:
         try:

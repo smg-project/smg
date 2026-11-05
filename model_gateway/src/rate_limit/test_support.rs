@@ -47,7 +47,7 @@ impl RecordingBackend {
 
 #[async_trait]
 impl RateLimitBackend for RecordingBackend {
-    async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
         ReserveOutcome::Admitted
     }
 

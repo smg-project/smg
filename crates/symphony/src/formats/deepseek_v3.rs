@@ -552,7 +552,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                parameters: Some(
+                    value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },
@@ -572,7 +574,7 @@ mod tests {
             .payload();
         let one_call = value!({"type": "or", "elements": [{"type": "sequence", "elements": [
             {"type": "const_string", "value": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n"},
-            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "json_schema", "json_schema": tool.function.parameters_schema()},
             {"type": "const_string", "value": "```<｜tool▁call▁end｜>"},
         ]}]});
         let tag = |begin: &str| {

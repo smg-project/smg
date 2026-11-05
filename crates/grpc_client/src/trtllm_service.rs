@@ -80,6 +80,23 @@ impl TrtllmServiceClient {
     }
 
     crate::impl_get_tokenizer!();
+    /// `GetLoads`: the engine's load per data-parallel rank, the router's
+    /// fallback poll for the records it takes over `SubscribeKvEvents`.
+    pub async fn get_loads(
+        &self,
+        include: Vec<String>,
+    ) -> Result<proto::GetLoadsResponse, tonic::Status> {
+        debug!("Requesting TensorRT-LLM load metrics");
+        let request = Request::new(proto::GetLoadsRequest {
+            dp_rank: None,
+            include,
+        });
+        let mut client = self.client.clone();
+        let response = client.get_loads(request).await?;
+        debug!("TensorRT-LLM load metrics response received");
+        Ok(response.into_inner())
+    }
+
     crate::impl_subscribe_kv_events!();
 
     /// Build a TensorRT-LLM GenerateRequest from OpenAI ChatCompletionRequest
@@ -258,7 +275,7 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream.unwrap_or(false),
-            stop: vec![], // Does not pass through body.stop yet (follow-up fix)
+            stop: stop_strings(body.stop.as_ref()),
             stop_token_ids: vec![],
             ignore_eos: false,
             guided_decoding,
@@ -617,10 +634,127 @@ impl TrtllmServiceClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Proto → protocol type conversions (load metrics)
+// ---------------------------------------------------------------------------
+
+/// A rank's poll figures, field for field (the message mirrors the vLLM
+/// service's); the measured input capacity stays absent when the servicer
+/// reports none.
+impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+    fn from(load: proto::SchedulerLoad) -> Self {
+        Self {
+            dp_rank: load.dp_rank,
+            num_running_reqs: load.num_running_reqs,
+            num_waiting_reqs: load.num_waiting_reqs,
+            num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
+            num_total_reqs: load.num_total_reqs,
+            num_used_tokens: load.num_used_tokens,
+            max_total_num_tokens: load.max_total_num_tokens,
+            token_usage: load.token_usage,
+            gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
+            cache_hit_rate: load.cache_hit_rate,
+            utilization: load.utilization,
+            max_running_requests: load.max_running_requests,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
+    fn from(resp: proto::GetLoadsResponse) -> Self {
+        Self {
+            timestamp: resp.timestamp,
+            version: resp.version,
+            dp_rank_count: resp.dp_rank_count,
+            loads: resp.loads.into_iter().map(Into::into).collect(),
+            aggregate: None,
+            sampled_at: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channel::testing::refused_endpoint;
+
+    /// A poll's answer reaches the worker's report rank for rank, the
+    /// measured capacity included where the servicer reports one.
+    #[test]
+    fn a_get_loads_answer_converts_rank_for_rank() {
+        let response = proto::GetLoadsResponse {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            version: "1.0".into(),
+            dp_rank_count: 2,
+            loads: vec![
+                proto::SchedulerLoad {
+                    dp_rank: 0,
+                    num_running_reqs: 3,
+                    num_waiting_reqs: 1,
+                    num_total_reqs: 4,
+                    num_used_tokens: 640,
+                    max_total_num_tokens: 6_400,
+                    token_usage: 0.1,
+                    gen_throughput: 800.0,
+                    cache_hit_rate: 0.5,
+                    utilization: 0.1,
+                    max_running_requests: 32,
+                    num_waiting_uncached_tokens: 500,
+                    prefill_throughput: Some(12_000.0),
+                },
+                proto::SchedulerLoad {
+                    dp_rank: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        let loads = openai_protocol::worker::WorkerLoadResponse::from(response);
+        assert_eq!(
+            (
+                loads.dp_rank_count,
+                loads.loads.len(),
+                loads.version.as_str()
+            ),
+            (2, 2, "1.0")
+        );
+        let rank0 = &loads.loads[0];
+        assert_eq!(
+            (
+                rank0.dp_rank,
+                rank0.num_running_reqs,
+                rank0.num_waiting_reqs,
+                rank0.num_total_reqs
+            ),
+            (0, 3, 1, 4)
+        );
+        assert_eq!(
+            (
+                rank0.num_used_tokens,
+                rank0.max_total_num_tokens,
+                rank0.max_running_requests
+            ),
+            (640, 6_400, 32)
+        );
+        assert_eq!(
+            (
+                rank0.token_usage,
+                rank0.gen_throughput,
+                rank0.cache_hit_rate,
+                rank0.utilization
+            ),
+            (0.1, 800.0, 0.5, 0.1)
+        );
+        assert_eq!(
+            (rank0.num_waiting_uncached_tokens, rank0.prefill_throughput),
+            (500, Some(12_000.0))
+        );
+        assert_eq!(
+            (loads.loads[1].dp_rank, loads.loads[1].prefill_throughput),
+            (1, None)
+        );
+    }
 
     #[test]
     fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
@@ -782,6 +916,43 @@ mod tests {
         assert_eq!(disabled_cfg.top_k, None);
         // Default min_p (0.0) maps to None for the same reason.
         assert_eq!(disabled_cfg.min_p, None);
+    }
+
+    #[tokio::test]
+    async fn a_responses_request_s_stop_sequences_reach_the_engine_request() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // A client over a lazy channel nothing listens on (made under the
+        // runtime a channel needs): the builders dial nothing.
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+        };
+        let build = |request: &ResponsesRequest| {
+            client
+                .build_generate_request_from_responses(
+                    "r".to_string(),
+                    request,
+                    String::new(),
+                    vec![1],
+                    None,
+                )
+                .expect("build request")
+        };
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(build(&request).stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        assert!(build(&ResponsesRequest::default()).stop.is_empty());
     }
 
     #[tokio::test]

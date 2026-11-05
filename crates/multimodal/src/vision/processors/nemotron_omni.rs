@@ -372,7 +372,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess_with_context(images, &VisionPreprocessingContext::default())
     }
@@ -383,7 +383,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
     )]
     fn preprocess_with_context(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
@@ -539,8 +539,9 @@ mod tests {
     /// than refused.
     #[test]
     fn a_token_budget_shrinks_the_images_it_cannot_fit() {
-        let images = vec![DynamicImage::new_rgb8(640, 480); 2];
-        let preprocess = |images: &[DynamicImage], token_budget| {
+        let owned = vec![DynamicImage::new_rgb8(640, 480); 2];
+        let images: Vec<&DynamicImage> = owned.iter().collect();
+        let preprocess = |images: &[&DynamicImage], token_budget| {
             NemotronOmniProcessor::new()
                 .preprocess_with_context(images, &VisionPreprocessingContext { token_budget })
                 .unwrap()

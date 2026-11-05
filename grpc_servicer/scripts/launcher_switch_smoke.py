@@ -86,9 +86,10 @@ class Case:
 
     @property
     def label(self) -> str:
-        how = {"env": "SMG_VLLM_SERVICER_IMPL=rust", "flag": "--servicer-impl rust"}.get(
-            self.selection, "default"
-        )
+        how = {
+            "env": f"SMG_VLLM_SERVICER_IMPL={self.impl}",
+            "flag": f"--servicer-impl {self.impl}",
+        }.get(self.selection, "default")
         entry = f"python -m {self.launcher}" if self.form == "module" else "vllm serve --grpc"
         return f"{entry} [{how}]"
 
@@ -124,16 +125,19 @@ def launcher_modules_installed() -> list[str]:
 def cases_for(launchers: list[str], selections: tuple[str, ...]) -> list[Case]:
     """The matrix: ``python -m`` on every launcher module present, and the
     CLI's import of the newest one (what ``vllm serve --grpc`` imports on that
-    release), each with the Rust selections asked for and the Python default."""
+    release), each with the Rust default and, for every selection asked for,
+    Rust and the deprecated Python servicer selected that way."""
     cases = []
     for launcher in launchers:
+        cases.append(Case("module", launcher, "rust", "default"))
         for selection in selections:
             cases.append(Case("module", launcher, "rust", selection))
-        cases.append(Case("module", launcher, "python", "default"))
+            cases.append(Case("module", launcher, "python", selection))
     if launchers:
+        cases.append(Case("cli", launchers[0], "rust", "default"))
         for selection in selections:
             cases.append(Case("cli", launchers[0], "rust", selection))
-        cases.append(Case("cli", launchers[0], "python", "default"))
+            cases.append(Case("cli", launchers[0], "python", selection))
     return cases
 
 

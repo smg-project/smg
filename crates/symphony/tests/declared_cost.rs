@@ -6,8 +6,10 @@
 //! copy, the held bytes joined to it; inside a streamed call, a delta of the call's arguments the
 //! JSON syntax passes on whole allocates nothing of its own either, its fragment borrows the delta
 //! (the assembler's own copy of the call's bytes still grows by doubling as the value lengthens,
-//! the one cost that remains, outside the pin). A separate executable, so it can declare the
-//! counting allocator the pins need.
+//! the one cost that remains, outside the pin). What a tagged syntax still pays is pinned too: a
+//! delta of a string argument costs two strings today, the escaped text and its source, a count
+//! held so that the change which removes them flips the pin in the same commit. A separate
+//! executable, so it can declare the counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -77,7 +79,7 @@ fn tools() -> Arc<[Tool]> {
             function: Function {
                 name: format!("lookup_{k}"),
                 description: Some(filler.clone()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "key": {"type": "string", "description": "the record key"},
@@ -92,7 +94,7 @@ fn tools() -> Arc<[Tool]> {
                         }
                     },
                     "required": ["key"]
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -290,6 +292,221 @@ fn a_delta_of_a_calls_arguments_read_whole_allocates_nothing() {
             Some(Event::Finish { tool_calls: 1, .. })
         ),
         "the output ends with its one call counted: {:?}",
+        out.as_slice()
+    );
+}
+
+/// A tagged syntax writes the call's JSON itself, so every streamed piece of a string argument
+/// is written as its escaped text and carried as its own source: two strings per delta today,
+/// where the JSON syntax's fragments borrow the delta. The pin holds that count, so the change
+/// that lets the tagged assembler's pieces borrow the delta flips it to zero in the same commit,
+/// and a third copy cannot arrive unnoticed. The attributed, keyed and XML assemblers write their
+/// strings through the same object.
+#[test]
+fn a_delta_of_a_tagged_calls_string_argument_costs_two_strings_today() {
+    let mut engine = Engine::new(Table::Qwen3Tagged.format(), Declared::shared(tools()));
+    let mut out = Events::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: "<|im_start|>assistant\n",
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    black_box(out.drain());
+    // The call's opener, the function and the parameter tags, and the value's first bytes: the
+    // start's events, the member's opening fragment and the buffers take their capacity here.
+    for text in [
+        "Let me look that up.\n",
+        "<tool_call>\n",
+        "<function=lookup_0>\n",
+        "<parameter=key>\n",
+        "k7-1",
+    ] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    // The string argument streams in deltas of four bytes, 2,000 bytes in all; the first few are
+    // warm-up, the rest are the pin. No delta ends in a byte that could begin a tag or in the
+    // newline the template puts before the closing tag, so each streams whole.
+    let piece = "abcd";
+    let mut costs = Vec::with_capacity(500);
+    for _ in 0..500 {
+        costs.push(allocations_for_delta(&mut engine, &mut out, piece));
+    }
+    let steady = &costs[4..];
+    assert!(
+        steady.iter().all(|&cost| cost == 2),
+        "the deltas of a tagged call's string argument allocated {:?} times (the first four \
+         {:?}): today each piece is written as one escaped JSON string and carried as one source \
+         string, two allocations per delta where the JSON syntax's fragment borrows the delta; \
+         pieces that borrow the delta take this to 0",
+        steady
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        &costs[..4]
+    );
+    // One more piece, read for its shape: one fragment, the escaped text and its source both
+    // owned, which is where the two strings go.
+    let mut events = std::mem::take(&mut out);
+    engine
+        .feed(
+            Input::Delta {
+                token_ids: &[],
+                text: piece,
+                spans: &[],
+            },
+            &mut events,
+        )
+        .expect("the delta is taken");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Event::ToolCallArguments { json: Cow::Owned(json), source, .. }]
+                if json == piece && matches!(&source.text, Cow::Owned(bytes) if bytes == piece)
+        ),
+        "the arguments delta {piece:?} gave {:?}: one fragment, its text and its source each a \
+         string of its own",
+        events.as_slice()
+    );
+    out = events.recycle();
+    for text in ["\n</parameter>\n", "</function>\n", "</tool_call>"] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    assert!(
+        matches!(
+            out.as_slice().last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ),
+        "the output ends with its one call counted: {:?}",
+        out.as_slice()
+    );
+}
+
+/// What a delta of text cut before a marker the table keeps as text allocates today: the
+/// marker's own text, once; the cut text's event borrows the delta.
+const PIN_CUT_TEXT_CALLS: usize = 1;
+
+/// A delta the scanner cuts, text before a marker: the text piece is a slice of the delta,
+/// and its event borrows it, as a delta read as text whole does; what the delta still pays is
+/// the marker's own text where the table keeps the marker as text (the table's bytes, which no
+/// event can borrow), one allocation.
+#[test]
+fn text_the_scanner_cuts_before_a_marker_keeps_its_borrow_of_the_delta() {
+    let mut engine = Engine::new(Table::Qwen3.format(), Declared::of(&[]));
+    let mut out = Events::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: "<|im_start|>assistant\n",
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    black_box(out.drain());
+    // The answer begins; then a thought's closer where no thought is open, which the table
+    // leaves as text after the text before it: the scan cuts the delta in two. The first
+    // deltas take the buffers' capacity; the pin reads a later one.
+    allocations_for_delta(&mut engine, &mut out, "The answer: ");
+    let mut costs = Vec::with_capacity(4);
+    for _ in 0..4 {
+        costs.push(allocations_for_delta(
+            &mut engine,
+            &mut out,
+            "more text</think>",
+        ));
+    }
+    let cut = costs[3];
+    assert_eq!(
+        cut,
+        PIN_CUT_TEXT_CALLS,
+        "a delta of text cut before a marker the table keeps as text allocated {cut} times \
+         (the first ones {:?}): the cut text's event borrows the delta, and the marker's own \
+         text, the table's, is copied once; a copy of the cut text takes this to one more",
+        &costs[..3]
+    );
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    black_box(out.drain());
+}
+
+/// What a call's open (at the end of a text delta), its three argument deltas and its close
+/// allocate today, delta by delta: the call's id and its start's events, the fragments the JSON
+/// syntax owns as the value grows, the close's events; the text cut before the opener is
+/// borrowed.
+const PIN_CALL_BOUNDARY_CALLS: [usize; 5] = [4, 4, 7, 2, 2];
+
+/// A call opened at the end of a text delta, fed its arguments in three deltas and closed:
+/// what each delta allocates is the call's own (its id, its name, the fragments the syntax
+/// owns), never a copy of the text the scan cut before the opener.
+#[test]
+fn a_call_boundary_allocates_the_calls_own_and_no_copy_of_the_cut_text() {
+    let mut engine = Engine::new(Table::Qwen3.format(), Declared::shared(tools()));
+    let mut out = Events::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: "<|im_start|>assistant\n",
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    black_box(out.drain());
+    let turn = [
+        "Let me look that up.<tool_call>",
+        "\n{\"name\": \"lookup_0\", ",
+        "\"arguments\": {\"key\": \"k7\"",
+        "}}\n",
+        "</tool_call>",
+    ];
+    // Two calls warm the buffers (the event list, the scanner's, the assembler's); the third
+    // call is read.
+    let mut costs = [[0usize; 5]; 3];
+    for call in &mut costs {
+        for (delta, text) in call.iter_mut().zip(turn) {
+            *delta = allocations_for_delta(&mut engine, &mut out, text);
+        }
+    }
+    assert_eq!(
+        costs[2], PIN_CALL_BOUNDARY_CALLS,
+        "a call's open, three argument deltas and close allocated {:?} times (the two calls \
+         before {:?}, {:?}): the text cut before the opener is borrowed, the call's own id and \
+         name and the fragments the syntax owns are what remains; a copy of the cut text and a \
+         fresh event list for the start's events take the open's count from 4 to 6",
+        costs[2], costs[0], costs[1]
+    );
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    assert!(
+        matches!(
+            out.as_slice().last(),
+            Some(Event::Finish { tool_calls: 3, .. })
+        ),
+        "the output ends with its three calls counted: {:?}",
         out.as_slice()
     );
 }

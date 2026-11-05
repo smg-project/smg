@@ -6,11 +6,21 @@
 //! instances is roughly N× the configured value. Exact cluster-wide
 //! enforcement is out of scope for this backend — that's what a future
 //! `External` (distributed) backend behind the same trait is for.
+//!
+//! A bucket is created on a tenant key's first request and every client IP
+//! is its own tenant key, so a periodic sweep drops buckets nobody is using
+//! (see `LocalRateLimitBackend::sweep_idle_buckets`); without it the map
+//! grows with every distinct client for the life of the process.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
@@ -20,6 +30,16 @@ use super::{
 };
 use crate::tenant::TenantKey;
 
+/// How long a bucket must go untouched before the sweep may drop it. The
+/// sweep also requires the bucket to have refilled to capacity, so this is
+/// not what keeps eviction from forgiving usage; it keeps a tenant that
+/// comes back every few minutes on the bucket it already has. At least one
+/// refill window (60s), the time an emptied bucket takes to refill.
+const IDLE_BUCKET_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// How often the sweep runs.
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 enum ScopeKey {
     TenantGlobal(TenantKey),
@@ -27,11 +47,21 @@ enum ScopeKey {
 }
 
 /// What was actually debited for a reservation, kept around so
-/// settle/close/abandon know which scopes to touch (and, for settlement,
-/// how much to true up).
+/// settle/close/abandon know which buckets to touch (and, for settlement,
+/// how much to true up): the tenant-global bucket, and the model rule's
+/// when one matched. Holding the buckets' `Arc`s is also what keeps the
+/// idle sweep off them until the reservation ends.
 struct ActiveReservation {
-    scopes: Vec<ScopeKey>,
+    global: Arc<ScopeBucket>,
+    rule: Option<Arc<ScopeBucket>>,
     reserved_tokens: u32,
+}
+
+impl ActiveReservation {
+    /// The buckets debited, in lock order.
+    fn buckets(&self) -> impl Iterator<Item = &Arc<ScopeBucket>> {
+        std::iter::once(&self.global).chain(self.rule.iter())
+    }
 }
 
 pub struct LocalRateLimitBackend {
@@ -51,17 +81,121 @@ impl LocalRateLimitBackend {
         }
     }
 
+    /// The backend, with its idle sweep running every
+    /// `IDLE_SWEEP_INTERVAL` on the current Tokio runtime. `Err` outside
+    /// a runtime.
+    pub fn start(policy: CompiledPolicySet) -> Result<Arc<Self>, String> {
+        Self::start_with_sweep(policy, IDLE_SWEEP_INTERVAL, IDLE_BUCKET_TTL)
+    }
+
+    fn start_with_sweep(
+        policy: CompiledPolicySet,
+        interval: Duration,
+        idle_ttl: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("tenant rate limiting needs a Tokio runtime for its idle-bucket sweep: {error}")
+        })?;
+        let backend = Arc::new(Self::new(policy));
+        let weak = Arc::downgrade(&backend);
+        // Holds only a Weak<Self> between sweeps and exits within one
+        // interval of the backend being dropped. Nothing waits for the task
+        // at shutdown; a sweep already on the blocking pool delays the
+        // runtime's drop by at most its own run.
+        runtime.spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick completes immediately
+            loop {
+                tick.tick().await;
+                let Some(backend) = weak.upgrade() else {
+                    break;
+                };
+                // The scan is synchronous and grows with the number of
+                // buckets, so it runs on the blocking pool, not on a worker
+                // that serves requests.
+                let swept = tokio::task::spawn_blocking(move || {
+                    let evicted = backend.sweep_idle_buckets(idle_ttl);
+                    (evicted, backend.buckets.len())
+                })
+                .await;
+                match swept {
+                    Ok((0, _)) => {}
+                    Ok((evicted, remaining)) => {
+                        debug!(
+                            evicted,
+                            remaining, "tenant rate limiter dropped idle buckets"
+                        );
+                    }
+                    Err(error) => warn!(%error, "tenant rate limiter's idle-bucket sweep failed"),
+                }
+            }
+        });
+        Ok(backend)
+    }
+
     fn bucket_for(&self, key: ScopeKey, limits: ScopeLimits) -> Arc<ScopeBucket> {
+        // A shard read lock first: an existing bucket is the common case,
+        // and the sweep's scan holds shard read locks, which never make a
+        // reader wait.
+        if let Some(bucket) = self.buckets.get(&key) {
+            return Arc::clone(&bucket);
+        }
         self.buckets
             .entry(key)
             .or_insert_with(|| Arc::new(ScopeBucket::new(limits)))
             .clone()
     }
+
+    /// Drop every bucket that no reservation holds, that has gone untouched
+    /// for at least `idle_ttl`, and that has refilled to capacity; returns
+    /// how many were dropped. A dropped bucket is recreated full on its key's
+    /// next request, which is the state it was dropped in, so no usage is
+    /// forgiven (a bucket still paying off settlement debt is kept).
+    ///
+    /// Two passes, so no shard's write lock is held for more than one
+    /// entry. The first scans under shard read locks and only reads two
+    /// atomics per bucket to pick out the ones that look evictable: a
+    /// reserve of an existing bucket never waits on it, and one that
+    /// creates a bucket waits for at most the scan of its own shard. The
+    /// second evicts each candidate with `remove_if`, which re-checks
+    /// everything under the entry's shard write lock.
+    ///
+    /// That re-check is what makes the sweep race-free against `reserve`:
+    /// `bucket_for` clones the map's `Arc` under the same shard's read or
+    /// write lock, so a strong count of one there means no reserve holds the
+    /// bucket and none can take it before it is gone. A reserve that comes
+    /// after finds the slot vacant and starts a fresh bucket.
+    fn sweep_idle_buckets(&self, idle_ttl: Duration) -> usize {
+        let now = Instant::now();
+        let candidates: Vec<ScopeKey> = self
+            .buckets
+            .iter()
+            .filter(|entry| {
+                Arc::strong_count(entry.value()) == 1 && entry.value().idle_at(now) >= idle_ttl
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        candidates
+            .iter()
+            .filter(|key| {
+                self.buckets
+                    .remove_if(*key, |_, bucket| {
+                        // `is_full` takes the bucket's lock, which nothing
+                        // else can hold once the count is one.
+                        Arc::strong_count(bucket) == 1
+                            && bucket.idle_at(Instant::now()) >= idle_ttl
+                            && bucket.is_full()
+                    })
+                    .is_some()
+            })
+            .count()
+    }
 }
 
 #[async_trait]
 impl RateLimitBackend for LocalRateLimitBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         // Idempotent per request_charge_id: a retry reuses the same
         // charge_id and must not be debited twice. Claim the slot before
         // any bucket work so a duplicate (even concurrent) call just
@@ -75,32 +209,31 @@ impl RateLimitBackend for LocalRateLimitBackend {
         let policy = self.policy.load();
         let tenant_policy = policy.policy_for(&request.tenant_key);
 
-        let mut scopes: Vec<(ScopeKey, Arc<ScopeBucket>)> = Vec::with_capacity(2);
+        // The tenant-global bucket, and the model rule's when one matches:
+        // at most two, held as a pair.
         let global_key = ScopeKey::TenantGlobal(request.tenant_key.clone());
-        let global_bucket = self.bucket_for(global_key.clone(), tenant_policy.limits);
-        scopes.push((global_key, global_bucket));
-
-        if let Some(model_id) = request.model_id.as_deref() {
-            if let Some(rule) = tenant_policy.matching_rule(model_id) {
+        let global = self.bucket_for(global_key, tenant_policy.limits);
+        let rule = request
+            .model_id
+            .and_then(|model_id| tenant_policy.matching_rule(model_id))
+            .map(|rule| {
                 let rule_key =
                     ScopeKey::ModelRule(request.tenant_key.clone(), rule.rule_id.clone());
-                let rule_bucket = self.bucket_for(rule_key.clone(), rule.limits);
-                scopes.push((rule_key, rule_bucket));
-            }
-        }
+                self.bucket_for(rule_key, rule.limits)
+            });
 
         // Fixed lock order (tenant-global, then model-rule): every
         // reservation for the same tenant locks in this same order, so
         // this can never deadlock. Different tenants never share a bucket,
-        // so cross-tenant ordering doesn't matter.
-        let mut locked: Vec<_> = scopes.iter().map(|(_, b)| (b, b.lock())).collect();
-        for (bucket, guard) in &mut locked {
-            bucket.refill(guard);
-        }
+        // so cross-tenant ordering doesn't matter. Each lock refills its
+        // bucket from the clock read that stamps the touch.
+        let mut global_guard = global.lock_and_refill();
+        let mut rule_guard = rule.as_ref().map(|bucket| bucket.lock_and_refill());
 
         let tokens_needed = f64::from(request.estimated_input_tokens);
         let mut denied_retry_after: Option<u64> = None;
-        for (bucket, guard) in &locked {
+        let locked = std::iter::once((&global, &global_guard)).chain(rule.iter().zip(&rule_guard));
+        for (bucket, guard) in locked {
             let dry = bucket.dry_run(guard, tokens_needed, 1.0);
             if !dry.allowed {
                 denied_retry_after =
@@ -112,13 +245,16 @@ impl RateLimitBackend for LocalRateLimitBackend {
             return ReserveOutcome::Denied { retry_after_secs };
         }
 
-        for (bucket, guard) in &mut locked {
+        global.debit(&mut global_guard, tokens_needed, 1.0);
+        if let (Some(bucket), Some(guard)) = (&rule, rule_guard.as_mut()) {
             bucket.debit(guard, tokens_needed, 1.0);
         }
-        drop(locked);
+        drop(global_guard);
+        drop(rule_guard);
 
         active_entry.insert(ActiveReservation {
-            scopes: scopes.into_iter().map(|(k, _)| k).collect(),
+            global,
+            rule,
             reserved_tokens: request.estimated_input_tokens,
         });
 
@@ -132,14 +268,11 @@ impl RateLimitBackend for LocalRateLimitBackend {
         let actual_total =
             i64::from(usage.actual_input_tokens) + i64::from(usage.completion_tokens);
         let delta = (actual_total - i64::from(reservation.reserved_tokens)) as f64;
-        for key in &reservation.scopes {
-            if let Some(bucket) = self.buckets.get(key) {
-                let mut guard = bucket.lock();
-                // Refill first, or a later deferred refill can overshoot
-                // capacity and clamp, silently erasing this delta.
-                bucket.refill(&mut guard);
-                bucket.settle_tokens(&mut guard, delta);
-            }
+        for bucket in reservation.buckets() {
+            // Refilled first, or a later deferred refill can overshoot
+            // capacity and clamp, silently erasing this delta.
+            let mut guard = bucket.lock_and_refill();
+            bucket.settle_tokens(&mut guard, delta);
         }
     }
 
@@ -179,7 +312,7 @@ mod tests {
         CompiledPolicySet::compile(&yaml).unwrap()
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest {
+    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
         ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new(tenant),
@@ -383,7 +516,7 @@ mod tests {
         let req = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("gpt-4".to_string()),
+            model_id: Some("gpt-4"),
             estimated_input_tokens: 40,
         };
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
@@ -394,7 +527,7 @@ mod tests {
         let second = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("gpt-4".to_string()),
+            model_id: Some("gpt-4"),
             estimated_input_tokens: 20,
         };
         assert!(matches!(
@@ -407,9 +540,279 @@ mod tests {
         let other_model = ReserveRequest {
             request_charge_id: Uuid::now_v7(),
             tenant_key: TenantKey::new("auth:team-red"),
-            model_id: Some("claude-3".to_string()),
+            model_id: Some("claude-3"),
             estimated_input_tokens: 20,
         };
         assert_eq!(backend.reserve(other_model).await, ReserveOutcome::Admitted);
+    }
+
+    /// Refills a token in ~0.1ms and a request in ~1ms, so a bucket a
+    /// one-token reservation drew on is full again a few milliseconds later.
+    fn fast_refill_policy() -> CompiledPolicySet {
+        policy_set(600_000, 60_000)
+    }
+
+    #[tokio::test]
+    async fn sweep_drops_an_idle_full_bucket_and_keeps_a_recent_one() {
+        let backend = LocalRateLimitBackend::new(fast_refill_policy());
+        let req = request("ip:203.0.113.7", 1);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+        backend.close_reserved_only(charge_id).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Full again, but touched more recently than the TTL.
+        assert_eq!(backend.sweep_idle_buckets(Duration::from_secs(3600)), 0);
+        assert_eq!(backend.buckets.len(), 1);
+
+        assert_eq!(backend.sweep_idle_buckets(Duration::from_millis(10)), 1);
+        assert!(backend.buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_never_drops_a_bucket_an_open_reservation_holds() {
+        let yaml = RateLimitYaml {
+            default_policy: TenantPolicySpec {
+                tenant_key: None,
+                tokens_per_minute: 600_000,
+                requests_per_minute: 60_000,
+                model_rules: vec![ModelRuleSpec {
+                    rule_id: "gpt4".to_string(),
+                    matcher: ModelMatcherSpec::Exact {
+                        value: "gpt-4".to_string(),
+                    },
+                    tokens_per_minute: 600_000,
+                    requests_per_minute: 60_000,
+                }],
+            },
+            tenants: Vec::new(),
+        };
+        let backend = LocalRateLimitBackend::new(CompiledPolicySet::compile(&yaml).unwrap());
+        let gpt4 = |tokens| ReserveRequest {
+            model_id: Some("gpt-4"),
+            ..request("ip:203.0.113.7", tokens)
+        };
+        let req = gpt4(1);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+
+        // Both scopes are idle and refilled: only the open reservation
+        // keeps them.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend.sweep_idle_buckets(Duration::ZERO), 0);
+        assert_eq!(backend.buckets.len(), 2);
+
+        // The settlement lands on the buckets the map still serves: twice
+        // the capacity over the reservation leaves both scopes in debt.
+        backend
+            .settle_success(
+                charge_id,
+                UsageSettlement {
+                    actual_input_tokens: 1,
+                    completion_tokens: 1_200_000,
+                    ..UsageSettlement::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            backend.reserve(gpt4(1)).await,
+            ReserveOutcome::Denied { .. }
+        ));
+        assert!(matches!(
+            backend.reserve(request("ip:203.0.113.7", 1)).await,
+            ReserveOutcome::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_a_bucket_in_settlement_debt() {
+        let backend = LocalRateLimitBackend::new(fast_refill_policy());
+        let req = request("ip:203.0.113.7", 1);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+        // A full refill window of debt beyond capacity: dropping the bucket
+        // now would forgive it.
+        backend
+            .settle_success(
+                charge_id,
+                UsageSettlement {
+                    actual_input_tokens: 1,
+                    completion_tokens: 1_200_000,
+                    ..UsageSettlement::default()
+                },
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend.sweep_idle_buckets(Duration::ZERO), 0);
+        assert_eq!(backend.buckets.len(), 1);
+        assert!(matches!(
+            backend.reserve(request("ip:203.0.113.7", 1)).await,
+            ReserveOutcome::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn evicted_bucket_comes_back_at_full_capacity() {
+        // 100 tokens/s: refills a one-token draw in ~10ms, but not a
+        // hundred tokens in the few milliseconds the rest of the test takes.
+        let backend = LocalRateLimitBackend::new(policy_set(6000, 60_000));
+        let req = request("ip:203.0.113.7", 1);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+        backend.close_reserved_only(charge_id).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend.sweep_idle_buckets(Duration::from_millis(10)), 1);
+        assert!(backend.buckets.is_empty());
+
+        assert_eq!(
+            backend.reserve(request("ip:203.0.113.7", 6000)).await,
+            ReserveOutcome::Admitted
+        );
+        assert_eq!(backend.buckets.len(), 1);
+        assert!(matches!(
+            backend.reserve(request("ip:203.0.113.7", 100)).await,
+            ReserveOutcome::Denied { .. }
+        ));
+    }
+
+    /// A reserve racing the sweep either takes the bucket first (and so
+    /// keeps the sweep off it) or finds it gone and starts a fresh one: an
+    /// admitted reservation always holds the bucket the map serves for its
+    /// key, never one the sweep removed out from under it.
+    ///
+    /// In rounds, so the sweep gets its evictions on any host: the reserve
+    /// threads hammer the key while the sweep passes back to back, then
+    /// park past their last close, and a pass over the parked bucket must
+    /// leave the map empty; the next round's reserves start it afresh
+    /// under the sweep. A free-running sweep has to find the bucket free
+    /// at its scan and again at its `remove_if`, which three reserve
+    /// threads allow a few times in a hundred passes on a many-core host,
+    /// where a pass over the map's many shards takes tens of microseconds,
+    /// so a floor of a thousand evictions it must win on its own is a
+    /// floor on the host's scheduling, not on the backend.
+    #[test]
+    fn a_reserve_racing_the_sweep_never_debits_a_removed_bucket() {
+        use std::{
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+            time::Instant,
+        };
+
+        use futures::FutureExt;
+
+        const TENANT: &str = "ip:203.0.113.7";
+        const RESERVE_THREADS: usize = 3;
+        const ROUNDS: usize = 1000;
+        const RESERVES_PER_ROUND: usize = 100;
+        // Refills a one-token draw in nanoseconds, so the bucket is full,
+        // and sweepable, almost whenever no reserve holds it.
+        let backend = LocalRateLimitBackend::new(policy_set(u32::MAX, u32::MAX));
+        let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
+        let stop = AtomicBool::new(false);
+        let parked = AtomicUsize::new(0);
+        let rounds = AtomicUsize::new(0);
+        // The rounds are a fixed amount of work; this bounds a starved run.
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    backend.sweep_idle_buckets(Duration::ZERO);
+                    if parked.load(Ordering::Acquire) == RESERVE_THREADS {
+                        // Every reserve thread is past its close, so nothing
+                        // holds the bucket and it has long refilled: this
+                        // pass, if not the one just made, drops it.
+                        backend.sweep_idle_buckets(Duration::ZERO);
+                        assert!(
+                            backend.buckets.is_empty(),
+                            "the sweep kept a full bucket no reservation holds"
+                        );
+                        parked.store(0, Ordering::Relaxed);
+                        rounds.fetch_add(1, Ordering::Release);
+                    }
+                    // A pass, then the core: on a host with fewer cores than
+                    // threads the reserve threads run between passes rather
+                    // than after the sweep's whole slice.
+                    std::thread::yield_now();
+                }
+            });
+            for _ in 0..RESERVE_THREADS {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let round = rounds.load(Ordering::Acquire);
+                        for _ in 0..RESERVES_PER_ROUND {
+                            let req = request(TENANT, 1);
+                            let charge_id = req.request_charge_id;
+                            // reserve/close never await, so one poll finishes them.
+                            let outcome = backend.reserve(req).now_or_never().unwrap();
+                            assert_eq!(outcome, ReserveOutcome::Admitted);
+                            {
+                                let held = backend.active.get(&charge_id).unwrap();
+                                let served = backend.buckets.get(&key);
+                                assert!(
+                                    served.is_some_and(|b| Arc::ptr_eq(&held.global, b.value())),
+                                    "an admitted reservation holds a bucket the map no longer serves"
+                                );
+                            }
+                            backend
+                                .close_reserved_only(charge_id)
+                                .now_or_never()
+                                .unwrap();
+                        }
+                        parked.fetch_add(1, Ordering::Release);
+                        while rounds.load(Ordering::Acquire) == round
+                            && !stop.load(Ordering::Relaxed)
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+            }
+            while rounds.load(Ordering::Relaxed) < ROUNDS && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        assert!(
+            rounds.load(Ordering::Relaxed) >= ROUNDS,
+            "the reserve threads and the sweep did not get through {ROUNDS} rounds in 10 s"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_backend_sweeps_on_its_own_and_does_not_outlive_its_owner() {
+        let backend = LocalRateLimitBackend::start_with_sweep(
+            fast_refill_policy(),
+            Duration::from_millis(20),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let req = request("ip:203.0.113.7", 1);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+        backend.close_reserved_only(charge_id).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !backend.buckets.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sweep task never dropped the idle bucket");
+
+        // The task holds only a Weak between sweeps, so the backend goes
+        // with its last owner once a sweep in flight on the blocking pool
+        // (which can outlast the emptying of the map) has returned.
+        let weak = Arc::downgrade(&backend);
+        drop(backend);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep task kept the backend alive after its owner dropped it");
     }
 }

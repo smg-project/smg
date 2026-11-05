@@ -176,7 +176,7 @@ async fn test_json_array_streaming_required_mode() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
+            parameters: Some(serde_json::json!({})),
             strict: None,
             extra: Default::default(),
         },
@@ -251,7 +251,7 @@ async fn test_json_array_multiple_tools_streaming() {
             function: openai_protocol::common::Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather".to_string()),
-                parameters: serde_json::json!({}),
+                parameters: Some(serde_json::json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -261,7 +261,7 @@ async fn test_json_array_multiple_tools_streaming() {
             function: openai_protocol::common::Function {
                 name: "get_news".to_string(),
                 description: Some("Get news".to_string()),
-                parameters: serde_json::json!({}),
+                parameters: Some(serde_json::json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -317,7 +317,7 @@ async fn test_json_array_closing_bracket_separate_chunk() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: json!({}),
+            parameters: Some(json!({})),
             strict: None,
             extra: Default::default(),
         },
@@ -378,7 +378,7 @@ async fn test_json_single_object_with_trailing_text() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
+            parameters: Some(serde_json::json!({})),
             strict: None,
             extra: Default::default(),
         },
@@ -432,7 +432,7 @@ async fn test_json_single_object_with_bracket_in_text() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
+            parameters: Some(serde_json::json!({})),
             strict: None,
             extra: Default::default(),
         },
@@ -484,7 +484,7 @@ async fn test_json_array_bracket_in_text_after_tools() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
+            parameters: Some(serde_json::json!({})),
             strict: None,
             extra: Default::default(),
         },

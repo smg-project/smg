@@ -199,7 +199,13 @@ pub(super) fn calls(
     };
     let invokes = tools
         .iter()
-        .map(|tool| writer.invoke(markers, &tool.function.name, &tool.function.parameters))
+        .map(|tool| {
+            writer.invoke(
+                markers,
+                &tool.function.name,
+                tool.function.parameters_schema(),
+            )
+        })
         .collect();
     // The block holds at least one invoke whether or not the request asks for a call: an empty
     // block is no answer.
@@ -452,7 +458,8 @@ mod tests {
         testing::{tool, weather_tools},
     };
 
-    const SEP: &str = "]<]minimax[>[";
+    /// MiniMax M3's separator before every tag, as its table spells it.
+    const SEP: &str = formats::minimax_m3::SEPARATOR;
 
     /// The markers that end a call wherever they stand, in the order of the table's rows.
     fn exits() -> Vec<&'static str> {

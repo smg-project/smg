@@ -2,8 +2,8 @@
 
 use openai_protocol::{
     common::{
-        ContextManagementType, Detail, PromptCacheRetention, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference,
+        to_value_exact, ContextManagementType, Detail, PromptCacheRetention,
+        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference,
     },
     responses::*,
 };
@@ -4841,4 +4841,36 @@ fn responses_response_echoes_tool_choice_as_sent() {
         json!("auto")
     );
     assert_eq!(echo(json!({"model": "m", "input": "hi"})), json!("auto"));
+}
+
+#[test]
+fn function_tool_round_trips_a_missing_schema_as_null() {
+    // The Responses API reference lists a function tool's `parameters` as
+    // required and nullable: a re-serialized body keeps the key and writes
+    // `null` for a schema the client did not give (absent or `null`), and the
+    // client's own `{}` as given.
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test-model", "input":"hi", "store":false,
+        "tools":[
+            {"type":"function", "name":"absent"},
+            {"type":"function", "name":"nulled", "description":"no schema", "parameters":null, "strict":false},
+            {"type":"function", "name":"empty", "parameters":{}}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        to_value_exact(&request).unwrap()["tools"],
+        json!([
+            {"type":"function", "name":"absent", "parameters":null},
+            {"type":"function", "name":"nulled", "description":"no schema", "parameters":null, "strict":false},
+            {"type":"function", "name":"empty", "parameters":{}}
+        ])
+    );
+    let tool: ResponseTool =
+        serde_json::from_value(json!({"type":"function", "name":"absent", "parameters":null}))
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(tool).unwrap(),
+        json!({"type":"function", "name":"absent", "parameters":null})
+    );
 }

@@ -435,10 +435,10 @@ fn weather() -> Declared {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: json!({"type": "object", "properties": {
+            parameters: Some(json!({"type": "object", "properties": {
                 "city": {"type": "string"},
                 "days": {"type": "integer"},
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -1200,7 +1200,7 @@ fn probe_tools() -> Vec<Tool> {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },

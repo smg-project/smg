@@ -264,7 +264,7 @@ impl VisionPreProcessor for InklingImageProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -399,7 +399,7 @@ mod tests {
         };
         let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
         let err = processor
-            .preprocess(&[test_image()])
+            .preprocess(&[&test_image()])
             .expect_err("must reject an image exceeding in_patch_limit");
         assert!(
             matches!(err, TransformError::ShapeError(_)),
@@ -422,7 +422,7 @@ mod tests {
             ..PreProcessorConfig::default()
         };
         let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
-        assert!(processor.preprocess(&[test_image()]).is_ok());
+        assert!(processor.preprocess(&[&test_image()]).is_ok());
     }
 
     fn norm(raw: f32, channel: usize) -> f32 {
@@ -446,7 +446,7 @@ mod tests {
             ..PreProcessorConfig::default()
         };
         let processor = processor_without_rescale().with_preprocessor_config(&config);
-        let result = processor.preprocess(&[test_image()]).unwrap();
+        let result = processor.preprocess(&[&test_image()]).unwrap();
         assert_eq!(result.encoder_input.shape(), &[2, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![2]);
 
@@ -512,7 +512,7 @@ mod tests {
         };
         let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
 
-        let result = processor.preprocess(&[test_image()]).unwrap();
+        let result = processor.preprocess(&[&test_image()]).unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[2, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![2]);
@@ -532,7 +532,7 @@ mod tests {
         .unwrap();
         let processor = InklingImageProcessor::from_preprocessor_config(&config).unwrap();
 
-        let result = processor.preprocess(&[test_image()]).unwrap();
+        let result = processor.preprocess(&[&test_image()]).unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[6, 2, 2, 2, 3]);
         assert_eq!(result.feature_token_counts, vec![6]);

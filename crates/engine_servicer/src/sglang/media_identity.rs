@@ -17,17 +17,17 @@ pub(super) fn mode(state: &State, expected: &str) -> bool {
 
 /// Consume an optional identity only after validation, retaining original inputs on failure.
 pub(super) fn apply(state: &State, req: &mut sg::GenerateRequest) -> bool {
-    let identity = req.media_identity.take();
-    let Some(identity) = identity else {
+    let Some(identity) = req.media_identity.take() else {
         return false;
     };
+    let identity = *identity;
     let valid = mode(state, "decode")
         && key(state).is_some_and(|key| contract::validate(&identity, req, key));
     if valid {
         if let Some(tokens) = &mut req.tokenized {
             tokens.input_ids = identity.input_ids;
         }
-        req.mm_inputs = identity.mm_inputs;
+        req.mm_inputs = identity.mm_inputs.map(Box::new);
         tracing::debug!(target: "smg_request_timing", request_id = %req.request_id, "sglang_media_identity_reused");
         state.shared.metrics.media_identity("reused");
     } else {

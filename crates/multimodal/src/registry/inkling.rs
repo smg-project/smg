@@ -90,13 +90,24 @@ impl ModelProcessorSpec for InklingSpec {
         }
     }
 
+    /// The family sets no per-request image count of its own: its serving
+    /// engines read the image count as unlimited (the family's processing
+    /// info declares `image: None` for a checkpoint with a vision tower), the
+    /// checkpoint's processor config and card bound an image's dimensions,
+    /// not the number of images, and the context length is the practical
+    /// bound. Images stay declared (an undeclared modality is refused as
+    /// unsupported) without a bound of the spec's, so the effective limit is
+    /// the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. The audio
+    /// count keeps the spec's declared default (`SMG_AUDIO_MAX_COUNT` moves
+    /// it).
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         let mut limits = HashMap::new();
         if Self::tower_enabled(metadata, "vision_config") {
-            limits.insert(Modality::Image, 10);
+            limits.insert(Modality::Image, usize::MAX);
         }
         if Self::tower_enabled(metadata, "audio_config") {
             limits.insert(Modality::Audio, 10);
@@ -306,6 +317,53 @@ mod tests {
         assert_eq!(result.encoder_input.shape(), &[1, 8]);
     }
 
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten it carried
+    /// was the registry's default for other families, never a count of the
+    /// family's), so a deployment knob is the only router-side bound and
+    /// video stays unsupported.
+    #[test]
+    fn inkling_declares_images_without_a_count_of_its_own() {
+        use crate::{registry::ModelRegistryError, types::Modality};
+
+        let tokenizer = tokenizer();
+        let config = config();
+        let metadata = ModelMetadata {
+            model_id: "local-checkpoint",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = InklingSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap()[&Modality::Image],
+            usize::MAX
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "inkling",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Video, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Video,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn modality_limits_follow_configured_towers() {
         let tokenizer = tokenizer();
@@ -316,7 +374,7 @@ mod tests {
                     "audio_config": {"decoder_dmodel": 6144}
                 }),
                 HashMap::from([
-                    (crate::types::Modality::Image, 10),
+                    (crate::types::Modality::Image, usize::MAX),
                     (crate::types::Modality::Audio, 10),
                 ]),
             ),
@@ -332,7 +390,7 @@ mod tests {
                     "vision_config": {"decoder_dmodel": 6144},
                     "audio_config": {}
                 }),
-                HashMap::from([(crate::types::Modality::Image, 10)]),
+                HashMap::from([(crate::types::Modality::Image, usize::MAX)]),
             ),
             (json!({}), HashMap::new()),
         ] {

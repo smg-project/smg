@@ -9,6 +9,11 @@ use crate::{
     vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
 
+/// The image placeholder the chat template writes once per image, the one
+/// token the expansion repeats; `image_token_id` in the config names its id.
+/// Qwen3-Omni (`super::qwen3_omni`) answers the same spelling.
+pub(super) const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+
 pub(super) struct QwenVLVisionSpec;
 
 impl QwenVLVisionSpec {
@@ -36,7 +41,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|image_pad|>".to_string())
+        Ok(IMAGE_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
@@ -46,11 +51,19 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         Self::pad_token_id(metadata)
     }
 
+    /// The family sets no per-request image count of its own: its serving
+    /// engines read the image count as unlimited (the family's processing
+    /// info declares `image: None`), the checkpoints' processor configs bound
+    /// an image's pixels, not the number of images, and the context length is
+    /// the practical bound. Images stay declared (an undeclared modality is
+    /// refused as unsupported) without a bound of the spec's, so the effective
+    /// limit is the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, 10)]))
+        Ok(HashMap::from([(Modality::Image, usize::MAX)]))
     }
 
     fn vision_processor(
@@ -149,6 +162,63 @@ mod tests {
         assert_eq!(replacements[0].tokens.len(), 256);
         assert_eq!(replacements[0].tokens[0], 151655); // pad (image_token_id)
         assert_eq!(*replacements[0].tokens.last().unwrap(), 151655);
+    }
+
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten it carried
+    /// was the first registry's default, never a count of the family's), so
+    /// a deployment knob is the only router-side bound and video stays
+    /// unsupported.
+    #[test]
+    fn qwen_vl_declares_images_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::{
+            registry::{ModelProcessorSpec, ModelRegistryError},
+            types::Modality,
+        };
+
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
+        let config = json!({
+            "model_type": "qwen2_vl",
+            "vision_start_token_id": 151652,
+            "vision_token_id": 151654,
+            "image_token_id": 151655
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen2-VL-7B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::QwenVLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen_vl",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Video, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Video,
+                ..
+            })
+        ));
     }
 
     #[test]

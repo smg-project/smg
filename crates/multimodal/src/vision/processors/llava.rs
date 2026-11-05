@@ -324,7 +324,7 @@ impl VisionPreProcessor for LlavaProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -583,7 +583,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -883,7 +883,7 @@ mod tests {
         let processor = LlavaProcessor::new().with_preprocessor_config(&config);
 
         let image = create_test_image(336, 336, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert_eq!(result.height().unwrap(), 336);
@@ -910,7 +910,7 @@ mod tests {
 
         // Tall image - should be resized so shortest edge = 336, then center cropped
         let image = create_test_image(200, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert_eq!(result.height().unwrap(), 336);
@@ -930,7 +930,7 @@ mod tests {
 
         // Tall image should be padded to square first
         let image = create_test_image(200, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         // After expand_to_square: 400x400, then resize to 336x336
@@ -984,7 +984,7 @@ mod tests {
         let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 5D: [num_images=1, num_patches, C, H, W]
         assert_eq!(result.batch_size(), 1);

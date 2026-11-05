@@ -439,6 +439,10 @@ pub struct EngineParams {
     /// stream shaped for a gateway that parses the engine's tokens (a channel
     /// header, say). Empty by default.
     pub output_prefix: Vec<u32>,
+    /// The data-parallel rank this engine stamps on its KV-event batches
+    /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
+    /// for one of a gRPC worker's `--grpc-dp-size` ranks.
+    pub dp_rank: i32,
 }
 
 impl Default for EngineParams {
@@ -459,6 +463,7 @@ impl Default for EngineParams {
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
+            dp_rank: 0,
         }
     }
 }
@@ -1650,10 +1655,12 @@ impl SchedulerState {
     /// pass has run and the cold-shape hook is set to `hold_ms`: the new
     /// longest counts as run from here on, so the hold is paid once per new
     /// longest prompt, and the shapes run while the hook was off are run.
+    /// A queued prompt whose client has gone is not read: the pass drops it.
     fn cold_shape_hold(&mut self, hold_ms: u64) -> Option<Duration> {
         let longest_queued = self
             .waiting
             .iter()
+            .filter(|w| !w.req.events.is_closed())
             .map(|w| w.prompt_tokens)
             .max()
             .unwrap_or(0);
@@ -1868,6 +1875,12 @@ impl SchedulerState {
         }
 
         // ---- 2. FCFS admission while the budget and KV room last ----
+        // A queued request whose client has gone (its receiver dropped, the
+        // signal the running loop reads) leaves the queue here, without a
+        // prefill: its output would go nowhere, and this pass's load report
+        // must not count it. A request preempted above whose client left
+        // while it ran goes the same way.
+        self.waiting.retain(|w| !w.req.events.is_closed());
         while budget > 0 && self.running.len() < p.max_running {
             let Some(front) = self.waiting.front() else {
                 break;
@@ -2076,7 +2089,7 @@ impl SchedulerState {
                 // delay hook holds back keeps it, so the delay shows up as lag.
                 timestamp: unix_seconds(),
                 events: kv,
-                dp_rank: Some(0),
+                dp_rank: Some(p.dp_rank),
                 snapshot: None,
                 load: None,
             })
@@ -2762,6 +2775,80 @@ mod tests {
             "the oracle is never below what the worker actually served"
         );
         drop((rx1, rx2));
+    }
+
+    #[test]
+    fn a_queued_request_whose_client_left_leaves_the_queue_at_the_next_pass_without_a_prefill() {
+        let p = EngineParams {
+            max_running: 1,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (first, rx_first) = req("first", vec![1; 64], 8);
+        st.enqueue(first, &p);
+        let second_prompt = vec![2; 64];
+        let (second, rx_second) = req("second", second_prompt.clone(), 2);
+        st.enqueue(second, &p);
+        // One slot: the first request runs, the second waits behind it.
+        let step = st.step(&p);
+        assert_eq!(step.admitted.len(), 1);
+        assert_eq!(step.snapshot.num_waiting_reqs, 1);
+        // The waiting request's client goes away while it is queued.
+        drop(rx_second);
+
+        // The cold-shape hook reads the queue before the pass: a prompt whose
+        // client has gone buys no hold and moves no high-water mark.
+        assert_eq!(
+            st.cold_shape_hold(10),
+            None,
+            "a queued request whose client left buys no cold-shape hold"
+        );
+        assert_eq!(st.longest_run, 0);
+
+        // The next pass drops it while the slot is still taken: the load
+        // report no longer counts it, and nothing of it is admitted.
+        let step = st.step(&p);
+        assert!(
+            step.admitted.is_empty(),
+            "the pass admitted {:?}",
+            step.admitted
+                .iter()
+                .map(|a| &a.request_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            step.snapshot.num_running_reqs, 1,
+            "the first request still runs"
+        );
+        assert_eq!(
+            step.snapshot.num_waiting_reqs, 0,
+            "a queued request whose client left no longer counts as waiting"
+        );
+        assert_eq!(st.in_flight(), 1);
+
+        let mut admitted_later = Vec::new();
+        for _ in 0..16 {
+            let step = st.step(&p);
+            admitted_later.extend(step.admitted.into_iter().map(|a| a.request_id));
+            if st.is_idle() {
+                break;
+            }
+        }
+        assert!(
+            st.is_idle(),
+            "the engine drains once the first request finishes"
+        );
+        assert!(
+            admitted_later.is_empty(),
+            "a queued request whose client left is never admitted: {admitted_later:?}"
+        );
+        let (keys, _, _) = prompt_blocks(&second_prompt, p.block_size as usize);
+        assert_eq!(
+            st.pool.match_prefix(&keys),
+            0,
+            "nothing of the dropped request's prompt was computed"
+        );
+        drop(rx_first);
     }
 
     #[test]

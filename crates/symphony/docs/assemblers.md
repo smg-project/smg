@@ -306,9 +306,9 @@ What the syntax says, and what the assembler does with it:
   name="…">`) refuses the same way everything inside an invoke its syntax cannot read: a word
   between tags, a tag out of its place or cut short, a tail a tag has no place for, an invoke
   that named no call (whole, its closing tag included); a call that started keeps the members it
-  read. (A parameter tag written without its `<` and a call's arguments written as JSON and
-  closed with a region of the model's own, both seen live, reached the client as content with
-  the format's tokens in it before.)
+  read and, unlike here, gets no close (its section below). (A parameter tag written without its
+  `<` and a call's arguments written as JSON and closed with a region of the model's own, both
+  seen live, reached the client as content with the format's tokens in it before.)
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what
@@ -365,6 +365,20 @@ What the syntax says, and what the assembler does with it:
   its arguments are no whole value (`tagged::end_cut_call`), and an invoke the cut found before
   it named a call is refused whole as `UnterminatedRegion`, as the keyed one is, so that the
   reader's release of a refused output that made no call takes the whole slice.
+- **A call inside which the syntax refused bytes gets no close.** A word between tags, a tag out
+  of its place, cut short or with a tail, a value held for its close that the invoke's end cut:
+  each is refused as above, and the model's call had something in it the client will not get, so
+  the call is no whole call. At `close` the object is then not closed: the fragments stand (the
+  pairs the syntax read, a strict JSON prefix; none when it read no pair) and are no whole
+  value, which is how a client that reads the arguments as JSON is told, as a cut call tells it;
+  the whitespace carried before the close leaves as wrapping; the refusal's own event of no
+  bytes stands inside the call, as the contract asks of a call that ends without whole
+  arguments. The engine's own parser hands such a call out whole with the members its reader
+  matched, `{}` when none, under `tool_calls`, and so did this assembler: a client read a
+  well-formed call with no word that the model's call had failed (a fleet verifier saw a
+  two-parameter call come back as `{}` once in several hundred answers to one prompt, the
+  parameter tags written without their `<`). The keyed, Qwen tagged and XML assemblers still
+  close the object of such a call (the keyed note above); they are owed the same rule.
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
@@ -475,10 +489,17 @@ The rules, in the order `json` applies them:
 
 A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
 `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value from
-inside the arguments object, because that is how the adapters read a call's arguments back. Text it
-refuses there, such as a lone surrogate escape or nesting that reaches its depth limit once the
-object is around it, is a string like any other text, so one odd value never costs a call its other
-arguments.
+inside the arguments object, because that is how the adapters read a call's arguments back, nesting
+no deeper than the crate's own JSON reader allows a call's arguments (`PartialJson::DEFAULT_MAX_DEPTH`
+containers, the arguments object counted), because that is the prefix every syntax's fragments are
+held to. Text either refuses, a lone surrogate escape, nesting past the bound, is a string like any
+other text, so one odd value never costs a call its other arguments; a value the end of the stream
+cut stands as written only where `serde_json` and the crate's own judge of a JSON prefix
+(`json::Prefix`) both take it, and opens a string holding it otherwise. The two differ in two
+places: nesting past the bound, which `serde_json` follows, and a `\u` escape short of its four
+hex digits before the quote that ends its string (`"\u1"`), which `serde_json` reads four bytes of
+blindly and then asks for more bytes rather than refuse, and which the judge refuses from the
+escape's backslash, whatever follows the quote; no continuation makes such a text JSON.
 
 Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and from
 `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three things

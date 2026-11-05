@@ -1,23 +1,32 @@
 // Ported from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
+//
+// The tools template follows the serving engines' own copies of that module
+// instead: they render this architecture from their copy, never from the
+// checkpoint's file, and the copies agree with each other byte for byte
+// (see `render_tools_template`).
 
 use std::fmt::Write as _;
 
 use serde_json::Value;
 use thiserror::Error;
 
-// The index predicates, the JSON spelling and the OpenAI-shape readers are
-// the V4 family's too and come from `deepseek_common`. V3.2's tool-message
-// handling, drop-thinking role set, DSML argument rendering and tools
-// template are different algorithms and texts and stay here.
+// The message read, the index predicates, the JSON spelling, the OpenAI-shape
+// readers and the tools-and-response-format section are the V4 family's too
+// and come from `deepseek_common`. V3.2's tool-message handling, drop-thinking
+// role set, DSML argument rendering and tools template are different
+// algorithms and texts and stay here.
 use super::{
     deepseek_common::{
-        after_last_user, at_or_after_last_user, find_last_user_index, to_json,
-        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT, BOS,
-        DSML, EOS, THINKING_END, THINKING_START, USER,
+        after_last_user, at_or_after_last_user, find_last_user_index,
+        push_tools_and_response_format, to_json, tool_schemas, Turn, ASSISTANT, BOS, DSML, EOS,
+        THINKING_END, THINKING_START, USER,
     },
     marks, RendererProfile,
 };
-use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
+use crate::{
+    chat_template::{ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -103,7 +112,13 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     native_effort_off_values: &[],
     // `<｜Assistant｜><think>` ends the prompt when thinking is on.
     think_in_prefill: true,
-    capabilities: RendererProfile::NO_CAPABILITIES,
+    // The engine's tokenizer wrapper switches thinking on from `thinking` or
+    // its `enable_thinking` alias; the shim reads both, so the gateway arms
+    // the reasoning parser from the alias as the prompt is rendered from it.
+    capabilities: RendererCapabilities {
+        enable_thinking_alias: true,
+        ..RendererProfile::NO_CAPABILITIES
+    },
     thinking_mode: None,
 };
 
@@ -111,15 +126,18 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
 // Templates
 // ---------------------------------------------------------------------------
 
-/// Mirrors `TOOLS_SYSTEM_TEMPLATE` from the Python source, including the
-/// blank lines between paragraphs that the upstream template preserves.
+/// Mirrors `TOOLS_SYSTEM_TEMPLATE` as the serving engines' own copies of the
+/// encoder module write it (each renders this architecture from its copy of
+/// `encoding_dsv32.py`, never from the checkpoint's file, and the copies agree
+/// byte for byte): no blank line after the `## Tools` header or between the
+/// paragraphs. The checkpoint's own file separates them with blank lines,
+/// which the model is never served.
 fn render_tools_template(tool_schemas: &str) -> String {
     let dsml = DSML;
     let tstart = THINKING_START;
     let tend = THINKING_END;
     format!(
 "## Tools
-
 You have access to a set of tools you can use to answer the user's question.
 You can invoke functions by writing a \"<{dsml}function_calls>\" block like the following as part of your reply to the user:
 <{dsml}function_calls>
@@ -131,32 +149,20 @@ You can invoke functions by writing a \"<{dsml}function_calls>\" block like the 
 ...
 </{dsml}invoke>
 </{dsml}function_calls>
-
 String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).
-
 If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
-
 <{dsml}function_calls>
 ...
 </{dsml}function_calls>
-
 <function_results>
 ...
 </function_results>
-
 {tstart}...thinking about results{tend}
-
 Here are the functions available in JSONSchema format:
 <functions>
 {tool_schemas}
 </functions>
 "
-    )
-}
-
-fn response_format_block(schema: &str) -> String {
-    format!(
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}",
     )
 }
 
@@ -213,8 +219,8 @@ fn equals_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
 
 // ---------------------------------------------------------------------------
 // render_message — direct port of the Python function with the same name:
-// the message read into its parts, one function per role for the arms of its
-// `match role`.
+// the message read into its parts (the family's `Turn`), one function per
+// role for the arms of its `match role`.
 // ---------------------------------------------------------------------------
 
 fn render_message(
@@ -222,67 +228,46 @@ fn render_message(
     messages: &[Value],
     thinking_mode: ThinkingMode,
 ) -> Result<String, DsEncodingError> {
-    if index >= messages.len() {
+    let Some(msg) = messages.get(index) else {
         return Err(DsEncodingError::IndexOutOfRange {
             index,
             len: messages.len(),
         });
-    }
-
-    let mut prompt = String::new();
-    let msg = &messages[index];
+    };
+    let turn = Turn::read(index, msg);
     let last_user_idx = find_last_user_index(messages);
-
-    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let tools_raw = msg.get("tools").and_then(|v| v.as_array());
-    let response_format = msg.get("response_format");
-    let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
-    let reasoning_content = msg
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let tools_owned = tools_raw.map(|t| tools_from_openai_format(t));
-    let tools = tools_owned.as_deref();
-
-    let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
-    let tool_calls = tool_calls_owned.as_deref();
+    let mut prompt = String::new();
 
     // The thinking token after a user or developer message opens the thinking
     // at the last user turn in thinking mode and closes it everywhere else.
     let opens_thinking = equals_last_user(index, last_user_idx) && thinking_mode.is_thinking();
 
-    match role {
-        "system" => render_system(&mut prompt, content, tools, response_format),
+    match turn.role {
+        "system" => render_system(&mut prompt, &turn),
         "developer" => {
-            if content.is_empty() {
+            if turn.content.is_empty() {
                 return Err(DsEncodingError::InvalidMessage {
-                    role: role.to_string(),
-                    msg: msg.to_string(),
+                    role: turn.role.to_string(),
+                    msg: turn.msg.to_string(),
                 });
             }
-            render_developer(&mut prompt, content, tools, response_format, opens_thinking);
+            render_developer(&mut prompt, &turn, opens_thinking);
         }
-        "user" => render_user(&mut prompt, content, opens_thinking),
+        "user" => render_user(&mut prompt, turn.content, opens_thinking),
         "tool" => {
             let position = tool_result_position(index, messages)?;
             // The last result of a block opens the thinking from the last user
             // turn on in thinking mode (not the user message's rule above).
             let block_opens_thinking =
                 at_or_after_last_user(index, last_user_idx) && thinking_mode.is_thinking();
-            render_tool(&mut prompt, position, content, block_opens_thinking);
+            render_tool(&mut prompt, position, turn.content, block_opens_thinking);
         }
         "assistant" => {
-            let assistant = AssistantParts {
-                message: msg,
-                content,
-                tool_calls,
-                reasoning_content,
-                emits_thinking: thinking_mode.is_thinking()
-                    && after_last_user(index, last_user_idx),
-            };
-            render_assistant(&mut prompt, &assistant)?;
+            // The turn's thinking goes out in thinking mode after the last
+            // user message.
+            let emits_thinking =
+                thinking_mode.is_thinking() && after_last_user(index, last_user_idx);
+            render_assistant(&mut prompt, &turn, emits_thinking)?;
         }
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
@@ -300,47 +285,30 @@ fn thinking_token(opens_thinking: bool) -> &'static str {
     }
 }
 
-/// The tools and the response format a system or developer message carries,
-/// each after a blank line.
-fn render_tools_and_response_format(
-    prompt: &mut String,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(rf) = response_format {
-        prompt.push_str("\n\n");
-        prompt.push_str(&response_format_block(&to_json(rf)));
-    }
-}
-
 /// A system message: its content (`system_msg_template` is "{content}"),
 /// then the tools and the response format it carries.
-fn render_system(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-) {
-    prompt.push_str(content);
-    render_tools_and_response_format(prompt, tools, response_format);
+fn render_system(prompt: &mut String, turn: &Turn<'_>) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
 /// A developer message: a user message made of the tools and the response
 /// format it carries and its content under a heading, then the thinking
 /// token (the content is never empty: the caller refused an empty one).
-fn render_developer(
-    prompt: &mut String,
-    content: &str,
-    tools: Option<&[Value]>,
-    response_format: Option<&Value>,
-    opens_thinking: bool,
-) {
+fn render_developer(prompt: &mut String, turn: &Turn<'_>, opens_thinking: bool) {
     let mut content_developer = String::new();
-    render_tools_and_response_format(&mut content_developer, tools, response_format);
+    push_tools_and_response_format(
+        &mut content_developer,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
+    let content = turn.content;
     let _ = write!(content_developer, "\n\n# The user's message is: {content}");
 
     prompt.push_str(&user_msg(&content_developer));
@@ -442,17 +410,6 @@ fn render_tool(
     }
 }
 
-/// What an assistant message renders from: its content, its tool calls, its
-/// reasoning, and whether the turn's thinking goes out (thinking mode, after
-/// the last user message); the message itself names a refused one.
-struct AssistantParts<'a> {
-    message: &'a Value,
-    content: &'a str,
-    tool_calls: Option<&'a [Value]>,
-    reasoning_content: &'a str,
-    emits_thinking: bool,
-}
-
 /// An assistant message (`assistant_msg_template` is
 /// "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"): its reasoning and
 /// the thinking end token when the turn's thinking goes out (a turn with
@@ -460,12 +417,13 @@ struct AssistantParts<'a> {
 /// calls as a DSML block, and the EOS token.
 fn render_assistant(
     prompt: &mut String,
-    parts: &AssistantParts<'_>,
+    turn: &Turn<'_>,
+    emits_thinking: bool,
 ) -> Result<(), DsEncodingError> {
     let mut thinking_part = String::new();
 
     let mut tool_calls_content = String::new();
-    if let Some(tcs) = parts.tool_calls.filter(|t| !t.is_empty()) {
+    if let Some(tcs) = turn.tool_calls.as_deref() {
         let mut rendered = Vec::with_capacity(tcs.len());
         for tc in tcs {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -481,17 +439,17 @@ fn render_assistant(
         );
     }
 
-    let summary_content = parts.content;
+    let summary_content = turn.content;
 
-    if parts.emits_thinking {
-        let has_reasoning = !parts.reasoning_content.is_empty();
-        let has_tool_calls = parts.tool_calls.is_some_and(|t| !t.is_empty());
+    if emits_thinking {
+        let has_reasoning = !turn.reasoning_content.is_empty();
+        let has_tool_calls = turn.tool_calls.is_some();
         if !has_reasoning && !has_tool_calls {
             return Err(DsEncodingError::MissingReasoningOrToolCalls(
-                parts.message.to_string(),
+                turn.msg.to_string(),
             ));
         }
-        thinking_part.push_str(parts.reasoning_content);
+        thinking_part.push_str(turn.reasoning_content);
         thinking_part.push_str(THINKING_END);
     }
 
@@ -567,14 +525,11 @@ pub(crate) fn render_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let messages = marks::without_marks(messages);
-    // The engine's renderer rewrites a `developer` message as a `system` one
-    // (and merges the system messages when one is not first) before any
-    // tokenizer mode's own encoder sees the conversation, so the vendor
-    // encoding's developer branch is never reached there; the same rule here.
-    let mut full_messages: Vec<Value> =
-        crate::chat_template::developer_messages_as_system(&messages)
-            .unwrap_or_else(|| messages.into_owned());
+    // The engine's renderer hands the conversation to this encoder with a
+    // `developer` message as written (its developer-to-system rewrite belongs
+    // to its template path, which this encoder never takes), so the vendor
+    // encoding's developer branch renders it: a user turn under a heading.
+    let mut full_messages: Vec<Value> = marks::without_marks(messages).into_owned();
 
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -602,7 +557,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        super::deepseek_common::{
+            object_arguments_render_one_parameter_per_key_through, ASSISTANT_SP_TOKEN,
+            USER_SP_TOKEN,
+        },
         *,
     };
 
@@ -708,37 +666,74 @@ mod tests {
     }
 
     #[test]
-    fn object_form_tool_call_arguments_render_params() {
-        // `model_gateway`'s `process_tool_call_arguments` converts the OpenAI
-        // arguments *string* into a dict before the chat template runs, so the
-        // encoder receives object-form arguments. It must render them, not drop
-        // them — dropping erased every historical tool call's parameters in
-        // multi-turn prompts and made the model loop (re-calling tools forever).
+    fn tools_template_renders_as_the_engines_copy_of_the_encoder_writes_it() {
+        // The serving engines render this architecture with their own copies
+        // of the encoder, whose tools template has no blank line after the
+        // `## Tools` header nor between its paragraphs; the checkpoint's own
+        // `encoding_dsv32.py` separates them with blank lines, which the
+        // model is never served.
         let msgs = [
-            user("call my tool"),
             json!({
-                "role": "assistant",
+                "role": "system",
                 "content": "",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": { "query": "deepseek", "limit": 5 }
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "city": { "type": "string" } },
+                            "required": ["city"]
                         }
                     }
-                ]
+                }]
             }),
+            user("What is the weather in Paris?"),
         ];
-
         let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        let start = out.find("## Tools").expect("the tools block");
+        let block = &out[start..];
+        let expected_head = format!(
+            "## Tools\n\
+             You have access to a set of tools you can use to answer the user's question.\n\
+             You can invoke functions by writing a \"<{DSML_TOKEN}function_calls>\" block like the following as part of your reply to the user:\n\
+             <{DSML_TOKEN}function_calls>\n\
+             <{DSML_TOKEN}invoke name=\"$FUNCTION_NAME\">\n\
+             <{DSML_TOKEN}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{DSML_TOKEN}parameter>\n\
+             ...\n\
+             </{DSML_TOKEN}invoke>\n\
+             <{DSML_TOKEN}invoke name=\"$FUNCTION_NAME2\">\n\
+             ...\n\
+             </{DSML_TOKEN}invoke>\n\
+             </{DSML_TOKEN}function_calls>\n\
+             String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).\n\
+             If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:\n\
+             <{DSML_TOKEN}function_calls>\n\
+             ...\n\
+             </{DSML_TOKEN}function_calls>\n\
+             <function_results>\n\
+             ...\n\
+             </function_results>\n\
+             {THINKING_START_TOKEN}...thinking about results{THINKING_END_TOKEN}\n\
+             Here are the functions available in JSONSchema format:\n\
+             <functions>\n"
+        );
+        assert!(block.starts_with(&expected_head), "{block}");
+        assert!(
+            block.contains(&format!(
+                "\n</functions>\n{USER_SP_TOKEN}What is the weather in Paris?"
+            )),
+            "{block}"
+        );
+    }
 
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}parameter>"
-        )));
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
-        )));
+    #[test]
+    fn object_form_tool_call_arguments_render_params() {
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &EncodeParams::default()),
+            "parameter",
+        );
     }
 
     #[test]
@@ -763,10 +758,10 @@ mod tests {
     #[test]
     fn drop_thinking_does_not_overrun_when_filtering_shrinks_messages() {
         // `drop_thinking_messages` can leave `full_messages` shorter than
-        // `messages` (the roles it drops before the last user turn), so the
-        // outer loop must iterate the filtered length, not the original, or
-        // it walks off the end and returns IndexOutOfRange. A developer
-        // message is a system message by the time it gets there and stays.
+        // `messages` (the roles it drops before the last user turn: here the
+        // developer message, dropped as the encoder drops it), so the outer
+        // loop must iterate the filtered length, not the original, or it
+        // walks off the end and returns IndexOutOfRange.
         let msgs = [
             json!({ "role": "developer", "content": "earlier developer note" }),
             json!({ "role": "user", "content": "now" }),
@@ -774,17 +769,19 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default())
             .expect("filtered message length must not blow up the loop");
         assert!(
-            out.contains("now") && out.contains("earlier developer note"),
-            "messages missing from prompt: {out}"
+            out.contains("now") && !out.contains("earlier developer note"),
+            "the last user turn stays, the earlier developer turn goes: {out}"
         );
     }
 
-    /// The engine's renderer hands every tokenizer mode a `developer` message
-    /// as a `system` one: the recorded reference of the developer-role case
-    /// (the content as the system message, no user token before it), the same
-    /// as a system message in both modes.
+    /// The engine's renderer hands this encoder a `developer` message as
+    /// written (its developer-to-system rewrite is the template path's), so
+    /// the encoding's own developer branch renders it: a user turn made of the
+    /// content under its heading, followed by the thinking token of a turn
+    /// before the last user message. The recorded reference of the
+    /// developer-role case, byte for byte; not the system message's prompt.
     #[test]
-    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
+    fn developer_message_renders_as_the_encoder_developer_turn() {
         let msgs = [
             json!({ "role": "developer", "content": "Answer in one word." }),
             json!({ "role": "user", "content": "Colour of the sky?" }),
@@ -792,17 +789,64 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
         assert_eq!(
             out,
-            "<｜begin▁of▁sentence｜>Answer in one word.<｜User｜>Colour of the sky?<｜Assistant｜></think>"
+            "<｜begin▁of▁sentence｜><｜User｜>\n\n# The user's message is: Answer in one word.<｜Assistant｜></think><｜User｜>Colour of the sky?<｜Assistant｜></think>"
         );
         let as_system = [
             json!({ "role": "system", "content": "Answer in one word." }),
             json!({ "role": "user", "content": "Colour of the sky?" }),
         ];
-        for mode in [ThinkingMode::Chat, ThinkingMode::Thinking] {
-            assert_eq!(
-                encode_messages(&msgs, mode, &EncodeParams::default()).unwrap(),
-                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
-            );
+        assert_ne!(
+            out,
+            encode_messages(&as_system, ThinkingMode::Chat, &EncodeParams::default()).unwrap()
+        );
+        // In thinking mode the thought opens at the last user turn only: the
+        // developer turn before it is closed, and kept when nothing is dropped.
+        let keep_reasoning = EncodeParams {
+            add_default_bos_token: true,
+            drop_thinking: false,
+        };
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &keep_reasoning).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>\n\n# The user's message is: Answer in one word.<｜Assistant｜></think><｜User｜>Colour of the sky?<｜Assistant｜><think>"
+        );
+        // A developer message as the final turn is the last user turn: the
+        // thought opens after it.
+        let developer_last = [
+            json!({ "role": "user", "content": "Colour of the sky?" }),
+            json!({ "role": "developer", "content": "Answer in one word." }),
+        ];
+        let out =
+            encode_messages(&developer_last, ThinkingMode::Thinking, &keep_reasoning).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>Colour of the sky?<｜Assistant｜></think><｜User｜>\n\n# The user's message is: Answer in one word.<｜Assistant｜><think>"
+        );
+    }
+
+    /// The reference writes the response-format section under `if
+    /// response_format:`, so `null` and `{}` render no section (the engine's
+    /// own encoder copy renders these bytes).
+    #[test]
+    fn a_falsy_response_format_renders_no_section() {
+        for (mode, thinking_token) in [
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+        ] {
+            for falsy in [json!(null), json!({})] {
+                let messages = [
+                    json!({ "role": "system", "content": "You are terse.", "response_format": falsy }),
+                    user("hello"),
+                ];
+                let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "{BOS_TOKEN}You are terse.{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    ),
+                    "{falsy}"
+                );
+            }
         }
     }
 }

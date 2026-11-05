@@ -233,14 +233,14 @@ impl VisionPreProcessor for Qwen2VLProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -395,7 +395,7 @@ mod tests {
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -435,7 +435,7 @@ mod tests {
         };
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
         let image = create_test_image(600, 400, Rgb([17, 128, 255]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
         let flat = result.encoder_input_flat();
         assert!(!flat.is_empty());
         assert!(flat
@@ -451,12 +451,14 @@ mod tests {
     #[test]
     fn test_qwen2_vl_preprocess_multiple() {
         let processor = Qwen2VLProcessor::new();
-        let images = vec![
+        let images = [
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_two_image_batch(&result);
     }
@@ -529,7 +531,7 @@ mod tests {
             ..Default::default()
         };
         let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 616x616 -> grid (1, 44, 44) -> (44*44)/4 = 484 tokens, vs 1225 at the default.
         assert_eq!(result.feature_token_counts[0], 484);
