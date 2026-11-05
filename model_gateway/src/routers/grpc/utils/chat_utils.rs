@@ -295,7 +295,8 @@ pub(crate) fn missing_tokenizer_response(
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
 /// costs more than the encode itself, so we tokenize inline. Larger prompts —
-/// the ones that actually pin a worker thread — are offloaded.
+/// the ones that actually pin a worker thread — are offloaded. A prompt of
+/// ids counts its ids' bytes, four each.
 const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
@@ -313,24 +314,25 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Run CPU-bound tokenization off the async worker threads so it cannot stall
-/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
-/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
-/// the offload round-trip dominating.
-async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+/// Run CPU-bound tokenizer work, an encode or a decode, off the async worker
+/// threads so it cannot stall the runtime, bounded by [`encode_permits`] so
+/// concurrent offloaded jobs cannot oversubscribe the CPU. Inputs below the
+/// threshold run inline to avoid the offload round-trip dominating.
+async fn offload<T, F>(len: usize, work: F) -> anyhow::Result<T>
 where
-    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     if len < ENCODE_OFFLOAD_MIN_BYTES {
-        return encode();
+        return work();
     }
     let _permit = encode_permits()
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(encode)
+    tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+        .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
 }
 
 /// Tokenize `text` through the offload policy of [`offload`].
@@ -341,6 +343,19 @@ pub(crate) async fn encode_blocking(
 ) -> anyhow::Result<Encoding> {
     offload(text.len(), move || {
         tokenizer.encode(&text, add_special_tokens)
+    })
+    .await
+}
+
+/// Decode `ids` through the offload policy of [`offload`]: a prompt given as
+/// ids leaves the worker thread at the same size a text prompt does.
+pub(crate) async fn decode_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    ids: Vec<u32>,
+    skip_special_tokens: bool,
+) -> anyhow::Result<String> {
+    offload(ids.len() * size_of::<u32>(), move || {
+        tokenizer.decode(&ids, skip_special_tokens)
     })
     .await
 }

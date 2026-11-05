@@ -1446,6 +1446,21 @@ impl<'de> Deserialize<'de> for InputIds {
     }
 }
 
+/// Token ids as their decimal rendering joined by spaces: the routing text of
+/// a prompt given as ids, on `/generate` and `/v1/completions` alike.
+pub(crate) fn join_ids<T: std::fmt::Display>(ids: impl IntoIterator<Item = T>) -> String {
+    use std::fmt::Write as _;
+    let ids = ids.into_iter();
+    let mut text = String::with_capacity(ids.size_hint().0 * 6);
+    for (i, id) in ids.enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{id}");
+    }
+    text
+}
+
 /// LoRA adapter path - can be single path or batch of paths (an engine extension)
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]

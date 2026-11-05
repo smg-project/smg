@@ -9,8 +9,7 @@ use std::{hint::black_box, time::Instant};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::StringOrArray,
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     sampling_params::SamplingParams,
 };
@@ -102,7 +101,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
 fn default_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: String::new(),
-        prompt: StringOrArray::String(String::new()),
+        prompt: CompletionPrompt::Text(String::new()),
         suffix: None,
         max_tokens: None,
         temperature: None,
@@ -192,7 +191,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
 fn create_sample_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "text-davinci-003".to_string(),
-        prompt: StringOrArray::String("Complete this sentence: The future of AI is".to_string()),
+        prompt: CompletionPrompt::Text("Complete this sentence: The future of AI is".to_string()),
         max_tokens: Some(50),
         temperature: Some(0.8),
         top_p: Some(1.0),

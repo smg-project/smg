@@ -15,7 +15,7 @@ pub(crate) mod tonic_ext;
 // Re-export all public items so consumer imports stay unchanged.
 pub use aliases::{answering_to, ALIASES, UNANSWERED};
 pub(crate) use chat_utils::{
-    completion_finish_reason, encode_blocking, encode_prompt_blocking,
+    completion_finish_reason, decode_blocking, encode_blocking, encode_prompt_blocking,
     filter_chat_request_by_tool_choice, filter_tools_by_tool_choice, generate_tool_call_id,
     keep_first_tool_call, keep_first_tool_call_items, missing_tokenizer_response,
     parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,

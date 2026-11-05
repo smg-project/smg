@@ -371,7 +371,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
                 context::ExecutionResult::Single { stream },
-                CompletionResponseSpec::from(&request),
+                CompletionResponseSpec::new(&request, Vec::new()),
                 dispatch(),
                 tokenizer.clone(),
                 None,
@@ -1027,7 +1027,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
         serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "ignore_eos":true}),
     )
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     for ids in [vec![1], vec![1, 2]] {
         let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), "0").await;
         let (tx, rx) = sse_channel();
@@ -1069,7 +1069,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                          "ignore_eos":true, "suffix":"requested-suffix"}),
     )
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     for prefix in ["", "t"] {
         let source = format!("{prefix}é");
         let ids: Vec<_> = source.bytes().map(|byte| u32::from(byte) + 1).collect();
@@ -3625,7 +3625,7 @@ async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_g
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
             nested,
-            CompletionResponseSpec::from(&request),
+            CompletionResponseSpec::new(&request, Vec::new()),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             None,
