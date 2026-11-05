@@ -23,14 +23,24 @@ Two modes:
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
 
-**gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
-ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
-chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
-scheduler service the server hosts the standard `grpc.health.v1` service
-(`Check`, `Watch`): the empty name and the scheduler service are SERVING
-exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
-both), any other name is unknown.
+**gRPC** (one engine's scheduler service, `--grpc-wire tokenspeed|vllm|sglang`,
+TokenSpeed by default — the gateway tokenizes, the worker speaks token ids):
+`HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed chunks +
+complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`;
+the other RPCs (admin, embeddings, LoRA) return `unimplemented`. The canned
+and scripted answers, the realistic engine, the data-parallel ranks and the
+prefill/decode roles are the same behind each wire; each shapes its own
+messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
+and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
+`kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
+is a struct of named fields the admin API's info patch sets by name: the mock
+moves no KV cache and names Mooncake as its transport on every wire).
+`--capture` records the TokenSpeed wire's requests only. Beside the scheduler
+service the server hosts the standard `grpc.health.v1` service (`Check`,
+`Watch`): the empty name and the served scheduler service are SERVING exactly
+when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips both),
+any other name is unknown; the gateway detects a worker's runtime by the
+scheduler service that answers its health check, so a worker serves one.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP

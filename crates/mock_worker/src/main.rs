@@ -2,8 +2,9 @@
 //! process to scale-test the SMG gateway's routing and runtime behavior.
 //!
 //! Workers are protocol-accurate stand-ins for vLLM/SGLang engines: HTTP
-//! workers answer the probe + chat/generate surface; gRPC workers implement the
-//! TokenSpeed scheduler service (the gateway tokenizes and speaks token ids).
+//! workers answer the probe + chat/generate surface; gRPC workers serve one
+//! engine's scheduler service (`--grpc-wire`; the gateway tokenizes and speaks
+//! token ids).
 //! All responses are canned — there is no real model.
 
 use std::{pin::pin, process::ExitCode, sync::Arc};
