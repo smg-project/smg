@@ -31,6 +31,7 @@ from .constants import (
     effective_startup_timeout,
     get_gpu_offset,
     get_mm_processing,
+    get_mock_wire,
     get_runtime,
     get_servicer_impl,
     get_servicer_impl_setting,
@@ -443,8 +444,12 @@ class Worker:
             # exists for the engines that have a choice.
             return "mooncake"
         if self.engine == "mock":
-            # The mock engine moves no KV; the gateway pairs it on the
-            # scheduler wire it speaks, whose one transport is Mooncake.
+            # The mock engine moves no KV and names Mooncake as its transport
+            # on every scheduler wire it can speak (``--grpc-wire``): as the
+            # transfer backend in its server args on the TokenSpeed and SGLang
+            # wires, as the connector on the vLLM one. The gateway pairs it on
+            # that, whatever the lane's setting for the engines that have a
+            # choice.
             return "mooncake"
         return vllm_kv_backend()
 
@@ -696,6 +701,13 @@ class Worker:
         ]
         if self.mode == ConnectionMode.GRPC:
             cmd += ["--grpc-base-port", str(self.port), "--grpc-count", "1"]
+            # The scheduler proto the lane runs the mock on; the mock's own
+            # default (TokenSpeed) when the lane names none. A class's own
+            # ``--grpc-wire`` comes after, in its extra engine arguments, and
+            # the mock takes the last.
+            wire = get_mock_wire()
+            if wire is not None:
+                cmd += ["--grpc-wire", wire]
         elif self.mode == ConnectionMode.ZMQ:
             # The gateway binds the handshake it derives from the worker's
             # ipc:// URL on the IPv4 loopback whatever the lane's host is
