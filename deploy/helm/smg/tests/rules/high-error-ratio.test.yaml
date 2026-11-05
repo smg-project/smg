@@ -1,0 +1,70 @@
+# SmgHighErrorRatio reads client traffic alone: the probe routes are the
+# kubelet's polls, not responses to a client. The series carry the labels the
+# chart's job selector renders (run.sh).
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # An engine's bring-up: the readiness probe answers 503 every 10 s and the
+  # liveness probe 200 every 30 s, with no client request in sight. Over the
+  # family whole that is a 75 % error ratio; the alert stays quiet.
+  - interval: 1m
+    name: a bring-up's readiness 503s are not an error ratio
+    input_series:
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/readiness", status_code="503", error_code=""}'
+        values: '0+6x20'
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/health", status_code="200", error_code=""}'
+        values: '0+2x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighErrorRatio
+        exp_alerts: []
+
+  # A serving fleet whose every client request fails, one every three minutes,
+  # under the same probes now answering 200: over the family whole the probes
+  # are the denominator and the share reads 4 %, under the threshold; the
+  # alert reads the client's share, 100 %.
+  - interval: 1m
+    name: a failing client share is not diluted by the probes
+    input_series:
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/readiness", status_code="200", error_code=""}'
+        values: '0+6x20'
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/health", status_code="200", error_code=""}'
+        values: '0+2x20'
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/v1/chat/completions", status_code="502", error_code="upstream_error"}'
+        values: '0 0 0 1 1 1 2 2 2 3 3 3 4 4 4 5 5 5 6 6 6'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "Too many responses are server errors"
+              description: "100% of the responses of smg/smg-router, the probe routes excluded, were 5xx over the last 5 minutes (threshold 0.05)."
+
+  # One client response in ten a 502 beside the probes: 10 %, over the threshold.
+  - interval: 1m
+    name: a tenth of the client responses failing fires
+    input_series:
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/readiness", status_code="200", error_code=""}'
+        values: '0+6x20'
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/v1/chat/completions", status_code="200", error_code=""}'
+        values: '0+9x20'
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/v1/chat/completions", status_code="502", error_code="upstream_error"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "Too many responses are server errors"
+              description: "10% of the responses of smg/smg-router, the probe routes excluded, were 5xx over the last 5 minutes (threshold 0.05)."

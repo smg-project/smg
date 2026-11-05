@@ -31,16 +31,17 @@ spec:
           annotations:
             summary: "No healthy worker behind the gateway"
             description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes for {{ $a.noHealthyWorkerFor }}; requests are refused until one returns."
+        {{- /* The ratio reads client traffic alone: the probe routes (/health, /readiness, /liveness) are the kubelet's polls, answered 503 for the whole of an engine's bring-up with no client in sight, and 200 every few seconds once the fleet serves, where they would dilute the share of failing client responses. The access log demotes the same three routes. */}}
         - alert: SmgHighErrorRatio
           expr: |
-            sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, status_code=~"5.." }[5m]))
-              / sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
+            sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, path!~"/health|/readiness|/liveness", status_code=~"5.." }[5m]))
+              / sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, path!~"/health|/readiness|/liveness" }[5m])) > {{ $a.errorRatio }}
           for: {{ $a.errorRatioFor }}
           labels:
             severity: critical
           annotations:
             summary: "Too many responses are server errors"
-            description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
+            description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }}, the probe routes excluded, were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
         - alert: SmgTtftP99High
           expr: |
             histogram_quantile(0.99, sum by (le, namespace, job) (rate(smg_router_ttft_seconds_bucket{ {{ $job }} }[5m]))) > {{ $a.ttftP99Seconds }}

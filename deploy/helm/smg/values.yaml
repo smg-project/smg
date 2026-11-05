@@ -435,7 +435,10 @@ grafana:
 # SLOs. The rationale of each default:
 #   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
 #     minutes is an outage to a retrying client; a shorter window pages on one
-#     worker's restart.
+#     worker's restart. The probe routes (/health, /readiness, /liveness) are
+#     out of the ratio: the readiness probe answers 503 for the whole of an
+#     engine's bring-up with no client in sight, and once the fleet serves the
+#     probes' 200s would dilute the share of failing client responses.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
 #     front of the engines (set it to the SLO once there is one).
