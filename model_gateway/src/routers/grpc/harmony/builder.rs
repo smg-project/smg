@@ -1101,15 +1101,15 @@ impl HarmonyBuilder {
                     content,
                     name,
                     tool_calls,
-                    reasoning_content,
+                    reasoning,
                     ..
                 } => {
                     if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
                         // Per Harmony spec: when tool calls are present, include
                         // previous reasoning as a separate analysis channel message
                         // because the model calls tools as part of its chain-of-thought.
-                        if let Some(reasoning) = reasoning_content {
-                            if !reasoning.is_empty() {
+                        if let Some(text) = &reasoning.text {
+                            if !text.is_empty() {
                                 let analysis_msg = HarmonyMessage {
                                     author: Author {
                                         role: Role::Assistant,
@@ -1117,7 +1117,7 @@ impl HarmonyBuilder {
                                     },
                                     recipient: None,
                                     content: vec![Content::Text(TextContent {
-                                        text: reasoning.clone(),
+                                        text: text.clone(),
                                     })],
                                     channel: Some("analysis".to_string()),
                                     content_type: None,
