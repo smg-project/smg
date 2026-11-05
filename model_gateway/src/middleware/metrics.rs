@@ -185,7 +185,7 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let method = method_to_static_str(req.method().as_str());
-        let path = matched_path_label(req.extensions()).to_owned();
+        let path = PathLabel::of(req.extensions());
         let start = Instant::now();
 
         let mut inner = self.inner.clone();
@@ -212,7 +212,7 @@ where
             };
 
             outcome.head(&response);
-            Metrics::record_http_duration(method, &path, start.elapsed());
+            Metrics::record_http_duration(method, path.as_str(), start.elapsed());
 
             // Hold the in-flight guard for the response BODY's lifetime, not
             // the handler's: streaming handlers return their response
@@ -243,14 +243,14 @@ where
 /// the head's status with [`BODY_FAILED_CODE`] when its body failed after
 /// the head, a client-closed request when the client left first.
 pub(super) struct ResponseOutcome {
-    path: String,
+    path: PathLabel,
     /// The response head's status and gateway error code, once there is one.
     head: Option<(u16, String)>,
     recorded: bool,
 }
 
 impl ResponseOutcome {
-    pub(super) fn pending(path: String) -> Self {
+    pub(super) fn pending(path: PathLabel) -> Self {
         Self {
             path,
             head: None,
@@ -272,7 +272,7 @@ impl ResponseOutcome {
             return;
         }
         if let Some((status_code, error_code)) = &self.head {
-            Metrics::record_http_response(&self.path, *status_code, error_code);
+            Metrics::record_http_response(self.path.as_str(), *status_code, error_code);
         }
     }
 
@@ -288,7 +288,7 @@ impl ResponseOutcome {
             } else {
                 error_code.as_str()
             };
-            Metrics::record_http_response(&self.path, *status_code, error_code);
+            Metrics::record_http_response(self.path.as_str(), *status_code, error_code);
         }
     }
 
@@ -298,7 +298,7 @@ impl ResponseOutcome {
             return;
         }
         Metrics::record_http_response(
-            &self.path,
+            self.path.as_str(),
             CLIENT_CLOSED_REQUEST_STATUS,
             CLIENT_CLOSED_REQUEST_CODE,
         );
@@ -326,7 +326,37 @@ impl Drop for ResponseOutcome {
 pub(super) fn matched_path_label(extensions: &http::Extensions) -> &str {
     extensions
         .get::<MatchedPath>()
-        .map_or("other", MatchedPath::as_str)
+        .map_or(UNMATCHED_PATH_LABEL, MatchedPath::as_str)
+}
+
+/// The path label of a request that matched no route.
+const UNMATCHED_PATH_LABEL: &str = "other";
+
+/// The bounded path label ([`matched_path_label`]) a request's response is
+/// counted under once it has gone out: the matched route's own template,
+/// shared with the router that holds it (a clone is a reference count, not a
+/// copy of the text), or a constant.
+#[derive(Clone, Debug)]
+pub(super) enum PathLabel {
+    Matched(MatchedPath),
+    Static(&'static str),
+}
+
+impl PathLabel {
+    /// The label of a request: its matched route, or `"other"`.
+    pub(super) fn of(extensions: &http::Extensions) -> Self {
+        extensions
+            .get::<MatchedPath>()
+            .cloned()
+            .map_or(Self::Static(UNMATCHED_PATH_LABEL), Self::Matched)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        match self {
+            Self::Matched(path) => path.as_str(),
+            Self::Static(label) => label,
+        }
+    }
 }
 
 #[cfg(test)]

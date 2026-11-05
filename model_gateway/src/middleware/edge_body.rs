@@ -344,7 +344,7 @@ impl Drop for EdgeBody {
 pub(crate) fn at_the_edge(mut response: Response) -> Response {
     let tracker = InFlightRequestTracker::new();
     let guard = tracker.track();
-    let mut outcome = ResponseOutcome::pending("/test".to_owned());
+    let mut outcome = ResponseOutcome::pending(super::metrics::PathLabel::Static("/test"));
     outcome.head(&response);
     let progress = BodyProgress::new(&response);
     let duties = BodyDuties::take(&mut response);
