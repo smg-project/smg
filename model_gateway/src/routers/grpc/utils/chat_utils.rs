@@ -458,8 +458,22 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// (`thinking.effort`, else the top-level field) is written over an entry,
 /// as the engine's own server renders it.
 fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined = HashMap::with_capacity(kwargs_capacity);
+    let request_kwargs = request
+        .chat_template_kwargs
+        .as_ref()
+        .map_or(0, HashMap::len);
+    let reasoning_effort = request.effective_reasoning_effort();
+    // A plain request (no tool choice, no response format, no kwargs, no
+    // effort) renders with no kwargs at all: its map stays unallocated.
+    let mut combined = if request.tool_choice.is_some()
+        || request.response_format.is_some()
+        || request_kwargs > 0
+        || reasoning_effort.is_some()
+    {
+        HashMap::with_capacity(3 + request_kwargs)
+    } else {
+        HashMap::new()
+    };
     if let Some(tool_choice) = &request.tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
@@ -471,7 +485,7 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
     }
-    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
+    if let Some(reasoning_effort) = reasoning_effort {
         combined.insert(
             REASONING_EFFORT_KEY.to_string(),
             Value::String(reasoning_effort.to_string()),
