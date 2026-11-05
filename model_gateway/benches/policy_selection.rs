@@ -207,19 +207,7 @@ fn bench_least_load_decision(c: &mut Criterion) {
 /// `workers` ready regular workers (no health checker behind them) and the ring built over their
 /// URLs, as the registry builds it.
 fn ring_pool(workers: usize) -> (Vec<Arc<dyn Worker>>, Arc<HashRing>) {
-    let pool: Vec<Arc<dyn Worker>> = (0..workers)
-        .map(|i| {
-            Arc::new(
-                BasicWorkerBuilder::new(format!("http://worker-{i:03}:8000"))
-                    .worker_type(WorkerType::Regular)
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
-                    .build(),
-            ) as Arc<dyn Worker>
-        })
-        .collect();
+    let pool = ready_pool(workers);
     let ring = Arc::new(HashRing::new(pool.iter().map(|worker| worker.url())));
     (pool, ring)
 }
