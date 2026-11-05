@@ -15,7 +15,8 @@
 //! sequences, so the lossy decode of the pending bytes alone is the text the
 //! reference would emit: the same pieces at the same tokens, and over a
 //! whole stream exactly `decode(all_ids)`. The pending buffer holds at most
-//! the bytes since the last emission, normally one partial character.
+//! the bytes since the last emission, normally one partial character; the
+//! stream's end releases it as `decode` renders the same bytes.
 
 use std::{
     borrow::Cow,
@@ -421,6 +422,19 @@ impl IncrementalDecoder for ByteLevelIncremental {
         })
     }
 
+    fn finish_into(&mut self, out: &mut String) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
+        // The emitted text ends at a character boundary, so the lossy decode
+        // of the pending bytes alone is the tail `decode` renders for the
+        // whole stream: the complete characters among them as they are, an
+        // incomplete or invalid sequence as the replacement character.
+        out.push_str(&String::from_utf8_lossy(&self.pending));
+        self.pending.clear();
+        Ok(true)
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
         self.text.clear();
@@ -430,7 +444,7 @@ impl IncrementalDecoder for ByteLevelIncremental {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use tokenizers::{
@@ -442,7 +456,7 @@ mod tests {
 
     use super::*;
 
-    const SPECIAL: &str = "<|im_end|>";
+    pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
 
     fn alphabet() -> Vec<char> {
@@ -462,7 +476,7 @@ mod tests {
     /// bytes of a 4-byte emoji, "Ġà" (a space plus the lead byte of a 3-byte
     /// character) and "ï¿½" (the three bytes of a literal U+FFFD), so
     /// characters get split across tokens in every way the fixtures show.
-    fn byte_level_tokenizer() -> HfTokenizer {
+    pub(crate) fn byte_level_tokenizer() -> HfTokenizer {
         let mut vocab = Vocab::default();
         for (id, ch) in alphabet().into_iter().enumerate() {
             vocab.insert(ch.to_string(), id as u32);
