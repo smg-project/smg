@@ -205,12 +205,16 @@ run_commands() {
             case " $cargo_args " in *" --doc "*) continue ;; esac
             # shellcheck disable=SC2086
             (set -x; cargo test $cargo_args --no-run)
+        # A run names several test binaries; without --no-fail-fast cargo stops at
+        # the first binary that fails, and the ones after it in the list never run,
+        # so their result hides behind the first red. Every binary runs and every
+        # failure is reported; the invocation still fails when any binary does.
         elif [ -n "$test_args" ]; then
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args -- $test_args)
+            (set -x; cargo test --no-fail-fast $cargo_args -- $test_args)
         else
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args)
+            (set -x; cargo test --no-fail-fast $cargo_args)
         fi
     done <<< "$commands"
 }
