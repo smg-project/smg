@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     byte_fallback::PieceTable,
-    byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_level::{cut_start, push_token_bytes, ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
@@ -117,6 +117,10 @@ pub struct HuggingFaceTokenizer {
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
     byte_fallback_values: Vec<Option<u8>>,
+    /// The decoder is a sequence with a byte-level member, which gets no
+    /// per-id table: the generic window then holds the bytes of an
+    /// unfinished character, and the stream's end judges a cut from them.
+    byte_level_chain: bool,
 }
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
@@ -146,6 +150,17 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
     match decoder {
         DecoderWrapper::ByteFallback(_) => true,
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
+        _ => false,
+    }
+}
+
+/// Whether a `Sequence` decoder has a byte-level member (a plain `ByteLevel`
+/// decoder gets the per-id table instead, see `byte_level`).
+fn has_byte_level_member(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(|member| {
+            matches!(member, DecoderWrapper::ByteLevel(_)) || has_byte_level_member(member)
+        }),
         _ => false,
     }
 }
@@ -897,6 +912,8 @@ impl HuggingFaceTokenizer {
         let tools_block =
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
         let byte_level = ByteLevelTable::build(&tokenizer);
+        let byte_level_chain =
+            byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
         log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         Ok(HuggingFaceTokenizer {
@@ -919,6 +936,7 @@ impl HuggingFaceTokenizer {
             renderer,
             has_byte_fallback,
             byte_fallback_values,
+            byte_level_chain,
         })
     }
 
@@ -936,6 +954,55 @@ impl HuggingFaceTokenizer {
         usize::try_from(token_id)
             .ok()
             .and_then(|index| self.byte_fallback_values.get(index).copied().flatten())
+    }
+
+    /// How many ids at the end of `held` (the window's ids past the emitted
+    /// text) are a character the stream's end cut short: the byte tokens of
+    /// a trailing sequence that is the valid start of a character and nothing
+    /// more (`cut_start`), with a skipped special token among or after them,
+    /// which renders nothing. Zero when the held run ends on a complete
+    /// character or on an invalid sequence, which the full decode's
+    /// replacement characters stand for.
+    fn cut_tail(&self, held: &[TokenIdType], skip_special_tokens: bool) -> usize {
+        let run_start = held
+            .iter()
+            .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+            .map_or(0, |index| index + 1);
+        let run = &held[run_start..];
+        let bytes: Vec<u8> = run
+            .iter()
+            .filter_map(|&id| self.byte_fallback_value(id))
+            .collect();
+        let mut cut_bytes = bytes.len() - cut_start(&bytes);
+        let mut cut = 0;
+        for &id in run.iter().rev() {
+            if cut_bytes == 0 {
+                break;
+            }
+            if self.byte_fallback_value(id).is_some() {
+                cut_bytes -= 1;
+            }
+            cut += 1;
+        }
+        cut
+    }
+
+    /// Whether the held ids of a window decoded by a sequence with a
+    /// byte-level member end in a character the stream's end cut short: their
+    /// bytes (the byte-level characters mapped back, a skipped special token
+    /// left out) end in the start of a character and nothing more.
+    fn byte_level_window_ends_cut(&self, held: &[TokenIdType], skip_special_tokens: bool) -> bool {
+        let added = self.core.tokenizer.get_added_vocabulary();
+        let mut bytes = Vec::new();
+        for &id in held {
+            if let Some(token) = self.reverse_vocab.get(&id) {
+                if skip_special_tokens && added.is_special_token(token) {
+                    continue;
+                }
+                push_token_bytes(token, &mut bytes);
+            }
+        }
+        cut_start(&bytes) < bytes.len()
     }
 
     /// Whether the window is a lost byte run: every id a byte token rendered
@@ -1156,6 +1223,8 @@ impl HuggingFaceTokenizer {
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let byte_level = ByteLevelTable::build(&tokenizer);
+        let byte_level_chain =
+            byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
         log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         HuggingFaceTokenizer {
@@ -1178,6 +1247,7 @@ impl HuggingFaceTokenizer {
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
+            byte_level_chain,
         }
     }
 
@@ -2117,8 +2187,17 @@ impl Decoder for HuggingFaceTokenizer {
             *prefix_index = 0;
             return Ok(DecodeStep::default());
         }
+        if self.has_byte_fallback {
+            // The byte tokens of a character the end cut short come off the
+            // window: the end releases the text before them and nothing for
+            // the character, where the window's decode would render one
+            // replacement character per byte of it.
+            let held = (*prefix_index).min(ids.len());
+            let cut = self.cut_tail(&ids[held..], skip_special_tokens);
+            ids.truncate(ids.len() - cut);
+        }
         let decoded = self.window_decode(ids, skip_special_tokens)?;
-        let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
+        let (mut pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
                 let run_start =
@@ -2134,6 +2213,18 @@ impl Decoder for HuggingFaceTokenizer {
                 (pending, true)
             }
         };
+        if self.byte_level_chain
+            && pending.ends_with(char::REPLACEMENT_CHARACTER)
+            && self.byte_level_window_ends_cut(
+                &ids[(*prefix_index).min(ids.len())..],
+                skip_special_tokens,
+            )
+        {
+            // The chain's byte-level decoder renders a sequence the end cut
+            // short as one replacement character at the very end: the start
+            // of a character the model never finished, released as nothing.
+            pending.pop();
+        }
         ids.clear();
         prefix.clear();
         *prefix_index = 0;
