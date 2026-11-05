@@ -135,7 +135,8 @@ fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool) {
         tracing::info!(
             path,
             declined = %crate::byte_level::decoder_kind(tokenizer.get_decoder()),
-            "tokenizer decode path (the tables take a ByteLevel decoder or one with byte fallback)"
+            "tokenizer decode path (the tables take a ByteLevel decoder, or the chain \
+             [Replace U+2581 -> space] ByteFallback Fuse [Strip one leading space])"
         );
     }
 }
