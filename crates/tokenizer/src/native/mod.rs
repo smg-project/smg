@@ -927,6 +927,7 @@ impl NativeEncoder {
             normalizer: Normalizer::None,
             raw_added: AddedTokens::build(specials)?,
             normalized_added: None,
+            nfc_quick: None,
             stages,
             chain,
             frame: Frame::default(),
