@@ -11,9 +11,9 @@ use openai_protocol::{
 };
 use smg_grpc_client::{
     common_proto, mlx_proto, sglang_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
-    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, MlxEngineClient,
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    TrtllmServiceClient, VllmEngineClient,
+    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, FormatSetAside,
+    MlxEngineClient, OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
 use super::multimodal::SUPPORTS_VISION_LABEL;
@@ -59,6 +59,11 @@ pub enum GrpcClient {
 pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
+    /// Which of a chat body's own format fields `tool_constraints` answers (a
+    /// table's tag for a JSON `response_format`; the whole turn's grammar for
+    /// the `regex` and the `ebnf` too): the builders read them as absent, so
+    /// the engine's request carries the constraint alone.
+    pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
     /// `tool_constraints` was led with the model's thought and its close for
     /// a worker whose engine starts the grammar at the first generated token:
@@ -566,9 +571,14 @@ impl GrpcClient {
         let GenerateRequestBuildOptions {
             multimodal_inputs,
             tool_constraints,
+            format_set_aside,
             require_reasoning,
             first_token_grammar,
         } = options;
+        let constraint = OutputConstraint {
+            tool: tool_constraints,
+            set_aside: format_set_aside,
+        };
         let EngineBuilders {
             sglang,
             vllm,
@@ -592,7 +602,8 @@ impl GrpcClient {
                     token_ids,
                     SglangGenerateRequestOptions {
                         multimodal_inputs: sglang_mm,
-                        tool_call_constraint: tool_constraints,
+                        tool_call_constraint: constraint.tool,
+                        format_set_aside: constraint.set_aside,
                         require_reasoning,
                     },
                 )?;
@@ -605,14 +616,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_vllm_request(vllm_mm, |mm| {
-                    vllm(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    vllm(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
             Self::Trtllm(client) => {
@@ -627,7 +631,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -639,7 +643,7 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
@@ -649,14 +653,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                    tokenspeed(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    tokenspeed(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
         }?;
@@ -710,7 +707,7 @@ pub(crate) type VllmMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<vllm_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<vllm_proto::GenerateRequest, String>;
 
 /// The TokenSpeed counterpart of [`VllmMmBuilder`].
@@ -720,7 +717,7 @@ pub(crate) type TokenSpeedMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<tokenspeed_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<tokenspeed_proto::GenerateRequest, String>;
 
 /// The SGLang counterpart of [`VllmMmBuilder`] on the connected client; its
@@ -742,7 +739,7 @@ type TrtllmClientMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<trtllm_proto::MultimodalInput>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<trtllm_proto::GenerateRequest, String>;
 
 /// The MLX counterpart of [`VllmMmBuilder`] on the connected client; MLX
@@ -753,7 +750,7 @@ type MlxClientMmBuilder<B> = fn(
     &B,
     String,
     Vec<u32>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<mlx_proto::GenerateRequest, String>;
 
 /// A vLLM builder for a request kind with neither multimodal inputs nor tool

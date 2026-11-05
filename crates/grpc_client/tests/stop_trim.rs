@@ -8,6 +8,7 @@ use smg_grpc_client::{
     tokenspeed_scheduler::TokenSpeedSchedulerClient,
     trtllm_service::TrtllmServiceClient,
     vllm_engine::VllmEngineClient,
+    OutputConstraint,
 };
 
 fn plain(no_stop_trim: bool) -> serde_json::Result<GenerateRequest> {
@@ -86,7 +87,7 @@ fn a_chat_requests_no_stop_trim_reaches_every_engine_client() {
             "hi".into(),
             vec![1],
             None,
-            None,
+            OutputConstraint::default(),
         )
         .unwrap();
         assert_eq!(
@@ -113,7 +114,7 @@ fn a_chat_requests_no_stop_trim_reaches_every_engine_client() {
             "hi".into(),
             vec![1],
             None,
-            None,
+            OutputConstraint::default(),
         )
         .unwrap();
         assert_eq!(
@@ -127,7 +128,7 @@ fn a_chat_requests_no_stop_trim_reaches_every_engine_client() {
             "hi".into(),
             vec![1],
             None,
-            None,
+            OutputConstraint::default(),
         )
         .unwrap();
         assert_eq!(

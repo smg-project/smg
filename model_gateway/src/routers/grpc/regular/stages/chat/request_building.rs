@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
@@ -71,7 +72,9 @@ fn reasoning_decision(
 /// `provider` is the model's profile as the request's preparation derived it
 /// (`ProcessingState::provider`); `generation_prompt` and
 /// `continued_final_message` are the rendered prompt's (`ProcessedMessages`).
-/// `table_tag` derives the
+/// `format_set_aside` names which of the body's own format fields
+/// `tool_constraints` answers, so the builders read them as absent and the
+/// engine's request carries the constraint alone. `table_tag` derives the
 /// table's tag for a worker's grammar start when `tool_constraints` is one
 /// the table shapes by the start, the `auto` tag or a JSON answer's
 /// (`regular::symphony::constraint::WorkerConstraint::table_tag`).
@@ -85,6 +88,7 @@ pub(crate) async fn build_chat_backed_plan(
     continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
+    format_set_aside: FormatSetAside,
     table_tag: Option<Arc<dyn TagForStart>>,
     first_token_tag: bool,
     id_prefix: &'static str,
@@ -113,6 +117,7 @@ pub(crate) async fn build_chat_backed_plan(
             processed_text,
             token_ids,
             tool_constraints,
+            format_set_aside,
             table_tag,
             first_token_tag,
             require_reasoning,
@@ -202,37 +207,31 @@ impl ChatRequestBuildingStage {
         )?;
         // The table's structural tag stands in for a JSON response_format (see
         // `regular::symphony::constraint`), and the whole turn's grammar for a
-        // regex or an ebnf too: the engine's request carries the tag alone, so
-        // no client reads the two as competing constraints.
+        // regex or an ebnf too: the engine's request carries the tag alone. The
+        // body's own fields are set aside for the client's builders, which read
+        // them as absent, so no client reads the two as competing constraints
+        // and the request is built from the client's request as sent.
         let answered = assignment.is_some()
             && chat_request.response_format.is_some()
             && tool_constraints
                 .as_ref()
                 .is_some_and(|(kind, _)| kind == "structural_tag");
-        let engine_request = (answered || whole_turn).then(|| {
-            let mut request = chat_request.as_ref().clone();
-            request.response_format = None;
-            if whole_turn {
-                request.regex = None;
-                request.ebnf = None;
-            }
-            request
-        });
-        let engine_request = match &engine_request {
-            Some(request) => request,
-            None => chat_request.as_ref(),
+        let format_set_aside = FormatSetAside {
+            response_format: answered || whole_turn,
+            grammar: whole_turn,
         };
         let generation_prompt = processed_messages.generation_prompt;
         let continued_final_message = processed_messages.continued_final_message;
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
-            engine_request,
+            &chat_request,
             provider,
             processed_messages.text,
             generation_prompt,
             continued_final_message,
             token_ids,
             tool_constraints,
+            format_set_aside,
             table_tag,
             first_token,
             "chatcmpl-",
@@ -308,6 +307,7 @@ mod tests {
             false,
             vec![1, 2, 3],
             Some(("structural_tag".to_string(), FORCED_CALL_TAG.to_string())),
+            FormatSetAside::default(),
             None,
             false,
             "chatcmpl-",
@@ -319,6 +319,52 @@ mod tests {
         .expect("built");
         engine.abort();
         assert!(!reasoning_in_prefill);
+        assert_fixed_request_plan(&plan, &stamp, "chatcmpl-");
+    }
+
+    /// A JSON answer the table's tag stands in for: the plan is built from the
+    /// client's request as sent, its `response_format` set aside for the
+    /// builder, and carries the tag as its one constraint.
+    #[tokio::test]
+    async fn a_json_answer_the_tag_stands_in_for_builds_the_plan_from_the_request_as_sent() {
+        let (client, engine) = mock_backend_client(MODEL).await;
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "temperature": 0.5, "max_tokens": 7,
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": {"type": "object"}}
+                }
+            }))
+            .expect("a chat request"),
+        );
+        let mut ctx =
+            RequestContext::for_chat(Arc::clone(&chat), None, MODEL.to_string(), components());
+        ctx.state.clients = Some(ClientSelection::Single { client });
+        let (plan, stamp, _) = build_chat_backed_plan(
+            &mut ctx,
+            &chat,
+            ProviderProfile::for_model(MODEL),
+            "<prompt>".to_string(),
+            true,
+            false,
+            vec![1, 2, 3],
+            Some(("structural_tag".to_string(), FORCED_CALL_TAG.to_string())),
+            FormatSetAside {
+                response_format: true,
+                grammar: false,
+            },
+            None,
+            false,
+            "chatcmpl-",
+            false,
+            ExecutionPlanKind::Single,
+        )
+        .await
+        .map_err(|refusal| refusal.status())
+        .expect("built");
+        engine.abort();
         assert_fixed_request_plan(&plan, &stamp, "chatcmpl-");
     }
 }
