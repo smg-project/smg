@@ -1180,10 +1180,33 @@ pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> 
     )
 }
 
+/// Keys' cubic (`a = -0.5`) as torch's compiled CPU kernel evaluates it in
+/// `f32`: `((a + 2) x - (a + 3)) x x + 1` below one and
+/// `((a x - 5a) x + 8a) x - 4a` below two, with the fused multiply-adds its
+/// compiler contracts (the inner `a x - c` and every trailing `t x + c`).
+/// The same polynomials in double, or in `f32` without the contractions,
+/// move a weight by one `f32` ULP at non-dyadic ratios and the output with it.
+fn torch_aa_cubic_f32(x: f32) -> f32 {
+    const A: f32 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0).mul_add(x, -(A + 3.0)) * x).mul_add(x, 1.0)
+    } else if x < 2.0 {
+        A.mul_add(x, -(5.0 * A))
+            .mul_add(x, 8.0 * A)
+            .mul_add(x, -(4.0 * A))
+    } else {
+        0.0
+    }
+}
+
 /// torch's antialiasing bicubic weights for one axis, computed as its CPU
 /// kernel does on a float tensor: the scale, kernel center and normalized
-/// weights in `f32` (the cubic itself in `f64`). Pillow's `f64` weights shift
-/// by up to ~5e-5 at large output indices, which moves sharp edges by ~0.01.
+/// weights in `f32`, the cubic of [`torch_aa_cubic_f32`], and the tap count
+/// read from the rounded bounds and capped at the kernel's weight buffer
+/// (`ceil(support) * 2 + 1` taps: the rounded bounds can count one more).
+/// Pillow's `f64` weights shift by up to ~5e-5 at large output indices, which
+/// moves sharp edges by ~0.01.
 fn torch_aa_bicubic_weights(
     in_size: usize,
     out_size: usize,
@@ -1194,16 +1217,18 @@ fn torch_aa_bicubic_weights(
     } else {
         (2.0, 1.0)
     };
+    let max_taps = (support.ceil() as usize) * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
     let mut weights = Vec::with_capacity(out_size);
     for i in 0..out_size {
         let center = (f64::from(scale) * (i as f64 + 0.5)) as f32;
         let start = (f64::from(center - support) + 0.5).max(0.0) as usize;
         let end = ((f64::from(center + support) + 0.5) as usize).min(in_size);
-        let mut w: Vec<f32> = (start..end)
+        let count = end.saturating_sub(start).min(max_taps);
+        let mut w: Vec<f32> = (start..start + count)
             .map(|j| {
                 let x = (f64::from(j as f32 - center) + 0.5) * f64::from(invscale);
-                pil_cubic(f64::from(x as f32)) as f32
+                torch_aa_cubic_f32(x as f32)
             })
             .collect();
         let total: f32 = w.iter().sum();
@@ -1212,17 +1237,29 @@ fn torch_aa_bicubic_weights(
                 *wx /= total;
             }
         }
-        bounds.push((start, end - start));
+        bounds.push((start, count));
         weights.push(w);
     }
     (bounds, weights)
 }
 
+/// The taps after the first that torch's compiled loop adds plainly for an
+/// output of `count` taps: its unrolled body takes four taps at a time after
+/// the first, a rounded product and a rounded add each; the remaining taps
+/// (the loop's tail, contracted by its compiler) are fused multiply-adds.
+/// Read from the kernel's output on impulse inputs, tap count by tap count;
+/// every other order differs in the last bit on some inputs.
+#[inline]
+fn torch_aa_plain_until(count: usize) -> usize {
+    (count.saturating_sub(1) / 4) * 4
+}
+
 /// `torch.nn.functional.interpolate(mode="bicubic", antialias=True)` on the
 /// image as a float tensor: interleaved RGB bytes in, interleaved `f32`
 /// values on the byte scale out, nothing rounded. The kernel is Keys cubic
-/// `a = -0.5` widened by the downscale factor, with torch's `f32` weights;
-/// the width pass runs first.
+/// `a = -0.5` widened by the downscale factor, with torch's `f32` weights and
+/// its compiled loop's order of roundings (`torch_aa_passes`), so an output is
+/// the reference's bit for bit; the width pass runs first.
 pub fn resize_bicubic_torch_aa_f32(
     data: &[u8],
     width: u32,
@@ -1250,34 +1287,133 @@ pub fn resize_bicubic_torch_aa_f32(
     }
     let (x_bounds, x_weights) = torch_aa_bicubic_weights(in_w, out_w);
     let (y_bounds, y_weights) = torch_aa_bicubic_weights(in_h, out_h);
+    let x = TorchAaAxis {
+        bounds: &x_bounds,
+        weights: &x_weights,
+    };
+    let y = TorchAaAxis {
+        bounds: &y_bounds,
+        weights: &y_weights,
+    };
+    #[cfg(target_arch = "x86_64")]
+    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &y) {
+        return Ok(out);
+    }
+    Ok(torch_aa_passes(data, in_w, &x, &y))
+}
+
+/// One axis of the torch-style resize: per output sample the first source
+/// index and the tap count, and the taps' weights.
+struct TorchAaAxis<'a> {
+    bounds: &'a [(usize, usize)],
+    weights: &'a [Vec<f32>],
+}
+
+/// The two passes of [`resize_bicubic_torch_aa_f32`]: every source row
+/// resampled along the width, then the rows along the height. An output's
+/// taps add in the reference's three runs: the first tap is the bare product,
+/// the next [`torch_aa_plain_until`] taps add a rounded product in a second
+/// rounding, and the rest are fused multiply-adds. Inlined into its callers so
+/// that the fused taps compile to the caller's instruction set.
+#[inline(always)]
+fn torch_aa_passes(data: &[u8], in_w: usize, x: &TorchAaAxis<'_>, y: &TorchAaAxis<'_>) -> Vec<f32> {
+    let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
+    let in_h = data.len() / (in_w * 3);
 
     let mut rows = vec![0.0_f32; in_h * out_w * 3];
-    for y in 0..in_h {
-        let src = &data[y * in_w * 3..][..in_w * 3];
-        let dst = &mut rows[y * out_w * 3..][..out_w * 3];
-        for (ox, (&(start, count), weights)) in x_bounds.iter().zip(&x_weights).enumerate() {
+    for (src, dst) in data
+        .chunks_exact(in_w * 3)
+        .zip(rows.chunks_exact_mut(out_w * 3))
+    {
+        let (pixels, _) = src.as_chunks::<3>();
+        let (outs, _) = dst.as_chunks_mut::<3>();
+        for (out, (&(start, count), weights)) in outs.iter_mut().zip(x.bounds.iter().zip(x.weights))
+        {
+            let mut taps = weights[..count].iter().zip(&pixels[start..start + count]);
             let mut acc = [0.0_f32; 3];
-            for (k, &weight) in weights[..count].iter().enumerate() {
-                let pixel = &src[(start + k) * 3..][..3];
-                for c in 0..3 {
-                    acc[c] += weight * f32::from(pixel[c]);
+            if let Some((&weight, pixel)) = taps.next() {
+                for (sum, &byte) in acc.iter_mut().zip(pixel) {
+                    *sum = weight * f32::from(byte);
                 }
             }
-            dst[ox * 3..][..3].copy_from_slice(&acc);
+            for (&weight, pixel) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (sum, &byte) in acc.iter_mut().zip(pixel) {
+                    *sum += weight * f32::from(byte);
+                }
+            }
+            for (&weight, pixel) in taps {
+                for (sum, &byte) in acc.iter_mut().zip(pixel) {
+                    *sum = weight.mul_add(f32::from(byte), *sum);
+                }
+            }
+            *out = acc;
         }
     }
 
     let mut out = vec![0.0_f32; out_h * out_w * 3];
-    for (oy, (&(start, count), weights)) in y_bounds.iter().zip(&y_weights).enumerate() {
-        let dst = &mut out[oy * out_w * 3..][..out_w * 3];
-        for (k, &weight) in weights[..count].iter().enumerate() {
-            let src = &rows[(start + k) * out_w * 3..][..out_w * 3];
+    let row = out_w * 3;
+    for (dst, (&(start, count), weights)) in out
+        .chunks_exact_mut(row)
+        .zip(y.bounds.iter().zip(y.weights))
+    {
+        let mut taps = weights[..count]
+            .iter()
+            .zip(rows[start * row..(start + count) * row].chunks_exact(row));
+        if let Some((&weight, src)) = taps.next() {
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = weight * v;
+            }
+        }
+        for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
             for (d, &v) in dst.iter_mut().zip(src) {
                 *d += weight * v;
             }
         }
+        for (&weight, src) in taps {
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = weight.mul_add(v, *d);
+            }
+        }
     }
-    Ok(out)
+    out
+}
+
+/// [`torch_aa_passes`] compiled for the fused multiply-add instruction. At
+/// the baseline x86-64 target the fused taps of [`torch_aa_passes`] call the C
+/// library's software `fmaf`, the same bits several times slower; the
+/// reference kernel dispatches a build of its own with the instruction on
+/// such processors.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+fn torch_aa_passes_fma(
+    data: &[u8],
+    in_w: usize,
+    x: &TorchAaAxis<'_>,
+    y: &TorchAaAxis<'_>,
+) -> Vec<f32> {
+    torch_aa_passes(data, in_w, x, y)
+}
+
+/// [`torch_aa_passes_fma`] on a processor that reports the feature, `None`
+/// on one that does not: the detection and the call sit in one function,
+/// as the crate's NEON kernels keep them.
+#[cfg(target_arch = "x86_64")]
+#[expect(
+    unsafe_code,
+    reason = "the target-feature function runs only after this function detected its feature"
+)]
+fn torch_aa_passes_with_fma(
+    data: &[u8],
+    in_w: usize,
+    x: &TorchAaAxis<'_>,
+    y: &TorchAaAxis<'_>,
+) -> Option<Vec<f32>> {
+    if !std::arch::is_x86_feature_detected!("fma") {
+        return None;
+    }
+    // SAFETY: `is_x86_feature_detected!("fma")` answered true just above, the
+    // only requirement of a `target_feature(enable = "fma")` function.
+    Some(unsafe { torch_aa_passes_fma(data, in_w, x, y) })
 }
 
 /// Resize image preserving aspect ratio, fitting within max dimensions.
@@ -2313,6 +2449,160 @@ mod tests {
                         "channel {c} at ({x}, {y})"
                     );
                 }
+            }
+        }
+    }
+
+    /// [`resize_bicubic_torch_aa_f32`] carries torch's bits: four seeded
+    /// inputs (an LCG's bytes) through a four-tap upscale, a seven-tap and a
+    /// seventeen-tap one-row downscale and a mixed resize, against
+    /// `torch.nn.functional.interpolate(mode="bicubic", antialias=True)` on
+    /// the CPU (torch 2.13.0): the digest of every output's bits and, for a
+    /// readable failure, four elements per case where the previous evaluation
+    /// (the cubic in double, every tap added plainly) parted by one ULP. The
+    /// dispatching entry point, the generic body and, where the processor has
+    /// it, the FMA body are each driven directly, so a host with the
+    /// instruction covers the fallback too.
+    #[test]
+    fn resize_bicubic_torch_aa_f32_carries_the_reference_bits() {
+        use sha2::{Digest, Sha256};
+
+        struct Case {
+            width: u32,
+            height: u32,
+            out_w: u32,
+            out_h: u32,
+            seed: u32,
+            // SHA-256 of the little-endian f32 bits of the reference's output.
+            digest: &'static str,
+            // (index, bits) where the previous evaluation parted by one ULP.
+            witnesses: [(usize, u32); 4],
+        }
+        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                    ((state >> 16) & 0xff) as u8
+                })
+                .collect()
+        }
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        let cases = [
+            Case {
+                width: 5,
+                height: 7,
+                out_w: 3,
+                out_h: 4,
+                seed: 11,
+                digest: "d4bfc041c7c9ab5e8f3740ddb25b93c0dfdc4e5a7187b92c32f201c6776cc240",
+                witnesses: [
+                    (1, 0x4336_b058),
+                    (2, 0x42d1_fa32),
+                    (3, 0x434e_08f2),
+                    (4, 0x4313_c030),
+                ],
+            },
+            Case {
+                width: 13,
+                height: 1,
+                out_w: 7,
+                out_h: 1,
+                seed: 23,
+                digest: "fb846101957b27905415b007ae9cd8daeaf9656d787e71c0d2eeb494dff0afa8",
+                witnesses: [
+                    (0, 0x4362_6944),
+                    (1, 0x4299_0234),
+                    (3, 0x4303_883b),
+                    (4, 0x421e_1e2c),
+                ],
+            },
+            Case {
+                width: 33,
+                height: 3,
+                out_w: 8,
+                out_h: 3,
+                seed: 37,
+                digest: "de6d9663c4ce3e6c48f5a0d77d081a97667bedc70ff3b1f243861448a3a2d453",
+                witnesses: [
+                    (0, 0x4302_3f58),
+                    (1, 0x42ef_062d),
+                    (2, 0x42dc_09e2),
+                    (4, 0x430d_68a6),
+                ],
+            },
+            Case {
+                width: 11,
+                height: 5,
+                out_w: 12,
+                out_h: 8,
+                seed: 5,
+                digest: "4c42196b1e0615e6780584fdbfb1e149752ff3248eb4ad4a44d8b1f618d22cca",
+                witnesses: [
+                    (1, 0xc0ab_e092),
+                    (4, 0x434e_ddc0),
+                    (5, 0x42d7_239c),
+                    (6, 0x4337_999a),
+                ],
+            },
+        ];
+        for case in cases {
+            let Case {
+                width,
+                height,
+                out_w,
+                out_h,
+                seed,
+                digest,
+                witnesses,
+            } = case;
+            let data = lcg_bytes((width * height * 3) as usize, seed);
+            let (x_bounds, x_weights) = torch_aa_bicubic_weights(width as usize, out_w as usize);
+            let (y_bounds, y_weights) = torch_aa_bicubic_weights(height as usize, out_h as usize);
+            let x = TorchAaAxis {
+                bounds: &x_bounds,
+                weights: &x_weights,
+            };
+            let y = TorchAaAxis {
+                bounds: &y_bounds,
+                weights: &y_weights,
+            };
+            #[cfg(target_arch = "x86_64")]
+            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &y);
+            #[cfg(not(target_arch = "x86_64"))]
+            let fma: Option<Vec<f32>> = None;
+            let bodies = [
+                (
+                    "the dispatching entry point",
+                    Some(resize_bicubic_torch_aa_f32(&data, width, height, out_w, out_h).unwrap()),
+                ),
+                (
+                    "the generic body",
+                    Some(torch_aa_passes(&data, width as usize, &x, &y)),
+                ),
+                ("the FMA body", fma),
+            ];
+            for (body, out) in bodies
+                .into_iter()
+                .filter_map(|(body, out)| out.map(|out| (body, out)))
+            {
+                assert_eq!(out.len(), (out_w * out_h * 3) as usize);
+                for (index, bits) in witnesses {
+                    assert_eq!(
+                        out[index].to_bits(),
+                        bits,
+                        "{width}x{height} -> {out_w}x{out_h} element {index} through {body}"
+                    );
+                }
+                let bytes: Vec<u8> = out.iter().flat_map(|value| value.to_le_bytes()).collect();
+                assert_eq!(
+                    hex(&Sha256::digest(&bytes)),
+                    digest,
+                    "{width}x{height} -> {out_w}x{out_h} through {body}"
+                );
             }
         }
     }
