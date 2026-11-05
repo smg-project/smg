@@ -60,10 +60,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (status_code) (rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "expr": "sum by (status_code) (rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\", path!~\"/health|/readiness|/liveness\"}[5m]))",
               "legendFormat": "{{ "{{" }}status_code{{ "}}" }}"
             }
           ],
+          "description": "Every response but the probe routes' (/health, /readiness, /liveness: the kubelet's polls, left out as the SmgHighErrorRatio alert leaves them out).",
           "fieldConfig": {
             "defaults": {
               "unit": "reqps"
@@ -83,11 +84,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\", status_code=~\"5..\"}[5m])) / sum(rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "expr": "sum(rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\", path!~\"/health|/readiness|/liveness\", status_code=~\"5..\"}[5m])) / sum(rate(smg_http_responses_total{namespace=~\"$namespace\", job=~\"$job\", path!~\"/health|/readiness|/liveness\"}[5m]))",
               "legendFormat": "5xx"
             }
           ],
-          "description": "Server-side failures over every response; the SmgHighErrorRatio alert fires above prometheusRule.alerts.errorRatio.",
+          "description": "Server-side failures over every response but the probe routes' (/health, /readiness, /liveness), as the SmgHighErrorRatio alert reads them; the alert fires above prometheusRule.alerts.errorRatio.",
           "fieldConfig": {
             "defaults": {
               "unit": "percentunit",
