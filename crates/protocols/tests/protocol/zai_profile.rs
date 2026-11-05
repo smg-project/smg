@@ -1,11 +1,11 @@
-//! z.ai rules for the GLM-5.3 series, through normalization and validation
-//! in the order the HTTP extractor runs them.
+//! z.ai rules for the GLM-5.3 series. The test normalizes first and then
+//! validates, as the HTTP extractor does.
 use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
 use serde_json::json;
 use validator::Validate;
 
-/// The request of issue #5181: an agent client's default effort on a
-/// GLM-5.3 model.
+/// The request from issue #5181. An agent client sends its default effort
+/// to a GLM-5.3 model.
 #[expect(clippy::expect_used, reason = "test helper")]
 fn request(effort: &str) -> ChatCompletionRequest {
     serde_json::from_value(json!({
@@ -17,7 +17,7 @@ fn request(effort: &str) -> ChatCompletionRequest {
     .expect("request")
 }
 
-/// `medium` is served as `high`; `minimal` as `low`, with thinking on;
+/// `medium` becomes `high`. `minimal` becomes `low` and thinking stays on.
 /// `none` is refused.
 #[test]
 fn a_glm53_request_with_the_default_medium_effort_is_served() {
@@ -31,8 +31,8 @@ fn a_glm53_request_with_the_default_medium_effort_is_served() {
     assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     assert!(req.validate().is_ok());
 
-    // The series cannot switch thinking off, so `minimal` means `low`,
-    // not "do not think".
+    // The series cannot switch thinking off. `minimal` means `low`, not
+    // "no thinking".
     let mut req = request("minimal");
     req.normalize();
     assert_eq!(req.reasoning_effort.as_deref(), Some("low"));

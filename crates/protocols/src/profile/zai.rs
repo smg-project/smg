@@ -1,11 +1,10 @@
 //! z.ai (GLM) contract rules, from the providers-verifier golden set recorded
 //! against GLM-5.3-Flash and docs.z.ai.
 //!
-//! The GLM-5.3 series cannot switch thinking off and takes efforts
-//! low/high/max. The names minimal, medium and xhigh are read as low, high
-//! and max, as z.ai reads them; `none` is refused. Other GLM generations
-//! keep their thinking switch and the
-//! documented wider set (GLM-5-Next is not pinned: its contract is not
+//! The GLM-5.3 series cannot switch thinking off. It takes the efforts
+//! low, high and max. It reads minimal as low, medium as high and xhigh as
+//! max, as z.ai does. It refuses `none`. Other GLM generations keep their
+//! thinking switch and the documented wider set (GLM-5-Next is not pinned: its contract is not
 //! recorded, and the registry's media grouping says nothing about it). The
 //! sampling defaults go to the models docs.z.ai lists them for. Everything
 //! else is z.ai-wide: `thinking.clear_thinking` reaches the chat template,
@@ -75,10 +74,10 @@ fn is_glm53(model: &str) -> bool {
     is_series(model, &GLM53_MARKERS)
 }
 
-/// The GLM-5.3 level for an effort name. A level names itself. The names
-/// z.ai maps to a level name that level: minimal is low, medium is high,
-/// xhigh is max. Any other name, `none` included, names no level: the
-/// series cannot switch thinking off.
+/// The GLM-5.3 level for an effort name. A level is its own name. z.ai
+/// reads minimal as low, medium as high and xhigh as max. All other names
+/// give `None`. `none` is one of them, because the series cannot switch
+/// thinking off.
 fn glm53_level(effort: &str) -> Option<&'static str> {
     match effort {
         "low" | "minimal" => Some("low"),
@@ -94,8 +93,8 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }
     if is_glm53(&req.model) {
-        // Each effort spelling is written as its level, so the engine and
-        // an upstream z.ai see a level only.
+        // Write the level into each effort field. The engine and an
+        // upstream z.ai then see a level only.
         for effort in super::effort_fields(req) {
             if let Some(level) = glm53_level(effort) {
                 *effort = level.into();
@@ -176,9 +175,9 @@ fn validate_thinking_enabled(
     Ok(())
 }
 
-/// The effort must be one the model takes (`takes` says which names it
-/// takes), in each spelling the request carries: both are forwarded, so a
-/// bad value hidden behind the preferred one still counts.
+/// Each effort field must hold a name the model takes. `takes` says which
+/// names it takes. Both fields are forwarded, so a bad name in either
+/// field counts.
 fn validate_efforts(
     req: &ChatCompletionRequest,
     takes: impl Fn(&str) -> bool,
@@ -309,9 +308,9 @@ mod tests {
         assert_eq!(validate(&request(json!({}))), Ok(()));
     }
 
-    /// The three levels pass as they are. The names z.ai maps to them pass
-    /// too, and normalization writes the level in both spellings. `none`
-    /// and unknown names are refused.
+    /// The three levels pass as sent. The three mapped names pass too, and
+    /// normalization writes their levels into both fields. `none` and
+    /// unknown names are refused.
     #[test]
     fn glm53_takes_its_three_levels_and_the_names_zai_maps_to_them() {
         for effort in ["low", "high", "max"] {
@@ -330,7 +329,7 @@ mod tests {
             assert_eq!(req.reasoning_effort.as_deref(), Some(effort), "{effort}");
         }
         for (name, level) in [("minimal", "low"), ("medium", "high"), ("xhigh", "max")] {
-            // Validation takes the name as sent, with no normalization first.
+            // Validation takes the mapped name as sent, with no normalization.
             assert_eq!(
                 validate(&request(json!({"reasoning_effort": name}))),
                 Ok(()),
@@ -497,8 +496,8 @@ mod tests {
             let mut req = with_model(model, json!({"tool_stream": true}));
             ProviderProfile::Zai.normalize_chat(&mut req);
             assert!(!req.other.contains_key(TOOL_STREAM), "{model}");
-            // The GLM-5.3 name mapping is that series' own: the name sent
-            // stays as sent here.
+            // The name mapping is for GLM-5.3 only. These models keep the
+            // name as sent.
             let mut req = with_model(
                 model,
                 json!({"reasoning_effort": "medium", "thinking": {"effort": "xhigh"}}),

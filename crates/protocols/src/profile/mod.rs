@@ -476,9 +476,8 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-/// The two effort fields of a request, `reasoning_effort` and
-/// `thinking.effort`, when they are present. A profile that maps effort
-/// names to its levels writes the levels through this.
+/// The effort fields a request has, `reasoning_effort` and
+/// `thinking.effort`. A profile writes its levels into them through this.
 fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
     [
         req.reasoning_effort.as_mut(),

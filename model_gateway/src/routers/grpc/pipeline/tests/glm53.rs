@@ -347,8 +347,8 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
     );
 }
 
-/// A `medium` effort on a GLM-5.3 model is rendered as the `high` level
-/// z.ai maps it to (issue #5181), through the normal chat preparation.
+/// Chat preparation renders a `medium` effort on a GLM-5.3 model as
+/// `High`, the level z.ai maps it to (issue #5181).
 #[tokio::test]
 async fn glm53_medium_effort_is_rendered_as_high() {
     use openai_protocol::validated::Normalizable;
