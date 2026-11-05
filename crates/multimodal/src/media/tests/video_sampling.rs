@@ -1320,13 +1320,29 @@ fn expanding_selected_frames_repeats_them_to_match_the_indices() {
     assert!(selection.expand(vec!['a', 'b', 'c']).is_err());
 }
 
+/// A stated release of 5.1 or later takes the current flag, and so does a
+/// build that states no release: a git snapshot (the static downloads), a
+/// dated build, an empty banner, unless its `libavcodec` line is older than
+/// release 5.1's (59.37). A stated release before 5.1 takes the flag those
+/// builds know, and so does a snapshot with that older library line.
 #[test]
 fn passthrough_flag_follows_the_ffmpeg_version() {
+    // A static snapshot build's `-version` output: banner and library lines.
+    const SNAPSHOT: &str = "ffmpeg version N-128433-gdb8537d8cc-20261105 Copyright (c) 2000-2026 the FFmpeg developers\nbuilt with gcc 16.2.0 (crosstool-NG 1.29.0.7_b1a94f6)\nconfiguration: --prefix=/ffbuild/prefix --enable-gpl\nlibavutil      61. 20.100 / 61. 20.100\nlibavcodec     63. 26.101 / 63. 26.101\nlibavformat    63. 18.100 / 63. 18.100\n";
+    // Snapshots on either side of release 5.1's libavcodec 59.37.
+    const SNAPSHOT_AT_5_1: &str = "ffmpeg version N-107000-g0123456789-20220722 Copyright (c) 2000-2022 the FFmpeg developers\nlibavutil      57. 28.100 / 57. 28.100\nlibavcodec     59. 37.100 / 59. 37.100\n";
+    const SNAPSHOT_BEFORE_5_1: &str = "ffmpeg version N-105000-g0123456789-20220501 Copyright (c) 2000-2022 the FFmpeg developers\nbuilt with gcc 11\nlibavutil      57. 17.100 / 57. 17.100\nlibavcodec     59. 18.100 / 59. 18.100\n";
     for version in [
+        SNAPSHOT,
+        SNAPSHOT_AT_5_1,
         "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers\nbuilt with gcc",
         "ffmpeg version 5.1.4-0+deb12u1 Copyright (c) 2000-2023 the FFmpeg developers",
         "ffmpeg version n7.0.2-6-gabcdef Copyright (c) 2000-2024 the FFmpeg developers",
         "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024",
+        "ffmpeg version N-128406-g1fe6854fd9-20261104 Copyright (c) 2000-2026 the FFmpeg developers",
+        "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
+        "ffmpeg version 2025-10-30-git-abcdef1234-full_build-www.gyan.dev Copyright (c) 2000-2025",
+        "",
     ] {
         assert_eq!(
             passthrough_flag_for_version(version),
@@ -1337,8 +1353,7 @@ fn passthrough_flag_follows_the_ffmpeg_version() {
     for version in [
         "ffmpeg version 5.0.3 Copyright (c) 2000-2022 the FFmpeg developers",
         "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
-        "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
-        "",
+        SNAPSHOT_BEFORE_5_1,
     ] {
         assert_eq!(
             passthrough_flag_for_version(version),
@@ -1346,6 +1361,23 @@ fn passthrough_flag_follows_the_ffmpeg_version() {
             "{version}"
         );
     }
+    assert_eq!(libavcodec_version(SNAPSHOT), Some((63, 26)));
+    assert_eq!(libavcodec_version(SNAPSHOT_BEFORE_5_1), Some((59, 18)));
+    assert_eq!(libavcodec_version("ffmpeg version N-1-gabc\n"), None);
+}
+
+/// The fallback tells a selection that came back short, a property of the
+/// clip, from a run the decoder refused.
+#[test]
+fn a_short_selection_is_told_from_a_refused_run() {
+    assert!(is_short_selection(&short_selection(9, 10)));
+    assert_eq!(
+        short_selection(9, 10).to_string(),
+        "video decode error: ffmpeg produced 9 selected frames, expected 10"
+    );
+    assert!(!is_short_selection(&MediaConnectorError::VideoDecode(
+        "ffmpeg failed: Unrecognized option 'vsync'.".to_string()
+    )));
 }
 
 #[test]

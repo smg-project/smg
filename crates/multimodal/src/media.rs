@@ -24,7 +24,7 @@ use opencv::{
 };
 use reqwest::{header::LOCATION, redirect, Client, StatusCode};
 use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::{
@@ -2427,7 +2427,23 @@ async fn decode_video_with_ffmpeg(
             Resized::Unchanged => {}
         }
     }
-    // A probed frame count past the stream's end leaves the selection short; resample by rate.
+    // A failed selection is resampled by rate, a change of sampling rule a
+    // deployment hears of with the decoder's own words rather than by finding
+    // another frame count. A run the decoder refused (or a seek that did not
+    // land) is a property of the build and warns; a selection that came back
+    // short, a probed frame count past the stream's end, is a property of the
+    // clip and informs.
+    if is_short_selection(&selected_error) {
+        info!(
+            error = %selected_error,
+            "ffmpeg frame selection came back short; the clip is resampled by rate instead"
+        );
+    } else {
+        warn!(
+            error = %selected_error,
+            "ffmpeg frame selection failed; the clip is resampled by rate instead"
+        );
+    }
     if log_video_decode_timing_enabled() {
         info!(
             error = %selected_error,
@@ -3600,6 +3616,20 @@ enum Resized {
     Selection(FrameSelection),
 }
 
+/// The words of a selection that came back short, built and recognised here
+/// so the fallback's log level follows the cause.
+const SHORT_SELECTION: &str = "ffmpeg produced";
+
+fn short_selection(produced: usize, expected: usize) -> MediaConnectorError {
+    MediaConnectorError::VideoDecode(format!(
+        "{SHORT_SELECTION} {produced} selected frames, expected {expected}"
+    ))
+}
+
+fn is_short_selection(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::VideoDecode(text) if text.starts_with(SHORT_SELECTION))
+}
+
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
 struct FrameSelection {
@@ -3788,11 +3818,7 @@ impl FrameSelection {
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
     fn expand<T: Clone>(&self, frames: Vec<T>) -> Result<Vec<T>, MediaConnectorError> {
         if frames.len() != self.unique_frames.len() {
-            return Err(MediaConnectorError::VideoDecode(format!(
-                "ffmpeg produced {} selected frames, expected {}",
-                frames.len(),
-                self.unique_frames.len()
-            )));
+            return Err(short_selection(frames.len(), self.unique_frames.len()));
         }
         let mut expanded = Vec::with_capacity(self.frame_indices.len());
         for (frame, &(_, repeat)) in frames.into_iter().zip(&self.unique_frames) {
@@ -3974,26 +4000,57 @@ fn ffmpeg_decode_command_from(threads: i32, autorotate: bool, seek: Option<&str>
 const FPS_MODE_PASSTHROUGH: [&str; 2] = ["-fps_mode", "passthrough"];
 const VSYNC_PASSTHROUGH: [&str; 2] = ["-vsync", "0"];
 
-/// Probe `ffmpeg -version` once per process; the binary on PATH does not change underneath.
+/// Probe `ffmpeg -version` once per process, once a probe succeeded; the
+/// binary on PATH does not change underneath.
 async fn ffmpeg_passthrough_flag() -> [&'static str; 2] {
     if let Some(flag) = FFMPEG_PASSTHROUGH_FLAG.get() {
         return *flag;
     }
     let mut command = Command::new("ffmpeg");
     command.arg("-version");
-    let flag = match run_video_command_output(command, "ffmpeg").await {
-        Ok(output) => passthrough_flag_for_version(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => VSYNC_PASSTHROUGH,
+    let output = match run_video_command_output(command, "ffmpeg").await {
+        Ok(output) => output,
+        // A probe that did not run says nothing about the build: the current
+        // flag for this decode, and the next decode probes again.
+        Err(_) => return FPS_MODE_PASSTHROUGH,
     };
+    if !output.status.success() {
+        // A run that did not succeed read nothing either: the same answer as
+        // a probe that did not run.
+        return FPS_MODE_PASSTHROUGH;
+    }
+    let flag = passthrough_flag_for_version(&String::from_utf8_lossy(&output.stdout));
     *FFMPEG_PASSTHROUGH_FLAG.get_or_init(|| flag)
 }
 
-/// ffmpeg 5.1 replaced `-vsync 0` with `-fps_mode passthrough`, which older builds reject.
+/// ffmpeg 5.1 replaced `-vsync 0` with `-fps_mode passthrough`: a build that
+/// states a release before 5.1 takes the flag it knows, every other build the
+/// current one. A git snapshot (`ffmpeg version N-128406-g...`, the form of
+/// the common static downloads) states no release number; its `libavcodec`
+/// line places it, 59.37 being the one release 5.1 shipped. A snapshot at or
+/// past it is a current build; sent `-vsync`, it refuses every frame-select
+/// run, and the decode falls through to the rate resampler with another
+/// sampling rule.
 fn passthrough_flag_for_version(version_output: &str) -> [&'static str; 2] {
+    const LIBAVCODEC_OF_5_1: (u32, u32) = (59, 37);
     match ffmpeg_version(version_output) {
-        Some(version) if version >= (5, 1) => FPS_MODE_PASSTHROUGH,
-        _ => VSYNC_PASSTHROUGH,
+        Some(version) if version < (5, 1) => VSYNC_PASSTHROUGH,
+        Some(_) => FPS_MODE_PASSTHROUGH,
+        None => match libavcodec_version(version_output) {
+            Some(version) if version < LIBAVCODEC_OF_5_1 => VSYNC_PASSTHROUGH,
+            _ => FPS_MODE_PASSTHROUGH,
+        },
     }
+}
+
+/// `major.minor` of the `libavcodec` line every build's `ffmpeg -version`
+/// prints after the banner (`libavcodec     59. 37.100 / 59. 37.100`).
+fn libavcodec_version(version_output: &str) -> Option<(u32, u32)> {
+    let line = version_output
+        .lines()
+        .find_map(|line| line.strip_prefix("libavcodec"))?;
+    let mut parts = line.split('.').map(str::trim);
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 /// `major.minor` from the first line of `ffmpeg -version`; git snapshots carry no such number.
