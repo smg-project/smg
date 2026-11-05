@@ -11,7 +11,10 @@ use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
 };
-use openai_protocol::{common::StringOrArray, completion::CompletionStreamChoice};
+use openai_protocol::{
+    common::{LogProbs, StringOrArray},
+    completion::CompletionStreamChoice,
+};
 
 use super::{CompletionChunkFrame, StreamingProcessor};
 use crate::{
@@ -106,6 +109,10 @@ pub(super) struct CompletionStream<'a> {
     /// Tokens the engine streamed for choices after their local stop, read
     /// before the abort: the tail generated for nobody.
     tail_tokens: u64,
+    /// Per expected choice, at the engine's index: the characters of the
+    /// choice's tokens so far, where its next chunk's logprobs offsets start
+    /// (the echoed prompt's first).
+    logprob_offsets: Vec<u32>,
 
     /// The per-chunk SSE frames: the bytes around a chunk's choice are the
     /// same for every chunk of this stream and are serialized once; per
@@ -160,6 +167,25 @@ fn completion_choice(
     }
 }
 
+/// The chunk's logprobs when the request asked for them: its positions in
+/// the legacy shape, their offsets continuing `text_offset`, the choice's
+/// count of characters so far.
+fn chunk_logprobs(
+    spec: &CompletionResponseSpec,
+    tokenizer: &Arc<dyn Tokenizer>,
+    text_offset: &mut u32,
+    chunk: &ProtoGenerateStreamChunk,
+) -> Option<LogProbs> {
+    let top_logprobs = spec.logprobs?;
+    let proto_logprobs = chunk.output_logprobs()?;
+    Some(utils::convert_proto_to_completion_logprobs(
+        proto_logprobs,
+        tokenizer,
+        top_logprobs,
+        text_offset,
+    ))
+}
+
 impl<'a> CompletionStream<'a> {
     /// What the spec and the dispatch decide for the whole unit, the frame,
     /// and the empty per-choice state and totals. `pd_timing` is `Some` only
@@ -182,6 +208,19 @@ impl<'a> CompletionStream<'a> {
             dispatch.created,
             dispatch.weight_version.as_deref(),
         );
+        // Where every choice's logprobs offsets start: after the echoed
+        // prompt. A request that asked for no logprobs keeps no offsets (an
+        // empty vector allocates nothing).
+        let logprob_offsets = if spec.logprobs.is_some() {
+            let echoed = if spec.echo {
+                u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX)
+            } else {
+                0
+            };
+            vec![echoed; spec.choices_per_prompt as usize]
+        } else {
+            Vec::new()
+        };
         Self {
             dispatch,
             tokenizer,
@@ -198,6 +237,7 @@ impl<'a> CompletionStream<'a> {
                 .collect(),
             engine_outlived: false,
             tail_tokens: 0,
+            logprob_offsets,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
@@ -288,12 +328,25 @@ impl<'a> CompletionStream<'a> {
             choice.started = true;
         }
 
-        if !text.is_empty() {
+        // The chunk's logprobs when the request asked for them: a chunk
+        // whose tokens made no text yet carries them all the same.
+        let logprobs = self
+            .logprob_offsets
+            .get_mut(chunk.index() as usize)
+            .and_then(|text_offset| {
+                chunk_logprobs(self.spec, &self.tokenizer, text_offset, &chunk)
+            });
+        if !text.is_empty() || logprobs.is_some() {
             StreamingProcessor::send_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
-                &completion_choice(index, text, None),
+                &CompletionStreamChoice {
+                    text,
+                    index,
+                    logprobs,
+                    finish_reason: None,
+                },
             )
             .await?;
         }

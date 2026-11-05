@@ -1,9 +1,9 @@
 //! Proto-to-OpenAI logprob conversion functions.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
+use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, LogProbs, TopLogProb};
 
 use crate::routers::grpc::proto_wrapper::{ProtoInputLogProbs, ProtoOutputLogProbs};
 
@@ -124,6 +124,78 @@ pub(crate) fn convert_generate_input_logprobs(
             vec![logprob_value, Some(token_id as f64)]
         })
         .collect()
+}
+
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// legacy `/v1/completions` shape: per generated token its own decode, its
+/// logprob, the position's candidates and its character offset in the
+/// choice's text. The offsets count the characters of the tokens before each
+/// one from `text_offset`, which is moved past the positions converted so
+/// that a stream's chunks continue one count.
+///
+/// `top_logprobs` is the request's `logprobs`: the public API returns that
+/// many most likely tokens and always the sampled token's logprob, up to
+/// `logprobs + 1` entries per position, so the engine's candidates are kept
+/// in its order up to that many, one per token id, keyed by their text as the
+/// engine's own server keys them (a later candidate of the same text takes
+/// the entry).
+pub(crate) fn convert_proto_to_completion_logprobs(
+    proto_logprobs: ProtoOutputLogProbs<'_>,
+    tokenizer: &Arc<dyn Tokenizer>,
+    top_logprobs: u32,
+    text_offset: &mut u32,
+) -> LogProbs {
+    completion_logprobs(proto_logprobs, top_logprobs, text_offset, |token_id| {
+        tokenizer
+            .decode(&[token_id], false)
+            .unwrap_or_else(|_| format!("<token_{token_id}>"))
+    })
+}
+
+/// [`convert_proto_to_completion_logprobs`] over any token decode.
+pub(crate) fn completion_logprobs(
+    proto_logprobs: ProtoOutputLogProbs<'_>,
+    top_logprobs: u32,
+    text_offset: &mut u32,
+    decode_token: impl Fn(u32) -> String,
+) -> LogProbs {
+    let count = proto_logprobs.len();
+    let mut logprobs = LogProbs {
+        tokens: Vec::with_capacity(count),
+        token_logprobs: Vec::with_capacity(count),
+        top_logprobs: Vec::with_capacity(count),
+        text_offset: Vec::with_capacity(count),
+    };
+    let entries = top_logprobs as usize + 1;
+    for position in proto_logprobs.positions() {
+        let token = decode_token(position.token_id);
+        // The candidates by text; a repeated id (a wire that leads its row
+        // with the sampled token and ranks it too) takes no second entry.
+        let mut candidates = HashMap::with_capacity(entries.min(position.top_logprobs.len()));
+        let mut kept: Vec<u32> = Vec::with_capacity(entries);
+        for (token_id, logprob) in position.top_logprobs.iter() {
+            if kept.len() >= entries {
+                break;
+            }
+            if kept.contains(&token_id) {
+                continue;
+            }
+            kept.push(token_id);
+            let text = if token_id == position.token_id {
+                token.clone()
+            } else {
+                decode_token(token_id)
+            };
+            candidates.insert(text, logprob);
+        }
+        logprobs.text_offset.push(*text_offset);
+        *text_offset =
+            text_offset.saturating_add(u32::try_from(token.chars().count()).unwrap_or(u32::MAX));
+        logprobs.tokens.push(token);
+        logprobs.token_logprobs.push(Some(position.logprob));
+        logprobs.top_logprobs.push(Some(candidates));
+    }
+    logprobs
 }
 
 #[cfg(test)]
@@ -320,6 +392,102 @@ mod tests {
         assert_eq!(
             alternatives(Some(5)),
             vec![vec!["t1", "t3"], vec!["t2", "t4"]]
+        );
+    }
+
+    fn pairs(entries: &[(&str, f32)]) -> HashMap<String, f32> {
+        entries
+            .iter()
+            .map(|(token, logprob)| (token.to_string(), *logprob))
+            .collect()
+    }
+
+    /// The legacy shape of the same two tokens: one entry per position in
+    /// each of the four lists, the candidates keyed by text, the offsets
+    /// counting the tokens' characters from where the count stood, and the
+    /// count moved past them for the next chunk.
+    #[test]
+    fn completion_logprobs_list_tokens_candidates_and_offsets() {
+        let proto = proto();
+        let mut offset = 0;
+        let logprobs =
+            completion_logprobs(ProtoOutputLogProbs::Vllm(&proto), 1, &mut offset, |id| {
+                format!("t{id}")
+            });
+        assert_eq!(logprobs.tokens, vec!["t1", "t2"]);
+        assert_eq!(logprobs.token_logprobs, vec![Some(-0.1), Some(-0.2)]);
+        assert_eq!(
+            logprobs.top_logprobs,
+            vec![
+                Some(pairs(&[("t1", -0.1), ("t3", -1.5)])),
+                Some(pairs(&[("t2", -0.2), ("t4", -1.6)]))
+            ]
+        );
+        assert_eq!(logprobs.text_offset, vec![0, 2]);
+        assert_eq!(offset, 4);
+        let next = completion_logprobs(ProtoOutputLogProbs::Vllm(&proto), 1, &mut offset, |id| {
+            format!("t{id}")
+        });
+        assert_eq!(next.text_offset, vec![4, 6]);
+        assert_eq!(
+            completion_logprobs(ProtoOutputLogProbs::Trtllm(&records()), 1, &mut 0, |id| {
+                format!("t{id}")
+            })
+            .top_logprobs,
+            logprobs.top_logprobs
+        );
+    }
+
+    /// `logprobs: k` keeps up to `k + 1` candidates per position: the sampled
+    /// token's entry beside the `k` the request asked for, never more than
+    /// the engine ranked.
+    #[test]
+    fn completion_candidates_are_capped_at_one_more_than_requested() {
+        let candidates = |top_logprobs: u32| -> Vec<Vec<String>> {
+            let proto = proto();
+            completion_logprobs(
+                ProtoOutputLogProbs::Vllm(&proto),
+                top_logprobs,
+                &mut 0,
+                |id| format!("t{id}"),
+            )
+            .top_logprobs
+            .iter()
+            .map(|top| {
+                let mut texts: Vec<String> = top.iter().flatten().map(|(t, _)| t.clone()).collect();
+                texts.sort();
+                texts
+            })
+            .collect()
+        };
+        assert_eq!(candidates(0), vec![vec!["t1"], vec!["t2"]]);
+        assert_eq!(candidates(1), vec![vec!["t1", "t3"], vec!["t2", "t4"]]);
+        assert_eq!(candidates(5), vec![vec!["t1", "t3"], vec!["t2", "t4"]]);
+    }
+
+    /// A row that repeats the sampled token's id fills no second slot with
+    /// it, and two ids that decode to one text share the entry, the later
+    /// value standing, as the engine's own server keys its map.
+    #[test]
+    fn completion_candidates_hold_one_entry_per_id_and_per_text() {
+        let proto = vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1],
+            token_ids: vec![1],
+            top_logprobs: vec![vllm::TopLogProbs {
+                values: vec![-0.1, -0.1, -1.5, -2.5, -3.5],
+                token_ids: vec![1, 1, 3, 4, 5],
+            }],
+        };
+        let logprobs = completion_logprobs(ProtoOutputLogProbs::Vllm(&proto), 2, &mut 0, |id| {
+            if id == 4 {
+                "t3".to_string()
+            } else {
+                format!("t{id}")
+            }
+        });
+        assert_eq!(
+            logprobs.top_logprobs,
+            vec![Some(pairs(&[("t1", -0.1), ("t3", -2.5)]))]
         );
     }
 }
