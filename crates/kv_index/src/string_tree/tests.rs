@@ -2240,6 +2240,30 @@ fn a_node_handed_a_second_hash_keeps_the_newer_one_only() {
 }
 
 #[test]
+fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
+    // The token tree's rule, kept in the twin: a repair never displaces the
+    // hash a request recorded at the node, and names a node that has none.
+    let tree = Tree::new();
+    let request = crate::hash_node_path("hello world?");
+    let repair = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", request);
+    tree.insert_text_with_hash_unless_named("hello world", "t2", repair);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert!(tree.insert_tenant_by_hash(request, "t3"));
+    assert!(!tree.insert_tenant_by_hash(repair, "t3"));
+
+    tree.insert_text("other text", "t1");
+    tree.insert_text_with_hash_unless_named(
+        "other text",
+        "t2",
+        crate::hash_node_path("other text"),
+    );
+    assert_eq!(tree.hashed_paths(), 2);
+    assert!(tree.insert_tenant_by_hash(crate::hash_node_path("other text"), "t3"));
+}
+
+#[test]
 fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
     // A record that crosses its node's detach leaves an entry naming a node
     // that is gone; the next pass that evicts drops it.

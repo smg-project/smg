@@ -2466,6 +2466,35 @@ fn two_tails_over_one_aligned_path_leave_one_hash_on_their_node() {
 }
 
 #[test]
+fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
+    // A request named `base ++ [a]` at the node of `base`; a repair page
+    // brings `base` under its own (aligned) hash: the node keeps the
+    // request's hash and still takes the repair's tenant. A node the tree
+    // never named itself takes the repair's hash.
+    let tree = TokenTree::new();
+    let base = make_tokens(0, 2);
+    let mut tailed = base.clone();
+    tailed.push(100);
+    let (request, aligned) = (
+        crate::hash_token_path(&tailed),
+        crate::hash_token_path(&base),
+    );
+    tree.insert_tokens_with_hash(&tailed, "t1", request);
+    tree.insert_tokens_with_hash_unless_named(&base, "t2", aligned);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    assert!(tree.insert_tenant_by_hash(request, "t3"));
+    assert!(!tree.insert_tenant_by_hash(aligned, "t3"));
+
+    let other = make_tokens(1_000, 1);
+    tree.insert_tokens(&other, "t1");
+    tree.insert_tokens_with_hash_unless_named(&other, "t2", crate::hash_token_path(&other));
+    assert_eq!(tree.hashed_paths(), 2);
+    assert!(tree.insert_tenant_by_hash(crate::hash_token_path(&other), "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
 fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
     // A record that crosses its node's detach leaves an entry naming a node
     // that is gone; the next pass that evicts drops it.

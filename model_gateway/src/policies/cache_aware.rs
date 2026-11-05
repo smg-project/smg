@@ -1048,10 +1048,12 @@ impl TreeHandle for CacheAwarePolicy {
                     match entry {
                         RepairEntry::String { path, tenants } => {
                             // The path rides with its hash, so a later delta
-                            // that names it resolves to this node.
+                            // that names it resolves to this node; a node this
+                            // gateway named from its own request keeps that hash
+                            // (a repair fills, it never displaces).
                             let path_hash = kv_index::hash_node_path(path);
                             for (tenant, _epoch) in tenants {
-                                tree.insert_text_with_hash(path, tenant, path_hash);
+                                tree.insert_text_with_hash_unless_named(path, tenant, path_hash);
                             }
                             applied += 1;
                         }
@@ -1075,9 +1077,15 @@ impl TreeHandle for CacheAwarePolicy {
                 for entry in &page.entries {
                     match entry {
                         RepairEntry::Token { tokens, tenants } => {
+                            // A request names the sequence it routed, a repair
+                            // the page-aligned path the tree holds: the node
+                            // keeps the hash this gateway recorded itself and the
+                            // repair fills the rest.
                             let path_hash = kv_index::hash_token_path(tokens);
                             for (tenant, _epoch) in tenants {
-                                tree.insert_tokens_with_hash(tokens, tenant, path_hash);
+                                tree.insert_tokens_with_hash_unless_named(
+                                    tokens, tenant, path_hash,
+                                );
                             }
                             applied += 1;
                         }

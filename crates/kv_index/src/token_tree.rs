@@ -83,6 +83,19 @@ fn align_to_page(len: usize, page_size: usize) -> usize {
     (len / page_size) * page_size
 }
 
+/// What a hashed insert does with its hash at the node the path ends at.
+#[derive(Clone, Copy)]
+enum Naming {
+    /// A plain insert: no hash.
+    None,
+    /// The node takes the hash and an earlier, different one leaves: a
+    /// request's insert names the newest sequence that ended at the node.
+    Newest(u64),
+    /// The node takes the hash only when it carries none: a repair page
+    /// fills what the tree has not named itself and displaces nothing.
+    UnlessNamed(u64),
+}
+
 /// Digest of the first `page_size` tokens (FxHash-style multiplication mixing).
 #[inline]
 fn page_key_of(tokens: &[TokenId], page_size: usize) -> TokenPageKey {
@@ -471,7 +484,7 @@ impl TokenTree {
     /// **Page-aligned**: Input is aligned to PAGE_SIZE boundary.
     /// Sequences shorter than PAGE_SIZE are skipped (no cache benefit).
     pub fn insert_tokens(&self, tokens: &[TokenId], tenant: &str) {
-        self.insert_tokens_hashed(tokens, tenant, None);
+        self.insert_tokens_hashed(tokens, tenant, Naming::None);
     }
 
     /// [`Self::insert_tokens`], and the node the (page-aligned) path ends
@@ -481,7 +494,22 @@ impl TokenTree {
     /// sequence under one page inserts nothing and remembers nothing. The
     /// caller hashes, so a tree never asked by hash never pays for one.
     pub fn insert_tokens_with_hash(&self, tokens: &[TokenId], tenant: &str, path_hash: u64) {
-        self.insert_tokens_hashed(tokens, tenant, Some(path_hash));
+        self.insert_tokens_hashed(tokens, tenant, Naming::Newest(path_hash));
+    }
+
+    /// [`Self::insert_tokens_with_hash`] for a path a peer repaired: the node
+    /// takes `path_hash` only when it carries none, so a repair never
+    /// displaces the hash this tree recorded from its own request (a request
+    /// names the sequence it routed, a repair names the page-aligned path the
+    /// tree holds, and the two differ when the sequence has a tail under one
+    /// page). A node the tree never named itself answers to the repair's hash.
+    pub fn insert_tokens_with_hash_unless_named(
+        &self,
+        tokens: &[TokenId],
+        tenant: &str,
+        path_hash: u64,
+    ) {
+        self.insert_tokens_hashed(tokens, tenant, Naming::UnlessNamed(path_hash));
     }
 
     /// Attach `tenant` to the path an earlier hashed insert recorded under
@@ -504,7 +532,7 @@ impl TokenTree {
         let Some(path) = self.path_of(&node) else {
             return false;
         };
-        self.insert_tokens_hashed(&path, tenant, Some(path_hash));
+        self.insert_tokens_hashed(&path, tenant, Naming::Newest(path_hash));
         true
     }
 
@@ -530,6 +558,19 @@ impl TokenTree {
             path.extend_from_slice(edge);
         }
         Some(path)
+    }
+
+    /// Apply `naming` at `node`, the end of an inserted path.
+    fn record(&self, node: &NodeRef, naming: Naming) {
+        match naming {
+            Naming::None => {}
+            Naming::Newest(path_hash) => self.record_hash(node, Some(path_hash)),
+            Naming::UnlessNamed(path_hash) => {
+                if node.path_hash.load(Ordering::Relaxed) == 0 {
+                    self.record_hash(node, Some(path_hash));
+                }
+            }
+        }
     }
 
     /// Remember `node` as the end of the path hashed `path_hash`: the node
@@ -567,7 +608,7 @@ impl TokenTree {
         }
     }
 
-    fn insert_tokens_hashed(&self, tokens: &[TokenId], tenant: &str, path_hash: Option<u64>) {
+    fn insert_tokens_hashed(&self, tokens: &[TokenId], tenant: &str, naming: Naming) {
         let page_size = self.page_size;
         // Align to page boundary (truncate to nearest page)
         let aligned_len = align_to_page(tokens.len(), page_size);
@@ -605,7 +646,7 @@ impl TokenTree {
         // Update tenant token count and tree-wide total
         self.add_tenant_tokens(tenant_id, tokens_added);
         if let Some(end) = ends_at {
-            self.record_hash(&end, path_hash);
+            self.record(&end, naming);
         }
     }
 
@@ -1840,6 +1881,10 @@ impl TokenTree {
             }
         }
 
+        // The pass's own holds on the leaves and the promoted parents go
+        // first, so a node this pass detached counts as gone below.
+        drop(heap);
+        drop(leaf_data);
         // An entry whose node left without passing `forget_hash` (a record
         // that crossed the node's detach) leaves here, so the map never
         // outgrows the tree's hashed nodes by more than one eviction pass.

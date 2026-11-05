@@ -117,6 +117,19 @@ impl Hasher for CharHasher {
 
 type CharHasherBuilder = BuildHasherDefault<CharHasher>;
 
+/// What a hashed insert does with its hash at the node the path ends at.
+#[derive(Clone, Copy)]
+enum Naming {
+    /// A plain insert: no hash.
+    None,
+    /// The node takes the hash and an earlier, different one leaves: a
+    /// request's insert names the newest sequence that ended at the node.
+    Newest(u64),
+    /// The node takes the hash only when it carries none: a repair page
+    /// fills what the tree has not named itself and displaces nothing.
+    UnlessNamed(u64),
+}
+
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
 /// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
@@ -476,7 +489,7 @@ impl Tree {
     }
 
     pub fn insert_text(&self, text: &str, tenant: &str) {
-        self.insert_text_hashed(text, tenant, None);
+        self.insert_text_hashed(text, tenant, Naming::None);
     }
 
     /// [`Self::insert_text`], and the node the path ends at remembers
@@ -485,7 +498,17 @@ impl Tree {
     /// and dies with the node under the tree's own eviction. The caller
     /// hashes, so a tree never asked by hash never pays for one.
     pub fn insert_text_with_hash(&self, text: &str, tenant: &str, path_hash: u64) {
-        self.insert_text_hashed(text, tenant, Some(path_hash));
+        self.insert_text_hashed(text, tenant, Naming::Newest(path_hash));
+    }
+
+    /// [`Self::insert_text_with_hash`] for a path a peer repaired: the node
+    /// takes `path_hash` only when it carries none, so a repair never
+    /// displaces the hash this tree recorded from its own request; a node the
+    /// tree never named itself answers to the repair's hash. (Here a request
+    /// and a repair name one text by one hash; the rule is the token tree's,
+    /// kept in the twin.)
+    pub fn insert_text_with_hash_unless_named(&self, text: &str, tenant: &str, path_hash: u64) {
+        self.insert_text_hashed(text, tenant, Naming::UnlessNamed(path_hash));
     }
 
     /// Attach `tenant` to the path an earlier hashed insert recorded under
@@ -508,7 +531,7 @@ impl Tree {
         let Some(path) = self.path_of(&node) else {
             return false;
         };
-        self.insert_text_hashed(&path, tenant, Some(path_hash));
+        self.insert_text_hashed(&path, tenant, Naming::Newest(path_hash));
         true
     }
 
@@ -534,6 +557,19 @@ impl Tree {
             path.push_str(edge);
         }
         Some(path)
+    }
+
+    /// Apply `naming` at `node`, the end of an inserted path.
+    fn record(&self, node: &NodeRef, naming: Naming) {
+        match naming {
+            Naming::None => {}
+            Naming::Newest(path_hash) => self.record_hash(node, Some(path_hash)),
+            Naming::UnlessNamed(path_hash) => {
+                if node.path_hash.load(Ordering::Relaxed) == 0 {
+                    self.record_hash(node, Some(path_hash));
+                }
+            }
+        }
     }
 
     /// Remember `node` as the end of the path hashed `path_hash`: the node
@@ -571,7 +607,7 @@ impl Tree {
         }
     }
 
-    fn insert_text_hashed(&self, text: &str, tenant: &str, path_hash: Option<u64>) {
+    fn insert_text_hashed(&self, text: &str, tenant: &str, naming: Naming) {
         // Insert text into tree with given tenant
         // Use slice-based traversal to avoid Vec<char> allocation
 
@@ -589,7 +625,7 @@ impl Tree {
             .or_insert(0);
 
         // Descend from the root inserting the whole text.
-        self.insert_from(Arc::clone(&self.root), text, tenant_id, path_hash);
+        self.insert_from(Arc::clone(&self.root), text, tenant_id, naming);
     }
 
     /// Insert `remaining` for `tenant_id` starting the descent at `start` (treated
@@ -609,7 +645,7 @@ impl Tree {
         start: NodeRef,
         mut remaining: &str,
         tenant_id: TenantId,
-        path_hash: Option<u64>,
+        naming: Naming,
     ) {
         let mut prev = start;
 
@@ -647,7 +683,7 @@ impl Tree {
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
                     // The leaf ends the inserted text.
-                    self.record_hash(&new_node, path_hash);
+                    self.record(&new_node, naming);
 
                     entry.insert(new_node);
                     InsertStep::Done
@@ -759,7 +795,7 @@ impl Tree {
         let epoch = get_epoch();
         prev.tenant_last_access_time
             .insert(Arc::clone(&tenant_id), epoch);
-        self.record_hash(&prev, path_hash);
+        self.record(&prev, naming);
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
@@ -1083,7 +1119,12 @@ impl Tree {
             // edges it newly attaches, so nothing is counted twice, and it
             // splices the suffix under live nodes, so the prompt is cached.
             // One extra descent, in the rare case.
-            self.insert_from(Arc::clone(&self.root), text, tenant_id, path_hash);
+            self.insert_from(
+                Arc::clone(&self.root),
+                text,
+                tenant_id,
+                path_hash.map_or(Naming::None, Naming::Newest),
+            );
         } else if remaining.is_empty() {
             // Loop-end: `current` is the final leaf; give it the real timestamp
             // (insert_text's tail). It already received the epoch-0 attach above
@@ -1104,7 +1145,12 @@ impl Tree {
                 Some(i) => Arc::clone(&path[i]),
                 None => Arc::clone(&self.root),
             };
-            self.insert_from(fall_off, remaining, tenant_id, path_hash);
+            self.insert_from(
+                fall_off,
+                remaining,
+                tenant_id,
+                path_hash.map_or(Naming::None, Naming::Newest),
+            );
         }
 
         result
