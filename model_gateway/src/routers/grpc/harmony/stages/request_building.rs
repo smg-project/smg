@@ -149,27 +149,32 @@ impl BuildStage for HarmonyRequestBuildingStage {
 
         // The engine builders lay a chat request's `logit_bias` on the wire,
         // past the engine front ends that bound its ids, so the ids are judged
-        // here first, as a pretokenized prompt's are.
+        // here first, as a pretokenized prompt's are. This pipeline encodes
+        // with its own Harmony encoding and resolves no tokenizer for the
+        // request, so the model's is looked up here, for a request with a
+        // bias only.
         if let HarmonyBody::Chat(request) = &body {
-            match ctx.tokenizer_arc() {
-                Some(tokenizer) => token_ids::validate_logit_bias_token_ids(
-                    request.logit_bias.as_ref(),
-                    tokenizer.as_ref(),
-                    || {
-                        token_ids::reported_embedding_rows(
-                            &ctx.components.worker_registry,
-                            &ctx.input.model_id,
-                        )
-                    },
-                ),
-                None if request.logit_bias.as_ref().is_some_and(|bias| !bias.is_empty()) => Err(
-                    "logit_bias cannot be checked against the model's vocabulary: no tokenizer \
-                     is registered for the model"
-                        .to_string(),
-                ),
-                None => Ok(()),
+            if let Some(bias) = request.logit_bias.as_ref().filter(|bias| !bias.is_empty()) {
+                let model_id = ctx.input.model_id.as_str();
+                match ctx.components.tokenizer_registry.get(model_id) {
+                    Some(tokenizer) => token_ids::validate_logit_bias_token_ids(
+                        Some(bias),
+                        tokenizer.as_ref(),
+                        || {
+                            token_ids::reported_embedding_rows(
+                                &ctx.components.worker_registry,
+                                model_id,
+                            )
+                        },
+                    ),
+                    None => Err(
+                        "logit_bias cannot be checked against the model's vocabulary: no \
+                         tokenizer is registered for the model"
+                            .to_string(),
+                    ),
+                }
+                .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
             }
-            .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
         }
 
         let mut proto_request = build_harmony_proto(

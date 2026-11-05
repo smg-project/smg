@@ -1,5 +1,6 @@
 mod alias_pipeline;
 mod build_parity;
+mod chat_logit_bias;
 mod generate_body;
 mod glm53;
 mod model_label;
@@ -98,6 +99,8 @@ fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// The `(offset, length)` placeholder ranges of one generate call.
 type PlaceholderRanges = Vec<(u32, u32)>;
+/// A bias map as the stub received it, sorted by token.
+type ReceivedBias = Vec<(String, f32)>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
 type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
 type TokenizerStream =
@@ -119,8 +122,8 @@ type TokenizerStream =
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
 /// for a stream that outlasts its dispatch. Every call's input token ids,
-/// prompt text, stop sequences and engine request id are recorded, as is
-/// every aborted request id.
+/// prompt text, stop sequences, bias map and engine request id are
+/// recorded, as is every aborted request id.
 #[derive(Clone, Default)]
 struct GatedScheduler {
     probe: Option<Weak<CompletionRequest>>,
@@ -146,6 +149,7 @@ struct GatedScheduler {
     seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
     seen_request_ids: Arc<Mutex<Vec<String>>>,
     seen_stops: Arc<Mutex<Vec<Vec<String>>>>,
+    seen_logit_bias: Arc<Mutex<Vec<ReceivedBias>>>,
     aborted_request_ids: Arc<Mutex<Vec<String>>>,
 }
 
@@ -254,6 +258,24 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .sampling_params
                     .as_ref()
                     .map(|params| params.stop.clone())
+                    .unwrap_or_default(),
+            );
+        self.seen_logit_bias
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                request
+                    .sampling_params
+                    .as_ref()
+                    .map(|params| {
+                        let mut bias: ReceivedBias = params
+                            .logit_bias
+                            .iter()
+                            .map(|(token, bias)| (token.clone(), *bias))
+                            .collect();
+                        bias.sort_by(|a, b| a.0.cmp(&b.0));
+                        bias
+                    })
                     .unwrap_or_default(),
             );
         if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
