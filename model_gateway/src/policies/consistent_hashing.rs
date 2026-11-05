@@ -14,9 +14,12 @@
 //! The ring is built once when workers are added/removed, not per-request.
 //! This ensures O(log n) lookup performance.
 //!
-//! Complexity: O(log n) binary search + O(k) walk where k = consecutive unhealthy workers.
+//! Complexity per request: O(log n) binary search + O(k) walk where k =
+//! consecutive unhealthy workers, each probed node read for eligibility and
+//! found in the pool by one scan of its URLs; nothing is allocated for the
+//! translation.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use rand::RngExt as _;
 
@@ -66,42 +69,52 @@ impl ConsistentHashingPolicy {
     /// The ring returns a worker URL, which we then map to an index in the workers array.
     /// This correctly handles filtered worker arrays since we match by URL, not by index.
     ///
-    /// Complexity: O(n) to build healthy URL map + O(log n) ring lookup + O(k) walk
+    /// Complexity: O(log n) ring lookup + O(k) walk, each probed node read for
+    /// eligibility and found in the pool by a scan of its URLs (the last
+    /// eligible worker at that URL, as the map this replaced answered).
     fn find_by_consistent_hash(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
     ) -> Option<usize> {
-        // Build URL→index map for healthy workers: O(n) once, O(1) lookups
         // A lifted overload veto keeps an owner over the thresholds.
-        let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| {
-                if info.overload_lifted {
-                    w.routing_state().eligible_ignoring_overload()
-                } else {
-                    w.is_healthy_and_eligible()
-                }
-            })
-            .map(|(i, w)| (w.url(), i))
-            .collect();
-
-        if healthy_url_to_idx.is_empty() {
-            return None;
-        }
+        let eligible = |worker: &Arc<dyn Worker>| {
+            if info.overload_lifted {
+                worker.routing_state().eligible_ignoring_overload()
+            } else {
+                worker.is_healthy_and_eligible()
+            }
+        };
 
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
-            // O(1) lookup per URL checked instead of O(n)
-            let url = ring.find_healthy_url(key, |url| healthy_url_to_idx.contains_key(url))?;
-            return healthy_url_to_idx.get(url).copied();
+            let eligible_at = |url: &str| {
+                workers
+                    .iter()
+                    .rposition(|worker| worker.url() == url && eligible(worker))
+            };
+            // The probe that accepts the ring's answer keeps the position it
+            // found: one scan and one eligibility read per probed node, and
+            // the answer cannot disagree with the probe that admitted it.
+            let found = Cell::new(None);
+            ring.find_healthy_url(key, |url| {
+                found.set(eligible_at(url));
+                found.get().is_some()
+            })?;
+            return found.get();
         }
 
         // Fallback: no ring provided, use simple modulo (less optimal but functional)
         // This shouldn't happen in normal operation as WorkerSelectionStage provides the ring
-        let mut healthy_indices: Vec<usize> = healthy_url_to_idx.values().copied().collect();
-        healthy_indices.sort_unstable(); // Ensure deterministic order
+        let healthy_indices: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| eligible(worker))
+            .map(|(idx, _)| idx)
+            .collect();
+        if healthy_indices.is_empty() {
+            return None;
+        }
 
         // Use blake3 for consistent hashing in fallback too
         let hash = blake3::hash(key.as_bytes());
