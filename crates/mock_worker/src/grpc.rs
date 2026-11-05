@@ -337,6 +337,17 @@ impl Drop for Placed {
     }
 }
 
+/// The line a worker of several ranks logs per request: the rank the request
+/// came pinned to (`dp_rank=<n>`, or `dp_rank=None` for an unpinned one) and
+/// the rank it ran on. An engine's servicer logs the pinned rank in this form
+/// and the data-parallel e2e class reads a worker's log for it, so the mock
+/// twin of that class reads the mock as it reads an engine. A worker of one
+/// rank logs nothing: the line is about the placement, not the request.
+fn rank_line(request_id: &str, pin: Option<i32>, rank: usize) -> String {
+    let pin = pin.map_or_else(|| "None".to_string(), |pin| pin.to_string());
+    format!("request {request_id}: dp_rank={pin}, ran on rank {rank}")
+}
+
 impl MockScheduler {
     /// The rank a request runs on: its `data_parallel_rank` when pinned (a
     /// rank past the worker's is the caller's error, as the servicers answer
@@ -413,6 +424,10 @@ impl TokenSpeedScheduler for MockScheduler {
             let mut finish_reason = "stop";
             if !self.ranks.is_empty() {
                 let (rank, _placed) = self.place(req.data_parallel_rank)?;
+                if self.ranks.len() > 1 {
+                    let line = rank_line(&req.request_id, req.data_parallel_rank, rank);
+                    tracing::info!("{line}");
+                }
                 let engine = &self.ranks[rank].engine;
                 if let Some(fault) = engine.inject() {
                     if !fault.stall.is_zero() {
@@ -504,6 +519,10 @@ impl TokenSpeedScheduler for MockScheduler {
         // rank's engine simulator and stream its output.
         if !self.ranks.is_empty() {
             let (rank, placed) = self.place(req.data_parallel_rank)?;
+            if self.ranks.len() > 1 {
+                let line = rank_line(&req.request_id, req.data_parallel_rank, rank);
+                tracing::info!("{line}");
+            }
             let rank = &self.ranks[rank];
             let engine = &rank.engine;
             // The fault hook's answer for this request, when one is armed: a
@@ -2423,5 +2442,19 @@ mod tests {
         let constraint = injected_status(422);
         assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
         assert!(smg_grpc_client::is_constraint_failure(&constraint));
+    }
+
+    /// The per-request line of a worker of several ranks carries the pin as
+    /// an engine's servicer writes it, and the rank the request ran on.
+    #[test]
+    fn the_rank_line_names_the_pin_and_the_rank() {
+        assert_eq!(
+            rank_line("r-7", Some(1), 1),
+            "request r-7: dp_rank=1, ran on rank 1"
+        );
+        assert_eq!(
+            rank_line("r-8", None, 0),
+            "request r-8: dp_rank=None, ran on rank 0"
+        );
     }
 }
