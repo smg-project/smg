@@ -1024,6 +1024,7 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
     // the scan, next to each other, and nowhere.
     use unicode_normalization_alignments::is_nfc as library_is_nfc;
     let library_nfc = |text: &str| -> String { text.nfc().map(|(ch, _)| ch).collect() };
+    let quick = NfcQuick::read();
     let pieces = [
         "a",
         "b",
@@ -1064,6 +1065,11 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
             .collect();
         let expected = library_nfc(&text);
         assert_eq!(is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        assert_eq!(
+            quick.is_nfc(&text),
+            library_is_nfc(&text),
+            "{text:?} (quick)"
+        );
         let normalized = nfc(&text);
         assert_eq!(normalized.as_ref(), expected, "{text:?}");
         assert_eq!(
@@ -1112,6 +1118,7 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
         ("漢字\u{301}\u{323}", false),
     ] {
         assert_eq!(is_nfc(text), in_nfc, "{text:?}");
+        assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
         assert_eq!(nfc(text).as_ref(), library_nfc(text), "{text:?}");
     }
 }
