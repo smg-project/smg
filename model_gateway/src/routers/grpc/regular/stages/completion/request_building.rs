@@ -118,6 +118,13 @@ impl BuildStage for CompletionRequestBuildingStage {
         )?;
 
         let completion_request = ctx.completion_request_arc();
+        // The echo prepends each prompt's text: a text prompt as sent, a token
+        // prompt decoded, both prepared above.
+        let prompt_texts = if completion_request.echo {
+            items.iter().map(|item| item.text.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
@@ -205,8 +212,9 @@ impl BuildStage for CompletionRequestBuildingStage {
 
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Completion(CompletionResponseSpec::from(
+            spec: ResponseSpec::Completion(CompletionResponseSpec::new(
                 completion_request.as_ref(),
+                prompt_texts,
             )),
             stamp: AttemptStamp {
                 id: id_stamp,

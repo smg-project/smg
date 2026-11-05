@@ -272,7 +272,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
         "max_tokens": 4096, "stop": "STOP"
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
@@ -702,7 +702,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
         "model": "eof-test", "prompt": "test", "stream": true, "max_tokens": 4096
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (stream, server) = scripted_stream(ended_on_the_stop(9), "0").await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(

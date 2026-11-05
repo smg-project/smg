@@ -567,7 +567,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::StringOrArray;
+    use openai_protocol::{common::StringOrArray, completion::CompletionPrompt};
 
     use super::*;
     use crate::channel::testing::refused_endpoint;
@@ -578,7 +578,7 @@ mod tests {
     fn minimal_completion_request() -> CompletionRequest {
         CompletionRequest {
             model: String::new(),
-            prompt: StringOrArray::String(String::new()),
+            prompt: CompletionPrompt::Text(String::new()),
             best_of: None,
             echo: false,
             frequency_penalty: None,

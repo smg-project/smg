@@ -1,8 +1,11 @@
-//! A generate request that carries token ids instead of text: the ids reach the worker as they
-//! were sent, the tokenizer encodes nothing, the engine counts them as the prompt, and the
-//! answer decodes as it does for a text prompt. The text request on the same path keeps its one
-//! encode, and the shapes the path does not take (a batch of id lists, a negative id) are refused
-//! before any worker is spoken to.
+//! A prompt that arrives as token ids instead of text, on the two routes that take one: the
+//! native `/generate` (`input_ids`) and `/v1/completions` (`prompt` as an array of ids, or of
+//! id arrays). The ids reach the worker as they were sent, the tokenizer encodes nothing, the
+//! engine counts them as the prompt, and the answer decodes as it does for a text prompt. The
+//! text request on the same path keeps its one encode. On `/generate` the shapes the path does
+//! not take (a batch of id lists, a negative id) are refused before any worker is spoken to; on
+//! `/v1/completions` a batch of id lists is one engine request per prompt, as a batch of texts
+//! is, and an `echo` opens the answer with the ids' decode.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,6 +29,9 @@ const VOCAB: usize = 1_000;
 
 /// An added token above the reported vocabulary, known to the tokenizer by lookup alone.
 const ADDED: u32 = 5_000;
+
+/// The mock vocabulary's "Hello world": ids whose decode an `echo` can show.
+const HELLO_WORLD: [u32; 2] = [1, 2];
 
 /// The mock tokenizer behind a count of its encode calls, with the stub's answer token (100)
 /// in its vocabulary so a decoded answer reads as a word and a skipped decode as nothing.
@@ -93,7 +99,7 @@ impl Tokenizer for CountingTokenizer {
     }
 }
 
-/// The chat+generate pipeline over one stub worker, with the counting tokenizer loaded for the
+/// One route's pipeline over one stub worker, with the counting tokenizer loaded for the
 /// model and the stub's record of what it received.
 struct Bed {
     pipeline: RequestPipeline,
@@ -104,13 +110,14 @@ struct Bed {
 }
 
 impl Bed {
-    async fn new() -> Self {
-        Self::with_worker_labels(&[]).await
+    /// `Endpoint::Chat` is the chat+generate pipeline; `Endpoint::Completion` the completions one.
+    async fn new(endpoint: Endpoint) -> Self {
+        Self::with_worker_labels(endpoint, &[]).await
     }
 
     /// The bed over a worker that carries `labels` (an engine's model-info fields, as
     /// discovery keeps them).
-    async fn with_worker_labels(labels: &[(&str, &str)]) -> Self {
+    async fn with_worker_labels(endpoint: Endpoint, labels: &[(&str, &str)]) -> Self {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let seen_texts = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -128,8 +135,8 @@ impl Bed {
             None,
             Duration::from_secs(60),
         );
-        let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps)
-            .expect("chat+generate pipeline");
+        let pipeline =
+            RequestPipeline::build(endpoint, Mode::Regular, &deps).expect("the route's pipeline");
         let tokenizer = Arc::new(CountingTokenizer::new());
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         let loaded = Arc::clone(&tokenizer) as Arc<dyn Tokenizer>;
@@ -147,7 +154,7 @@ impl Bed {
         }
     }
 
-    /// The pipeline's answer to `body`: its status and its bytes.
+    /// The pipeline's answer to a `/generate` `body`: its status and its bytes.
     async fn generate(&self, body: Value) -> (http::StatusCode, bytes::Bytes) {
         let request: Arc<GenerateRequest> =
             Arc::new(serde_json::from_value(body).expect("generate request"));
@@ -165,11 +172,28 @@ impl Bed {
         )
         .await
         .expect("the pipeline answers within its budget");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        (status, body)
+        drain(response).await
+    }
+
+    /// The pipeline's answer to a `/v1/completions` `body`: its status and its bytes.
+    async fn complete(&self, body: Value) -> (http::StatusCode, bytes::Bytes) {
+        let request: Arc<CompletionRequest> =
+            Arc::new(serde_json::from_value(body).expect("completion request"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.pipeline.execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                Arc::clone(&self.components),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the pipeline answers within its budget");
+        drain(response).await
     }
 
     fn seen_ids(&self) -> Vec<Vec<u32>> {
@@ -187,6 +211,14 @@ impl Bed {
     }
 }
 
+async fn drain(response: Response) -> (http::StatusCode, bytes::Bytes) {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("drain body");
+    (status, body)
+}
+
 fn ids_request(stream: bool) -> Value {
     json!({
         "model": MODEL,
@@ -201,9 +233,23 @@ fn json_body(body: &bytes::Bytes) -> Value {
         .unwrap_or_else(|e| panic!("json body: {e}: {}", String::from_utf8_lossy(body)))
 }
 
+/// The `data:` payloads of an SSE body that ends with `[DONE]`.
+fn sse_events(body: &bytes::Bytes) -> Vec<Value> {
+    let body = String::from_utf8_lossy(body);
+    assert!(
+        body.ends_with("data: [DONE]\n\n"),
+        "the stream finishes: {body}"
+    );
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("stream event"))
+        .collect()
+}
+
 #[tokio::test]
 async fn ids_reach_the_worker_as_sent_without_an_encode() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
 
     let (status, body) = bed.generate(ids_request(false)).await;
 
@@ -237,7 +283,7 @@ async fn ids_reach_the_worker_as_sent_without_an_encode() {
 
 #[tokio::test]
 async fn a_text_request_on_the_same_path_encodes_once() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
 
     let (status, body) = bed
         .generate(json!({
@@ -272,23 +318,13 @@ async fn a_text_request_on_the_same_path_encodes_once() {
 
 #[tokio::test]
 async fn a_streamed_ids_request_reports_the_ids_count_on_every_event() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
 
     let (status, body) = bed.generate(ids_request(true)).await;
 
     assert_eq!(status, http::StatusCode::OK);
-    let body = String::from_utf8_lossy(&body);
-    assert!(
-        body.ends_with("data: [DONE]\n\n"),
-        "the stream finishes: {body}"
-    );
-    let events: Vec<Value> = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).expect("generate event"))
-        .collect();
-    assert!(!events.is_empty(), "{body}");
+    let events = sse_events(&body);
+    assert!(!events.is_empty(), "{}", String::from_utf8_lossy(&body));
     for event in &events {
         assert_eq!(
             event["meta_info"]["prompt_tokens"],
@@ -300,7 +336,8 @@ async fn a_streamed_ids_request_reports_the_ids_count_on_every_event() {
     assert_eq!(
         events.last().map(|event| &event["text"]),
         Some(&json!("Paris")),
-        "{body}"
+        "{}",
+        String::from_utf8_lossy(&body)
     );
     assert_eq!(bed.seen_ids(), vec![IDS.to_vec()]);
     assert_eq!(bed.tokenizer.encodes(), 0);
@@ -308,7 +345,7 @@ async fn a_streamed_ids_request_reports_the_ids_count_on_every_event() {
 
 #[tokio::test]
 async fn a_batch_of_id_lists_is_refused_before_any_worker_call() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
 
     let (status, body) = bed
         .generate(json!({
@@ -327,7 +364,7 @@ async fn a_batch_of_id_lists_is_refused_before_any_worker_call() {
 
 #[tokio::test]
 async fn a_negative_id_is_refused_before_any_worker_call() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
 
     let (status, body) = bed
         .generate(json!({
@@ -346,7 +383,7 @@ async fn a_negative_id_is_refused_before_any_worker_call() {
 
 #[tokio::test]
 async fn an_id_past_the_vocabulary_is_refused_before_any_worker_call() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
     // Above the reported vocabulary and none of the mock's added tokens (its own sit at
     // 999-1003, the bed's at ADDED), so neither the range nor the lookup knows it.
     let unknown = VOCAB as u32 + 500;
@@ -380,7 +417,7 @@ async fn an_id_past_the_vocabulary_is_refused_before_any_worker_call() {
 /// worker reports its table size, such an id passes as it would on the engine.
 #[tokio::test]
 async fn an_id_inside_the_reported_embedding_table_reaches_the_worker() {
-    let bed = Bed::with_worker_labels(&[("vocab_size", "2000")]).await;
+    let bed = Bed::with_worker_labels(Endpoint::Chat, &[("vocab_size", "2000")]).await;
     let gap = VOCAB as u32 + 500;
     let ids = vec![1, gap, 2];
 
@@ -409,7 +446,7 @@ async fn an_id_inside_the_reported_embedding_table_reaches_the_worker() {
 
 #[tokio::test]
 async fn an_id_past_the_reported_embedding_table_is_refused_naming_the_table() {
-    let bed = Bed::with_worker_labels(&[("vocab_size", "2000")]).await;
+    let bed = Bed::with_worker_labels(Endpoint::Chat, &[("vocab_size", "2000")]).await;
 
     let (status, body) = bed
         .generate(json!({
@@ -433,7 +470,7 @@ async fn an_id_past_the_reported_embedding_table_is_refused_naming_the_table() {
 
 #[tokio::test]
 async fn an_added_token_above_the_vocabulary_reaches_the_worker() {
-    let bed = Bed::new().await;
+    let bed = Bed::new(Endpoint::Chat).await;
     let ids = vec![11, ADDED, 12];
 
     let (status, body) = bed
@@ -456,5 +493,177 @@ async fn an_added_token_above_the_vocabulary_reaches_the_worker() {
         vec![ids],
         "an added token the tokenizer knows by lookup rides the wire as sent"
     );
+    assert_eq!(bed.tokenizer.encodes(), 0);
+}
+
+#[tokio::test]
+async fn a_completion_token_prompt_reaches_the_worker_as_sent_without_an_encode() {
+    let bed = Bed::new(Endpoint::Completion).await;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": IDS, "max_tokens": 4}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let body = json_body(&body);
+    assert_eq!(body["object"], "text_completion", "{body}");
+    assert_eq!(
+        bed.seen_ids(),
+        vec![IDS.to_vec()],
+        "the ids ride the wire as sent"
+    );
+    assert_eq!(
+        bed.seen_texts(),
+        vec![String::new()],
+        "no prompt text is rebuilt next to the ids"
+    );
+    assert_eq!(bed.tokenizer.encodes(), 0, "the prompt is never encoded");
+    assert_eq!(
+        body["usage"]["prompt_tokens"],
+        json!(IDS.len()),
+        "the worker's prompt count is the ids' length: {body}"
+    );
+    assert_eq!(body["choices"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["choices"][0]["index"], json!(0), "{body}");
+    assert_eq!(
+        body["choices"][0]["text"], "Paris",
+        "the answer still decodes: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_completion_text_prompt_on_the_same_path_encodes_once() {
+    let bed = Bed::new(Endpoint::Completion).await;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": "Hello world", "max_tokens": 4}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let body = json_body(&body);
+    assert_eq!(
+        bed.tokenizer.encodes(),
+        1,
+        "a text prompt is encoded exactly once"
+    );
+    assert_eq!(bed.seen_ids(), vec![HELLO_WORLD.to_vec()]);
+    assert_eq!(body["usage"]["prompt_tokens"], json!(2), "{body}");
+    assert_eq!(body["choices"][0]["text"], "Paris", "{body}");
+}
+
+#[tokio::test]
+async fn a_batch_of_completion_token_prompts_is_one_engine_request_per_prompt() {
+    let bed = Bed::new(Endpoint::Completion).await;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": [IDS, HELLO_WORLD], "max_tokens": 4}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let body = json_body(&body);
+    // The batch's requests are dispatched together; the stub records them as they land.
+    let mut seen = bed.seen_ids();
+    seen.sort();
+    let mut sent = vec![IDS.to_vec(), HELLO_WORLD.to_vec()];
+    sent.sort();
+    assert_eq!(seen, sent, "every prompt's ids ride the wire as sent");
+    assert_eq!(
+        bed.tokenizer.encodes(),
+        0,
+        "no prompt of the batch is encoded"
+    );
+    let choices = body["choices"].as_array().expect("choices");
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice["index"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1)],
+        "one choice per prompt, in the prompts' order: {body}"
+    );
+    assert!(
+        choices.iter().all(|c| c["text"] == "Paris"),
+        "every prompt is answered: {body}"
+    );
+    assert_eq!(
+        body["usage"]["prompt_tokens"],
+        json!(IDS.len() + HELLO_WORLD.len()),
+        "the usage counts every prompt's ids: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_echoed_completion_token_prompt_opens_with_its_decode() {
+    let bed = Bed::new(Endpoint::Completion).await;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": HELLO_WORLD, "max_tokens": 4, "echo": true}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let body = json_body(&body);
+    assert_eq!(
+        body["choices"][0]["text"], "Hello worldParis",
+        "the echo is the ids' decode, then the answer: {body}"
+    );
+    assert_eq!(bed.seen_ids(), vec![HELLO_WORLD.to_vec()]);
+    assert_eq!(
+        bed.tokenizer.encodes(),
+        0,
+        "an echo decodes, it never encodes"
+    );
+    assert_eq!(body["usage"]["prompt_tokens"], json!(2), "{body}");
+}
+
+#[tokio::test]
+async fn a_streamed_completion_token_prompt_reports_the_ids_count_in_its_usage() {
+    let bed = Bed::new(Endpoint::Completion).await;
+
+    let (status, body) = bed
+        .complete(json!({
+            "model": MODEL,
+            "prompt": IDS,
+            "max_tokens": 4,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        }))
+        .await;
+
+    assert_eq!(status, http::StatusCode::OK);
+    let events = sse_events(&body);
+    assert!(!events.is_empty(), "{}", String::from_utf8_lossy(&body));
+    let text: String = events
+        .iter()
+        .flat_map(|event| event["choices"].as_array().into_iter().flatten())
+        .filter_map(|choice| choice["text"].as_str())
+        .collect();
+    assert_eq!(text, "Paris", "{}", String::from_utf8_lossy(&body));
+    let usage = events
+        .iter()
+        .filter_map(|event| event.get("usage"))
+        .find(|usage| !usage.is_null())
+        .expect("the stream states its usage");
+    assert_eq!(usage["prompt_tokens"], json!(IDS.len()), "{usage}");
+    assert_eq!(bed.seen_ids(), vec![IDS.to_vec()]);
     assert_eq!(bed.tokenizer.encodes(), 0);
 }

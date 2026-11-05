@@ -121,7 +121,7 @@ fn completion_spec(prompt: Value) -> CompletionResponseSpec {
     let request: CompletionRequest =
         serde_json::from_value(json!({"model": MODEL, "prompt": prompt, "stream": true}))
             .expect("completion request");
-    CompletionResponseSpec::from(&request)
+    CompletionResponseSpec::new(&request, Vec::new())
 }
 
 fn source(endpoint: &'static str) -> utils::StreamSource {
