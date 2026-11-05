@@ -191,6 +191,27 @@ impl ByteLevelTableBuilder {
     }
 }
 
+/// The decoder kind of a `tokenizers` vocabulary as the load's log names it:
+/// the variant, with a `Sequence`'s members listed, `none` without a decoder.
+pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
+    fn variant(decoder: &DecoderWrapper) -> String {
+        let debug = format!("{decoder:?}");
+        debug
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or(debug.as_str())
+            .to_owned()
+    }
+    match decoder {
+        None => "none".to_owned(),
+        Some(DecoderWrapper::Sequence(sequence)) => {
+            let members: Vec<String> = sequence.get_decoders().iter().map(variant).collect();
+            format!("Sequence({})", members.join(", "))
+        }
+        Some(decoder) => variant(decoder),
+    }
+}
+
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
@@ -218,7 +239,6 @@ impl ByteLevelTable {
     /// Decode a complete HF sequence using the same bytes as incremental decode.
     /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
     /// only after concatenation so characters may span token boundaries.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
         let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
         for &id in ids {
@@ -253,7 +273,6 @@ impl ByteLevelTable {
     /// and one slice of the store the kind picks; the step's piece, with the
     /// text slice's boundary checks, is not built for a decode that only
     /// concatenates bytes.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     #[inline]
     fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
