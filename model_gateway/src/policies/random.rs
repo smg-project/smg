@@ -96,4 +96,37 @@ mod tests {
             None
         );
     }
+
+    /// Eight workers, two of them not ready: each eligible worker is picked
+    /// one time in six and a vetoed worker never. The draw is uniform over
+    /// the eligible workers, as the listed pick was.
+    #[test]
+    fn a_pick_is_uniform_over_the_eligible_workers_and_never_a_vetoed_one() {
+        let policy = RandomPolicy::new();
+        let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        for vetoed in [2, 5] {
+            workers[vetoed].set_status(WorkerStatus::NotReady);
+        }
+        let mut picks = [0usize; 8];
+        for _ in 0..6_000 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .expect("six workers are eligible");
+            picks[idx] += 1;
+        }
+        assert_eq!(
+            picks[2] + picks[5],
+            0,
+            "a not-ready worker was picked: {picks:?}"
+        );
+        for (idx, &count) in picks.iter().enumerate() {
+            if idx != 2 && idx != 5 {
+                assert!(
+                    (800..=1_200).contains(&count),
+                    "worker {idx} took {count} of 6,000 picks, one in six expected: {picks:?}"
+                );
+            }
+        }
+    }
 }

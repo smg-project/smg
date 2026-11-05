@@ -393,4 +393,64 @@ mod tests {
             );
         }
     }
+
+    /// Eight dark workers with nothing in flight, two of them not ready:
+    /// every pair ties on the scorer, so each eligible worker wins one pick
+    /// in six and a vetoed worker never. The draw is uniform over the
+    /// eligible workers, as the listed pair was.
+    #[test]
+    fn a_pick_draws_its_pair_uniformly_over_the_eligible_workers_and_never_a_vetoed_one() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
+        for vetoed in [2, 5] {
+            workers[vetoed].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        let mut wins = [0usize; 8];
+        for _ in 0..6_000 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .expect("six workers are eligible");
+            wins[idx] += 1;
+        }
+        assert_eq!(
+            wins[2] + wins[5],
+            0,
+            "a not-ready worker won a pick: {wins:?}"
+        );
+        for (idx, &count) in wins.iter().enumerate() {
+            if idx != 2 && idx != 5 {
+                assert!(
+                    (800..=1_200).contains(&count),
+                    "worker {idx} won {count} of 6,000 picks, one in six expected: {wins:?}"
+                );
+            }
+        }
+    }
+
+    /// A pool with one eligible worker picks it every time (the draw cannot
+    /// find a second and the walk finds the one); a pool with none picks
+    /// nothing.
+    #[test]
+    fn a_pool_with_one_eligible_worker_picks_it_and_a_vetoed_pool_picks_nothing() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
+        for vetoed in [0, 1, 3] {
+            workers[vetoed].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(2)
+            );
+        }
+        workers[2].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
+    }
 }
