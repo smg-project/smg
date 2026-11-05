@@ -39,11 +39,10 @@ impl PipelineStage for CompletionPreparationStage {
                 encode_prompts(&tokenizer, std::slice::from_ref(text)).await?
             }
             CompletionPrompt::Texts(texts) => encode_prompts(&tokenizer, texts).await?,
-            CompletionPrompt::TokenIds(ids) => vec![token_prompt(tokenizer.as_ref(), ids)?],
-            CompletionPrompt::TokenIdBatches(batches) => batches
-                .iter()
-                .map(|ids| token_prompt(tokenizer.as_ref(), ids))
-                .collect::<Result<_, _>>()?,
+            CompletionPrompt::TokenIds(ids) => vec![token_prompt(&tokenizer, ids).await?],
+            CompletionPrompt::TokenIdBatches(batches) => {
+                try_join_all(batches.iter().map(|ids| token_prompt(&tokenizer, ids))).await?
+            }
         };
 
         let joined_routing_text = (items.len() > 1).then(|| {
@@ -112,57 +111,106 @@ async fn encode_prompts(
 /// A prompt given as token ids goes to the engine as given, with no encode.
 /// Its text, for `echo` and for the policies that route on text, is the ids'
 /// decode with special tokens kept, as the engines' own servers echo a token
-/// prompt. An id the vocabulary lacks has no text here; the engine refuses
-/// it, as it does on `/generate`.
-fn token_prompt(tokenizer: &dyn Tokenizer, ids: &[u32]) -> Result<CompletionItem, Response> {
-    let text = tokenizer.decode(ids, false).map_err(|e| {
-        error!(
-            function = "CompletionPreparationStage::execute",
-            error = %e,
-            "Prompt token ids cannot be decoded"
-        );
-        error::bad_request(
-            "invalid_prompt_token",
-            format!("prompt token ids cannot be decoded: {e}"),
-        )
-    })?;
-    Ok(CompletionItem {
-        text,
-        token_ids: ids.to_vec(),
-    })
+/// prompt; a long prompt decodes off the worker thread, as a long text
+/// encodes. An id the vocabulary lacks is the decoder's call: the byte-level
+/// and HF decoders drop it and the prompt rides on for the engine to refuse,
+/// as on `/generate`; the tiktoken decoder refuses it, and so does the
+/// gateway, here.
+async fn token_prompt(
+    tokenizer: &Arc<dyn Tokenizer>,
+    ids: &[u32],
+) -> Result<CompletionItem, Response> {
+    let token_ids = ids.to_vec();
+    let text = utils::decode_blocking(tokenizer.clone(), token_ids.clone(), false)
+        .await
+        .map_err(|e| {
+            error!(
+                function = "CompletionPreparationStage::execute",
+                error = %e,
+                "Prompt token ids cannot be decoded"
+            );
+            error::bad_request(
+                "invalid_prompt_token",
+                format!("prompt token ids cannot be decoded: {e}"),
+            )
+        })?;
+    Ok(CompletionItem { text, token_ids })
 }
 
 #[cfg(test)]
 mod tests {
-    use llm_tokenizer::MockTokenizer;
+    use axum::http::StatusCode;
+    use llm_tokenizer::{MockTokenizer, TiktokenModel, TiktokenTokenizer};
 
     use super::*;
 
+    fn mock() -> Arc<dyn Tokenizer> {
+        Arc::new(MockTokenizer::new())
+    }
+
     /// A token prompt keeps its ids and takes their decode as its text, the
     /// text `echo` prepends and the text-reading policies route on.
-    #[test]
-    fn a_token_prompt_goes_as_given_with_its_decode_as_text() {
-        let tokenizer = MockTokenizer::new();
+    #[tokio::test]
+    async fn a_token_prompt_goes_as_given_with_its_decode_as_text() {
+        let tokenizer = mock();
         let ids: Vec<u32> = ["Hello", "world"]
             .iter()
             .map(|token| tokenizer.token_to_id(token).expect("mock vocab"))
             .collect();
 
-        let item = token_prompt(&tokenizer, &ids).expect("known ids");
+        let item = token_prompt(&tokenizer, &ids).await.expect("known ids");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, "Hello world");
     }
 
-    /// An id the vocabulary lacks decodes to nothing and still rides the
-    /// prompt: the engine, not the gateway, refuses it.
-    #[test]
-    fn an_unknown_id_has_no_text_and_still_rides_the_prompt() {
-        let tokenizer = MockTokenizer::new();
+    /// A prompt long enough to decode off the worker thread reads the same
+    /// as the short one.
+    #[tokio::test]
+    async fn a_long_token_prompt_decodes_to_the_same_text() {
+        let tokenizer = mock();
+        let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+        let ids = vec![hello; 1024];
 
-        let item = token_prompt(&tokenizer, &[1, 424_242]).expect("decode keeps what it knows");
+        let item = token_prompt(&tokenizer, &ids).await.expect("known ids");
+
+        assert_eq!(item.token_ids, ids);
+        assert_eq!(item.text, tokenizer.decode(&ids, false).expect("decode"));
+    }
+
+    /// The mock drops an id its vocabulary lacks, as the byte-level and HF
+    /// decoders do: the prompt still rides, for the engine to refuse.
+    #[tokio::test]
+    async fn an_unknown_id_has_no_text_and_still_rides_the_prompt() {
+        let item = token_prompt(&mock(), &[1, 424_242])
+            .await
+            .expect("decode keeps what it knows");
 
         assert_eq!(item.token_ids, vec![1, 424_242]);
         assert_eq!(item.text, "Hello");
+    }
+
+    /// The tiktoken decoder refuses an id its encoding lacks, so on such a
+    /// model the gateway refuses the prompt itself.
+    #[tokio::test]
+    async fn a_tiktoken_decoder_refuses_an_unknown_id_at_the_gateway() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("built-in encoding"));
+        let known = tokenizer
+            .encode("Hello", false)
+            .expect("encode")
+            .into_token_ids();
+
+        let response = match token_prompt(&tokenizer, &[known[0], 4_000_000_000]).await {
+            Ok(_) => panic!("an unknown id is refused"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("invalid_prompt_token"), "{body}");
     }
 }

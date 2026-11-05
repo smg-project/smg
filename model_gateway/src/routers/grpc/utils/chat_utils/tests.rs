@@ -1908,6 +1908,94 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
 }
 
 #[test]
+fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+
+    use llm_tokenizer::traits::{Decoder, Encoder, Encoding, SpecialTokens};
+
+    /// The mock behind a record of the thread its decode ran on.
+    struct ThreadRecordingTokenizer {
+        inner: llm_tokenizer::MockTokenizer,
+        ran_on: Arc<Mutex<Option<ThreadId>>>,
+    }
+
+    impl Encoder for ThreadRecordingTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for ThreadRecordingTokenizer {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            *self.ran_on.lock().unwrap() = Some(thread::current().id());
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for ThreadRecordingTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // `block_on` polls on this thread, so an offloaded decode runs somewhere else.
+    let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let inner = llm_tokenizer::MockTokenizer::new();
+    let hello = inner.token_to_id("Hello").expect("mock vocab");
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ThreadRecordingTokenizer {
+        inner,
+        ran_on: ran_on.clone(),
+    });
+    let decode = |ids: Vec<u32>| block_on(decode_blocking(tokenizer.clone(), ids, false)).unwrap();
+
+    let long = vec![hello; ENCODE_OFFLOAD_MIN_BYTES / size_of::<u32>()];
+    let expected = tokenizer.decode(&long, false).unwrap();
+    ran_on.lock().unwrap().take();
+    assert_eq!(decode(long), expected);
+    let offloaded = ran_on.lock().unwrap().take().expect("the decode ran");
+    assert_ne!(
+        offloaded,
+        thread::current().id(),
+        "a prompt of ids the size of a long text decodes off the worker thread"
+    );
+
+    assert_eq!(decode(vec![hello]), "Hello");
+    let inline = ran_on.lock().unwrap().take().expect("the decode ran");
+    assert_eq!(
+        inline,
+        thread::current().id(),
+        "a short prompt of ids decodes inline"
+    );
+}
+
+#[test]
 fn deferred_encode_takes_the_offload_path_for_large_prompts() {
     use std::{
         sync::Mutex,
