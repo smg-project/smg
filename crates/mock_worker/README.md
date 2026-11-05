@@ -37,7 +37,13 @@ mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
 and gRPC workers, which bind and are dialed, each rank dials the frontend's
 handshake address, registers, takes `EngineCoreRequest`s and pushes
 `EngineCoreOutputs` with the engine's load as `scheduler_stats`; the admin API
-sees it as worker `zmq:<index>`.
+sees it as worker `zmq:<index>`. `--zmq-step-ms <ms>` has the ranks send an
+engine's steps: one message per period carrying the next token of every
+running request (a request that produced faster than the period waits its
+turn, one output per step), instead of one message per token;
+`GET /admin/zmq/zmq:<index>` reads what the rank pushed since it connected,
+the messages that carried request outputs and the outputs in them
+(cumulative; a reset does not clear them).
 
 ## Run (canned)
 
@@ -255,6 +261,7 @@ path has no engine to hook.
 |----------|--------|
 | `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+| `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
 A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
 for exactly N failures inside the breaker's window, `secs=T` for a worker that
