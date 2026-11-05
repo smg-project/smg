@@ -101,6 +101,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           cargo bench -p kv-index --bench throughput_bench -- \
             --num-sessions 200000 \
             --num-workers 256 \
@@ -122,6 +123,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           for trace in conversation_trace synthetic_trace toolagent_trace; do
             echo "=== ${trace} ==="
             cargo bench -p kv-index --bench throughput_bench -- \

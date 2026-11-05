@@ -14,23 +14,60 @@
 # overran the 40-minute step; the radix bench sets 0.5 s and 2 s in code and runs its 72 ids there
 # in under four minutes a run.
 #
-# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) /
-# median of the per-run criterion medians over ten pinned runs of one build of main (five "base" and
-# five "pull request" runs of the same binary through this gate), was measured twice on a shared
-# build host whose load ran from 15 to 480 on 192 cores during the runs: the gated ids spread
-# 9 - 59 % the first time and 14 - 76 % the second (median 39 % and 44 %), numbers that say more
-# about that host than about the benchmark (the tokenizer's ids read 0.8 - 6.7 % on the same host
-# at a lower load). Both null cases at a 10 % threshold passed through the overlap rule (0 failed;
-# 12 of 66 and 3 of 57 suspect). 25 % is provisional: it fails the regressions that matter on this
-# path (a 2 x slower parse of a turn) and holds under the noise seen; every job uploads
-# bench-gate/results.json with the raw per-run medians of both sides, and the hosted runner's own
-# spread, read from those, is the number to tighten this to.
+# Threshold (the method is described in tokenizer.toml). The identical-build spread was first
+# measured on a shared build host at loads of 15 to 480 (9 - 59 % and 14 - 76 % over the gated ids,
+# numbers that described the host, not the benchmark) and the gate opened at a provisional 25 %.
+# The hosted runner's own null case (the gate pull request's run of 2026-11-04: two builds of the
+# same source, three interleaved runs a side, 57 ids, 0 failed, 0 suspect) read, per group, as the
+# median and the largest per-id spread of a side's three runs, and the largest change of medians
+# between the two builds:
+#
+#   group             identical build   across builds   threshold
+#   parse/whole       1.3 - 2.9 %       1.7 %           10 %
+#   parse/pieces8     2.0 - 3.0 %       1.2 %           10 %
+#   prose/pieces8     2.2 - 2.4 %       0.9 %           10 %
+#   prose/whole       7.6 - 7.8 %       0.7 %           20 %
+#   setup/engine      4.1 - 8.1 %       5.4 %           20 %
+#   setup/declared    9.3 %             1.3 %           20 %
+#   setup/table       6.5 - 10.3 %      5.8 %           25 %
+#
+# The thresholds are the tokenizer rule's: the smallest multiple of 5 % that is at least twice the
+# identical-build spread and 1.5 x the across-build change, never under 10 %. Every job uploads
+# bench-gate/results.json with the raw per-run medians of both sides; a second null case can
+# tighten the setup rows further. The last entry catches a row added later at the provisional 25 %.
 
 repeats = 3
 filter = "^((parse|prose)/|setup/(table|engine)/|setup/declared$)"
 bench_args = ["--warm-up-time", "0.5", "--measurement-time", "2"]
 
 [[gate]]
+pattern = "^parse/(whole|pieces8)/"
+threshold = 0.10
+note = "runner null case: identical build 1.3 - 3.0 %, across builds 1.2 - 1.7 %"
+
+[[gate]]
+pattern = "^prose/pieces8/"
+threshold = 0.10
+note = "runner null case: identical build 2.2 - 2.4 %, across builds 0.9 %"
+
+[[gate]]
+pattern = "^prose/whole/"
+threshold = 0.20
+note = "runner null case: identical build 7.6 - 7.8 %, across builds 0.7 %"
+
+[[gate]]
+pattern = "^setup/(engine/|declared$)"
+threshold = 0.20
+note = "runner null case: identical build 4.1 - 9.3 %, across builds 1.3 - 5.4 %"
+
+[[gate]]
+pattern = "^setup/table/"
+threshold = 0.25
+note = "runner null case: identical build 6.5 - 10.3 %, across builds 5.8 %"
+
+# Last, so the first match above wins: a row the filter admits that no entry names (one added after
+# the null case) is gated at the provisional level instead of running report-only in silence.
+[[gate]]
 pattern = "^(parse|prose|setup)/"
 threshold = 0.25
-note = "provisional: identical build 9 - 59 % and 14 - 76 % on a loaded host; tighten from the runner's results.json"
+note = "fallback for a row added after the 2026-11-04 null case; measure it and give it its own entry"
