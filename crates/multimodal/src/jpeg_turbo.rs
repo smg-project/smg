@@ -350,13 +350,16 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     //   exactly once and never used after destruction.
     // - `bytes` is a live `&[u8]`; its ptr/len describe a valid immutable region
     //   for the duration of the calls (libjpeg-turbo only reads it).
-    // - `buf` is an owned `Vec<u8>` sized to exactly `w*h*channels`
+    // - `buf` is an owned `Vec<u8>` whose length is exactly `w*h*channels`
     //   (overflow-checked) from the header dimensions, with `channels` the
     //   pixel size of the format requested (3 for `TJPF_RGB`, 4 for
-    //   `TJPF_CMYK`), and is the sole alias passed to the decoder; with
+    //   `TJPF_CMYK`); a pooled buffer has a larger capacity, the length is
+    //   what matters. It is the sole alias passed to the decoder; with
     //   `pitch=0` (=> `w*channels`) the decoder writes at most `w*h*channels`
     //   bytes, so no out-of-bounds write occurs. The image is built only after
-    //   `rc == 0` confirms a successful, complete write.
+    //   `rc == 0` confirms a successful, complete write, which covers every
+    //   byte of the buffer (its contents before the write are a previous
+    //   frame's, not zeros).
     unsafe {
         let handle = (tj.init)();
         if handle.is_null() {
@@ -389,7 +392,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
                 return None;
             }
         };
-        let mut buf = vec![0_u8; nbytes];
+        let mut buf = crate::buffer_pool::take(nbytes);
         let rc = (tj.decompress)(
             handle,
             bytes.as_ptr(),
@@ -635,5 +638,47 @@ mod tests {
             turbojpeg_available()
         );
         assert_eq!(enforce_policy(TurboJpegPolicy::Prefer), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    /// The decoded frame is a pooled buffer: the second decode of a frame
+    /// takes the buffer the first one returned and writes the same pixels
+    /// into it (the library writes every pixel of the frame it reports).
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_decode_reuses_the_returned_buffer_and_writes_the_same_pixels() {
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the pooled decode test");
+            return;
+        }
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 4000x3000: 36 MB of pixels, the 64 MiB class.
+            let bytes = std::fs::read(format!(
+                "{}/tests/fixtures/images/large.jpg",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("fixture");
+            let first = decode_jpeg_rgb(&bytes).expect("decoded");
+            let address = first.as_bytes().as_ptr();
+            let reference = first.as_bytes().to_vec();
+            buffer_pool::recycle_image(first);
+            assert_eq!(MINE.held(), 64 << 20);
+            let second = decode_jpeg_rgb(&bytes).expect("decoded");
+            assert_eq!(
+                second.as_bytes().as_ptr(),
+                address,
+                "the second decode took the first's buffer"
+            );
+            assert!(
+                second.as_bytes() == reference.as_slice(),
+                "the pixels differ on the reused buffer"
+            );
+        });
     }
 }

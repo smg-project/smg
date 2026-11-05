@@ -8,7 +8,12 @@
 //! and the move) and run with every task inline on the test thread, so no pool thread
 //! allocates into the window. The decode's own calls depend on which decoder is loaded
 //! (TurboJPEG and libwebp are runtime bindings; their C allocations never reach this
-//! allocator), so the decode pin counts the large buffers only: the one decoded frame.
+//! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
+//! binding decodes a frame of a megabyte or more into a buffer from the pool, the fallback
+//! decoder allocates its own.
+//! The warm pass returns its buffers the way a request does (the frame dropped, the wire
+//! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
+//! wire the pool serves counts no large buffer.
 //! A separate executable, so it can declare the counting allocator.
 //!
 //! `MM_PINS_RECORD=1 cargo test -p llm-multimodal --test alloc_pins -- --nocapture`
@@ -30,8 +35,10 @@ use bytes::Bytes;
 use common::counting_alloc::{Counting, BYTES, CALLS, LARGE_CALLS};
 use image::{DynamicImage, ImageReader, Rgba, RgbaImage};
 use llm_multimodal::{
+    buffer_pool::recycled_bytes,
     configure_parallelism,
     encoder_inputs::EncoderDtype,
+    jpeg_turbo::turbojpeg_available,
     types::{ImageDetail, ImageFrame, ImageSize, ImageSource, TransparencyPolicy},
     vision::{
         preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
@@ -183,7 +190,14 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
             .preprocess_wire(&[&image], EncoderDtype::BFloat16)
             .expect("one-pass")
             .expect("preprocess");
-        drop(inputs.encoder_input.into_bytes_as(EncoderDtype::BFloat16));
+        // The wire payload returns its buffer once sent, as in the gateway; the
+        // warm frame returns its pixels when it drops at the end of this block.
+        drop(recycled_bytes(
+            inputs
+                .encoder_input
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("wire"),
+        ));
     }
     let frame = frame(&class.bytes);
     let ((), decode) =
@@ -216,10 +230,11 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 /// the preprocess's calls and large buffers, the move's calls. Today's values, with the
 /// copy that each large buffer is.
 ///
-/// - decode: the large buffers of the decode (the decoded frame and the decoder's own
-///   planes; a small input decodes under the threshold). The calls are not pinned: they
-///   differ between the TurboJPEG binding and the fallback decoder, the large buffers do
-///   not.
+/// - decode: the large buffers of the decode (the decoded frame, the decoder's own planes,
+///   a copy of a large encoded file; a small input decodes under the threshold), per
+///   decoder (`Frames`): the TurboJPEG binding takes a frame of a megabyte or more from the
+///   buffer pool, where the warm pass left one, the fallback decoder allocates it. The
+///   calls are not pinned: they differ between the two decoders in their bookkeeping.
 /// - copy: one call, one large buffer: the gateway's per-frame clone before the processor
 ///   (the first copy to go; its pin falls to zero calls when it does).
 /// - preprocess: the calls of the resize, the layout and the wire write of one image, one
@@ -228,11 +243,28 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 /// - serialize: zero: the wire bytes move.
 struct Pin {
     class: &'static str,
-    decode_large: usize,
+    decode_large: Frames,
     copy: (usize, usize),
     preprocess_calls: Calls,
     preprocess_large: usize,
     serialize_calls: usize,
+}
+
+/// A large-buffer count per decoder: the TurboJPEG binding when it is loaded, the fallback
+/// decoder otherwise.
+struct Frames {
+    fallback: usize,
+    turbo: usize,
+}
+
+impl Frames {
+    fn here(&self) -> usize {
+        if turbojpeg_available() {
+            self.turbo
+        } else {
+            self.fallback
+        }
+    }
 }
 
 /// A call count per resize row path. The resize's rows run through NEON on aarch64
@@ -258,68 +290,86 @@ impl Calls {
 const PINS: &[Pin] = &[
     Pin {
         class: "jpeg-large",
-        decode_large: 2,
+        decode_large: Frames {
+            fallback: 2,
+            turbo: 1,
+        },
         copy: (1, 1),
         preprocess_calls: Calls {
-            scalar: 6039,
-            neon: 6038,
+            scalar: 6038,
+            neon: 6037,
         },
         preprocess_large: 2,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-small",
-        decode_large: 0,
+        decode_large: Frames {
+            fallback: 0,
+            turbo: 0,
+        },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1052,
-            neon: 1053,
+            scalar: 1051,
+            neon: 1052,
         },
         preprocess_large: 1,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-grayscale",
-        decode_large: 1,
+        decode_large: Frames {
+            fallback: 1,
+            turbo: 1,
+        },
         copy: (1, 1),
         preprocess_calls: Calls {
-            scalar: 1372,
-            neon: 1373,
+            scalar: 1370,
+            neon: 1371,
         },
-        preprocess_large: 3,
+        preprocess_large: 2,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-cmyk",
-        decode_large: 0,
+        decode_large: Frames {
+            fallback: 0,
+            turbo: 0,
+        },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1052,
-            neon: 1053,
+            scalar: 1051,
+            neon: 1052,
         },
         preprocess_large: 1,
         serialize_calls: 0,
     },
     Pin {
         class: "png-rgb",
-        decode_large: 2,
+        decode_large: Frames {
+            fallback: 2,
+            turbo: 2,
+        },
         copy: (1, 1),
         preprocess_calls: Calls {
-            scalar: 1431,
-            neon: 1430,
+            scalar: 1429,
+            neon: 1428,
         },
-        preprocess_large: 2,
+        preprocess_large: 1,
         serialize_calls: 0,
     },
     Pin {
         class: "png-rgba",
-        decode_large: 3,
+        decode_large: Frames {
+            fallback: 3,
+            turbo: 3,
+        },
         copy: (1, 1),
         preprocess_calls: Calls {
-            scalar: 17,
-            neon: 17,
+            scalar: 15,
+            neon: 15,
         },
-        preprocess_large: 1,
+        preprocess_large: 0,
         serialize_calls: 0,
     },
 ];
@@ -366,7 +416,7 @@ fn every_stage_allocates_what_it_allocates_today() {
             (
                 "decode large buffers",
                 measured.decode.large,
-                pin.decode_large,
+                pin.decode_large.here(),
             ),
             ("copy calls", measured.copy.calls, pin.copy.0),
             ("copy large buffers", measured.copy.large, pin.copy.1),
