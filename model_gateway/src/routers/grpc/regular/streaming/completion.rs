@@ -100,6 +100,10 @@ pub(super) struct CompletionStream<'a> {
     backend_type: &'static str,
 
     first_token_time: Option<Instant>,
+    /// Whether the frame carrying the first token has left: until it has,
+    /// the read flushes before every poll, so the first token waits for
+    /// nothing ([`StreamingProcessor::next_packed`]).
+    first_token_out: bool,
 
     /// The per-choice state, one entry per choice the request expects
     /// (`spec.choices_per_prompt`), at the engine's index.
@@ -245,6 +249,7 @@ impl<'a> CompletionStream<'a> {
                     ..Default::default()
                 })
                 .collect(),
+            first_token_out: false,
             engine_outlived: false,
             tail_tokens: 0,
             frame,
@@ -255,16 +260,42 @@ impl<'a> CompletionStream<'a> {
         }
     }
 
-    /// The loop over the engine's messages, each reaching the client as its
-    /// own chunks as soon as it is processed.
+    /// The loop over the engine's messages: each is processed as soon as it
+    /// arrives and its chunks are written into the unit's buffer; the chunks
+    /// of the messages ready at one poll leave as one frame, the first
+    /// token's alone (the packed read, as the chat loop's).
     pub(super) async fn read_engine(
         &mut self,
         grpc_stream: &mut ProtoStream,
     ) -> Result<(), utils::StreamFailure> {
-        while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, self.total_completion.delivered())
-            })?;
+        loop {
+            let next = StreamingProcessor::next_packed(
+                grpc_stream,
+                self.tx,
+                &mut self.sse_buffer,
+                &mut self.first_token_out,
+                self.first_token_time.is_some(),
+            )
+            .await?;
+            let Some(response) = next else {
+                if grpc_stream.client_left() {
+                    // As on the chat path: the departure ends the read before
+                    // held-back text is flushed to the closed sender.
+                    return Ok(());
+                }
+                break;
+            };
+            let gen_response = match response {
+                Ok(response) => response,
+                Err(e) => {
+                    // What was produced before the failure still goes out.
+                    StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                    return Err(utils::StreamFailure::upstream(
+                        e,
+                        self.total_completion.delivered(),
+                    ));
+                }
+            };
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await?,
@@ -279,6 +310,7 @@ impl<'a> CompletionStream<'a> {
                 break;
             }
         }
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
     }
 
@@ -336,7 +368,7 @@ impl<'a> CompletionStream<'a> {
         // whose tokens made no text yet carries them all the same.
         let logprobs = chunk_logprobs(self.spec, &self.tokenizer, &mut choice.text_offset, &chunk);
         if !text.is_empty() || logprobs.is_some() {
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
@@ -369,7 +401,7 @@ impl<'a> CompletionStream<'a> {
             self.total_completion.record_local_stop(chunk.index());
 
             if let Some(sfx) = self.spec.suffix.as_deref() {
-                StreamingProcessor::send_completion_chunk(
+                StreamingProcessor::write_completion_chunk(
                     self.tx,
                     &mut self.sse_buffer,
                     &self.frame,
@@ -378,7 +410,7 @@ impl<'a> CompletionStream<'a> {
                 .await?;
             }
 
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
@@ -423,7 +455,7 @@ impl<'a> CompletionStream<'a> {
         // (e.g., max_tokens=0). The Chunk arm normally prepends prompt_text
         // on the first event, but if no Chunks arrive we must emit it here.
         if !choice.started && self.spec.echo && !self.prompt_text.is_empty() {
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
@@ -443,7 +475,7 @@ impl<'a> CompletionStream<'a> {
             | SequenceDecoderOutput::StoppedWithText(text) = tail
             {
                 if !text.is_empty() {
-                    StreamingProcessor::send_completion_chunk(
+                    StreamingProcessor::write_completion_chunk(
                         self.tx,
                         &mut self.sse_buffer,
                         &self.frame,
@@ -455,7 +487,7 @@ impl<'a> CompletionStream<'a> {
         }
 
         if let Some(sfx) = self.spec.suffix.as_deref() {
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
@@ -467,7 +499,7 @@ impl<'a> CompletionStream<'a> {
         let finish_reason =
             utils::completion_finish_reason(choice.stopped, complete.finish_reason()).to_string();
 
-        StreamingProcessor::send_completion_chunk(
+        StreamingProcessor::write_completion_chunk(
             self.tx,
             &mut self.sse_buffer,
             &self.frame,
@@ -505,7 +537,7 @@ impl<'a> CompletionStream<'a> {
             if text.is_empty() && !stopped {
                 continue;
             }
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
@@ -513,6 +545,9 @@ impl<'a> CompletionStream<'a> {
             )
             .await?;
         }
+        // The finish of the open choices is written after the read's end
+        // flush: it leaves as its own frame.
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
     }
 

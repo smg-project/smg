@@ -438,3 +438,93 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token() {
         "{events:?}"
     );
 }
+
+/// As the chat stream packs its frames: the chunk carrying the first token
+/// leaves on its own as soon as its message is processed; after it, the
+/// chunks of the messages the engine has ready at one poll leave as one
+/// frame: the second token, ready with the first, leaves alone once the
+/// first frame is out (the loop does not wait for more); the two after the
+/// gate share a frame with the finish the Complete behind them writes.
+#[tokio::test]
+async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completion_stream() {
+    let (gate, gated) = oneshot::channel();
+    let (stream, server) = staged_stream(
+        vec![
+            (None, vec![chunk(0, "a"), chunk(0, "b")]),
+            (
+                Some(gated),
+                vec![chunk(0, "c"), chunk(0, "d"), complete(0, "stop")],
+            ),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": "fixture-model", "prompt": "frames", "stream": true
+    }))
+    .expect("completion request");
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
+    let dispatch = context::DispatchMetadata {
+        request_id: "cmpl-frames".to_string(),
+        model: "fixture-model".to_string(),
+        created: 1,
+        weight_version: None,
+    };
+    let processor = processor(false);
+    let reading = async {
+        let result = processor
+            .process_completion_streaming_chunks(
+                stream,
+                dispatch,
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                &spec,
+                "",
+                0,
+                &tx,
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let reader = async {
+        let mut frames = Vec::new();
+        // The two messages ready at once: the reader parks at the gate only
+        // after their two frames left.
+        for _ in 0..2 {
+            frames.push(rx.recv().await.expect("a frame").expect("a write"));
+        }
+        gate.send(()).expect("the reader waits at the gate");
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame.expect("a write"));
+        }
+        frames
+    };
+    let (result, frames) = tokio::join!(reading, reader);
+    server.abort();
+    assert!(result.is_ok(), "the completion stream failed");
+    let chunks: Vec<(usize, String)> = frames
+        .iter()
+        .map(|frame| {
+            let text = String::from_utf8_lossy(frame).to_string();
+            (text.matches("data: ").count(), text)
+        })
+        .collect();
+    let shape: Vec<usize> = chunks.iter().map(|(count, _)| *count).collect();
+    assert_eq!(
+        shape.len(),
+        3,
+        "the first token alone, the second alone, everything after the gate together: {chunks:?}"
+    );
+    assert_eq!(&shape[..2], [1, 1], "{chunks:?}");
+    assert!(chunks[0].1.contains(r#""text":"a""#), "{chunks:?}");
+    assert!(chunks[1].1.contains(r#""text":"b""#), "{chunks:?}");
+    assert!(
+        chunks[2].1.contains(r#""text":"c""#)
+            && chunks[2].1.contains(r#""text":"d""#)
+            && chunks[2].1.contains(r#""finish_reason":"stop""#)
+            && chunks[2].1.ends_with("\n\n"),
+        "{chunks:?}"
+    );
+}

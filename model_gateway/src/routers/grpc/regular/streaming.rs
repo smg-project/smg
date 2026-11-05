@@ -1572,8 +1572,8 @@ impl StreamingProcessor {
             .map_err(|_| "Failed to send chunks".to_string())
     }
 
-    /// The engine's next message as the packed loops read it (the chat and
-    /// Messages streams). The engine is polled once in place before the
+    /// The engine's next message as the packed loops read it (the chat,
+    /// completion and Messages streams). The engine is polled once in place before the
     /// events written into `buffer` leave: a message it has ready joins the
     /// frame being written, so the messages ready at one poll leave as one
     /// frame; when it has none ready, the frame leaves before the reader
@@ -2721,18 +2721,22 @@ impl StreamingProcessor {
         buffer.extend_from_slice(b"\n\n");
     }
 
-    /// Write one completion chunk carrying `choice` and hand it to the
-    /// channel as its own frame, without a copy.
-    async fn send_completion_chunk(
+    /// Write one completion chunk carrying `choice` into `buffer`. The buffer
+    /// goes to the channel as one frame, without a copy, by
+    /// [`Self::flush_chunks`] once the engine has nothing more ready (the
+    /// completion loop's `read_engine`: the chunks ready at one poll share a
+    /// frame, after the first token's), at the unit's end, or here once it
+    /// holds [`CHUNK_FLUSH_BYTES`].
+    async fn write_completion_chunk(
         tx: &SseSender,
         buffer: &mut BytesMut,
         frame: &CompletionChunkFrame,
         choice: &CompletionStreamChoice,
     ) -> Result<(), String> {
         frame.write_chunk(buffer, choice);
-        tx.send(Ok(buffer.split().freeze()))
+        Self::flush_when_full(tx, buffer)
             .await
-            .map_err(|_| "Channel closed".to_string())
+            .map_err(|()| "Channel closed".to_string())
     }
 
     /// Skeleton usage for the `message_start` event, written before the
