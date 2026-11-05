@@ -97,6 +97,8 @@
 //! one, through the table's key built once.
 
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     sync::{
         atomic::{AtomicU32, Ordering},
         OnceLock,
@@ -104,8 +106,9 @@ use std::{
     time::Instant,
 };
 
-use metrics::{Key, Label, Level, Metadata};
+use metrics::{Counter, Key, Label, Level, Metadata};
 use parking_lot::Mutex;
+use smg_external_router::metrics::handles::keep_handles;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
 use tracing::{debug, warn};
 
@@ -854,9 +857,37 @@ fn publish(key: &Key) {
 static METADATA: Metadata<'static> =
     Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
 
-/// One more on the counter under `key`: the registry's lookup, no key built.
+thread_local! {
+    /// This thread's kept counter handles, by the series' key (every key lives in [`SERIES`] for
+    /// the process's life, so its address names it): built on the first record once a recorder
+    /// is installed, as the gateway's other recorders keep theirs. Registering a handle on the
+    /// exporter per record costs it an allocation each time; the kept one costs a map read.
+    static KEPT_COUNTERS: RefCell<HashMap<usize, Counter>> = RefCell::new(HashMap::new());
+}
+
+/// The counter under `key`, registered on the installed recorder.
+fn register_counter(key: &Key) -> Counter {
+    metrics::with_recorder(|recorder| recorder.register_counter(key, &METADATA))
+}
+
+/// One more on the counter under `key`: through this thread's kept handle once a recorder is
+/// installed, else the registry's lookup (a test's recorder is a local one); no key built.
 fn increment(key: &Key, by: u64) {
-    metrics::with_recorder(|recorder| recorder.register_counter(key, &METADATA)).increment(by);
+    if !keep_handles() {
+        register_counter(key).increment(by);
+        return;
+    }
+    KEPT_COUNTERS.with_borrow_mut(|kept| {
+        kept.entry(std::ptr::from_ref(key) as usize)
+            .or_insert_with(|| register_counter(key))
+            .increment(by);
+    });
+}
+
+/// For tests: this thread's kept handles dropped, so a later test's recorder gets its own.
+#[cfg(test)]
+fn reset_kept() {
+    KEPT_COUNTERS.with_borrow_mut(HashMap::clear);
 }
 
 /// One observation on the histogram under `key`.
@@ -998,6 +1029,7 @@ impl Sampler {
 
 #[cfg(test)]
 mod tests {
+    use smg_external_router::metrics::handles::force_on_this_thread;
     use symphony::{DropReason, FinishReason, Text};
 
     use super::*;
@@ -2432,5 +2464,37 @@ mod tests {
             "{scrape}"
         );
         assert!(!scrape.contains(OUTPUTS), "{scrape}");
+    }
+
+    /// Records through kept handles reach the recorder's series: two failed outputs and one
+    /// refused response under one table render with their counts (an unknown table name would
+    /// fold into `other`, so the test takes a registered one).
+    #[test]
+    fn kept_counter_handles_update_the_recorders_series() {
+        let table = Table::ALL[0].name();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            force_on_this_thread(Some(true));
+            record_failed(table);
+            record_failed(table);
+            record_refused(table);
+            force_on_this_thread(None);
+        });
+        assert_eq!(KEPT_COUNTERS.with_borrow(HashMap::len), 2);
+        reset_kept();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(
+                "smg_symphony_outputs_total{{table=\"{table}\",outcome=\"failed\"}} 2"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "smg_symphony_refused_total{{table=\"{table}\",reason=\"tool_use_input\"}} 1"
+            )),
+            "{rendered}"
+        );
     }
 }
