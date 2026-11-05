@@ -63,11 +63,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::V1),
     ),
-    (
-        "gemma-4-e4b-it",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("gemma-4-e4b-it", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-4.6", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-4.7-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-5.3-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
@@ -132,7 +128,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("minimax-m3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "mistral-7b-instruct-v0.3",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -140,11 +136,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
-    (
-        "nanbeige4.2-3b",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("nanbeige4.2-3b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "nvidia-nemotron-3-nano-30b-a3b-bf16",
         Hf(EncodePath::Native),
@@ -324,7 +316,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("step3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "tinyllama-1.1b-chat-v1.0",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
