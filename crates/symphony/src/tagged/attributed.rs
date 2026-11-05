@@ -54,12 +54,15 @@
 //! [`formats::deepseek_v4_1`]: crate::formats::deepseek_v4_1()
 //! [`formats::kimi_k3`]: crate::formats::kimi_k3()
 
+use std::borrow::Cow;
+
 use super::object::{Mode, Object};
 use crate::{
+    engine::part,
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
-        end_cut_call, held_text,
+        end_cut_call, held_text, take_owned,
         value::{cut as cut_json, json, Kind},
     },
     Declared,
@@ -305,6 +308,9 @@ pub struct Assembler {
     /// nothing is made up for its close ([`Self::close`]).
     refused: bool,
     done: bool,
+    /// The buffer the events of a piece the scanner held fill before they go out owned
+    /// (`take_owned`): kept between pieces with its room.
+    scratch: Events<'static>,
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +380,7 @@ impl Assembler {
             released: false,
             refused: false,
             done: false,
+            scratch: Events::new(),
         }
     }
 
@@ -390,12 +397,12 @@ impl Assembler {
 
     /// Append the next bytes of the invoke and push the events they complete. Every byte is the
     /// invoke's until the engine says otherwise, so this takes them all.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         if self.done {
             return;
         }
         let scanned = self.scanner.feed(bytes);
-        for piece in scanned.pieces() {
+        for piece in scanned.pieces_of_delta() {
             self.take(piece, declared, out);
         }
         self.scanner.reclaim(scanned);
@@ -556,7 +563,7 @@ impl Assembler {
             // The opener's first bytes, or fewer: no section opens now, so they are the value's.
             value.cdata = Cdata::Plain;
             let arrived = self.object.carried.split_off(value.start);
-            self.section_text(&arrived, out);
+            self.section_text(Cow::Owned(arrived), out);
         }
         let Stage::Value(value) = &self.stage else {
             return None;
@@ -593,7 +600,7 @@ impl Assembler {
             }
             self.object.carried.push('\n');
         } else {
-            self.value_bytes(&text, out);
+            self.value_bytes(Cow::Owned(text), out);
         }
         let Stage::Value(value) = &mut self.stage else {
             return cut_tag;
@@ -718,7 +725,7 @@ impl Assembler {
         if self.tags.value_on_its_own_line && text == "\n" {
             self.object.carried.push('\n');
         } else {
-            self.value_bytes(&text, out);
+            self.value_bytes(Cow::Owned(text), out);
         }
         super::left_open(why, out);
         self.object.close_member("\"".to_string(), "", out);
@@ -726,9 +733,17 @@ impl Assembler {
         cut_tag
     }
 
-    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
+    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
         match piece {
-            Piece::Text(text) => self.text(&text, declared, out),
+            Piece::Text(Cow::Borrowed(text)) => self.text(text, declared, out),
+            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
+            Piece::Text(Cow::Owned(text)) => {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                take_owned(&text, &mut scratch, out, |text, out| {
+                    self.text(text, declared, out);
+                });
+                self.scratch = scratch;
+            }
             Piece::Marker(tag) => self.tag(tag, declared, out),
         }
     }
@@ -772,7 +787,7 @@ impl Assembler {
         }
     }
 
-    fn text(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+    fn text<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) {
         match &self.stage {
             Stage::FunctionName => match text.split_once('"') {
                 Some((head, rest)) => {
@@ -994,7 +1009,7 @@ impl Assembler {
     /// The next bytes of a value. Where the family writes CDATA sections, the first bytes decide
     /// whether this value is one: they are held until the opener's length has arrived or a byte
     /// rules the opener out, then read as they would have been.
-    fn value_text(&mut self, text: &str, out: &mut Events) {
+    fn value_text<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
@@ -1028,27 +1043,29 @@ impl Assembler {
                     value.cdata = Cdata::Plain;
                 }
                 let arrived = self.object.carried.split_off(value.start);
-                self.section_text(&arrived, out);
+                self.section_text(Cow::Owned(arrived), out);
             }
-            _ => self.section_text(text, out),
+            _ => self.section_text(Cow::Borrowed(text), out),
         }
     }
 
     /// The next bytes of a value whose CDATA question is settled: inside a section the text up to
     /// `]]>` is the value's and a trailing start of the closer is held; after the closer, text is
-    /// out of place; a plain value's bytes are the value's.
-    fn section_text(&mut self, text: &str, out: &mut Events) {
+    /// out of place; a plain value's bytes are the value's. Bytes held before the piece (a
+    /// closer's start, the newline that may be the template's) are joined to it, and the join is
+    /// the value's own; a piece with nothing held before it stays the delta's, so that its
+    /// fragment can borrow it ([`Object::value_bytes`]).
+    fn section_text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
         match value.cdata {
             Cdata::Inside => {
-                let mut pending = std::mem::take(&mut value.held);
-                pending.push_str(text);
+                let pending = joined_to(std::mem::take(&mut value.held), text);
                 if let Some(at) = pending.find(CDATA_CLOSE) {
-                    let inside = pending[..at].to_string();
-                    let after = pending[at + CDATA_CLOSE.len()..].to_string();
-                    self.value_bytes(&inside, out);
+                    let inside = part(&pending, 0..at);
+                    let after = part(&pending, at + CDATA_CLOSE.len()..pending.len());
+                    self.value_bytes(inside, out);
                     if let Stage::Value(value) = &mut self.stage {
                         value.cdata = Cdata::Done;
                         if matches!(value.mode, Mode::Whole | Mode::Undecided) {
@@ -1056,7 +1073,7 @@ impl Assembler {
                         }
                     }
                     self.object.carried.push_str(CDATA_CLOSE);
-                    self.section_text(&after, out);
+                    self.section_text(after, out);
                 } else {
                     // A trailing `]]` or `]` may be the closer's start: held. Both are ASCII, so
                     // the split falls on a character boundary.
@@ -1067,23 +1084,31 @@ impl Assembler {
                     } else {
                         0
                     };
-                    let (give, hold) = pending.split_at(pending.len() - keep);
-                    let give = give.to_string();
-                    value.held = hold.to_string();
-                    self.value_bytes(&give, out);
+                    let give = part(&pending, 0..pending.len() - keep);
+                    value.held = pending[pending.len() - keep..].to_string();
+                    self.value_bytes(give, out);
                 }
             }
-            Cdata::Done => self.after_the_section(text, out),
+            Cdata::Done => self.after_the_section(&text, out),
             Cdata::Plain | Cdata::Undecided if self.tags.value_on_its_own_line => {
                 // A trailing newline may be the template's framing before the closing tag: held.
-                let mut pending = std::mem::take(&mut value.held);
-                pending.push_str(text);
-                let (give, hold) = match pending.strip_suffix('\n') {
-                    Some(give) => (give.to_string(), "\n".to_string()),
-                    None => (pending, String::new()),
+                let (give, hold) = match joined_to(std::mem::take(&mut value.held), text) {
+                    Cow::Borrowed(text) => match text.strip_suffix('\n') {
+                        Some(give) => (Cow::Borrowed(give), true),
+                        None => (Cow::Borrowed(text), false),
+                    },
+                    Cow::Owned(mut text) => {
+                        let hold = text.ends_with('\n');
+                        if hold {
+                            text.pop();
+                        }
+                        (Cow::Owned(text), hold)
+                    }
                 };
-                value.held = hold;
-                self.value_bytes(&give, out);
+                if hold {
+                    value.held.push('\n');
+                }
+                self.value_bytes(give, out);
             }
             Cdata::Plain | Cdata::Undecided => self.value_bytes(text, out),
         }
@@ -1139,7 +1164,7 @@ impl Assembler {
     }
 
     /// The value's own bytes, by its mode.
-    fn value_bytes(&mut self, text: &str, out: &mut Events) {
+    fn value_bytes<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
@@ -1160,7 +1185,7 @@ impl Assembler {
             }
             self.object.carried.push('\n');
         } else {
-            self.value_bytes(&held, out);
+            self.value_bytes(Cow::Owned(held), out);
         }
         let Stage::Value(value) = &self.stage else {
             return;
@@ -1194,6 +1219,17 @@ impl Assembler {
         }
         self.stage = Stage::Between;
         self.released = false;
+    }
+}
+
+/// `held` then `text`: `text` itself when nothing was held, so that a piece of the delta stays
+/// the delta's; the join, the assembler's own, otherwise.
+fn joined_to<'d>(mut held: String, text: Cow<'d, str>) -> Cow<'d, str> {
+    if held.is_empty() {
+        text
+    } else {
+        held.push_str(&text);
+        Cow::Owned(held)
     }
 }
 
@@ -1269,15 +1305,15 @@ mod tests {
     }
 
     /// The events of one invoke fed in `pieces`, closed by its tag or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
+    fn run<'p>(pieces: &[&'p str], cut: bool) -> Vec<Event<'p>> {
         run_with(Tags::MINIMAX_M2, pieces, cut)
     }
 
-    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
+    fn run_with<'p>(tags: Tags, pieces: &[&'p str], cut: bool) -> Vec<Event<'p>> {
         let mut assembler = Assembler::new(0, "call_0", tags);
         let mut out = Events::new();
         let declared = declared();
-        for piece in pieces {
+        for &piece in pieces {
             assembler.feed(piece, &declared, &mut out);
         }
         if cut {
@@ -1314,7 +1350,8 @@ mod tests {
             "{\"\\u1\"".to_string(),
             "[\"\\u1\"]".to_string(),
         ] {
-            let events = run_with(Tags::XTML, &[&argument(&cut)], true);
+            let piece = argument(&cut);
+            let events = run_with(Tags::XTML, &[&piece], true);
             let written = arguments(&events);
             assert!(
                 written.starts_with("{\"o\": \""),

@@ -165,7 +165,7 @@ fn event_text<'e, 'd>(event: &'e mut Event<'d>) -> Option<&'e mut Text<'d>> {
 /// `text[range]` as `text` is: a slice of a borrowed run stays borrowed from the delta, a slice
 /// of an owned run is copied. The pieces of a run the engine cuts (a lead, a body, a tail, the
 /// runs of a wrapper) keep the run's claim on the delta.
-fn part<'d>(text: &Cow<'d, str>, range: Range<usize>) -> Cow<'d, str> {
+pub(crate) fn part<'d>(text: &Cow<'d, str>, range: Range<usize>) -> Cow<'d, str> {
     match text {
         Cow::Borrowed(text) => Cow::Borrowed(&text[range]),
         Cow::Owned(text) => Cow::Owned(text[range].to_owned()),

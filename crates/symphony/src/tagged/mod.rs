@@ -42,6 +42,25 @@ pub(crate) fn open_at_the_stop(out: &mut Events) {
     left_open(MalformedReason::OpenAtTheStop, out);
 }
 
+/// The events `take` records for `text`, read into `scratch` and moved into `out` owning
+/// their text: for a piece that is nobody's delta, the copy of the scanner's join that the
+/// held bytes are part of ([`crate::markers::Scanned::pieces_of_delta`]), which no event of
+/// the delta's lifetime can borrow; the engine takes a piece it held the same way. `scratch`
+/// keeps its room between pieces, so the piece costs no list of its own.
+pub(super) fn take_owned<'d>(
+    text: &str,
+    scratch: &mut Events<'static>,
+    out: &mut Events<'d>,
+    take: impl for<'t> FnOnce(&'t str, &mut Events<'t>),
+) {
+    let mut events: Events<'_> = std::mem::take(scratch);
+    take(text, &mut events);
+    for event in events.consume() {
+        out.push(event.into_owned());
+    }
+    *scratch = events.recycle();
+}
+
 /// The one event of a string value that one of a call's two own ends closed: the stream's stop
 /// (`why` = [`MalformedReason::OpenAtTheStop`], [`open_at_the_stop`]) or the call's closing
 /// marker (`why` = [`MalformedReason::OpenAtTheMarker`]: the model ended the call, its own
