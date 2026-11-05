@@ -5,19 +5,25 @@
 //! `preprocessor_config.json` / video processor config files to the local HF
 //! cache and returns the resolved path.
 
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::{
-    fmt,
-    path::{Path, PathBuf},
+    fmt, fs,
+    io::{self, Write},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::Context;
-use hf_hub::api::tokio::{ApiBuilder, ApiError};
+use hf_hub::{
+    api::tokio::{Api, ApiBuilder, ApiError, ApiRepo},
+    Cache, CacheRepo,
+};
 
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
 
 /// Bound on one Hub object fetch of this crate (`config.json` or a processor
-/// config on a cache miss: the metadata request, the download, the blob lock),
+/// config on a cache miss: the metadata request and the file's download),
 /// the one bound for every such fetch. The Hub client has no timeout of its
 /// own, so an endpoint that drops packets would hold the fetch until the
 /// connect gives up, and with nothing cached after a failure every request of
@@ -27,12 +33,11 @@ const HF_TOKEN_ENV: &str = "HF_TOKEN";
 /// mirror's cold fetch would refuse every request of that model for as long
 /// as the Hub stays slow.
 ///
-/// An elapsed bound frees the request, not every socket: the client awaits
-/// the metadata request inline, so a Hub that never answers it leaves nothing
-/// behind, while a Hub that answers it and then stalls the body has one
-/// download task already spawned for the fetch, which dropping the fetch
-/// detaches rather than aborts; that task lives until its socket ends, the
-/// client having no timeout of its own.
+/// An elapsed bound ends the whole fetch: each of its requests is awaited
+/// inline ([`HubRepo::fetch`]), so dropping the fetch drops the request in
+/// flight and closes its connection, and a Hub that answers the metadata
+/// request and then withholds the body holds nothing of this process past
+/// the bound.
 const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve a model source to a local directory containing `config.json`.
@@ -46,23 +51,19 @@ const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// the caller never reads an incomplete directory as a checkpoint without the
 /// file.
 pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
+    resolve_within(source, HUB_FETCH_TIMEOUT).await
+}
+
+/// [`resolve_model_config_dir`] with each Hub fetch under `bound`.
+async fn resolve_within(source: &str, bound: Duration) -> anyhow::Result<PathBuf> {
     let path = Path::new(source);
     if path.join("config.json").exists() {
         return Ok(path.to_path_buf());
     }
 
-    let mut builder = ApiBuilder::from_env().with_progress(false);
-    if let Ok(token) = std::env::var(HF_TOKEN_ENV) {
-        if !token.is_empty() {
-            builder = builder.with_token(Some(token));
-        }
-    }
-    let api = builder
-        .build()
-        .context("Failed to build HuggingFace API client")?;
-    let repo = api.model(source.to_string());
+    let hub = HubRepo::open(source)?;
 
-    let config_path = match tokio::time::timeout(HUB_FETCH_TIMEOUT, repo.get("config.json")).await {
+    let config_path = match tokio::time::timeout(bound, hub.fetch("config.json")).await {
         Ok(Ok(path)) => path,
         // The Hub's 404, or the 401/403 it answers without access for a
         // repository that does not exist or is gated, is a checkpoint this
@@ -72,7 +73,7 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
             return Err(unreadable(source, "config.json", error));
         }
         Ok(Err(error)) => return Err(HubFetchError::failed(source, "config.json", &error).into()),
-        Err(_) => return Err(HubFetchError::elapsed(source, "config.json").into()),
+        Err(_) => return Err(HubFetchError::elapsed(source, "config.json", bound).into()),
     };
 
     // The processor configs beside config.json: a checkpoint ships the ones of
@@ -91,14 +92,14 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
         "video_preprocessor_config.json",
         "processor_config.json",
     ] {
-        match tokio::time::timeout(HUB_FETCH_TIMEOUT, repo.get(config_file)).await {
+        match tokio::time::timeout(bound, hub.fetch(config_file)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) if is_absent(&error) => {}
             Ok(Err(error)) if is_refused(&error) => {
                 return Err(unreadable(source, config_file, error));
             }
             Ok(Err(error)) => return Err(HubFetchError::failed(source, config_file, &error).into()),
-            Err(_) => return Err(HubFetchError::elapsed(source, config_file).into()),
+            Err(_) => return Err(HubFetchError::elapsed(source, config_file, bound).into()),
         }
     }
 
@@ -106,6 +107,126 @@ pub async fn resolve_model_config_dir(source: &str) -> anyhow::Result<PathBuf> {
         .parent()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| anyhow::anyhow!("Invalid HF cache path for model '{source}'"))
+}
+
+/// A checkpoint's repository on the Hub and in the local Hub cache, as this
+/// crate's resolution reads it.
+struct HubRepo {
+    api: Api,
+    repo: ApiRepo,
+    cache: CacheRepo,
+}
+
+impl HubRepo {
+    /// The Hub client from the environment (`HF_ENDPOINT`, `HF_HOME`, the
+    /// cache's token file, `HF_TOKEN` over it) and the checkpoint `source`'s
+    /// repository on it and in the cache.
+    fn open(source: &str) -> anyhow::Result<Self> {
+        let mut builder = ApiBuilder::from_env();
+        if let Ok(token) = std::env::var(HF_TOKEN_ENV) {
+            if !token.is_empty() {
+                builder = builder.with_token(Some(token));
+            }
+        }
+        let api = builder
+            .build()
+            .context("Failed to build HuggingFace API client")?;
+        let repo = api.model(source.to_string());
+        // The client keeps its cache to itself; this one is the same cache,
+        // read from `HF_HOME` the way the client reads it.
+        let cache = Cache::from_env().model(source.to_string());
+        Ok(Self { api, repo, cache })
+    }
+
+    /// The local path of `filename`: the cached file when the cache has it (no
+    /// request), else the file fetched into the cache as the client lays it
+    /// out (the blob under its etag, the snapshot's link to it, the revision's
+    /// ref). The metadata request and the body's GET are both awaited here
+    /// rather than left to the client's own download, which spawns a task per
+    /// chunk and detaches it when the download is dropped: a fetch dropped at
+    /// its bound ends with no task reading a body that never comes.
+    async fn fetch(&self, filename: &str) -> Result<PathBuf, ApiError> {
+        if let Some(path) = self.cache.get(filename) {
+            return Ok(path);
+        }
+        let url = self.repo.url(filename);
+        let metadata = self.api.metadata(&url).await?;
+        let body = self
+            .api
+            .client()
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let blob = self.cache.blob_path(metadata.etag());
+        write_whole(&blob, &body)?;
+        let pointer = self
+            .cache
+            .pointer_path(metadata.commit_hash())
+            .join(filename);
+        link_pointer(&pointer, &blob)?;
+        self.cache.create_ref(metadata.commit_hash())?;
+        Ok(pointer)
+    }
+}
+
+/// Writes `content` to `path` whole or not at all: a temporary file beside
+/// it, renamed into place, so a reader of the cache (another process
+/// resolving the same checkpoint) never sees a partial blob.
+fn write_whole(path: &Path, content: &[u8]) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("a blob path has no directory"))?;
+    fs::create_dir_all(dir)?;
+    let mut builder = tempfile::Builder::new();
+    // The mode a created file gets (0o666 under the umask), as the client's
+    // own blobs have, not a temporary file's owner-only one: the cache is
+    // read by every user of it.
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o666));
+    let mut file = builder.tempfile_in(dir)?;
+    file.write_all(content)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Links `pointer`, a file of a snapshot directory, to `blob` by a relative
+/// path, as the Hub cache keeps its snapshots; a pointer already there (the
+/// file linked by an earlier fetch of this snapshot, or by another process
+/// now) stays.
+fn link_pointer(pointer: &Path, blob: &Path) -> io::Result<()> {
+    let dir = pointer
+        .parent()
+        .ok_or_else(|| io::Error::other("a snapshot path has no directory"))?;
+    fs::create_dir_all(dir)?;
+    if pointer.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let linked = symlink(relative_path(blob, dir), pointer);
+    #[cfg(not(unix))]
+    let linked = fs::hard_link(blob, pointer);
+    match linked {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        linked => linked,
+    }
+}
+
+/// `target` relative to the directory `from`: a step up for each component
+/// of `from` below their common ancestor, then the rest of `target`.
+#[cfg(unix)]
+fn relative_path(target: &Path, from: &Path) -> PathBuf {
+    let mut target = target.components().peekable();
+    let mut from = from.components().peekable();
+    while target.peek().is_some() && target.peek() == from.peek() {
+        target.next();
+        from.next();
+    }
+    let mut relative: PathBuf = from.map(|_| Component::ParentDir).collect();
+    relative.extend(target);
+    relative
 }
 
 /// A file of a checkpoint the Hub failed to serve: no answer, a 5xx, a 429, a
@@ -136,12 +257,12 @@ impl HubFetchError {
         }
     }
 
-    /// The fetch of `file` outlived [`HUB_FETCH_TIMEOUT`].
-    fn elapsed(model: &str, file: &'static str) -> Self {
+    /// The fetch of `file` outlived `bound`.
+    fn elapsed(model: &str, file: &'static str, bound: Duration) -> Self {
         Self {
             model: model.to_string(),
             file,
-            cause: format!("no answer within {}s", HUB_FETCH_TIMEOUT.as_secs()),
+            cause: format!("no answer within {}s", bound.as_secs()),
         }
     }
 
@@ -220,11 +341,24 @@ fn describe(error: &ApiError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{
+        ffi::OsString,
+        io::{self, Read, Write},
+        net::{TcpListener, TcpStream},
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex, MutexGuard,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     use hf_hub::api::tokio::ApiError;
 
-    use super::{describe, is_absent, is_refused, HubFetchError};
+    #[cfg(unix)]
+    use super::relative_path;
+    use super::{describe, is_absent, is_refused, resolve_within, HubFetchError};
 
     /// The error `repo.get` returns when the Hub answers `status` to the
     /// file's request (hf-hub runs `error_for_status` on the answer).
@@ -345,6 +479,204 @@ mod tests {
         assert_eq!(
             describe(&io),
             "I/O error client error (Connect): tcp connect error: Connection refused (os error 111)"
+        );
+    }
+
+    /// The relative link a snapshot's file gets to its blob: up out of the
+    /// snapshot directory (and the file's own directories) to the
+    /// repository's, then into its blobs.
+    #[cfg(unix)]
+    #[test]
+    fn a_pointer_links_to_its_blob_relative_to_its_snapshot() {
+        let repo = Path::new("/cache/hub/models--org--name");
+        assert_eq!(
+            relative_path(&repo.join("blobs/e1"), &repo.join("snapshots/c1")),
+            Path::new("../../blobs/e1")
+        );
+        assert_eq!(
+            relative_path(&repo.join("blobs/e1"), &repo.join("snapshots/c1/sub")),
+            Path::new("../../../blobs/e1")
+        );
+    }
+
+    /// The commit and etag the withholding Hub names, and the length of the
+    /// body it never sends.
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const ETAG: &str = "etag-of-the-withheld-file";
+    const WITHHELD_LEN: usize = 42;
+
+    /// A Hub on loopback that answers a file's metadata request (`Range:
+    /// bytes=0-0`) with the commit, etag and content range the client reads,
+    /// and the file's own request with its status line and length and nothing
+    /// more: the body never comes, and the connection stays open until the
+    /// client closes it, which the Hub records.
+    struct WithholdingHub {
+        endpoint: String,
+        /// The file's request arrived; its body is being withheld.
+        withholding: Arc<AtomicBool>,
+        /// The client closed the connection the body was withheld on.
+        closed: Arc<AtomicBool>,
+    }
+
+    impl WithholdingHub {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+            let withholding = Arc::new(AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
+            let flags = (withholding.clone(), closed.clone());
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let (withholding, closed) = flags.clone();
+                    thread::spawn(move || answer(stream, &withholding, &closed));
+                }
+            });
+            Self {
+                endpoint,
+                withholding,
+                closed,
+            }
+        }
+    }
+
+    /// One connection's answer: the metadata, or the status line of the body
+    /// that is then withheld until the client gives up the connection.
+    fn answer(mut stream: TcpStream, withholding: &AtomicBool, closed: &AtomicBool) {
+        let head = request_head(&mut stream);
+        if head.contains("bytes=0-0\r\n") {
+            let answer = format!(
+                "HTTP/1.1 206 Partial Content\r\nx-repo-commit: {COMMIT}\r\netag: \"{ETAG}\"\r\n\
+                 content-range: bytes 0-0/{WITHHELD_LEN}\r\ncontent-length: 1\r\n\
+                 connection: close\r\n\r\n{{"
+            );
+            let _ = stream.write_all(answer.as_bytes());
+            return;
+        }
+        let answer = format!("HTTP/1.1 200 OK\r\ncontent-length: {WITHHELD_LEN}\r\n\r\n");
+        let _ = stream.write_all(answer.as_bytes());
+        withholding.store(true, Ordering::SeqCst);
+        let mut buf = [0u8; 256];
+        while matches!(stream.read(&mut buf), Ok(read) if read > 0) {}
+        closed.store(true, Ordering::SeqCst);
+    }
+
+    /// A request's head off `stream`, up to and including the blank line.
+    fn request_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(read) if read > 0 => head.extend_from_slice(&buf[..read]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// `HF_HOME` and `HF_ENDPOINT` pointed at a test's cache and Hub while
+    /// this lives, then put back. The variables are process-wide: the tests
+    /// that set them take turns.
+    struct HubEnv {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _turn: MutexGuard<'static, ()>,
+    }
+
+    static HUB_ENV_TURN: Mutex<()> = Mutex::new(());
+
+    impl HubEnv {
+        fn set(home: &Path, endpoint: &str) -> Self {
+            let turn = HUB_ENV_TURN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = ["HF_HOME", "HF_ENDPOINT"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            std::env::set_var("HF_HOME", home);
+            std::env::set_var("HF_ENDPOINT", endpoint);
+            Self {
+                previous,
+                _turn: turn,
+            }
+        }
+    }
+
+    impl Drop for HubEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Whether `condition` holds within `wait`, the runtime running meanwhile
+    /// (the client closes a dropped request's connection from a task of its
+    /// own, which needs the runtime).
+    async fn holds_within(wait: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + wait;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A Hub that answers the metadata request and then withholds the file's
+    /// body holds the fetch for its bound and nothing past it: the request is
+    /// dropped with the fetch, so the Hub sees the connection close, the
+    /// runtime keeps no task of the fetch, and nothing of the file is cached.
+    /// (The client's own download would leave its chunk task behind, reading
+    /// the body that never comes for as long as the Hub holds the connection,
+    /// one such task per fetch that ran out of its bound.)
+    #[tokio::test]
+    async fn a_fetch_whose_body_the_hub_withholds_ends_at_its_bound_with_nothing_behind() {
+        let hub = WithholdingHub::start();
+        let home = tempfile::tempdir().expect("a cache directory");
+        let _env = HubEnv::set(home.path(), &hub.endpoint);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let tasks = metrics.num_alive_tasks();
+
+        let bound = Duration::from_secs(2);
+        let failed = resolve_within("cell/withheld", bound)
+            .await
+            .expect_err("the body never comes");
+        let message = format!("{failed:#}");
+        assert!(
+            hub.withholding.load(Ordering::SeqCst),
+            "the Hub had the file's request before the bound elapsed: {message}"
+        );
+        assert!(HubFetchError::is(&failed), "{message}");
+        assert!(
+            message.contains("config.json") && message.contains("no answer within 2s"),
+            "the error names the file and the elapsed bound: {message}"
+        );
+
+        let grace = Duration::from_secs(5);
+        let closed = holds_within(grace, || hub.closed.load(Ordering::SeqCst)).await;
+        assert!(
+            closed,
+            "the Hub still holds the fetch's connection {grace:?} after the bound, \
+             with {} task(s) alive on the runtime against {tasks} before the fetch",
+            metrics.num_alive_tasks()
+        );
+        assert!(
+            holds_within(grace, || metrics.num_alive_tasks() == tasks).await,
+            "{} task(s) alive on the runtime {grace:?} after the bound, {tasks} before the fetch",
+            metrics.num_alive_tasks()
+        );
+        assert!(
+            !home
+                .path()
+                .join("hub/models--cell--withheld/snapshots")
+                .exists(),
+            "nothing of the file is in the cache; the next resolution fetches it again"
         );
     }
 }
