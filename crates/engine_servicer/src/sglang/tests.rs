@@ -3855,3 +3855,131 @@ fn media_optimization_defaults_require_a_supported_identity() {
     assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
     assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
 }
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 1000)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 1000))),
+    )
+    .await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 1000))),
+    )
+    .await;
+    chunk(third.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 1000))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

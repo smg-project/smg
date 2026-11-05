@@ -240,9 +240,6 @@ pub(super) struct State {
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
-    /// Queued token-work, generation throughput and hit rate from the
-    /// requests this servicer forwards, per rank, for `GetLoads`.
-    pub(super) loads: crate::load_tracker::LoadTracker,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
     pub(super) tokenizer: TokenizerSlot,
@@ -327,7 +324,6 @@ impl VllmServicerServer {
                 config.servicer.tokenizer_dir.clone(),
                 config.servicer.warmup_nonce.clone(),
             ),
-            loads: crate::load_tracker::LoadTracker::default(),
             tokenizer: TokenizerSlot::new(),
             media: config.media_processor.map(MediaGate::new),
         });

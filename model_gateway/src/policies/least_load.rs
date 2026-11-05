@@ -817,6 +817,74 @@ mod tests {
         }
     }
 
+    /// A mixed prefill pool, each worker's load read through its own
+    /// engine's `GetLoads` conversion: a measured worker is priced on its
+    /// own rate whichever engine reported it, so the faster one wins with
+    /// four times the queued work; a worker whose conversion carries no
+    /// measurement is priced at the fleet's measured mean, not at the
+    /// configured default (which would hand the pick to its slower peer).
+    #[test]
+    fn a_mixed_fleet_prices_measured_workers_alike_and_unmeasured_ones_at_the_mean() {
+        use smg_grpc_client::{sglang_proto, tokenspeed_proto};
+        let report = |snapshot: SchedulerLoadSnapshot| WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![snapshot],
+            ..Default::default()
+        };
+        let measured_fast = report(SchedulerLoadSnapshot::from(sglang_proto::SchedulerLoad {
+            num_running_reqs: 1,
+            num_waiting_uncached_tokens: 8_000,
+            prefill_throughput: Some(40_000.0),
+            ..Default::default()
+        }));
+        let measured_slow = report(SchedulerLoadSnapshot::from(
+            tokenspeed_proto::SchedulerLoad {
+                num_running_reqs: 1,
+                num_waiting_uncached_tokens: 2_000,
+                prefill_throughput: Some(4_000.0),
+                ..Default::default()
+            },
+        ));
+        let unmeasured = report(SchedulerLoadSnapshot::from(
+            tokenspeed_proto::SchedulerLoad {
+                num_running_reqs: 1,
+                num_waiting_uncached_tokens: 2_000,
+                ..Default::default()
+            },
+        ));
+        for (peer, peer_score, expected) in [
+            (measured_slow, 3_024.0 / 4_000.0, 0),
+            (unmeasured, 3_024.0 / 40_000.0, 1),
+        ] {
+            let policy = LeastLoadPolicy::with_params(0.15, 1024, 1_000.0);
+            let feed = TestFeed::attached_to(&policy);
+            let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2"]
+                .into_iter()
+                .map(|url| {
+                    Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .worker_type(WorkerType::Prefill)
+                            .health_config(no_health_check())
+                            .build(),
+                    ) as Arc<dyn Worker>
+                })
+                .collect();
+            feed.publish(&HashMap::from([
+                (workers[0].url().to_string(), measured_fast.clone()),
+                (workers[1].url().to_string(), peer),
+            ]));
+            let snapshot = policy.snapshot().unwrap();
+            let inflight = HashMap::new();
+            let inputs = policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight);
+            assert_eq!(policy.score(&workers[0], &inputs), 9_024.0 / 40_000.0);
+            assert_eq!(policy.score(&workers[1], &inputs), peer_score);
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(expected)
+            );
+        }
+    }
+
     /// Prefill scores and missing-peer estimates must not track output-token rates.
     #[test]
     fn prefill_ignores_generation_rate() {

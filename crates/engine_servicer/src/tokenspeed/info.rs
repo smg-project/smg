@@ -110,7 +110,10 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape the Python servicer derives from the scheduler's load
-/// replies: pages in use become tokens, running is total minus waiting.
+/// replies (pages in use become tokens, running is total minus waiting), with
+/// the servicer's own bookkeeping ([`crate::load_tracker`]) for the queued
+/// token-work, the prefill and generation throughput and the hit rate this
+/// wire's load tail does not carry, each rank's own.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
@@ -123,25 +126,42 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
         max_total_num_tokens,
         ranks,
         dp_rank,
-        |_, figures| ts::SchedulerLoad {
-            dp_rank: figures.dp_rank,
-            num_running_reqs: figures.running,
-            num_waiting_reqs: figures.waiting,
-            num_total_reqs: figures.total,
-            num_used_tokens: figures.used_tokens,
-            max_total_num_tokens,
-            max_running_requests,
-            token_usage: figures.usage,
-            // The direct TokenSpeed wire reports active pages, excluding
-            // retained cache (unlike the Python legacy GetLoad projection).
-            active_token_usage: Some(figures.usage),
-            ..Default::default()
+        |load, figures| {
+            let estimate = state
+                .shared
+                .loads
+                .estimate(load.dp_rank, load.num_waiting_reqs);
+            ts::SchedulerLoad {
+                dp_rank: figures.dp_rank,
+                num_running_reqs: figures.running,
+                num_waiting_reqs: figures.waiting,
+                num_total_reqs: figures.total,
+                num_used_tokens: figures.used_tokens,
+                max_total_num_tokens,
+                max_running_requests,
+                token_usage: figures.usage,
+                // The direct TokenSpeed wire reports active pages, excluding
+                // retained cache (unlike the Python legacy GetLoad projection).
+                active_token_usage: Some(figures.usage),
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
+                ..Default::default()
+            }
         },
-        |dp_rank| ts::SchedulerLoad {
-            dp_rank,
-            max_running_requests,
-            max_total_num_tokens,
-            ..Default::default()
+        |dp_rank| {
+            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+            ts::SchedulerLoad {
+                dp_rank,
+                max_running_requests,
+                max_total_num_tokens,
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                prefill_throughput: estimate.prefill_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
+                ..Default::default()
+            }
         },
     );
     Ok(ts::GetLoadsResponse {

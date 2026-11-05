@@ -86,6 +86,7 @@ impl From<&trtllm_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &sglang_proto::SchedulerLoad) -> Self {
         Self {
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -141,6 +142,7 @@ impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &tokenspeed_proto::SchedulerLoad) -> Self {
         Self {
+            prefill_throughput: load.prefill_throughput,
             active_token_usage: load.active_token_usage,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
@@ -251,6 +253,42 @@ pub fn core_only(record: &mut common::EngineLoad) {
 mod tests {
     use super::*;
 
+    /// Every engine's poll carries the measured input capacity the same way
+    /// into the record and back to the snapshot, present or absent.
+    #[test]
+    fn every_engine_carries_the_measured_input_capacity_alike() {
+        for rate in [Some(4_321.0), None] {
+            let sglang = sglang_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            let tokenspeed = tokenspeed_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            let vllm = vllm_proto::SchedulerLoad {
+                prefill_throughput: rate,
+                ..Default::default()
+            };
+            for record in [
+                common::EngineLoad::from(&sglang),
+                common::EngineLoad::from(&tokenspeed),
+                common::EngineLoad::from(&vllm),
+            ] {
+                assert_eq!(record.prefill_throughput, rate);
+                assert_eq!(
+                    SchedulerLoadSnapshot::from(&record).prefill_throughput,
+                    rate
+                );
+            }
+            assert_eq!(SchedulerLoadSnapshot::from(sglang).prefill_throughput, rate);
+            assert_eq!(
+                SchedulerLoadSnapshot::from(tokenspeed).prefill_throughput,
+                rate
+            );
+        }
+    }
+
     /// Polling and core-only push records preserve optional input capacity.
     #[test]
     fn prefill_capacity_survives_poll_push_and_core_only_and_clears_when_absent() {
@@ -288,6 +326,7 @@ mod tests {
             utilization: 0.1875,
             max_running_requests: 128,
             num_waiting_uncached_tokens: 0,
+            prefill_throughput: None,
             memory: Some(sglang_proto::MemoryMetrics {
                 weight_gb: 15.0,
                 kv_cache_gb: 40.0,
@@ -358,6 +397,7 @@ mod tests {
             token_usage: 0.25,
             active_token_usage: Some(0.125),
             gen_throughput: 900.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.6,
             utilization: 0.25,
             memory: Some(tokenspeed_proto::MemoryMetrics {
