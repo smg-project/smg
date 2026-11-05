@@ -813,7 +813,9 @@ fn refuse_media(messages: &[ChatMessage]) -> Result<(), Failure> {
                 ContentPart::AudioUrl { .. } => "audio_url",
                 ContentPart::InputAudio { .. } => "input_audio",
                 ContentPart::VideoUrl { .. } => "video_url",
-                ContentPart::Text { .. } | ContentPart::Unknown(_) => continue,
+                ContentPart::Text { .. }
+                | ContentPart::Refusal { .. }
+                | ContentPart::Unknown(_) => continue,
             };
             return Err(Failure::Input(format!(
                 "messages[{index}] has {kind} content; SMG expands media into the model's own \

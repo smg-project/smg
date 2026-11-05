@@ -644,8 +644,10 @@ fn transform_content_field(
                     continue;
                 };
                 match obj.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                    // A refusal part is the turn's text, as the engines' own
+                    // servers render it.
+                    Some(type_name @ ("text" | "refusal")) => {
+                        if let Some(t) = obj.get(type_name).and_then(|t| t.as_str()) {
                             match media_order {
                                 MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
                                 MediaPartOrder::Authored => authored_parts.push(t.to_string()),
@@ -690,17 +692,23 @@ fn transform_content_field(
             // the request's order whatever `media_order` says: the template
             // walks them and writes each anchor where its part sits (a text
             // part before an image renders before it), which is how the
-            // engine's own server hands them to such a template.
+            // engine's own server hands them to such a template. A refusal
+            // part becomes a text part, as that server hands it over.
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
                     part.as_object()
-                        .and_then(|obj| obj.get("type")?.as_str())
-                        .and_then(|type_str| match type_str {
-                            "image_url" => Some(json!({"type": "image"})),
-                            "video_url" => Some(json!({"type": "video"})),
-                            "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
-                            _ => None,
+                        .and_then(|obj| {
+                            let type_str = obj.get("type")?.as_str()?;
+                            match type_str {
+                                "image_url" => Some(json!({"type": "image"})),
+                                "video_url" => Some(json!({"type": "video"})),
+                                "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
+                                "refusal" => {
+                                    Some(json!({"type": "text", "text": obj.get("refusal")?}))
+                                }
+                                _ => None,
+                            }
                         })
                         .unwrap_or_else(|| part.clone())
                 })
@@ -713,14 +721,15 @@ fn transform_content_field(
     Ok(())
 }
 
-/// A popped assistant message's prefill: its string content, or its text parts joined in order.
+/// A popped assistant message's prefill: its string content, or its text
+/// parts (a refusal part among them) joined in order.
 fn prefill_text(content: Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
-                .filter_map(|part| part.get("text")?.as_str())
+                .filter_map(|part| part.get("text").or_else(|| part.get("refusal"))?.as_str())
                 .collect(),
         ),
         _ => None,
