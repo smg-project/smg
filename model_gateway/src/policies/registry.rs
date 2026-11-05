@@ -568,7 +568,7 @@ impl PolicyRegistry {
 
     /// Attach the mesh outbound bridge (thread-safe, can be called after
     /// initialization). Every existing cache-aware policy gets the adapter
-    /// wired in and its `populate_hash_index` flag flipped on (both flip
+    /// wired in and its mesh flag raised (both flip
     /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
@@ -593,7 +593,7 @@ impl PolicyRegistry {
     }
 
     /// Inject the mesh adapter into a policy if it's cache-aware.
-    /// The setter also flips `populate_hash_index` to match adapter
+    /// The setter also flips the policy's mesh flag to match adapter
     /// presence, so callers do not need to touch that flag directly.
     fn maybe_inject_mesh_tree_sync(
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -2536,7 +2536,7 @@ mod tests {
                 "{role} policy missed the load feed"
             );
             assert!(
-                cache_aware.should_populate_hash_index_for_test(),
+                cache_aware.mesh_attached_for_test(),
                 "{role} policy missed the mesh tree bridge"
             );
         }
