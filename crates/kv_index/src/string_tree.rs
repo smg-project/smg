@@ -564,27 +564,37 @@ impl Tree {
     /// route); their orders are chosen so that every interleaving ends with
     /// the request's hash on the node and one entry in the map: a request
     /// inserts its entry, swaps the node's hash and removes the earlier
-    /// entry (`record_hash`); a repair inserts its entry, claims the node
-    /// only if it is still unnamed (a compare-exchange from 0) and takes its
-    /// entry back when the claim loses.
+    /// entry (`record_hash`); a repair that has read the node as unnamed
+    /// claims it through [`Self::claim_unless_named`].
     fn record(&self, node: &NodeRef, naming: Naming) {
         match naming {
             Naming::None => {}
             Naming::Newest(path_hash) => self.record_hash(node, Some(path_hash)),
             Naming::UnlessNamed(path_hash) => {
-                if node.path_hash.load(Ordering::Relaxed) != 0 {
-                    return;
+                if node.path_hash.load(Ordering::Relaxed) == 0 {
+                    self.claim_unless_named(node, path_hash);
                 }
-                self.hashed.insert(path_hash, Arc::downgrade(node));
-                if node
-                    .path_hash
-                    .compare_exchange(0, path_hash, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-                {
-                    self.hashed.remove_if(&path_hash, |_, weak| {
-                        std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
-                    });
-                }
+            }
+        }
+    }
+
+    /// A repair's claim of a node it read as unnamed: insert the entry,
+    /// compare-exchange the node's hash from 0, and take the entry back only
+    /// when the exchange lost to a different hash. A request that named the
+    /// node with this same hash in between wrote this same entry (the request
+    /// path and a repair page hash a node's page-aligned path alike), so the
+    /// entry is the request's as much as the repair's and stays; removing it
+    /// would leave a named node that no lookup reaches until its eviction.
+    fn claim_unless_named(&self, node: &NodeRef, path_hash: u64) {
+        self.hashed.insert(path_hash, Arc::downgrade(node));
+        if let Err(current) =
+            node.path_hash
+                .compare_exchange(0, path_hash, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            if current != path_hash {
+                self.hashed.remove_if(&path_hash, |_, weak| {
+                    std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+                });
             }
         }
     }

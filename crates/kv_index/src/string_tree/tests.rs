@@ -2264,6 +2264,31 @@ fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
 }
 
 #[test]
+fn a_repair_that_loses_the_claim_to_the_same_hash_keeps_the_shared_entry() {
+    // The token tree's interleaving, kept in the twin: the request names the
+    // node (insert, swap 0 -> h), then the repair's claim loses the exchange
+    // to h itself; the shared entry stays. Lost to a different hash, the
+    // repair's entry goes.
+    let tree = Tree::new();
+    let hash = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", hash);
+    let (_, node) = hashed_nodes(&tree)
+        .pop()
+        .expect("the request named the node");
+    tree.claim_unless_named(&node, hash);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+
+    let other = crate::hash_node_path("other text");
+    tree.claim_unless_named(&node, other);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(other, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
 fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
     // A record that crosses its node's detach leaves an entry naming a node
     // that is gone; the next pass that evicts drops it.

@@ -2495,6 +2495,38 @@ fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
 }
 
 #[test]
+fn a_repair_that_loses_the_claim_to_the_same_hash_keeps_the_shared_entry() {
+    // The interleaving: a repair reads the node as unnamed; a request names
+    // it with the same hash (insert, swap 0 -> h); the repair's claim then
+    // loses the exchange to h itself. The entry is the request's as much as
+    // the repair's and must stay, or the node is named and unreachable until
+    // its eviction. The repair's stale read is played by calling the claim
+    // directly after the request's record.
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 2);
+    let hash = crate::hash_token_path(&path);
+    tree.insert_tokens_with_hash(&path, "t1", hash);
+    let (_, node) = hashed_nodes(&tree)
+        .pop()
+        .expect("the request named the node");
+    tree.claim_unless_named(&node, hash);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(
+        tree.insert_tenant_by_hash(hash, "t2"),
+        "a peer's delta still finds the node"
+    );
+    assert_hashes_name_live_nodes(&tree);
+
+    // Lost to a different hash: the repair's entry is the stray one and goes.
+    let other = crate::hash_token_path(&make_tokens(5_000, 2));
+    tree.claim_unless_named(&node, other);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(other, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
 fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
     // A record that crosses its node's detach leaves an entry naming a node
     // that is gone; the next pass that evicts drops it.
