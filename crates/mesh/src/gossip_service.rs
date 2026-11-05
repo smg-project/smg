@@ -61,6 +61,7 @@ use super::{
     transport::{
         limits::MAX_MESSAGE_SIZE,
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
+        sync_stream::build_heartbeat,
     },
 };
 
@@ -421,13 +422,23 @@ impl Gossip for GossipService {
                 )
                 .await;
                 match frame {
+                    // The dialer names itself with a heartbeat; answering it
+                    // is the acceptor's part, once per heartbeat received.
+                    Frame::Heartbeat => {
+                        if tx
+                            .send(Ok(build_heartbeat(sequence, &self_name)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Frame::Continue | Frame::Ack { success: None, .. } => {}
                     Frame::Ack {
                         success: Some(success),
                         ..
                     } => record_ack(&peer_id, success),
                     Frame::Nack { .. } => record_nack(&peer_id),
-                    Frame::Closed => break,
                 }
             }
 

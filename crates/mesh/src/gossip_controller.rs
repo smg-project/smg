@@ -61,7 +61,7 @@ use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
     transport::{
-        limits::MAX_MESSAGE_SIZE,
+        limits::{MAX_MESSAGE_SIZE, STREAM_HEARTBEAT_INTERVAL},
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
         sync_stream::build_heartbeat,
     },
@@ -566,6 +566,9 @@ impl GossipController {
                 // The periodic sender: the shared round every second, with
                 // this end's round metrics around it. The peer is known from
                 // the start, so every round can carry its targeted entries.
+                // It also sends a heartbeat every
+                // `STREAM_HEARTBEAT_INTERVAL`, which the acceptor answers, so
+                // an idle stream is not closed by either end's idle timeout.
                 let incremental_sender_handle = {
                     let tx_incremental = tx.clone();
                     let self_name_incremental = self_name.clone();
@@ -578,9 +581,21 @@ impl GossipController {
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
                         let mut sender = SenderState::default();
+                        let mut last_heartbeat = tokio::time::Instant::now();
 
                         loop {
                             interval.tick().await;
+
+                            if last_heartbeat.elapsed() >= STREAM_HEARTBEAT_INTERVAL {
+                                last_heartbeat = tokio::time::Instant::now();
+                                let heartbeat = build_heartbeat(
+                                    shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                    &self_name_incremental,
+                                );
+                                if tx_incremental.send(heartbeat).await.is_err() {
+                                    return;
+                                }
+                            }
 
                             let round_start = Instant::now();
                             let stream_batch = stream_batch_handle.read().clone();
@@ -631,14 +646,13 @@ impl GossipController {
                     )
                     .await;
                     match frame {
-                        Frame::Continue => {}
+                        Frame::Continue | Frame::Heartbeat => {}
                         Frame::Ack { sequence, .. } => {
                             log::trace!("Received ACK from {} (seq: {})", peer_name, sequence);
                         }
                         Frame::Nack { sequence } => {
                             log::warn!("Received NACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Frame::Closed => break,
                     }
                 }
 
@@ -1114,3 +1128,7 @@ mod dial_tests {
         assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/heartbeat_integration.rs"]
+mod heartbeat_tests;
