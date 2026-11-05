@@ -430,8 +430,11 @@ pub(crate) async fn broadcast_node_states(
             let state_sync = StateSync {
                 nodes: nodes_for_task,
             };
+            // A broadcast carries verdicts, not the sender's table: no
+            // sender to re-admit on it.
             let ping_payload = gossip_message::Payload::Ping(Ping {
                 state_sync: Some(state_sync),
+                sender: String::new(),
             });
             match dialer.ping(&target_node_clone, Some(ping_payload)).await {
                 Ok(_) => {
@@ -593,6 +596,7 @@ mod tests {
                 },
                 Some(gossip_message::Payload::Ping(Ping {
                     state_sync: Some(StateSync { nodes: vec![] }),
+                    sender: String::new(),
                 })),
             )
             .await
@@ -774,6 +778,7 @@ mod tests {
                 },
                 Some(gossip_message::Payload::Ping(Ping {
                     state_sync: Some(StateSync { nodes: vec![] }),
+                    sender: String::new(),
                 })),
             )
             .await
@@ -1015,7 +1020,10 @@ mod tests {
             .unwrap()
             .connect_timeout(Duration::from_secs(5));
         let ping = GossipMessage {
-            payload: Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+            payload: Some(gossip_message::Payload::Ping(Ping {
+                state_sync: None,
+                sender: String::new(),
+            })),
         };
         let refused = match endpoint.connect().await {
             Err(_) => true,
@@ -1043,7 +1051,10 @@ mod tests {
         let result = Dialer::new(Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))))
             .ping(
                 &node_state("A", addr_a),
-                Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+                Some(gossip_message::Payload::Ping(Ping {
+                    state_sync: None,
+                    sender: String::new(),
+                })),
             )
             .await;
 
@@ -1067,6 +1078,7 @@ mod tests {
     fn probe() -> gossip_message::Payload {
         gossip_message::Payload::Ping(Ping {
             state_sync: Some(StateSync { nodes: vec![] }),
+            sender: String::new(),
         })
     }
 
@@ -1111,6 +1123,149 @@ mod tests {
         );
         handler_a.shutdown();
         handler_b.shutdown();
+    }
+
+    /// The status and version a member's table holds for `name`.
+    fn held(handler: &MeshServerHandler, name: &str) -> Option<(i32, u64)> {
+        handler
+            .state
+            .read()
+            .get(name)
+            .map(|node| (node.status, node.version))
+    }
+
+    /// Two members in the clear, B joined through A, both tables full.
+    async fn pair() -> (SocketAddr, MeshServerHandler, SocketAddr, MeshServerHandler) {
+        let (listener_a, addr_a) = bind_node().await;
+        let handler_a = mesh_run!("A", listener_a, addr_a, None);
+        let (listener_b, addr_b) = bind_node().await;
+        let handler_b = mesh_run!("B", listener_b, addr_b, Some(addr_a));
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "the pair forms",
+        )
+        .await;
+        (addr_a, handler_a, addr_b, handler_b)
+    }
+
+    /// A member whose answer to one probe came late is `Suspected` on its
+    /// prober. Before, the suspect merged that verdict into its own entry
+    /// and answered `Suspected` from then on, and no answer was ever written
+    /// back `Alive`: one late answer stuck for good. Now the suspect refutes
+    /// the verdict it reads in the next probe's table (`Alive`, one version
+    /// above it) and the prober writes the `Alive` answer above the verdict
+    /// as well, so both tables agree within a round.
+    #[tokio::test]
+    async fn a_member_refutes_a_stale_suspicion_and_its_prober_follows() {
+        init();
+        let (_addr_a, handler_a, _addr_b, handler_b) = pair().await;
+
+        // B's verdict after a failed probe round, as the failure path writes
+        // it: Suspected, one version up.
+        let verdict = {
+            let mut state = handler_b.state.write();
+            let a = state.get_mut("A").expect("B holds A");
+            a.status = NodeStatus::Suspected as i32;
+            a.version += 1;
+            a.version
+        };
+        let alive_again = Some((NodeStatus::Alive as i32, verdict + 1));
+        wait_for(
+            || held(&handler_b, "A") == alive_again && held(&handler_a, "A") == alive_again,
+            Duration::from_secs(20),
+            "A refutes the suspicion one version above it and B follows",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// A member held `Down` is never probed again, so before, a static mesh
+    /// never healed it: its own probes carried its entry at a version the
+    /// verdict beat, and the verdict stood for good. Now a probe names its
+    /// sender, and a member that speaks is alive again on the member it
+    /// probes, above the verdict; the member counts on from there.
+    #[tokio::test]
+    async fn a_member_held_down_is_alive_again_on_a_peer_it_probes() {
+        init();
+        let (_addr_a, handler_a, _addr_b, handler_b) = pair().await;
+
+        let verdict = {
+            let mut state = handler_b.state.write();
+            let a = state.get_mut("A").expect("B holds A");
+            a.status = NodeStatus::Down as i32;
+            a.version += 2;
+            a.version
+        };
+        let alive_again = Some((NodeStatus::Alive as i32, verdict + 1));
+        wait_for(
+            || held(&handler_b, "A") == alive_again,
+            Duration::from_secs(20),
+            "A's probe makes it alive again on B, above the verdict",
+        )
+        .await;
+        wait_for(
+            || held(&handler_a, "A") == alive_again,
+            Duration::from_secs(20),
+            "A counts on from the version B holds it at",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// A member that stopped cleanly is `Leaving` on its peers; before, for
+    /// good: it was never probed again, and back under its name it began at
+    /// version 1, below the `Leaving` entry, so its keys were dead on arrival
+    /// everywhere. Now its first probe of a peer makes it alive again there,
+    /// and the peer probes it from then on.
+    #[tokio::test]
+    async fn a_member_back_under_its_name_after_a_clean_stop_rejoins() {
+        init();
+        let (addr_a, handler_a, addr_b, handler_b) = pair().await;
+
+        handler_a.graceful_shutdown().await.unwrap();
+        wait_for(
+            || {
+                held(&handler_b, "A")
+                    .is_some_and(|(status, _)| status == NodeStatus::Leaving as i32)
+            },
+            Duration::from_secs(10),
+            "B holds A Leaving",
+        )
+        .await;
+        let (_, left_at) = held(&handler_b, "A").expect("B holds A");
+
+        // A's second life on its address, joining through B.
+        let listener_a = rebind(addr_a).await;
+        let handler_a = mesh_run!("A", listener_a, addr_a, Some(addr_b));
+        wait_for(
+            || {
+                held(&handler_b, "A") == Some((NodeStatus::Alive as i32, left_at + 1))
+                    && handler_a.state.read().len() == 2
+            },
+            Duration::from_secs(20),
+            "the returned member is alive again on its peer and holds it",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// `addr` bound again once the life that held it is gone.
+    async fn rebind(addr: SocketAddr) -> TcpListener {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    log::debug!("the address is still held: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("the address was never released: {e}"),
+            }
+        }
     }
 
     /// A member that goes away and comes back on its address answers a later

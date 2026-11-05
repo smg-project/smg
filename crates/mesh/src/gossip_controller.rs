@@ -359,6 +359,7 @@ impl GossipController {
                 &peer,
                 Some(gossip_message::Payload::Ping(Ping {
                     state_sync: Some(state_sync),
+                    sender: self.self_name.clone(),
                 })),
             )
             .await
@@ -374,6 +375,20 @@ impl GossipController {
                         let entry = s
                             .entry(node_update.name.clone())
                             .and_modify(|e| {
+                                // The answer is the member's own word. A
+                                // member held Suspected, Down or Leaving that
+                                // answers Alive is written above the version
+                                // of that verdict, so the next merge of the
+                                // verdict loses to it; the member refutes it
+                                // on its side at the same version (it read
+                                // the verdict in this probe's table), so the
+                                // two agree. An unversioned write here lost
+                                // to the verdict's next arrival.
+                                if node_update.status == NodeStatus::Alive as i32
+                                    && e.status != NodeStatus::Alive as i32
+                                {
+                                    e.version += 1;
+                                }
                                 e.status = node_update.status;
                                 e.address.clone_from(&node_update.address);
                             })
