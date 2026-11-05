@@ -1780,6 +1780,75 @@ fn a_thread_whose_packed_table_outgrew_its_share_remakes_it_at_its_next_encode()
     );
 }
 
+/// A thread's map of the 16-to-64-byte pieces grown for an earlier share
+/// keeps its buckets through a clear at the bound (the map's own clear
+/// keeps the allocation); once the share fell below half its capacity
+/// (threads joined) the thread's next encode call makes the map anew for
+/// the share, entries within it or not.
+#[test]
+fn a_thread_whose_map_outgrew_its_share_remakes_it_at_its_next_encode() {
+    let mut state = 0xCAFE_F00D_BEEF_DEADu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let capacity = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().map_capacity())
+            .sum()
+    };
+    let entries = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().short_entries())
+            .sum()
+    };
+    // Pieces of 21 bytes (a space and twenty letters): the map tier.
+    let head: String = (0..200).map(|i| format!(" {}", letters(20, i))).collect();
+    let text: String = (0..20_000)
+        .map(|i| format!(" {}", letters(20, i)))
+        .collect();
+    let before = native
+        .encode_with(Some(model), &head, false, false)
+        .expect("ids");
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(entries(&mut native) >= 20_000);
+    let grown = capacity(&mut native);
+    assert!(grown >= 20_000, "{grown}");
+    // Threads join: the share falls below the entries; the clear at the
+    // start of the next call keeps the buckets, which still serve the share.
+    native.threads.store(256, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(grown <= 2 * share, "{grown} for a share of {share}");
+    assert_eq!(
+        native
+            .encode_with(Some(model), &head, false, false)
+            .expect("ids"),
+        before
+    );
+    assert!(entries(&mut native) <= share);
+    assert_eq!(capacity(&mut native), grown);
+    // More threads join: the entries are within the new share, the buckets
+    // are more than twice it; the next call makes the map anew for the share.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(entries(&mut native) <= share, "{share}");
+    assert!(grown > 2 * share, "{grown} for a share of {share}");
+    assert_eq!(
+        native
+            .encode_with(Some(model), &head, false, false)
+            .expect("ids"),
+        before
+    );
+    let kept = capacity(&mut native);
+    assert!(kept <= 2 * share, "{kept} for a share of {share}");
+}
+
 /// `len` letters, distinct for distinct `i`: one piece of `len` bytes
 /// under the byte-level split (letters only, no space). The padding is
 /// a letter `word` never uses, so no two differ only in where it starts.
