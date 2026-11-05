@@ -1147,6 +1147,42 @@ fn byte_level_stream_end_releases_the_bytes_it_holds() {
     assert_eq!(finish, "\u{FFFD}");
 }
 
+/// A seeded byte-level sequence: the seed is prompt text, so a sequence that
+/// generated nothing releases nothing at its end even when the seed ends
+/// inside a character; a generated token that completes the seed's character
+/// streams it, as before, and the end releases what the generated tokens
+/// left held.
+#[test]
+fn byte_level_seeded_sequence_does_not_reemit_prompt() {
+    use crate::byte_level::tests::byte_level_tokenizer;
+    let hf = byte_level_tokenizer();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(hf.clone()));
+    let id = |token: &str| hf.token_to_id(token).expect(token);
+    let (hello, space_lead, c3, a9) = (id("hello"), id("Ġà"), id("Ã"), id("©"));
+    for seed in [
+        vec![hello],
+        vec![hello, space_lead],
+        vec![c3],
+        vec![hello, c3],
+    ] {
+        for skip in [false, true] {
+            let mut unchanged =
+                crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), skip);
+            assert_eq!(unchanged.finish().unwrap(), "", "seed {seed:?} skip={skip}");
+        }
+    }
+    // The seed's lead byte and a generated continuation byte make one character.
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![c3], false);
+    assert_eq!(sequence.append_token(a9).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
+    // A generated token that leaves bytes held: the end releases those.
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer, vec![hello], false);
+    assert_eq!(sequence.append_token(hello).unwrap(), "hello");
+    assert_eq!(sequence.append_token(a9).unwrap(), "");
+    assert_eq!(sequence.finish().unwrap(), "\u{FFFD}");
+}
+
 /// Random id lists through the public `Sequence` API with its finish: the
 /// whole stream is the full decode, whatever the last token leaves held.
 #[test]
