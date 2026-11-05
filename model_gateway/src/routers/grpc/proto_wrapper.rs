@@ -974,6 +974,13 @@ pub struct TrackedStream {
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
     replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
+    /// When the request was dispatched, for a stream booked at its dispatch
+    /// (see [`DispatchBooking::book_at`]): the one instant the dispatch read,
+    /// shared with its deadline and its prefill booking, and the origin of
+    /// the generation's duration ([`ProtoStream::dispatched_at`]). A side of
+    /// a disaggregated dispatch carries none: its timing rides with the
+    /// dispatch.
+    dispatched_at: Option<Instant>,
 }
 
 /// What [`ProtoStream::first_response_within`] found as the stream's first
@@ -1071,8 +1078,19 @@ impl PrefillTicket {
         prompt_tokens: u64,
         timed: bool,
     ) -> Option<Self> {
+        Self::book_as_at(worker, prompt_tokens, timed, liveness::now_ms())
+    }
+
+    /// [`Self::book_as`] at `now_ms` on the gateway clock (`liveness::now_ms`):
+    /// the dispatch's one stamp, shared with its deadline.
+    pub(crate) fn book_as_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+        now_ms: u64,
+    ) -> Option<Self> {
         (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, timed);
+            worker.note_prefill_started_at(prompt_tokens, timed, now_ms);
             Self {
                 worker: Arc::clone(worker),
                 tokens: prompt_tokens,
@@ -1082,13 +1100,14 @@ impl PrefillTicket {
         })
     }
 
-    /// The first response came back, reporting `cached` prompt tokens served
-    /// from the engine's prefix cache.
-    fn first_response(&mut self, cached: u64) {
+    /// The first response came back at `now_ms` on the gateway clock (the
+    /// stamp its reader took for the message), reporting `cached` prompt
+    /// tokens served from the engine's prefix cache.
+    fn first_response_at(&mut self, cached: u64, now_ms: u64) {
         if !self.released {
             self.released = true;
             self.worker
-                .note_prefill_ended(self.tokens, self.timed, Some(cached));
+                .note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms);
         }
     }
 }
@@ -1111,10 +1130,25 @@ impl Drop for PrefillTicket {
 pub(crate) struct DispatchBooking {
     prefill: Option<PrefillTicket>,
     progress: Option<ProgressTicket>,
+    /// When the request was dispatched: the booking's stamp, handed on to
+    /// the stream (see [`TrackedStream::dispatched_at`]).
+    dispatched_at: Instant,
 }
 
 impl DispatchBooking {
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        Self::book_at(worker, prompt_tokens, streaming, Instant::now())
+    }
+
+    /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
+    /// instant the dispatch read, which its deadline runs from too, stamps
+    /// the prefill booking and rides with the stream.
+    pub(crate) fn book_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        streaming: bool,
+        dispatched_at: Instant,
+    ) -> Self {
         let progress = streaming.then(|| {
             worker.note_tracked_started();
             ProgressTicket {
@@ -1122,8 +1156,14 @@ impl DispatchBooking {
             }
         });
         Self {
-            prefill: PrefillTicket::book_as(worker, prompt_tokens, streaming),
+            prefill: PrefillTicket::book_as_at(
+                worker,
+                prompt_tokens,
+                streaming,
+                liveness::ms_at(dispatched_at),
+            ),
             progress,
+            dispatched_at,
         }
     }
 }
@@ -1517,6 +1557,26 @@ mod tracked_tests {
         drop(booking);
         assert_eq!(books(&worker), none);
     }
+
+    #[test]
+    fn a_stream_booked_at_its_dispatch_carries_the_dispatch_instant() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let dispatched_at = std::time::Instant::now();
+        let booking = DispatchBooking::book_at(&worker, 4_096, true, dispatched_at);
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_booked(Arc::clone(&worker), booking);
+        assert_eq!(stream.dispatched_at(), Some(dispatched_at));
+        // The instant rides along when the stream is wrapped again.
+        assert_eq!(
+            stream.defer_abort_until_first_item().dispatched_at(),
+            Some(dispatched_at)
+        );
+        // A side of a disaggregated dispatch carries none: its timing rides
+        // with the dispatch.
+        let side = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_side(Arc::clone(&worker), 4_096);
+        assert_eq!(side.dispatched_at(), None);
+    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -1564,7 +1624,11 @@ impl ProtoStream {
     /// response, and the request has been in the pile since the dispatch.
     #[must_use]
     pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
-        let DispatchBooking { prefill, progress } = booking;
+        let DispatchBooking {
+            prefill,
+            progress,
+            dispatched_at,
+        } = booking;
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
@@ -1573,6 +1637,7 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
+            dispatched_at: Some(dispatched_at),
         }))
     }
 
@@ -1607,6 +1672,7 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
+            dispatched_at: None,
         }))
     }
 
@@ -1692,6 +1758,21 @@ impl ProtoStream {
             Self::DecodeSide(side) => side.inner.worker(),
             Self::Ahead(ahead) => ahead.inner.worker(),
             Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::worker),
+            _ => None,
+        }
+    }
+
+    /// When the request was dispatched, for a stream booked at its dispatch
+    /// (see [`DispatchBooking::book_at`]): the origin of the generation's
+    /// duration, read once at the dispatch. `None` for a stream that was not
+    /// (a side of a disaggregated dispatch, whose timing rides with the
+    /// dispatch; a transport stream on its own).
+    pub fn dispatched_at(&self) -> Option<Instant> {
+        match self {
+            Self::Tracked(tracked) => tracked
+                .dispatched_at
+                .or_else(|| tracked.inner.dispatched_at()),
+            Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::dispatched_at),
             _ => None,
         }
     }
@@ -1841,7 +1922,10 @@ impl ProtoStream {
         };
         match &item {
             Some(Ok(response)) => {
-                liveness::on_token_progress(&tracked.worker);
+                // One stamp for the message: the worker's progress note and,
+                // on the first response, the end of the prompt's prefill.
+                let now_ms = liveness::now_ms();
+                liveness::on_token_progress_at(&tracked.worker, now_ms);
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }
@@ -1849,7 +1933,7 @@ impl ProtoStream {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
                 if let Some(ticket) = tracked.prefill.as_mut() {
-                    ticket.first_response(u64::from(response.cached_tokens()));
+                    ticket.first_response_at(u64::from(response.cached_tokens()), now_ms);
                 }
                 tracked.prefill = None;
             }
@@ -1995,6 +2079,7 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
+                    dispatched_at,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_until_first_item(),
@@ -2004,6 +2089,7 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
+                    dispatched_at,
                 }))
             }
             Self::DecodeSide(side) => {

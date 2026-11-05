@@ -22,7 +22,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{body::Body, extract::Request, http::StatusCode, response::Response};
@@ -33,6 +33,7 @@ use tokio::time::Sleep;
 use tower::{Layer, Service};
 use tracing::warn;
 
+use super::request_start::RequestStarted;
 use crate::{config::types::RouterConfig, routers::error::create_error};
 
 /// Error code of a body whose client made no progress for the stall timeout.
@@ -84,8 +85,17 @@ impl RequestBodyTimeouts {
 /// is written to.
 fn timed(request: Request<Body>, timeouts: RequestBodyTimeouts) -> (Request<Body>, Arc<AtomicU8>) {
     let outcome = Arc::new(AtomicU8::new(READING));
-    let request =
-        request.map(|body| Body::new(TimedBody::new(body, timeouts, Arc::clone(&outcome))));
+    // The request timeout counts from the edge's entry stamp when the request
+    // carries one (see `request_start`): the same bound, no clock read here.
+    let started = RequestStarted::of(request.extensions());
+    let request = request.map(|body| {
+        Body::new(TimedBody::new(
+            body,
+            timeouts,
+            Arc::clone(&outcome),
+            started,
+        ))
+    });
     (request, outcome)
 }
 
@@ -232,12 +242,25 @@ struct TimedBody {
 }
 
 impl TimedBody {
-    fn new(inner: Body, timeouts: RequestBodyTimeouts, outcome: Arc<AtomicU8>) -> Self {
+    fn new(
+        inner: Body,
+        timeouts: RequestBodyTimeouts,
+        outcome: Arc<AtomicU8>,
+        started: Option<Instant>,
+    ) -> Self {
+        // The deadline from the request's entry stamp when it has one, else
+        // from now; a total the clock cannot add never passes.
+        let deadline = started
+            .and_then(|started| tokio::time::Instant::from_std(started).checked_add(timeouts.total))
+            .map_or_else(
+                || tokio::time::sleep(timeouts.total),
+                tokio::time::sleep_until,
+            );
         Self {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
-            deadline: Box::pin(tokio::time::sleep(timeouts.total)),
+            deadline: Box::pin(deadline),
             outcome,
             ended: false,
         }
@@ -402,6 +425,28 @@ mod tests {
         assert!(
             waited >= Duration::from_secs(20) && waited < Duration::from_secs(22),
             "ended after {waited:?}, expected the 20 s request timeout"
+        );
+    }
+
+    /// The request timeout runs from the edge's entry stamp when the request
+    /// carries one: a body whose request was taken in 15 s ago has 5 s of a
+    /// 20 s timeout left.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_timeout_runs_from_the_edge_s_entry_stamp() {
+        let started = Instant::now();
+        let earlier = started
+            .into_std()
+            .checked_sub(Duration::from_secs(15))
+            .expect("the clock has been running for fifteen seconds");
+        let mut request = echo(trickle(usize::MAX, Duration::from_secs(1)));
+        request.extensions_mut().insert(RequestStarted::at(earlier));
+        let response = app(timeouts(5, 20)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(error_code(response).await, REQUEST_BODY_TIMEOUT);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(5) && waited < Duration::from_secs(7),
+            "ended after {waited:?}, expected the 5 s left of the 20 s request timeout"
         );
     }
 

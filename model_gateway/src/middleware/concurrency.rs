@@ -184,7 +184,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
         // Rate limiting disabled: the route's own future, untouched.
         let Some(token_bucket) = &self.app_state.context.rate_limiter else {
             return ConcurrencyLimitFuture::Through {
@@ -194,8 +194,9 @@ where
         if let Ok(permit) = TokenPermit::try_acquire(Arc::clone(token_bucket), 1.0) {
             debug!("Acquired token immediately");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-            // The bound ahead of worker selection counts from here.
-            restamp_accepted_at(request.extensions_mut());
+            // Granted at once: the bound ahead of worker selection counts from
+            // the acceptance already stamped on the request (no wait in the
+            // queue to leave out, no second clock read).
             return ConcurrencyLimitFuture::Admitted {
                 inner: self.inner.call(request),
                 permit: Some(permit),

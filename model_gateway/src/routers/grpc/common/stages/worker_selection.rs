@@ -3104,6 +3104,7 @@ mod tests {
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
+            created: 0,
             headers: None,
             rate_limit_cell: None,
             routing: RoutingSnapshot {

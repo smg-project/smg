@@ -738,7 +738,11 @@ impl WorkerRuntime {
     }
 
     pub fn note_token_progress(&self) {
-        let now = super::liveness::now_ms();
+        self.note_token_progress_at(super::liveness::now_ms());
+    }
+
+    /// [`Self::note_token_progress`] at `now` on the gateway clock.
+    pub fn note_token_progress_at(&self, now: u64) {
         // The stamps are millisecond stamps and the wake keeps one permit, so
         // a token within the millisecond of the previous one has nothing to
         // record: it leaves with one plain load. Every stream of the worker

@@ -631,6 +631,7 @@ impl RequestPipeline {
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            dctx.created,
         ));
 
         execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;

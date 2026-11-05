@@ -357,12 +357,18 @@ pub(crate) async fn execute_plan(
     );
 
     // The deadline runs from here: the admission wait above is the gateway's
-    // own queueing, bounded by its own setting, not time the worker had.
-    let deadline = request_timeout.map(RequestDeadline::after);
+    // own queueing, bounded by its own setting, not time the worker had. The
+    // instant is read once: the single dispatch's booking and its stream's
+    // generation duration run from the same one.
+    let dispatched_at = tokio::time::Instant::now();
+    let deadline =
+        request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
     let dispatch = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
+                }
                 ProtoRequest::Embed(req) => {
                     execute_single_embed(req, clients, workers, ledger).await
                 }
@@ -396,6 +402,7 @@ pub(crate) async fn execute_plan(
                     model,
                     prefill_guard,
                     ledger,
+                    dispatched_at.into_std(),
                 )
                 .await
             }
@@ -754,6 +761,7 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,
@@ -762,6 +770,7 @@ async fn execute_batch_dispatch(
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
+    dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -782,7 +791,7 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger).await
+                        execute_single(request, &mut clients, workers, ledger, dispatched_at).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
@@ -810,6 +819,7 @@ async fn execute_single(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_or_mismatch("execute_single")?;
 
@@ -831,6 +841,7 @@ async fn execute_single(
         worker,
         prompt_tokens,
         streaming,
+        dispatched_at,
     )
     .await;
     if let Some(status) = result.breaker_status() {
@@ -874,11 +885,12 @@ async fn dispatch_single_booked(
     worker: Option<&Arc<dyn Worker>>,
     prompt_tokens: u64,
     streaming: bool,
+    dispatched_at: Instant,
 ) -> StreamResult {
     let Some(worker) = worker else {
         return call.await;
     };
-    let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
+    let booking = DispatchBooking::book_at(worker, prompt_tokens, streaming, dispatched_at);
     let stream = call.await?;
     Ok(stream.tracked_booked(Arc::clone(worker), booking))
 }
@@ -5295,9 +5307,10 @@ mod tests {
                     )))
                 }
             };
-            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming)
-                .await
-                .expect("the call answered");
+            let stream =
+                dispatch_single_booked(call, Some(&worker), 4_096, streaming, Instant::now())
+                    .await
+                    .expect("the call answered");
             assert_eq!(
                 seen.lock().unwrap().take(),
                 Some((pending, pile)),
@@ -5316,6 +5329,7 @@ mod tests {
             Some(&worker),
             4_096,
             true,
+            Instant::now(),
         )
         .await;
         assert!(failed.is_err(), "the call's failure is the dispatch's");

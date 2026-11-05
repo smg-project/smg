@@ -4,6 +4,11 @@
 
 use crate::{chat::*, common::Usage};
 
+/// The wall clock as a `created` stamp, for a builder nobody gave one.
+pub(super) fn now_unix_seconds() -> u64 {
+    chrono::Utc::now().timestamp() as u64
+}
+
 /// Builder for ChatCompletionResponse
 ///
 /// Provides a fluent interface for constructing chat completion responses with sensible defaults.
@@ -12,7 +17,9 @@ use crate::{chat::*, common::Usage};
 pub struct ChatCompletionResponseBuilder {
     id: String,
     object: String,
-    created: u64,
+    /// `None` until set: the wall clock is read at `build()` then, not for
+    /// a caller that sets the request's own stamp.
+    created: Option<u64>,
     model: String,
     choices: Vec<ChatChoice>,
     usage: Option<Usage>,
@@ -30,7 +37,7 @@ impl ChatCompletionResponseBuilder {
         Self {
             id: id.into(),
             object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
+            created: None,
             model: model.into(),
             choices: Vec::new(),
             usage: None,
@@ -53,9 +60,9 @@ impl ChatCompletionResponseBuilder {
         self
     }
 
-    /// Set the creation timestamp (default: current time)
+    /// Set the creation timestamp (default: the time of `build()`)
     pub fn created(mut self, timestamp: u64) -> Self {
-        self.created = timestamp;
+        self.created = Some(timestamp);
         self
     }
 
@@ -104,7 +111,7 @@ impl ChatCompletionResponseBuilder {
         ChatCompletionResponse {
             id: self.id,
             object: self.object,
-            created: self.created,
+            created: self.created.unwrap_or_else(now_unix_seconds),
             model: self.model,
             choices: self.choices,
             usage: self.usage,
@@ -237,6 +244,19 @@ mod tests {
     /// to report: `message.refusal`, `message.content`, `choices[].logprobs`,
     /// `service_tier` and the two usage detail objects with all their
     /// counters. Typed clients read them without a presence check.
+    /// `created` is the time of the build unless the caller set the
+    /// request's own stamp: the clock is read only when nobody did.
+    #[test]
+    fn created_is_the_build_time_unless_set() {
+        let before = now_unix_seconds();
+        let built = ChatCompletionResponseBuilder::new("chatcmpl_1", "m").build();
+        assert!((before..=now_unix_seconds()).contains(&built.created));
+        let set = ChatCompletionResponseBuilder::new("chatcmpl_1", "m")
+            .created(1_700_000_000)
+            .build();
+        assert_eq!(set.created, 1_700_000_000);
+    }
+
     #[test]
     fn completion_object_carries_the_always_present_fields() {
         let response = ChatCompletionResponse::builder("chatcmpl_1", "m")

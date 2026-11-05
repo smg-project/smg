@@ -112,6 +112,38 @@ fn middleware_id_is_base_with_per_execution_suffix() {
     assert_ne!(first, second);
 }
 
+/// The suffix a request's engine id gets is stamped at the request's own
+/// time (its charge id's: the one wall-clock read the edge made for it), not
+/// at a read of its own; a request without meta reads the clock.
+#[test]
+fn the_engine_id_suffix_is_stamped_at_the_requests_time() {
+    let request_type = chat_request_type(None);
+    let mut meta = meta_with_request_id("chatcmpl-mw");
+    meta.request_charge_id = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        1_700_000_000,
+        0,
+    ));
+    assert_eq!(request_wall_clock(Some(&meta)), (1_700_000_000, 0));
+
+    let (id, _) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
+    let suffix = id
+        .strip_prefix("chatcmpl-mw-")
+        .expect("the middleware id and a suffix");
+    let stamp = uuid::Uuid::parse_str(suffix)
+        .expect("a uuid suffix")
+        .get_timestamp()
+        .expect("a version-7 uuid carries its time");
+    assert_eq!(stamp.to_unix().0, 1_700_000_000);
+
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (seconds, _) = request_wall_clock(None);
+    assert!((before..=before + 1).contains(&seconds));
+}
+
 #[test]
 fn falls_back_to_prefixed_mint_without_rid_or_middleware_id() {
     let request_type = chat_request_type(None);
