@@ -222,11 +222,12 @@ fn the_configured_frame_the_file_lacks_goes_around_the_backend_s_ids() {
 }
 
 /// A tokenizer the backend serves builds its vocabulary, its added tokens
-/// and its per-stream tables from the file; one built in memory builds
-/// them from the pipeline. Over every id, with and without special tokens,
-/// the two stream and decode the same text and answer the same lookups.
+/// and its per-stream tables from the pipeline the load read the file
+/// into, then lets the pipeline go; one built in memory keeps it. Over
+/// every id, with and without special tokens, the two stream and decode
+/// the same text and answer the same lookups.
 #[test]
-fn the_file_built_tables_stream_what_the_pipeline_built_ones_stream() {
+fn a_tokenizer_the_backend_serves_streams_what_one_built_in_memory_streams() {
     // `fastokens` reads a vocabulary whose ids are contiguous, as every
     // checkpoint's are; the byte-fallback fixture's stand in for a 32k
     // vocabulary's, so they are renumbered in rank order here.

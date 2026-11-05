@@ -28,7 +28,7 @@ use tokenizers::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    added_tokens::AddedTokens,
+    added_tokens::{self, AddedToken as AddedTokenEntry, AddedTokens},
     byte_fallback::PieceTable,
     byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
@@ -40,7 +40,7 @@ use crate::{
         deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
         PromptSegment, RendererProfile, TemplateAnswers,
     },
-    file::{self, AddedToken as FileAddedToken, TokenizerFile},
+    pre_tokenizer::anchored_split_pattern,
     traits::{
         ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
         PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
@@ -121,7 +121,7 @@ pub struct HuggingFaceTokenizer {
     byte_fallback_values: Vec<Option<u8>>,
     /// The added tokens with the flags that place them in the pipeline (the
     /// cache's split rules read them, see [`TokenizerTrait::added_token_strings`]).
-    added_tokens: Vec<FileAddedToken>,
+    added_tokens: Vec<AddedTokenEntry>,
     /// The ids of the added tokens marked special: what `skip_special_tokens`
     /// strips.
     special_ids: HashSet<TokenIdType>,
@@ -140,11 +140,11 @@ fn pipeline_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Vec<String> 
 
 /// The added tokens of a built pipeline, in id order (the file's own, or the
 /// tokens as a load that changed them beyond the file left them).
-fn pipeline_added_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Vec<FileAddedToken> {
-    let mut tokens: Vec<FileAddedToken> = tokenizer
+fn pipeline_added_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Vec<AddedTokenEntry> {
+    let mut tokens: Vec<AddedTokenEntry> = tokenizer
         .get_added_tokens_decoder()
         .iter()
-        .map(|(&id, token)| FileAddedToken {
+        .map(|(&id, token)| AddedTokenEntry {
             id,
             content: token.content.clone(),
             special: token.special,
@@ -333,7 +333,7 @@ impl EncoderCore {
     fn new(
         engine: Engine,
         vocab: Arc<HashMap<String, TokenIdType>>,
-        added_tokens: &[FileAddedToken],
+        added_tokens: &[AddedTokenEntry],
     ) -> Self {
         Self {
             engine,
@@ -729,25 +729,21 @@ impl HuggingFaceTokenizer {
 
     /// Adds the tokens `tokenizer_config.json` names beyond the file's
     /// (`added_tokens_decoder`, the Qwen3.5 checkpoints' audio markers for
-    /// one) to the pipeline and to `file`'s list, where their ids follow on
-    /// from the vocabulary's end in id order, as `transformers` assigns them
-    /// at load and as the backend reads them. Returns whether any were left
-    /// out: ids that do not follow on, which the wrapper cannot place where
-    /// the backend would.
+    /// one) to the pipeline, where their ids follow on from the
+    /// vocabulary's end in id order, as `transformers` assigns them at load
+    /// and as the backend reads them. Returns whether any were left out: ids
+    /// that do not follow on, which the wrapper cannot place where the
+    /// backend would.
     fn add_configured_tokens(
         tokenizer: &mut LoadingTokenizer,
-        file: Option<&mut TokenizerFile>,
         configured: Vec<(TokenIdType, AddedTokenConfig)>,
     ) -> Result<bool> {
-        let known: HashSet<TokenIdType> = match &file {
-            Some(file) => file.added_tokens.iter().map(|token| token.id).collect(),
-            None => tokenizer
-                .get_added_vocabulary()
-                .get_added_tokens_decoder()
-                .keys()
-                .copied()
-                .collect(),
-        };
+        let known: HashSet<TokenIdType> = tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .keys()
+            .copied()
+            .collect();
         let mut beyond: Vec<(TokenIdType, AddedTokenConfig)> = configured
             .into_iter()
             .filter(|(id, _)| !known.contains(id))
@@ -782,15 +778,6 @@ impl HuggingFaceTokenizer {
                     .normalized(normalized(entry))
             }))
             .map_err(|error| Error::msg(format!("Failed to add configured tokens: {error}")))?;
-        if let Some(file) = file {
-            file.added_tokens
-                .extend(beyond.iter().map(|(id, entry)| FileAddedToken {
-                    id: *id,
-                    content: entry.content.clone(),
-                    special: entry.special,
-                    normalized: normalized(entry),
-                }));
-        }
         debug!(
             added = beyond.len(),
             "added tokens the configuration names beyond the file"
@@ -818,43 +805,22 @@ impl HuggingFaceTokenizer {
             ))
         })?;
         tokenizer.with_padding(None);
-        // The file as the wrapper reads it: the vocabulary, the added tokens
-        // and the decoder's shape (a vocabulary read from `vocab.json` and
-        // `merges.txt` has no file; a file the reader does not take leaves
-        // the pipeline to describe itself).
-        let file = tokenizer_path.is_file().then(|| {
-            TokenizerFile::read(tokenizer_path)
-                .map_err(
-                    |error| warn!(%error, "the tokenizer file is read through the pipeline alone"),
-                )
-                .ok()
-        });
-        let mut file = file.flatten();
-
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let mut config_result =
             Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         // `tokenizer_config.json` can name added tokens beyond the file's
         // (`added_tokens_decoder`): `transformers` adds them at load, with
         // the ids after the file's, and the backend reads them the same way.
-        // The wrapper adds them to the pipeline and to the file's list where
-        // the ids follow on; where they do not, it leaves them out, and the
-        // backend, which would read them, is declined below.
+        // The wrapper adds them to the pipeline where the ids follow on;
+        // where they do not, it leaves them out, and the backend, which
+        // would read them, is declined below.
         let config_adds_tokens = Self::add_configured_tokens(
             &mut tokenizer,
-            file.as_mut(),
             std::mem::take(&mut config_result.added_tokens_decoder),
         )?;
-        // The vocabulary with the added tokens (`<|im_start|>` and the like):
-        // the file's where there is one, else the pipeline's.
-        let vocab = Arc::new(
-            file.as_ref()
-                .map_or_else(|| tokenizer.get_vocab(true), TokenizerFile::vocab),
-        );
-        let model_vocab_size = file.as_ref().map_or_else(
-            || tokenizer.get_vocab_size(false),
-            |file| file.model_vocab.len(),
-        );
+        // The vocabulary with the added tokens (`<|im_start|>` and the like).
+        let vocab = Arc::new(tokenizer.get_vocab(true));
+        let model_vocab_size = tokenizer.get_vocab_size(false);
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
@@ -880,12 +846,10 @@ impl HuggingFaceTokenizer {
         let add_eos_token = config_result.add_eos_token;
 
         // Special tokens: the config's (a null is none), else a guess among the added special tokens
-        let special_added = file.as_ref().map_or_else(
-            || pipeline_special_tokens(&tokenizer),
-            TokenizerFile::special_tokens,
+        let special_tokens = Self::extract_special_tokens(
+            pipeline_special_tokens(&tokenizer),
+            &config_result.config_tokens,
         );
-        let special_tokens =
-            Self::extract_special_tokens(special_added, &config_result.config_tokens);
 
         if let Some(template_path) = chat_template_path {
             chat_template_str = load_chat_template_from_file(template_path)?;
@@ -1000,19 +964,12 @@ impl HuggingFaceTokenizer {
             Err(Declined::from(
                 "added tokens with one normalized spelling were settled beyond the file",
             ))
-        } else if file.is_none() {
-            Err(Declined::from(
-                "the crate's reader did not take tokenizer.json; the pipeline describes the file",
-            ))
         } else if config_adds_tokens {
             Err(Declined::from(
                 "tokenizer_config.json names added tokens beyond the file whose ids do not \
                  follow the vocabulary's: left out by the wrapper, read by the backend",
             ))
-        } else if let Some(pattern) = file
-            .as_ref()
-            .and_then(TokenizerFile::anchored_split_pattern)
-        {
+        } else if let Some(pattern) = anchored_split_pattern(tokenizer.get_pre_tokenizer()) {
             Err(Declined::from(format!(
                 "the pre-tokenizer pattern {pattern:?} anchors to the piece, which the backend \
                  does not split as tokenizers does"
@@ -1020,56 +977,23 @@ impl HuggingFaceTokenizer {
         } else {
             Ok(tokenizer_path)
         };
-        // The backend took the file, so the file describes the pipeline: the
-        // added tokens, the decoder's shape and the tables come from it and
-        // the vocabulary, and the pipeline the load read the file into goes
-        // with this function's frame. A file the load changed beyond itself,
-        // or none, leaves them to the pipeline, which is the engine then.
-        let (engine, added_tokens, has_byte_fallback, byte_level, pieces) =
-            match (choose_backend(vllm_source, configured_frame), file) {
-                (Some(vllm), Some(file)) => {
-                    let special: HashSet<&str> = file
-                        .added_tokens
-                        .iter()
-                        .filter(|token| token.special)
-                        .map(|token| token.content.as_str())
-                        .collect();
-                    let max_id = reverse_vocab.keys().copied().max().unwrap_or(0);
-                    let token_of = |id: TokenIdType| reverse_vocab.get(&id).cloned();
-                    let is_special = |token: &str| special.contains(token);
-                    let byte_level = file
-                        .decoder_is_byte_level()
-                        .then(|| ByteLevelTable::from_vocabulary(max_id, token_of, is_special));
-                    let pieces = file.decoder.as_ref().and_then(|chain| {
-                        PieceTable::from_vocabulary(chain, max_id, token_of, is_special)
-                    });
-                    let has_byte_fallback = file.has_byte_fallback();
-                    (
-                        Engine::Vllm(vllm),
-                        file.added_tokens,
-                        has_byte_fallback,
-                        byte_level,
-                        pieces,
-                    )
-                }
-                _ => {
-                    // The file's model moves into the built tokenizer with
-                    // its word cache bounded, no copy of the model (see
-                    // `word_cache`).
-                    let tokenizer = HfTokenizer::from(tokenizer);
-                    let added_tokens = pipeline_added_tokens(&tokenizer);
-                    let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
-                    let byte_level = ByteLevelTable::build(&tokenizer);
-                    let pieces = PieceTable::build(&tokenizer);
-                    (
-                        Engine::Tokenizers(Box::new(Pipeline::new(tokenizer))),
-                        added_tokens,
-                        has_byte_fallback,
-                        byte_level,
-                        pieces,
-                    )
-                }
-            };
+        // The file's model moves into the built tokenizer with its word cache
+        // bounded, no copy of the model (see `word_cache`). The added tokens,
+        // the decoder's shape and the per-stream tables are read from it
+        // either way; a tokenizer the backend serves then lets the pipeline
+        // go, the backend being its engine.
+        let tokenizer = HfTokenizer::from(tokenizer);
+        let added_tokens = pipeline_added_tokens(&tokenizer);
+        let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
+        let byte_level = ByteLevelTable::build(&tokenizer);
+        let pieces = PieceTable::build(&tokenizer);
+        let engine = match choose_backend(vllm_source, configured_frame) {
+            Some(vllm) => {
+                drop(tokenizer);
+                Engine::Vllm(vllm)
+            }
+            None => Engine::Tokenizers(Box::new(Pipeline::new(tokenizer))),
+        };
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
         let renderer = glm
@@ -2370,11 +2294,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn added_token_strings(&self) -> Vec<String> {
-        file::raw_pass_added_tokens(&self.added_tokens)
+        added_tokens::raw_pass_added_tokens(&self.added_tokens)
     }
 
     fn added_tokens_after_normalization(&self) -> Vec<String> {
-        file::normalized_pass_added_tokens(&self.added_tokens)
+        added_tokens::normalized_pass_added_tokens(&self.added_tokens)
     }
 
     fn apply_chat_template(
