@@ -31,6 +31,12 @@ pub(crate) fn reported_embedding_rows(
         .min()
 }
 
+/// Whether the tokenizer knows `id`: by range below its base vocabulary (one comparison, the
+/// common id), by lookup above it (an added token; the special tokens live there).
+fn known_to(tokenizer: &dyn Tokenizer, base_vocab: usize, id: u32) -> bool {
+    usize::try_from(id).is_ok_and(|id| id < base_vocab) || tokenizer.id_to_token(id).is_some()
+}
+
 /// Refuses the first id that can reach no row of the engine's embedding table, naming its
 /// position, its value and the bound it missed.
 ///
@@ -54,9 +60,7 @@ pub(crate) fn reject_unknown_token_id(
     embedding_rows: impl FnOnce() -> Option<usize>,
 ) -> Result<(), String> {
     let base_vocab = tokenizer.vocab_size();
-    let known = |id: u32| {
-        usize::try_from(id).is_ok_and(|id| id < base_vocab) || tokenizer.id_to_token(id).is_some()
-    };
+    let known = |id: u32| known_to(tokenizer, base_vocab, id);
     let first_unknown = if base_vocab == 0 {
         // Without a vocabulary every id would be a lookup: the table alone judges them.
         0
@@ -91,11 +95,32 @@ pub(crate) fn reject_unknown_token_id(
     }
 }
 
+/// The ids of a prompt the bound has passed that the tokenizer can decode, copied for the
+/// prompt's text: all of them on a prompt the tokenizer knows throughout (the common one, one
+/// comparison per id as in the bound), without the ids known only to the engine's embedding
+/// table otherwise. Such an id sits in the padding past the tokenizer's last id, and no decoder
+/// has text for it: the byte-level and HF decoders drop it on their own, the tiktoken decoder
+/// refuses the whole decode. Filtered here, the text is the same on every decoder and the
+/// prompt rides with its ids as given.
+pub(crate) fn decodable_ids(tokenizer: &dyn Tokenizer, ids: &[u32]) -> Vec<u32> {
+    let base_vocab = tokenizer.vocab_size();
+    let known = |id: u32| known_to(tokenizer, base_vocab, id);
+    match ids.iter().position(|&id| !known(id)) {
+        None => ids.to_vec(),
+        Some(first) => {
+            let mut kept = Vec::with_capacity(ids.len() - 1);
+            kept.extend_from_slice(&ids[..first]);
+            kept.extend(ids[first + 1..].iter().copied().filter(|&id| known(id)));
+            kept
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use llm_tokenizer::{
         traits::{Decoder, Encoder, Encoding, SpecialTokens},
-        MockTokenizer,
+        MockTokenizer, TiktokenModel, TiktokenTokenizer,
     };
 
     use super::*;
@@ -237,6 +262,50 @@ mod tests {
         assert_eq!(
             reject_unknown_token_id(&tokenizer, &[u32::MAX], "input_ids", || None),
             Ok(())
+        );
+    }
+
+    /// A prompt the tokenizer knows throughout decodes as given, its added token with it.
+    #[test]
+    fn the_decodable_ids_of_a_known_prompt_are_the_prompt() {
+        let tokenizer = tokenizer();
+        assert_eq!(
+            decodable_ids(&tokenizer, &[1, 2, 50_000]),
+            vec![1, 2, 50_000]
+        );
+    }
+
+    /// An id known only to the engine's table leaves the text, the rest keeps its order.
+    #[test]
+    fn an_id_known_only_to_the_table_leaves_the_decodable_ids() {
+        let tokenizer = tokenizer();
+        let gap = tokenizer.vocab_size() as u32 + 7;
+        assert_eq!(
+            decodable_ids(&tokenizer, &[1, gap, 2, 50_000, gap]),
+            vec![1, 2, 50_000]
+        );
+    }
+
+    /// The tiktoken decoder refuses an id it lacks; the decodable ids read the text around it.
+    #[test]
+    fn a_tiktoken_decoder_reads_the_decodable_ids_of_a_padded_table_prompt() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("built-in");
+        let mut ids = tokenizer
+            .encode("Hello world", false)
+            .expect("encode")
+            .into_token_ids();
+        // Past the encoding's special tokens, which sit just above its base vocabulary.
+        ids.push(tokenizer.vocab_size() as u32 + 500);
+
+        assert!(
+            tokenizer.decode(&ids, false).is_err(),
+            "the gap id refuses the decode"
+        );
+        assert_eq!(
+            tokenizer
+                .decode(&decodable_ids(&tokenizer, &ids), false)
+                .expect("known ids"),
+            "Hello world"
         );
     }
 

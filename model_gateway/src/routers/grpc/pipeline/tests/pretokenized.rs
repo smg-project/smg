@@ -72,7 +72,15 @@ impl Encoder for CountingTokenizer {
 }
 
 impl Decoder for CountingTokenizer {
+    /// As the tiktoken decoder: an id this tokenizer knows neither by its range nor by lookup
+    /// refuses the decode, so a table-only id reaching it fails the row instead of vanishing.
     fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        let known = |id: u32| {
+            usize::try_from(id).is_ok_and(|id| id < VOCAB) || self.inner.id_to_token(id).is_some()
+        };
+        if let Some(id) = token_ids.iter().find(|&&id| !known(id)) {
+            anyhow::bail!("no token for id {id}");
+        }
         self.inner.decode(token_ids, skip_special_tokens)
     }
 }

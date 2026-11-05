@@ -19,7 +19,9 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{CompletionItem, PreparationOutput, RequestContext},
-        regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
+        regular::stages::token_ids::{
+            decodable_ids, reject_unknown_token_id, reported_embedding_rows,
+        },
         utils,
     },
 };
@@ -130,8 +132,11 @@ async fn encode_prompts(
 /// ([`reject_unknown_token_id`], the rule `/generate` applies to `input_ids`:
 /// on the headless lanes an id past the table is an out-of-range index on
 /// the engine, not a refused request). Its text, for `echo` and for the
-/// policies that route on text, is the ids' decode with special tokens kept,
-/// as the engines' own servers echo a token prompt; a long prompt decodes off
+/// policies that route on text, is the decode of the ids the tokenizer knows
+/// ([`decodable_ids`]) with special tokens kept, as the engines' own servers
+/// echo a token prompt: an id known only to the engine's table rides the wire
+/// and leaves no text, on every decoder (the byte-level and HF decoders would
+/// drop it, the tiktoken decoder would refuse it). A long prompt decodes off
 /// the worker thread, as a long text encodes. `field` names the prompt in a
 /// refusal: `prompt`, or `prompt[b]` for one list of a batch.
 async fn token_prompt(
@@ -148,21 +153,25 @@ async fn token_prompt(
         );
         error::bad_request("invalid_prompt_token", message)
     })?;
-    let token_ids = ids.to_vec();
-    let text = utils::decode_blocking(tokenizer.clone(), token_ids.clone(), false)
+    let decodable = decodable_ids(tokenizer.as_ref(), ids);
+    let text = utils::decode_blocking(tokenizer.clone(), decodable, false)
         .await
         .map_err(|e| {
+            // Every id reaching the decoder is one the tokenizer knows: a failure is ours.
             error!(
                 function = "CompletionPreparationStage::execute",
                 error = %e,
                 "Prompt token ids cannot be decoded"
             );
-            error::bad_request(
-                "invalid_prompt_token",
+            error::internal_error(
+                "prompt_decode_failed",
                 format!("prompt token ids cannot be decoded: {e}"),
             )
         })?;
-    Ok(CompletionItem { text, token_ids })
+    Ok(CompletionItem {
+        text,
+        token_ids: ids.to_vec(),
+    })
 }
 
 #[cfg(test)]
@@ -277,8 +286,29 @@ mod tests {
             .await
             .expect("an id below the table is one the model can emit");
 
-        assert_eq!(item.token_ids, vec![hello, 1_500]);
-        assert_eq!(item.text, "Hello");
+        assert_eq!(item.token_ids, vec![hello, 1_500], "the ids ride as given");
+        assert_eq!(item.text, "Hello", "the id without a token leaves no text");
+    }
+
+    /// On a tiktoken model with a padded table, an id in the gap rides the prompt and leaves
+    /// no text: the decoder, which refuses such an id, never sees it.
+    #[tokio::test]
+    async fn a_padded_table_id_rides_a_tiktoken_prompt_and_leaves_no_text() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("built-in encoding"));
+        let vocab = tokenizer.vocab_size();
+        let mut ids = tokenizer
+            .encode("Hello world", false)
+            .expect("encode")
+            .into_token_ids();
+        ids.push(vocab as u32 + 500);
+
+        let item = token_prompt(&tokenizer, &ids, "prompt", || Some(vocab + 1_000))
+            .await
+            .expect("an id inside the reported table is one the model can emit");
+
+        assert_eq!(item.token_ids, ids, "the ids ride as given");
+        assert_eq!(item.text, "Hello world", "the gap id leaves no text");
     }
 
     /// A real tokenizer bounds the prompt by its own vocabulary.
