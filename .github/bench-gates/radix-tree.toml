@@ -8,17 +8,29 @@
 # throughput sweeps and the Mooncake replays are not criterion groups and do not fit a pull
 # request's runner: a push to main keeps running all of them.
 #
-# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) /
-# median of the per-run criterion medians over ten pinned runs of one build of main (five "base"
-# and five "pull request" runs of the same binary through this gate), was measured twice on a shared
-# build host whose load ran from 15 to 480 on 192 cores during the runs: the 72 ids spread 11 - 235 %
-# the first time and 14 - 117 % the second (median 32 % and 36 %), numbers that say more about that
-# host than about the benchmark (the tokenizer's ids read 0.8 - 6.7 % on the same host at a lower
-# load). Both null cases at a 10 % threshold passed through the overlap rule (0 failed; 19 of 81 and
-# 3 of 72 suspect). 25 % is provisional: it fails the regressions that matter on this path (a 2 x
-# slower match or insert) and holds under the noise seen; every job uploads bench-gate/results.json
-# with the raw per-run medians of both sides, and the hosted runner's own spread, read from those,
-# is the number to tighten this to.
+# Threshold (the method is described in tokenizer.toml). The identical-build spread was first
+# measured on a shared build host at loads of 15 to 480 (11 - 235 % and 14 - 117 % over the 72 ids,
+# numbers that described the host, not the benchmark) and the gate opened at a provisional 25 %. The
+# hosted runner's own null cases (the gate pull request's two runs of 2026-11-04: two builds of the
+# same source, three interleaved runs a side, 72 ids, both 0 failed and 0 suspect) read, per family,
+# as the median and the largest per-id spread of a side's three runs, and the largest change of
+# medians between the two builds (the first run, then the second, whose runner was the noisier: one
+# of its runs took 286 s against 230 s):
+#
+#   family          identical build (run 1 / run 2)    across builds   the tokenizer rule
+#   indexer_match   3.4 - 8.7 %   /  4.3 - 10.2 %      3.8 / 9.3 %     25 %
+#   indexer_store   4.4 - 11.9 %  /  9.7 - 29.6 %      10.7 / 11.7 %   60 %
+#   string_match    7.3 - 9.4 %   /  8.0 - 16.0 %      4.6 / 4.4 %     35 %
+#   token_match     6.4 - 17.0 %  /  9.8 - 27.5 %      8.1 / 20.2 %    55 %
+#   string_insert   10.5 - 20.9 % /  21.2 - 74.7 %     9.5 / 65.2 %    150 %
+#   token_insert    14.2 - 91.9 % /  26.5 - 98.3 %     14.8 / 75.2 %   200 %
+#
+# The rule (the smallest multiple of 5 % that is at least twice the identical-build spread and 1.5 x
+# the across-build change) would loosen every family, the insert ones to no gate at all: the runner's
+# spread on the insert rows is the allocator's and the machine's, not the code's. 25 % stays for every
+# family; both null cases passed it through the overlap rule (an id fails only when every pull-request
+# run is slower than every base run). Whether the insert rows should be gated at all, gated at the
+# rule's numbers, or run with more repeats is an open decision; this header records the numbers.
 
 repeats = 3
 filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
@@ -26,4 +38,4 @@ filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
 [[gate]]
 pattern = "^benchmark_summary/"
 threshold = 0.25
-note = "provisional: identical build 11 - 235 % and 14 - 117 % on a loaded host; tighten from the runner's results.json"
+note = "runner null cases of 2026-11-04: identical build 3 - 98 % by family (the header); 25 % kept, carried by the overlap rule"
