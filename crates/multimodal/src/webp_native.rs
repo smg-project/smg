@@ -216,6 +216,8 @@ pub fn decode_webp(bytes: &[u8]) -> Option<DynamicImage> {
         )
     };
     if written.is_null() {
+        // A refused decode hands its buffer back; the next take is warm.
+        crate::buffer_pool::recycle(buf);
         return None;
     }
     if alpha {

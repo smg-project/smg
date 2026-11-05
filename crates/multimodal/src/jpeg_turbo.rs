@@ -406,6 +406,10 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         );
         (tj.destroy)(handle);
         if rc != 0 {
+            // A failed decode (the library reports a warning the same way, and
+            // a corrupt-data warning is common) hands its buffer back, so the
+            // next request's take is warm.
+            crate::buffer_pool::recycle(buf);
             return None;
         }
         let rgb = if cmyk { cmyk_to_rgb_like_pil(buf) } else { buf };
@@ -678,6 +682,38 @@ mod buffer_pool_tests {
             assert!(
                 second.as_bytes() == reference.as_slice(),
                 "the pixels differ on the reused buffer"
+            );
+        });
+    }
+
+    /// A decode the library refuses (a truncated file ends with the premature
+    /// end-of-file warning, which the binding reads as a failure) returns its
+    /// buffer to the pool instead of freeing it, so the next decode of that
+    /// class is warm.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_failed_decode_returns_its_buffer_to_the_pool() {
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the failed-decode pool test");
+            return;
+        }
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let bytes = std::fs::read(format!(
+                "{}/tests/fixtures/images/large.jpg",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("fixture");
+            let truncated = &bytes[..bytes.len() / 2];
+            assert_eq!(MINE.held(), 0);
+            assert!(
+                decode_jpeg_rgb(truncated).is_none(),
+                "a truncated file decodes to nothing"
+            );
+            assert_eq!(
+                MINE.held(),
+                64 << 20,
+                "the failed decode's buffer is back in its class"
             );
         });
     }
