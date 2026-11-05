@@ -957,7 +957,8 @@ fn emit_arguments<O: DeltaObserver>(
 }
 
 /// Ends a synthesized event after its choices: the `usage: null` placeholder
-/// of the event the slice came from, then the frame's end.
+/// when the latest event carried one (see `SseRechunker::usage_null`), then
+/// the frame's end.
 fn close_synthesized(usage_null: bool, out: &mut Vec<u8>) {
     if usage_null {
         out.extend_from_slice(b",\"usage\":null");
