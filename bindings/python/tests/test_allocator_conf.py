@@ -3,10 +3,11 @@
 The router launched from Python (``smg launch``, ``python -m smg``) runs the
 Rust gateway inside ``smg.smg_rs``, whose jemalloc must take the same
 ``malloc_conf`` as the ``smg`` executable: a background purging thread, dirty
-pages returned after ten seconds, muzzy pages at once, 16 arenas. Otherwise a
-traffic burst's freed pages stay resident for the life of the process and a
-many-core host spreads a small live heap over one arena's slabs per thread.
-Asked to
+pages returned after ten seconds, muzzy pages at once, 16 arenas, and
+allocations below 32 MiB served from the arenas' dirty cache. Otherwise a
+traffic burst's freed pages stay resident for the life of the process, a
+many-core host spreads a small live heap over one arena's slabs per thread,
+and every image request's encoded tensor is faulted in page by page. Asked to
 through ``_RJEM_MALLOC_CONF``, jemalloc prints its statistics when the process
 exits, and the options in effect are their ``opt`` section.
 """
