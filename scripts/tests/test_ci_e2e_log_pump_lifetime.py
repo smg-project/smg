@@ -17,6 +17,13 @@ import time
 import unittest
 from pathlib import Path
 
+# Closed fixture environments still need the setup interpreter's loader paths.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO / ".github/workflows/e2e-gpu-job.yml"
 
@@ -146,6 +153,7 @@ class LogPumpLifetimeTests(unittest.TestCase):
             self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
             enabled = True
             env = {
+                **INTERPRETER_ENV,
                 "PATH": str(bin_dir),
                 "FINAL_ENVIRONMENT_CHECK": "1",
                 "MOCK_PYTEST_STATUS": str(status),

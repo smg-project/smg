@@ -1,6 +1,7 @@
 """Exercise the actual opt-in scope Bash without a container or backend."""
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -8,6 +9,13 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+# Closed fixture environments still need the setup interpreter's loader paths.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -190,6 +198,7 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
     result = subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
         env={
+            **INTERPRETER_ENV,
             "PATH": str(binary),
             "EVIDENCE_INPUTS": json.dumps(inputs),
             "GITHUB_RUN_ATTEMPT": attempt,
