@@ -2218,13 +2218,13 @@ fn a_token_prompt_under_one_page_is_not_hashed() {
 }
 
 #[test]
-fn a_repair_page_leaves_the_hash_of_a_routed_tailed_prompt_in_place() {
-    // The request path names the sequence it routed (here one page and a
-    // one-token tail), a repair page names the page-aligned path the tree
-    // holds. The repair must not displace the request's hash, or the peer's
-    // next delta for that prompt would read as unknown and ask for another
-    // repair; a repaired path this gateway never routed answers to its own
-    // (aligned) hash.
+fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() {
+    // The request path hashes the page-aligned prefix the tree stores (here
+    // the one page of a one-page-and-a-tail prompt), as a repair page does
+    // for its paths, so the two name the node by one hash and a repair can
+    // displace nothing; the hash of the unaligned sequence is one no peer
+    // publishes; a repaired path this gateway never routed answers to its
+    // own hash.
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
         eviction_interval_secs: 0,
         block_size: 16,
@@ -2269,18 +2269,92 @@ fn a_repair_page_leaves_the_hash_of_a_routed_tailed_prompt_in_place() {
         )
     };
     assert!(
-        resolves(&tailed),
-        "the routed prompt's hash survives the repair"
+        !resolves(&tailed),
+        "no peer publishes the hash of an unaligned sequence"
     );
     assert!(
-        !resolves(&aligned),
-        "the repair's aligned hash did not displace it"
+        resolves(&aligned),
+        "the routed prompt and the repair name the node by its aligned hash"
     );
     assert!(
         resolves(&never_routed),
         "a repaired path the gateway never routed answers to its hash"
     );
     assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 2);
+}
+
+#[test]
+fn peers_resolve_every_tail_of_a_shared_prefix() {
+    // The shared-prefix shape: prompts that share their pages and differ
+    // only inside their last page end at one node, and every one of them
+    // names that node by the hash of the shared prefix. A peer that routed
+    // one of them resolves all of them (counted), and the repair stream
+    // names the prefix by the same hash, so a repair page displaces nothing.
+    let new_policy = || {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            block_size: 16,
+            ..Default::default()
+        });
+        policy.set_mesh_attached_for_test(true);
+        policy
+    };
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let (a, b) = (new_policy(), new_policy());
+    a.init_workers(&workers);
+    b.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let prefix: Vec<u32> = (0..48).collect();
+    let prompts: Vec<Vec<u32>> = (0..6u32)
+        .map(|turn| {
+            let mut prompt = prefix.clone();
+            prompt.extend((0..=turn).map(|i| 1_000 + turn * 10 + i));
+            prompt
+        })
+        .collect();
+    // What the request path publishes for a prompt: the hash of its
+    // page-aligned prefix.
+    let published = |prompt: &[u32]| kv_index::hash_token_path(&prompt[..prompt.len() / 16 * 16]);
+
+    for prompt in &prompts {
+        route_tokens(&a, &workers, prompt);
+    }
+    assert_eq!(a.token_trees.get(model).unwrap().hashed_paths(), 1);
+    route_tokens(&b, &workers, &prompts[0]);
+    let resolved = prompts
+        .iter()
+        .filter(|prompt| {
+            b.apply_known_remote_insert(model, TreeKind::Token, published(prompt), "http://w1:8000")
+        })
+        .count();
+    assert_eq!(
+        resolved,
+        prompts.len(),
+        "every tail's delta resolves on the peer"
+    );
+
+    let entries: Vec<RepairEntry> = a
+        .open_repair_stream(model, TreeKind::Token)
+        .expect("a has a token tree")
+        .collect();
+    let page = TreeRepairPage {
+        session_id: uuid::Uuid::now_v7(),
+        model_id: model.to_string(),
+        tree_kind: TreeKind::Token,
+        page_index: 0,
+        entries,
+        next_cursor: None,
+        is_last: true,
+    };
+    assert_eq!(b.apply_repair_page(&page), 1);
+    let resolved_after = prompts
+        .iter()
+        .filter(|prompt| {
+            b.apply_known_remote_insert(model, TreeKind::Token, published(prompt), "http://w2:8000")
+        })
+        .count();
+    assert_eq!(resolved_after, prompts.len());
+    assert_eq!(b.token_trees.get(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]

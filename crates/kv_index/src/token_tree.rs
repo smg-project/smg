@@ -479,6 +479,12 @@ impl TokenTree {
         self.page_size
     }
 
+    /// The length of the page-aligned prefix of a sequence of `len` tokens:
+    /// what an insert of the sequence stores, so the path a hash of it names.
+    pub fn aligned_len(&self, len: usize) -> usize {
+        align_to_page(len, self.page_size)
+    }
+
     /// Insert a token sequence with associated tenant.
     ///
     /// **Page-aligned**: Input is aligned to PAGE_SIZE boundary.

@@ -881,11 +881,15 @@ impl CacheAwarePolicy {
             if let Some(tree) = tree {
                 // With the mesh attached the path's hash rides on the insert, so
                 // a peer's delta that names this path resolves to its node here.
-                if self.mesh_attached() {
+                // The hash is of the page-aligned prefix, the path the tree
+                // stores: every sequence that ends at a node names it by the one
+                // hash a repair page's entry (an aligned path) names it by.
+                let aligned = tree.aligned_len(tokens.len());
+                if self.mesh_attached() && aligned > 0 {
                     tree.insert_tokens_with_hash(
                         tokens,
                         worker_url,
-                        kv_index::hash_token_path(tokens),
+                        kv_index::hash_token_path(&tokens[..aligned]),
                     );
                 } else {
                     tree.insert_tokens(tokens, worker_url);
@@ -3223,10 +3227,14 @@ impl CacheAwarePolicy {
 
         // With the mesh attached the path's hash rides on the insert (the tree
         // remembers the node that ends this path, so a peer's delta naming the
-        // hash resolves there) and on the delta published below; a prompt under
-        // one page is never inserted, so there is no node to name and no delta.
-        let path_hash = (self.mesh_attached() && keyed.len() >= tree.page_size())
-            .then(|| kv_index::hash_token_path(keyed));
+        // hash resolves there) and on the delta published below. The hash is of
+        // the page-aligned prefix, the path the tree stores, so every prompt
+        // that ends at a node names it by the one hash a repair page's entry
+        // (an aligned path) names it by; a prompt under one page is never
+        // inserted, so there is no node to name and no delta.
+        let aligned = tree.aligned_len(keyed.len());
+        let path_hash = (self.mesh_attached() && aligned > 0)
+            .then(|| kv_index::hash_token_path(&keyed[..aligned]));
 
         // One fused descent: match first, atomically choose+credit the final
         // worker from the affinity/spill candidate set, then insert only that
