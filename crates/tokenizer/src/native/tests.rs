@@ -552,7 +552,7 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
         let mut compared = 0;
         for _ in 0..3 {
             let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
-            let units = native.units(&text, true, true).len();
+            let units = native.units(&text, true, true).as_slice().len();
             assert!(
                 units >= 4,
                 "{}: {units} units for {} bytes",
@@ -601,6 +601,7 @@ fn a_normalized_added_token_across_a_cut_stays_whole() {
     text.push_str("foo bar");
     text.push_str(&long_text(&mut state, &[], 3 * PARALLEL_CHUNK_BYTES));
     let units = native.units(&text, true, true);
+    let units = units.as_slice();
     assert!(
         units
             .iter()
@@ -641,6 +642,7 @@ fn chunking_goes_on_past_a_stretch_without_candidates() {
     assert!(text.len() > 2 * PARALLEL_CHUNK_BYTES);
     text.push_str(&long_text(&mut state, &[], 4 * PARALLEL_CHUNK_BYTES));
     let units = native.units(&text, true, true);
+    let units = units.as_slice();
     assert!(
         units.len() > 2,
         "{} units: the prose after the table is chunked",
@@ -678,13 +680,14 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         };
         let mut chunked = Vec::new();
         let units = native.units(&text, true, true);
+        let units = units.as_slice();
         assert!(
             units.len() >= 2,
             "{}: no cut in {} bytes",
             shape.name,
             text.len()
         );
-        for unit in &units {
+        for unit in units {
             let Segment::Text(chunk) = unit else {
                 panic!("no added tokens in this text");
             };
