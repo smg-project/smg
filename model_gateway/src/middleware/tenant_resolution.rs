@@ -34,9 +34,10 @@ use crate::{
 /// When the gateway accepted the request: stamped as the route request meta
 /// is built (after the serving auth and the wasm hooks, so their time is not
 /// the request's wait), and stamped again when an admission permit is granted
-/// after a wait in the admission queue ([`restamp_accepted_at`]), so the bound
-/// on the wait ahead of worker selection measures the time after admission,
-/// not the admission queue's own, bounded wait. Read once: the first worker selection of a request
+/// (by the scheduler on every admit, by the legacy limiter after a wait in its
+/// queue; [`restamp_accepted_at`]), so the bound on the wait ahead of worker
+/// selection measures the time after admission, not the admission queue's
+/// own, bounded wait. Read once: the first worker selection of a request
 /// takes the stamp ([`Self::take_for_selection`]); a later pipeline run of the
 /// same request (the Responses tool loops run the pipeline once per iteration
 /// with the same meta) finds it spent and is not bounded by it.
@@ -82,10 +83,12 @@ impl AcceptedAt {
 }
 
 /// Stamp the request's route meta with a fresh [`AcceptedAt`]: called when an
-/// admission permit is granted after a wait in the admission queue, so that
-/// wait (bounded by its own timeout) does not count against the bound ahead of
-/// worker selection; a permit granted at once leaves the entry stamp as the
-/// acceptance. `false` when the request carries no route meta.
+/// admission permit is granted (by the scheduler on every admit, by the legacy
+/// limiter only after a wait in its queue), so a wait in the admission queue
+/// (bounded by its own timeout) does not count against the bound ahead of
+/// worker selection; a legacy permit granted at once leaves the stamp taken at
+/// tenant resolution as the acceptance. `false` when the request carries no
+/// route meta.
 pub fn restamp_accepted_at(extensions: &mut Extensions) -> bool {
     match extensions.get_mut::<RouteRequestMeta>() {
         Some(meta) => {
