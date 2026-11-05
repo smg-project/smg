@@ -105,8 +105,13 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// 500k tokens encoded as slowly warm as cold: measured). Memory: a thread's
 /// table grows with use (see `short_pieces`), so a thread that encodes
 /// little holds a few KB; at the full bound it has 524,288 slots of 33
-/// bytes, 16.5 MiB (measured on one thread after a corpus of 7,015 prompts:
-/// 6 to 14 MB more than at the old bound).
+/// bytes, 16.5 MiB. The pieces of 16 to 64 bytes count against the same
+/// bound in a map (`PieceCache::short`) at about 140 bytes an entry (its
+/// slot with the table's slack, the piece and the ids as two boxes), so a
+/// thread whose entries were all such pieces would hold about 35 MiB.
+/// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
+/// grew by 8 MB on a 128k-token vocabulary and did not move on three
+/// larger ones, whose peak is the file load.
 const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
@@ -117,8 +122,13 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// tables of one tokenizer stay under 352 MiB however many runtime and
 /// blocking threads encode with it (sixteen threads at the full bound hold
 /// 264 MiB; more threads share the total, each table rounded up to a power
-/// of two slots, at most eight thirds of the total in slots; the maps of
-/// the longer pieces share the count); they are freed with the encoder.
+/// of two slots, at most eight thirds of the total in slots). The maps of
+/// the pieces of 16 to 64 bytes share the count at about 140 bytes an
+/// entry, so the count-bounded tiers of one tokenizer hold at most about
+/// 560 MiB when every entry is such a piece, 352 MiB when every entry is
+/// packed; the long pieces add `LONG_PIECE_BYTES_TOTAL` at most. Before
+/// this bound the same ceilings were a sixteenth of these. All of it is
+/// freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
