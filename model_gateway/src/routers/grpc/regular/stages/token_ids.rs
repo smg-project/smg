@@ -32,7 +32,9 @@ pub(crate) fn reported_embedding_rows(
 }
 
 /// Whether the tokenizer knows `id`: by range below its base vocabulary (one comparison, the
-/// common id), by lookup above it (an added token; the special tokens live there).
+/// common id), by lookup above it (an added token; the special tokens live there). The range
+/// is the tokenizer's own report and a fast path, not a guarantee: a tiktoken encoding leaves
+/// holes below it (ids with neither a rank nor a special token), which only a decode finds.
 fn known_to(tokenizer: &dyn Tokenizer, base_vocab: usize, id: u32) -> bool {
     usize::try_from(id).is_ok_and(|id| id < base_vocab) || tokenizer.id_to_token(id).is_some()
 }
@@ -101,7 +103,8 @@ pub(crate) fn reject_unknown_token_id(
 /// table otherwise. Such an id sits in the padding past the tokenizer's last id, and no decoder
 /// has text for it: the byte-level and HF decoders drop it on their own, the tiktoken decoder
 /// refuses the whole decode. Filtered here, the text is the same on every decoder and the
-/// prompt rides with its ids as given.
+/// prompt rides with its ids as given. A hole inside the range (see [`known_to`]) passes here
+/// as it passes the bound; its decode is the decoder's refusal.
 pub(crate) fn decodable_ids(tokenizer: &dyn Tokenizer, ids: &[u32]) -> Vec<u32> {
     let base_vocab = tokenizer.vocab_size();
     let known = |id: u32| known_to(tokenizer, base_vocab, id);

@@ -12,7 +12,7 @@ use axum::response::Response;
 use futures::future::try_join_all;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::completion::CompletionPrompt;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::routers::{
     error,
@@ -136,9 +136,12 @@ async fn encode_prompts(
 /// ([`decodable_ids`]) with special tokens kept, as the engines' own servers
 /// echo a token prompt: an id known only to the engine's table rides the wire
 /// and leaves no text, on every decoder (the byte-level and HF decoders would
-/// drop it, the tiktoken decoder would refuse it). A long prompt decodes off
-/// the worker thread, as a long text encodes. `field` names the prompt in a
-/// refusal: `prompt`, or `prompt[b]` for one list of a batch.
+/// drop it, the tiktoken decoder would refuse it). An id inside the
+/// tokenizer's range that its encoding never assigned (a hole of a tiktoken
+/// id space) is the decode's to find, and is refused as the client's error. A
+/// long prompt decodes off the worker thread, as a long text encodes. `field`
+/// names the prompt in a refusal: `prompt`, or `prompt[b]` for one list of a
+/// batch.
 async fn token_prompt(
     tokenizer: &Arc<dyn Tokenizer>,
     ids: &[u32],
@@ -146,7 +149,7 @@ async fn token_prompt(
     embedding_rows: impl FnOnce() -> Option<usize>,
 ) -> Result<CompletionItem, Response> {
     reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(|message| {
-        error!(
+        warn!(
             function = "CompletionPreparationStage::execute",
             error = %message,
             "Prompt token id outside the model's vocabulary"
@@ -157,14 +160,17 @@ async fn token_prompt(
     let text = utils::decode_blocking(tokenizer.clone(), decodable, false)
         .await
         .map_err(|e| {
-            // Every id reaching the decoder is one the tokenizer knows: a failure is ours.
-            error!(
+            // The range check behind `decodable_ids` is a fast path, not a guarantee: a
+            // tiktoken encoding leaves holes below its reported size (ids with neither a
+            // rank nor a special token), which only the decode finds. Such an id is the
+            // client's to drop, as one past the bound is.
+            warn!(
                 function = "CompletionPreparationStage::execute",
                 error = %e,
                 "Prompt token ids cannot be decoded"
             );
-            error::internal_error(
-                "prompt_decode_failed",
+            error::bad_request(
+                "invalid_prompt_token",
                 format!("prompt token ids cannot be decoded: {e}"),
             )
         })?;
@@ -309,6 +315,30 @@ mod tests {
 
         assert_eq!(item.token_ids, ids, "the ids ride as given");
         assert_eq!(item.text, "Hello world", "the gap id leaves no text");
+    }
+
+    /// A hole of a tiktoken encoding, an id below its reported size with neither a rank nor
+    /// a special token (o200k's 199998), passes the bound by range and is refused by the
+    /// decode, as the client's error.
+    #[tokio::test]
+    async fn a_hole_in_a_tiktoken_encoding_is_refused_by_its_decode() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::new(TiktokenModel::O200kBase).expect("built-in encoding"));
+        let known = tokenizer
+            .encode("Hello", false)
+            .expect("encode")
+            .into_token_ids();
+        assert!(
+            199_998 < tokenizer.vocab_size(),
+            "the hole sits inside the reported range"
+        );
+
+        let body = refusal(&tokenizer, &[known[0], 199_998], "prompt").await;
+
+        assert!(
+            body.contains("prompt token ids cannot be decoded"),
+            "{body}"
+        );
     }
 
     /// A real tokenizer bounds the prompt by its own vocabulary.
