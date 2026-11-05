@@ -446,7 +446,11 @@ grafana:
 #     tenant over its limit, a grammar of its own) are not counted there.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
-#     front of the engines (set it to the SLO once there is one).
+#     front of the engines (set it to the SLO once there is one). The family
+#     holds the gRPC router's streamed answers alone: the HTTP router records
+#     none, a collected answer records no first token (nor does a streamed
+#     Responses answer on the Harmony pipeline), so a deployment on the HTTP
+#     router or whose clients do not stream has an empty alert.
 #   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
 #     overlap of a rolling restart. The alert also fires when the gateway has
 #     no worker series at all while its scrape is up (none registered yet, or

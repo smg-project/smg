@@ -63,8 +63,8 @@ spec:
           labels:
             severity: critical
           annotations:
-            summary: "Time to first token p99 is over the SLO"
-            description: "p99 TTFT of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines."
+            summary: "Time to first token p99 of streamed answers is over the SLO"
+            description: "p99 TTFT of the streamed answers of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines. A collected answer records no first token, so the p99 is over the streamed share alone."
         - alert: SmgKvUsageNearCapacity
           expr: max by (namespace, job, worker) (smg_engine_token_usage{ {{ $job }} }) > {{ $a.kvUsage }}
           for: {{ $a.kvUsageFor }}

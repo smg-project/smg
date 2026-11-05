@@ -291,7 +291,7 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 | `SmgNoHealthyWorker` | critical | no registered worker is healthy, or no worker is registered at all while the gateway's scrape is up, for `noHealthyWorkerFor` |
 | `SmgHighErrorRatio` | critical | the 5xx share of responses, the probe routes (`/health`, `/readiness`, `/liveness`) excluded, exceeds `errorRatio` for `errorRatioFor` |
 | `SmgHighRouterErrorRatio` | critical | the router's server-side failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s; the client's own refusals are not counted) exceeds `errorRatio` for `errorRatioFor` |
-| `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
+| `SmgTtftP99High` | critical | p99 time to first token of the gRPC router's streamed answers (the HTTP router records none; a collected answer, and a streamed Responses answer on the Harmony pipeline, records no first token) exceeds `ttftP99Seconds` for `ttftP99For`, evaluated per namespace and job |
 | `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
 | `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker is open or half-open for `circuitBreakerOpenFor` (a worker failing requests while passing its probes cycles between the two) |
 | `SmgAdmissionRejections` | warning | the concurrency limit's queue or the priority scheduler's per-class queues reject requests for `admissionRejectionsFor` |
