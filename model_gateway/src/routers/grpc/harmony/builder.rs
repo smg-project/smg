@@ -1204,7 +1204,7 @@ impl HarmonyBuilder {
                         },
                         recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.clone().unwrap_or_default(),
                         })],
                         channel: None,
                         content_type: None,

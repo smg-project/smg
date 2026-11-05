@@ -64,8 +64,13 @@ pub enum ChatMessage {
         content: MessageContent,
         tool_call_id: String,
     },
+    /// The deprecated function result: its content is a string or null, as
+    /// the public API has it.
     #[serde(rename = "function")]
-    Function { content: String, name: String },
+    Function {
+        content: Option<String>,
+        name: String,
+    },
     #[serde(rename = "developer")]
     Developer {
         content: MessageContent,
@@ -1031,7 +1036,7 @@ impl GenerationRequest for ChatCompletionRequest {
                     }
                 }
                 ChatMessage::Function { content, .. } => {
-                    if !content.is_empty() {
+                    if let Some(content) = content.as_deref().filter(|c| !c.is_empty()) {
                         if has_content {
                             buffer.push(' ');
                         }
