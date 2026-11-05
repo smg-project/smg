@@ -415,6 +415,19 @@ fn finish_preserves_pending_decode_errors() {
     assert!(error.to_string().contains("pending token decode failed"));
 }
 
+/// The SSE frame of a Messages event written the plain way: the event's type line, then the
+/// whole event through serde.
+fn serialized_messages_event(event: &MessageStreamEvent) -> Vec<u8> {
+    let mut bytes = format!(
+        "event: {}\ndata: ",
+        StreamingProcessor::message_event_type_name(event)
+    )
+    .into_bytes();
+    serde_json::to_writer(&mut bytes, event).expect("the event serializes");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
 /// The one-pass `content_block_delta` frames write exactly the bytes of the
 /// serialized event, so the literal head can never drift from serde's walk of
 /// the two tagged enums: every string delta variant, several block indices and
@@ -422,16 +435,6 @@ fn finish_preserves_pending_decode_errors() {
 /// and the other events keep the serialized whole.
 #[test]
 fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
-    fn serialized(event: &MessageStreamEvent) -> Vec<u8> {
-        let mut bytes = format!(
-            "event: {}\ndata: ",
-            StreamingProcessor::message_event_type_name(event)
-        )
-        .into_bytes();
-        serde_json::to_writer(&mut bytes, event).expect("the event serializes");
-        bytes.extend_from_slice(b"\n\n");
-        bytes
-    }
     fn formatted(event: &MessageStreamEvent) -> Vec<u8> {
         let mut buffer = BytesMut::with_capacity(64);
         StreamingProcessor::format_messages_sse_into(&mut buffer, event)
@@ -468,7 +471,7 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
                 let event = MessageStreamEvent::ContentBlockDelta { index, delta };
                 assert_eq!(
                     formatted(&event),
-                    serialized(&event),
+                    serialized_messages_event(&event),
                     "index {index}, text {text:?}"
                 );
             }
@@ -487,9 +490,9 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
             }),
         },
     };
-    assert_eq!(formatted(&citation), serialized(&citation));
+    assert_eq!(formatted(&citation), serialized_messages_event(&citation));
     let stop = MessageStreamEvent::ContentBlockStop { index: 3 };
-    assert_eq!(formatted(&stop), serialized(&stop));
+    assert_eq!(formatted(&stop), serialized_messages_event(&stop));
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
