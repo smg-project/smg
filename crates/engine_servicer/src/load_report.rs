@@ -92,6 +92,17 @@ impl Aggregate {
     }
 }
 
+/// The mean of one per-rank figure over the entries a wire built, 0 with no
+/// entry: the aggregate's average throughput and utilization, which the
+/// entries carry from the servicer's own estimates and the wire's fill.
+pub(crate) fn mean(values: impl ExactSizeIterator<Item = f64>) -> f64 {
+    let count = values.len();
+    if count == 0 {
+        return 0.0;
+    }
+    values.sum::<f64>() / count as f64
+}
+
 /// The per-rank entries of a `GetLoads` answer, as every wire lists them:
 /// the snapshot's ranks (the one the request names, when it names one), each
 /// built by `reported` from its snapshot and its figures, then a zero-filled
@@ -234,6 +245,13 @@ mod tests {
         assert_eq!(one, vec![2]);
         let (silent, _) = rank_entries(snapshot, 1000, 3, Some(1), |_, f| f.dp_rank, |r| -r);
         assert_eq!(silent, vec![-1]);
+    }
+
+    /// The mean of a per-rank figure over the entries built; zero with none.
+    #[test]
+    fn the_mean_of_a_figure_over_the_entries_is_zero_with_none() {
+        assert_eq!(mean(std::iter::empty()), 0.0);
+        assert_eq!(mean([1.0, 2.0, 6.0].into_iter()), 3.0);
     }
 
     /// The aggregate sums the ranks (saturating) and averages their usage;

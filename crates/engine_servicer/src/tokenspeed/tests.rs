@@ -1281,6 +1281,10 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
             .is_some_and(|client| !client.get_loads().loads.is_empty())
     })
     .await;
+    // The server's own poll of the chunk credits the streamed token to the
+    // rank on the tracker (the request is not streamed to the client, so
+    // nothing here reads it first): the poll below runs once it has.
+    wait_until(|| h.server.state.shared.loads.estimate(0, 0).gen_throughput > 0.0).await;
     let loads = h
         .client
         .get_loads(ts::GetLoadsRequest::default())
@@ -1292,8 +1296,21 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!((load.num_running_reqs, load.num_waiting_reqs), (2, 1));
     assert_eq!(load.num_total_reqs, 3);
     assert!((load.token_usage - 0.1).abs() < 1e-9);
+    assert!(
+        (load.utilization - 0.1).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {load:?}"
+    );
     let aggregate = loads.aggregate.expect("aggregate");
     assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.1).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - load.gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
 
     // Once the rank's last request finished, its queue counts read idle (the
     // scheduler samples its snapshot before the finish is committed, so the
