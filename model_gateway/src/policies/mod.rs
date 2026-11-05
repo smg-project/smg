@@ -25,6 +25,7 @@ mod passthrough;
 mod power_of_two;
 mod prefix_hash;
 mod random;
+mod registration;
 mod registry;
 mod round_robin;
 #[cfg(test)]
@@ -45,6 +46,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
+pub use registration::PolicyRegistration;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 

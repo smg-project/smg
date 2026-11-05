@@ -73,6 +73,7 @@ use crate::{
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
     },
+    policies::PolicyRegistration,
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -2253,9 +2254,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         MeshAdapters::start(
             handler.mesh_kv(),
             handler.self_name.clone(),
-            app_context.worker_registry.clone(),
             handler.state.clone(),
-            app_context.policy_registry.clone(),
+            PolicyRegistration::of(&app_context),
         )
     });
 
