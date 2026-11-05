@@ -1223,7 +1223,7 @@ data:
               "legendFormat": "whole"
             }
           ],
-          "description": "The gateway's phase split of a prefill-decode request's time to first token: prefill dispatch to the prefill response drained, the relay between the sides (gateway work alone, under sequential dispatch; the engines' KV transfer runs inside the decode phase), decode dispatch to the first decode token, and the whole. Under sequential dispatch the three phases add up to the whole; under parallel dispatch the decode phase is the whole.",
+          "description": "The gateway's phase split of a prefill-decode request's time to first token: prefill dispatch to the prefill response drained, the relay between the sides (gateway work alone, under sequential dispatch; the engines' KV transfer runs inside the decode phase), decode dispatch to the first decode token, and the whole. Under sequential dispatch the three phases add up to the whole per request (their p99 lines do not add); under parallel dispatch the decode phase is the whole.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -1358,15 +1358,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_pd_prefill_admission_wait_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "expr": "max(smg_pd_prefill_admission_wait_seconds{quantile=\"0.5\", namespace=~\"$namespace\", job=~\"$job\"})",
               "legendFormat": "p50"
             },
             {
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_pd_prefill_admission_wait_seconds_bucket{namespace=~\"$namespace\", job=~\"$job\"}[5m])))",
+              "expr": "max(smg_pd_prefill_admission_wait_seconds{quantile=\"0.99\", namespace=~\"$namespace\", job=~\"$job\"})",
               "legendFormat": "p99"
             }
           ],
-          "description": "Time a request spent in the prefill admission queue.",
+          "description": "Time a request spent in the prefill admission queue. The gateway exports this family as a summary, so each line is the worst replica's own quantile: summary quantiles do not aggregate across replicas.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
