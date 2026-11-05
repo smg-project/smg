@@ -265,8 +265,25 @@ jobs:
           pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
           pytest -q grpc_servicer/tests -rs
 
+      # The release tests drive scripts/release/release.sh, which runs `make`; this
+      # runner's image ships no build tools (go-unit-tests installs its own too).
+      - name: Install the tools the tooling tests drive
+        run: |
+          bash scripts/ci_apt_mirror.sh
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+
+      # Every test under scripts/tests runs: the Python files as one pytest run, the
+      # shell tests one by one. The tools the step above can install come from there; a
+      # test that needs one it cannot skips itself and says so under -rs. A new test
+      # file runs from its first commit instead of waiting for a name here;
+      # scripts/tests/test_ci_tooling_tests.py pins this step. `python -m pytest`, not
+      # the console script: it puts the repository root on sys.path, which the tests
+      # that import `scripts.<module>` need to collect.
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_tokenspeed_image_tag.py scripts/tests/test_ci_gpu_runner_image.py scripts/tests/test_bench_gate.py scripts/tests/test_ci_reap_job_processes.py scripts/tests/test_check_release_versions.py scripts/tests/test_ci_rust_tests.py scripts/tests/test_ci_apt_update.py scripts/tests/test_ci_gpu_guard.py
+        run: |
+          python -m pytest -q -rs scripts/tests
+          for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
