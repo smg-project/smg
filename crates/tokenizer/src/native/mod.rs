@@ -43,6 +43,13 @@
 //! supported subset, a post-processor other than `ByteLevel` or a template
 //! of that shape, truncation or padding, added tokens with
 //! `single_word`/`lstrip`/`rstrip`) simply has no native path.
+//!
+//! A tiktoken vocabulary is a byte-level BPE of this shape with no
+//! normalizer, one pattern, special tokens cut out of the raw text and no
+//! frame, its merges implied by its ranks: [`NativeEncoder::from_ranks`]
+//! reads one into the same encoder (the merge table from the ranks, see
+//! [`merge`]), and a file whose ranks or pattern do not fit keeps its own
+//! encoder.
 
 use std::{
     borrow::Cow,
@@ -855,6 +862,68 @@ impl NativeEncoder {
         table
     }
 
+    /// This path's encoder for a tiktoken vocabulary, `ranks` as the file
+    /// lists them, `pattern` the file's regex and `specials` its special
+    /// tokens, or why it declines: a pattern outside the engine's subset, a
+    /// rank set that gives no complete merge table (see
+    /// [`MergeTable::from_ranks`]). The file's encoder cuts the specials out
+    /// of the raw text, runs the pattern over the text between them and
+    /// encodes each match: no normalizer, one stage whose matches alone are
+    /// pieces, no frame. The seed is ready at once: every token of a
+    /// complete table is its own id.
+    pub(crate) fn from_ranks(
+        ranks: &FxHashMap<Vec<u8>, u32>,
+        pattern: &str,
+        specials: &[(String, u32)],
+    ) -> Result<Self, Declined> {
+        let pattern = Pattern::parse(pattern).ok_or_else(|| {
+            Declined::from(format!(
+                "a split pattern outside the supported regex subset: {pattern}"
+            ))
+        })?;
+        if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
+            return Err(Declined::from(format!(
+                "special token {content:?} without content"
+            )));
+        }
+        let merges = MergeTable::from_ranks(ranks)?;
+        tracing::debug!(
+            merges = merges.merges(),
+            bytes = merges.bytes(),
+            "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
+        );
+        let stages = vec![Stage {
+            pattern,
+            keep_gaps: false,
+        }];
+        let chain = chain::Scanner::recognize(&stages);
+        Ok(Self {
+            normalizer: Normalizer::None,
+            raw_added: AddedTokens::build(specials)?,
+            normalized_added: None,
+            stages,
+            chain,
+            frame: Frame::default(),
+            alphabet: bytes_char(),
+            seed: Self::ranks_seed(ranks),
+            merges: Some(merges),
+            piece_cache: ThreadLocal::new(),
+            threads: AtomicUsize::new(0),
+        })
+    }
+
+    /// The seed of a tiktoken vocabulary: every token the key holds, with
+    /// its own id (what a miss on it merges to, the table being complete).
+    fn ranks_seed(ranks: &FxHashMap<Vec<u8>, u32>) -> ShortPieceTable {
+        let mut table = ShortPieceTable::for_entries(ranks.len());
+        for (token, &rank) in ranks {
+            if let Some(key) = ShortPieceKey::of(token) {
+                table.insert(key, &[rank], ranks.len());
+            }
+        }
+        table
+    }
+
     /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
     /// followed by one `ByteLevel` without prefix space.
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
@@ -949,10 +1018,14 @@ impl NativeEncoder {
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit.
+    /// the same code per unit. `model` is the model behind the vocabulary,
+    /// read for the whole-piece lookup of `ignore_merges` and for the
+    /// pieces of a model whose merge table declined; `None` for a
+    /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
+    /// complete.
     pub(crate) fn encode(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
@@ -971,7 +1044,7 @@ impl NativeEncoder {
     /// otherwise as [`Self::encode`].
     pub(crate) fn encode_plain(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         text: &str,
     ) -> Result<Vec<u32>, Fallback> {
         self.encode_units(model, text, text.len() >= PARALLEL_MIN_BYTES, false, false)
@@ -982,7 +1055,7 @@ impl NativeEncoder {
     /// order).
     pub(crate) fn encode_with(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         text: &str,
         parallel: bool,
         add_special_tokens: bool,
@@ -995,7 +1068,7 @@ impl NativeEncoder {
     /// `framed` whether the post-processor's frame goes around the ids.
     fn encode_units(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         text: &str,
         parallel: bool,
         added: bool,
@@ -1218,7 +1291,7 @@ impl NativeEncoder {
     /// ([`Self::thread_piece_cache`]), borrowed by the caller for the unit.
     fn encode_unit(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         unit: &Segment<'_>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
@@ -1280,7 +1353,9 @@ impl NativeEncoder {
     /// looked up first under `ignore_merges`), else, for a model the merge
     /// table declined, from the model itself over the piece's byte-level
     /// alphabet form; remembered in the thread's cache whichever answered;
-    /// [`Fallback::PieceDeclined`] when the model declines the piece. The
+    /// [`Fallback::PieceDeclined`] when the model declines the piece (or
+    /// there is none to ask: a vocabulary read from ranks has a complete
+    /// table and never gets here). The
     /// thread's cache comes first because it is small and hot: the pieces of
     /// the prompts a thread encodes, a few hundred KB, where the seed is
     /// several MB of lines a warm encode would read at random (measured:
@@ -1291,7 +1366,7 @@ impl NativeEncoder {
     /// vocabulary).
     fn tokenize_piece(
         &self,
-        model: &ModelWrapper,
+        model: Option<&ModelWrapper>,
         piece: &str,
         mapped: &mut String,
         ids: &mut Vec<u32>,
@@ -1319,7 +1394,7 @@ impl NativeEncoder {
         if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
             if let Some(table) = &self.merges {
                 let whole = if table.ignore_merges {
-                    model.token_to_id(self.mapped(bytes, mapped))
+                    model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
                 } else {
                     None
                 };
@@ -1328,9 +1403,9 @@ impl NativeEncoder {
                     None => table.merge(bytes, ids),
                 }
             } else {
-                match model.tokenize(self.mapped(bytes, mapped)) {
-                    Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
-                    Err(_) => return Err(Fallback::PieceDeclined),
+                match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
+                    Some(Ok(tokens)) => ids.extend(tokens.iter().map(|token| token.id)),
+                    Some(Err(_)) | None => return Err(Fallback::PieceDeclined),
                 }
             }
         }
