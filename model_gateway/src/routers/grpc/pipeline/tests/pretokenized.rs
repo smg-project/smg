@@ -5,7 +5,9 @@
 //! text request on the same path keeps its one encode. On `/generate` the shapes the path does
 //! not take (a batch of id lists, a negative id) are refused before any worker is spoken to; on
 //! `/v1/completions` a batch of id lists is one engine request per prompt, as a batch of texts
-//! is, and an `echo` opens the answer with the ids' decode.
+//! is, and an `echo` opens the answer with the ids' decode. On both routes an id past the
+//! model's vocabulary (or past the embedding table its workers report) is refused before any
+//! worker is spoken to; an added token the tokenizer knows by lookup passes.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -665,5 +667,99 @@ async fn a_streamed_completion_token_prompt_reports_the_ids_count_in_its_usage()
         .expect("the stream states its usage");
     assert_eq!(usage["prompt_tokens"], json!(IDS.len()), "{usage}");
     assert_eq!(bed.seen_ids(), vec![IDS.to_vec()]);
+    assert_eq!(bed.tokenizer.encodes(), 0);
+}
+
+#[tokio::test]
+async fn a_completion_id_past_the_vocabulary_is_refused_before_any_worker_call() {
+    let bed = Bed::new(Endpoint::Completion).await;
+    // Above the reported vocabulary and none of the mock's added tokens, as on `/generate`.
+    let unknown = VOCAB as u32 + 500;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": [1, 2, unknown], "max_tokens": 4}))
+        .await;
+
+    let body = json_body(&body);
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_prompt_token", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("prompt[2] = {unknown} ")),
+        "the refusal names the position and the value: {body}"
+    );
+    assert!(
+        message.contains(&format!("holds {VOCAB} tokens")),
+        "the refusal names the vocabulary: {body}"
+    );
+    assert!(bed.seen_ids().is_empty(), "no worker is spoken to");
+    assert_eq!(bed.tokenizer.encodes(), 0);
+}
+
+#[tokio::test]
+async fn a_completion_batch_with_an_id_past_the_vocabulary_is_refused_naming_its_list() {
+    let bed = Bed::new(Endpoint::Completion).await;
+    let unknown = VOCAB as u32 + 500;
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": [[1, 2], [3, unknown]], "max_tokens": 4}))
+        .await;
+
+    let body = json_body(&body);
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_prompt_token", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("prompt[1][1] = {unknown} ")),
+        "the refusal names the list and the position: {body}"
+    );
+    assert!(bed.seen_ids().is_empty(), "no worker is spoken to");
+    assert_eq!(bed.tokenizer.encodes(), 0);
+}
+
+#[tokio::test]
+async fn an_added_token_above_the_vocabulary_reaches_the_worker_on_the_completion_route() {
+    let bed = Bed::new(Endpoint::Completion).await;
+    let ids = vec![11, ADDED, 12];
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": ids, "max_tokens": 4}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        bed.seen_ids(),
+        vec![ids],
+        "an added token the tokenizer knows by lookup rides the wire as sent"
+    );
+    assert_eq!(bed.tokenizer.encodes(), 0);
+}
+
+#[tokio::test]
+async fn a_completion_id_inside_the_reported_embedding_table_reaches_the_worker() {
+    let bed = Bed::with_worker_labels(Endpoint::Completion, &[("vocab_size", "2000")]).await;
+    let gap = VOCAB as u32 + 500;
+    let ids = vec![1, gap, 2];
+
+    let (status, body) = bed
+        .complete(json!({"model": MODEL, "prompt": ids, "max_tokens": 4}))
+        .await;
+
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        bed.seen_ids(),
+        vec![ids],
+        "an id below the reported table rides the wire as sent"
+    );
     assert_eq!(bed.tokenizer.encodes(), 0);
 }

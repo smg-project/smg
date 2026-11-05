@@ -15,6 +15,10 @@ On the mock engine the ids request's answer is filed under the exact ids
 (``input_ids=``): the mock serves it only when the prompt it receives has that
 key, so a served answer proves the engine saw the ids unchanged, and the
 scripted mock reports the prompt count it received.
+
+An id past the model's vocabulary is refused by the gateway before any engine
+is spoken to, as ``/generate`` refuses it: on the engine such an id is an
+out-of-range embedding index, not a refused request.
 """
 
 from __future__ import annotations
@@ -151,3 +155,24 @@ class TestCompletionPretokenized:
         assert "".join(texts), texts
         assert usage is not None, "the stream states its usage"
         assert usage.prompt_tokens == len(ids), usage
+
+    def test_an_id_past_the_vocabulary_is_refused_before_the_engine(
+        self, setup_backend, api_client, mock_answers
+    ):
+        _backend, model, _client, gateway = setup_backend
+        ids = _tokenize(gateway, model, _TEXT)
+
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/completions",
+            json={"model": model, "prompt": [*ids, 10_000_000], "max_tokens": 4},
+            timeout=TIMEOUT,
+        )
+
+        assert resp.status_code == 400, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "invalid_prompt_token", resp.text
+        assert f"prompt[{len(ids)}] = 10000000 is not a token of this model" in error["message"], (
+            resp.text
+        )
+        if mock_answers.active:
+            assert mock_answers.served() == 0

@@ -19,6 +19,7 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{CompletionItem, PreparationOutput, RequestContext},
+        regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
         utils,
     },
 };
@@ -33,15 +34,31 @@ impl PipelineStage for CompletionPreparationStage {
         let tokenizer =
             utils::resolve_tokenizer(ctx, "CompletionPreparationStage::execute").map_err(|e| *e)?;
 
+        // The embedding table the model's workers report, read only after an id the
+        // tokenizer does not know (the bound of `token_prompt`).
+        let worker_registry = &ctx.components.worker_registry;
+        let model_id = ctx.input.model_id.as_str();
+        let embedding_rows = || reported_embedding_rows(worker_registry, model_id);
+
         // Empty arrays are rejected at the boundary (`validate_completion_prompt`).
         let items = match &request.prompt {
             CompletionPrompt::Text(text) => {
                 encode_prompts(&tokenizer, std::slice::from_ref(text)).await?
             }
             CompletionPrompt::Texts(texts) => encode_prompts(&tokenizer, texts).await?,
-            CompletionPrompt::TokenIds(ids) => vec![token_prompt(&tokenizer, ids).await?],
+            CompletionPrompt::TokenIds(ids) => {
+                vec![token_prompt(&tokenizer, ids, "prompt", embedding_rows).await?]
+            }
             CompletionPrompt::TokenIdBatches(batches) => {
-                try_join_all(batches.iter().map(|ids| token_prompt(&tokenizer, ids))).await?
+                let fields: Vec<String> =
+                    (0..batches.len()).map(|b| format!("prompt[{b}]")).collect();
+                try_join_all(
+                    batches
+                        .iter()
+                        .zip(&fields)
+                        .map(|(ids, field)| token_prompt(&tokenizer, ids, field, embedding_rows)),
+                )
+                .await?
             }
         };
 
@@ -108,18 +125,29 @@ async fn encode_prompts(
         .collect())
 }
 
-/// A prompt given as token ids goes to the engine as given, with no encode.
-/// Its text, for `echo` and for the policies that route on text, is the ids'
-/// decode with special tokens kept, as the engines' own servers echo a token
-/// prompt; a long prompt decodes off the worker thread, as a long text
-/// encodes. An id the vocabulary lacks is the decoder's call: the byte-level
-/// and HF decoders drop it and the prompt rides on for the engine to refuse,
-/// as on `/generate`; the tiktoken decoder refuses it, and so does the
-/// gateway, here.
+/// A prompt given as token ids goes to the engine as given, with no encode,
+/// once every id is bound to a row of the model's embedding table
+/// ([`reject_unknown_token_id`], the rule `/generate` applies to `input_ids`:
+/// on the headless lanes an id past the table is an out-of-range index on
+/// the engine, not a refused request). Its text, for `echo` and for the
+/// policies that route on text, is the ids' decode with special tokens kept,
+/// as the engines' own servers echo a token prompt; a long prompt decodes off
+/// the worker thread, as a long text encodes. `field` names the prompt in a
+/// refusal: `prompt`, or `prompt[b]` for one list of a batch.
 async fn token_prompt(
     tokenizer: &Arc<dyn Tokenizer>,
     ids: &[u32],
+    field: &str,
+    embedding_rows: impl FnOnce() -> Option<usize>,
 ) -> Result<CompletionItem, Response> {
+    reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(|message| {
+        error!(
+            function = "CompletionPreparationStage::execute",
+            error = %message,
+            "Prompt token id outside the model's vocabulary"
+        );
+        error::bad_request("invalid_prompt_token", message)
+    })?;
     let token_ids = ids.to_vec();
     let text = utils::decode_blocking(tokenizer.clone(), token_ids.clone(), false)
         .await
@@ -144,8 +172,24 @@ mod tests {
 
     use super::*;
 
+    /// The mock's base vocabulary is its token count; an added token sits far above it.
     fn mock() -> Arc<dyn Tokenizer> {
-        Arc::new(MockTokenizer::new())
+        Arc::new(MockTokenizer::new().with_tokens(&[("<|added|>", 50_000)]))
+    }
+
+    /// The refusal of `ids` under `field`: a 400 of this route's code, its body returned.
+    async fn refusal(tokenizer: &Arc<dyn Tokenizer>, ids: &[u32], field: &str) -> String {
+        let response = match token_prompt(tokenizer, ids, field, || None).await {
+            Ok(_) => panic!("{ids:?} is refused"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("invalid_prompt_token"), "{body}");
+        body
     }
 
     /// A token prompt keeps its ids and takes their decode as its text, the
@@ -158,7 +202,9 @@ mod tests {
             .map(|token| tokenizer.token_to_id(token).expect("mock vocab"))
             .collect();
 
-        let item = token_prompt(&tokenizer, &ids).await.expect("known ids");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("known ids");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, "Hello world");
@@ -172,28 +218,72 @@ mod tests {
         let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
         let ids = vec![hello; 1024];
 
-        let item = token_prompt(&tokenizer, &ids).await.expect("known ids");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("known ids");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, tokenizer.decode(&ids, false).expect("decode"));
     }
 
-    /// The mock drops an id its vocabulary lacks, as the byte-level and HF
-    /// decoders do: the prompt still rides, for the engine to refuse.
+    /// An added token above the base vocabulary is known by lookup and rides
+    /// the prompt as given.
     #[tokio::test]
-    async fn an_unknown_id_has_no_text_and_still_rides_the_prompt() {
-        let item = token_prompt(&mock(), &[1, 424_242])
-            .await
-            .expect("decode keeps what it knows");
+    async fn an_added_token_above_the_vocabulary_rides_the_prompt() {
+        let tokenizer = mock();
+        let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+        let ids = vec![hello, 50_000];
 
-        assert_eq!(item.token_ids, vec![1, 424_242]);
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("an added token is a token");
+
+        assert_eq!(item.token_ids, ids);
+        assert_eq!(item.text, tokenizer.decode(&ids, false).expect("decode"));
+    }
+
+    /// An id past the vocabulary is refused before the decode, naming its
+    /// position, its value and the bound: the engine never sees it.
+    #[tokio::test]
+    async fn an_id_past_the_vocabulary_is_refused_before_the_decode() {
+        let tokenizer = mock();
+        let vocab = tokenizer.vocab_size();
+
+        let body = refusal(&tokenizer, &[1, 424_242], "prompt").await;
+
+        assert!(
+            body.contains("prompt[1] = 424242 is not a token of this model"),
+            "{body}"
+        );
+        assert!(body.contains(&format!("holds {vocab} tokens")), "{body}");
+    }
+
+    /// One list of a batch is refused under its own name.
+    #[tokio::test]
+    async fn a_list_of_a_batch_is_refused_under_its_own_name() {
+        let body = refusal(&mock(), &[2, 424_242], "prompt[1]").await;
+
+        assert!(body.contains("prompt[1][1] = 424242 "), "{body}");
+    }
+
+    /// An id the tokenizer does not know but the workers' reported embedding
+    /// table holds passes, as it would on the engine; its decode is empty.
+    #[tokio::test]
+    async fn an_id_inside_the_reported_embedding_table_passes() {
+        let tokenizer = mock();
+        let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+
+        let item = token_prompt(&tokenizer, &[hello, 1_500], "prompt", || Some(2_000))
+            .await
+            .expect("an id below the table is one the model can emit");
+
+        assert_eq!(item.token_ids, vec![hello, 1_500]);
         assert_eq!(item.text, "Hello");
     }
 
-    /// The tiktoken decoder refuses an id its encoding lacks, so on such a
-    /// model the gateway refuses the prompt itself.
+    /// A real tokenizer bounds the prompt by its own vocabulary.
     #[tokio::test]
-    async fn a_tiktoken_decoder_refuses_an_unknown_id_at_the_gateway() {
+    async fn a_real_tokenizer_bounds_the_prompt_by_its_vocabulary() {
         let tokenizer: Arc<dyn Tokenizer> =
             Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("built-in encoding"));
         let known = tokenizer
@@ -201,16 +291,11 @@ mod tests {
             .expect("encode")
             .into_token_ids();
 
-        let response = match token_prompt(&tokenizer, &[known[0], 4_000_000_000]).await {
-            Ok(_) => panic!("an unknown id is refused"),
-            Err(response) => response,
-        };
+        let body = refusal(&tokenizer, &[known[0], 4_000_000_000], "prompt").await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("invalid_prompt_token"), "{body}");
+        assert!(
+            body.contains("prompt[1] = 4000000000 is not a token of this model"),
+            "{body}"
+        );
     }
 }
