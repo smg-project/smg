@@ -1,9 +1,11 @@
 //! Policy paths a request walks without allocating, pinned: the registry's
 //! question whether some policy wants the request's text (the answer is kept
-//! where a policy is added or removed), and the least-load decision, which
+//! where a policy is added or removed), the least-load decision, which
 //! allocates its eligible list and nothing else once it has dispatched to a
-//! worker. A separate executable, so it can declare the counting allocator
-//! the pins need.
+//! worker, and a request placed by a ring policy, which pays the ring's own
+//! lookup and the record of its branch metric and nothing besides (prefix
+//! hash also its eligible list and its boundary list). A separate executable,
+//! so it can declare the counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -18,10 +20,13 @@ use http::HeaderMap;
 use openai_protocol::worker::HealthCheckConfig;
 use smg::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-    policies::{LeastLoadPolicy, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PolicyRegistry,
+        PrefixHashConfig, PrefixHashPolicy, SelectWorkerInfo,
+    },
     worker::{
         load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, Worker, WorkerType,
+        BasicWorkerBuilder, HashRing, Worker, WorkerType,
     },
 };
 
@@ -179,5 +184,85 @@ fn a_least_load_decision_allocates_its_eligible_list_and_nothing_else() {
         2 * decisions,
         "least-load decisions allocated {allocations} times over {decisions} decisions; the \
          eligible list (two blocks for eight workers) is the budget"
+    );
+}
+
+/// Eight ready regular workers (no health checker behind them) on a ring: a
+/// consistent-hashing request keyed by a session pays the ring's own lookup
+/// (the ring dedupes its virtual nodes in a small set per lookup) and the
+/// record of its branch metric (one block in the metrics layer, the same for
+/// every policy that records a branch), and nothing besides; a prefix-hash
+/// request of 1,024 tokens over the boundaries 64 and 256 pays one ring
+/// lookup (the deeper level's owner is under its load margin), its eligible
+/// list (a filter collected without a size hint: four entries, then eight),
+/// its boundary list and the record of its branch metric, and nothing
+/// besides. The translation of the ring's answer back to a position
+/// allocates nothing, and prefix hash spells its ring key without a string.
+#[test]
+fn a_ring_policy_request_pays_the_ring_lookup_and_nothing_besides() {
+    let workers: Vec<Arc<dyn Worker>> = (0..8)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://worker-{i}:8000"))
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let ring = Arc::new(HashRing::new(workers.iter().map(|worker| worker.url())));
+    // The ring's own cost per lookup, read on the ring alone.
+    let ring_lookup = allocations_during(|| {
+        black_box(ring.find_healthy_url("session-0001", |_| true));
+    });
+
+    let consistent = ConsistentHashingPolicy::new();
+    let keyed = SelectWorkerInfo {
+        routing_key: Some("session-0001"),
+        hash_ring: Some(ring.clone()),
+        ..Default::default()
+    };
+    let prefix = PrefixHashPolicy::new(PrefixHashConfig {
+        cache_boundaries: vec![64, 256],
+        ..Default::default()
+    });
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let prompt = SelectWorkerInfo {
+        tokens: Some(&tokens),
+        hash_ring: Some(ring.clone()),
+        ..Default::default()
+    };
+    // A first request of each: whatever is set up once is set up now.
+    assert!(consistent.select_worker(&workers, &keyed).is_some());
+    assert!(prefix.select_worker(&workers, &prompt).is_some());
+
+    let requests = 1_000;
+    let mut consistent_allocations = 0;
+    let mut prefix_allocations = 0;
+    for _ in 0..requests {
+        consistent_allocations += allocations_during(|| {
+            black_box(consistent.select_worker(&workers, &keyed));
+        });
+        prefix_allocations += allocations_during(|| {
+            black_box(prefix.select_worker(&workers, &prompt));
+        });
+    }
+    // One block per request is the branch metric's record, outside this path.
+    let metric_record = 1;
+    assert_eq!(
+        consistent_allocations,
+        (ring_lookup + metric_record) * requests,
+        "consistent-hashing requests allocated {consistent_allocations} times over {requests}; \
+         the ring's lookup ({ring_lookup}) and the branch metric's record are the budget"
+    );
+    assert_eq!(
+        prefix_allocations,
+        (ring_lookup + 3 + metric_record) * requests,
+        "prefix-hash requests allocated {prefix_allocations} times over {requests}; one ring \
+         lookup ({ring_lookup}), the eligible list's two blocks, the boundary list and the \
+         branch metric's record are the budget"
     );
 }
