@@ -9,7 +9,10 @@ use std::{os::raw::c_char, sync::Arc, time::Duration};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{chat_reasoning_starts_in_rendered_prefill, process_chat_messages};
-use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
+use smg_grpc_client::{
+    sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient},
+    FormatSetAside,
+};
 use uuid::Uuid;
 
 use super::{
@@ -174,6 +177,8 @@ pub(crate) unsafe fn start_chat_stream(
         SglangGenerateRequestOptions {
             multimodal_inputs: None, // multimodal not supported in golang bindings
             tool_call_constraint: tool_constraint,
+            // No table answers the body's format here: the engine reads it as sent.
+            format_set_aside: FormatSetAside::default(),
             require_reasoning,
         },
     ) {
