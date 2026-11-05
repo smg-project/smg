@@ -82,9 +82,11 @@ impl VllmBackend {
                 "vllm-tokenizer's fastokens backend did not load the file: {error}"
             ))
         })?;
-        // The backend builds its pre-tokenizer's matcher on the first encode
-        // (some 30 ms on a Qwen3 vocabulary): paid here, not by the first
-        // request. A space is a token of every byte-level vocabulary.
+        // The backend's first encode builds the image of its per-thread
+        // pretoken cache (every short vocabulary word merged once, some 30 ms
+        // on a Qwen3 vocabulary) and seeds this thread's copy: paid here, not
+        // by the first request. A space is a token of every byte-level
+        // vocabulary.
         tokenizer.encode(" ", false).map_err(|error| {
             Declined::from(format!(
                 "vllm-tokenizer's fastokens backend did not encode a space: {error}"
