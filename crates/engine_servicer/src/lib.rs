@@ -1,6 +1,8 @@
-//! Rust engine servicers: the per-engine gRPC contract that the Python
-//! `smg_grpc_servicer` package serves today, implemented in Rust over the
-//! same-host ZMQ engine adapter (`engine-zmq-adapter`).
+//! Rust engine servicers: the per-engine gRPC contract the Python
+//! `smg_grpc_servicer` package served before these became the default for
+//! vLLM, SGLang and TokenSpeed (for TensorRT-LLM the engine's own Python
+//! servicer, `tensorrt_llm.grpc.smg`, stays the default), implemented over
+//! the same-host ZMQ engine adapter (`engine-zmq-adapter`).
 //!
 //! The Router keeps speaking the engine's own proto (`vllm_engine.proto` for
 //! vLLM, `sglang_scheduler.proto` for SGLang, `trtllm_service.proto` for

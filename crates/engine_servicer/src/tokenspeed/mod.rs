@@ -1,10 +1,10 @@
-//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust: the
-//! contract the Python `smg_grpc_servicer.tokenspeed` package serves, over
-//! the msgpack ZMQ wire a headless TokenSpeed scheduler dials (what
-//! `ts serve --headless` speaks to the Router's direct lane). The Router
-//! cannot tell the two implementations apart; Python keeps the lifecycle,
-//! launching the headless scheduler and driving this server through the
-//! binding.
+//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust, the
+//! default for TokenSpeed: the contract the deprecated Python
+//! `smg_grpc_servicer.tokenspeed` package served, over the msgpack ZMQ wire
+//! a headless TokenSpeed scheduler dials (what `ts serve --headless` speaks
+//! to the Router's direct lane). The Router cannot tell the two
+//! implementations apart; Python keeps the lifecycle, launching the headless
+//! scheduler and driving this server through the binding.
 
 mod encode;
 mod engine;
