@@ -8,7 +8,7 @@ use tonic::Status;
 
 use super::{State, HEALTHY};
 use crate::{
-    load_report::rank_entries,
+    load_report::{mean, rank_entries},
     proto_json::{insert_capacity, struct_from_json},
     servicer::proto_token_ids,
 };
@@ -141,6 +141,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
                 max_total_num_tokens,
                 max_running_requests,
                 token_usage: figures.usage,
+                utilization: figures.usage,
                 num_waiting_uncached_tokens: estimate.queued_token_work,
                 gen_throughput: estimate.gen_throughput,
                 prefill_throughput: estimate.prefill_throughput,
@@ -162,6 +163,14 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
             }
         },
     );
+    let aggregate = sg::AggregateMetrics {
+        total_running_reqs: aggregate.running,
+        total_waiting_reqs: aggregate.waiting,
+        total_reqs: aggregate.total,
+        avg_token_usage: aggregate.avg_usage,
+        avg_throughput: mean(loads.iter().map(|load| load.gen_throughput)),
+        avg_utilization: mean(loads.iter().map(|load| load.utilization)),
+    };
     Ok(sg::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: state
@@ -169,12 +178,6 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
             .engine_version(&state.model.sglang_version, "sglang-"),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
-        aggregate: Some(sg::AggregateMetrics {
-            total_running_reqs: aggregate.running,
-            total_waiting_reqs: aggregate.waiting,
-            total_reqs: aggregate.total,
-            avg_token_usage: aggregate.avg_usage,
-            ..Default::default()
-        }),
+        aggregate: Some(aggregate),
     })
 }

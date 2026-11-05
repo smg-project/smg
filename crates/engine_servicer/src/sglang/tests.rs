@@ -1880,7 +1880,21 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
     assert_eq!(busy.loads[0].num_running_reqs, 1);
     assert_eq!(busy.loads[0].num_waiting_reqs, 2);
     assert!((busy.loads[0].token_usage - 0.05).abs() < 1e-9);
-    assert_eq!(busy.aggregate.unwrap().total_reqs, 3);
+    assert!(
+        (busy.loads[0].utilization - 0.05).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {busy:?}"
+    );
+    let aggregate = busy.aggregate.unwrap();
+    assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.05).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - busy.loads[0].gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
