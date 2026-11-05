@@ -235,14 +235,15 @@ pub struct CacheAwarePolicy {
     /// `hash → reconstructable prefix/tokens` per tree kind.
     /// Spec §7.1 mandates model scoping: the same hash can refer
     /// to different prefixes in different models, so a global
-    /// index mis-routes multi-model deployments. Bounded by
-    /// eviction at `max_tree_size` total entries.
+    /// index mis-routes multi-model deployments. Every eviction
+    /// leaves it within `max_tree_size` entries and stored size, per
+    /// model and tree kind (see [`Generations::evict`]).
     ///
     /// Per-entry value semantics differ by populate site:
     /// - `select_worker_*` (request hot paths) store the prior
-    ///   shared prefix from a pre-insert match. Bytes/entry is
-    ///   bounded by tree depth, not input size — a 32K-token
-    ///   request costs O(matched-prefix), not O(input).
+    ///   shared prefix from a pre-insert match. In multi-turn chat
+    ///   that prefix is the whole previous request, so one entry
+    ///   can cost as much as the input.
     /// - `apply_repair_page` (cold-start replay) stores the full
     ///   inserted path because the canonical path is required to
     ///   attach remote tenants at the correct node. This path
@@ -309,12 +310,137 @@ fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
 /// Keeping both kinds in one struct per model makes the
 /// "separate model-scoped hash indexes for string and token
 /// trees" invariant from spec §7.1 explicit in the type.
+///
+/// Writers reach it through `hash_index.entry`, which holds the
+/// model's shard lock, so every method that changes it takes
+/// `&mut self` and no size count can race an eviction.
 #[derive(Debug, Default)]
 struct PerModelHashIndex {
     /// path hash → matched prefix (reconstructs the string-tree node).
-    string_tree: DashMap<u64, String>,
+    /// Sized in bytes; a char is at least one byte, so bounding the
+    /// bytes by `max_tree_size` keeps it within the tree's char budget.
+    string_tree: Generations<String>,
     /// token-path hash → tokens (reconstructs the token-tree node).
-    token_tree: DashMap<u64, Vec<u32>>,
+    token_tree: Generations<Vec<u32>>,
+}
+
+impl PerModelHashIndex {
+    /// Rotate each tree kind independently; see [`Generations::evict`].
+    fn evict(&mut self, model_id: &str, max_size: usize) {
+        if self.string_tree.evict(max_size) {
+            debug!(
+                model_id,
+                "String hash index rotated its generations (max_size: {})", max_size
+            );
+        }
+        if self.token_tree.evict(max_size) {
+            debug!(
+                model_id,
+                "Token hash index rotated its generations (max_size: {})", max_size
+            );
+        }
+    }
+}
+
+/// Size of a hash-index value: bytes for text, tokens for a token path.
+trait StoredSize {
+    fn stored_size(&self) -> usize;
+}
+
+impl StoredSize for String {
+    fn stored_size(&self) -> usize {
+        self.len()
+    }
+}
+
+impl StoredSize for Vec<u32> {
+    fn stored_size(&self) -> usize {
+        self.len()
+    }
+}
+
+/// One tree kind's hash index, held in two write generations. Eviction
+/// preserves entries while they fit, preferring the newer generation under
+/// pressure. Missing hashes can still trigger repairs when the budget is
+/// smaller than the working set; this does not change the mesh protocol.
+#[derive(Debug, Default)]
+struct Generations<V> {
+    current: HashMap<u64, V>,
+    previous: HashMap<u64, V>,
+    current_size: usize,
+    previous_size: usize,
+}
+
+impl<V: StoredSize> Generations<V> {
+    /// Store `value` in the current generation. A hash held by the
+    /// previous generation moves, so each hash is stored and counted once.
+    fn insert(&mut self, node_hash: u64, value: V) {
+        if let Some(old) = self.previous.remove(&node_hash) {
+            self.previous_size -= old.stored_size();
+        }
+        self.current_size += value.stored_size();
+        if let Some(old) = self.current.insert(node_hash, value) {
+            self.current_size -= old.stored_size();
+        }
+    }
+
+    fn get(&self, node_hash: u64) -> Option<&V> {
+        self.current
+            .get(&node_hash)
+            .or_else(|| self.previous.get(&node_hash))
+    }
+
+    fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+
+    #[cfg(test)]
+    fn size(&self) -> usize {
+        self.current_size + self.previous_size
+    }
+
+    /// Reject individually oversized values, then rotate a generation over
+    /// half the budget if the previous one is empty or the combined index is
+    /// over budget. Otherwise keep both: overwrites alone must not evict a
+    /// working set that fits. Trim an oversized generation to an arbitrary
+    /// subset that fits, including repair bursts. Returns whether we rotated.
+    fn evict(&mut self, max_size: usize) -> bool {
+        if self.current_size > max_size {
+            self.current.retain(|_, value| {
+                let size = value.stored_size();
+                if size > max_size {
+                    self.current_size -= size;
+                    return false;
+                }
+                true
+            });
+        }
+        let half = max_size / 2;
+        let over_budget =
+            self.len() > max_size || self.current_size + self.previous_size > max_size;
+        let rotate = (self.previous.is_empty() || over_budget)
+            && (self.current.len() > half || self.current_size > half);
+        if rotate {
+            self.previous = std::mem::take(&mut self.current);
+            self.previous_size = std::mem::take(&mut self.current_size);
+        }
+        let room_len = max_size - self.current.len();
+        let room_size = max_size - self.current_size;
+        if self.previous.len() > room_len || self.previous_size > room_size {
+            let (mut len, mut size) = (0, 0);
+            self.previous.retain(|_, value| {
+                let value_size = value.stored_size();
+                let keep = len < room_len && size + value_size <= room_size;
+                if keep {
+                    len += 1;
+                    size += value_size;
+                }
+                keep
+            });
+            self.previous_size = size;
+        }
+        rotate
+    }
 }
 
 /// Total cached characters across tenants and the tenant count for one
@@ -427,24 +553,9 @@ impl CacheAwarePolicy {
                     // must not wipe other models' still-valid metadata.
                     // Each tree kind is checked independently.
                     let mut hash_total: usize = 0;
-                    for entry in hash_index_clone.iter() {
-                        let per_model = entry.value();
-                        if per_model.string_tree.len() > max_tree_size {
-                            per_model.string_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "String hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
-                        if per_model.token_tree.len() > max_tree_size {
-                            per_model.token_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "Token hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
+                    for mut entry in hash_index_clone.iter_mut() {
+                        let (model_id, per_model) = entry.pair_mut();
+                        per_model.evict(model_id, max_tree_size);
                         hash_total += per_model.string_tree.len() + per_model.token_tree.len();
                     }
 
@@ -651,7 +762,7 @@ impl CacheAwarePolicy {
         node_hash: u64,
         matched: &str,
     ) {
-        let entry = self.hash_index.entry(model_id.to_string()).or_default();
+        let mut entry = self.hash_index.entry(model_id.to_string()).or_default();
         match tree_kind {
             TreeKind::String => {
                 entry.string_tree.insert(node_hash, matched.to_string());
@@ -962,22 +1073,9 @@ impl CacheAwarePolicy {
         // Evict hash index per model per tree kind. `max_size` is a
         // per-tree bound; clearing one model's overflow must not wipe
         // other models' still-valid metadata.
-        for entry in self.hash_index.iter() {
-            let per_model = entry.value();
-            if per_model.string_tree.len() > max_size {
-                per_model.string_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "String hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
-            if per_model.token_tree.len() > max_size {
-                per_model.token_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "Token hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
+        for mut entry in self.hash_index.iter_mut() {
+            let (model_id, per_model) = entry.pair_mut();
+            per_model.evict(model_id, max_size);
         }
     }
 
@@ -1145,7 +1243,7 @@ impl TreeHandle for CacheAwarePolicy {
         };
         match tree_kind {
             TreeKind::String => {
-                let Some(path) = model_entry.string_tree.get(&node_hash) else {
+                let Some(path) = model_entry.string_tree.get(node_hash) else {
                     return false;
                 };
                 let Some(tree) = self.string_trees.get(model_id) else {
@@ -1163,11 +1261,11 @@ impl TreeHandle for CacheAwarePolicy {
                     );
                     return false;
                 };
-                tree.insert_text(path.value(), worker_url);
+                tree.insert_text(path, worker_url);
                 true
             }
             TreeKind::Token => {
-                let Some(tokens) = model_entry.token_tree.get(&node_hash) else {
+                let Some(tokens) = model_entry.token_tree.get(node_hash) else {
                     return false;
                 };
                 let Some(tree) = self.token_trees.get(model_id) else {
@@ -1178,7 +1276,7 @@ impl TreeHandle for CacheAwarePolicy {
                     );
                     return false;
                 };
-                tree.insert_tokens(tokens.value(), worker_url);
+                tree.insert_tokens(tokens, worker_url);
                 true
             }
         }
