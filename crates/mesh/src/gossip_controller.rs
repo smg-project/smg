@@ -52,7 +52,7 @@ use super::{
             gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
             PingReq, StateSync, StreamMessage,
         },
-        ClusterState,
+        status_of, ClusterState,
     },
 };
 use crate::{
@@ -155,7 +155,7 @@ impl GossipController {
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
-            log::info!("Round {} Status:{:?}", round, self.state.read());
+            log::trace!("Round {} Status:{:?}", round, self.state.read());
             self.reap_finished_streams().await;
             let targets = self.probe_targets();
             let peer = self.peer_to_dial(&targets, round);
@@ -171,7 +171,7 @@ impl GossipController {
 
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
                     let Some(peer) = peer else {
-                        log::info!("No peer address available to connect");
+                        log::debug!("No peer address available to connect");
                         continue;
                     };
                     let outcome = Self::dial_with_backoff(
@@ -183,7 +183,7 @@ impl GossipController {
                     .await;
                     match outcome {
                         DialOutcome::Connected => {
-                            log::info!("Successfully connected to peer {}", peer.name);
+                            log::debug!("Successfully connected to peer {}", peer.name);
                         }
                         DialOutcome::JoinPeerAlone { next_delay } => {
                             log::debug!(
@@ -364,8 +364,9 @@ impl GossipController {
 
     /// A peer's answer to a probe, direct or relayed, written into the
     /// table: an `Alive` or `Leaving` status and the address it advertises
-    /// go in and the entry comes back; any other status is left to the
-    /// verdict path and `None` comes back.
+    /// go in and the entry comes back, with one info line when the status
+    /// held for the member changed (the member's own word); any other
+    /// status is left to the verdict path and `None` comes back.
     pub(crate) fn record_in_table(
         state: &ClusterState,
         node_update: &NodeUpdate,
@@ -376,6 +377,7 @@ impl GossipController {
             return None;
         }
         let mut s = state.write();
+        let held = s.get(&node_update.name).map(status_of);
         let entry = s
             .entry(node_update.name.clone())
             .and_modify(|e| {
@@ -389,7 +391,20 @@ impl GossipController {
                 version: 1,
                 metadata: HashMap::new(),
             });
-        Some(entry.clone())
+        let entry = entry.clone();
+        if held != Some(status_of(&entry)) {
+            log::info!(
+                "Member {} is {:?} at version {} (its own word; was {})",
+                entry.name,
+                status_of(&entry),
+                entry.version,
+                held.map_or_else(
+                    || "not in the table".to_string(),
+                    |status| format!("{status:?}")
+                )
+            );
+        }
+        Some(entry)
     }
 
     /// The answer a relay brought back: recorded (`true`) when it is the
@@ -419,7 +434,7 @@ impl GossipController {
             );
             return false;
         }
-        log::info!("Received NodeUpdate through the relay: {:?}", node_update);
+        log::debug!("Received NodeUpdate through the relay: {:?}", node_update);
         Self::record_in_table(state, node_update);
         true
     }
@@ -428,7 +443,7 @@ impl GossipController {
     /// (`record_in_table`), and for an `Alive` member the sync stream,
     /// started at the freshest address over the link that has just answered.
     async fn record_answer(&self, node_update: NodeUpdate) {
-        log::info!("Received NodeUpdate from peer: {:?}", node_update);
+        log::debug!("Received NodeUpdate from peer: {:?}", node_update);
         let Some(updated_peer) = Self::record_in_table(&self.state, &node_update) else {
             return;
         };
@@ -450,7 +465,7 @@ impl GossipController {
     }
 
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
-        log::info!("Connecting to peer {} at {}", peer.name, peer.address);
+        log::debug!("Connecting to peer {} at {}", peer.name, peer.address);
 
         let read_state = self.state.clone();
 
@@ -472,7 +487,12 @@ impl GossipController {
         {
             Ok(node_update) => self.record_answer(node_update).await,
             Err(e) => {
-                log::info!("Failed to connect to peer: {}, now try ping-req", e);
+                log::warn!(
+                    "Failed to connect to peer {} at {}: {}, now try ping-req",
+                    peer_name,
+                    peer.address,
+                    e
+                );
                 let mut map = read_state.read().clone();
                 map.retain(|k, v| {
                     k.ne(&self.self_name)
@@ -482,7 +502,7 @@ impl GossipController {
                 let random_nodes = get_random_values_refs(&map, 3);
                 let mut reachable = false;
                 for node in random_nodes {
-                    log::info!(
+                    log::debug!(
                         "Trying to ping-req node {}, req target: {}",
                         node.address,
                         peer_addr
@@ -559,7 +579,7 @@ impl GossipController {
             }
         }
 
-        log::info!("Successfully connected to peer {}", peer_addr);
+        log::debug!("Successfully connected to peer {}", peer_addr);
 
         Ok(())
     }
@@ -697,7 +717,7 @@ impl GossipController {
                                 round_elapsed,
                             );
                             if round_elapsed.as_millis() > 10 {
-                                log::info!(
+                                log::debug!(
                                     peer = %peer_name_incremental,
                                     round_ms = round_elapsed.as_millis(),
                                     "mesh sync round"
