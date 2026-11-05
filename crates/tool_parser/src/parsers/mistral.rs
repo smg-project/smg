@@ -59,7 +59,7 @@ impl MistralParser {
             if name.is_empty() {
                 continue;
             }
-            let schema = &tool.function.parameters;
+            let schema = tool.function.parameters_schema();
             let name_json = serde_json::to_string(name).unwrap_or_default();
             tags.push(serde_json::json!({
                 "begin": format!("{{\"name\": {name_json}, \"arguments\": "),

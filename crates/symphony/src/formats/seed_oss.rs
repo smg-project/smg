@@ -167,7 +167,9 @@ mod tests {
             function: Function {
                 name: "submit_patch".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {"patch": {"type": "string"}}}),
+                parameters: Some(
+                    value!({"type": "object", "properties": {"patch": {"type": "string"}}}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },
@@ -254,7 +256,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": properties}),
+                parameters: Some(value!({"type": "object", "properties": properties})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -569,11 +571,11 @@ mod tests {
             function: Function {
                 name: "detailed_weather_forecast".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "location": {"type": "string"},
                     "days": {"type": "integer"},
                     "details": {"type": "array", "items": {"type": "string"}},
-                }, "required": ["location", "days", "details"]}),
+                }, "required": ["location", "days", "details"]})),
                 strict: None,
                 extra: Default::default(),
             },

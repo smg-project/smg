@@ -403,7 +403,7 @@ impl ParserRegistry {
         // Fall back to generic JSON schema
         match tool_choice {
             ToolChoice::Function { .. } => {
-                let params_schema = serde_json::to_string(&tools[0].function.parameters)
+                let params_schema = serde_json::to_string(tools[0].function.parameters_schema())
                     .map_err(|e| format!("Failed to serialize tool parameters: {e}"))?;
                 Ok(Some(ToolConstraint::JsonSchema(params_schema)))
             }
@@ -785,7 +785,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
                     "type": "string",
                     "enum": [tool.function.name]
                 },
-                "parameters": tool.function.parameters
+                "parameters": tool.function.parameters_schema()
             },
             "required": ["name", "parameters"]
         });
@@ -795,7 +795,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Consolidate $defs from all tools
     let mut all_defs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for tool in tools {
-        if let serde_json::Value::Object(params) = &tool.function.parameters {
+        if let serde_json::Value::Object(params) = tool.function.parameters_schema() {
             if let Some(serde_json::Value::Object(defs)) = params.get("$defs") {
                 for (def_name, def_schema) in defs {
                     if let Some(existing) = all_defs.get(def_name) {

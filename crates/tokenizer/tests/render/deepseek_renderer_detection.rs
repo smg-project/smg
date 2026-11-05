@@ -1067,7 +1067,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
             function: Function {
                 name: "lookup".to_string(),
                 description: None,
-                parameters: parameters.clone(),
+                parameters: Some(parameters.clone()),
                 strict: None,
                 extra: Default::default(),
             },

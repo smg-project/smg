@@ -747,7 +747,7 @@ mod tests {
             {"type": "sequence", "elements": [
                 {"type": "regex", "pattern": "[0-9]+"},
                 {"type": "const_string", "value": "<|tool_call_argument_begin|>"},
-                {"type": "json_schema", "json_schema": tool.function.parameters},
+                {"type": "json_schema", "json_schema": tool.function.parameters_schema()},
             ]},
             {"type": "const_string", "value": "<|tool_call_end|>"},
         ]})

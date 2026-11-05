@@ -55,7 +55,7 @@ pub(super) fn calls(
                 "{before}{}{}\">{line}",
                 markers.call_open, tool.function.name
             ),
-            arguments(tags, &ends, &tool.function.parameters),
+            arguments(tags, &ends, tool.function.parameters_schema()),
             format!("{}{line}{after}", markers.call_close),
         )
     };

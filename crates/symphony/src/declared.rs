@@ -74,7 +74,7 @@ impl Declared {
         self.tools
             .iter()
             .find(|tool| tool.function.name == function)
-            .map(|tool| &tool.function.parameters)
+            .map(|tool| tool.function.parameters_schema())
     }
 
     /// The kind `function` declares for `parameter`, if it declares one.
@@ -119,7 +119,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": properties}),
+                parameters: Some(value!({"type": "object", "properties": properties})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn a_tool_without_properties_declares_nothing_and_the_first_of_two_names_counts() {
         let mut bare = tool("bare", value!({}));
-        bare.function.parameters = value!({"type": "object"});
+        bare.function.parameters = Some(value!({"type": "object"}));
         let declared = Declared::of(&[
             bare,
             tool("twice", value!({"x": {"type": "integer"}})),
@@ -399,7 +399,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -449,7 +449,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -479,7 +479,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -789,7 +789,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },

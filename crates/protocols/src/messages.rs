@@ -931,7 +931,7 @@ impl From<&CustomTool> for common::Tool {
             function: common::Function {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: Value::from(&tool.input_schema),
+                parameters: Some(Value::from(&tool.input_schema)),
                 strict: None,
                 extra: Default::default(),
             },
@@ -3643,7 +3643,7 @@ mod tests {
         let weather = &tools[0];
         assert_eq!(weather.tool_type, "function");
         assert_eq!(weather.function.description.as_deref(), Some("Get weather"));
-        let keys: Vec<&str> = weather.function.parameters["properties"]
+        let keys: Vec<&str> = weather.function.parameters_schema()["properties"]
             .as_object()
             .expect("properties")
             .keys()
@@ -3652,7 +3652,7 @@ mod tests {
         assert_eq!(keys, ["city"]);
         let keys: Vec<&str> = weather
             .function
-            .parameters
+            .parameters_schema()
             .as_object()
             .expect("an object schema")
             .keys()
@@ -3662,7 +3662,10 @@ mod tests {
             keys,
             ["type", "properties", "required", "additionalProperties"]
         );
-        assert_eq!(tools[1].function.parameters, json!({"type": "object"}));
+        assert_eq!(
+            tools[1].function.parameters_schema(),
+            &json!({"type": "object"})
+        );
         let none: CreateMessageRequest =
             serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
                 .expect("a Messages request");

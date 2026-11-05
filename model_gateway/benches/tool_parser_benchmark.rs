@@ -130,13 +130,13 @@ fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "search".to_string(),
                 description: Some("Search for information".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "limit": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -146,13 +146,13 @@ fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "code_interpreter".to_string(),
                 description: Some("Execute code".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "language": {"type": "string"},
                         "code": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

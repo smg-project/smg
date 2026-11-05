@@ -240,16 +240,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          re-recorded under the engine's rule",
     ),
     (
-        "falcon-h1-3b-instruct/render/glaive-v2-24087-0",
-        "a declared tool without parameters: the gateway renders its parameters as an empty \
-         object where the template reference writes null (2 cases of glaive-v2-15)",
-    ),
-    (
-        "falcon-h1-3b-instruct/render/glaive-v2-24087-2",
-        "a declared tool without parameters: the gateway renders its parameters as an empty \
-         object where the template reference writes null (2 cases of glaive-v2-15)",
-    ),
-    (
         "hermes-4-14b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \

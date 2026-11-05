@@ -2132,3 +2132,35 @@ fn process_with_derived_profile(
         ProviderProfile::for_model(&request.model),
     )
 }
+
+/// A tool declared without a parameter schema reaches the template with
+/// `"parameters": null`, whether the request left the field out or wrote
+/// `null`, as the engine's own server hands its declarations to the same
+/// template; a client's own `{}` stays `{}`. The prepared tool set keeps the
+/// two shapes apart as well: the second request reads the kept value.
+#[test]
+fn a_tool_declared_without_a_schema_reaches_the_template_with_a_null_schema() {
+    let tokenizer = llm_tokenizer::MockTokenizer::new()
+        .with_chat_template("{% for tool in tools %}{{ tool | tojson }};{% endfor %}")
+        .expect("chat template");
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "absent"}},
+            {"type": "function", "function": {"name": "nulled", "parameters": null}},
+            {"type": "function", "function": {"name": "empty", "parameters": {}}},
+        ]
+    }))
+    .expect("chat request");
+    for pass in ["first", "second"] {
+        let processed = process_chat_messages(&request, &tokenizer, None).expect(pass);
+        assert_eq!(
+            processed.text,
+            "{\"type\": \"function\", \"function\": {\"name\": \"absent\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"nulled\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"empty\", \"parameters\": {}}};",
+            "{pass} render"
+        );
+    }
+}

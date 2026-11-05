@@ -2540,7 +2540,7 @@ fn tag_tools() -> Vec<Tool> {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },

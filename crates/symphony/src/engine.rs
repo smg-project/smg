@@ -1663,7 +1663,9 @@ mod tests {
                 function: Function {
                     name: format!("tool_{k:02}"),
                     description: None,
-                    parameters: value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                    parameters: Some(
+                        value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                    ),
                     strict: None,
                     extra: Default::default(),
                 },
