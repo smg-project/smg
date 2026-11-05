@@ -12,7 +12,7 @@ use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
-use tokio::net::TcpSocket;
+use tokio::net::{TcpListener, TcpSocket};
 
 /// A loopback address nothing answers at, refused for as long as this value
 /// lives.
@@ -65,6 +65,41 @@ impl RefusedAddress {
     pub fn http_url(&self) -> String {
         format!("http://{}", self.addr)
     }
+}
+
+/// An engine's HTTP metadata endpoints as a test serves them: each route
+/// answers every GET with its status and JSON body, any other path a 404.
+/// Returns the base URL; the stub serves for as long as the runtime that
+/// spawned it runs.
+#[expect(
+    clippy::expect_used,
+    reason = "a test fixture: a loopback port the system cannot give is a test failure"
+)]
+pub async fn serve_json_routes(
+    routes: Vec<(&'static str, http::StatusCode, serde_json::Value)>,
+) -> String {
+    let mut router = axum::Router::new();
+    for (path, status, body) in routes {
+        router = router.route(
+            path,
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { (status, axum::Json(body)) }
+            }),
+        );
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a loopback port of the system's choice");
+    let addr = listener.local_addr().expect("the bound address");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test fixture: the stub lives as long as the test's runtime"
+    )]
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
 }
 
 /// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
