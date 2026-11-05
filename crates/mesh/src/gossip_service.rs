@@ -54,7 +54,7 @@ use super::{
         gossip::{
             self,
             gossip_server::{Gossip, GossipServer},
-            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
+            GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping, PingReq, StreamMessage,
         },
         ClusterState,
     },
@@ -308,7 +308,11 @@ impl Gossip for GossipService {
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
                 log::info!("PingReq to node {} addr:{}", node.name, node.address);
-                let res = self.dialer.ping(&node, None).await?;
+                // The probe sent on the asker's behalf carries no table: the
+                // asker's is not this node's to send, and the target's own
+                // answer is what the asker is waiting for.
+                let probe = gossip::gossip_message::Payload::Ping(Ping { state_sync: None });
+                let res = self.dialer.ping(&node, Some(probe)).await?;
                 Ok(Response::new(res))
             }
             _ => Err(Status::invalid_argument("Invalid message payload")),
