@@ -16,7 +16,11 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+WORKFLOWS = sorted(
+    path
+    for suffix in ("yml", "yaml")
+    for path in (ROOT / ".github" / "workflows").glob(f"*.{suffix}")
+)
 GLOB = re.compile(r"[*?\[]")
 
 
