@@ -33,9 +33,11 @@
 //! look the same from here, a request's future dropped without a response.
 
 use std::{
+    future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
+    time::Instant,
 };
 
 use axum::{
@@ -45,6 +47,7 @@ use axum::{
 };
 use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
+use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 use super::{
@@ -53,7 +56,7 @@ use super::{
 };
 use crate::{
     observability::{
-        inflight_tracker::InFlightRequestTracker,
+        inflight_tracker::{InFlightGuard, InFlightRequestTracker},
         metrics::{method_to_static_str, Metrics},
     },
     routers::{
@@ -173,13 +176,11 @@ pub struct HttpMetricsMiddleware<S> {
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
 where
-    S: Service<Request, Response = Response> + Send + Clone + 'static,
-    S::Future: Send + 'static,
+    S: Service<Request, Response = Response>,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = HttpMetricsFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -196,61 +197,121 @@ where
         req.extensions_mut().insert(started);
         let start = started.instant();
 
-        let mut inner = self.inner.clone();
-        let in_flight_request_tracker = self.in_flight_request_tracker.clone();
-
-        Box::pin(async move {
-            let guard = in_flight_request_tracker.track_from(start);
-            Metrics::set_http_connections_active(in_flight_request_tracker.len());
-            // Counted once the outcome is known. Dropped with this future
-            // before the handler answered (what the server does with a
-            // request whose client closed the connection), it counts the
-            // request as closed by the client.
-            let mut outcome = ResponseOutcome::pending(path.clone());
-
-            let mut response = match inner.call(req).await {
-                Ok(response) => response,
-                Err(e) => {
-                    // Decrement on error too.
-                    drop(guard);
-                    Metrics::set_http_connections_active(in_flight_request_tracker.len());
-                    outcome.forget();
-                    return Err(e);
-                }
-            };
-
-            outcome.head(&response);
-
-            // Hold the in-flight guard for the response BODY's lifetime, not
-            // the handler's: streaming handlers return their response
-            // immediately and keep generating from a detached task, and the
-            // guard is what `wait_for_drain()` and the age histogram observe.
-            // The outcome rides along: the response counts when its body
-            // ends, and as a client-closed request when the body is dropped
-            // before that. The layers inside handed over what they hold
-            // until the body ends; the one wrapper carries it all.
-            let progress = BodyProgress::new(&response);
-            let duties = BodyDuties::take(&mut response);
-            // The head went out: at the access-log layer's stamp of it when
-            // that layer is in the stack (it hands the stamp over with the
-            // duties), else read here.
-            let head_at = duties.head_at.unwrap_or_else(clock_now);
-            Metrics::record_http_duration(
+        let tracker = Arc::clone(&self.in_flight_request_tracker);
+        let guard = tracker.track_from(start);
+        Metrics::set_http_connections_active(tracker.len());
+        // Counted once the outcome is known. Dropped with the future before
+        // the handler answered (what the server does with a request whose
+        // client closed the connection), it counts the request as closed by
+        // the client.
+        let outcome = ResponseOutcome::pending(path);
+        // The inner service is called here, not from the future: the layer
+        // keeps no clone of the stack inside it per request (a clone of a
+        // route is a heap copy of the service in it), and its future is the
+        // route's own with the edge's duty beside it, not a box around both.
+        HttpMetricsFuture {
+            inner: self.inner.call(req),
+            duty: Some(EdgeDuty {
                 method,
-                path.as_str(),
-                head_at.saturating_duration_since(start),
-            );
-            let (parts, body) = response.into_parts();
-            let body = Body::new(EdgeBody::new(
-                body,
-                guard,
-                in_flight_request_tracker,
+                start,
+                tracker,
                 outcome,
-                progress,
-                duties,
-            ));
-            Ok(Response::from_parts(parts, body))
+                guard,
+            }),
+        }
+    }
+}
+
+pin_project! {
+    /// The metrics layer's future: the route's future, then the edge's
+    /// bookkeeping of the answer (the duration, the response head counted,
+    /// the one body wrapper). `duty` is what the edge holds for the request
+    /// until the route answers, taken at the answer.
+    pub struct HttpMetricsFuture<F> {
+        #[pin]
+        inner: F,
+        duty: Option<EdgeDuty>,
+    }
+}
+
+/// What the metrics layer holds for a request between its arrival and the
+/// route's answer. Dropped with the future before the answer, it counts the
+/// request as closed by the client and releases its in-flight guard.
+struct EdgeDuty {
+    method: &'static str,
+    start: Instant,
+    tracker: Arc<InFlightRequestTracker>,
+    outcome: ResponseOutcome,
+    guard: InFlightGuard,
+}
+
+impl<F, E> Future for HttpMetricsFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let answer = ready!(this.inner.poll(cx));
+        Poll::Ready(match this.duty.take() {
+            Some(duty) => duty.answered(answer),
+            // A poll after the answer breaks the caller's contract; the
+            // route's word to it passes through.
+            None => answer,
         })
+    }
+}
+
+impl EdgeDuty {
+    /// The route answered: the response head is counted and the body wrapped
+    /// once; an error of the inner service releases the guard and counts
+    /// nothing.
+    fn answered<E>(self, answer: Result<Response, E>) -> Result<Response, E> {
+        let Self {
+            method,
+            start,
+            tracker,
+            mut outcome,
+            guard,
+        } = self;
+        let mut response = match answer {
+            Ok(response) => response,
+            Err(e) => {
+                // Decrement on error too.
+                drop(guard);
+                Metrics::set_http_connections_active(tracker.len());
+                outcome.forget();
+                return Err(e);
+            }
+        };
+
+        outcome.head(&response);
+
+        // Hold the in-flight guard for the response BODY's lifetime, not
+        // the handler's: streaming handlers return their response
+        // immediately and keep generating from a detached task, and the
+        // guard is what `wait_for_drain()` and the age histogram observe.
+        // The outcome rides along: the response counts when its body
+        // ends, and as a client-closed request when the body is dropped
+        // before that. The layers inside handed over what they hold
+        // until the body ends; the one wrapper carries it all.
+        let progress = BodyProgress::new(&response);
+        let duties = BodyDuties::take(&mut response);
+        // The head went out: at the access-log layer's stamp of it when
+        // that layer is in the stack (it hands the stamp over with the
+        // duties), else read here.
+        let head_at = duties.head_at.unwrap_or_else(clock_now);
+        Metrics::record_http_duration(
+            method,
+            outcome.path(),
+            head_at.saturating_duration_since(start),
+        );
+        let (parts, body) = response.into_parts();
+        let body = Body::new(EdgeBody::new(
+            body, guard, tracker, outcome, progress, duties,
+        ));
+        Ok(Response::from_parts(parts, body))
     }
 }
 
@@ -272,6 +333,11 @@ impl ResponseOutcome {
             head: None,
             recorded: false,
         }
+    }
+
+    /// The path label the response counts under.
+    pub(super) fn path(&self) -> &str {
+        self.path.as_str()
     }
 
     /// The response head is out: the status a completed response counts as.

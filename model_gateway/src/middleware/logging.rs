@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -33,12 +33,15 @@ use axum::{
     response::Response,
 };
 use opentelemetry::trace::TraceContextExt;
+use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 use tower_http::{
     classify::ServerErrorsFailureClass,
     trace::{MakeSpan, OnFailure, OnRequest, OnResponse},
 };
-use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
+use tracing::{
+    debug, error, field::Empty, info, info_span, instrument::Instrumented, warn, Instrument, Span,
+};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
@@ -534,91 +537,156 @@ pub struct RequestTraceService<S> {
 
 impl<S> Service<Request> for RequestTraceService<S>
 where
-    S: Service<Request, Response = Response> + Send + Clone + 'static,
-    S::Future: Send + 'static,
+    S: Service<Request, Response = Response>,
 {
     type Response = Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
+    type Future = RequestTraceFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request) -> Self::Future {
+    fn call(&mut self, mut request: Request) -> Self::Future {
         let span = RequestSpan.make_span(&request);
         // The latency's origin: the edge's entry stamp when the metrics layer
         // put one on the request (see `request_start`), a read of this
         // layer's own otherwise.
         let start = RequestStarted::of(request.extensions()).unwrap_or_else(clock_now);
         let fields = self.fields;
-        let mut inner = self.inner.clone();
-        Box::pin(async move {
-            record_request_fields(&span, &request, fields);
-            RequestLogger.on_request(&request, &span);
-            let mut request = request;
-            if fields.contains(AccessLogField::Tenant) || fields.contains(AccessLogField::KeyId) {
-                request.extensions_mut().insert(AccessLogRecord {
-                    span: span.clone(),
-                    fields,
-                });
-            }
-            let mut request_bytes = None;
-            if fields.contains(AccessLogField::RequestBytes) {
-                let count = Arc::new(AtomicU64::new(0));
-                let counted = Arc::clone(&count);
-                request = request.map(|body| {
-                    Body::new(CountedBody {
-                        inner: body,
-                        count: counted,
-                    })
-                });
-                request_bytes = Some(count);
-            }
-            let mut close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone());
-            // The handler's future is created and polled under the span, as
-            // the trace layer did, so everything it logs carries the span.
-            let future = {
-                let _enter = span.enter();
-                inner.call(request)
-            };
-            let mut response = match future.instrument(span.clone()).await {
-                Ok(response) => response,
-                Err(error) => {
-                    close_log.done();
-                    return Err(error);
-                }
-            };
-            let progress = BodyProgress::new(&response);
-            record_response_fields(
-                &span,
-                &response,
+        record_request_fields(&span, &request, fields);
+        RequestLogger.on_request(&request, &span);
+        if fields.contains(AccessLogField::Tenant) || fields.contains(AccessLogField::KeyId) {
+            request.extensions_mut().insert(AccessLogRecord {
+                span: span.clone(),
                 fields,
-                request_bytes.as_deref(),
-                progress.declared(),
-            );
-            let head_at = clock_now();
-            ResponseLogger.on_response(&response, head_at.saturating_duration_since(start), &span);
-            close_log.head_sent();
-            let count_bytes = fields.contains(AccessLogField::ResponseBytes);
-            // A body without a declared length is a stream: its bytes are
-            // known at its end, which then gets a line of its own.
-            let end_line = count_bytes && progress.declared().is_none();
-            // The span stays open until the body ends: handed to the edge's one
-            // body wrapper with the close line it owes and the bytes it counts,
-            // which the wrapper reports at the body's end, failure or drop. The
-            // head's stamp rides along for the metrics layer's duration.
-            BodyDuties::hand(&mut response, |duties| {
-                duties.head_at = Some(head_at);
-                duties.span = Some(SpanDuty {
-                    span,
-                    close_log,
-                    count_bytes,
-                    end_line,
-                });
             });
-            Ok(response)
+        }
+        let mut request_bytes = None;
+        if fields.contains(AccessLogField::RequestBytes) {
+            let count = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&count);
+            request = request.map(|body| {
+                Body::new(CountedBody {
+                    inner: body,
+                    count: counted,
+                })
+            });
+            request_bytes = Some(count);
+        }
+        let close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone());
+        // The handler's future is created here and polled under the span, as
+        // the trace layer did, so everything it logs carries the span. The
+        // layer keeps no clone of the stack inside it per request (a clone of
+        // a route is a heap copy of the service in it), and its future is the
+        // route's own under the span with the record's duty beside it, not a
+        // box around both.
+        let inner = {
+            let _enter = span.enter();
+            self.inner.call(request)
+        };
+        RequestTraceFuture {
+            inner: inner.instrument(span.clone()),
+            duty: Some(RecordDuty {
+                span,
+                start,
+                fields,
+                request_bytes,
+                close_log,
+            }),
+        }
+    }
+}
+
+pin_project! {
+    /// The request-span layer's future: the route's future under the span,
+    /// then the response line of the access log and the span's hand-over to
+    /// the edge's body wrapper. `duty` is the record's state until the route
+    /// answers, taken at the answer.
+    pub struct RequestTraceFuture<F> {
+        #[pin]
+        inner: Instrumented<F>,
+        duty: Option<RecordDuty>,
+    }
+}
+
+/// What the request-span layer holds for a request between its first line
+/// and the route's answer. Dropped with the future before the answer, its
+/// close log writes the client-closed line.
+struct RecordDuty {
+    span: Span,
+    start: Instant,
+    fields: AccessLogFields,
+    request_bytes: Option<Arc<AtomicU64>>,
+    close_log: ClientCloseLog,
+}
+
+impl<F, E> Future for RequestTraceFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let answer = ready!(this.inner.poll(cx));
+        Poll::Ready(match this.duty.take() {
+            Some(duty) => duty.answered(answer),
+            // A poll after the answer breaks the caller's contract; the
+            // route's word to it passes through.
+            None => answer,
         })
+    }
+}
+
+impl RecordDuty {
+    /// The route answered: the response line is written and the span handed
+    /// to the edge's body wrapper; an error of the inner service ends the
+    /// record without a line of its own.
+    fn answered<E>(self, answer: Result<Response, E>) -> Result<Response, E> {
+        let Self {
+            span,
+            start,
+            fields,
+            request_bytes,
+            mut close_log,
+        } = self;
+        let mut response = match answer {
+            Ok(response) => response,
+            Err(error) => {
+                close_log.done();
+                return Err(error);
+            }
+        };
+        let progress = BodyProgress::new(&response);
+        record_response_fields(
+            &span,
+            &response,
+            fields,
+            request_bytes.as_deref(),
+            progress.declared(),
+        );
+        let head_at = clock_now();
+        ResponseLogger.on_response(&response, head_at.saturating_duration_since(start), &span);
+        close_log.head_sent();
+        let count_bytes = fields.contains(AccessLogField::ResponseBytes);
+        // A body without a declared length is a stream: its bytes are
+        // known at its end, which then gets a line of its own.
+        let end_line = count_bytes && progress.declared().is_none();
+        // The span stays open until the body ends: handed to the edge's one
+        // body wrapper with the close line it owes and the bytes it counts,
+        // which the wrapper reports at the body's end, failure or drop. The
+        // head's stamp rides along for the metrics layer's duration.
+        BodyDuties::hand(&mut response, |duties| {
+            duties.head_at = Some(head_at);
+            duties.span = Some(SpanDuty {
+                span,
+                close_log,
+                count_bytes,
+                end_line,
+            });
+        });
+        Ok(response)
     }
 }
 
