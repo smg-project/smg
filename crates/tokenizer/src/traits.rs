@@ -178,6 +178,34 @@ impl DecodeStep {
     }
 }
 
+/// What one incremental decode step appended into the caller's buffer, and
+/// the report the step makes ([`DecodeStep::prefix_mismatch`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedStep {
+    /// The step appended text; `false` while it holds an incomplete character.
+    pub appended: bool,
+    /// As [`DecodeStep::prefix_mismatch`].
+    pub prefix_mismatch: bool,
+}
+
+/// Appends a step's text to `out`, or hands the string itself over when `out`
+/// has no allocation yet (a cleared buffer kept for reuse, a stream's delta or
+/// the stop jail, keeps its capacity and is appended to); whether there was
+/// any.
+pub(crate) fn append_step_text(text: Option<String>, out: &mut String) -> bool {
+    match text {
+        Some(text) if !text.is_empty() => {
+            if out.capacity() == 0 {
+                *out = text;
+            } else {
+                out.push_str(&text);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
@@ -318,6 +346,37 @@ pub trait Decoder: Send + Sync {
         Ok(DecodeStep {
             text,
             prefix_mismatch: false,
+        })
+    }
+
+    /// [`decode_step_reporting`](Self::decode_step_reporting), with the
+    /// step's text appended to `out` instead of returned in a string of its
+    /// own: a stream that collects its text in one buffer takes each token's
+    /// text without a string per token. The default appends the reporting
+    /// step's text; a backend whose step can write the text straight from its
+    /// tables overrides it.
+    #[expect(clippy::too_many_arguments)]
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        let step = self.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )?;
+        Ok(AppendedStep {
+            appended: append_step_text(step.text, out),
+            prefix_mismatch: step.prefix_mismatch,
         })
     }
 

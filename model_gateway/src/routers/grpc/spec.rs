@@ -260,16 +260,11 @@ pub(crate) struct CompletionResponseSpec {
     pub ignore_eos: bool,
 }
 
-impl From<&CompletionRequest> for CompletionResponseSpec {
-    fn from(request: &CompletionRequest) -> Self {
-        let prompt_texts = if request.echo {
-            match &request.prompt {
-                StringOrArray::String(text) => vec![text.clone()],
-                StringOrArray::Array(texts) => texts.clone(),
-            }
-        } else {
-            Vec::new()
-        };
+impl CompletionResponseSpec {
+    /// `prompt_texts` are the prepared prompts' texts, one per prompt (a text
+    /// prompt as sent, a token prompt decoded); only an `echo` reads them, so
+    /// a builder passes none when the request asks for no echo.
+    pub(crate) fn new(request: &CompletionRequest, prompt_texts: Vec<String>) -> Self {
         Self {
             choices_per_prompt: request.choices(),
             echo: request.echo,

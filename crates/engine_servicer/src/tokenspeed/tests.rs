@@ -881,6 +881,47 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` of an id the servicer does not hold, never seen or already
+/// finished, is reported as not found, as the Python servicer and the other
+/// wires report it, not as a success.
+#[tokio::test]
+async fn abort_of_an_unknown_or_finished_id_is_reported_not_found() {
+    let mut h = harness(model_info(), None).await;
+    let abort = |request_id: &str| ts::AbortRequest {
+        request_id: request_id.to_string(),
+        reason: String::new(),
+    };
+    let unknown = h.client.abort(abort("nobody")).await.unwrap().into_inner();
+    assert!(!unknown.success, "{unknown:?}");
+    assert_eq!(unknown.message, "Request nobody not found");
+
+    let mut stream = h
+        .client
+        .generate(generate_request("r5", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r5", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The stream's end releases the registration (the entry leaves the map
+    // after the active count drops: read the map, which the abort reads);
+    // an abort after it finds nothing to end.
+    wait_until(|| h.server.state.shared.registry.len() == 0).await;
+    let finished = h.client.abort(abort("r5")).await.unwrap().into_inner();
+    assert!(!finished.success, "{finished:?}");
+    assert_eq!(finished.message, "Request r5 not found");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `Abort` ends the stream with an `abort` Complete and reaches the
 /// scheduler. The caller's own abort stays a completion (the scheduler's own
 /// terminal abort frame for it, which arrives after, reaches no stream and
@@ -1240,6 +1281,10 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
             .is_some_and(|client| !client.get_loads().loads.is_empty())
     })
     .await;
+    // The server's own poll of the chunk credits the streamed token to the
+    // rank on the tracker (the request is not streamed to the client, so
+    // nothing here reads it first): the poll below runs once it has.
+    wait_until(|| h.server.state.shared.loads.estimate(0, 0).gen_throughput > 0.0).await;
     let loads = h
         .client
         .get_loads(ts::GetLoadsRequest::default())
@@ -1251,8 +1296,21 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!((load.num_running_reqs, load.num_waiting_reqs), (2, 1));
     assert_eq!(load.num_total_reqs, 3);
     assert!((load.token_usage - 0.1).abs() < 1e-9);
+    assert!(
+        (load.utilization - 0.1).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {load:?}"
+    );
     let aggregate = loads.aggregate.expect("aggregate");
     assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.1).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - load.gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
 
     // Once the rank's last request finished, its queue counts read idle (the
     // scheduler samples its snapshot before the finish is committed, so the
@@ -3023,6 +3081,82 @@ async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// An encode worker has no scheduler: `GetLoads` answers no rank, as the
+/// Python servicer answers it, not a zero-filled entry per connected engine;
+/// the record the relay and the records-only stream read for the role is
+/// none, so a records-only subscription pushes nothing where a generate
+/// worker's (the control, read first) pushes its rank's record at the first
+/// tick.
+#[tokio::test]
+async fn an_encode_worker_reports_no_scheduler_load() {
+    use crate::kv_events::RankLoads;
+
+    let mut generate = harness(model_info(), None).await;
+    assert!(
+        generate.server.state.rank_load(Some(0)).is_some(),
+        "a generate worker's rank has a record"
+    );
+    let mut records = generate
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    let batch = tokio::time::timeout(Duration::from_secs(5), records.message())
+        .await
+        .expect("a generate worker's record in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert!(
+        batch.load.as_ref().is_some_and(|load| load.load_only),
+        "{batch:?}"
+    );
+    drop(records);
+    generate
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+
+    let mut h = harness_with_ready(encode_model_info(), None, encode_ready()).await;
+    let loads = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(
+        (loads.dp_rank_count, loads.loads.len()),
+        (0, 0),
+        "{loads:?}"
+    );
+    let aggregate = loads.aggregate.expect("an aggregate");
+    assert_eq!((aggregate.total_reqs, aggregate.avg_token_usage), (0, 0.0));
+    assert!(
+        h.server.state.rank_load(Some(0)).is_none() && h.server.state.rank_load(None).is_none(),
+        "no record for the role"
+    );
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .is_err(),
+        "nothing is pushed for the role"
+    );
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// The encode role: the encoder service takes an `Encode`, the request

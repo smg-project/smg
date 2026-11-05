@@ -136,6 +136,11 @@ impl TokenBucket {
     }
 
     fn refill_locked(&self, inner: &mut TokenBucketInner) {
+        // Without refill the budget moves with the returns alone: nothing to
+        // add, and no clock to read for it.
+        if self.refill_rate <= 0.0 {
+            return;
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
         inner.tokens = (inner.tokens + elapsed * self.refill_rate).min(self.capacity);

@@ -9,7 +9,7 @@ use tonic::Status;
 
 use super::{State, HEALTHY};
 use crate::{
-    load_report::rank_entries,
+    load_report::{mean, rank_entries},
     proto_json::{insert_capacity, struct_from_json},
     servicer::proto_token_ids,
 };
@@ -116,6 +116,21 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 /// wire's load tail does not carry, each rank's own.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
+    if state.encode_role.is_some() {
+        // An encode worker has no scheduler: its engine runs the vision
+        // tower alone, with no running batch, no waiting queue and no KV
+        // cache, and its encode path feeds no load figure. The answer is
+        // the Python servicer's: no rank, an empty aggregate; the load
+        // record the relay and the records-only stream read from here is
+        // then none, so nothing is pushed for the role either.
+        return Ok(ts::GetLoadsResponse {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            version: "tokenspeed".to_string(),
+            dp_rank_count: 0,
+            loads: Vec::new(),
+            aggregate: Some(ts::AggregateMetrics::default()),
+        });
+    }
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let max_running_requests = state
         .shared
@@ -140,6 +155,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
                 max_total_num_tokens,
                 max_running_requests,
                 token_usage: figures.usage,
+                utilization: figures.usage,
                 // The direct TokenSpeed wire reports active pages, excluding
                 // retained cache (unlike the Python legacy GetLoad projection).
                 active_token_usage: Some(figures.usage),
@@ -164,17 +180,19 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             }
         },
     );
+    let aggregate = ts::AggregateMetrics {
+        total_running_reqs: aggregate.running,
+        total_waiting_reqs: aggregate.waiting,
+        total_reqs: aggregate.total,
+        avg_token_usage: aggregate.avg_usage,
+        avg_throughput: mean(loads.iter().map(|load| load.gen_throughput)),
+        avg_utilization: mean(loads.iter().map(|load| load.utilization)),
+    };
     Ok(ts::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: "tokenspeed".to_string(),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
-        aggregate: Some(ts::AggregateMetrics {
-            total_running_reqs: aggregate.running,
-            total_waiting_reqs: aggregate.waiting,
-            total_reqs: aggregate.total,
-            avg_token_usage: aggregate.avg_usage,
-            ..Default::default()
-        }),
+        aggregate: Some(aggregate),
     })
 }

@@ -208,10 +208,6 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -381,10 +377,6 @@ jobs:
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh check
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
   # One job per shard of scripts/ci_rust_tests.sh that a pull request can
   # affect: detect-changes maps its rust-* path filters to the shard table and
   # emits the matrix (every shard on a push to main or a dispatch). The build
@@ -484,10 +476,6 @@ jobs:
       - name: Cleanup Postgres test database
         if: always() && contains(matrix.needs, 'postgres')
         run: bash scripts/ci_agentic_svc_deps.sh cleanup-postgres-db postgres-db
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Dependency audit ---
 
@@ -2087,10 +2075,6 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
 

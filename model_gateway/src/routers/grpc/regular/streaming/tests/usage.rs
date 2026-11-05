@@ -251,7 +251,7 @@ async fn streamed_completion_usage(
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, Vec::new()),
             dispatch,
             tokenizer(),
             reservation,
@@ -282,7 +282,7 @@ async fn non_streamed_completion(
     let response = response_processor()
         .process_non_streaming_completion_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, Vec::new()),
             dispatch(),
             &mut decoder,
         )
@@ -1345,7 +1345,7 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
     let stream = stream.until_client_gone(&tx, "cmpl-eof");
     let processor = processor(false);
     let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let streamed = processor.process_completion_streaming_chunks(
         stream,
         dispatch(),

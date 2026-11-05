@@ -1,11 +1,7 @@
 name: 'Setup Rust Environment'
-description: 'Install Rust, configure sccache and caching. Requires checkout to be done first.'
+description: 'Install Rust and the Rust cache. Requires checkout to be done first.'
 
 inputs:
-  sccache-version:
-    description: 'sccache version to use'
-    required: false
-    default: 'v0.12.0'
   cache-key:
     description: >-
       rust-cache shared key. Every job saving under the same key races for
@@ -26,12 +22,10 @@ runs:
       shell: bash
       run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
-    - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        version: ${{ inputs.sccache-version }}
-        disable_annotations: true
-
+    # No compiler cache in front of rustc: the units one would serve are the
+    # dependency units the Rust cache restores, a hosted runner's local disk
+    # cache never outlives its job, and the Actions-cache backend was taken out
+    # for its request volume. The Rust cache is the whole of the caching.
     - name: Rust cache
       uses: Swatinem/rust-cache@v2
       with:
@@ -62,10 +56,3 @@ runs:
         # seldom complete between merges.
         cache-on-failure: false
         save-if: ${{ github.ref == 'refs/heads/main' }}
-
-    - name: Start sccache
-      shell: bash
-      run: |
-        if command -v sccache &> /dev/null; then
-          sccache --start-server 2>/dev/null || true
-        fi

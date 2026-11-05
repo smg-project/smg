@@ -1,7 +1,8 @@
 //! Selection-policy stage cost: what one request pays inside `WorkerSelectionPolicy::select`
 //! for each policy, what the host pays to gather the inputs from a 128-worker overlap map
-//! before calling it, and what one least-load decision pays over a fed pool (the expected-wait
-//! scorer that least_load, power_of_two and cache-aware share).
+//! before calling it, what one least-load decision pays over a fed pool (the expected-wait
+//! scorer that least_load, power_of_two and cache-aware share), and what one request pays
+//! inside the two ring policies over a ready pool with its ring.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -16,11 +17,12 @@ use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
-        LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PrefixHashConfig,
+        PrefixHashPolicy, SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, Worker, WorkerType,
+        BasicWorkerBuilder, HashRing, Worker, WorkerType,
     },
 };
 
@@ -198,10 +200,74 @@ fn bench_least_load_decision(c: &mut Criterion) {
     group.finish();
 }
 
+/// `workers` ready regular workers (no health checker behind them) and the ring built over their
+/// URLs, as the registry builds it.
+fn ring_pool(workers: usize) -> (Vec<Arc<dyn Worker>>, Arc<HashRing>) {
+    let pool: Vec<Arc<dyn Worker>> = (0..workers)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://worker-{i:03}:8000"))
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let ring = Arc::new(HashRing::new(pool.iter().map(|worker| worker.url())));
+    (pool, ring)
+}
+
+/// One request of each ring policy over a ready pool with its ring: consistent_hashing placing a
+/// session key, prefix_hash placing a 1,024-token prompt over the boundaries 64 and 256 (the
+/// deeper level's owner is under its load margin, so one ring lookup places it). Every worker is
+/// eligible, so the ring's answer is the pick.
+fn bench_ring_policies(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ring_policies/select");
+    let tokens: Vec<u32> = (0..1_024).collect();
+    for workers in [8, 32, 128] {
+        let (pool, ring) = ring_pool(workers);
+        let consistent = ConsistentHashingPolicy::new();
+        let keyed = SelectWorkerInfo {
+            routing_key: Some("session-0001"),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new("consistent_hashing", workers),
+            &workers,
+            |b, _| {
+                b.iter(|| black_box(consistent.select_worker(black_box(&pool), black_box(&keyed))));
+            },
+        );
+        let prefix = PrefixHashPolicy::new(PrefixHashConfig {
+            cache_boundaries: vec![64, 256],
+            ..Default::default()
+        });
+        let prompt = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        group.bench_with_input(
+            BenchmarkId::new("prefix_hash", workers),
+            &workers,
+            |b, _| {
+                b.iter(|| black_box(prefix.select_worker(black_box(&pool), black_box(&prompt))));
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_select,
     bench_gather_and_select,
-    bench_least_load_decision
+    bench_least_load_decision,
+    bench_ring_policies
 );
 criterion_main!(benches);

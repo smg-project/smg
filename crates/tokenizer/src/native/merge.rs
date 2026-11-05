@@ -31,13 +31,23 @@
 //! model whose symbols are not the byte tokens (a prefix or suffix on
 //! subwords, a byte without a token) or whose merges are random (dropout)
 //! declines at load and keeps the model's merge for its misses.
+//!
+//! A tiktoken vocabulary lists its tokens by rank and no merges: its encoder
+//! merges, at every step, the adjacent pair whose concatenation is the token
+//! of least rank, so every split of a token into two tokens is a merge of
+//! the token's rank, and the rank is the id. [`MergeTable::from_ranks`]
+//! reads those merges off the ranks; the loops below then apply the same
+//! rule (a pair's rank is its concatenation's rank, the least rank first,
+//! the leftmost of equal ranks: equal ranks are one token, formed at two
+//! positions by the same or by different splits).
 
 use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
 
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use tokenizers::{models::ModelWrapper, Model};
 
-use crate::encode_path::Declined;
+use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS};
 
 mod serialized;
 
@@ -132,7 +142,7 @@ impl MergeTable {
                 "more merges than a short merge's keys carry",
             ));
         }
-        let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
+        let mut table = Self::with_capacity(merges.len(), merges.len(), bpe.ignore_merges);
         table.byte_ids = byte_ids;
         let mut token = String::new();
         for (rank, (left, right)) in merges.iter().enumerate() {
@@ -158,11 +168,78 @@ impl MergeTable {
         Ok(table)
     }
 
-    /// An empty table sized for `merges` pairs.
-    fn with_capacity(merges: usize, ignore_merges: bool) -> Self {
+    /// The table of a tiktoken vocabulary's merges (see the module
+    /// documentation), or why the file's own encoder stays in place: a byte
+    /// without a token, a token that is no two tokens' concatenation, or a
+    /// token its own bytes do not merge back into (the file's encoder looks
+    /// a whole piece up before it merges; the table does not, so every token
+    /// must be the merge of its bytes for the two to agree on every piece).
+    pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
+        let mut byte_ids = [0u32; 256];
+        for (byte, id) in byte_ids.iter_mut().enumerate() {
+            *id = ranks
+                .get([byte as u8].as_slice())
+                .copied()
+                .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
+        }
+        let ranks_end = ranks.values().max().map_or(0, |&rank| rank as usize + 1);
+        // The rank ids are a dense table (`new_ids`), bounded as the decode
+        // table of such a file is: ranks reaching far past the token count
+        // keep the file on its own encoder. The bound must also stay within
+        // what a short merge's key carries of a rank.
+        const _: () = assert!(MAX_BYTE_LEVEL_TABLE_IDS <= MAX_RANKS);
+        if ranks_end > MAX_BYTE_LEVEL_TABLE_IDS {
+            return Err(Declined::from(format!(
+                "ranks up to {ranks_end} on a table bounded at {MAX_BYTE_LEVEL_TABLE_IDS}"
+            )));
+        }
+        // Every split of every token into two tokens, at the token's rank.
+        let mut splits = Vec::with_capacity(ranks.len() * 2);
+        for (token, &rank) in ranks {
+            if token.len() < 2 {
+                continue;
+            }
+            let before = splits.len();
+            for cut in 1..token.len() {
+                if let (Some(&left), Some(&right)) =
+                    (ranks.get(&token[..cut]), ranks.get(&token[cut..]))
+                {
+                    splits.push((left, right, rank));
+                }
+            }
+            if splits.len() == before {
+                return Err(Declined::from(format!(
+                    "token {rank} is no two tokens' concatenation"
+                )));
+            }
+        }
+        let mut table = Self::with_capacity(splits.len(), ranks_end, false);
+        table.byte_ids = byte_ids;
+        for &(left, right, rank) in &splits {
+            table.new_ids[rank as usize] = rank;
+            table.insert(left, right, rank);
+        }
+        let mut ids = Vec::new();
+        for (token, &rank) in ranks {
+            if token.len() < 2 {
+                continue;
+            }
+            ids.clear();
+            table.merge(token, &mut ids);
+            if ids != [rank] {
+                return Err(Declined::from(format!(
+                    "token {rank} is not the merge of its bytes"
+                )));
+            }
+        }
+        Ok(table)
+    }
+
+    /// An empty table sized for `pairs` merges over `ranks` ranks.
+    fn with_capacity(pairs: usize, ranks: usize, ignore_merges: bool) -> Self {
         // The open-addressed part at a load of 0.6 at most, two slots at least
         // (so that a probe always meets an empty slot).
-        let slots = (merges * 5 / 3 + 1).next_power_of_two().max(2);
+        let slots = (pairs * 5 / 3 + 1).next_power_of_two().max(2);
         let shift = u64::BITS - slots.trailing_zeros();
         Self {
             byte_ids: [0; 256],
@@ -170,7 +247,7 @@ impl MergeTable {
             keys: vec![EMPTY_KEY; slots].into_boxed_slice(),
             ranks: vec![NO_RANK; slots].into_boxed_slice(),
             shift,
-            new_ids: vec![0; merges].into_boxed_slice(),
+            new_ids: vec![0; ranks].into_boxed_slice(),
             ignore_merges,
         }
     }
@@ -184,7 +261,8 @@ impl MergeTable {
             + size_of_val(&*self.new_ids)
     }
 
-    /// Merges the table holds.
+    /// Ranks the table holds (one per merge of a model; one per token of a
+    /// tiktoken vocabulary, whose splits share their token's rank).
     pub(super) fn merges(&self) -> usize {
         self.new_ids.len()
     }

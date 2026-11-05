@@ -40,3 +40,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`
   is the default most clients send (#5181). `none` is still refused, because the series cannot
   switch thinking off.
+- An assistant message with its reasoning under both `reasoning_content` and `reasoning` (the key
+  of vLLM and OpenRouter, which agent clients send too) is accepted when the two texts are the
+  same. Since 1.12.0 the serde alias between the two keys refused such a message as a duplicate
+  field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
+  message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
+  `reasoning: AssistantReasoning`, whose `text` is that option.

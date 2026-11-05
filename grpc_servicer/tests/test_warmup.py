@@ -2272,15 +2272,21 @@ def test_the_python_servicer_skips_the_pass_when_the_knob_is_off_or_bad(fake_vll
     assert any("No event loop runs here" in m for m in messages)
 
 
-def _health_servicer_module():
-    """The vLLM health servicer, loaded with a stand-in for vLLM's logger."""
+def _health_servicer_module(monkeypatch):
+    """The vLLM health servicer, loaded with a stand-in for vLLM's logger.
+
+    The stand-in lives for the test alone: a bare ``vllm`` left in
+    ``sys.modules`` satisfies another file's ``importorskip("vllm")`` in the
+    same process, and that file's real imports then fail under it.
+    """
     if "vllm.logger" not in sys.modules:
         vllm = types.ModuleType("vllm")
         vllm_logger = types.ModuleType("vllm.logger")
         vllm_logger.init_logger = logging.getLogger
         vllm.logger = vllm_logger
-        sys.modules.setdefault("vllm", vllm)
-        sys.modules["vllm.logger"] = vllm_logger
+        if "vllm" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "vllm", vllm)
+        monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
     path = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "health_servicer.py"
     spec = importlib.util.spec_from_file_location("warmup_health_servicer", path)
     module = importlib.util.module_from_spec(spec)
@@ -2289,7 +2295,7 @@ def _health_servicer_module():
 
 
 def test_the_health_service_answers_not_serving_while_the_pass_runs(monkeypatch):
-    module = _health_servicer_module()
+    module = _health_servicer_module(monkeypatch)
 
     class Engine:
         async def check_health(self):

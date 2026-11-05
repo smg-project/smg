@@ -21,8 +21,8 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
-    completion::CompletionRequest,
+    common::{GenerationRequest, InputIds},
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
@@ -300,7 +300,11 @@ impl PdRoute for CompletionRequest {
 
     fn batch_size(&self) -> Option<usize> {
         match &self.prompt {
-            StringOrArray::Array(arr) if !arr.is_empty() => Some(arr.len()),
+            CompletionPrompt::Texts(_) | CompletionPrompt::TokenIdBatches(_)
+                if !self.prompt.is_empty() =>
+            {
+                Some(self.prompt.len())
+            }
             _ => None,
         }
     }
@@ -310,11 +314,14 @@ impl PdRoute for CompletionRequest {
     }
 
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
-        let text = match &self.prompt {
-            StringOrArray::String(s) => Some(s.clone()),
-            StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-        };
-        (text, None)
+        match &self.prompt {
+            CompletionPrompt::Text(s) => (Some(s.clone()), None),
+            CompletionPrompt::Texts(v) => (v.first().map(|s| s.to_string()), None),
+            // A prompt of ids routes on them, as `/generate`'s does; a batch
+            // is dispatched to one worker, so its first prompt is the signal.
+            CompletionPrompt::TokenIds(ids) => (None, Some(ids.clone())),
+            CompletionPrompt::TokenIdBatches(batches) => (None, batches.first().cloned()),
+        }
     }
 }
 
@@ -3088,6 +3095,12 @@ mod tests {
         assert_eq!(prompt.batch_size(), None);
         assert!(!prompt.returns_logprob());
         assert_eq!(prompt.routing_inputs(), (Some("only".to_string()), None));
+        let ids: CompletionRequest = req(json!({"model": "m", "prompt": [11, 12, 13]}));
+        assert_eq!(ids.batch_size(), None);
+        assert_eq!(ids.routing_inputs(), (None, Some(vec![11, 12, 13])));
+        let batches: CompletionRequest = req(json!({"model": "m", "prompt": [[11, 12], [13]]}));
+        assert_eq!(batches.batch_size(), Some(2));
+        assert_eq!(batches.routing_inputs(), (None, Some(vec![11, 12])));
 
         let rerank: RerankRequest = req(json!({"model": "m", "query": "q", "documents": ["d"]}));
         assert_eq!(RerankRequest::ROUTE, "/v1/rerank");

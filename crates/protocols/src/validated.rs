@@ -475,6 +475,7 @@ mod tests {
     use validator::Validate;
 
     use super::*;
+    use crate::chat::{ChatCompletionRequest, ChatMessage};
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
@@ -997,6 +998,11 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
                 "invalid_value",
             ),
+            // Both reasoning keys with different text are refused as a value too.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1]: invalid value: `reasoning_content` and `reasoning` disagree; send one of them, or the same text in both at line 1 column 312",
+                "invalid_value",
+            ),
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
                 "integer_below_min_value",
@@ -1109,6 +1115,11 @@ mod tests {
                 "Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
                 Some("thinking"),
             ),
+            // A custom error inside a message keeps the message's path as the param.
+            (
+                "Failed to deserialize the JSON body into the target type: messages[1]: invalid value: `reasoning_content` and `reasoning` disagree; send one of them, or the same text in both at line 1 column 312",
+                Some("messages[1]"),
+            ),
             (
                 "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",
                 None,
@@ -1161,5 +1172,88 @@ mod tests {
         ] {
             assert_eq!(param_from_deserialize_message(message).as_deref(), param, "{message}");
         }
+    }
+
+    /// The request of issue #5092: an agent client's second request, with the
+    /// model's reasoning under both keys.
+    fn replayed_turn(reasoning: &str) -> String {
+        json!({
+            "model": "zai-org/GLM-5.3",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": reasoning,
+                    "reasoning_content": "I should run ls.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"ls\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "file.txt"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    /// Reads a chat completion body through the extractor, as the gateway does.
+    async fn chat_request(body: &str) -> Result<ChatCompletionRequest, (StatusCode, Value)> {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_default();
+        match ValidatedJson::<ChatCompletionRequest>::from_request(request, &()).await {
+            Ok(ValidatedJson(body)) => Ok(body),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                ))
+            }
+        }
+    }
+
+    /// Both keys with the same text make a request, as before the alias. Both
+    /// keys with different text are refused as a value, and the param names
+    /// the message.
+    #[tokio::test]
+    async fn an_assistant_turn_spelling_its_reasoning_both_ways_is_a_request() {
+        let request = chat_request(&replayed_turn("I should run ls."))
+            .await
+            .unwrap();
+        let ChatMessage::Assistant { reasoning, .. } = &request.messages[1] else {
+            panic!("{:?}: not an assistant message", request.messages[1]);
+        };
+        assert_eq!(reasoning.text.as_deref(), Some("I should run ls."));
+
+        let (status, json) = chat_request(&replayed_turn("I should run pwd."))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "messages[1]", "{json}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
+            "{json}"
+        );
     }
 }

@@ -1,9 +1,9 @@
 mod alias_pipeline;
 mod build_parity;
 mod generate_body;
-mod generate_pretokenized;
 mod glm53;
 mod model_label;
+mod pretokenized;
 mod rate_limit_reserve;
 
 use std::{

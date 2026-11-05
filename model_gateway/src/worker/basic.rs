@@ -468,6 +468,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a token or a completion from the worker.
     fn note_token_progress(&self) {}
 
+    /// [`Self::note_token_progress`] at `now_ms` on the gateway clock
+    /// (`liveness::now_ms`): a stamp the caller read once for every note of
+    /// the same message.
+    fn note_token_progress_at(&self, _now_ms: u64) {
+        self.note_token_progress();
+    }
+
     /// Record a transport failure (a poll, probe or stream that failed on the
     /// connection); cleared by the next contact.
     fn note_transport_failure(&self) {}
@@ -624,12 +631,24 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// backlog only.
     fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
 
+    /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock: the
+    /// dispatch's one stamp.
+    fn note_prefill_started_at(&self, tokens: u64, timed: bool, _now_ms: u64) {
+        self.note_prefill_started(tokens, timed);
+    }
+
     /// The request's first token came back, with `cached` of its prompt
     /// tokens reported served from the engine's prefix cache (`Some`; zero
     /// when the engine reports no count), or its stream ended or was dropped
     /// before one (`None`): its prompt is no longer pending prefill. `timed`
     /// as at its start.
     fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
+
+    /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock: the
+    /// first response's one stamp.
+    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, _now_ms: u64) {
+        self.note_prefill_ended(tokens, timed, cached);
+    }
 
     /// How long the engine may still need before the first token of its
     /// in-flight work is due: the prompt tokens dispatched and not yet
@@ -1671,6 +1690,10 @@ impl Worker for BasicWorker {
         self.runtime.load().note_token_progress();
     }
 
+    fn note_token_progress_at(&self, now_ms: u64) {
+        self.runtime.load().note_token_progress_at(now_ms);
+    }
+
     fn note_transport_failure(&self) {
         self.runtime.load().note_transport_failure();
     }
@@ -1765,10 +1788,23 @@ impl Worker for BasicWorker {
         self.runtime.load().note_prefill_started(tokens, timed);
     }
 
+    fn note_prefill_started_at(&self, tokens: u64, timed: bool, now_ms: u64) {
+        // 0 is the runtime's unset stamp, as the plain note guards too.
+        self.runtime
+            .load()
+            .note_prefill_started_at(tokens, timed, now_ms.max(1));
+    }
+
     fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
         self.runtime
             .load()
             .note_prefill_ended(tokens, timed, cached);
+    }
+
+    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
+        self.runtime
+            .load()
+            .note_prefill_ended_at(tokens, timed, cached, now_ms.max(1));
     }
 
     fn prefill_backlog(&self) -> Duration {

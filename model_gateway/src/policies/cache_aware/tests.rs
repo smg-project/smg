@@ -1977,6 +1977,22 @@ fn test_apply_repair_page_seeds_hash_index() {
         kv_index::hash_token_path(&tokens),
         "http://w2",
     ));
+    {
+        let index = policy.hash_index.get("model1").unwrap();
+        assert_eq!(index.string_tree.size(), text.len());
+        assert_eq!(index.token_tree.size(), tokens.len());
+    }
+    policy.evict_cache(tokens.len() - 1);
+    assert_eq!(policy.hash_index.get("model1").unwrap().token_tree.len(), 0);
+    assert_eq!(
+        policy.hash_index.get("model1").unwrap().string_tree.len(),
+        1
+    );
+    policy.evict_cache(text.len() - 1);
+    assert_eq!(
+        policy.hash_index.get("model1").unwrap().string_tree.len(),
+        0
+    );
 }
 
 #[test]
@@ -2024,6 +2040,198 @@ fn test_apply_known_remote_insert_from_request_hot_path() {
     // sites wrote.
     assert!(policy.apply_known_remote_insert("", TreeKind::String, text_hash, "http://remote",));
     assert!(policy.apply_known_remote_insert("", TreeKind::Token, token_hash, "http://remote",));
+}
+
+#[test]
+fn hash_index_counts_what_it_stores() {
+    let mut index = PerModelHashIndex::default();
+    index.string_tree.insert(1, "abcd".to_string());
+    index.string_tree.insert(1, "ab".to_string());
+    index.string_tree.insert(2, "xyz".to_string());
+    assert_eq!(index.string_tree.size(), 5);
+    index.token_tree.insert(7, vec![1, 2, 3]);
+    index.token_tree.insert(7, vec![1, 2, 3, 4]);
+    assert_eq!(index.token_tree.size(), 4);
+
+    index.evict("model1", 5);
+    assert_eq!(index.string_tree.previous.len(), 2);
+    assert_eq!(index.string_tree.previous_size, 5);
+    assert_eq!(index.token_tree.previous_size, 4);
+    index.string_tree.insert(2, "xyzw".to_string());
+    assert_eq!(index.string_tree.current_size, 4);
+    assert_eq!(index.string_tree.previous_size, 2);
+    assert_eq!(index.string_tree.get(2).map(String::as_str), Some("xyzw"));
+    assert_eq!((index.string_tree.len(), index.string_tree.size()), (2, 6));
+}
+
+#[test]
+fn hash_index_eviction_keeps_the_newer_generation() {
+    let mut index = Generations::<String>::default();
+    index.insert(1, "a".repeat(30));
+    index.insert(2, "b".repeat(30));
+    assert!(index.evict(100));
+    assert_eq!(index.get(1).map(String::len), Some(30));
+    index.insert(3, "c".repeat(30));
+    assert!(!index.evict(100));
+    index.insert(4, "d".repeat(30));
+    assert!(index.evict(100));
+    assert!(index.get(1).is_none() && index.get(2).is_none());
+    assert!(index.get(3).is_some() && index.get(4).is_some());
+    assert_eq!((index.len(), index.size()), (2, 60));
+    index.insert(5, "e".repeat(50));
+    assert!(!index.evict(100));
+    assert!(index.get(5).is_some());
+    assert_eq!((index.len(), index.size()), (2, 80));
+    // A burst over the budget, as a tree repair writes, keeps what fits.
+    for hash in 5..15 {
+        index.insert(hash, "f".repeat(30));
+    }
+    assert!(index.evict(100));
+    assert_eq!((index.len(), index.size()), (3, 90));
+    index.insert(30, "g".repeat(120));
+    assert!(!index.evict(100));
+    assert!(index.get(30).is_none());
+    assert_eq!(index.size(), 90);
+}
+
+#[test]
+fn hash_index_keeps_entries_that_fit_and_rejects_oversized_values() {
+    let mut index = Generations::<String>::default();
+    index.insert(1, "a".repeat(10));
+    index.insert(2, "b".repeat(60));
+    index.evict(100);
+    index.insert(2, "b".repeat(60));
+    index.evict(100);
+    assert_eq!((index.len(), index.size()), (2, 70));
+    assert!(index.get(1).is_some());
+    index.insert(3, "c".repeat(101));
+    index.evict(100);
+    assert_eq!((index.len(), index.size()), (2, 70));
+    assert!(index.get(3).is_none());
+    index.evict(0);
+    assert_eq!((index.len(), index.size()), (0, 0));
+    for hash in 0..5 {
+        index.insert(hash, String::new());
+    }
+    index.evict(3);
+    assert_eq!((index.len(), index.size()), (3, 0));
+    index.insert(99, "é".to_string());
+    assert_eq!(index.size(), 2); // UTF-8 bytes, not characters.
+    index.evict(1);
+    assert!(index.get(99).is_none());
+    assert!(index.len() <= 1);
+}
+
+#[test]
+fn hash_index_generations_hold_their_invariants() {
+    // Random overwrites/evictions must preserve exact accounting, disjoint
+    // generations, the size bound, and recent values when they fit.
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(4751);
+    let max = 500;
+    let mut index = Generations::<Vec<u32>>::default();
+    let mut since_eviction: HashMap<u64, usize> = HashMap::new();
+    for _ in 0..20_000 {
+        if rng.random_range(0..10) == 0 {
+            let fits = index.current.len() <= max && index.current_size <= max;
+            index.evict(max);
+            assert!(index.len() <= max && index.size() <= max);
+            if fits {
+                for (hash, len) in &since_eviction {
+                    assert_eq!(index.get(*hash).map(Vec::len), Some(*len));
+                }
+            } else {
+                // Entries are under 120 long, so a full trim leaves less room.
+                assert!(index.size() > max - 120);
+            }
+            since_eviction.clear();
+        } else {
+            let hash = rng.random_range(0..200);
+            let len = rng.random_range(0..120);
+            index.insert(hash, vec![0; len]);
+            since_eviction.insert(hash, len);
+        }
+        let counted: usize = index
+            .current
+            .values()
+            .chain(index.previous.values())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(index.size(), counted);
+        assert!(index
+            .current
+            .keys()
+            .all(|h| !index.previous.contains_key(h)));
+    }
+}
+
+#[test]
+fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    policy.set_populate_hash_index(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let converse = |name: &str| {
+        let mut conversation = String::new();
+        for turn in 0..3 {
+            conversation.push_str(&format!("{name} turn {turn}: {} ", "x".repeat(1_000)));
+            route_text(&policy, &workers, &conversation).unwrap();
+        }
+        kv_index::hash_node_path(&conversation)
+    };
+
+    let older = converse("first");
+    let budget = policy.hash_index.get(model).unwrap().string_tree.size() * 3 / 2;
+    policy.evict_cache(budget);
+    let newer = converse("second");
+    policy.evict_cache(budget);
+
+    assert!(policy.apply_known_remote_insert(model, TreeKind::String, newer, "http://remote"));
+    assert!(!policy.apply_known_remote_insert(model, TreeKind::String, older, "http://remote"));
+}
+
+#[test]
+fn hash_index_counts_and_bounds_both_multi_turn_request_paths() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    policy.set_populate_hash_index(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let (mut text, mut tokens) = (String::new(), Vec::new());
+    let (mut text_size, mut token_size) = (0, 0);
+    for turn in 0..5 {
+        text_size += text.len();
+        token_size += tokens.len();
+        text.push_str(&format!("turn {turn}: {} ", "x".repeat(1_000)));
+        tokens.extend((0..64).map(|i| turn * 1_000 + i));
+        route_text(&policy, &workers, &text).unwrap();
+        route_tokens(&policy, &workers, &tokens);
+    }
+    {
+        let index = policy.hash_index.get(model).unwrap();
+        assert_eq!(
+            (index.string_tree.len(), index.string_tree.size()),
+            (5, text_size)
+        );
+        assert_eq!(
+            (index.token_tree.len(), index.token_tree.size()),
+            (5, token_size)
+        );
+    }
+    policy.evict_cache(text_size);
+    assert_eq!(policy.hash_index.get(model).unwrap().string_tree.len(), 5);
+    policy.evict_cache(text_size - 1);
+    assert_eq!(policy.hash_index.get(model).unwrap().string_tree.len(), 4);
+    assert_eq!(policy.hash_index.get(model).unwrap().token_tree.len(), 5);
+    policy.evict_cache(token_size - 1);
+    assert_eq!(policy.hash_index.get(model).unwrap().token_tree.len(), 4);
 }
 
 #[test]

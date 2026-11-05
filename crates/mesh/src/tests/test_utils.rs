@@ -1,7 +1,15 @@
 //! Test utilities for mesh module
-use std::{net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, time::Duration};
 
-use tokio::net::TcpListener;
+use hyper_util::rt::TokioIo;
+use tokio::{net::TcpListener, task::JoinHandle};
+use tonic::transport::{Channel, Endpoint, Server};
+use tower::service_fn;
+
+use crate::{
+    gossip_service::GossipService,
+    service::gossip::{gossip_client::GossipClient, gossip_server::GossipServer},
+};
 
 /// Bind to an ephemeral port and return the listener + address.
 /// The caller must keep the listener alive and pass it to `mesh_run!`
@@ -26,4 +34,33 @@ where
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Connect the real gossip service over in-memory HTTP/2. Unlike a TCP socket,
+/// this transport needs no wall-clock waits when a test pauses Tokio's clock.
+pub async fn connect_gossip(service: GossipService) -> (GossipClient<Channel>, JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the caller owns the server task and aborts and awaits it"
+    )]
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(GossipServer::new(service))
+            .serve_with_incoming(tokio_stream::iter([Ok::<_, io::Error>(server_io)]))
+            .await
+            .unwrap();
+    });
+    let mut client_io = Some(client_io);
+    let channel = Endpoint::from_static("http://mesh.test")
+        .connect_with_connector(service_fn(move |_| {
+            let io = client_io.take();
+            async move {
+                io.map(TokioIo::new)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))
+            }
+        }))
+        .await
+        .unwrap();
+    (GossipClient::new(channel), server)
 }

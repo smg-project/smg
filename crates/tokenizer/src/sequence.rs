@@ -196,7 +196,9 @@ impl Sequence {
     /// [`append_token`](Self::append_token), with the newly decoded text
     /// appended to `out`; says whether there was any. A stream that collects
     /// its text in one buffer takes each token's text without a string per
-    /// token.
+    /// token: the backend's own decoder appends it, and so does the generic
+    /// step where the backend writes it from its tables
+    /// (`Decoder::decode_step_into`).
     #[inline]
     pub fn append_token_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
         if let Some(decoder) = self.incremental.as_mut() {
@@ -204,21 +206,20 @@ impl Sequence {
             self.total_tokens += 1;
             return Ok(appended);
         }
-        Ok(match self.step_generic(token_id)?.text {
-            // The generic step's text is a string of its own: an `out` with no
-            // allocation yet takes it as it is rather than a copy of it; a
-            // cleared buffer kept for reuse (a stream's delta, the jail) keeps
-            // its capacity and is appended to.
-            Some(text) if !text.is_empty() => {
-                if out.capacity() == 0 {
-                    *out = text;
-                } else {
-                    out.push_str(&text);
-                }
-                true
-            }
-            _ => false,
-        })
+        let step = self.tokenizer.decode_step_into(
+            token_id,
+            &mut self.token_ids,
+            &mut self.cached_prefix,
+            &mut self.prefix_index,
+            self.skip_special_tokens,
+            self.eager_stop_matching,
+            out,
+        )?;
+        self.total_tokens += 1;
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
+        }
+        Ok(step.appended)
     }
 
     /// One token through the generic algorithm (`Decoder::decode_step`), with
