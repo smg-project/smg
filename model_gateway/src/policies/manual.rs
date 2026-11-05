@@ -15,7 +15,7 @@
 //! - `SelectWorkerInfo::rid_key`: the fallback session key derived from the
 //!   request body's `rid` (populated under `--routing-key-override`)
 
-use std::{sync::Arc, time::Instant};
+use std::{borrow::Borrow, sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::RngExt;
@@ -70,6 +70,15 @@ struct RoutingId(String);
 impl RoutingId {
     fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+}
+
+/// A lookup borrows the request's key: `RoutingId` hashes and compares as
+/// its string does, so the map is read by `&str` and copies the key only
+/// when it inserts one.
+impl Borrow<str> for RoutingId {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 
@@ -184,18 +193,20 @@ impl ManualPolicy {
         self.routing_map.len()
     }
 
-    /// Probe the pin for `key` without reassigning. Refreshes `last_access`
-    /// when an entry exists so probing counts as use.
+    /// Probe the pin for `key` without reassigning: the first of its
+    /// candidates that `eligible` admits, by its position in `workers`.
+    /// Refreshes `last_access` when an entry exists so probing counts as
+    /// use. The key is looked up borrowed, and nothing is allocated.
     pub(crate) fn peek_pin(
         &self,
         workers: &[Arc<dyn Worker>],
         key: &str,
-        healthy_indices: &[usize],
+        eligible: impl Fn(usize) -> bool,
     ) -> PinState {
-        match self.routing_map.get_mut(&RoutingId::new(key)) {
+        match self.routing_map.get_mut(key) {
             Some(mut entry) => {
                 entry.last_access = Instant::now();
-                match find_healthy_worker(&entry.candi_worker_urls, workers, healthy_indices) {
+                match find_healthy_worker(&entry.candi_worker_urls, workers, eligible) {
                     Some(idx) => PinState::Pinned(idx),
                     None => PinState::Stale,
                 }
@@ -206,16 +217,22 @@ impl ManualPolicy {
 
     /// Pin `key` to `url` as the primary candidate, keeping the previous
     /// primary as bounded failover. Used by delegated assignment and
-    /// cap-respill, where the pin must follow the latest dispatch.
+    /// cap-respill, where the pin must follow the latest dispatch. An
+    /// existing entry is updated through a borrowed lookup; only a new key
+    /// is copied into the map.
     pub(crate) fn pin_front(&self, key: &str, url: &str) {
+        let front = |node: &mut Node| {
+            node.candi_worker_urls.retain(|u| u != url);
+            node.candi_worker_urls.insert(0, url.to_string());
+            node.candi_worker_urls.truncate(MAX_CANDIDATE_WORKERS);
+            node.last_access = Instant::now();
+        };
+        if let Some(mut entry) = self.routing_map.get_mut(key) {
+            front(&mut entry);
+            return;
+        }
         match self.routing_map.entry(RoutingId::new(key)) {
-            Entry::Occupied(mut entry) => {
-                let node = entry.get_mut();
-                node.candi_worker_urls.retain(|u| u != url);
-                node.candi_worker_urls.insert(0, url.to_string());
-                node.candi_worker_urls.truncate(MAX_CANDIDATE_WORKERS);
-                node.last_access = Instant::now();
-            }
+            Entry::Occupied(mut entry) => front(entry.get_mut()),
             Entry::Vacant(entry) => {
                 entry.insert(Node {
                     candi_worker_urls: vec![url.to_string()],
@@ -251,22 +268,24 @@ impl ManualPolicy {
         routing_id: &str,
         healthy_indices: &[usize],
     ) -> (usize, ExecutionBranch) {
-        let routing_id = RoutingId::new(routing_id);
-
-        match self.routing_map.entry(routing_id) {
-            Entry::Occupied(mut entry) => {
-                let node = entry.get_mut();
-                node.last_access = Instant::now();
-                if let Some(idx) =
-                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
-                {
-                    (idx, ExecutionBranch::OccupiedHit)
-                } else {
-                    let selected_idx = self.select_new_worker(workers, healthy_indices);
-                    node.push_bounded(workers[selected_idx].url().to_string());
-                    (selected_idx, ExecutionBranch::OccupiedMiss)
-                }
+        let eligible = |idx: usize| healthy_indices.contains(&idx);
+        // The hit path reads the entry through the borrowed key; only a key
+        // the map does not hold is copied in, below.
+        let occupied = |node: &mut Node| {
+            node.last_access = Instant::now();
+            if let Some(idx) = find_healthy_worker(&node.candi_worker_urls, workers, eligible) {
+                (idx, ExecutionBranch::OccupiedHit)
+            } else {
+                let selected_idx = self.select_new_worker(workers, healthy_indices);
+                node.push_bounded(workers[selected_idx].url().to_string());
+                (selected_idx, ExecutionBranch::OccupiedMiss)
             }
+        };
+        if let Some(mut entry) = self.routing_map.get_mut(routing_id) {
+            return occupied(&mut entry);
+        }
+        match self.routing_map.entry(RoutingId::new(routing_id)) {
+            Entry::Occupied(mut entry) => occupied(entry.get_mut()),
             Entry::Vacant(entry) => {
                 let selected_idx = self.select_new_worker(workers, healthy_indices);
                 entry.insert(Node {
@@ -331,19 +350,17 @@ impl LoadBalancingPolicy for ManualPolicy {
     }
 }
 
+/// The first of a pin's candidate URLs that is in `workers` and that
+/// `eligible` admits, by position. A pin holds at most two URLs, each found
+/// by one scan of the pool.
 fn find_healthy_worker(
     urls: &[String],
     workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
+    eligible: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    for url in urls {
-        if let Some(idx) = find_worker_index_by_url(workers, url) {
-            if healthy_indices.contains(&idx) {
-                return Some(idx);
-            }
-        }
-    }
-    None
+    urls.iter()
+        .filter_map(|url| find_worker_index_by_url(workers, url))
+        .find(|&idx| eligible(idx))
 }
 
 fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
@@ -821,9 +838,9 @@ mod tests {
             "http://w2:8000".to_string(),
             "http://w3:8000".to_string(),
         ];
-        let healthy_indices = vec![0, 1, 2];
+        let healthy_indices = [0, 1, 2];
 
-        let result = find_healthy_worker(&urls, &workers, &healthy_indices);
+        let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
         assert_eq!(
             result,
             Some(0),
@@ -831,18 +848,18 @@ mod tests {
         );
 
         workers[0].set_status(WorkerStatus::NotReady);
-        let healthy_indices = vec![1, 2];
-        let result = find_healthy_worker(&urls, &workers, &healthy_indices);
+        let healthy_indices = [1, 2];
+        let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
         assert_eq!(result, Some(1), "Should skip unhealthy and return next");
 
         workers[1].set_status(WorkerStatus::NotReady);
-        let healthy_indices = vec![2];
-        let result = find_healthy_worker(&urls, &workers, &healthy_indices);
+        let healthy_indices = [2];
+        let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
         assert_eq!(result, Some(2), "Should return last healthy worker");
 
         workers[2].set_status(WorkerStatus::NotReady);
         let healthy_indices: Vec<usize> = vec![];
-        let result = find_healthy_worker(&urls, &workers, &healthy_indices);
+        let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
         assert_eq!(result, None, "Should return None when no healthy workers");
     }
 
@@ -1104,18 +1121,24 @@ mod tests {
     fn test_peek_pin_states() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let healthy = vec![0, 1];
+        let healthy = [0, 1];
 
-        assert_eq!(policy.peek_pin(&workers, "k", &healthy), PinState::Vacant);
+        assert_eq!(
+            policy.peek_pin(&workers, "k", |idx| healthy.contains(&idx)),
+            PinState::Vacant
+        );
 
         policy.pin_front("k", "http://w2:8000");
         assert_eq!(
-            policy.peek_pin(&workers, "k", &healthy),
+            policy.peek_pin(&workers, "k", |idx| healthy.contains(&idx)),
             PinState::Pinned(1)
         );
 
         workers[1].set_status(WorkerStatus::NotReady);
-        assert_eq!(policy.peek_pin(&workers, "k", &[0]), PinState::Stale);
+        assert_eq!(
+            policy.peek_pin(&workers, "k", |idx| idx == 0),
+            PinState::Stale
+        );
     }
 
     #[test]
