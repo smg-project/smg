@@ -2123,6 +2123,65 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
 }
 
 #[test]
+fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+    // The job records the thread it ran on; `block_on` polls on this thread.
+    let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let probe = {
+        let ran_on = ran_on.clone();
+        move || *ran_on.lock().unwrap() = Some(thread::current().id())
+    };
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![1, 2])
+            .with_deferred_chat_probe(probe),
+    );
+    // A system prompt and two rounds of a conversation, about five kilobytes
+    // rendered: the shape of an ordinary multi-turn request, well above the
+    // old 512-byte threshold and below the one that protects the runtime.
+    let paragraph = |seed: usize| {
+        (0..350)
+            .map(|i| format!("w{}", (seed * 7 + i * 13) % 97))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": paragraph(1)},
+            {"role": "user", "content": paragraph(2)},
+            {"role": "assistant", "content": paragraph(3)},
+            {"role": "user", "content": paragraph(4)}
+        ]
+    }))
+    .unwrap();
+    let (processed, encoding) =
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
+    assert!(
+        processed.text.len() > 4 * 1024 && processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES,
+        "the rendered conversation is a few kilobytes ({} bytes), under the threshold",
+        processed.text.len()
+    );
+    block_on(encode_prompt_blocking(
+        tokenizer.clone(),
+        &processed.text,
+        encoding,
+    ))
+    .unwrap();
+    let ran = ran_on.lock().unwrap().take().expect("the job ran");
+    assert_eq!(
+        ran,
+        thread::current().id(),
+        "a conversation of a few kilobytes is encoded on the thread that holds the request, \
+         not handed to the blocking pool"
+    );
+}
+
+#[test]
 fn public_entry_point_keeps_the_flat_text_for_a_deferred_renderer() {
     let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
     let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();

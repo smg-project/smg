@@ -292,11 +292,29 @@ pub(crate) fn missing_tokenizer_response(
     )
 }
 
-/// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
-/// costs more than the encode itself, so we tokenize inline. Larger prompts —
-/// the ones that actually pin a worker thread — are offloaded. A prompt of
-/// ids counts its ids' bytes, four each.
-const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
+/// Below this input size (in bytes) a prompt is tokenized on the runtime
+/// thread that holds the request; from this size up the encode runs on the
+/// blocking pool, bounded by [`encode_permits`], so no worker is held for
+/// longer than about one request's own share of work. A prompt of ids counts
+/// its ids' bytes, four each.
+///
+/// The bound is where the encode outweighs its offload. An offloaded encode
+/// costs the request a round trip through the pool: the pool thread's wake,
+/// the request task re-scheduled through the inject queue when the encode
+/// ends, and the parked worker those wakes notify. On the gateway's CPU bed
+/// (the repository's `gateway-perf` cells: eight runtime threads, 500 chat
+/// requests per second against scripted engines) the round trip costs the
+/// same whatever the prompt's length: about 55 k instructions, 3.7 context
+/// switches and, on a virtual machine, 0.25 ms of CPU time per request more
+/// than the same encode in place, and the first token leaves 0.2 ms later.
+/// The encode itself costs about 70 k instructions and 10-20 us per
+/// kilobyte of prompt with a byte-level BPE tokenizer: from one kilobyte up
+/// the work outweighs the trip in instructions, and at 16 KiB (about 3,000
+/// tokens, 0.2-0.3 ms) it still holds a worker for no longer than one short
+/// request's own CPU time (0.3 ms). Above that the pool takes it. The
+/// earlier bound of 512 bytes charged the round trip to every ordinary
+/// conversation: a system prompt and a few turns render to 1-10 KiB.
+const ENCODE_OFFLOAD_MIN_BYTES: usize = 16 * 1024;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
 /// tokio's blocking pool is otherwise unbounded (grows to 512 threads), so under
