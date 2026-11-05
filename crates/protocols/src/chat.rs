@@ -1158,7 +1158,10 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
     /// The service tier the completion ran under. Always present, as the
     /// OpenAI API sends it; the gateway has one tier, `default`.
-    #[serde(default = "default_service_tier")]
+    #[serde(
+        default = "default_service_tier",
+        deserialize_with = "deserialize_null_as_default_tier"
+    )]
     pub service_tier: String,
 }
 
@@ -1167,6 +1170,20 @@ pub const DEFAULT_SERVICE_TIER: &str = "default";
 
 fn default_service_tier() -> String {
     DEFAULT_SERVICE_TIER.to_string()
+}
+
+/// Deserialize the service tier where JSON `null` means the gateway's tier.
+///
+/// Use with `#[serde(default = "default_service_tier",
+/// deserialize_with = "deserialize_null_as_default_tier")]` on the tier of a
+/// completion and of a chunk: an upstream that serializes an unset tier as
+/// `null` reads as a missing key does, so a consumer of its chunks keeps parsing.
+fn deserialize_null_as_default_tier<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+        .map(|tier| tier.unwrap_or_else(default_service_tier))
 }
 
 impl ChatCompletionResponse {
@@ -1226,7 +1243,10 @@ pub struct ChatCompletionStreamResponse {
     pub model: String,
     /// The service tier the completion runs under, on every chunk as the
     /// public API writes it; the gateway has one tier, `default`.
-    #[serde(default = "default_service_tier")]
+    #[serde(
+        default = "default_service_tier",
+        deserialize_with = "deserialize_null_as_default_tier"
+    )]
     pub service_tier: String,
     pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
@@ -1332,9 +1352,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
-        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
-        ThinkingParam, ThinkingType,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatCompletionResponse,
+        ChatCompletionStreamResponse, ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice,
+        ChatStreamChoiceRef, GenerationRequest, ThinkingParam, ThinkingType,
     };
     use crate::common::{FunctionCallDelta, ToolCallDelta};
 
@@ -1908,6 +1928,43 @@ mod tests {
         .expect("parse");
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value["annotations"], json!([]), "{value}");
+    }
+
+    #[test]
+    fn a_null_or_missing_service_tier_reads_as_the_default_tier() {
+        let read = |tier: &str| {
+            let completion: ChatCompletionResponse = serde_json::from_str(&format!(
+                r#"{{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[]{tier}}}"#
+            ))
+            .expect("the completion parses");
+            let chunk: ChatCompletionStreamResponse = serde_json::from_str(&format!(
+                r#"{{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[]{tier}}}"#
+            ))
+            .expect("the chunk parses");
+            (completion.service_tier, chunk.service_tier)
+        };
+        // The key was ignored before the field existed; a null, as an unset
+        // optional is commonly serialized, reads as a missing key does.
+        for tier in ["", r#","service_tier":null"#] {
+            assert_eq!(
+                read(tier),
+                ("default".to_string(), "default".to_string()),
+                "{tier:?}"
+            );
+        }
+        // A tier an upstream names is kept.
+        assert_eq!(
+            read(r#","service_tier":"flex""#),
+            ("flex".to_string(), "flex".to_string())
+        );
+        // What was read as a null leaves as the string every chunk carries.
+        let chunk: ChatCompletionStreamResponse = serde_json::from_value(json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [], "service_tier": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&chunk).expect("serialize");
+        assert_eq!(value["service_tier"], json!("default"), "{value}");
     }
 
     #[test]
