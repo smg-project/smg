@@ -88,6 +88,62 @@ pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<
     weights
 }
 
+/// The two bounds that keep a resampling kernel cheap, shared by the
+/// single-precision and the exact resampler and applied before anything is
+/// built. Each output costs a `kernel_len` dot product, and the table holds
+/// `new_freq` phases of `kernel_len` coefficients, so a rate that shares
+/// little with the frontend's is expensive on both counts, and a corrupt
+/// header can name any rate: 2 147 491 648 Hz (8 kHz with one bit flipped) to
+/// 16 kHz reduces to 33 554 557 : 250, a table of 8.8 G coefficients that
+/// took minutes to build for the two samples it yields. The rates audio is
+/// stored at reduce to small ratios: to 16 kHz the longest kernel among the
+/// common ones is 176.4 kHz's 575 coefficients and the largest table
+/// 11.025 kHz's 291 200; to 24 kHz, 176.4 kHz's 237 and 11.025 kHz's 51 520.
+/// The odd ones real headers carry still fit: 5 512 Hz (689 : 2 000 to
+/// 16 kHz, 703 coefficients, a 1.4 M table), 47 952 Hz, the 48 kHz NTSC
+/// pull-down (2 997 : 1 000 to 16 kHz, 3 035 coefficients, a 3.0 M table;
+/// 999 : 500 to 24 kHz, 1 025), and the hi-res rates up to DSD512 as the
+/// external decoder renders it (2 822 400 Hz: 882 : 5 to 16 kHz, 3 022
+/// coefficients). A kernel of up to 4 096 coefficients and a
+/// table of up to 2^22 (16 MiB of f32, 32 MiB of i64) admit all of those;
+/// past either bound the rate is refused, deliberately: 44 056 Hz (5 507 :
+/// 2 000 to 16 kHz, 5 541 coefficients, an 11 M table), 23 994 Hz (3 999 :
+/// 4 000 to 24 kHz, a 16 M table) and 23 999 Hz (24 013 coefficients, over
+/// half a billion) would each take seconds per clip. The kernel bound is also
+/// what keeps the exact resampler's accumulator in range: `kernel_len`
+/// products of 2^40 by 2^62 stay under 2^114 in i128.
+const MAX_RESAMPLE_KERNEL_LEN: usize = 1 << 12;
+const MAX_RESAMPLE_KERNEL_VALUES: usize = 1 << 22;
+
+/// The size of the band-limited sinc kernel from `src_sample_rate` to
+/// `dst_sample_rate` over the reduced ratio `orig_freq : new_freq` with the
+/// half width `width` in input samples: the coefficients per output and in
+/// the whole table, refused past [`MAX_RESAMPLE_KERNEL_LEN`] or
+/// [`MAX_RESAMPLE_KERNEL_VALUES`] before either is allocated.
+fn resample_kernel_size(
+    src_sample_rate: usize,
+    dst_sample_rate: usize,
+    orig_freq: usize,
+    new_freq: usize,
+    width: usize,
+) -> Result<(usize, usize), TransformError> {
+    let kernel_len = width
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(orig_freq))
+        .ok_or_else(|| TransformError::ShapeError("audio resample kernel is too large".into()))?;
+    let kernel_values = new_freq
+        .checked_mul(kernel_len)
+        .ok_or_else(|| TransformError::ShapeError("audio resample kernel size overflow".into()))?;
+    if kernel_len > MAX_RESAMPLE_KERNEL_LEN || kernel_values > MAX_RESAMPLE_KERNEL_VALUES {
+        return Err(TransformError::ShapeError(format!(
+            "audio sample rate {src_sample_rate} Hz has no resampling kernel of a practical \
+             size for {dst_sample_rate} Hz ({kernel_len} coefficients per output, \
+             {kernel_values} in the table)"
+        )));
+    }
+    Ok((kernel_len, kernel_values))
+}
+
 /// Match torchaudio's default `functional.resample`: band-limited sinc
 /// interpolation with a Hann window, filter width 6, and rolloff 0.99.
 pub(super) fn bandlimited_resample(
@@ -112,13 +168,8 @@ pub(super) fn bandlimited_resample(
     let new_freq = dst_sample_rate / gcd;
     let base_freq = orig_freq.min(new_freq) as f32 * ROLLOFF;
     let width = (LOWPASS_FILTER_WIDTH * orig_freq as f32 / base_freq).ceil() as usize;
-    let kernel_len = width
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(orig_freq))
-        .ok_or_else(|| TransformError::ShapeError("audio resample kernel is too large".into()))?;
-    let kernel_values = new_freq
-        .checked_mul(kernel_len)
-        .ok_or_else(|| TransformError::ShapeError("audio resample kernel size overflow".into()))?;
+    let (kernel_len, kernel_values) =
+        resample_kernel_size(src_sample_rate, dst_sample_rate, orig_freq, new_freq, width)?;
     let mut kernels = Vec::new();
     kernels.try_reserve_exact(kernel_values).map_err(|error| {
         TransformError::ShapeError(format!("failed to allocate audio resample kernel: {error}"))
@@ -234,38 +285,10 @@ pub(super) fn bandlimited_resample_exact(
     let new_freq = dst_sample_rate / gcd;
     let base_freq = orig_freq.min(new_freq) as f64 * ROLLOFF;
     let width = (LOWPASS_FILTER_WIDTH * orig_freq as f64 / base_freq).ceil() as usize;
-    let kernel_len = width
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(orig_freq))
-        .ok_or_else(|| TransformError::ShapeError("audio resample kernel is too large".into()))?;
-    let kernel_values = new_freq
-        .checked_mul(kernel_len)
-        .ok_or_else(|| TransformError::ShapeError("audio resample kernel size overflow".into()))?;
-    // Two bounds keep the exact evaluation cheap and refuse the rest before
-    // anything is built. Each output costs a `kernel_len` dot product, and the
-    // table holds `new_freq` phases of `kernel_len` coefficients, so a rate
-    // that shares little with 24 kHz is expensive on both counts. The rates
-    // audio is stored at reduce to small ratios: the longest kernel among the
-    // common ones is 176.4 kHz's 237 coefficients and the largest table
-    // 11.025 kHz's 51 520; the odd ones real headers carry still fit, 5 512 Hz
-    // (689 : 3 000, 703 coefficients, a 2.1 M table) and 47 952 Hz (999 : 500,
-    // 1 025 coefficients). A kernel of up to 2 048 coefficients and a table of
-    // up to 2^22 (32 MiB of i64) admit all of those; past either bound the
-    // rate is refused, deliberately: 44 056 Hz (5 507 : 3 000, 5 531
-    // coefficients, a 16.6 M table), 23 994 Hz (3 999 : 4 000, 4 013
-    // coefficients, 16 M) and 23 999 Hz (24 013 coefficients, over half a
-    // billion) would each take seconds per clip. The kernel bound is also what
-    // keeps the accumulator in range: `kernel_len` products of 2^40 by 2^62
-    // stay under 2^114 in i128.
-    const MAX_KERNEL_LEN: usize = 1 << 11;
-    const MAX_KERNEL_VALUES: usize = 1 << 22;
-    if kernel_len > MAX_KERNEL_LEN || kernel_values > MAX_KERNEL_VALUES {
-        return Err(TransformError::ShapeError(format!(
-            "audio sample rate {src_sample_rate} Hz has no exact resampling kernel of a \
-             practical size for {dst_sample_rate} Hz ({kernel_len} coefficients per output, \
-             {kernel_values} in the table)"
-        )));
-    }
+    // The shared bounds refuse an impractical rate before anything is built;
+    // the kernel bound is also what keeps the accumulator below in range.
+    let (kernel_len, kernel_values) =
+        resample_kernel_size(src_sample_rate, dst_sample_rate, orig_freq, new_freq, width)?;
 
     // Coefficients on the 2^-62 grid, from the filter evaluated in f64 as
     // torchaudio writes it: t = (idx - phase / new) * base, clamped to the
@@ -449,6 +472,47 @@ mod tests {
         }
     }
 
+    /// A header's rate sizes the single-precision kernel too, and a corrupt
+    /// one can size it as it likes: 2 147 491 648 Hz (8 kHz with one bit
+    /// flipped) to 16 kHz reduces to 33 554 557 : 250, a table of 250 phases
+    /// by 35 M coefficients that took minutes to build before the two samples
+    /// it yields were refused. The bound refuses the rate before anything is
+    /// built; the odd rates refused for 24 kHz are refused here too (44 056 Hz:
+    /// 5 507 : 2 000, 5 541 coefficients; 15 999 Hz: 16 013 coefficients, a
+    /// 256 M table).
+    #[test]
+    fn a_rate_with_an_impractical_single_precision_kernel_is_refused_before_it_is_built() {
+        let started = std::time::Instant::now();
+        for rate in [2_147_491_648_usize, 44_056, 15_999] {
+            let error = bandlimited_resample(&[0.25; 48], rate, 16_000).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no resampling kernel of a practical size"),
+                "{rate} Hz: {error}"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the refusals took {elapsed:?}"
+        );
+        // The rates audio is stored at resample to the 16 kHz frontends as
+        // before; the odd ones real headers carry fit too, 47 952 Hz (the
+        // 48 kHz NTSC pull-down, 2 997 : 1 000) with the longest kernel of
+        // them, 3 035 coefficients, and the hi-res rates up to DSD512 as the
+        // external decoder renders it (705 600, 768 000, 1 411 200 and
+        // 2 822 400 Hz: 977, 630, 1 511 and 3 022 coefficients).
+        for rate in [
+            4_000, 5_512, 8_000, 11_025, 12_000, 22_050, 24_000, 32_000, 37_800, 44_100, 47_952,
+            48_000, 64_000, 88_200, 96_000, 176_400, 192_000, 384_000, 705_600, 768_000, 1_411_200,
+            2_822_400,
+        ] {
+            bandlimited_resample(&[0.25; 48], rate, 16_000)
+                .unwrap_or_else(|error| panic!("{rate} Hz: {error}"));
+        }
+    }
+
     #[test]
     fn a_rate_with_an_impractical_kernel_is_refused_before_it_is_built() {
         // 23 999 Hz shares no factor with 24 000 (24 000 phases of 24 013
@@ -459,7 +523,9 @@ mod tests {
         for rate in [23_999, 23_994, 44_056] {
             let error = bandlimited_resample_exact(&[0.25; 48], rate, 24_000).unwrap_err();
             assert!(
-                error.to_string().contains("no exact resampling kernel"),
+                error
+                    .to_string()
+                    .contains("no resampling kernel of a practical size"),
                 "{rate} Hz: {error}"
             );
         }
@@ -467,10 +533,12 @@ mod tests {
         // kernel among the common ones is 176.4 kHz's and the largest table
         // 11.025 kHz's; the odd ones real headers carry, 5 512 Hz (legacy
         // 5.5 kHz) and 47 952 Hz (the 48 kHz NTSC pull-down, 1 025
-        // coefficients), fit too.
+        // coefficients), fit too, as do the hi-res rates up to DSD512 as the
+        // external decoder renders it (505, 420, 1 008 and 2 014 coefficients).
         for rate in [
             4_000, 5_512, 8_000, 11_025, 12_000, 16_000, 22_050, 32_000, 37_800, 44_100, 47_952,
-            48_000, 64_000, 88_200, 96_000, 176_400, 192_000,
+            48_000, 64_000, 88_200, 96_000, 176_400, 192_000, 384_000, 705_600, 768_000, 1_411_200,
+            2_822_400,
         ] {
             bandlimited_resample_exact(&[0.25; 48], rate, 24_000)
                 .unwrap_or_else(|error| panic!("{rate} Hz: {error}"));
