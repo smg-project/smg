@@ -158,6 +158,16 @@ def is_tokenspeed() -> bool:
     return get_runtime() == "tokenspeed"
 
 
+def zmq_backend(engine: str) -> str:
+    """The backend the gateway is pinned to for a ZMQ engine.
+
+    The gateway cannot probe a ZMQ engine's runtime from its ``ipc://`` URL,
+    so the harness names it: the engine itself, or the vLLM wire for the mock
+    worker, whose ZMQ ranks speak it.
+    """
+    return Runtime.VLLM.value if engine == Runtime.MOCK.value else engine
+
+
 def get_connection_mode_override() -> "ConnectionMode | None":
     """Per-lane wire-protocol override for local backends.
 
