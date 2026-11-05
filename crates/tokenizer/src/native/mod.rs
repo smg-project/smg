@@ -1266,7 +1266,8 @@ impl NativeEncoder {
 
     /// Room for the ids of one unit, from its bytes: about a token per three
     /// bytes of prose, with a floor for a short unit; a unit of a denser
-    /// script grows its Vec once.
+    /// script grows its Vec past the estimate (by doubling, so a unit at one
+    /// id per byte grows twice).
     fn ids_capacity(unit: &Segment<'_>) -> usize {
         match unit {
             Segment::Added(_) => 1,
