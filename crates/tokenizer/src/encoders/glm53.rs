@@ -14,6 +14,7 @@ use std::{
 use anyhow::{bail, Result};
 use serde_json::Value;
 
+use super::truthy;
 use crate::chat_template::{self, ChatTemplateParams};
 
 /// The current official templates identify the supported renderer revision.
@@ -79,17 +80,6 @@ static TOOLS_SUFFIX: LazyLock<String> = LazyLock::new(|| {
         "{TOOLS_CLOSE}\n\nFor each function call, output the function name and arguments within the following XML format:\n{TOOL_CALL_OPEN}{{function-name}}{ARG_KEY_OPEN}{{arg-key-1}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-1}}{ARG_VALUE_CLOSE}{ARG_KEY_OPEN}{{arg-key-2}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-2}}{ARG_VALUE_CLOSE}...{TOOL_CALL_CLOSE}"
     )
 });
-
-pub(super) fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64() != Some(0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
-}
 
 fn text(value: &Value) -> String {
     match value {

@@ -334,14 +334,16 @@ class VllmWorkerLauncher(WorkerLauncher):
         # The servicer implementation is a flag inside the smg servicer package
         # (`SMG_VLLM_SERVICER_IMPL`), read by upstream vLLM's gRPC entrypoint
         # before it builds an AsyncLLM; the worker command line stays upstream's.
-        if (
-            getattr(args, "connection_mode", "grpc") == "grpc"
-            and getattr(args, "servicer_impl", "python") == "rust"
-        ):
-            env["SMG_VLLM_SERVICER_IMPL"] = "rust"
-        else:
-            # The flag is authoritative: an inherited value must not outlive it.
+        # The package's default is the Rust servicer: an unset flag exports
+        # nothing and an inherited value stays (it is the operator's export);
+        # an explicit flag, python or rust, travels as it stands and overrides
+        # an inherited value.
+        impl = getattr(args, "servicer_impl", None)
+        if getattr(args, "connection_mode", "grpc") != "grpc":
+            # No servicer package on an HTTP worker's path.
             env.pop("SMG_VLLM_SERVICER_IMPL", None)
+        elif impl in ("python", "rust"):
+            env["SMG_VLLM_SERVICER_IMPL"] = impl
         return env
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
@@ -845,13 +847,14 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--servicer-impl",
-        default="python",
+        default=None,
         choices=["python", "rust"],
         help=(
-            "gRPC servicer implementation for vllm workers (default: python). "
-            "rust keeps the same vLLM gRPC contract but serves it from Rust over "
-            "a same-host ZMQ engine connection, selected through "
-            "SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
+            "gRPC servicer implementation for vllm workers (default: rust, the servicer "
+            "package's own default). rust serves the vLLM gRPC contract from Rust over a "
+            "same-host ZMQ engine connection; python is upstream's in-process servicer, "
+            "deprecated (the launcher logs so). An explicit value is "
+            "set as SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
             "--backend vllm --connection-mode grpc"
         ),
     )
@@ -905,16 +908,25 @@ def _import_backend_args(backend: str, parser: argparse.ArgumentParser) -> None:
     BACKEND_ARG_ADDERS[backend](parser)
 
 
-def _require_rust_servicer_hook() -> None:
-    """Fail fast when the installed vLLM cannot select the Rust servicer."""
+def _require_rust_servicer_hook(explicit: bool = True) -> None:
+    """Fail fast when the installed vLLM cannot select the Rust servicer: the
+    servicer package's switch must bind on the installed launcher, or the
+    workers would run the Python servicer while the launch reads as Rust. An
+    explicit ``--servicer-impl rust`` needs the package importable here; on the
+    default (nothing chosen) a host without the package is left to the worker,
+    whose gRPC entrypoint needs the package for either servicer and says so.
+    The refusal names the choice as it was made (the variable, or the default)
+    and the deprecated Python servicer as the way out."""
     try:
         from smg_grpc_servicer.vllm.rust import require_upstream_hook
     except ImportError as error:
+        if not explicit:
+            return
         raise RuntimeError(
             "servicer-impl rust needs the smg-grpc-servicer package importable by this "
             "interpreter (it carries the Rust request path)"
         ) from error
-    require_upstream_hook()
+    require_upstream_hook(explicit=explicit)
 
 
 def parse_serve_args(
@@ -954,16 +966,32 @@ def parse_serve_args(
             "connection-mode zmq is only supported for the vllm, tokenspeed and sglang "
             f"backends, not {backend}"
         )
-    if getattr(serve_router_args, "servicer_impl", "python") == "rust":
-        if backend != "vllm" or serve_router_args.connection_mode != "grpc":
-            pre_parser.error(
-                "servicer-impl rust is only available for --backend vllm with "
-                f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
-            )
-        # The flag is read by upstream vLLM's gRPC entrypoint; a vLLM without
-        # the hook would start Python workers while reporting Rust ones.
+    servicer_impl = getattr(serve_router_args, "servicer_impl", None)
+    if servicer_impl is not None and (
+        backend != "vllm" or serve_router_args.connection_mode != "grpc"
+    ):
+        pre_parser.error(
+            "servicer-impl is only available for --backend vllm with "
+            f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
+        )
+    # The worker resolves its implementation as the servicer package does: the
+    # flag, else an inherited SMG_VLLM_SERVICER_IMPL (gpu_env leaves it alone
+    # when the flag is unset), else the package default (the Rust servicer);
+    # the hook check follows that same choice.
+    effective_impl = servicer_impl or (
+        os.environ.get("SMG_VLLM_SERVICER_IMPL", "").strip().lower() or None
+    )
+    if (
+        backend == "vllm"
+        and serve_router_args.connection_mode == "grpc"
+        and effective_impl != "python"
+    ):
+        # The Rust servicer (explicit, inherited, or the package default) is
+        # selected by the switch upstream vLLM's gRPC entrypoint loads from the
+        # servicer package; a vLLM without the hook would start Python workers
+        # while the launch reads as Rust ones.
         try:
-            _require_rust_servicer_hook()
+            _require_rust_servicer_hook(explicit=effective_impl == "rust")
         except RuntimeError as error:
             pre_parser.error(str(error))
 

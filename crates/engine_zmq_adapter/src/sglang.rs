@@ -27,6 +27,7 @@ use crate::{
     abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
+    pin_yield::PinYieldNote,
     stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
 };
@@ -85,6 +86,11 @@ impl SglangGenerateStream {
     /// Reasoning tokens the scheduler has counted for this choice so far.
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens
+    }
+
+    /// The choice `index` stamped on this stream's responses.
+    pub fn index(&self) -> u32 {
+        self.index
     }
 
     /// The engine-side id of this choice's request.
@@ -424,12 +430,14 @@ pub(crate) fn fan_out_sglang_requests(
 /// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
 /// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
 /// side of a disaggregated pair, by its room's residue
-/// ([`room_residue_rank`]).
+/// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
+/// connection's note, at WARN once and at DEBUG after.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
     ranks: usize,
     placement: RankPlacement,
+    yields: &PinYieldNote,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let tokenized = req
         .tokenized
@@ -485,7 +493,7 @@ pub(crate) fn translate_request_sglang(
     };
     let routed_dp_rank = match (placement, bootstrap_room) {
         (RankPlacement::RoomResidue, Some(room)) => {
-            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id)
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields)
         }
         _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
     };
@@ -696,10 +704,17 @@ pub(crate) enum RankPlacement {
 /// The scheduler rank a disaggregated request goes to on a prefill side that
 /// follows the room: `bootstrap_room % ranks`, Python's `%` as the engine
 /// computes it (a negative room folds the same way); a pin that names
-/// another rank is logged and ignored, never refused, since placing by the
-/// pin would fail the request at the engine's KV sender. A single rank takes
+/// another rank yields and is logged on `yields` (at WARN once per
+/// connection, at DEBUG after), never refused, since placing by the pin
+/// would fail the request at the engine's KV sender. A single rank takes
 /// everything.
-fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str) -> Option<u32> {
+fn room_residue_rank(
+    room: i64,
+    pin: Option<i32>,
+    ranks: usize,
+    request_id: &str,
+    yields: &PinYieldNote,
+) -> Option<u32> {
     let Ok(ranks) = u32::try_from(ranks) else {
         return None;
     };
@@ -709,14 +724,7 @@ fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str
     let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
     if let Some(pin) = pin {
         if u32::try_from(pin).ok() != Some(rank) {
-            warn!(
-                request_id,
-                data_parallel_rank = pin,
-                bootstrap_room = room,
-                dp_size = ranks,
-                "data_parallel_rank conflicts with the bootstrap_room residue; the room \
-                 stays authoritative on a disaggregated request, the pin is ignored"
-            );
+            yields.log(request_id, pin, room, ranks);
         }
     }
     Some(rank)
@@ -1024,6 +1032,7 @@ mod tests {
             default_ready_response().max_model_len,
             1,
             RankPlacement::Pin,
+            &PinYieldNote::default(),
         )
     }
 
@@ -1583,6 +1592,7 @@ mod tests {
                 default_ready_response().max_model_len,
                 ranks,
                 RankPlacement::Pin,
+                &PinYieldNote::default(),
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1616,9 +1626,10 @@ mod tests {
     /// On the prefill side of a disaggregated pair the room places the
     /// request: `bootstrap_room % ranks` over two and over four ranks, a
     /// negative room folding as the engine's `%` does; a pin that disagrees
-    /// yields to the room (and is logged once, which the servicer's test
-    /// reads); a request without a room, the decode side and an aggregated
-    /// engine keep the pin rule; a single rank takes everything.
+    /// yields to the room (and is logged on the connection's note, whose
+    /// own test pins the levels); a request without a room, the
+    /// decode side and an aggregated engine keep the pin rule; a single rank
+    /// takes everything.
     #[test]
     fn sglang_translation_places_a_prefill_sides_request_by_its_rooms_residue() {
         use RankPlacement::{Pin, RoomResidue};
@@ -1643,6 +1654,7 @@ mod tests {
                 default_ready_response().max_model_len,
                 ranks,
                 placement,
+                &PinYieldNote::default(),
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1701,12 +1713,38 @@ mod tests {
             default_ready_response().max_model_len,
             2,
             RoomResidue,
+            &PinYieldNote::default(),
         )
         .unwrap();
         assert_eq!(
             (wire.bootstrap_room, wire.routed_dp_rank),
             (Some(7), Some(1))
         );
+    }
+
+    /// A pin's yield to the room goes through the note of the connection it
+    /// came on (the note's own test pins the WARN-once-then-DEBUG levels): a
+    /// conflicting pin marks that note, an agreeing pin marks nothing, and a
+    /// second connection's conflicting pin marks the second note.
+    #[test]
+    fn a_pins_yield_to_the_room_is_noted_on_the_connection() {
+        let connection = PinYieldNote::default();
+        assert_eq!(
+            room_residue_rank(7, Some(1), 2, "agrees", &connection),
+            Some(1)
+        );
+        assert!(!connection.noted(), "an agreeing pin is no yield");
+        assert_eq!(
+            room_residue_rank(7, Some(0), 2, "yields", &connection),
+            Some(1)
+        );
+        assert!(
+            connection.noted(),
+            "the conflicting pin yielded on this connection"
+        );
+        let other = PinYieldNote::default();
+        assert_eq!(room_residue_rank(7, Some(0), 2, "other", &other), Some(1));
+        assert!(other.noted(), "each connection keeps its own note");
     }
 
     /// Prompt bounds apply before the scheduler, with or without an output
@@ -1749,6 +1787,7 @@ mod tests {
                     max_model_len,
                     1,
                     RankPlacement::Pin,
+                    &PinYieldNote::default(),
                 );
                 assert_eq!(
                     result.is_ok(),

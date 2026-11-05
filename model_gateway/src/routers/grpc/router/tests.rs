@@ -818,7 +818,7 @@ struct ClosingBackend {
 
 #[async_trait]
 impl RateLimitBackend for ClosingBackend {
-    async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
         ReserveOutcome::Admitted
     }
     async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}

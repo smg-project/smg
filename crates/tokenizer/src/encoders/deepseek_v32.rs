@@ -557,7 +557,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        super::deepseek_common::{
+            object_arguments_render_one_parameter_per_key_through, ASSISTANT_SP_TOKEN,
+            USER_SP_TOKEN,
+        },
         *,
     };
 
@@ -727,36 +730,10 @@ mod tests {
 
     #[test]
     fn object_form_tool_call_arguments_render_params() {
-        // `model_gateway`'s `process_tool_call_arguments` converts the OpenAI
-        // arguments *string* into a dict before the chat template runs, so the
-        // encoder receives object-form arguments. It must render them, not drop
-        // them — dropping erased every historical tool call's parameters in
-        // multi-turn prompts and made the model loop (re-calling tools forever).
-        let msgs = [
-            user("call my tool"),
-            json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": { "query": "deepseek", "limit": 5 }
-                        }
-                    }
-                ]
-            }),
-        ];
-
-        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
-
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}parameter>"
-        )));
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
-        )));
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &EncodeParams::default()),
+            "parameter",
+        );
     }
 
     #[test]
@@ -845,5 +822,31 @@ mod tests {
             out,
             "<｜begin▁of▁sentence｜><｜User｜>Colour of the sky?<｜Assistant｜></think><｜User｜>\n\n# The user's message is: Answer in one word.<｜Assistant｜><think>"
         );
+    }
+
+    /// The reference writes the response-format section under `if
+    /// response_format:`, so `null` and `{}` render no section (the engine's
+    /// own encoder copy renders these bytes).
+    #[test]
+    fn a_falsy_response_format_renders_no_section() {
+        for (mode, thinking_token) in [
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+        ] {
+            for falsy in [json!(null), json!({})] {
+                let messages = [
+                    json!({ "role": "system", "content": "You are terse.", "response_format": falsy }),
+                    user("hello"),
+                ];
+                let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "{BOS_TOKEN}You are terse.{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    ),
+                    "{falsy}"
+                );
+            }
+        }
     }
 }

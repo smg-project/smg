@@ -430,7 +430,7 @@ fn reads_malformed(table: Table, prompt: &str, output: &str, tools: &[String]) -
             function: ToolFunction {
                 name: name.clone(),
                 description: None,
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: Some(serde_json::json!({"type": "object"})),
                 strict: None,
                 extra: Default::default(),
             },

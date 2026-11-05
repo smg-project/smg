@@ -46,6 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bytes(".tokenspeed.grpc.scheduler.TensorData.inline")
         .bytes(".vllm.grpc.engine.TensorData.inline")
         .bytes(".sglang.grpc.scheduler.TensorData.data")
+        // The raw image files of the TRT-LLM request are `Bytes` for the
+        // same reason: the frame already holds each file as `Bytes`, so the
+        // request shares it instead of copying it per image.
+        .bytes(".trtllm.MultimodalInput.image_data")
         // The SGLang request's two optional multimodal messages are 768 of
         // its 1,232 bytes, and a text request leaves both unset. Boxed, the
         // request is 480 bytes, and so is every copy of it a generate call

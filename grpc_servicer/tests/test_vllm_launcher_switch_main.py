@@ -214,11 +214,11 @@ def test_each_upstream_launcher_runs_through_to_the_servicer_on_every_entry(
 ):
     """The vendored upstream launcher of each release (tests/launchers/README.md)
     runs in a fresh interpreter, as `python -m` on every module the release has
-    and as the CLI's import after its parse, with Rust selected by the variable
-    (what a deployment sets) and with the Python default: Rust hands over to
-    serve_rust before any engine exists; Python builds the stub engine and
-    constructs the servicer on it. The 0.28 `python -m` case is the launcher
-    as __main__."""
+    and as the CLI's import after its parse, with the Rust default, Rust
+    selected by the variable (what a deployment sets) and the deprecated Python
+    servicer selected by the variable: Rust hands over to serve_rust before any
+    engine exists; Python builds the stub engine and constructs the servicer on
+    it. The 0.28 `python -m` case is the launcher as __main__."""
     smoke, results = _run(layout, version, ("env",))
     assert smoke.launcher_modules_in_tree(LAUNCHERS_DIR / layout) == launchers
     covered = {(result.case.form, result.case.launcher, result.case.impl) for result in results}
@@ -229,9 +229,13 @@ def test_each_upstream_launcher_runs_through_to_the_servicer_on_every_entry(
 
 def test_the_flag_selects_rust_on_the_launcher_run_as_main():
     """`--servicer-impl rust` on the 0.28 launcher's own command line: the
-    plugin's flag, parsed by the launcher as __main__, selects Rust."""
+    plugin's flag, parsed by the launcher as __main__, selects Rust (and
+    `--servicer-impl python` the deprecated Python servicer, both forms)."""
     smoke, results = _run("v0_28", "0.28.0", ("flag",))
     flagged = [result for result in results if result.case.selection == "flag"]
-    assert {result.case.form for result in flagged} == {"module", "cli"}
+    assert {(result.case.form, result.case.impl) for result in flagged} == {
+        (form, impl) for form in ("module", "cli") for impl in ("rust", "python")
+    }
     for result in flagged:
-        assert '"servicer_impl": "rust"' in result.stdout
+        if result.case.impl == "rust":
+            assert '"servicer_impl": "rust"' in result.stdout

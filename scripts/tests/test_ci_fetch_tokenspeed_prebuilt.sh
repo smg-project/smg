@@ -66,6 +66,14 @@ case "$1" in
 esac
 FAKE
     chmod +x "$T/bin/docker"
+    # The script runs its install steps through sudo where it exists, and sudo
+    # resolves commands on its own secure path: a pass-through fake keeps the
+    # ln fake of the link-failure test on this PATH.
+    cat > "$T/bin/sudo" <<'FAKE'
+#!/bin/bash
+exec "$@"
+FAKE
+    chmod +x "$T/bin/sudo"
     export PATH="$T/bin:$PATH"
     CACHE="$T/cache"
 }

@@ -994,19 +994,14 @@ async fn v1_tokenizers_remove(
 }
 
 pub struct ServerConfig {
-    pub host: String,
-    pub port: u16,
-    /// Dedicated port for the isolated liveness/readiness/health probe listener. `None`
-    /// leaves the dedicated listener off; probe routes always stay on the
-    /// main `port` regardless.
-    pub health_check_port: Option<u16>,
-    /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`). Only the CLI's
-    /// `main` sizes its runtime from it; `startup` runs on the caller's
-    /// runtime and logs the size it finds (and this setting, as `pinned`).
-    pub runtime_worker_threads: Option<usize>,
+    /// The router configuration, which carries the listener settings too:
+    /// the bind host and port, the probe listener's port, the runtime's
+    /// worker-thread count, the body limit, the request timeout and the
+    /// request-id header names. The listeners read them from here, the
+    /// value the validator checks, so there is no second copy to drift
+    /// (a caller that set one copy and left the other at its default was
+    /// validated for one port and bound to the other).
     pub router_config: RouterConfig,
-    pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub log_json: bool,
@@ -1015,8 +1010,6 @@ pub struct ServerConfig {
     /// worker discovery provider: either may run without the other.
     pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
-    pub request_timeout_secs: u64,
-    pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
     /// Listener propagation window; defaults to 5 seconds, capped at half the grace period.
     pub shutdown_settle_secs: Option<u64>,
@@ -1602,9 +1595,12 @@ async fn start_observability(
         config.router_config.max_background_responses > 0,
     );
 
-    if let Some(probe_port) = config.health_check_port {
-        let probe_addr =
-            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
+    if let Some(probe_port) = config.router_config.health_check_port {
+        let probe_addr = crate::health::start_probe_listener(
+            &config.router_config.host,
+            probe_port,
+            probe_state.clone(),
+        )?;
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
     Ok(probe_state)
@@ -2056,12 +2052,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(mesh_server_config) = &config.mesh_server_config {
         crate::config::validate_mesh_listener_port(
             mesh_server_config.bind_addr.port(),
-            config.port,
+            config.router_config.port,
             config
                 .prometheus_config
                 .as_ref()
                 .map(|prometheus_config| prometheus_config.port),
-            config.health_check_port,
+            config.router_config.health_check_port,
             config.router_config.admin_port,
         )?;
     }
@@ -2122,19 +2118,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // configuration's say; only the CLI's `main` sizes its runtime from it.
     info!(
         worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
-        pinned = config.runtime_worker_threads.is_some(),
+        pinned = config.router_config.runtime_worker_threads.is_some(),
         "Tokio runtime sized"
     );
     // A pinned count well above the CPUs available to the process is the
     // operator's choice, served with a warning: a worker thread beyond the
     // CPUs only waits for one. The ceiling on the count is the validator's,
     // and reads nothing of the host.
-    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
-        crate::config::runtime_worker_threads_oversubscription(
-            threads,
-            crate::config::available_cpus(),
-        )
-    }) {
+    if let Some(warning) = config
+        .router_config
+        .runtime_worker_threads
+        .and_then(|threads| {
+            crate::config::runtime_worker_threads_oversubscription(
+                threads,
+                crate::config::available_cpus(),
+            )
+        })
+    {
         tracing::warn!("{warning}");
     }
     // A rank scheduler under rank expansion chooses nothing: the operator's
@@ -2225,17 +2225,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
-        config.host,
-        config.port,
+        config.router_config.host,
+        config.router_config.port,
         config.router_config.mode,
         config.router_config.policy,
-        config.max_payload_size / (1024 * 1024)
+        config.router_config.max_payload_size / (1024 * 1024)
     );
 
     let app_context = Arc::new(
         AppContext::from_config(
             config.router_config.clone(),
-            config.request_timeout_secs,
+            config.router_config.request_timeout_secs,
             config.webrtc_bind_addr,
             config.webrtc_stun_server.clone(),
         )
@@ -2378,14 +2378,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .collect::<Vec<_>>()
     );
 
-    let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
-        vec![
-            "x-request-id".to_string(),
-            "x-correlation-id".to_string(),
-            "x-trace-id".to_string(),
-            "request-id".to_string(),
-        ]
-    });
+    let request_id_headers = config
+        .router_config
+        .request_id_headers
+        .clone()
+        .unwrap_or_else(|| {
+            vec![
+                "x-request-id".to_string(),
+                "x-correlation-id".to_string(),
+                "x-trace-id".to_string(),
+                "request-id".to_string(),
+            ]
+        });
 
     // Serving routes accept both the shared key and per-tenant keys, so the
     // rate limiter (and anything else keyed on tenant identity) can tell
@@ -2411,7 +2415,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                     .router_config
                     .admin_host
                     .as_deref()
-                    .unwrap_or(&config.host),
+                    .unwrap_or(&config.router_config.host),
                 admin_port,
             )
             .map_err(|e| {
@@ -2439,15 +2443,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         serving_auth_config,
         admin_auth_config,
         control_plane_auth_state,
-        config.max_payload_size,
+        config.router_config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         admin_addr.is_some(),
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
-    let addr = crate::config::bind_socket_addr(&config.host, config.port)
-        .map_err(|e| format!("Invalid address: {e}"))?;
+    let addr =
+        crate::config::bind_socket_addr(&config.router_config.host, config.router_config.port)
+            .map_err(|e| format!("Invalid address: {e}"))?;
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
@@ -3794,23 +3799,17 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
-    /// Build a loopback test server without discovery, mesh, or authentication.
+    /// Build a test server config without discovery, mesh, or authentication;
+    /// the listener is the one `router_config` names.
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            health_check_port: None,
-            runtime_worker_threads: None,
             router_config,
-            max_payload_size: 1024,
             log_dir: None,
             log_level: None,
             log_json: false,
             service_discovery_config: None,
             mesh_discovery_config: None,
             prometheus_config: None,
-            request_timeout_secs: 60,
-            request_id_headers: None,
             shutdown_grace_period_secs: 5,
             shutdown_settle_secs: None,
             control_plane_auth: None,
@@ -3831,6 +3830,7 @@ mod tests {
     #[tokio::test]
     async fn startup_validates_directly_constructed_router_config() {
         let router_config = RouterConfig {
+            host: "127.0.0.1".to_string(),
             tenant_api_keys: vec![TenantApiKeyEntry {
                 tenant_id: "team-a".to_string(),
                 key: String::new(),
@@ -3838,10 +3838,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = startup(minimal_server_config(router_config)).await;
+        // The refusal named, not any error: a listener that failed to bind
+        // would also be one.
+        let error = startup(minimal_server_config(router_config))
+            .await
+            .expect_err("startup must validate router_config even when constructed directly");
         assert!(
-            result.is_err(),
-            "startup must validate router_config even when constructed directly"
+            error.to_string().contains("must have a non-empty key"),
+            "startup refused for another reason: {error}"
         );
     }
 }

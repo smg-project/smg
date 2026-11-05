@@ -360,7 +360,7 @@ async fn images_ride_as_frames_behind_the_request() {
     let mut h = harness(model_info()).await;
     let mut req = generate_request("img", true);
     req.multimodal_input = Some(trt::MultimodalInput {
-        image_data: vec![b"first".to_vec(), b"second".to_vec()],
+        image_data: vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")],
     });
     let _stream = h.client.generate(req).await.expect("generate").into_inner();
     let (request, aux) = recv_add(&mut h.engine_in).await;
@@ -792,7 +792,10 @@ async fn a_connected_ranks_record_is_zero_filled_before_its_first_load_tail() {
 
 /// Two connected shims, one of which has reported a load tail: the record
 /// of the other stays zero-filled (an idle scheduler, not a gone one), never
-/// the sibling's figures; a rank past the connected ones has none.
+/// the sibling's figures; a rank past the connected ones has none. `GetLoads`
+/// answers the same figures for every connected rank, the named rank alone
+/// when the request names one, and the record pushed for a rank is that
+/// rank's poll entry.
 #[tokio::test]
 async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     let dir = tempfile::tempdir().unwrap();
@@ -802,8 +805,11 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.engine_count = 2;
     let server = TrtllmServicerServer::start(config).expect("servicer starts");
+    // A KV capacity on the handshake, so the token figures below are real
+    // counts (the shim's batch reports 10 of 100 KV tokens), not zeros.
     let ready = |rank: u32| EngineCoreReadyResponse {
         data_parallel_rank: rank,
+        kv_cache_size_tokens: Some(100),
         ..ready_response()
     };
     let (first, second) = tokio::join!(
@@ -859,6 +865,83 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
         "{idle:?}"
     );
     assert!(kv_events::LoadSource::load(&source, Some(2)).is_none());
+
+    let loads = client
+        .get_loads(smg_grpc_client::trtllm_proto::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2, "{loads:?}");
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_total_reqs))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, i32::from(served == 0), i32::from(served == 0)),
+            (1, i32::from(served == 1), i32::from(served == 1))
+        ]
+    );
+    assert!(loads
+        .loads
+        .iter()
+        .all(|load| load.prefill_throughput.is_none()));
+    // The served rank's entry carries the shim's real counts over the
+    // handshake's capacity; the idle rank reads the capacity and no use.
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (
+                load.dp_rank,
+                load.num_used_tokens,
+                load.max_total_num_tokens
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, if served == 0 { 10 } else { 0 }, 100),
+            (1, if served == 1 { 10 } else { 0 }, 100)
+        ]
+    );
+    // The record the relay pushes for a rank is the poll's entry for it: one
+    // field set on both wires, the token counts and the KV capacity included,
+    // so a gateway's DP-rank token cache reads the same from a push as from
+    // a poll.
+    for load in &loads.loads {
+        let pushed = kv_events::LoadSource::load(&source, Some(load.dp_rank))
+            .expect("the rank's pushed record");
+        assert_eq!(
+            (pushed.num_used_tokens, pushed.max_total_num_tokens),
+            (Some(load.num_used_tokens), Some(load.max_total_num_tokens)),
+            "{pushed:?}"
+        );
+        let mut from_push = openai_protocol::worker::SchedulerLoadSnapshot::from(&pushed);
+        from_push.dp_rank = load.dp_rank;
+        assert_eq!(
+            format!(
+                "{:?}",
+                openai_protocol::worker::SchedulerLoadSnapshot::from(*load)
+            ),
+            format!("{from_push:?}")
+        );
+    }
+    let named = client
+        .get_loads(smg_grpc_client::trtllm_proto::GetLoadsRequest {
+            dp_rank: Some(served_rank),
+            include: vec![],
+        })
+        .await
+        .expect("get_loads of one rank")
+        .into_inner();
+    assert_eq!(
+        (
+            named.dp_rank_count,
+            named.loads.len(),
+            named.loads[0].dp_rank
+        ),
+        (1, 1, served_rank)
+    );
 
     drop(stream);
     server.stop(Duration::from_secs(5)).expect("clean stop");
@@ -981,4 +1064,199 @@ fn structured_outputs_support_follows_the_launcher_facts() {
     );
     assert_eq!(support(""), StructuredOutputsBackendConfig::Other.into());
     let _ = Arc::new(());
+}
+
+/// After the shim's first output for a request (one of its three prompt
+/// tokens cached) and four streamed tokens, with a second request the shim
+/// holds waiting, `GetLoads` and the pushed record both carry the rank's hit
+/// rate, a throughput and the waiting request's queued token-work, the
+/// servicer's own estimate as on every wire; the two readers agree.
+#[tokio::test]
+async fn the_loads_and_the_record_carry_the_servicers_estimate_of_queued_work_rate_and_hit_rate() {
+    let mut h = harness(model_info()).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r1", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut started = batch("r1", vec![10, 11, 12, 13], 4, None, None);
+    started.cached_tokens = vec![1];
+    started.num_waiting = 1;
+    send(&mut h.engine_out, &started).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![10, 11, 12, 13]
+    );
+    let second = h
+        .client
+        .generate(generate_request("r2", true))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+
+    let loads = h
+        .client
+        .get_loads(smg_grpc_client::trtllm_proto::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(loads.loads.len(), 1, "one entry per rank: {loads:?}");
+    let rank0 = &loads.loads[0];
+    assert_eq!((rank0.num_running_reqs, rank0.num_waiting_reqs), (1, 1));
+    assert!(
+        (rank0.cache_hit_rate - 1.0 / 3.0).abs() < 1e-9,
+        "the rank cached one token in three: {rank0:?}"
+    );
+    assert!(
+        rank0.gen_throughput > 0.0,
+        "the rank streamed the tokens: {rank0:?}"
+    );
+    assert_eq!(
+        rank0.num_waiting_uncached_tokens, 2,
+        "the waiting request's three prompt tokens at the rank's hit rate: {rank0:?}"
+    );
+    assert!((rank0.utilization - rank0.token_usage).abs() < f64::EPSILON);
+
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (1, 1));
+    assert_eq!(
+        record.waiting_uncached_tokens,
+        Some(2),
+        "the waiting request's three prompt tokens at the rank's hit rate: {record:?}"
+    );
+    assert_eq!(
+        record.cache_hit_rate,
+        Some(rank0.cache_hit_rate),
+        "the record and GetLoads read the one estimate: {record:?}"
+    );
+    assert!(record.gen_throughput > 0.0, "{record:?}");
+
+    drop(second);
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the shim, each answered after its prefill,
+/// calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), None);
+        done.cached_tokens = vec![cached];
+        done.num_running = 0;
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(trt::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut step = batch("q1", vec![10], 1, None, None);
+    step.num_waiting = 1;
+    send(&mut h.engine_out, &step).await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(trt::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    let mut step = batch("q2", vec![11], 1, None, None);
+    step.num_running = 2;
+    send(&mut h.engine_out, &step).await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    let mut full = batch("q2", vec![12], 2, None, None);
+    full.num_running = 64;
+    send(&mut h.engine_out, &full).await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut step = batch("q3", vec![13], 1, None, None);
+    step.num_running = 3;
+    send(&mut h.engine_out, &step).await;
+    chunk(third.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the shim's word (a stream dropped mid-flight
+    // would send the shim an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), None),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

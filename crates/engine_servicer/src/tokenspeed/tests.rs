@@ -42,7 +42,9 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     ServicerError,
 };
 
@@ -2145,9 +2147,12 @@ async fn an_idle_rank_keeps_its_zero_entry_once_a_sibling_reports() {
 /// handshake, not the order or the identity it dialled in with: here the
 /// scheduler that dialled in as identity 0 declares rank 1. An aggregated
 /// request goes where its pin says, under the same numbering, and a pin
-/// outside the ranks is refused as the engine refuses it.
+/// outside the ranks is refused as the engine refuses it. A pin that
+/// disagrees with the room yields to it: the connection's first such request
+/// is the warning line with the request's fields, the second logs below WARN.
 #[tokio::test]
 async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
+    let logs = captured_logs();
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model_info());
@@ -2205,6 +2210,58 @@ async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
         assert_eq!(done.finish_reason, "stop");
         assert!(stream.message().bounded().await.unwrap().is_none());
     }
+
+    // A pin that disagrees with the room yields to it (rooms 9 and 11 are
+    // rank 1, the pin says 0): the connection's first such request is the
+    // WARN line with the request's fields, the second logs below WARN (the
+    // capture reads WARN and above).
+    let mut yielding = disaggregated_request("pinned-9", 9);
+    yielding.data_parallel_rank = Some(0);
+    let mut first_yield = client
+        .generate(yielding)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-9", Some(9))
+    );
+    let mut yielding_again = disaggregated_request("pinned-11", 11);
+    yielding_again.data_parallel_rank = Some(0);
+    let mut second_yield = client
+        .generate(yielding_again)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-11", Some(11))
+    );
+    send(&mut rank1_out, &answer("pinned-9", 0)).await;
+    send(&mut rank1_out, &answer("pinned-11", 0)).await;
+    for stream in [&mut first_yield, &mut second_yield] {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    let lines = logs.lines_containing("pinned-9");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    for field in [
+        "WARN",
+        "data_parallel_rank conflicts with the bootstrap_room residue",
+        "data_parallel_rank=0",
+        "bootstrap_room=9",
+        "dp_size=2",
+    ] {
+        assert!(lines[0].contains(field), "{field} in {}", lines[0]);
+    }
+    assert!(
+        logs.lines_containing("pinned-11").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("pinned-11")
+    );
 
     let mut outside = generate_request("pin-9", false, Vec::new());
     outside.data_parallel_rank = Some(9);
@@ -3197,4 +3254,132 @@ fn an_encode_launch_without_its_rendezvous_address_is_refused_before_the_start()
             "{host:?}: {error:?}"
         );
     }
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight, or while the last tail shows the window full,
+/// takes no sample.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info(), None).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 100)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
+    // and counts as queued work until it starts.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A would-be sample must clear the estimator's 1 ms rule: the batches
+    // below follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 100))),
+    )
+    .await;
+    first.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    let busy = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 1, 0, 100))),
+    )
+    .await;
+    second.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
+    // The last tail says the window is full while q1 and q2 still run: q3
+    // has nothing of ours queued ahead of it and still cannot vouch for an
+    // immediate admission.
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![12], 2, None, Some((64, 0, 0, 100))),
+    )
+    .await;
+    second.message().bounded().await.unwrap().unwrap();
+    let mut third = h
+        .client
+        .generate(generate_request("q3", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q3", vec![13], 1, None, Some((3, 0, 0, 100))),
+    )
+    .await;
+    third.message().bounded().await.unwrap().unwrap();
+    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 100))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

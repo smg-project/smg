@@ -118,6 +118,29 @@ pub struct HuggingFaceTokenizer {
     byte_fallback_values: Vec<Option<u8>>,
 }
 
+/// Logs, once per load, which path a tokenizer's full decode takes: the
+/// byte-level table (a `ByteLevel` decoder), the piece table (byte fallback),
+/// or `tokenizers` itself, with the decoder kind that kept the tables out.
+fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool) {
+    let path = if byte_level {
+        "byte-level table"
+    } else if pieces {
+        "piece table"
+    } else {
+        "tokenizers"
+    };
+    if byte_level || pieces {
+        tracing::info!(path, "tokenizer decode path");
+    } else {
+        tracing::info!(
+            path,
+            declined = %crate::byte_level::decoder_kind(tokenizer.get_decoder()),
+            "tokenizer decode path (the tables take a ByteLevel decoder, or the chain \
+             [Replace U+2581 -> space] ByteFallback Fuse [Strip one leading space])"
+        );
+    }
+}
+
 fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
     match decoder {
         DecoderWrapper::ByteFallback(_) => true,
@@ -872,9 +895,12 @@ impl HuggingFaceTokenizer {
             .and_then(deepseek_v31::Checkpoint::load);
         let tools_block =
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
+        let byte_level = ByteLevelTable::build(&tokenizer);
+        let pieces = PieceTable::build(&tokenizer);
+        log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         Ok(HuggingFaceTokenizer {
-            byte_level: ByteLevelTable::build(&tokenizer),
-            pieces: PieceTable::build(&tokenizer),
+            byte_level,
+            pieces,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
@@ -1128,9 +1154,12 @@ impl HuggingFaceTokenizer {
 
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
+        let byte_level = ByteLevelTable::build(&tokenizer);
+        let pieces = PieceTable::build(&tokenizer);
+        log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         HuggingFaceTokenizer {
-            byte_level: ByteLevelTable::build(&tokenizer),
-            pieces: PieceTable::build(&tokenizer),
+            byte_level,
+            pieces,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
@@ -1879,7 +1908,9 @@ impl Decoder for HuggingFaceTokenizer {
     }
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        #[cfg(feature = "tokenizers-v1")]
+        // A byte-level vocabulary decodes through the table its streams use:
+        // every id's bytes concatenated and one UTF-8 conversion, in place of
+        // the `tokenizers` decoder chain over every piece.
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
         }
@@ -1990,7 +2021,12 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> Result<DecodeStep> {
-        if !self.has_byte_fallback {
+        if !self.has_byte_fallback && ids.len() <= *prefix_index {
+            // Nothing held past the emitted text: a window without byte runs
+            // holds only while its decode ends in an incomplete character.
+            ids.clear();
+            prefix.clear();
+            *prefix_index = 0;
             return Ok(DecodeStep::default());
         }
         if prefix.is_empty() && ids.len() == *prefix_index {

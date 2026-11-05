@@ -1931,6 +1931,72 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Exercise the production path: vLLM wire -> Rust servicer -> gRPC GetLoads,
+/// plus the record used by the KV-event relay. Only actual input work counts.
+#[tokio::test]
+async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, mut input, mut output) = two_rank_harness(model).await;
+    for (id, start) in [("p1", 10.0), ("p2", 20.0)] {
+        let mut request = generate_request(id, true, vec![]);
+        request.data_parallel_rank = Some(1);
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        assert_eq!(recv_add(&mut input).await.request_id, id);
+        output
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 1,
+                timestamp: start + 0.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.to_string(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Queued,
+                            timestamp: start - 9.0,
+                        },
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Scheduled,
+                            timestamp: start,
+                        },
+                    ]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank1 = loads.loads.iter().find(|load| load.dp_rank == 1).unwrap();
+    assert_eq!(rank1.prefill_throughput, Some(4.0));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
+    assert_eq!(record.prefill_throughput, Some(4.0));
+    assert_eq!(
+        kv_events::LoadSource::load(&source, Some(0))
+            .unwrap()
+            .prefill_throughput,
+        None
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Every relayed batch carries the servicer's load record: the figures
 /// `GetLoads` answers with, so the gateway reads the queue, running set, KV
 /// usage and window at every scheduler step.
@@ -2264,6 +2330,67 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
             break;
         }
     }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay reads for a rank is the entry `GetLoads` lists for
+/// it, reported or not yet (the zero-filled entry with the servicer's own
+/// figures), rank 0 for a publisher that names no rank, and nothing for a
+/// rank past the connected ones.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        let answer = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .expect("GetLoads answers")
+            .into_inner();
+        if answer
+            .loads
+            .iter()
+            .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == 2)
+        {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rank 1's figures in time: {answer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let ranks: Vec<i32> = answer.loads.iter().map(|load| load.dp_rank).collect();
+    assert_eq!(ranks, [0, 1], "rank 0 is listed before its first step");
+    let state = &h.server.state;
+    for load in &answer.loads {
+        let mut expected = common::EngineLoad::from(load);
+        expected.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        assert_eq!(
+            state.rank_load(Some(load.dp_rank)),
+            Some(expected),
+            "rank {}",
+            load.dp_rank
+        );
+    }
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(2)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

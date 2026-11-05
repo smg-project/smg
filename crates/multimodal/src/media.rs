@@ -133,7 +133,7 @@ impl Default for MediaConnectorConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageFetchConfig {
     pub detail: ImageDetail,
     /// MiniMax-M3 extension: cap the decoded image's long side.
@@ -154,7 +154,7 @@ impl Default for ImageFetchConfig {
 }
 
 /// Where the sampled frames sit within a clip.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FrameSampling {
     /// Spread evenly from the first frame to the last.
     #[default]

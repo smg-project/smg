@@ -123,7 +123,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_flag):
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": "python"}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -145,7 +146,7 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_flag):
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
     assert rust.servicer_impl_source(environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == (
         "rust",
         "env",
@@ -158,7 +159,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_
     assert environ == {"SMG_SGLANG_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
     # The flag the plugin parsed in this process counts as the launcher's:
     # SGLang's ServerArgs does not carry it.

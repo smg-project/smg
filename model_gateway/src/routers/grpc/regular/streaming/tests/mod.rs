@@ -2,7 +2,9 @@ mod delta_slicing;
 pub(crate) mod eof;
 mod failure;
 mod generate_bytes;
+mod generate_decode;
 mod generate_finish;
+mod generate_tokens;
 mod isolation;
 mod local_stop;
 mod messages_bytes;
@@ -248,6 +250,7 @@ fn messages_usage_cache_counters_serialize_as_integer_zeros() {
     let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         None,
     ))
     .unwrap();
@@ -255,6 +258,24 @@ fn messages_usage_cache_counters_serialize_as_integer_zeros() {
     assert_eq!(delta["input_tokens"], 25);
     assert_eq!(delta["cache_creation_input_tokens"], 0);
     assert_eq!(delta["cache_read_input_tokens"], 0);
+}
+
+/// The final message_delta splits the engine's prompt count as the wire
+/// does: the input outside the cache beside the hit as
+/// `cache_read_input_tokens`, both integers, their sum the prompt; the
+/// creation counter stays zero.
+#[test]
+fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
+    let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
+        15,
+        Some(945),
+        896,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(delta["input_tokens"], 49);
+    assert_eq!(delta["cache_read_input_tokens"], 896);
+    assert_eq!(delta["cache_creation_input_tokens"], 0);
 }
 
 /// The `message_start` skeleton carries every key the public API writes
@@ -273,6 +294,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
     let plain = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         None,
     ))
     .unwrap();
@@ -280,6 +302,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
     let thinking = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
         15,
         Some(25),
+        0,
         Some(9),
     ))
     .unwrap();
@@ -291,7 +314,7 @@ fn messages_usage_always_present_keys_and_thinking_tokens() {
 #[test]
 fn message_delta_input_tokens_null_without_authoritative_usage() {
     let delta = serde_json::to_value(StreamingProcessor::final_messages_delta_usage(
-        15, None, None,
+        15, None, 0, None,
     ))
     .unwrap();
     assert!(delta.get("input_tokens").is_some_and(Value::is_null));
@@ -392,6 +415,19 @@ fn finish_preserves_pending_decode_errors() {
     assert!(error.to_string().contains("pending token decode failed"));
 }
 
+/// The SSE frame of a Messages event written the plain way: the event's type line, then the
+/// whole event through serde.
+fn serialized_messages_event(event: &MessageStreamEvent) -> Vec<u8> {
+    let mut bytes = format!(
+        "event: {}\ndata: ",
+        StreamingProcessor::message_event_type_name(event)
+    )
+    .into_bytes();
+    serde_json::to_writer(&mut bytes, event).expect("the event serializes");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
 /// The one-pass `content_block_delta` frames write exactly the bytes of the
 /// serialized event, so the literal head can never drift from serde's walk of
 /// the two tagged enums: every string delta variant, several block indices and
@@ -399,16 +435,6 @@ fn finish_preserves_pending_decode_errors() {
 /// and the other events keep the serialized whole.
 #[test]
 fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
-    fn serialized(event: &MessageStreamEvent) -> Vec<u8> {
-        let mut bytes = format!(
-            "event: {}\ndata: ",
-            StreamingProcessor::message_event_type_name(event)
-        )
-        .into_bytes();
-        serde_json::to_writer(&mut bytes, event).expect("the event serializes");
-        bytes.extend_from_slice(b"\n\n");
-        bytes
-    }
     fn formatted(event: &MessageStreamEvent) -> Vec<u8> {
         let mut buffer = BytesMut::with_capacity(64);
         StreamingProcessor::format_messages_sse_into(&mut buffer, event)
@@ -445,7 +471,7 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
                 let event = MessageStreamEvent::ContentBlockDelta { index, delta };
                 assert_eq!(
                     formatted(&event),
-                    serialized(&event),
+                    serialized_messages_event(&event),
                     "index {index}, text {text:?}"
                 );
             }
@@ -464,9 +490,9 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
             }),
         },
     };
-    assert_eq!(formatted(&citation), serialized(&citation));
+    assert_eq!(formatted(&citation), serialized_messages_event(&citation));
     let stop = MessageStreamEvent::ContentBlockStop { index: 3 };
-    assert_eq!(formatted(&stop), serialized(&stop));
+    assert_eq!(formatted(&stop), serialized_messages_event(&stop));
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"

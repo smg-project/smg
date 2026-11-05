@@ -734,19 +734,7 @@ async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
 async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
     let (tx, rx) = sse_channel();
-    let spec = MessagesResponseSpec {
-        thinking_requested: false,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    };
+    let spec = messages_spec(false);
     let result = processor(false)
         .process_messages_streaming_chunks(
             stream,
@@ -831,7 +819,19 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
     Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap())
 }
 
-fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
+/// The non-streaming processor with the parsers of [`processor`] (the Qwen3
+/// reasoning parser, no tool parser named).
+pub(crate) fn response_processor() -> ResponseProcessor {
+    unary_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        None,
+        Some("qwen3".to_string()),
+    ))
+}
+
+/// The Messages response spec of a plain text turn: thinking on or off, no
+/// tools, no stops. The streaming tests that want nothing else build theirs here.
+pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -953,7 +953,7 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
                 dispatch(),
                 tokenizer.clone(),
                 (None, None, false, false, true),
-                byte_fallback_messages_spec(false),
+                messages_spec(false),
                 &tx,
                 None,
             )
@@ -999,7 +999,7 @@ async fn byte_fallback_messages_transport_eof_reports_local_stop_with_the_chunk_
                 false,
                 true,
             ),
-            byte_fallback_messages_spec(false),
+            messages_spec(false),
             &tx,
             None,
         )
@@ -1141,7 +1141,7 @@ async fn byte_fallback_messages_complete_counts_held_thinking_tokens() {
             dispatch(),
             byte_fallback_reasoning_tokenizer(),
             (None, None, false, false, true),
-            byte_fallback_messages_spec(true),
+            messages_spec(true),
             &tx,
             None,
         )
@@ -1172,11 +1172,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         byte_fallback_reasoning_tokenizer(),
         llm_tokenizer::CacheConfig::default(),
     ));
-    let processor = unary_processor(utils::ParserResolver::with_flags(
-        Arc::new(WorkerRegistry::new()),
-        None,
-        Some("qwen3".into()),
-    ));
+    let processor = response_processor();
     for ids in [
         b"<think>ab</think>de"
             .iter()
@@ -1219,7 +1215,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         let (message, _) = processor
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single { stream },
-                byte_fallback_messages_spec(true),
+                messages_spec(true),
                 dispatch(),
                 tokenizer.clone(),
                 &mut decoder,
@@ -1381,7 +1377,7 @@ async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
 
 /// Per choice, the role and finish reason of each of its deltas, in stream
 /// order.
-fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
+pub(crate) fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
     events
         .iter()
         .filter_map(|event| {
@@ -1913,21 +1909,17 @@ async fn chat_unary_logprobs_cover_every_generated_token() {
     let stop = Some(StringOrArray::String("STOP".to_string()));
     let mut decoder =
         utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
-    let (response, _) = unary_processor(utils::ParserResolver::with_flags(
-        Arc::new(WorkerRegistry::new()),
-        None,
-        Some("qwen3".to_string()),
-    ))
-    .process_non_streaming_chat_response(
-        context::ExecutionResult::Single { stream },
-        chat_spec(false),
-        dispatch(),
-        tokenizer,
-        &mut decoder,
-        false,
-    )
-    .await
-    .unwrap_or_else(|response| panic!("{}", response.status()));
+    let (response, _) = response_processor()
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
     let choice = &serde_json::to_value(response).unwrap()["choices"][0];
     assert_eq!(choice["message"]["reasoning_content"], "why");
@@ -2144,19 +2136,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         }
         let (stream, server) = scripted_stream(responses, "0").await;
         let (tx, rx) = sse_channel();
-        let spec = MessagesResponseSpec {
-            thinking_requested: true,
-            thinking_text_returned: true,
-            reasoning_in_prefill: false,
-            tool_choice: None,
-            has_tools: false,
-            history_tool_calls_count: 0,
-            chat_tools: Vec::new().into(),
-            stop_sequences: None,
-            symphony: None,
-            first_tool_call_only: false,
-            parser_names: None,
-        };
+        let spec = messages_spec(true);
         let result = processor(false)
             .process_messages_streaming_chunks(
                 stream,
@@ -3409,7 +3389,7 @@ async fn messages_stream_cut_keeps_upstream_failure_and_does_not_finish_decoding
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
-            byte_fallback_messages_spec(false),
+            messages_spec(false),
             &tx,
             None,
         )

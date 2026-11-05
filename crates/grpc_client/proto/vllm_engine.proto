@@ -564,8 +564,9 @@ message SchedulerLoad {
   double utilization = 10;
   int32 max_running_requests = 11;
   // Queued token-work: prompt tokens of waiting requests not served from the
-  // prefix cache, what the gateway's expected-wait score drains at
-  // gen_throughput. The servicer estimates it from the requests it forwarded
+  // prefix cache. The servicer estimates it from the requests it forwarded
   // that the engine has not started (same semantics as the SGLang field).
   int32 num_waiting_uncached_tokens = 12;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 13;
 }

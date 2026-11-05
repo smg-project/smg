@@ -341,7 +341,7 @@ mod tests {
     use tower::{ServiceBuilder, ServiceExt};
 
     use super::*;
-    use crate::observability::metrics::interner_size;
+    use crate::observability::metrics::is_interned;
 
     #[test]
     fn matched_path_label_defaults_to_other_when_absent() {
@@ -444,8 +444,12 @@ mod tests {
         assert_eq!(error_code_label(&ok), "");
     }
 
+    /// A code an upstream forges in `X-SMG-Error-Code` never becomes an
+    /// `error_code` label; the code the gateway's own error builder sets
+    /// does. Asked of each value by name, so what neighbouring tests intern
+    /// meanwhile cannot move the verdict.
     #[tokio::test]
-    async fn upstream_forged_error_codes_do_not_grow_interner() {
+    async fn an_upstream_forged_error_code_never_becomes_a_label() {
         use axum::{
             extract::Path,
             http::HeaderValue,
@@ -454,12 +458,12 @@ mod tests {
 
         use crate::{
             observability::inflight_tracker::InFlightRequestTracker,
-            routers::error::HEADER_X_SMG_ERROR_CODE,
+            routers::error::{create_error, HEADER_X_SMG_ERROR_CODE},
         };
 
-        // Simulates a handler returning a fresh X-SMG-Error-Code per response.
-        // Only gateway-set codes may become metric labels, so the interner
-        // must stay flat.
+        // A handler that returns a fresh X-SMG-Error-Code per response, as an
+        // upstream would, and one that refuses through the gateway's builder.
+        const GATEWAY_CODE: &str = "forged_code_test_gateway_refusal";
         let app = Router::new()
             .route(
                 "/echo/{id}",
@@ -472,41 +476,52 @@ mod tests {
                     response
                 }),
             )
+            .route(
+                "/refused",
+                get(|| async { create_error(http::StatusCode::NOT_FOUND, GATEWAY_CODE, "no") }),
+            )
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
 
-        let send = |uri: String| {
+        let send = |uri: String, expected: http::StatusCode| {
             let app = app.clone();
             async move {
                 let response = app
                     .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                     .await
                     .unwrap();
-                assert!(response.status().is_success());
+                assert_eq!(response.status(), expected);
             }
         };
-
-        send("/echo/warmup".to_owned()).await;
-        let size_before = interner_size();
 
         const ITERS: usize = 1000;
         for i in 0..ITERS {
-            send(format!("/echo/{i}")).await;
+            send(format!("/echo/{i}"), http::StatusCode::OK).await;
         }
+        send("/refused".to_owned(), http::StatusCode::NOT_FOUND).await;
 
-        let growth = interner_size().saturating_sub(size_before);
+        for i in 0..ITERS {
+            assert!(
+                !is_interned(&format!("evil-{i}")),
+                "the upstream's forged code evil-{i} became a label"
+            );
+        }
         assert!(
-            growth < 100,
-            "interner grew by {growth} for {ITERS} distinct upstream error codes"
+            is_interned(GATEWAY_CODE),
+            "the gateway's own code is the error_code label"
         );
     }
 
+    /// A request id in the path of a matched route never becomes a `path`
+    /// label; the route's template does. Asked of each value by name, so
+    /// what neighbouring tests intern meanwhile cannot move the verdict.
     #[tokio::test]
-    async fn distinct_ids_on_matched_route_do_not_grow_interner() {
+    async fn a_request_id_on_a_matched_route_never_becomes_a_label() {
         // Drive the real `HttpMetricsLayer`. Every request matches the dynamic
         // route `/v1/responses/{response_id}`, so each distinct id must record
-        // the bounded template label and leave the never-evicted interner flat.
+        // the bounded template label and nothing of its own.
+        const TEMPLATE: &str = "/v1/responses/{response_id}";
         let app = Router::new()
-            .route("/v1/responses/{response_id}", get(|| async { "ok" }))
+            .route(TEMPLATE, get(|| async { "ok" }))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
 
         let send = |uri: String| {
@@ -519,22 +534,21 @@ mod tests {
                 assert!(response.status().is_success());
             }
         };
-
-        // Warm up so the template label and the empty error_code are interned.
-        send("/v1/responses/resp_warmup".to_owned()).await;
-        let size_before = interner_size();
 
         const ITERS: usize = 1000;
         for i in 0..ITERS {
             send(format!("/v1/responses/resp_{i}")).await;
         }
 
-        // Slack tolerates strings unrelated parallel tests may intern; an
-        // unbounded label would instead grow the interner by ~ITERS.
-        let growth = interner_size().saturating_sub(size_before);
+        for i in 0..ITERS {
+            assert!(
+                !is_interned(&format!("/v1/responses/resp_{i}")),
+                "the request path /v1/responses/resp_{i} became a label"
+            );
+        }
         assert!(
-            growth < 100,
-            "interner grew by {growth} for {ITERS} distinct request ids"
+            is_interned(TEMPLATE),
+            "the route's template is the path label"
         );
     }
 

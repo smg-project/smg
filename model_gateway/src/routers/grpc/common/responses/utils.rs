@@ -49,21 +49,23 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
 }
 
 /// Map a Chat finish reason to a generated function-call item's status: a call whose arguments
-/// are not complete JSON was cut, by the token limit or an abort, unless the turn ended on the
-/// call (`tool_calls`), whose arguments stand as the parser wrote them.
+/// are no JSON value is `incomplete` whatever the finish, since a client must not run it as a
+/// whole one: cut by the token limit or an abort, or ended by the model and not read whole (a
+/// tagged syntax that refused bytes inside the call writes no close for it; a JSON syntax carries
+/// the bytes as written from where they stopped being JSON), the turn ending on the call
+/// (`tool_calls`) all the same; a failed generation stays `in_progress`.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
         Some("failed" | "error") => "in_progress",
-        Some("tool_calls") => "completed",
         _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
     }
 }
 
-/// Whether a turn's calls hold one that was cut: a call whose status under the finish reason
-/// reads `incomplete` (`function_call_status`), read on the function-shaped arguments of every
-/// call before a custom tool's call becomes its `custom_tool_call` item, which carries no
-/// status on the wire.
+/// Whether a turn's calls hold one that is no whole call, cut or not read whole: a call whose
+/// status under the finish reason reads `incomplete` (`function_call_status`), read on the
+/// function-shaped arguments of every call before a custom tool's call becomes its
+/// `custom_tool_call` item, which carries no status on the wire.
 pub(crate) fn cut_call<'a>(
     finish_reason: Option<&str>,
     arguments: impl IntoIterator<Item = &'a str>,
@@ -74,8 +76,9 @@ pub(crate) fn cut_call<'a>(
 }
 
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
-/// finish is the token limit; a call cut by anything else (`cut_call`, read on the calls'
-/// function-shaped arguments) leaves the response incomplete with no stated reason. Every
+/// finish is the token limit; a call that is no whole call under any other finish (`cut_call`,
+/// read on the calls' function-shaped arguments) leaves the response incomplete with no stated
+/// reason. Every
 /// builder of a Responses object reads its status here: the non-streaming conversions,
 /// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
 /// terminal event and stored object under the finish it holds, whether chat chunks or a
@@ -252,7 +255,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
     openai_protocol::common::Function {
         name: ct.name.clone(),
         description: ct.description.clone(),
-        parameters: serde_json::json!({
+        parameters: Some(serde_json::json!({
             "type": "object",
             "properties": {
                 "input": {
@@ -262,7 +265,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
             },
             "required": ["input"],
             "additionalProperties": false
-        }),
+        })),
         strict: Some(false),
         extra: Default::default(),
     }
@@ -1225,16 +1228,25 @@ mod tests {
     }
 
     #[test]
-    fn a_call_whose_arguments_are_not_complete_json_is_incomplete_unless_the_turn_ended_on_it() {
-        for finish in [Some("length"), Some("abort"), Some("stop"), None] {
-            assert_eq!(function_call_status(finish, "{\"a\": \"b"), "incomplete");
-            assert_eq!(function_call_status(finish, ""), "incomplete");
-            assert_eq!(function_call_status(finish, "{\"a\": 1}"), "completed");
-        }
-        for arguments in ["{\"a\": 1}", "", "weather in Paris"] {
+    fn a_call_whose_arguments_are_no_json_value_is_incomplete_whatever_the_finish() {
+        for finish in [
+            Some("length"),
+            Some("abort"),
+            Some("stop"),
+            Some("tool_calls"),
+            None,
+        ] {
+            for arguments in ["{\"a\": \"b", "", "weather in Paris"] {
+                assert_eq!(
+                    function_call_status(finish, arguments),
+                    "incomplete",
+                    "{finish:?} {arguments:?}"
+                );
+            }
             assert_eq!(
-                function_call_status(Some("tool_calls"), arguments),
-                "completed"
+                function_call_status(finish, "{\"a\": 1}"),
+                "completed",
+                "{finish:?}"
             );
         }
         assert_eq!(function_call_status(Some("failed"), "{"), "in_progress");

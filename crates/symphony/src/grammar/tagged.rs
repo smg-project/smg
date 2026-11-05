@@ -57,7 +57,7 @@ pub(super) fn calls(
             markers,
             &values,
             &tool.function.name,
-            &tool.function.parameters,
+            tool.function.parameters_schema(),
         )
     });
     calls::in_block(markers, ways_in, calls.collect(), count, |one_call| {

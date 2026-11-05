@@ -1525,7 +1525,7 @@ impl ChatDecode {
             let encoding = try_harmony_encoding()?;
             chunk
                 .output_logprobs()
-                .map(|lp| convert_harmony_logprobs(encoding, &lp))
+                .map(|lp| convert_harmony_logprobs(encoding, lp))
         } else {
             None
         };

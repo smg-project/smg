@@ -670,16 +670,19 @@ fn validate_chat_cross_parameters(
         validate_tool_choice(req, tool_choice)?;
     }
 
-    // 8. A function's `parameters` is a JSON Schema object (null was already
-    //    read as the empty schema)
+    // 8. A function's `parameters`, when given, is a JSON Schema object (an
+    //    absent or null schema was read as none and passes)
     for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
-        if !tool.function.parameters.is_object() {
+        let Some(schema) = &tool.function.parameters else {
+            continue;
+        };
+        if !schema.is_object() {
             return Err(invalid(
                 "invalid_type",
                 format!(
                     "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
                      instead",
-                    json_type_name(&tool.function.parameters)
+                    json_type_name(schema)
                 ),
             ));
         }
@@ -1687,7 +1690,7 @@ mod tests {
         let request: ChatCompletionRequest =
             serde_json::from_value(value).expect("request must deserialize");
         let tools = request.tools.expect("tools must be present");
-        assert_eq!(tools[0].function.parameters, json!({}));
+        assert_eq!(tools[0].function.parameters_schema(), &json!({}));
     }
 
     #[test]

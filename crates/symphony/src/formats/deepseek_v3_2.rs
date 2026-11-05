@@ -414,7 +414,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}),
+                parameters: Some(
+                    value!({"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },

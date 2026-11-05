@@ -239,8 +239,24 @@ impl Sequence {
         Ok(step)
     }
 
-    /// Finish incremental decoding without inventing an extra token.
+    /// Finish incremental decoding without inventing an extra token: the
+    /// text the decoder still holds (an incomplete trailing character, a
+    /// replacement character waiting for text after it), rendered as the
+    /// full decode renders the end of the same ids. A seeded sequence that
+    /// generated nothing releases nothing: what the decoder holds is the
+    /// seed's, and the seed is prompt text.
     pub fn finish(&mut self) -> Result<String> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let mut text = String::new();
+            // In this mode `token_ids` holds the seed alone and
+            // `total_tokens` grows with every token appended after it.
+            if self.total_tokens > self.token_ids.len() {
+                decoder.finish_into(&mut text)?;
+            } else {
+                decoder.reset();
+            }
+            return Ok(text);
+        }
         let step = self.tokenizer.finish_decode(
             &mut self.token_ids,
             &mut self.cached_prefix,

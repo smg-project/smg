@@ -310,17 +310,41 @@ impl Bed {
     }
 }
 
+/// One enqueue body carries at most this many answers and about `ENQUEUE_BYTES` of
+/// them: the admin API reads a bounded body (two mebibytes), and five hundred copies
+/// of a two-thousand-word answer are several times that.
 pub const ENQUEUE_CHUNK: usize = 500;
+pub const ENQUEUE_BYTES: usize = 1 << 20;
+
+/// The answers cut into the bodies `enqueue` posts: each under both bounds, one
+/// answer at least however long it is.
+pub fn enqueue_chunks(items: &[Value]) -> Vec<&[Value]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (i, item) in items.iter().enumerate() {
+        let size = item.to_string().len() + 1;
+        if i > start && (i - start >= ENQUEUE_CHUNK || bytes + size > ENQUEUE_BYTES) {
+            chunks.push(&items[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < items.len() {
+        chunks.push(&items[start..]);
+    }
+    chunks
+}
 
 /// Hands the mock engines the cell's answers: the shared queue every worker reads,
 /// emptied first (an earlier window's leftovers would answer the next requests), filled
-/// in chunks (ten thousand 128-token answers in one body would exceed the admin API's
-/// request size).
+/// in bounded bodies (see [`enqueue_chunks`]).
 pub fn enqueue(bed: &Bed, items: &[Value]) -> Result<()> {
     let admin = bed.admin_url()?;
     let url = format!("{admin}/admin/script/all");
     http::delete(&url, Duration::from_secs(30))?;
-    for chunk in items.chunks(ENQUEUE_CHUNK) {
+    for chunk in enqueue_chunks(items) {
         http::post(
             &url,
             &Value::Array(chunk.to_vec()),
@@ -541,5 +565,29 @@ mod tests {
         );
         let empty = serve(BTreeMap::new(), false);
         assert_eq!(script_counts_at(&empty.url, 2, 40).unreadable, 3);
+    }
+
+    #[test]
+    fn enqueue_bodies_are_bounded_by_count_and_by_bytes() {
+        let small: Vec<Value> = (0..1200)
+            .map(|_| serde_json::json!({"output_text": "a"}))
+            .collect();
+        let sizes: Vec<usize> = enqueue_chunks(&small).iter().map(|c| c.len()).collect();
+        assert_eq!(sizes, [500, 500, 200]);
+
+        let long: Vec<Value> = (0..300)
+            .map(|_| serde_json::json!({"output_text": "w".repeat(12_000)}))
+            .collect();
+        let chunks = enqueue_chunks(&long);
+        assert!(chunks.len() > 1, "{} chunk(s)", chunks.len());
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 300);
+        for chunk in &chunks {
+            let bytes: usize = chunk.iter().map(|v| v.to_string().len() + 1).sum();
+            assert!(bytes <= ENQUEUE_BYTES, "{bytes} bytes in one body");
+        }
+
+        let one: Vec<Value> = vec![serde_json::json!({"output_text": "w".repeat(3_000_000)})];
+        assert_eq!(enqueue_chunks(&one).len(), 1);
+        assert!(enqueue_chunks(&[]).is_empty());
     }
 }

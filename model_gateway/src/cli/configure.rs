@@ -1295,24 +1295,13 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.routing.host.clone(),
-            port: self.routing.port,
-            health_check_port: self.routing.health_check_port,
-            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.serving.max_payload_size,
             log_dir: self.serving.log_dir.clone(),
             log_level: Some(self.serving.log_level.clone()),
             log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.serving.request_timeout_secs,
-            request_id_headers: if self.serving.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.serving.request_id_headers.clone())
-            },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,
@@ -1378,16 +1367,17 @@ impl CliArgs {
         }
     }
 
-    /// Phase 3, configure: the router configuration, validated, wrapped in
-    /// the server configuration. Every refusal is a [`ConfigError`] naming
-    /// the flag; nothing has been bound or spawned when one is raised.
+    /// Phase 3, configure: the router configuration, validated once by the
+    /// builder's `build()`, wrapped in the server configuration. Every
+    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
+    /// or spawned when one is raised. (`startup` validates once more, for a
+    /// library caller that never went through the builder.)
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<ServerConfig> {
         let router_config = self.to_router_config(prefill_urls, encode_urls)?;
-        router_config.validate()?;
         self.to_server_config(router_config)
     }
 }

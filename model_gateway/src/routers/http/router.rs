@@ -2858,14 +2858,13 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
-    use openai_protocol::worker::HealthCheckConfig;
     use serde_json::{json, Value};
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
-        observability::logging::test_support::test_subscriber,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         policies::CacheAwarePolicy,
         routers::common::{
             body_policy::{
@@ -2876,7 +2875,9 @@ mod tests {
         },
         service_discovery::testing::create_test_app_context,
         test_support::RefusedAddress,
-        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
+        worker::{
+            circuit_breaker::CircuitState, test_support::no_health_check, BasicWorkerBuilder,
+        },
     };
 
     /// Accepts `kill_first` connections and closes them before any response
@@ -2948,13 +2949,6 @@ mod tests {
 
         send_with_stale_conn_retry(builder).await.unwrap_err();
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
-    }
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
     }
 
     fn create_test_regular_router() -> Router {
@@ -5715,28 +5709,6 @@ mod tests {
         );
         let worker = &router.worker_registry.get_all()[0];
         assert!(worker.circuit_breaker_can_execute());
-    }
-
-    /// Counts, on this thread's subscriber, the ERROR events and the refusal
-    /// lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-        }
     }
 
     /// A refusal this router answers on its own is marked as reported for
