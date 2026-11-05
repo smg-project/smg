@@ -30,8 +30,11 @@ Policy this adapter sets, where the events say more than Chat Completions can:
   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
   that chunk. The bytes a call syntax refuses as the model's failed call come as `Dropped {
   MalformedCall }` behind a `Malformed` event of no bytes (`docs/assemblers.md`), so they are
-  counted and never content. A call inside which the attributed syntax refused such bytes gets
-  no close, so its `arguments` are a strict JSON prefix and no whole value, as a cut call's are:
+  counted and never content. A call inside which a tagged syntax refused such bytes (the
+  attributed, keyed, Qwen tagged and XML assemblers alike; a bare closing tag between members,
+  one that names nothing open, costs a call nothing on the last three) gets no close, so its
+  `arguments` are
+  a strict JSON prefix and no whole value, as a cut call's are:
   a client that reads them as JSON is told the call failed, where it read a closed object with
   the model's member missing before.
 - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
