@@ -42,6 +42,17 @@ spec:
           annotations:
             summary: "Too many responses are server errors"
             description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }}, the probe routes excluded, were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
+        {{- /* The edge family counts a response once, by its head: a stream that fails after its first token (an engine that died mid-generation, a worker whose connection broke, an output the reader could not parse) is a 200 there, with no error code, and the ratio above never sees it. The router families count the request and its failure whatever the point of failure, so a wave of failed streams reads here. */}}
+        - alert: SmgHighRouterErrorRatio
+          expr: |
+            sum by (namespace, job) (rate(smg_router_request_errors_total{ {{ $job }} }[5m]))
+              / sum by (namespace, job) (rate(smg_router_requests_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
+          for: {{ $a.errorRatioFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Too many routed requests fail"
+            description: "{{ `{{ $value | humanizePercentage }}` }} of the requests routed by {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} failed over the last 5 minutes (threshold {{ $a.errorRatio }}), streams that failed after their first token included; the edge's response families count those as 200s."
         - alert: SmgTtftP99High
           expr: |
             histogram_quantile(0.99, sum by (le, namespace, job) (rate(smg_router_ttft_seconds_bucket{ {{ $job }} }[5m]))) > {{ $a.ttftP99Seconds }}
