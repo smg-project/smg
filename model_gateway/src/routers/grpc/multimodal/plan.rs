@@ -586,6 +586,114 @@ mod tests {
         );
     }
 
+    /// The specs that carried another family's ten declare images without a
+    /// count of their own: for each, with no engine limit and no knob a
+    /// request above that ten goes through, and the flag and the engine's
+    /// limit still refuse it, each naming itself.
+    #[tokio::test]
+    async fn the_specs_without_an_image_count_of_their_own_leave_the_bound_to_the_engine_and_the_knobs(
+    ) {
+        let families = [
+            (
+                "org/qwen3-vl",
+                "<|image_pad|>",
+                151655,
+                serde_json::json!({"model_type": "qwen3_vl", "image_token_id": 151655}),
+            ),
+            (
+                "org/qwen2-vl",
+                "<|image_pad|>",
+                151655,
+                serde_json::json!({"model_type": "qwen2_vl", "image_token_id": 151655}),
+            ),
+            (
+                "org/inkling",
+                "<|unused_200054|>",
+                200054,
+                serde_json::json!({
+                    "model_type": "inkling_mm_model",
+                    "vision_config": {"decoder_dmodel": 6144}
+                }),
+            ),
+            (
+                "org/muse-spark",
+                "<|patch|>",
+                200092,
+                serde_json::json!({"model_type": "muse_spark", "image_token_id": 200092}),
+            ),
+        ];
+        let plan = image_urls(11);
+        for (model_id, placeholder, token_id, config) in families {
+            let registry = Arc::new(MultimodalConfigRegistry::new());
+            registry.insert(
+                "tok".to_string(),
+                Arc::new(MultimodalModelConfig::new(
+                    config,
+                    PreProcessorConfig::default(),
+                    None,
+                )),
+            );
+            let tokenizer = MockTokenizer::new().with_tokens(&[(placeholder, token_id)]);
+            let prepare = |image_limit, engine: HashMap<Modality, EngineItemLimit>| {
+                let components = MultimodalComponents::new(
+                    registry.clone(),
+                    image_limit,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .unwrap();
+                let plan = &plan;
+                let tokenizer = &tokenizer;
+                async move {
+                    prepare_placeholder_tokens(
+                        plan,
+                        model_id,
+                        tokenizer,
+                        &components,
+                        "tok",
+                        "unused",
+                        &engine,
+                        |_| true,
+                    )
+                    .await
+                }
+            };
+
+            let placeholders = prepare(None, HashMap::new())
+                .await
+                .unwrap_or_else(|error| panic!("{model_id}: no engine limit and no knob: {error}"));
+            assert_eq!(
+                placeholders.get(Modality::Image),
+                Some(placeholder),
+                "{model_id}"
+            );
+
+            let error = prepare(Some(10), HashMap::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("11 image items")
+                    && error.contains("limit of 10")
+                    && error.contains("(--mm-per-request-image-limit)"),
+                "{model_id}: {error}"
+            );
+
+            let engine = HashMap::from([(
+                Modality::Image,
+                EngineItemLimit {
+                    limit: 8,
+                    runtime: RuntimeType::Vllm,
+                },
+            )]);
+            let error = prepare(None, engine).await.unwrap_err().to_string();
+            assert!(
+                error.contains("limit of 8") && error.contains("the engine's"),
+                "{model_id}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn media_plan_preserves_media_order_and_counts() {
         let plan = MediaPlan::new([
