@@ -1147,7 +1147,9 @@ mod tests {
 
     // TODO: ModelInfo not in current proto - skip test
 
-    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
     #[test]
     fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -1197,6 +1199,7 @@ mod tests {
         );
     }
 
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]
     fn constraint_of_maps_each_kind_to_the_engines_variant() {
         use crate::request_fields::ConstraintKind;

@@ -930,7 +930,9 @@ mod tests {
 
     // TODO: ModelInfo not in current proto - skip test
 
-    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    /// A grammar set aside for the builder reads as absent: the request's
+    /// `regex` is the constraint when nothing is set aside and no constraint is
+    /// built from it when the grammar is.
     #[test]
     fn a_format_field_set_aside_reads_as_absent() {
         use crate::request_fields::FormatSetAside;
@@ -970,6 +972,7 @@ mod tests {
         );
     }
 
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]
     fn constraint_of_maps_each_kind_to_the_engines_variant() {
         use crate::request_fields::ConstraintKind;

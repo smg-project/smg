@@ -774,9 +774,9 @@ mod tests {
         assert_eq!(request.stop_token_ids, vec![1, 2]);
     }
 
-    /// A plain request names at most one structured constraint, as a completion
-    /// request does: two are refused with the completion path's words, one still
-    /// reaches the request as its guide.
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the request's one guide, where the body's schema wins when nothing
+    /// is set aside.
     #[test]
     fn a_response_format_set_aside_leaves_the_tag_as_the_one_guide() {
         use crate::request_fields::FormatSetAside;
@@ -825,6 +825,9 @@ mod tests {
         );
     }
 
+    /// A plain request names at most one structured constraint, as a completion
+    /// request does: two are refused with the completion path's words, one still
+    /// reaches the request as its guide.
     #[test]
     fn a_plain_request_with_two_structured_constraints_is_refused_as_a_completion_is() {
         let schema = "{\"type\":\"object\"}";

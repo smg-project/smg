@@ -738,7 +738,9 @@ mod constraint_mapping_tests {
     use super::*;
     use crate::request_fields::ConstraintKind;
 
-    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
     #[test]
     fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
         use crate::request_fields::FormatSetAside;
@@ -784,6 +786,7 @@ mod constraint_mapping_tests {
         );
     }
 
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]
     fn constraint_of_maps_each_kind_to_the_engines_variant() {
         for (kind, expected) in [
