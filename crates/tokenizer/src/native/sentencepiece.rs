@@ -30,6 +30,11 @@ const MARKER_BYTES: [u8; 3] = [0xE2, 0x96, 0x81];
 const NO_ID: u32 = u32::MAX;
 /// Words of the bridge table: one bit per pair of bytes.
 const BRIDGE_WORDS: usize = 256 * 256 / 64;
+/// Symbols the thread's scratch list keeps between merges, 16 KiB: a piece
+/// longer than this (a space-free text no vocabulary token cuts can be the
+/// whole unit) hands its list back after the merge, so a thread holds this
+/// much scratch, not the longest piece it ever met.
+pub(super) const MERGE_SCRATCH_SYMBOLS: usize = 4_096;
 
 /// Where the word marker is prepended: the `Metaspace` prepend scheme
 /// (`Never` for a `Replace` normalizer too, which prepends nothing).
@@ -226,6 +231,10 @@ impl CharSymbols {
             }
         }
         self.merges.merge_symbols(symbols, ids);
+        if symbols.capacity() > MERGE_SCRATCH_SYMBOLS {
+            symbols.clear();
+            symbols.shrink_to(MERGE_SCRATCH_SYMBOLS);
+        }
     }
 }
 

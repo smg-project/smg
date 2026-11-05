@@ -32,7 +32,7 @@ use tokenizers::{
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
-    sentencepiece::WORD_MARKER,
+    sentencepiece::{MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
     short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
@@ -3288,4 +3288,70 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         "the token \"a<0x41>\" spells a byte token inside it"
     );
     assert!(NativeEncoder::from_tokenizer(&small(&["ab"], "")).is_ok());
+}
+
+/// A piece no vocabulary token cuts can be the whole text: the thread's
+/// scratch list of initial symbols grows to it for the merge and is handed
+/// back afterwards, so a thread keeps `MERGE_SCRATCH_SYMBOLS` of scratch,
+/// not the longest piece it ever met.
+#[test]
+fn a_long_uncut_piece_leaves_the_thread_a_bounded_scratch() {
+    let mut vocab = Vocab::default();
+    let add = |vocab: &mut Vocab, token: String| {
+        if !vocab.contains_key(&token) {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
+    };
+    add(&mut vocab, "<unk>".to_owned());
+    for byte in 0..=255u8 {
+        add(&mut vocab, format!("<0x{byte:02X}>"));
+    }
+    for token in [
+        "\u{4e2d}",
+        "\u{6587}",
+        "\u{4e2d}\u{6587}",
+        "\u{6587}\u{4e2d}",
+    ] {
+        add(&mut vocab, token.to_owned());
+    }
+    let merges: Merges = vec![
+        ("\u{4e2d}".to_owned(), "\u{6587}".to_owned()),
+        ("\u{6587}".to_owned(), "\u{4e2d}".to_owned()),
+    ];
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("a byte-fallback BPE");
+    let mut tokenizer = HfTokenizer::new(model);
+    tokenizer
+        .with_normalizer(Some(
+            Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
+        ))
+        .expect("normalizer");
+    let native = seeded(&tokenizer);
+    // Every adjacent pair of bytes of the text is in a vocabulary token, so
+    // the text is one piece, merged on this thread.
+    let text = "\u{4e2d}\u{6587}".repeat(4 * MERGE_SCRATCH_SYMBOLS);
+    assert_eq!(
+        native.units(&text, true, true).as_slice().len(),
+        1,
+        "nothing cuts the text"
+    );
+    let expected = tokenizer
+        .encode(text.as_str(), false)
+        .expect("tokenizers encodes")
+        .get_ids()
+        .to_vec();
+    assert_eq!(
+        native.encode(Some(tokenizer.get_model()), &text, false),
+        Ok(expected)
+    );
+    let scratch = native.thread_piece_cache().borrow().symbols.capacity();
+    assert!(
+        scratch <= MERGE_SCRATCH_SYMBOLS,
+        "the thread kept a scratch of {scratch} symbols"
+    );
 }
