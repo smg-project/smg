@@ -394,14 +394,20 @@ impl<I> TimedConnection<I> {
             self.armed = None;
             return Poll::Pending;
         }
-        let now = Instant::now();
-        let wait = *self.head_wait(now);
+        // The clock is read when a wait begins (once per idle period, not
+        // once per poll of the read side): the deadline follows from the wait
+        // alone, and a poll while it is armed asks the sleep.
+        let started = self.count.started.load(Ordering::Acquire);
+        if self.wait.is_none_or(|wait| wait.started != started) {
+            let now = Instant::now();
+            self.head_wait(now);
+        }
+        let Some(wait) = self.wait else {
+            return Poll::Pending;
+        };
         let Some((deadline, timeout)) = self.deadline_for(&wait) else {
             return Poll::Pending;
         };
-        if now >= deadline {
-            return self.expire(timeout, now);
-        }
         if self.armed != Some(deadline) {
             self.armed = Some(deadline);
             match self.sleep.as_mut() {
@@ -411,7 +417,7 @@ impl<I> TimedConnection<I> {
         }
         match self.sleep.as_mut() {
             Some(sleep) => match sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => self.expire(timeout, now),
+                Poll::Ready(()) => self.expire(timeout, Instant::now()),
                 Poll::Pending => Poll::Pending,
             },
             None => Poll::Pending,

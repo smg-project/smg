@@ -64,10 +64,16 @@ impl InFlightRequestTracker {
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
+        self.track_from(Instant::now())
+    }
+
+    /// [`Self::track`] for a request that came in at `started` (the edge's
+    /// entry stamp): its age is counted from there.
+    pub fn track_from(self: &Arc<Self>, started: Instant) -> InFlightGuard {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Count first: a drain check must never see zero once admission began.
         self.count.fetch_add(1, Ordering::AcqRel);
-        self.requests.insert(request_id, Instant::now());
+        self.requests.insert(request_id, started);
         InFlightGuard {
             tracker: self.clone(),
             request_id,

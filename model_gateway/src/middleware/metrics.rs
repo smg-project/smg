@@ -36,7 +36,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
 };
 
 use axum::{
@@ -48,7 +47,10 @@ use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
 use tower::{Layer, Service};
 
-use super::edge_body::{BodyDuties, EdgeBody};
+use super::{
+    edge_body::{BodyDuties, EdgeBody},
+    request_start::{clock_now, RequestStarted},
+};
 use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
@@ -183,16 +185,22 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&mut self, mut req: Request) -> Self::Future {
         let method = method_to_static_str(req.method().as_str());
         let path = PathLabel::of(req.extensions());
-        let start = Instant::now();
+        // The request's entry stamp: read from the clock once, here, and
+        // carried on the request for the layers inside (the access log's
+        // latency, the in-flight age, the acceptance, the body deadline all
+        // count from it; see `request_start`).
+        let started = RequestStarted::now();
+        req.extensions_mut().insert(started);
+        let start = started.instant();
 
         let mut inner = self.inner.clone();
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
-            let guard = in_flight_request_tracker.track();
+            let guard = in_flight_request_tracker.track_from(start);
             Metrics::set_http_connections_active(in_flight_request_tracker.len());
             // Counted once the outcome is known. Dropped with this future
             // before the handler answered (what the server does with a
@@ -212,7 +220,6 @@ where
             };
 
             outcome.head(&response);
-            Metrics::record_http_duration(method, path.as_str(), start.elapsed());
 
             // Hold the in-flight guard for the response BODY's lifetime, not
             // the handler's: streaming handlers return their response
@@ -224,6 +231,15 @@ where
             // until the body ends; the one wrapper carries it all.
             let progress = BodyProgress::new(&response);
             let duties = BodyDuties::take(&mut response);
+            // The head went out: at the access-log layer's stamp of it when
+            // that layer is in the stack (it hands the stamp over with the
+            // duties), else read here.
+            let head_at = duties.head_at.unwrap_or_else(clock_now);
+            Metrics::record_http_duration(
+                method,
+                path.as_str(),
+                head_at.saturating_duration_since(start),
+            );
             let (parts, body) = response.into_parts();
             let body = Body::new(EdgeBody::new(
                 body,
@@ -784,6 +800,38 @@ mod client_closed_tests {
         handle.render()
     }
 
+    /// [`render`] on a paused clock: the scenario advances time itself.
+    fn render_paused<F, Fut>(scenario: F) -> String
+    where
+        F: FnOnce(PrometheusHandle) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("runtime");
+            rt.block_on(scenario(handle.clone()));
+        });
+        handle.render()
+    }
+
+    /// The `smg_http_request_duration_seconds` sum of `path`.
+    fn duration_sum(rendered: &str, path: &str) -> f64 {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_http_request_duration_seconds_sum{")
+                    && line.contains(&format!("path=\"{path}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("a duration sum for {path} in {rendered}"))
+    }
+
     /// The value of the label `name` on a rendered sample line.
     fn label(line: &str, name: &str) -> String {
         let key = format!("{name}=\"");
@@ -1142,6 +1190,38 @@ mod client_closed_tests {
             responses(&rendered, "/slow"),
             sample("499", "client_closed_request"),
             "{rendered}"
+        );
+    }
+
+    /// The layer reads the clock once at the request's entry and shares the
+    /// stamp: the handler finds it on the request, and the request's
+    /// duration runs from it to the head, on the runtime's clock.
+    #[test]
+    fn the_entry_stamp_rides_the_request_and_the_duration_runs_from_it() {
+        let rendered = render_paused(|_| async {
+            let app = Router::new()
+                .route(
+                    "/stamped",
+                    get(|request: Request<Body>| async move {
+                        let started = RequestStarted::of(request.extensions())
+                            .expect("the entry stamp rides the request");
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        assert_eq!(
+                            clock_now().saturating_duration_since(started),
+                            std::time::Duration::from_secs(3),
+                            "the stamp is on the runtime's clock"
+                        );
+                        "ok"
+                    }),
+                )
+                .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
+            let response = app.oneshot(request("/stamped")).await.expect("response");
+            let _ = response.into_body().collect().await.expect("body");
+        });
+        let seconds = duration_sum(&rendered, "/stamped");
+        assert!(
+            (seconds - 3.0).abs() < 0.01,
+            "duration {seconds} s, expected the 3 s from the entry stamp to the head: {rendered}"
         );
     }
 

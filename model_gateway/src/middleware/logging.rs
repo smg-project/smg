@@ -45,6 +45,7 @@ use super::{
     edge_body::BodyDuties,
     metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
+    request_start::{clock_now, RequestStarted},
 };
 use crate::{
     config::AccessLogField,
@@ -546,7 +547,10 @@ where
 
     fn call(&mut self, request: Request) -> Self::Future {
         let span = RequestSpan.make_span(&request);
-        let start = Instant::now();
+        // The latency's origin: the edge's entry stamp when the metrics layer
+        // put one on the request (see `request_start`), a read of this
+        // layer's own otherwise.
+        let start = RequestStarted::of(request.extensions()).unwrap_or_else(clock_now);
         let fields = self.fields;
         let mut inner = self.inner.clone();
         Box::pin(async move {
@@ -593,7 +597,8 @@ where
                 request_bytes.as_deref(),
                 progress.declared(),
             );
-            ResponseLogger.on_response(&response, start.elapsed(), &span);
+            let head_at = clock_now();
+            ResponseLogger.on_response(&response, head_at.saturating_duration_since(start), &span);
             close_log.head_sent();
             let count_bytes = fields.contains(AccessLogField::ResponseBytes);
             // A body without a declared length is a stream: its bytes are
@@ -601,8 +606,10 @@ where
             let end_line = count_bytes && progress.declared().is_none();
             // The span stays open until the body ends: handed to the edge's one
             // body wrapper with the close line it owes and the bytes it counts,
-            // which the wrapper reports at the body's end, failure or drop.
+            // which the wrapper reports at the body's end, failure or drop. The
+            // head's stamp rides along for the metrics layer's duration.
             BodyDuties::hand(&mut response, |duties| {
+                duties.head_at = Some(head_at);
                 duties.span = Some(SpanDuty {
                     span,
                     close_log,
@@ -1464,6 +1471,36 @@ mod field_tests {
         assert_eq!(lines[0].0, "started processing request");
         assert_eq!(lines[1].0, "finished processing request");
         assert_eq!(keys(&lines[1].1), DEFAULT_FINISH_KEYS);
+    }
+
+    /// The finish line's latency runs from the edge's entry stamp when the
+    /// request carries one (the metrics layer's, ahead of this layer in the
+    /// gateway's stack), not from a read of this layer's own.
+    #[tokio::test]
+    async fn the_latency_runs_from_the_edge_s_entry_stamp() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(|| async { "ok" }))
+            .layer(create_logging_layer(AccessLogFields::NONE));
+        let earlier = clock_now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("the clock has been running for five seconds");
+        let mut request = request("/v1/chat/completions");
+        request.extensions_mut().insert(RequestStarted::at(earlier));
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.expect("body");
+
+        let lines = access_lines(&capture);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let latency = lines[1].1["latency"]
+            .as_u64()
+            .expect("the latency, in microseconds");
+        assert!(
+            latency >= 5_000_000,
+            "latency {latency} us, expected at least the 5 s since the entry stamp"
+        );
     }
 
     /// Every selected field is on the finish line with its value; the

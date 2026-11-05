@@ -1,6 +1,10 @@
 //! Common helper functions shared across stages
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
@@ -120,6 +124,34 @@ pub(crate) fn middleware_request_id(tenant_meta: Option<&TenantRequestMeta>) -> 
         .map(|request_id| request_id.0.as_str())
 }
 
+/// The request's wall-clock time as `(seconds, subsecond nanos)` since the
+/// Unix epoch: the timestamp of its charge id, a version-7 uuid the edge
+/// minted when it took the request in, which is the request's one wall-clock
+/// read (the response's `created`, the engine request id's stamp and the
+/// charge id all tell the same second); read from the clock for a request
+/// that carries no meta.
+pub(crate) fn request_wall_clock(tenant_meta: Option<&TenantRequestMeta>) -> (u64, u32) {
+    tenant_meta
+        .and_then(|meta| meta.request_charge_id().get_timestamp())
+        .map_or_else(
+            || {
+                let since_epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                (since_epoch.as_secs(), since_epoch.subsec_nanos())
+            },
+            |stamp| stamp.to_unix(),
+        )
+}
+
+/// A fresh version-7 uuid at the request's wall-clock time (see
+/// [`request_wall_clock`]): unique by its random bits, ordered by the
+/// request's time like one minted now, without a clock read of its own.
+fn request_stamp_uuid(tenant_meta: Option<&TenantRequestMeta>) -> uuid::Uuid {
+    let (seconds, nanos) = request_wall_clock(tenant_meta);
+    uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, nanos))
+}
+
 /// How each retry attempt re-mints the engine request id, captured at build
 /// so replays reproduce exactly what a fresh build would have minted.
 ///
@@ -154,7 +186,8 @@ pub(crate) struct BatchIdStamp {
 /// attempts re-mint it with.
 ///
 /// Priority: the protocol `rid`, else the middleware request id, else a fresh
-/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules).
+/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules). The uuid is
+/// stamped at the request's wall-clock time ([`request_stamp_uuid`]).
 pub(crate) fn resolve_request_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
@@ -166,20 +199,20 @@ pub(crate) fn resolve_request_id_stamp(
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
-            (format!("{rid}-{}", uuid::Uuid::now_v7()), stamp)
+            (format!("{rid}-{}", request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", uuid::Uuid::now_v7()),
+            format!("{request_id}-{}", request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
                 base: request_id.to_string(),
             },
         ),
         None => (
-            format!("{prefix}{}", uuid::Uuid::now_v7()),
+            format!("{prefix}{}", request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
