@@ -220,14 +220,16 @@ mod tests {
             "<｜DSML｜ parameter name=\"x\" string=\"false\">1"
         );
         // The model's own end of output there ends the call as its closing tag would: the value
-        // held for its close is reported, the object closes without it, and one word says the
-        // stop closed the call.
+        // held for its close is refused, and no close is made up for a call the syntax refused
+        // bytes in, so no word says the stop closed it.
         let stopped = run("<think>", &[output]);
-        assert_eq!(arguments_of(&stopped, 0), "{}");
-        assert!(stopped.iter().any(|event| matches!(
+        assert_eq!(arguments_of(&stopped, 0), "");
+        assert!(!stopped.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: crate::event::MalformedReason::OpenAtTheStop }
-                if text.text.is_empty()
+            Event::Malformed {
+                why: crate::event::MalformedReason::OpenAtTheStop,
+                ..
+            }
         )));
         // Cut by the token limit, nothing closes.
         let events = crate::testing::drive_to(
@@ -707,7 +709,8 @@ mod tests {
         );
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(arguments_of(&events, 0), r#"{"a": "1"}"#);
+        // The pair the syntax read stands; the call refused a tag, so it gets no close.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "1""#);
         // The tag with its tail is refused: its bytes dropped as the model's failed call, never
         // content, behind the counted event of no bytes.
         let refused: Vec<&str> = events

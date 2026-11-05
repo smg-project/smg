@@ -302,13 +302,16 @@ mod tests {
             Some(Event::Finish { tool_calls: 1, .. })
         ));
         // The model's own end of output there ends the call as its closing tag would: the value
-        // held for its close is reported, the object closes without it, and one word says the
-        // stop closed the call.
+        // held for its close is refused, and no close is made up for a call the syntax refused
+        // bytes in, so no word says the stop closed it.
         let stopped = run("<think>", &[output]);
-        assert_eq!(arguments_of(&stopped, 0), "{}");
-        assert!(stopped.iter().any(|event| matches!(
+        assert_eq!(arguments_of(&stopped, 0), "");
+        assert!(!stopped.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+            Event::Malformed {
+                why: MalformedReason::OpenAtTheStop,
+                ..
+            }
         )));
     }
 
@@ -909,9 +912,11 @@ mod tests {
     }
 
     /// A parameter tag the model wrote without its `<` (seen live: the third of four parallel
-    /// calls lost its `action` this way): the invoke is read without that member, and the bytes
-    /// of the slip, `｜DSML｜` and the closing tag included, are refused as the model's failed call,
-    /// counted and never content, where they reached the client as content before.
+    /// calls lost its `action` this way): the invoke is read without that member and gets no
+    /// close, so its arguments are no whole value and a client is told the call failed rather
+    /// than handed a closed object with the member missing; the bytes of the slip, `｜DSML｜` and
+    /// the closing tag included, are refused as the model's failed call, counted and never
+    /// content, where they reached the client as content before.
     #[test]
     fn a_parameter_tag_without_its_angle_bracket_is_refused_never_content() {
         const OUTPUT: &str = concat!(
@@ -930,7 +935,7 @@ mod tests {
             assert_eq!(calls_of(&events), [(0, "emission_estimator".to_string())]);
             assert_eq!(
                 arguments_of(&events, 0),
-                r#"{"current_emissions": 10, "duration": 1}"#,
+                r#"{"current_emissions": 10, "duration": 1"#,
                 "{pieces:?}"
             );
             // What a chat client reads: content and malformed text alike. Nothing.
@@ -1119,5 +1124,99 @@ mod tests {
         // The reading and the writing agree on what the template puts before the block.
         let spelled = format!("{}<｜DSML｜tool_calls>", Tags::DSML_V4.before_block);
         assert!(deepseek_v4().terminal_texts().any(|text| text == spelled));
+    }
+
+    /// The draw a fleet verifier saw once in several hundred answers to one prompt: an invoke
+    /// that names the tool and writes both parameter tags without their `<`, so the syntax reads
+    /// no pair (text where it has tags, then a closing tag out of its place). The engine's own
+    /// parser hands such a call out as `{}` under `tool_calls`, and so did this table: every
+    /// client read a well-formed call with no arguments, and nothing on the wire said the call had
+    /// failed. Now the call is no whole call: the syntax writes no close for it, so its arguments
+    /// are no JSON value, which a chat client's own reader refuses and the Responses item says
+    /// (`incomplete`); the refused bytes are counted and never content; the Messages block keeps
+    /// the `{}` a cut call's has, as the adapter's notes say.
+    #[test]
+    fn a_call_whose_every_parameter_the_syntax_refused_is_no_whole_call_to_any_client() {
+        use crate::adapt;
+        const OUTPUT: &str = concat!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n",
+            "｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n",
+            "｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        const SLIPS: [&str; 2] = [
+            "｜DSML｜parameter name=\"a\" string=\"false\">17",
+            "｜DSML｜parameter name=\"b\" string=\"false\">25",
+        ];
+        // Chat mode, thinking off: the turn opens with the thought's close.
+        let prompt = "<｜Assistant｜></think>";
+        let (content, reasoning, calls) = however_cut(prompt, OUTPUT);
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, [("add_integers".to_string(), String::new())]);
+
+        let events = run(prompt, &[OUTPUT]);
+        let reasons: Vec<MalformedReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => {
+                    assert!(text.text.is_empty(), "{event:?}");
+                    Some(*why)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reasons.contains(&MalformedReason::TextBetweenTags)
+                && reasons.contains(&MalformedReason::TagOutOfPlace),
+            "{reasons:?}"
+        );
+        let refused: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            SLIPS.iter().all(|slip| refused.contains(*slip)),
+            "{refused:?}"
+        );
+        let arguments = arguments_of(&events, 0);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&arguments).is_err(),
+            "{arguments:?} reads as a whole value"
+        );
+
+        // Chat Completions: the call, under `tool_calls`, with arguments a strict reader refuses.
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(choice.message.content, None);
+        let calls = choice.message.tool_calls.as_deref().expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "add_integers");
+        let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(arguments).is_err(),
+            "{arguments:?} reads as a whole value"
+        );
+
+        // Responses: the item says the call is incomplete.
+        let output = adapt::responses::output("resp", &events);
+        let items = serde_json::to_value(&output.items).expect("wire");
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+        assert_eq!(items[0]["type"], "function_call", "{items}");
+        assert_eq!(items[0]["name"], "add_integers", "{items}");
+        assert_eq!(items[0]["status"], "incomplete", "{items}");
+
+        // Messages: the block carries `{}`, as a cut call's does; the call is not refused.
+        let message = adapt::messages::output(&events);
+        assert!(message.refused.is_empty(), "{:?}", message.refused);
+        let blocks = serde_json::to_value(&message.content).expect("wire");
+        assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+        assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
     }
 }

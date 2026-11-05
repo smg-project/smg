@@ -1645,6 +1645,31 @@ mod tests {
         }
     }
 
+    /// A call the parser did not read whole, delivered under `tool_calls` with arguments that
+    /// are no JSON value (a tagged syntax that refused bytes inside the call writes no close for
+    /// it): the item is `incomplete`, and so is the response, with no stated reason, as a call
+    /// cut by an abort leaves it.
+    #[test]
+    fn a_generated_call_the_parser_did_not_read_whole_leaves_the_response_incomplete() {
+        let request = ResponsesRequest::default();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_add","type":"function","function":{"name":"add_integers","arguments":""}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(
+            wire["incomplete_details"],
+            serde_json::Value::Null,
+            "{wire}"
+        );
+        assert_eq!(wire["output"][0]["type"], "function_call", "{wire}");
+        assert_eq!(wire["output"][0]["status"], "incomplete", "{wire}");
+        assert_eq!(wire["output"][0]["arguments"], "", "{wire}");
+    }
+
     #[test]
     fn failed_generation_does_not_complete_partial_messages_or_tool_calls() {
         for finish_reason in ["failed", "error"] {
