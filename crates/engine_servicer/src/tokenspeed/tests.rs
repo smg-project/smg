@@ -3025,6 +3025,82 @@ async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
     }
 }
 
+/// An encode worker has no scheduler: `GetLoads` answers no rank, as the
+/// Python servicer answers it, not a zero-filled entry per connected engine;
+/// the record the relay and the records-only stream read for the role is
+/// none, so a records-only subscription pushes nothing where a generate
+/// worker's (the control, read first) pushes its rank's record at the first
+/// tick.
+#[tokio::test]
+async fn an_encode_worker_reports_no_scheduler_load() {
+    use crate::kv_events::RankLoads;
+
+    let mut generate = harness(model_info(), None).await;
+    assert!(
+        generate.server.state.rank_load(Some(0)).is_some(),
+        "a generate worker's rank has a record"
+    );
+    let mut records = generate
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    let batch = tokio::time::timeout(Duration::from_secs(5), records.message())
+        .await
+        .expect("a generate worker's record in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert!(
+        batch.load.as_ref().is_some_and(|load| load.load_only),
+        "{batch:?}"
+    );
+    drop(records);
+    generate
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+
+    let mut h = harness_with_ready(encode_model_info(), None, encode_ready()).await;
+    let loads = h
+        .client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .expect("get_loads")
+        .into_inner();
+    assert_eq!(
+        (loads.dp_rank_count, loads.loads.len()),
+        (0, 0),
+        "{loads:?}"
+    );
+    let aggregate = loads.aggregate.expect("an aggregate");
+    assert_eq!((aggregate.total_reqs, aggregate.avg_token_usage), (0, 0.0));
+    assert!(
+        h.server.state.rank_load(Some(0)).is_none() && h.server.state.rank_load(None).is_none(),
+        "no record for the role"
+    );
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest {
+            loads_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe: the records need no relay")
+        .into_inner();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .is_err(),
+        "nothing is pushed for the role"
+    );
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The encode role: the encoder service takes an `Encode`, the request
 /// reaches the worker under the wire's encode type as the engine's tagged
 /// `EncodeRequest` (the worker's own rendezvous, the room, the item with its
