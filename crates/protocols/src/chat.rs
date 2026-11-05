@@ -1224,6 +1224,10 @@ pub struct ChatCompletionStreamResponse {
     pub object: String, // "chat.completion.chunk"
     pub created: u64,
     pub model: String,
+    /// The service tier the completion runs under, on every chunk as the
+    /// public API writes it; the gateway has one tier, `default`.
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
     pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
     pub usage: Option<Usage>,
