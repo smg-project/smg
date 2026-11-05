@@ -5319,3 +5319,6 @@ use crate::routers::common::sse::sse_channel;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) mod bench;
