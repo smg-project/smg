@@ -823,20 +823,18 @@ fn bench_generate_path(c: &mut Criterion) {
     let wire = Wire::from_env();
     let bed = runtime.block_on(Bed::start(wire, tokens, metrics));
     let mut group = c.benchmark_group("generate_path");
-    // The vLLM row keeps its name (the ledger's rows read it); the other
-    // wires' rows carry theirs, and the rows of several streams at once
-    // their count.
+    // Every row names its stream count. The mock answers in steps since the
+    // rows of several streams came, so the one-stream row is a new series
+    // too: `request_<tokens>_tokens_metrics_<label>` ended with the mock that
+    // pushed from one task. The vLLM rows carry no wire suffix, the other
+    // wires' rows carry theirs.
     let suffix = match wire {
         Wire::Vllm => String::new(),
         other => format!("_{}", other.name()),
     };
     let metrics_label = if metrics { "on" } else { "off" };
     for streams in streams_per_loop() {
-        let id = if streams == 1 {
-            format!("request_{tokens}_tokens_metrics_{metrics_label}{suffix}")
-        } else {
-            format!("streams_{streams}_x_{tokens}_tokens_metrics_{metrics_label}{suffix}")
-        };
+        let id = format!("streams_{streams}_x_{tokens}_tokens_metrics_{metrics_label}{suffix}");
         group.throughput(Throughput::Elements(u64::from(tokens) * streams));
         group.bench_function(id, |b| b.iter(|| runtime.block_on(bed.requests(streams))));
     }
