@@ -82,19 +82,29 @@ jobs:
           python3 scripts/bench_gate.py build --out "$RUNNER_TEMP/bench-gate/pr" -- \
             cargo bench -p smg --bench stream_state_machines --no-run
 
+      # A base without the bench source (the first pull request that adds it, a
+      # release branch it was not backported to) has nothing to gate against:
+      # the base build and the gate are skipped and the step says so.
       - name: Build the base branch's benchmark
+        id: base
         if: github.event_name == 'pull_request'
         timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
           head=$(git rev-parse HEAD)
           git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
-          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
-            cargo bench -p smg --bench stream_state_machines --no-run
+          if [ -f model_gateway/benches/stream_state_machines.rs ]; then
+            python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
+              cargo bench -p smg --bench stream_state_machines --no-run
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The base has no stream_state_machines bench; nothing to gate against."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
           git checkout --quiet "$head"
 
       - name: Run the benchmark gate
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.base.outputs.present == 'true'
         timeout-minutes: 40
         run: |
           set -o pipefail
@@ -107,6 +117,7 @@ jobs:
         timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
+          set -o pipefail
           cargo bench -p smg --bench stream_state_machines 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
@@ -119,7 +130,3 @@ jobs:
             benchmark_output.txt
             bench-gate/
           retention-days: 30
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
