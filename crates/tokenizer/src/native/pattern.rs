@@ -32,6 +32,9 @@ pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
+    /// Categories taken out of the class before any negation: the engine's
+    /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
+    without: u16,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
     /// Membership of U+0000..=U+FFFF, resolved once (empty until
@@ -126,6 +129,15 @@ impl PlaneSet {
         }
     }
 
+    /// Removes every code point of `ranges` that is in the plane.
+    fn remove_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] &= !(1 << (code & 63));
+            }
+        }
+    }
+
     /// The complement within the plane.
     fn negate(&mut self) {
         for word in self.0.iter_mut() {
@@ -145,6 +157,10 @@ const CAT_TITLECASE: u16 = 1 << 7;
 const CAT_MODIFIER_LETTER: u16 = 1 << 8;
 const CAT_OTHER_LETTER: u16 = 1 << 9;
 const CAT_SPACE: u16 = 1 << 10;
+/// The `Han` script: the one script property the patterns use (a template
+/// cuts ideograph runs out before its letter classes and takes them out of
+/// those classes).
+const CAT_HAN: u16 = 1 << 11;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -152,7 +168,7 @@ const CAT_SPACE: u16 = 1 << 10;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -164,12 +180,20 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
     (CAT_MODIFIER_LETTER, unicode::MODIFIER_LETTER),
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
+    (CAT_HAN, unicode::HAN),
 ];
 
 #[inline]
 fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
     let index = ranges.partition_point(|&(_, end)| end < code);
     ranges.get(index).is_some_and(|&(start, _)| start <= code)
+}
+
+/// Whether `code` is in the table of any category of `categories`.
+fn in_categories(categories: u16, code: u32) -> bool {
+    CATEGORY_TABLES
+        .iter()
+        .any(|&(bit, table)| categories & bit != 0 && in_ranges(table, code))
 }
 
 impl Class {
@@ -196,6 +220,11 @@ impl Class {
                 plane.insert_ranges(table);
             }
         }
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.without & bit != 0 {
+                plane.remove_ranges(table);
+            }
+        }
         if self.negated {
             plane.negate();
         }
@@ -205,9 +234,10 @@ impl Class {
     fn contains_slow(&self, code: u32) -> bool {
         let mut hit = in_ranges(&self.ranges, code);
         if !hit && self.categories != 0 {
-            hit = CATEGORY_TABLES
-                .iter()
-                .any(|&(bit, table)| self.categories & bit != 0 && in_ranges(table, code));
+            hit = in_categories(self.categories, code);
+        }
+        if hit && self.without != 0 {
+            hit = !in_categories(self.without, code);
         }
         hit != self.negated
     }
@@ -1380,8 +1410,25 @@ impl Parser<'_> {
             "Lt" => CAT_TITLECASE,
             "Lm" => CAT_MODIFIER_LETTER,
             "Lo" => CAT_OTHER_LETTER,
+            "Han" => CAT_HAN,
             _ => return None,
         })
+    }
+
+    /// `[^\p{X}...]` after `&&` inside a class: the properties it takes out
+    /// of the class. Nothing else may stand on either side of the `&&`.
+    fn parse_subtracted_properties(&mut self) -> Option<u16> {
+        if self.chars.next()? != '[' || self.chars.next()? != '^' {
+            return None;
+        }
+        let mut categories = 0;
+        loop {
+            match self.chars.next()? {
+                ']' if categories != 0 => return Some(categories),
+                '\\' if self.chars.next()? == 'p' => categories |= self.parse_property()?,
+                _ => return None,
+            }
+        }
     }
 
     /// The body of `[...]`, after the opening bracket.
@@ -1410,9 +1457,23 @@ impl Parser<'_> {
                     'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
                     other => escaped_literal(other)?,
                 },
-                // Nested classes, intersections and POSIX brackets are not supported.
+                // An intersection with a negated property class closes the
+                // class: `[...&&[^\p{Han}]]`. Nested classes, other
+                // intersections and POSIX brackets are not supported.
+                '&' if self.chars.peek() == Some(&'&') => {
+                    // Nothing before the intersection would be the empty
+                    // set: declined, as every other shape of it is.
+                    if first {
+                        return None;
+                    }
+                    self.chars.next();
+                    class.without = self.parse_subtracted_properties()?;
+                    if self.chars.next()? != ']' {
+                        return None;
+                    }
+                    break;
+                }
                 '[' => return None,
-                '&' if self.chars.peek() == Some(&'&') => return None,
                 literal => literal,
             };
             first = false;
@@ -1472,6 +1533,8 @@ fn escaped_literal(c: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashMap;
+    use tiktoken_rs::CoreBPE;
     use tokenizers::utils::SysRegex;
 
     use super::*;
@@ -1490,8 +1553,12 @@ mod tests {
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 10] = [
-        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED,
+    /// The Kimi template: ideograph runs first, the cased letter runs
+    /// without the ideographs, the rest as cl100k's.
+    const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 11] = [
+        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED, KIMI,
     ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
@@ -1593,6 +1660,12 @@ mod tests {
         '中',
         '文',
         '龥',
+        '々',
+        '〇',
+        '〡',
+        '⺀',
+        '𠀀',
+        '𮯰',
         'あ',
         'ん',
         'ア',
@@ -1702,9 +1775,16 @@ mod tests {
             r"a++",
             r"[[:alpha:]]",
             r"[a&&b]",
+            r"[\p{L}&&\p{Han}]",
+            r"[\p{L}&&[^a]]",
+            r"[\p{L}&&[^\p{Han}]a]",
+            r"[&&[^\p{Han}]]",
+            r"[&&a]",
+            r"[^&&a]",
+            r"[\p{L}&&[^]]",
             r"\d+",
             r"(?=a)",
-            r"\p{Han}",
+            r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
             r"(?:ab)+",
@@ -1727,6 +1807,87 @@ mod tests {
             r"(?i:fi|fl|ff)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// The code points the two cross-engine sweeps below check: every one of
+    /// the four planes that hold assigned scripts (0 to 3) and plane 14's
+    /// first block (tags and variation selectors), then a stride over the
+    /// unassigned and private planes. A script a Unicode version adds,
+    /// however small, lies inside the part swept whole.
+    fn code_points_swept() -> impl Iterator<Item = u32> + Clone {
+        (0u32..0x4_0000)
+            .chain(0xE_0000..0xE_1000)
+            .chain((0x4_0000..=0x10_FFFF).step_by(97))
+    }
+
+    /// The `Han` property and a class with it taken out agree with the
+    /// engine character by character over [`code_points_swept`], for the
+    /// property alone, negated, taken out of the Kimi template's two letter
+    /// classes, and taken out under an outer negation.
+    #[test]
+    fn han_and_the_classes_it_is_taken_out_of_agree_with_the_engine() {
+        let patterns = [
+            r"\p{Han}",
+            r"[^\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\p{L}\p{N}&&[^\p{Han}]]",
+            r"[a-z\p{M}&&[^\p{Han}\p{Lo}]]",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for pattern in patterns {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = engine.find_iter(&buf).next() == Some((0, buf.len()));
+                assert_eq!(ours, theirs, "{pattern} at U+{code:04X}");
+            }
+        }
+    }
+
+    /// The classes of the tiktoken templates the direct path reads, checked
+    /// over [`code_points_swept`] against the file's own encoder (a `CoreBPE`
+    /// whose pattern is the class alone encodes a code point it matches and
+    /// drops one it does not): the two engines' Unicode tables agree today,
+    /// and a version apart between them, a new script included, would show
+    /// here.
+    #[test]
+    fn the_tiktoken_template_classes_agree_with_the_files_own_encoder() {
+        let ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+        let classes = [
+            r"[\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\r\n\p{L}\p{N}]",
+            r"\p{L}",
+            r"\p{N}",
+            r"[^\s\p{L}\p{N}]",
+            r"\s",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for class in classes {
+            let parsed = Pattern::parse(class).expect("parses");
+            let own = CoreBPE::new(ranks.clone(), FxHashMap::default(), class)
+                .expect("the file's own encoder compiles the class");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = !own.encode_ordinary(&buf).is_empty();
+                assert_eq!(ours, theirs, "{class} at U+{code:04X}");
+            }
         }
     }
 

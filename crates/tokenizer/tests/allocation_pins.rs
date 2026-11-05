@@ -309,12 +309,14 @@ fn forty_messages() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The allocation calls of a forty-turn segmented encode today: the library's
-/// own encodes make almost all of it (a parts list and a rank list per word it
-/// merges); the ids buffer, sized up front at one id per three bytes, makes one
-/// and its regrowths on this one-id-per-byte vocabulary (about twice the
-/// reservation) make the rest of its share; nothing is made per segment.
-const PIN_SEGMENTED_ENCODE_CALLS: usize = 2_430;
+/// The allocation calls of a forty-turn segmented encode today: the direct
+/// encoder's encodes make almost all of it (a unit list and an ids list per
+/// piece it is handed, where the file's own encoder made a parts list and a
+/// rank list per word it merged); the ids buffer, sized up front at one id per
+/// three bytes, makes one and its regrowths on this one-id-per-byte vocabulary
+/// (about twice the reservation) make the rest of its share; nothing is made
+/// per segment by the segmented encode itself.
+const PIN_SEGMENTED_ENCODE_CALLS: usize = 1_572;
 
 #[test]
 fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
@@ -346,13 +348,14 @@ fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
         calls,
         PIN_SEGMENTED_ENCODE_CALLS,
         "encoding the segments of a forty-turn render ({} ids; about twenty segments per turn, \
-         every piece of a tag's attributes one of them) allocated {calls} times: the library's \
-         own encodes make almost all of it, the ids buffer sized up front at one id per three \
-         bytes makes one and its regrowths on this one-id-per-byte vocabulary the rest of its \
-         share, and nothing is made per segment; a list per segment (the checkpoint's cut of a \
-         segment shorter than its bounds, or a vector around the text) moves this up by the \
+         every piece of a tag's attributes one of them) allocated {calls} times: the direct \
+         encoder's encodes make almost all of it (a unit list and an ids list per piece), the \
+         ids buffer sized up front at one id per three bytes makes one and its regrowths on \
+         this one-id-per-byte vocabulary the rest of its share, and nothing is made per \
+         segment by the segmented encode itself; a list per segment (the checkpoint's cut of \
+         a segment shorter than its bounds, or a vector around the text) moves this up by the \
          segment count (about 760), a tighter or looser sizing rule by the regrowths it saves \
-         or adds, and a change of the library by what its encodes make",
+         or adds, and a change of the encoder by what its encodes make",
         ids.token_ids().len()
     );
 }

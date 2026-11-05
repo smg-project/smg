@@ -407,7 +407,7 @@ impl EncoderCore {
     /// passed by.
     fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
         if let Some(native) = &self.native {
-            match native.encode_plain(self.tokenizer.get_model(), text) {
+            match native.encode_plain(Some(self.tokenizer.get_model()), text) {
                 Ok(plain) => {
                     ids.extend(plain);
                     return Ok(());
@@ -1554,7 +1554,11 @@ impl Encoder for HuggingFaceTokenizer {
         // tokens (what the post-processor it read at load adds). An input it
         // gives up is counted and encoded by `tokenizers`.
         if let Some(native) = &self.core.native {
-            match native.encode(self.core.tokenizer.get_model(), input, add_special_tokens) {
+            match native.encode(
+                Some(self.core.tokenizer.get_model()),
+                input,
+                add_special_tokens,
+            ) {
                 Ok(ids) => return Ok(Encoding::Plain(ids)),
                 Err(fallback) => encode_path::note_fallback(fallback),
             }

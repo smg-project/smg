@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{hash_map::Entry, HashSet};
 
+use rustc_hash::FxHashMap;
+use tiktoken_rs::CoreBPE;
 use tokenizers::{
     models::{
         bpe::{Merges, Vocab, BPE},
@@ -66,6 +68,52 @@ fn table_ids(table: &MergeTable, piece: &[u8]) -> Vec<u32> {
     let mut ids = Vec::new();
     table.merge(piece, &mut ids);
     ids
+}
+
+/// The raw bytes an alphabet string stands for.
+fn unmapped(table: &[char; 256], entry: &str) -> Vec<u8> {
+    entry
+        .chars()
+        .map(|c| {
+            table
+                .iter()
+                .position(|&a| a == c)
+                .expect("an alphabet character") as u8
+        })
+        .collect()
+}
+
+/// A tiktoken vocabulary: the 256 bytes, then `merges` in order, each
+/// concatenation a new token at the next rank (one that exists already
+/// keeps its rank). With `bytes_last` the byte tokens take the ranks after
+/// the merges instead, as a file whose byte tokens are not its first lines.
+fn ranks_of(merges: &[(&str, &str)], bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
+    let (_, alphabet) = alphabet_vocab();
+    let mut ranks = FxHashMap::default();
+    let mut next = if bytes_last { 0 } else { 256 };
+    for (a, b) in merges {
+        let token = unmapped(&alphabet, &format!("{a}{b}"));
+        if let Entry::Vacant(slot) = ranks.entry(token) {
+            slot.insert(next);
+            next += 1;
+        }
+    }
+    for byte in 0..=255u8 {
+        ranks.insert(
+            vec![byte],
+            if bytes_last {
+                next + u32::from(byte)
+            } else {
+                u32::from(byte)
+            },
+        );
+    }
+    ranks
+}
+
+/// The file's own encoder over `ranks`, every piece one match.
+fn own_encoder(ranks: &FxHashMap<Vec<u8>, u32>) -> CoreBPE {
+    CoreBPE::new(ranks.clone(), FxHashMap::default(), r"[\s\S]+").expect("the encoder loads")
 }
 
 /// Merges that chain (`t` `h` `e` `the` `Ġthe`), repeat (`a` `a` `aa`
@@ -192,6 +240,201 @@ fn every_piece_merges_to_the_models_ids() {
             );
         }
     }
+}
+
+/// A tiktoken vocabulary's table merges every piece as the file's own
+/// encoder does: the merges of `merges()` as ranks (bytes first and bytes
+/// last), the pieces of `pieces()`, and pieces that are tokens themselves
+/// (the encoder looks those up whole; the table merges them, and a complete
+/// table reaches them).
+#[test]
+fn a_tiktoken_vocabulary_merges_as_its_own_encoder_does() {
+    for bytes_last in [false, true] {
+        let ranks = ranks_of(&merges(), bytes_last);
+        let table = MergeTable::from_ranks(&ranks).expect("a complete table");
+        assert!(!table.ignore_merges);
+        assert_eq!(table.merges(), ranks.len());
+        let own = own_encoder(&ranks);
+        let mut tokens: Vec<Vec<u8>> = ranks.keys().cloned().collect();
+        tokens.sort();
+        for piece in pieces().into_iter().chain(tokens) {
+            let expected = match std::str::from_utf8(&piece) {
+                Ok(text) => own.encode_ordinary(text),
+                // A token that is not text on its own (a byte or a prefix
+                // of a multi-byte character): the encoder's whole lookup.
+                Err(_) => vec![ranks[&piece]],
+            };
+            assert_eq!(
+                table_ids(&table, &piece),
+                expected,
+                "piece {:?} (bytes last {bytes_last})",
+                String::from_utf8_lossy(&piece)
+            );
+        }
+    }
+}
+
+/// On a vocabulary whose merges are a derivation (every token made by the
+/// merge the byte-pair rule itself would make), the table read from the
+/// ranks, the table read from the equivalent `tokenizers` model and the
+/// model agree on every piece: the pairs implied by the ranks are the
+/// model's merges, at the same priorities.
+#[test]
+fn the_table_from_ranks_equals_the_table_from_the_equivalent_model() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (_, alphabet) = alphabet_vocab();
+    // A corpus over a small pool, merged by the byte-pair rule itself: the
+    // most frequent adjacent pair becomes the next token, 300 times.
+    let pool: &[u8] = b"abcdef \n1\xc3\xa9";
+    let corpus: Vec<u8> = (0..4000)
+        .map(|_| pool[next() as usize % pool.len()])
+        .collect();
+    let mut symbols: Vec<Vec<u8>> = corpus.iter().map(|&b| vec![b]).collect();
+    let mut ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+    let mut list: Vec<(String, String)> = Vec::new();
+    // A pair whose concatenation is a token already is passed over (its
+    // token has its one derivation), so that the model's merge list is
+    // exactly the derivation of every token.
+    let mut passed_over: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
+    while list.len() < 300 {
+        let mut counts: FxHashMap<(Vec<u8>, Vec<u8>), usize> = FxHashMap::default();
+        for pair in symbols.windows(2) {
+            let pair = (pair[0].clone(), pair[1].clone());
+            if pair.0 != b" " && pair.1 != b" " && !passed_over.contains(&pair) {
+                *counts.entry(pair).or_default() += 1;
+            }
+        }
+        let Some(((a, b), _)) = counts
+            .into_iter()
+            .max_by_key(|((a, b), n)| (*n, std::cmp::Reverse((a.clone(), b.clone()))))
+        else {
+            break;
+        };
+        let token = [a.as_slice(), b.as_slice()].concat();
+        if ranks.contains_key(&token) {
+            passed_over.insert((a, b));
+            continue;
+        }
+        ranks.insert(token.clone(), ranks.len() as u32);
+        list.push((mapped(&alphabet, &a), mapped(&alphabet, &b)));
+        let mut merged = Vec::with_capacity(symbols.len());
+        let mut i = 0;
+        while i < symbols.len() {
+            if i + 1 < symbols.len() && symbols[i] == a && symbols[i + 1] == b {
+                merged.push(token.clone());
+                i += 2;
+            } else {
+                merged.push(symbols[i].clone());
+                i += 1;
+            }
+        }
+        symbols = merged;
+    }
+    let from_ranks = MergeTable::from_ranks(&ranks).expect("a complete table");
+    let (mut vocab, _) = alphabet_vocab();
+    let mut merges = Merges::new();
+    for (a, b) in &list {
+        let merged = format!("{a}{b}");
+        let id = vocab.len() as u32;
+        vocab.entry(merged).or_insert(id);
+        merges.push((a.clone(), b.clone()));
+    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .expect("a byte-level BPE");
+    let from_model = table_of(&model);
+    let own = own_encoder(&ranks);
+    let token_of_rank: FxHashMap<u32, &Vec<u8>> =
+        ranks.iter().map(|(token, &rank)| (rank, token)).collect();
+    for round in 0..3000 {
+        let len = 1 + round % 40;
+        let piece: Vec<u8> = (0..len)
+            .map(|_| pool[next() as usize % pool.len()])
+            .collect();
+        let text = String::from_utf8_lossy(&piece).into_owned();
+        let piece = text.as_bytes();
+        let expected: Vec<u32> = own.encode_ordinary(&text);
+        assert_eq!(table_ids(&from_ranks, piece), expected, "ranks: {text:?}");
+        // The model's ids name the same tokens by their alphabet spelling.
+        let via_model: Vec<Vec<u8>> = table_ids(&from_model, piece)
+            .iter()
+            .map(|&id| unmapped(&alphabet, &model.id_to_token(id).expect("a token")))
+            .collect();
+        let via_ranks: Vec<Vec<u8>> = expected
+            .iter()
+            .map(|id| token_of_rank[id].to_vec())
+            .collect();
+        assert_eq!(via_model, via_ranks, "model: {text:?}");
+    }
+}
+
+#[test]
+fn a_rank_set_the_table_cannot_stand_in_for_declines() {
+    let bytes = |ranks: &mut FxHashMap<Vec<u8>, u32>| {
+        for byte in 0..=255u8 {
+            ranks.insert(vec![byte], u32::from(byte));
+        }
+    };
+    // A byte without a token.
+    let mut ranks = FxHashMap::default();
+    bytes(&mut ranks);
+    ranks.remove([0x7Fu8].as_slice());
+    assert_eq!(
+        MergeTable::from_ranks(&ranks)
+            .err()
+            .expect("declined")
+            .to_string(),
+        "byte 0x7f has no token"
+    );
+    // A token that is no two tokens' concatenation.
+    let mut ranks = FxHashMap::default();
+    bytes(&mut ranks);
+    ranks.insert(b"ab".to_vec(), 256);
+    ranks.insert(b"abcd".to_vec(), 257);
+    assert_eq!(
+        MergeTable::from_ranks(&ranks)
+            .err()
+            .expect("declined")
+            .to_string(),
+        "token 257 is no two tokens' concatenation"
+    );
+    // A token its own bytes do not merge back into: `ab` merges before `bc`
+    // can, and nothing merges `ab` with `c` or `cd`; the file's encoder
+    // would still answer the whole piece `abcd` with its token.
+    let mut ranks = FxHashMap::default();
+    bytes(&mut ranks);
+    ranks.insert(b"ab".to_vec(), 256);
+    ranks.insert(b"bcd".to_vec(), 257);
+    ranks.insert(b"bc".to_vec(), 258);
+    ranks.insert(b"abcd".to_vec(), 259);
+    assert_eq!(
+        MergeTable::from_ranks(&ranks)
+            .err()
+            .expect("declined")
+            .to_string(),
+        "token 259 is not the merge of its bytes"
+    );
+    assert_eq!(own_encoder(&ranks).encode_ordinary("abcd"), vec![259]);
+    // The same set without that token is complete.
+    ranks.remove(b"abcd".as_slice());
+    assert!(MergeTable::from_ranks(&ranks).is_ok());
+    // A rank far past the token count: the table of rank ids is dense and
+    // bounded, as the decode table of such a file is.
+    ranks.insert(b"ab".to_vec(), 1 << 30);
+    assert_eq!(
+        MergeTable::from_ranks(&ranks)
+            .err()
+            .expect("declined")
+            .to_string(),
+        "ranks up to 1073741825 on a table bounded at 4194304"
+    );
 }
 
 #[test]
