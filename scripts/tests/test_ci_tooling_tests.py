@@ -4,10 +4,21 @@ lacks; the main workflow's tooling step runs the whole test directory rather tha
 list kept by hand."""
 
 import importlib.util
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+
+# Closed fixture environments still need the setup interpreter's loader paths.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "pr-test-rust.yml"
@@ -61,6 +72,84 @@ def test_suite_without_its_source_is_an_error(tmp_path, source, suite):
     create(tmp_path, *RUNNER.BASELINE, suite)
     with pytest.raises(ValueError, match="CPU test component is incomplete"):
         RUNNER.test_paths(tmp_path)
+
+
+_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/pr-test-rust.yml"
+_CLOSED_AMD_JOBS = (
+    "e2e-1gpu-responses-memory-core-amd",
+    "e2e-2gpu-pd-vllm-nixl-amd",
+    "e2e-2gpu-pd-vllm-mooncake-amd",
+    "e2e-4gpu-pd-vllm-nixl-amd",
+)
+_RESULT = re.compile(r"\$\{\{\s*needs\.([a-z0-9_-]+)\.result\s*\}\}")
+
+
+def _run_finish_gate(tmp_path, *, source=None, results=None, step="Check CI result"):
+    source = _WORKFLOW.read_text() if source is None else source
+    finish = yaml.safe_load(source)["jobs"]["finish"]
+    script = next(item["run"] for item in finish["steps"] if item.get("name") == step)
+    values = dict.fromkeys(finish["needs"], "success")
+    assert set(results or {}) <= values.keys()
+    values.update(results or {})
+    script = _RESULT.sub(lambda match: values[match[1]], script)
+    assert "${{" not in script, "finish fixture must render every GitHub expression"
+    work = tmp_path / "work"
+    workflow = work / ".github/workflows/pr-test-rust.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(source)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (binary / "python3").symlink_to(sys.executable)
+    return subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=work,
+        env={**INTERPRETER_ENV, "PATH": str(binary), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+@pytest.mark.parametrize("job", _CLOSED_AMD_JOBS)
+@pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled", "", "unknown"])
+def test_finish_optional_amd_result_is_closed(tmp_path, job, result):
+    completed = _run_finish_gate(tmp_path, results={job: result})
+    assert (completed.returncode == 0) is (result in ("success", "skipped")), completed.stdout
+
+
+@pytest.mark.parametrize("job", ["python-lint", "e2e-1gpu-chat"])
+@pytest.mark.parametrize("result", ["failure", "cancelled"])
+def test_finish_still_rejects_other_cpu_and_nvidia_failures(tmp_path, job, result):
+    completed = _run_finish_gate(tmp_path, results={job: result})
+    assert completed.returncode != 0, completed.stdout
+
+
+def test_finish_drift_check_accepts_the_actual_workflow(tmp_path):
+    completed = _run_finish_gate(tmp_path, step="Gate-integrity lint")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("job", _CLOSED_AMD_JOBS)
+@pytest.mark.parametrize("omission", ["needs", "result"])
+def test_finish_drift_check_rejects_an_omitted_job_reference(tmp_path, job, omission):
+    source = _WORKFLOW.read_text()
+    if omission == "needs":
+        match = re.search(r"^  finish:\n    needs: \[([^\]]*)\]", source, re.MULTILINE)
+        assert match is not None
+        names = [name.strip() for name in match[1].split(",")]
+        assert names.count(job) == 1
+        source = (
+            source[: match.start(1)]
+            + ", ".join(name for name in names if name != job)
+            + source[match.end(1) :]
+        )
+    else:
+        reference = f"needs.{job}.result"
+        assert reference in source
+        source = source.replace(reference, "needs.omitted-job.result")
+    completed = _run_finish_gate(tmp_path, source=source, step="Gate-integrity lint")
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert job in completed.stdout
 
 
 def test_every_path_the_runner_names_exists_on_the_tree():

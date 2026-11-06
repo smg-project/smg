@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 
@@ -17,10 +18,22 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import effective_parser, get_runtime
+from infra.constants import effective_parser, get_parser, get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
+
+
+def _function_calling_sampling(original_temperature: float) -> dict[str, float]:
+    """Keep current sampling unless the Original1 lane explicitly opts in."""
+    profile = os.environ.get("E2E_SAMPLING_PROFILE", "").strip()
+    if not profile:
+        return {"temperature": 0}
+    if profile != "original1":
+        raise ValueError(f"Unknown E2E_SAMPLING_PROFILE={profile!r}")
+    if get_runtime() != "vllm" or get_parser() != "legacy":
+        raise ValueError("original1 sampling requires vllm and explicit legacy parser")
+    return {"temperature": original_temperature, "top_p": original_temperature}
 
 
 # =============================================================================
@@ -123,11 +136,13 @@ class TestOpenAIServerFunctionCalling:
     answer per choice the request samples.
 
     On a real engine the cases that leave the choice to the model
-    (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
+    (``tool_choice: auto``) decode greedily by default (``temperature=0``): they assert
     the shape of the tool call the gateway reads, and a sampled answer in
     plain words would fail that by chance. The constrained cases (a
     ``required`` or a named choice) are decided by the grammar the gateway
-    installs, not by the draw.
+    installs, not by the draw. The explicit Original1 sampling profile under
+    vLLM/Legacy instead preserves the historical temperature/top_p pairs.
+    Its sampled auto answers can be plain text and fail the same shape assertions.
     """
 
     def test_function_calling_format(self, model, api_client, mock_answers):
@@ -169,7 +184,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0,
+            **_function_calling_sampling(0.8),
             stream=False,
             tools=tools,
         )
@@ -230,7 +245,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0,
+            **_function_calling_sampling(0.8),
             stream=True,
             tools=tools,
         )
@@ -296,7 +311,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0,
+            **_function_calling_sampling(0.9),
             stream=True,
             tools=tools,
         )

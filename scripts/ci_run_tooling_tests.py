@@ -23,10 +23,26 @@ COMPONENTS = (
 # error, not a notice, so a deleted or renamed suite is noticed at once.
 REGRESSIONS = (
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
+    ("scripts/ci_reap_job_processes.py", "scripts/tests/test_ci_reap_job_processes.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
     (
         "e2e_test/benchmarks/nightly_summarize.py",
         "scripts/tests/test_nightly_summary_errors.py",
+    ),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_startup_timeout.py"),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_parallel_start.py"),
+    ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_final_environment_scope.py",
+    ),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_e2e_log_pump_lifetime.py",
+    ),
+    (
+        "scripts/ci_verify_sglang_rocm_cohort.py",
+        "scripts/tests/test_ci_engine_http_dependencies.py",
     ),
 )
 
