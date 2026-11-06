@@ -70,6 +70,7 @@ def _generate(**overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hashes", [[], ["h"]])
 @pytest.mark.parametrize("consumer", [False, True])
 @pytest.mark.parametrize(
     "ec",
@@ -86,12 +87,12 @@ def _generate(**overrides):
     ],
 )
 @pytest.mark.parametrize("kv", [False, True])
-async def test_grid_only_requires_a_handoff(consumer, ec, kv):
+async def test_grid_only_requires_a_handoff(hashes, consumer, ec, kv):
     """Reject incomplete EC inputs before processing tensors or submitting engine work."""
     request = pb.GenerateRequest(
         request_id="ec-test",
         tokenized=pb.TokenizedInput(input_ids=[1, 2]),
-        mm_inputs=pb.MultimodalInputs(mm_hashes=["h"]),
+        mm_inputs=pb.MultimodalInputs(mm_hashes=hashes),
     )
     request.mm_inputs.model_specific_tensors["image_grid_thw"].shape.extend([1, 3])
     if ec is not None:
@@ -134,7 +135,9 @@ async def test_grid_only_requires_a_handoff(consumer, ec, kv):
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     valid_json = ec not in ("{", "[]", "null")
     allowed = valid_json and (
-        kv or (consumer and ec == '{"ec_items":[{"mm_hash":"h","transfer_id":"t"}]}')
+        kv
+        if ec is None
+        else consumer and bool(hashes) and ec == '{"ec_items":[{"mm_hash":"h","transfer_id":"t"}]}'
     )
     if allowed:
         assert [reply async for reply in _generate()(servicer, request, context)] == []

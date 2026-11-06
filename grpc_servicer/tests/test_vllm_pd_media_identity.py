@@ -161,9 +161,12 @@ async def test_decode_side_from_identity_never_touches_the_processor(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kv", [False, True])
 @pytest.mark.parametrize("producer", [False, True])
 @pytest.mark.parametrize("connector", ["ECCPUConnector", "ECMooncakeConnector"])
-async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch, producer, connector):
+async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(
+    monkeypatch, kv, producer, connector
+):
     """An ec_both prefill consumes E's handles without having to publish new ones."""
     processor = _Processor()
     servicer = _servicer(monkeypatch, processor)
@@ -172,7 +175,7 @@ async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch, pr
     servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
         is_ec_consumer=True, is_ec_producer=producer, ec_connector=connector
     )
-    request = _request(identity=prefill.media_identity)
+    request = _request(identity=prefill.media_identity, kv=kv)
     request.ec_transfer_params_json = json.dumps(
         {"ec_items": [{"mm_hash": "h1", "transfer_id": "transfer-1"}]}
         if connector == "ECMooncakeConnector"
@@ -310,6 +313,7 @@ async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kv", [False, True])
 @pytest.mark.parametrize(
     "handles",
     [
@@ -320,7 +324,7 @@ async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatc
         {"h1": {"peer_host": "e", "peer_port": "9000"}},
     ],
 )
-async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch, handles):
+async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch, handles, kv):
     """A grid-only ECCPU leg must never fall back to encoding missing pixels."""
     import grpc
 
@@ -329,7 +333,7 @@ async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch,
     servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
         is_ec_consumer=True, is_ec_producer=False, ec_connector="ECCPUConnector"
     )
-    request = _request(identity=prefill.media_identity)
+    request = _request(identity=prefill.media_identity, kv=kv)
     request.ec_transfer_params_json = json.dumps(handles)
     seen = []
     servicer.engine.generate = _engine(seen).generate
@@ -338,3 +342,45 @@ async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch,
     context.abort.assert_awaited_once()
     assert context.abort.call_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
     assert seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kv", [False, True])
+@pytest.mark.parametrize("connector", ["ECCPUConnector", "ECMooncakeConnector"])
+async def test_ec_consumer_rejects_a_pixel_less_batch_without_hashes(monkeypatch, kv, connector):
+    """Missing hashes cannot make either connector's coverage check vacuously pass."""
+    from unittest.mock import Mock
+
+    import grpc
+
+    servicer = _servicer(monkeypatch, _Processor())
+    prefill = await _complete(servicer, _request(refs=True, kv=True))
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=True, is_ec_producer=False, ec_connector=connector
+    )
+    request = _request(identity=prefill.media_identity, kv=kv)
+    request.mm_inputs.ClearField("mm_hashes")
+    request.ec_transfer_params_json = json.dumps(
+        {
+            "h1": {"peer_host": "e", "peer_port": 9000},
+            "ec_items": [{"mm_hash": "h1", "transfer_id": "t"}],
+        }
+    )
+    build = Mock(wraps=servicer._build_preprocessed_mm_inputs)
+    servicer._build_preprocessed_mm_inputs = build
+    context = SimpleNamespace(abort=AsyncMock(), invocation_metadata=lambda: ())
+    assert [r async for r in servicer.Generate(request, context)] == []
+    assert context.abort.call_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+    build.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ec_both_normal_pd_does_not_require_an_ec_completion(monkeypatch):
+    """KV-only PD may return a media identity without soliciting any EC handles."""
+    servicer = _servicer(monkeypatch, _Processor())
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=True, is_ec_producer=True, ec_connector="ECCPUConnector"
+    )
+    complete = await _complete(servicer, _request(refs=True, kv=True))
+    assert list(complete.output_ids) == [42]
+    assert complete.HasField("media_identity")

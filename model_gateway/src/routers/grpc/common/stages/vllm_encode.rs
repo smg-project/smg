@@ -144,16 +144,15 @@ fn push_destination(prefill: &dyn Worker) -> Result<Option<String>, Response> {
     let required = labels
         .get("ec_connector")
         .is_some_and(|name| name == "ECMooncakeConnector");
-    let Some(addrs) = labels.get("ec_zmq_addrs") else {
-        return if required {
-            Err(error::service_unavailable(
-                "ec_consumer_address",
-                "Mooncake consumer has no EC destination",
-            ))
-        } else {
-            Ok(None)
-        };
-    };
+    if !required {
+        return Ok(None);
+    }
+    let addrs = labels.get("ec_zmq_addrs").ok_or_else(|| {
+        error::service_unavailable(
+            "ec_consumer_address",
+            "Mooncake consumer has no EC destination",
+        )
+    })?;
     let addrs: Vec<String> = serde_json::from_str(addrs)
         .map_err(|e| error::internal_error("ec_consumer_address", e.to_string()))?;
     consumer_address(&addrs, prefill.dp_rank())
@@ -454,6 +453,13 @@ mod tests {
                 push_destination(&worker).is_err(),
                 connector == "ECMooncakeConnector"
             );
+        }
+        for addrs in ["[]", "invalid", r#"["tcp://unused:9001"]"#] {
+            let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
+                .label("ec_connector", "ECCPUConnector")
+                .label("ec_zmq_addrs", addrs)
+                .build();
+            assert!(push_destination(&worker).unwrap().is_none());
         }
         let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
             .label("ec_connector", "ECMooncakeConnector")

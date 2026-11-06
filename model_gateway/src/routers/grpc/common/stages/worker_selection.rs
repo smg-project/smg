@@ -32,11 +32,10 @@ use crate::{
         grpc::{
             context::{
                 stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
-                ExecutionPlanKind, PreparationOutput, RequestContext, RequestInput, RequestType,
-                RoutingSnapshot, WireConstraint, WorkerSelection,
+                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
+                WireConstraint, WorkerSelection,
             },
             multimodal,
-            proto_wrapper::ProtoGenerateRequest,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -67,6 +66,7 @@ enum EpdSelectionFailure {
     EcIncompatible,
     DecodeVisionUnsupported,
     EncodeNotSupported,
+    EncodeVisionUnsupported,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -707,19 +707,7 @@ impl WorkerSelectionStage {
         ctx: &mut DispatchContext,
         plan: &ExecutionPlan,
     ) -> Result<(), Response> {
-        let carries_ec_media = |request: &ProtoGenerateRequest| {
-            request.is_vllm() && (request.has_mm_inputs() || request.has_vllm_media_refs())
-        };
-        let cannot_replay = match plan {
-            ExecutionPlan::EncodePrefillDecode { request } => carries_ec_media(request),
-            ExecutionPlan::Batch {
-                kind: ExecutionPlanKind::EncodePrefillDecode,
-                requests,
-                ..
-            } => requests.iter().any(carries_ec_media),
-            _ => false,
-        };
-        if cannot_replay {
+        if plan.has_replica_bound_ec_handoff() {
             let mut response = error::bad_gateway(
                 "ec_retry_unsupported",
                 "Cannot replay a replica-bound EC handoff from the pre-encode request",
@@ -906,11 +894,10 @@ impl WorkerSelectionStage {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
                     EpdSelectionFailure::EncodeNotSupported => {
-                        return if demand.encode.vision {
-                            self.vision_refusal(model_id, "encode workers")
-                        } else {
-                            multimodal::MmRefsError::EncodeNotSupported.into_response()
-                        }
+                        return multimodal::MmRefsError::EncodeNotSupported.into_response()
+                    }
+                    EpdSelectionFailure::EncodeVisionUnsupported => {
+                        return self.vision_refusal(model_id, "encode workers")
                     }
                     EpdSelectionFailure::Placement(failure) => {
                         return self.pair_failure(model_id, *failure)
@@ -1974,24 +1961,36 @@ impl WorkerSelectionStage {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
-        let capable = |worker: &Arc<dyn Worker>| {
-            demand.encode.accepts(worker.as_ref())
+        let capable_for = |worker: &Arc<dyn Worker>, media: MediaDemands| {
+            media.accepts(worker.as_ref())
                 && match worker.metadata().spec.runtime_type {
                     RuntimeType::Vllm => ec_role(worker.as_ref(), "ec_producer"),
-                    RuntimeType::TokenSpeed => !demand.encode.media_refs,
+                    RuntimeType::TokenSpeed => !media.media_refs,
                     _ => false,
                 }
         };
+        let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
         available_encode.retain(capable);
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
         if needs_encode && available_encode.is_empty() {
             // Only membership can prove a permanent configuration gap.
             return Err(if registered_encode.iter().any(capable) {
                 EpdSelectionFailure::Unavailable
+            } else if demand.encode.vision
+                && registered_encode.iter().any(|worker| {
+                    capable_for(
+                        worker,
+                        MediaDemands {
+                            vision: false,
+                            ..demand.encode
+                        },
+                    )
+                })
+            {
+                EpdSelectionFailure::EncodeVisionUnsupported
             } else if registered_encode.iter().any(|worker| {
                 worker.metadata().spec.runtime_type == RuntimeType::Vllm
                     && demand.encode.accepts(worker.as_ref())
-                    && multimodal::worker_supports_ec_transfer(worker.as_ref())
             }) {
                 EpdSelectionFailure::EcIncompatible
             } else if !registered_encode.is_empty() && demand.encode.any() {
@@ -2207,7 +2206,7 @@ mod tests {
                 retry::is_retryable_response,
             },
             grpc::{
-                context::{PreparationOutput, SharedComponents},
+                context::{ExecutionPlanKind, PreparationOutput, SharedComponents},
                 proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
                 regular::symphony::template::Templates,
                 utils,
@@ -4224,7 +4223,7 @@ mod tests {
                 if runtime == RuntimeType::Vllm && needs_vision && !e_vision {
                     assert!(matches!(
                         result,
-                        Err(EpdSelectionFailure::EncodeNotSupported)
+                        Err(EpdSelectionFailure::EncodeVisionUnsupported)
                     ));
                     stage
                         .worker_registry
@@ -4246,7 +4245,7 @@ mod tests {
                             },
                             None
                         ),
-                        Err(EpdSelectionFailure::EncodeNotSupported)
+                        Err(EpdSelectionFailure::EncodeVisionUnsupported)
                     ));
                 }
                 if runtime == RuntimeType::Vllm && allowed && !d_vision {

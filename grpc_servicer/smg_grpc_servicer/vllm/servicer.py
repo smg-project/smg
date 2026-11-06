@@ -458,7 +458,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Every batch needs its own, not just one of them: a batch left
                 # out contributes no encoder tensor, and the engine would run
                 # that modality's encoder with nothing to encode.
+                missing_pixels = batches_missing_pixels(preprocessed_batches)
                 ec_handoff = bool(is_ec_consumer and ec_transfer_params)
+                if ec_handoff and ec_config.ec_connector in (
+                    "ECCPUConnector",
+                    "ECMooncakeConnector",
+                ):
+                    ec_handoff = all(batch.mm_hashes for batch in missing_pixels)
                 if ec_handoff and ec_config.ec_connector == "ECMooncakeConnector":
                     # Mooncake consumes per-occurrence transfer IDs; a nonempty
                     # dict alone does not prevent a pixel-less encoder schedule.
@@ -482,12 +488,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 if ec_handoff and ec_config.ec_connector == "ECCPUConnector":
                     ec_handoff = all(
                         _valid_cpu_ec_handle(ec_transfer_params.get(mm_hash))
-                        for batch in batches_missing_pixels(preprocessed_batches)
+                        for batch in missing_pixels
                         for mm_hash in batch.mm_hashes
                     )
+                # P may send KV remotely, but it still needs every incoming EC
+                # handle. Only a leg without EC parameters may rely on KV alone.
                 if (
-                    batches_missing_pixels(preprocessed_batches)
-                    and kv_transfer_params is None
+                    missing_pixels
+                    and (ec_transfer_params is not None or kv_transfer_params is None)
                     and not ec_handoff
                 ):
                     logger.warning(
@@ -509,11 +517,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
-                if (
-                    ec_transfer_params is not None
-                    and is_ec_producer
-                    and not batches_missing_pixels(preprocessed_batches)
-                ):
+                if ec_transfer_params is not None and is_ec_producer and not missing_pixels:
                     media_identity = build_media_identity(prompt)
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
@@ -604,6 +608,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # recompute it after EPD, so refuse before returning a handoff.
                 if (
                     output.finished
+                    and ec_transfer_params is not None
                     and ec_config is not None
                     and is_ec_producer
                     and ec_config.ec_connector == "ECCPUConnector"
