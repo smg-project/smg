@@ -536,7 +536,8 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render.
+/// gRPC backends require content parts the gateway knows how to render, and
+/// a refusal part only where the contract defines it: on an assistant turn.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
     for message in messages {
         let content = match message {
@@ -548,16 +549,27 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
             ChatMessage::Assistant { content, .. } => content.as_ref(),
             ChatMessage::Function { .. } => None,
         };
+        let assistant = matches!(message, ChatMessage::Assistant { .. });
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
-                if let ContentPart::Unknown(fields) = part {
-                    let type_name = fields
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("<missing>");
-                    return Err(format!(
-                        "Unsupported chat content part type {type_name:?} for gRPC backends"
-                    ));
+                match part {
+                    ContentPart::Unknown(fields) => {
+                        let type_name = fields
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>");
+                        return Err(format!(
+                            "Unsupported chat content part type {type_name:?} for gRPC backends"
+                        ));
+                    }
+                    ContentPart::Refusal { .. } if !assistant => {
+                        return Err(
+                            "Unsupported chat content part type \"refusal\" outside an assistant \
+                             message for gRPC backends"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -660,8 +672,10 @@ fn transform_content_field(
                     continue;
                 };
                 match obj.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                    // A refusal part is the turn's text, as the engines' own
+                    // servers render it.
+                    Some(type_name @ ("text" | "refusal")) => {
+                        if let Some(t) = obj.get(type_name).and_then(|t| t.as_str()) {
                             match media_order {
                                 MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
                                 MediaPartOrder::Authored => authored_parts.push(t.to_string()),
@@ -706,17 +720,23 @@ fn transform_content_field(
             // the request's order whatever `media_order` says: the template
             // walks them and writes each anchor where its part sits (a text
             // part before an image renders before it), which is how the
-            // engine's own server hands them to such a template.
+            // engine's own server hands them to such a template. A refusal
+            // part becomes a text part, as that server hands it over.
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
                     part.as_object()
-                        .and_then(|obj| obj.get("type")?.as_str())
-                        .and_then(|type_str| match type_str {
-                            "image_url" => Some(json!({"type": "image"})),
-                            "video_url" => Some(json!({"type": "video"})),
-                            "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
-                            _ => None,
+                        .and_then(|obj| {
+                            let type_str = obj.get("type")?.as_str()?;
+                            match type_str {
+                                "image_url" => Some(json!({"type": "image"})),
+                                "video_url" => Some(json!({"type": "video"})),
+                                "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
+                                "refusal" => {
+                                    Some(json!({"type": "text", "text": obj.get("refusal")?}))
+                                }
+                                _ => None,
+                            }
                         })
                         .unwrap_or_else(|| part.clone())
                 })

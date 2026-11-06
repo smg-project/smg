@@ -331,10 +331,26 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// An assistant turn's refusal, as the public API returns one and a client
+    /// replays it in the history; the renderers read it as the turn's text.
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     /// Pass through unknown content objects to HTTP backends.
     /// Also matches malformed known types; gRPC backends reject this variant.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
+}
+
+impl ContentPart {
+    /// The text a renderer reads from the part: a text part's text, a
+    /// refusal's text (the engines' own servers render a refusal part as the
+    /// turn's text); none for a media or an unknown part.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -2373,6 +2389,31 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// An assistant `refusal` part reads as a typed part, writes back as the
+    /// public API spells it, and is the turn's text to the renderers; a text
+    /// part keeps being text and a media part has none.
+    #[test]
+    fn a_refusal_part_is_typed_and_read_as_text() {
+        let body = json!({"type": "refusal", "refusal": "I cannot help with that."});
+        let part: ContentPart = serde_json::from_value(body.clone()).expect("a content part");
+        assert_eq!(
+            part,
+            ContentPart::Refusal {
+                refusal: "I cannot help with that.".to_string()
+            }
+        );
+        assert_eq!(part.text(), Some("I cannot help with that."));
+        assert_eq!(serde_json::to_value(&part).expect("json"), body);
+        let text: ContentPart =
+            serde_json::from_value(json!({"type": "text", "text": "hi"})).expect("a content part");
+        assert_eq!(text.text(), Some("hi"));
+        let image: ContentPart = serde_json::from_value(
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+        )
+        .expect("a content part");
+        assert_eq!(image.text(), None);
     }
 
     /// `response_format` on the wire: `{"type": ...}` with the schema object

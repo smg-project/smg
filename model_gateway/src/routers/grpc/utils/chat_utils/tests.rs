@@ -71,6 +71,24 @@ fn process_chat_messages_rejects_unknown_content_parts() {
     assert!(error.contains("vendor_media"));
 }
 
+/// A refusal part is the assistant's: on any other role it is refused before
+/// the engine wire, as the unknown parts are, so no pipeline drops it.
+#[test]
+fn a_refusal_part_outside_an_assistant_turn_is_refused() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    let error = validate_chat_content_parts(&messages).unwrap_err();
+    assert!(error.contains("refusal"), "{error}");
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -83,6 +101,7 @@ fn known_chat_content_parts_are_accepted() {
             {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
         ]},
         {"role": "assistant", "content": null},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]},
         {"role": "function", "name": "lookup", "content": "result"},
         {"role": "function", "name": "lookup", "content": null}
     ]))
@@ -109,6 +128,40 @@ fn a_function_result_without_content_reaches_the_template_as_empty_content() {
         process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
     assert_eq!(as_parts[1]["content"], json!([]));
     assert_eq!(as_parts[2]["content"], json!("found"));
+}
+
+/// A replayed assistant refusal part is the turn's text to the template, in
+/// the string format and in the parts format, as the engines' own servers
+/// hand it over; the text parts beside it keep their order.
+#[test]
+fn a_refusal_part_reaches_the_template_as_the_turns_text() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Sorry."},
+            {"type": "refusal", "refusal": "I cannot help with that."}
+        ]},
+        {"role": "user", "content": "ok"}
+    ]))
+    .unwrap();
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_string[1]["content"],
+        json!("Sorry.\nI cannot help with that.")
+    );
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_parts[1]["content"],
+        json!([
+            {"type": "text", "text": "Sorry."},
+            {"type": "text", "text": "I cannot help with that."}
+        ])
+    );
 }
 
 #[test]

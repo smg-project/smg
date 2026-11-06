@@ -201,14 +201,12 @@ impl MessageContent {
             MessageContent::Parts(parts) => {
                 let mut result = String::new();
                 let mut first = true;
-                for part in parts {
-                    if let ContentPart::Text { text } = part {
-                        if !first {
-                            result.push(' ');
-                        }
-                        result.push_str(text);
-                        first = false;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !first {
+                        result.push(' ');
                     }
+                    result.push_str(text);
+                    first = false;
                 }
                 result
             }
@@ -230,15 +228,13 @@ impl MessageContent {
             }
             MessageContent::Parts(parts) => {
                 let mut appended = false;
-                for part in parts {
-                    if let ContentPart::Text { text } = part {
-                        if !text.is_empty() {
-                            if appended {
-                                buffer.push(' ');
-                            }
-                            buffer.push_str(text);
-                            appended = true;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !text.is_empty() {
+                        if appended {
+                            buffer.push(' ');
                         }
+                        buffer.push_str(text);
+                        appended = true;
                     }
                 }
                 appended
@@ -253,7 +249,8 @@ impl MessageContent {
             MessageContent::Text(text) => !text.is_empty(),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .any(|part| matches!(part, ContentPart::Text { text } if !text.is_empty())),
+                .filter_map(ContentPart::text)
+                .any(|text| !text.is_empty()),
         }
     }
 }
