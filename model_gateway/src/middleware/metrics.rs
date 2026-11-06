@@ -235,11 +235,21 @@ pin_project! {
         inner: F,
         duty: Option<EdgeDuty>,
     }
+
+    impl<F> PinnedDrop for HttpMetricsFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            // Dropped with the duty still held: the route never answered.
+            if let Some(duty) = this.project().duty.take() {
+                duty.unanswered();
+            }
+        }
+    }
 }
 
 /// What the metrics layer holds for a request between its arrival and the
 /// route's answer. Dropped with the future before the answer, it counts the
-/// request as closed by the client and releases its in-flight guard.
+/// request as closed by the client and releases its in-flight guard, with
+/// the gauge set from the tracker as at every other release (`unanswered`).
 struct EdgeDuty {
     method: &'static str,
     start: Instant,
@@ -315,6 +325,17 @@ impl EdgeDuty {
             body, guard, tracker, outcome, progress, duties,
         ));
         Ok(Response::from_parts(parts, body))
+    }
+
+    /// The route never answered: the request's future was dropped (what the
+    /// server does with a request whose client closed the connection). The
+    /// in-flight guard goes and the gauge follows it; the outcome, dropped
+    /// with the rest, counts the request as closed by the client.
+    fn unanswered(self) {
+        let Self { tracker, guard, .. } = self;
+        // Drop before reading len() so the gauge reflects the decrement.
+        drop(guard);
+        Metrics::set_http_connections_active(tracker.len());
     }
 }
 
@@ -901,6 +922,17 @@ mod client_closed_tests {
             .unwrap_or_else(|| panic!("a duration sum for {path} in {rendered}"))
     }
 
+    /// The `smg_http_connections_active` sample: the requests in flight at
+    /// the edge, as the gauge reports them.
+    fn connections_active(rendered: &str) -> f64 {
+        rendered
+            .lines()
+            .find(|line| line.starts_with("smg_http_connections_active "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("the in-flight gauge in {rendered}"))
+    }
+
     /// The value of the label `name` on a rendered sample line.
     fn label(line: &str, name: &str) -> String {
         let key = format!("{name}=\"");
@@ -1259,6 +1291,43 @@ mod client_closed_tests {
             responses(&rendered, "/slow"),
             sample("499", "client_closed_request"),
             "{rendered}"
+        );
+    }
+
+    /// The gauge is set from the tracker's count at the request's arrival
+    /// and at every release of its guard. The future dropped before the
+    /// route answered is one of the releases: left out, an idle server
+    /// reported one phantom request in flight until its next request.
+    #[test]
+    fn a_request_the_client_dropped_before_the_response_leaves_the_in_flight_gauge_at_the_tracker_s_count(
+    ) {
+        let tracker = InFlightRequestTracker::new();
+        let rendered = render(|handle| {
+            let tracker = Arc::clone(&tracker);
+            async move {
+                let app = Router::new()
+                    .route(
+                        "/slow",
+                        get(|| async {
+                            std::future::pending::<()>().await;
+                            "never"
+                        }),
+                    )
+                    .layer(HttpMetricsLayer::new(Arc::clone(&tracker)));
+                let mut pending = Box::pin(app.oneshot(request("/slow")));
+                assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+                assert_eq!(tracker.len(), 1);
+                assert_eq!(connections_active(&handle.render()), 1.0);
+                // The client closes the connection: the server drops the
+                // request's future, and the guard with it.
+                drop(pending);
+                assert_eq!(tracker.len(), 0, "the guard went with the future");
+            }
+        });
+        assert_eq!(
+            connections_active(&rendered),
+            0.0,
+            "the gauge reads the tracker's count once the future is gone: {rendered}"
         );
     }
 
