@@ -2160,13 +2160,19 @@ impl SchedulerState {
         // sample starts over. The sample is stamped at the pass's end, when
         // `run` has slept the pass's duration and publishes it: stamped at
         // its start, a pass longer than the ttl would expire as it ended.
+        // The previous sample is judged at that same end: a pass that
+        // outlasts its remaining ttl publishes its own rate alone, as a read
+        // at publication would have found the previous one expired.
         if prefill_tokens > 0 && prefill_ms > 0.0 {
             let sample = f64::from(prefill_tokens) / (prefill_ms / 1000.0);
-            let rate = match self.prefill_throughput() {
-                Some(prev) => ewma(prev, sample, 0.3),
-                None => sample,
+            let end = Instant::now() + duration;
+            let rate = match self.prefill_tp {
+                Some((at, prev)) if end.saturating_duration_since(at) <= PREFILL_RATE_TTL => {
+                    ewma(prev, sample, 0.3)
+                }
+                _ => sample,
             };
-            self.prefill_tp = Some((Instant::now() + duration, rate));
+            self.prefill_tp = Some((end, rate));
         }
 
         let batch = if kv.is_empty() {
@@ -2652,6 +2658,45 @@ mod tests {
         assert_ne!(
             cold, different,
             "the partial tail participates in output identity"
+        );
+    }
+
+    /// A pass longer than the previous sample's remaining ttl publishes its
+    /// own rate alone: by its end the previous sample has expired, as a read
+    /// at that moment would have found, so nothing stale is averaged in.
+    #[test]
+    fn a_pass_that_outlasts_the_previous_sample_s_ttl_starts_the_rate_over() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("first", vec![7; 256], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let first = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("one pass prefilled");
+        let mut slow = p.clone();
+        slow.timing = TimingModel::Linear {
+            prefill_tps: 1.0,
+            decode_base_ms: 0.0,
+            decode_per_req_ms: 0.0,
+        };
+        let (r, _rx) = req("slow", vec![9; 128], 4);
+        st.enqueue(r, &slow);
+        let step = st.step(&slow);
+        assert!(
+            step.duration > PREFILL_RATE_TTL,
+            "the pass outlasts the ttl: {:?}",
+            step.duration
+        );
+        let rate = st
+            .snapshot(&slow)
+            .prefill_throughput
+            .expect("the slow pass prefilled");
+        let own = 128.0 / (slow.timing.prefill_pass_ms(128, 128) / 1000.0);
+        assert!(
+            (rate - own).abs() < 1e-6,
+            "{rate} vs the pass's own {own}: the first pass's {first} expired by the end"
         );
     }
 
