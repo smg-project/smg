@@ -187,6 +187,22 @@ fn resize_rgb_with(
     }
 }
 
+/// A pass's output buffer: a plain allocation filled in place, never a zeroed
+/// one. Every byte is written by the pass, and an allocator serves a large
+/// zeroed block by returning its pages to the kernel and taking them back page
+/// fault by page fault (jemalloc zeroes a recycled block that way; glibc's
+/// zeroed allocation of a fresh heap top relies on fresh pages): on a
+/// multi-megabyte intermediate those faults cost a quarter of the pass.
+#[expect(
+    clippy::slow_vector_initialization,
+    reason = "the zeroed form the lint prefers re-faults every page of the buffer on every image under the production allocator"
+)]
+fn plain_buffer(len: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(len);
+    buffer.resize(len, 0);
+    buffer
+}
+
 /// Every input row resampled along its width; rows banded across the pool
 /// (each output row depends on its input row alone, so the banding changes
 /// nothing).
@@ -199,7 +215,7 @@ fn horizontal_pass(
     path: Rows,
 ) -> Vec<u8> {
     let row_out = out_w * 3;
-    let mut out = vec![0u8; rows * row_out];
+    let mut out = plain_buffer(rows * row_out);
     let tasks = execution::task_count(out.len(), rows, 32);
     if tasks <= 1 {
         horizontal_rows(src, in_w, out_w, axis, 0, &mut out, path);
@@ -302,7 +318,7 @@ fn horizontal_row_scalar(row: &[u8], axis: &Axis, out_row: &mut [u8]) {
 /// Every output row resampled along the height; rows banded across the pool.
 fn vertical_pass(src: &[u8], width: usize, out_h: usize, axis: &Axis, path: Rows) -> Vec<u8> {
     let row_len = width * 3;
-    let mut out = vec![0u8; out_h * row_len];
+    let mut out = plain_buffer(out_h * row_len);
     let tasks = execution::task_count(out.len(), out_h, 32);
     if tasks <= 1 {
         vertical_rows(src, row_len, axis, 0, &mut out, path);
