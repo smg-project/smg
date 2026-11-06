@@ -87,6 +87,26 @@ impl PolicyRegistration {
         needs_kv_events
     }
 
+    /// The PD policies' worker sets, read again from the registry: the
+    /// prefill and decode cache-aware policies' trees and the prefill bucket
+    /// policy's per-model URL partition (`init_pd_cache_aware_policies`,
+    /// `init_pd_bucket_policies`). The registration step runs it after its
+    /// admissions; the import sync after it admits an import with a prefill
+    /// or decode role, so a model served by imports alone has its bucket
+    /// from the first import on.
+    pub fn init_pd_policies(&self) {
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+        self.policy_registry
+            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        if !prefill_workers.is_empty()
+            && self.policy_registry.get_prefill_policy().name() == "bucket"
+        {
+            self.policy_registry
+                .init_pd_bucket_policies(&prefill_workers);
+        }
+    }
+
     /// Hand the stream under `from`'s address to `to`, the registry's worker
     /// at that address now (a local claim of an import's address, or a
     /// registration that took it after the import's tombstone), and release

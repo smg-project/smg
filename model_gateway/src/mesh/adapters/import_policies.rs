@@ -26,8 +26,19 @@ use tracing::{debug, warn};
 
 use crate::{
     policies::PolicyRegistration,
-    worker::{event::WorkerEvent, registry::WorkerId, Worker, WorkerOrigin, WorkerRegistry},
+    worker::{
+        event::WorkerEvent, registry::WorkerId, Worker, WorkerOrigin, WorkerRegistry, WorkerType,
+    },
 };
+
+/// Whether the worker's role is one the PD policies partition by: the
+/// prefill and decode policies' worker sets change with its admission.
+fn has_pd_role(worker: &Arc<dyn Worker>) -> bool {
+    matches!(
+        worker.worker_type(),
+        WorkerType::Prefill | WorkerType::Decode
+    )
+}
 
 /// The task that admits mesh imports to the policies and releases them.
 #[derive(Debug)]
@@ -131,13 +142,18 @@ impl Sync {
     }
 
     /// Admit the import, with the `policy` label its spec carries as the
-    /// hint a local registration's label gives.
+    /// hint a local registration's label gives. An import with a prefill or
+    /// decode role then refreshes the PD policies' worker sets, as the
+    /// registration step does after its admissions.
     async fn admit(&mut self, worker_id: WorkerId, worker: Arc<dyn Worker>) {
         if self.tracked.contains_key(&worker_id) {
             return;
         }
         let hint = worker.metadata().spec.labels.get("policy").cloned();
         self.registration.admit(&worker, hint.as_deref()).await;
+        if has_pd_role(&worker) {
+            self.registration.init_pd_policies();
+        }
         debug!(
             worker_id = %worker_id.as_str(),
             url = worker.redacted_url(),
@@ -246,7 +262,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{CacheAwarePolicy, PolicyRegistry},
+        policies::{BucketPolicy, CacheAwarePolicy, PolicyRegistry},
         worker::{
             test_support::no_health_check, BasicWorkerBuilder, KvEventMonitor, WorkerMonitor,
         },
@@ -301,6 +317,18 @@ mod tests {
         let mut spec = WorkerSpec::new(url);
         spec.models = WorkerModels::Single(Box::new(ModelCard::new(model_id)));
         spec.connection_mode = ConnectionMode::Grpc;
+        WorkerState {
+            spec: serde_json::to_vec(&spec).expect("a worker spec serializes"),
+            ..remote_state(worker_id, url, model_id)
+        }
+    }
+
+    /// A peer's prefill worker over gRPC: the spec carries the role.
+    fn prefill_remote_state(worker_id: &str, url: &str, model_id: &str) -> WorkerState {
+        let mut spec = WorkerSpec::new(url);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new(model_id)));
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec.worker_type = WorkerType::Prefill;
         WorkerState {
             spec: serde_json::to_vec(&spec).expect("a worker spec serializes"),
             ..remote_state(worker_id, url, model_id)
@@ -810,6 +838,37 @@ mod tests {
             Arc::strong_count(&local),
             held - 1,
             "the admission started the local worker's load-record stream"
+        );
+    }
+
+    /// An import with the prefill role: its admission refreshes the PD
+    /// policies' worker sets, so the prefill bucket policy partitions its
+    /// model from the first import on, as the registration step does for a
+    /// local prefill worker. Without it a model served by imports alone
+    /// stayed on the policy's fallback.
+    #[tokio::test]
+    async fn an_imported_prefill_worker_enters_the_prefill_bucket() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, _monitor) = streaming_registration(&registry);
+        policies.set_prefill_policy(Arc::new(BucketPolicy::new()));
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&prefill_remote_state(
+            "peer-p1",
+            "grpc://127.0.0.1:1",
+            "m1",
+        ));
+        handle_queued(&mut sync, &mut events).await;
+
+        let prefill_policy = policies.get_prefill_policy();
+        let bucket = prefill_policy
+            .as_any()
+            .downcast_ref::<BucketPolicy>()
+            .expect("the prefill policy is the bucket policy");
+        assert!(
+            bucket.has_bucket("m1"),
+            "the import's admission refreshed the prefill bucket policy's worker set"
         );
     }
 
