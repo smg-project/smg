@@ -849,9 +849,9 @@ impl FixedKernel {
 
 /// The computation the fixed-point passes replace, for the tests: per
 /// sample, the kernel's own taps summed in `i64`, width first then height,
-/// `(sum >> precision)` clamped to a byte.
+/// `(sum >> precision)` clamped to a byte; `C` interleaved channels.
 #[cfg(test)]
-pub(super) fn per_sample_reference(
+pub(super) fn per_sample_reference_channels<const C: usize>(
     data: &[u8],
     in_w: usize,
     in_h: usize,
@@ -867,17 +867,17 @@ pub(super) fn per_sample_reference(
     if in_w != out_w {
         let k = FixedKernel::new(in_w, out_w, filter, quantization);
         let half = 1_i64 << (k.precision - 1);
-        let mut out = vec![0u8; in_h * out_w * 3];
+        let mut out = vec![0u8; in_h * out_w * C];
         for y in 0..in_h {
             for xx in 0..out_w {
                 let (x0, n) = k.bounds[xx];
-                for c in 0..3 {
+                for c in 0..C {
                     let mut s = half;
                     for x in 0..n {
                         s +=
-                            i64::from(data[(y * in_w + x0 + x) * 3 + c]) * i64::from(k.taps[xx][x]);
+                            i64::from(data[(y * in_w + x0 + x) * C + c]) * i64::from(k.taps[xx][x]);
                     }
-                    out[(y * out_w + xx) * 3 + c] = clip(&k, s);
+                    out[(y * out_w + xx) * C + c] = clip(&k, s);
                 }
             }
         }
@@ -888,18 +888,32 @@ pub(super) fn per_sample_reference(
     }
     let k = FixedKernel::new(in_h, out_h, filter, quantization);
     let half = 1_i64 << (k.precision - 1);
-    let mut out = vec![0u8; out_h * out_w * 3];
+    let mut out = vec![0u8; out_h * out_w * C];
     for yy in 0..out_h {
         let (y0, n) = k.bounds[yy];
-        for x in 0..out_w * 3 {
+        for x in 0..out_w * C {
             let mut s = half;
             for y in 0..n {
-                s += i64::from(mid[(y0 + y) * out_w * 3 + x]) * i64::from(k.taps[yy][y]);
+                s += i64::from(mid[(y0 + y) * out_w * C + x]) * i64::from(k.taps[yy][y]);
             }
-            out[yy * out_w * 3 + x] = clip(&k, s);
+            out[yy * out_w * C + x] = clip(&k, s);
         }
     }
     out
+}
+
+/// [`per_sample_reference_channels`] for RGB.
+#[cfg(test)]
+pub(super) fn per_sample_reference(
+    data: &[u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    filter: PilResizeFilter,
+    quantization: KernelQuantization,
+) -> Vec<u8> {
+    per_sample_reference_channels::<3>(data, in_w, in_h, out_w, out_h, filter, quantization)
 }
 
 /// Number of threads to split an elementwise or row-banded preprocessing pass
@@ -910,10 +924,11 @@ pub(crate) fn par_threads(out_bytes: usize, out_rows: usize) -> usize {
     task_count(out_bytes, out_rows, 32)
 }
 
-/// Output rows `[y0, y0 + band.len() / (out_w * 3))` of the width pass: each
-/// output pixel sums its taps over the source pixels of its row, the three
-/// channels side by side, in the 32-bit arithmetic of [`FixedKernel`].
-fn pil_h_band(
+/// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass, the
+/// portable arm of [`WidthPass`]: each output pixel sums its taps over the
+/// source pixels of its row, the `C` channels side by side, in the 32-bit
+/// arithmetic of [`FixedKernel`].
+fn pil_h_band<const C: usize>(
     src: &[u8],
     kernel: &FixedKernel,
     in_w: usize,
@@ -921,36 +936,142 @@ fn pil_h_band(
     y0: usize,
     band: &mut [u8],
 ) {
-    let half = kernel.half();
-    let row_in = in_w * 3;
-    for (i, out_row) in band.chunks_exact_mut(out_w * 3).enumerate() {
+    let row_in = in_w * C;
+    for (i, out_row) in band.chunks_exact_mut(out_w * C).enumerate() {
         let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
-        for ((out, &(x0, n)), taps) in out_row
-            .as_chunks_mut::<3>()
+        pil_h_outputs::<C>(row, kernel, 0, out_row);
+    }
+}
+
+/// Outputs `first..first + out.len() / C` of one row of the width pass, one
+/// at a time: output `x` sums its taps over source pixels `x0..x0 + n`.
+fn pil_h_outputs<const C: usize>(row: &[u8], kernel: &FixedKernel, first: usize, out: &mut [u8]) {
+    let half = kernel.half();
+    for ((out, &(x0, n)), taps) in out
+        .as_chunks_mut::<C>()
+        .0
+        .iter_mut()
+        .zip(&kernel.bounds[first..])
+        .zip(&kernel.taps[first..])
+    {
+        let mut sums = [half; C];
+        for (pixel, &tap) in row[x0 * C..(x0 + n) * C]
+            .as_chunks::<C>()
             .0
-            .iter_mut()
-            .zip(&kernel.bounds)
-            .zip(&kernel.taps)
+            .iter()
+            .zip(taps)
         {
-            let mut sums = [half; 3];
-            for (pixel, &tap) in row[x0 * 3..(x0 + n) * 3]
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(taps)
-            {
-                sums[0] += i32::from(pixel[0]) * tap;
-                sums[1] += i32::from(pixel[1]) * tap;
-                sums[2] += i32::from(pixel[2]) * tap;
+            for (sum, &value) in sums.iter_mut().zip(pixel) {
+                *sum += i32::from(value) * tap;
             }
-            *out = sums.map(|sum| kernel.clip8(sum));
+        }
+        *out = sums.map(|sum| kernel.clip8(sum));
+    }
+}
+
+/// How [`pil_resample_horizontal`] runs its rows: the portable per-output
+/// loop, or, on an x86-64 processor that reports AVX2, the eight-tap vector
+/// steps of [`avx2::h_band`] over the kernel's taps padded for them.
+enum WidthPass {
+    Portable,
+    #[cfg(target_arch = "x86_64")]
+    Avx2(PaddedTaps),
+}
+
+impl WidthPass {
+    #[cfg(target_arch = "x86_64")]
+    fn new(kernel: &FixedKernel, in_w: usize) -> Self {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            Self::Avx2(PaddedTaps::new(kernel, in_w))
+        } else {
+            Self::Portable
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn new(_kernel: &FixedKernel, _in_w: usize) -> Self {
+        Self::Portable
+    }
+
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass;
+    /// the vector arm detects its feature and calls in one place, as the
+    /// crate's NEON kernels and the FMA pass keep them.
+    #[cfg_attr(
+        target_arch = "x86_64",
+        expect(
+            unsafe_code,
+            reason = "the target-feature function runs only after this function detected its feature"
+        )
+    )]
+    fn rows<const C: usize>(
+        &self,
+        src: &[u8],
+        kernel: &FixedKernel,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
+        match self {
+            Self::Portable => pil_h_band::<C>(src, kernel, in_w, out_w, y0, band),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2(padded) => {
+                if !std::arch::is_x86_feature_detected!("avx2") {
+                    return pil_h_band::<C>(src, kernel, in_w, out_w, y0, band);
+                }
+                // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
+                // above, the only requirement of a `target_feature(enable =
+                // "avx2")` function.
+                unsafe { avx2::h_band::<C>(src, kernel, padded, in_w, out_w, y0, band) }
+            }
+        }
+    }
+}
+
+/// The width pass's taps as [`avx2::h_band`] reads them: every output's
+/// taps zero-padded to `stride`, the longest window rounded up to eight, at
+/// `taps[x * stride..]`; and `vector_outputs`, how many leading outputs keep
+/// their padded window `x0..x0 + stride` inside the row. Windows start
+/// monotonically along the axis, so the outputs past that count are a
+/// suffix at the right edge, which take the per-output loop.
+#[cfg(target_arch = "x86_64")]
+struct PaddedTaps {
+    taps: Vec<i32>,
+    stride: usize,
+    vector_outputs: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PaddedTaps {
+    /// Taps per vector step: one 32-bit lane each.
+    const STEP: usize = 8;
+
+    fn new(kernel: &FixedKernel, in_w: usize) -> Self {
+        let longest = kernel.bounds.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let stride = longest.max(1).next_multiple_of(Self::STEP);
+        let mut taps = vec![0_i32; kernel.bounds.len() * stride];
+        for (padded, output_taps) in taps.chunks_exact_mut(stride).zip(&kernel.taps) {
+            padded[..output_taps.len()].copy_from_slice(output_taps);
+        }
+        let vector_outputs = kernel
+            .bounds
+            .iter()
+            .position(|&(x0, _)| x0 + stride > in_w)
+            .unwrap_or(kernel.bounds.len());
+        Self {
+            taps,
+            stride,
+            vector_outputs,
         }
     }
 }
 
 /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass: each
 /// output row sums its taps over whole source rows, one tap's row at a time,
-/// so the inner loop runs along the row.
+/// so the inner loop runs along the row. Inlined into its callers so that
+/// the loop compiles to the caller's instruction set ([`pil_v_rows`]'s AVX2
+/// arm).
+#[inline(always)]
 fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
     let half = kernel.half();
     let mut sums = vec![0_i32; row_len];
@@ -969,22 +1090,213 @@ fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band:
     }
 }
 
-/// Every row of `src` (`rows` rows of `in_w` interleaved RGB pixels)
-/// resampled along the width to `out_w` pixels; rows banded across the pool
-/// (an output row depends on its own input row alone, so the banding changes
-/// nothing).
-fn pil_resample_horizontal(
+/// [`pil_v_band`] on the AVX2 unit when the processor has one, the portable
+/// loop otherwise: the detection and the call sit in one function, as the
+/// crate's NEON kernels and the FMA pass keep them.
+#[cfg(target_arch = "x86_64")]
+#[expect(
+    unsafe_code,
+    reason = "the target-feature function runs only after this function detected its feature"
+)]
+fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return pil_v_band(src, kernel, row_len, y0, band);
+    }
+    // SAFETY: `is_x86_feature_detected!("avx2")` answered true just above, the
+    // only requirement of a `target_feature(enable = "avx2")` function.
+    unsafe { avx2::v_band(src, kernel, row_len, y0, band) }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
+    pil_v_band(src, kernel, row_len, y0, band);
+}
+
+/// The Pillow-exact passes compiled for AVX2, the vector arms of
+/// [`WidthPass`] and [`pil_v_rows`]: the same 32-bit integer arithmetic as
+/// the portable passes, eight lanes at a time. Integer sums are the same in
+/// any order, so the bytes are those of the portable passes and of Pillow.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_add_epi32, _mm256_blend_epi32, _mm256_castsi256_si128,
+        _mm256_cvtepu8_epi32, _mm256_extracti128_si256, _mm256_mullo_epi32,
+        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_setr_epi32,
+        _mm256_setzero_si256, _mm256_zextsi128_si256, _mm_add_epi32, _mm_cvtsi128_si32,
+        _mm_cvtsi32_si128, _mm_cvtsi64_si128, _mm_packs_epi32, _mm_packus_epi16, _mm_set1_epi32,
+        _mm_setzero_si128, _mm_sra_epi32,
+    };
+
+    use super::{pil_h_outputs, pil_v_band, FixedKernel, PaddedTaps};
+
+    /// Lane `l` of the `q`th eight-byte group of a chunk of eight
+    /// `C`-channel source pixels holds pixel `(8q + l) / C`, so multiplies
+    /// that pixel's tap: the lane indices that spread the chunk's eight taps
+    /// over the group.
+    const fn tap_lanes<const C: usize>(q: usize) -> [i32; 8] {
+        let mut lanes = [0_i32; 8];
+        let mut l = 0;
+        while l < 8 {
+            lanes[l] = ((8 * q + l) / C) as i32;
+            l += 1;
+        }
+        lanes
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn lanes(values: [i32; 8]) -> __m256i {
+        _mm256_setr_epi32(
+            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
+        )
+    }
+
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass.
+    /// Per output, the padded taps go eight at a time against the eight
+    /// source pixels they weigh: each eight-byte group of those pixels' `8C`
+    /// bytes multiplies, by the taps spread to its lanes, into an accumulator
+    /// of its own, `C` of them, and `channel_sums` gathers the channel totals
+    /// at the end. The outputs whose padded window would cross the row's end
+    /// take the per-output loop.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn h_band<const C: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        padded: &PaddedTaps,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
+        let row_in = in_w * C;
+        let stride = padded.stride;
+        let spreads: [__m256i; C] = std::array::from_fn(|q| lanes(tap_lanes::<C>(q)));
+        for (i, out_row) in band.chunks_exact_mut(out_w * C).enumerate() {
+            let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
+            let (vector, rest) = out_row.split_at_mut(padded.vector_outputs * C);
+            for ((out, &(x0, _)), taps) in vector
+                .as_chunks_mut::<C>()
+                .0
+                .iter_mut()
+                .zip(&kernel.bounds)
+                .zip(padded.taps.chunks_exact(stride))
+            {
+                let mut sums = [_mm256_setzero_si256(); C];
+                let groups = row[x0 * C..(x0 + stride) * C].as_chunks::<8>().0;
+                for (eight, groups) in taps
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .zip(groups.as_chunks::<C>().0)
+                {
+                    let eight = lanes(*eight);
+                    for ((sum, group), spread) in sums.iter_mut().zip(groups).zip(&spreads) {
+                        let pixels =
+                            _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(i64::from_le_bytes(*group)));
+                        let taps = _mm256_permutevar8x32_epi32(eight, *spread);
+                        *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(pixels, taps));
+                    }
+                }
+                *out = clipped::<C>(channel_sums::<C>(&sums), kernel);
+            }
+            pil_h_outputs::<C>(row, kernel, padded.vector_outputs, rest);
+        }
+    }
+
+    /// The `C` channel sums of an output pixel in the low `C` lanes, from
+    /// the accumulators of its eight-byte groups: lane `l` of accumulator
+    /// `q` holds channel `(8q + l) % C`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn channel_sums<const C: usize>(sums: &[__m256i; C]) -> __m128i {
+        const {
+            assert!(
+                C == 3 || C == 4,
+                "the width pass spreads three or four channels"
+            );
+        }
+        match sums.as_slice() {
+            [a, b, c] => {
+                // Twenty-four lanes whose channel is the lane's index modulo
+                // three. Lanes 12.. fold onto lanes 0.. (twelve is a multiple
+                // of three): `x` is lanes 0..8 of the fold, channels
+                // 0,1,2,0,1,2,0,1; `y` lanes 8..12, channels 2,0,1,2. Then
+                // channel 0 is x0 + x3 + x6 + y1, channel 1 x1 + x4 + x7 + y2
+                // and channel 2 x2 + x5 + y3 + y0.
+                let x = _mm256_add_epi32(*a, _mm256_permute2x128_si256::<0x21>(*b, *c));
+                let y = _mm256_zextsi128_si256(_mm_add_epi32(
+                    _mm256_castsi256_si128(*b),
+                    _mm256_extracti128_si256::<1>(*c),
+                ));
+                let second = _mm256_permutevar8x32_epi32(x, lanes([3, 4, 5, 0, 0, 0, 0, 0]));
+                let third = _mm256_blend_epi32::<0b0000_0100>(
+                    _mm256_permutevar8x32_epi32(x, lanes([6, 7, 0, 0, 0, 0, 0, 0])),
+                    _mm256_permutevar8x32_epi32(y, lanes([0, 0, 3, 0, 0, 0, 0, 0])),
+                );
+                let fourth = _mm256_permutevar8x32_epi32(y, lanes([1, 2, 0, 0, 0, 0, 0, 0]));
+                _mm256_castsi256_si128(_mm256_add_epi32(
+                    _mm256_add_epi32(x, second),
+                    _mm256_add_epi32(third, fourth),
+                ))
+            }
+            [a, b, c, d] => {
+                // Thirty-two lanes whose channel is the lane's index modulo
+                // four: the four accumulators share one lane order, and the
+                // high half of their sum folds onto the low half.
+                let s = _mm256_add_epi32(_mm256_add_epi32(*a, *b), _mm256_add_epi32(*c, *d));
+                _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s))
+            }
+            // Excluded by the assertion above.
+            _ => _mm_setzero_si128(),
+        }
+    }
+
+    /// `kernel.clip8(half + sum)` of the low `C` lanes, as bytes.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn clipped<const C: usize>(sums: __m128i, kernel: &FixedKernel) -> [u8; C] {
+        let shifted = _mm_sra_epi32(
+            _mm_add_epi32(sums, _mm_set1_epi32(kernel.half())),
+            _mm_cvtsi32_si128(kernel.precision as i32),
+        );
+        // Both packs saturate: `i32 -> i16` keeps the shifted sums (below 2^10
+        // in magnitude), `i16 -> u8` is the clamp to a byte.
+        let bytes = _mm_packus_epi16(_mm_packs_epi32(shifted, shifted), _mm_setzero_si128());
+        let bytes = _mm_cvtsi128_si32(bytes).to_le_bytes();
+        std::array::from_fn(|channel| bytes[channel])
+    }
+
+    /// [`pil_v_band`] compiled for AVX2: its row-long inner loops run eight
+    /// lanes wide.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn v_band(
+        src: &[u8],
+        kernel: &FixedKernel,
+        row_len: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
+        pil_v_band(src, kernel, row_len, y0, band);
+    }
+}
+
+/// Every row of `src` (`rows` rows of `in_w` interleaved pixels of `C`
+/// channels) resampled along the width to `out_w` pixels; rows banded across
+/// the pool (an output row depends on its own input row alone, so the banding
+/// changes nothing).
+fn pil_resample_horizontal<const C: usize>(
     src: &[u8],
     rows: usize,
     in_w: usize,
     out_w: usize,
     kernel: &FixedKernel,
 ) -> Vec<u8> {
-    let row_out = out_w * 3;
+    let row_out = out_w * C;
     let mut out = vec![0_u8; rows * row_out];
+    let pass = &WidthPass::new(kernel, in_w);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
-        pil_h_band(src, kernel, in_w, out_w, 0, &mut out);
+        pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
         return out;
     }
     let band_rows = rows.div_ceil(tasks);
@@ -996,21 +1308,26 @@ fn pil_resample_horizontal(
             let (band, tail) = rest.split_at_mut(n * row_out);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pil_h_band(src, kernel, in_w, out_w, start, band));
+            scope.spawn(move |_| pass.rows::<C>(src, kernel, in_w, out_w, start, band));
             y0 += n;
         }
     });
     out
 }
 
-/// `src` (rows of `width` interleaved RGB pixels) resampled along the height
-/// to `out_h` rows; rows banded across the pool.
-fn pil_resample_vertical(src: &[u8], out_h: usize, width: usize, kernel: &FixedKernel) -> Vec<u8> {
-    let row_len = width * 3;
+/// `src` (rows of `width` interleaved pixels of `C` channels) resampled along
+/// the height to `out_h` rows; rows banded across the pool.
+fn pil_resample_vertical<const C: usize>(
+    src: &[u8],
+    out_h: usize,
+    width: usize,
+    kernel: &FixedKernel,
+) -> Vec<u8> {
+    let row_len = width * C;
     let mut out = vec![0_u8; out_h * row_len];
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
-        pil_v_band(src, kernel, row_len, 0, &mut out);
+        pil_v_rows(src, kernel, row_len, 0, &mut out);
         return out;
     }
     let band_rows = out_h.div_ceil(tasks);
@@ -1022,7 +1339,7 @@ fn pil_resample_vertical(src: &[u8], out_h: usize, width: usize, kernel: &FixedK
             let (band, tail) = rest.split_at_mut(n * row_len);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pil_v_band(src, kernel, row_len, start, band));
+            scope.spawn(move |_| pil_v_rows(src, kernel, row_len, start, band));
             y0 += n;
         }
     });
@@ -1034,7 +1351,7 @@ fn pil_resample_vertical(src: &[u8], out_h: usize, width: usize, kernel: &FixedK
 pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
     let rgb = image.to_rgb8();
     let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes(
+    let output = resize_pil_bytes::<3>(
         rgb.as_raw(),
         in_w,
         in_h,
@@ -1077,7 +1394,7 @@ pub fn resize_bicubic_pil_rgb(
             "PIL bicubic RGB target {out_w}x{out_h} must be non-empty"
         )));
     }
-    let output = resize_pil_bytes(
+    let output = resize_pil_bytes::<3>(
         data,
         width,
         height,
@@ -1098,7 +1415,7 @@ pub fn resize_bicubic_pil_rgb(
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
     let rgb = image.to_rgb8();
     let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes(
+    let output = resize_pil_bytes::<3>(
         rgb.as_raw(),
         in_w,
         in_h,
@@ -1116,11 +1433,12 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
     )
 }
 
-/// `data` (`in_w` x `in_h` interleaved RGB) resampled to `out_w` x `out_h`
-/// with `filter`'s kernel in `quantization`: the width pass first, then the
-/// height pass, each skipped on an axis that keeps its size (Pillow's own
-/// order and skips).
-fn resize_pil_bytes(
+/// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
+/// `out_w` x `out_h` with `filter`'s kernel in `quantization`: the width pass
+/// first, then the height pass, each skipped on an axis that keeps its size
+/// (Pillow's own order and skips). `C` is 3 or 4, the channel counts the
+/// vector arms' lane folds spread; the rule holds on every platform.
+fn resize_pil_bytes<const C: usize>(
     data: &[u8],
     in_w: u32,
     in_h: u32,
@@ -1129,6 +1447,12 @@ fn resize_pil_bytes(
     filter: PilResizeFilter,
     quantization: KernelQuantization,
 ) -> Vec<u8> {
+    const {
+        assert!(
+            C == 3 || C == 4,
+            "the Pillow-exact resample takes three or four channels"
+        );
+    }
     let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
     if out_w == 0 || out_h == 0 {
         // A zero-sized target has no pixels; the band resamplers would panic
@@ -1141,15 +1465,15 @@ fn resize_pil_bytes(
         data.to_vec()
     } else if in_w == out_w {
         let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
-        pil_resample_vertical(data, out_h, in_w, &kernel)
+        pil_resample_vertical::<C>(data, out_h, in_w, &kernel)
     } else {
         let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
-        let horizontal = pil_resample_horizontal(data, in_h, in_w, out_w, &kernel);
+        let horizontal = pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel);
         if in_h == out_h {
             horizontal
         } else {
             let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
-            pil_resample_vertical(&horizontal, out_h, out_w, &kernel)
+            pil_resample_vertical::<C>(&horizontal, out_h, out_w, &kernel)
         }
     }
 }
@@ -1617,7 +1941,7 @@ pub fn pad_to_size_pil_rgb(
         )));
     }
 
-    let resized = resize_pil_bytes(
+    let resized = resize_pil_bytes::<3>(
         data,
         w,
         h,
@@ -1959,55 +2283,131 @@ mod tests {
         );
     }
 
-    /// Up- and downscales, identity axes, extreme aspects, row lengths that
-    /// leave vector tails and a large image, bicubic and Lanczos: every byte
-    /// of the 32-bit passes equals the per-sample `i64` computation.
+    /// The passes' parity cases: up- and downscales, identity axes, extreme
+    /// aspects, row lengths that leave vector tails, a large image, and the
+    /// vector width pass's edges (an axis shorter than one padded window,
+    /// windows of eight, nine and seven taps, a window of one tap past a
+    /// multiple of eight, a downscale by 154 whose padded windows run
+    /// hundreds of source pixels).
+    const PIL_PASS_CASES: [(usize, usize, usize, usize); 19] = [
+        (37, 23, 64, 32),
+        (259, 194, 256, 192),
+        (640, 480, 320, 224),
+        (100, 20, 32, 32),
+        (20, 100, 32, 32),
+        (113, 97, 112, 96),
+        (7, 5, 33, 17),
+        (33, 17, 7, 5),
+        (31, 23, 31, 17),
+        (31, 23, 19, 23),
+        (1, 1, 5, 3),
+        (5, 3, 1, 1),
+        (1296, 972, 1036, 777),
+        (64, 5, 8, 5),
+        (64, 5, 9, 5),
+        (64, 5, 7, 5),
+        (5, 3, 40, 3),
+        (300, 4, 97, 4),
+        (2000, 3, 13, 3),
+    ];
+
+    /// `w` by `h` four-channel bytes that vary with the position and `seed`.
+    fn gradient_rgba(w: usize, h: usize, seed: usize) -> Vec<u8> {
+        gradient_rgb(w, h, seed)
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &[r, g, b])| [r, g, b, ((seed + i * 37) % 256) as u8])
+            .collect()
+    }
+
+    /// Every byte of the 32-bit passes, three and four channels, bicubic and
+    /// Lanczos, over [`PIL_PASS_CASES`], equals the per-sample `i64`
+    /// computation.
     #[test]
     fn pil_passes_equal_the_per_sample_i64_reference() {
-        let cases = [
-            (37, 23, 64, 32),
-            (259, 194, 256, 192),
-            (640, 480, 320, 224),
-            (100, 20, 32, 32),
-            (20, 100, 32, 32),
-            (113, 97, 112, 96),
-            (7, 5, 33, 17),
-            (33, 17, 7, 5),
-            (31, 23, 31, 17),
-            (31, 23, 19, 23),
-            (1, 1, 5, 3),
-            (5, 3, 1, 1),
-            (1296, 972, 1036, 777),
-        ];
+        fn check<const C: usize>(
+            data: &[u8],
+            (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
+            filter: PilResizeFilter,
+            what: &str,
+        ) {
+            let actual = resize_pil_bytes::<C>(
+                data,
+                in_w as u32,
+                in_h as u32,
+                out_w as u32,
+                out_h as u32,
+                filter,
+                KernelQuantization::Pillow,
+            );
+            let expected = per_sample_reference_channels::<C>(
+                data,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                filter,
+                KernelQuantization::Pillow,
+            );
+            assert_same_bytes(&actual, &expected, &format!("{C} channels, {what}"));
+        }
         for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
             .into_iter()
             .enumerate()
         {
-            for (seed, &(in_w, in_h, out_w, out_h)) in cases.iter().enumerate() {
-                let data = gradient_rgb(in_w, in_h, seed * 13 + f * 101);
-                let actual = resize_pil_bytes(
-                    &data,
-                    in_w as u32,
-                    in_h as u32,
-                    out_w as u32,
-                    out_h as u32,
-                    filter,
-                    KernelQuantization::Pillow,
-                );
-                let expected = per_sample_reference(
-                    &data,
-                    in_w,
-                    in_h,
-                    out_w,
-                    out_h,
-                    filter,
-                    KernelQuantization::Pillow,
-                );
-                assert_same_bytes(
-                    &actual,
-                    &expected,
-                    &format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}"),
-                );
+            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                let (in_w, in_h, out_w, out_h) = case;
+                let seed = seed * 13 + f * 101;
+                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
+                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
+                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
+            }
+        }
+    }
+
+    /// The portable and the detected arms of the two passes write the same
+    /// bytes on every case, three and four channels (on a processor without
+    /// the vector unit both arms are the portable loop).
+    #[test]
+    fn pil_pass_arms_agree() {
+        fn check<const C: usize>(
+            data: &[u8],
+            (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
+            filter: PilResizeFilter,
+            what: &str,
+        ) {
+            let kernel = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
+            let mut portable = vec![0_u8; in_h * out_w * C];
+            WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
+            let mut detected = vec![0_u8; in_h * out_w * C];
+            WidthPass::new(&kernel, in_w).rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+            assert_same_bytes(
+                &detected,
+                &portable,
+                &format!("width pass, {C} channels, {what}"),
+            );
+            let kernel = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
+            let mut portable_rows = vec![0_u8; out_h * out_w * C];
+            pil_v_band(&portable, &kernel, out_w * C, 0, &mut portable_rows);
+            let mut detected_rows = vec![0_u8; out_h * out_w * C];
+            pil_v_rows(&portable, &kernel, out_w * C, 0, &mut detected_rows);
+            assert_same_bytes(
+                &detected_rows,
+                &portable_rows,
+                &format!("height pass, {C} channels, {what}"),
+            );
+        }
+        for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
+            .into_iter()
+            .enumerate()
+        {
+            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                let (in_w, in_h, out_w, out_h) = case;
+                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
+                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
+                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
             }
         }
     }
@@ -2127,7 +2527,7 @@ mod tests {
                 PilResizeFilter::Bicubic,
                 KernelQuantization::Pillow,
             );
-            let horizontal = pil_resample_horizontal(
+            let horizontal = pil_resample_horizontal::<3>(
                 &data,
                 src_h as usize,
                 src_w as usize,
@@ -2140,7 +2540,7 @@ mod tests {
                 PilResizeFilter::Bicubic,
                 KernelQuantization::Pillow,
             );
-            let expected = pil_resample_vertical(
+            let expected = pil_resample_vertical::<3>(
                 &horizontal,
                 out_h as usize,
                 out_w as usize,
