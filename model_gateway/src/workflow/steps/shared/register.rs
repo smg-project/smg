@@ -119,6 +119,18 @@ fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -
     groups
 }
 
+/// The models a registration of `workers` moves workers off: the model of
+/// each worker it replaces at the same URL with a worker of another model.
+fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> Vec<String> {
+    workers
+        .iter()
+        .filter_map(|worker| {
+            let replaced = registry.get_by_url(worker.url())?;
+            (replaced.model_id() != worker.model_id()).then(|| replaced.model_id().to_string())
+        })
+        .collect()
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
@@ -142,6 +154,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // worker's group must refresh the group it leaves as well as the one
         // it joins, and only the registry as it is now knows the former.
         let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+        let left_models = models_left(&app_context.worker_registry, workers);
 
         for worker in workers {
             let worker_id = register_worker(
@@ -208,6 +221,15 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // Update Layer 3 worker pool size metrics per unique
         // `(worker_type, connection_mode, model_id)` the registration touched.
         refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
+
+        // A replacement that moved a worker to another model takes the old
+        // model's policy with it when no worker of this node serves that
+        // model any more, as the worker's removal would.
+        for model_id in &left_models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
+        }
 
         // WorkerMonitor subscribes to registry events directly (see
         // `worker::monitor::WorkerMonitor::start_event_loop`), so this

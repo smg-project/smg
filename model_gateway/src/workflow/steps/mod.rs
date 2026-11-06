@@ -301,6 +301,9 @@ pub fn create_worker_workflow_data(
 }
 
 #[cfg(test)]
+mod policy_lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::RouterConfig;

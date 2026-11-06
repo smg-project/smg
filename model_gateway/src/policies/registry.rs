@@ -130,9 +130,6 @@ pub struct PolicyRegistry {
     /// the bits that addition published.
     text_needs_refresh: Arc<Mutex<()>>,
 
-    /// Model ID -> Worker count for cleanup tracking (lock-free reads via DashMap)
-    model_worker_counts: Arc<DashMap<String, usize>>,
-
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
 
@@ -247,7 +244,6 @@ impl PolicyRegistry {
             model_policies: Arc::new(DashMap::new()),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
-            model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
             default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
@@ -618,8 +614,6 @@ impl PolicyRegistry {
         }
     }
 
-    /// Called when a worker is added
-    /// Returns the policy that should be used for this worker's model
     /// The request-completion observer to install on every worker (see
     /// [`RequestCompletionSink`]): policies that book state at dispatch
     /// release it when the request's load guard drops.
@@ -651,20 +645,16 @@ impl PolicyRegistry {
             .reconcile_in_flight(worker.url(), worker.load());
     }
 
+    /// The policy for `model_id`'s requests: built for the model's first
+    /// worker (from `policy_hint`, its `policy` label) and returned as it is
+    /// for every later one, until no worker of this node serves the model
+    /// ([`Self::on_model_unserved`]). Registering, replacing or updating a
+    /// worker of the model calls this as often as it likes.
     pub fn on_worker_added(
         &self,
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        // Increment worker count using DashMap entry API
-        let count = self
-            .model_worker_counts
-            .entry(model_id.to_string())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-        debug!("Worker added for model {}, count: {}", model_id, *count);
-        drop(count); // Release the entry lock
-
         // Check if model already has a policy (lock-free read via DashMap)
         if let Some(existing_policy) = self.model_policies.get(model_id) {
             debug!(
@@ -713,41 +703,18 @@ impl PolicyRegistry {
         publish();
     }
 
-    /// Called when a worker is removed
-    pub fn on_worker_removed(&self, model_id: &str) {
-        // Decrement worker count and check if cleanup needed
-        let should_cleanup = if let Some(mut count_ref) = self.model_worker_counts.get_mut(model_id)
-        {
-            *count_ref = count_ref.saturating_sub(1);
-            debug!(
-                "Worker removed for model {}, count: {}",
-                model_id, *count_ref
-            );
-            if *count_ref == 0 {
-                drop(count_ref); // Release before remove
-                self.model_worker_counts.remove(model_id);
-                true
-            } else {
-                false
-            }
-        } else {
-            warn!(
-                "Attempted to remove worker for model {} with no registered workers",
+    /// Called once no worker of this node serves `model_id` any more (see
+    /// `WorkerRegistry::serves_model_locally`): the model's policy goes with
+    /// its last worker, so a later registration builds the policy its own
+    /// labels name.
+    pub fn on_model_unserved(&self, model_id: &str) {
+        if let Some((_, policy)) = self.model_policies.remove(model_id) {
+            info!(
+                "Removed policy {} for model {} (no worker of this node serves it)",
+                policy.name(),
                 model_id
             );
-            false
-        };
-
-        // Clean up policy if this was the last worker
-        if should_cleanup {
-            if let Some((_, policy)) = self.model_policies.remove(model_id) {
-                info!(
-                    "Removed policy {} for model {} (last worker removed)",
-                    policy.name(),
-                    model_id
-                );
-                self.refresh_text_needs();
-            }
+            self.refresh_text_needs();
         }
     }
 
@@ -858,18 +825,9 @@ impl PolicyRegistry {
             .collect()
     }
 
-    /// Get worker counts per model
-    pub fn get_worker_counts(&self) -> HashMap<String, usize> {
-        self.model_worker_counts
-            .iter()
-            .map(|entry| (entry.key().clone(), *entry.value()))
-            .collect()
-    }
-
     /// Clear all policies (useful for testing)
     pub fn clear(&self) {
         self.model_policies.clear();
-        self.model_worker_counts.clear();
         self.refresh_text_needs();
     }
 
@@ -1146,7 +1104,6 @@ impl std::fmt::Debug for PolicyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyRegistry")
             .field("model_policies", &self.model_policies)
-            .field("model_worker_counts", &self.model_worker_counts)
             .field("default_policy", &self.default_policy.name())
             .field(
                 "text_needs",
@@ -1415,11 +1372,9 @@ mod tests {
         reg.on_worker_added("affine", Some("cache_aware"));
         reg.on_worker_added("affine", Some("cache_aware"));
         assert!(reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("affine");
-        assert!(reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("affine");
+        reg.on_model_unserved("affine");
         assert!(!reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("plain");
+        reg.on_model_unserved("plain");
         assert!(!reg.any_policy_needs_request_text(None));
 
         reg.on_worker_added("affine", Some("cache_aware"));
@@ -2205,31 +2160,25 @@ mod tests {
         let mappings = registry.get_all_mappings();
         assert_eq!(mappings.get("llama-3").unwrap(), "cache_aware");
         assert_eq!(mappings.get("gpt-4").unwrap(), "random");
-
-        // Check worker counts
-        let counts = registry.get_worker_counts();
-        assert_eq!(*counts.get("llama-3").unwrap(), 2);
-        assert_eq!(*counts.get("gpt-4").unwrap(), 1);
     }
 
     #[test]
     fn test_policy_registry_cleanup() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
-        // Add workers
+        // A model's policy outlives any number of adds: a replacement or an
+        // update of a worker adds again.
         registry.on_worker_added("llama-3", Some("cache_aware"));
         registry.on_worker_added("llama-3", None);
-        assert_eq!(registry.get_worker_counts().get("llama-3"), Some(&2));
-
-        // Remove one worker - policy should remain
-        registry.on_worker_removed("llama-3");
+        registry.on_worker_added("llama-3", None);
         assert!(registry.get_policy("llama-3").is_some());
-        assert_eq!(registry.get_worker_counts().get("llama-3"), Some(&1));
 
-        // Remove last worker - policy should be cleaned up
-        registry.on_worker_removed("llama-3");
+        // It goes once no worker serves the model, and the next first
+        // worker's hint builds the next one.
+        registry.on_model_unserved("llama-3");
         assert!(registry.get_policy("llama-3").is_none());
-        assert_eq!(registry.get_worker_counts().get("llama-3"), None);
+        let policy = registry.on_worker_added("llama-3", Some("round_robin"));
+        assert_eq!(policy.name(), "round_robin");
     }
 
     /// A policy shared between slots is visited once: a model with no hint
