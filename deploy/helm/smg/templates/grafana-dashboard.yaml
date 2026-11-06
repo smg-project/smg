@@ -232,6 +232,7 @@ data:
               "legendFormat": "p99"
             }
           ],
+          "description": "The gRPC router's streamed answers alone, across models: the HTTP router records none, and a collected answer records no first token (nor does a streamed Responses answer on the Harmony pipeline). This p99 combines the selected namespaces and jobs; the SmgTtftP99High alert evaluates each namespace and job on its own and fires when its p99 stays above prometheusRule.alerts.ttftP99Seconds for ttftP99For.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -255,6 +256,7 @@ data:
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
+          "description": "The gRPC router's streamed answers alone: the HTTP router records none, and a collected answer records no first token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -286,6 +288,7 @@ data:
               "legendFormat": "p99"
             }
           ],
+          "description": "The gRPC router's streamed answers alone, across models: the HTTP router records none, and a collected answer records no first token and so no time per output token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -309,6 +312,7 @@ data:
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
+          "description": "The gRPC router's streamed answers alone: the HTTP router records none, and a collected answer records no first token and so no time per output token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"

@@ -737,22 +737,26 @@ pub(crate) fn init_metrics() {
         "Per-request body-path decisions by path (streamed/buffered) and dominant reason"
     );
 
-    // Layer 2: Router inference metrics (gRPC only)
+    // Layer 2: Router inference metrics (gRPC only). The first-token and
+    // per-token families hold streamed answers alone: a collected answer is
+    // built from the drained stream and sees no first token, and a streamed
+    // Responses answer on the Harmony pipeline records only the prefill-decode
+    // first-token pair, none of these four.
     describe_histogram!(
         "smg_router_ttft_seconds",
-        "Time to first token by router_type, backend_type, model, endpoint (gRPC only)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline)"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
-        "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
+        "Time per output token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no time per token)"
     );
     describe_histogram!(
         TIME_TO_FIRST_TOKEN_SECONDS,
-        "Time to first token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
     );
     describe_histogram!(
         REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
-        "Per-request mean time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
+        "Per-request mean time per output token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no time per token): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
     );
     describe_counter!(
         "smg_router_tokens_total",
