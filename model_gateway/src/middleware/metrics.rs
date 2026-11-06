@@ -1262,6 +1262,35 @@ mod client_closed_tests {
         );
     }
 
+    /// The layers inside read the stamp from their `call`s, before their
+    /// futures run (the access log does): this layer calls the inner service
+    /// under the stamp's scope, not only the future it returns.
+    #[tokio::test]
+    async fn the_inner_service_s_call_runs_inside_the_entry_stamp_s_scope() {
+        let seen = Arc::new(Mutex::new(None));
+        let inner = tower::service_fn({
+            let seen = Arc::clone(&seen);
+            move |_request: Request<Body>| {
+                *seen.lock().expect("the slot") = Some(RequestStarted::current().is_some());
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }
+        });
+        let mut layered = HttpMetricsLayer::new(InFlightRequestTracker::new()).layer(inner);
+        let response = layered
+            .ready()
+            .await
+            .expect("ready")
+            .call(request("/scoped"))
+            .await
+            .expect("response");
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(
+            *seen.lock().expect("the slot"),
+            Some(true),
+            "the inner service's call ran inside the entry stamp's scope"
+        );
+    }
+
     /// The layer reads the clock once at the request's entry and shares the
     /// stamp: the handler finds it in the request's scope, and the
     /// request's duration runs from it to the head, on the runtime's clock.
