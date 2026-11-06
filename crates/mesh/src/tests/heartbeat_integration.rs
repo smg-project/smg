@@ -23,7 +23,7 @@ async fn heartbeats_do_not_echo_and_keep_an_idle_stream_open() {
         msg
     });
     let inbound = client.sync_stream(outbound).await.unwrap().into_inner();
-    let dialer = GossipController::new(Arc::default(), addr, "A", None, Dialer::new(None));
+    let dialer = GossipController::new(Arc::default(), addr, "A", Vec::new(), Dialer::new(None));
     let handler = dialer.spawn_sync_stream_handler(inbound, tx, "A".into(), "B".into());
 
     // Observe beyond the idle timeout on the same connection. An echo arrives
