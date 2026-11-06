@@ -443,6 +443,36 @@ mod tests {
         }))
     }
 
+    /// `count` fetchable parts of `modality`.
+    fn media_urls(modality: Modality, count: usize) -> MediaPlan {
+        match modality {
+            Modality::Video => MediaPlan::new((0..count).map(|i| MediaContentPart::VideoUrl {
+                url: format!("https://example.com/{i}.mp4"),
+                uuid: None,
+                fps: None,
+                max_long_side_pixel: None,
+            })),
+            Modality::Audio => MediaPlan::new((0..count).map(|i| MediaContentPart::AudioUrl {
+                url: format!("https://example.com/{i}.wav"),
+                uuid: None,
+            })),
+            Modality::Image | Modality::ImageEmbeds => image_urls(count),
+        }
+    }
+
+    /// A three-modality checkpoint's config, its token ids nested as the
+    /// family's checkpoints nest them.
+    fn omni_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_omni_moe",
+            "thinker_config": {
+                "audio_token_id": 151675,
+                "image_token_id": 151655,
+                "video_token_id": 151656
+            }
+        })
+    }
+
     /// The limit the model's workers advertise for their engine refuses a plan
     /// above it before any placeholder work, naming the limit and the engine's
     /// knob; without one the same plan goes on into the spec's own resolution.
@@ -554,6 +584,7 @@ mod tests {
                 163605,
                 serde_json::json!({"model_type": "kimi_k3", "media_placeholder_token_id": 163605}),
             ),
+            ("org/qwen3-omni", "<|image_pad|>", 151655, omni_config()),
         ];
         let plan = image_urls(11);
         for (model_id, placeholder, token_id, config) in families {
@@ -624,6 +655,185 @@ mod tests {
             assert!(
                 error.contains("limit of 8") && error.contains("the engine's"),
                 "{model_id}: {error}"
+            );
+        }
+    }
+
+    /// The specs that declare video or audio without a count of their own
+    /// leave the bound to the engine's advertised limit and the router's
+    /// environment override: for each family and modality, with neither a
+    /// request above the count the spec used to declare goes through and
+    /// resolves the family's placeholder, and the override and the engine's
+    /// limit still refuse it, each naming itself.
+    #[tokio::test]
+    async fn the_specs_without_a_video_or_audio_count_of_their_own_leave_the_bound_to_the_engine_and_the_env(
+    ) {
+        let rows = [
+            (
+                "org/qwen3-vl",
+                Modality::Video,
+                "<|video_pad|>",
+                151656,
+                serde_json::json!({
+                    "model_type": "qwen3_vl",
+                    "image_token_id": 151655,
+                    "video_token_id": 151656
+                }),
+                1,
+            ),
+            (
+                "org/qwen2.5-vl",
+                Modality::Video,
+                "<|video_pad|>",
+                151656,
+                serde_json::json!({
+                    "model_type": "qwen2_5_vl",
+                    "image_token_id": 151655,
+                    "video_token_id": 151656
+                }),
+                1,
+            ),
+            (
+                "org/muse-spark",
+                Modality::Video,
+                "<|video|>",
+                200091,
+                serde_json::json!({
+                    "model_type": "muse_spark",
+                    "image_token_id": 200092,
+                    "video_token_id": 200091
+                }),
+                1,
+            ),
+            (
+                "org/muse-spark",
+                Modality::Audio,
+                "<|audio|>",
+                200038,
+                serde_json::json!({
+                    "model_type": "muse_spark",
+                    "image_token_id": 200092,
+                    "audio_token_id": 200038,
+                    "audio_config": {"model_type": "muse_spark_audio", "patch_sizes": [16, 6, 5, 4]}
+                }),
+                10,
+            ),
+            (
+                "org/inkling",
+                Modality::Audio,
+                "<|unused_200053|>",
+                200053,
+                serde_json::json!({
+                    "model_type": "inkling_mm_model",
+                    "audio_config": {"decoder_dmodel": 6144}
+                }),
+                10,
+            ),
+            (
+                "org/qwen3-omni",
+                Modality::Video,
+                "<|video_pad|>",
+                151656,
+                omni_config(),
+                1,
+            ),
+            (
+                "org/qwen3-omni",
+                Modality::Audio,
+                "<|audio_pad|>",
+                151675,
+                omni_config(),
+                10,
+            ),
+            (
+                "org/qwen3-asr",
+                Modality::Audio,
+                "<|audio_pad|>",
+                151676,
+                serde_json::json!({
+                    "model_type": "qwen3_asr",
+                    "thinker_config": {"audio_token_id": 151676}
+                }),
+                10,
+            ),
+        ];
+        for (model_id, modality, placeholder, token_id, config, cap) in rows {
+            let registry = Arc::new(MultimodalConfigRegistry::new());
+            registry.insert(
+                "tok".to_string(),
+                Arc::new(MultimodalModelConfig::new(
+                    config,
+                    PreProcessorConfig::default(),
+                    None,
+                )),
+            );
+            let tokenizer = MockTokenizer::new().with_tokens(&[(placeholder, token_id)]);
+            let components =
+                MultimodalComponents::new(registry, None, None, &MultimodalSettings::default())
+                    .unwrap();
+            let plan = media_urls(modality, cap + 1);
+            // `env` stands in for the modality's `SMG_<MODALITY>_MAX_COUNT`.
+            let prepare = |env: Option<usize>, engine: HashMap<Modality, EngineItemLimit>| {
+                let plan = &plan;
+                let tokenizer = &tokenizer;
+                let components = &components;
+                async move {
+                    prepare_placeholder_tokens_with_env(
+                        plan,
+                        model_id,
+                        tokenizer,
+                        components,
+                        "tok",
+                        "unused",
+                        &engine,
+                        |_| true,
+                        move |requested| if requested == modality { env } else { None },
+                    )
+                    .await
+                }
+            };
+
+            let placeholders = prepare(None, HashMap::new()).await.unwrap_or_else(|error| {
+                panic!("{model_id} {modality}: no engine limit and no override: {error}")
+            });
+            assert_eq!(
+                placeholders.get(modality),
+                Some(placeholder),
+                "{model_id} {modality}"
+            );
+
+            let error = prepare(Some(cap), HashMap::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            let variable = format!(
+                "SMG_{}_MAX_COUNT",
+                modality.to_string().to_ascii_uppercase()
+            );
+            assert!(
+                error.contains(&format!("{} {modality} items", cap + 1))
+                    && error.contains(&format!("limit of {cap}"))
+                    && error.contains(&variable),
+                "{model_id} {modality}: {error}"
+            );
+
+            // The engine whose servicer advertises this modality's limit.
+            let runtime = if modality == Modality::Audio {
+                RuntimeType::Sglang
+            } else {
+                RuntimeType::Vllm
+            };
+            let engine = HashMap::from([(
+                modality,
+                EngineItemLimit {
+                    limit: cap,
+                    runtime,
+                },
+            )]);
+            let error = prepare(None, engine).await.unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("limit of {cap}")) && error.contains("the engine's"),
+                "{model_id} {modality}: {error}"
             );
         }
     }
