@@ -85,7 +85,8 @@ const NO_RANK: u32 = u32::MAX;
 /// one pair in twenty that is no merge passes the filter (5.3 % measured on
 /// random pairs; the rounding of the word count up to a power of two gives
 /// up to sixteen bits per merge and a rate down to 2 %), in 64-512 KiB for
-/// the vocabularies in use (50k to 280k merges).
+/// the vocabularies in use (50k to 280k merges; a vocabulary built from token
+/// ranks is sized by its two-token splits and can take more).
 const PAIR_FILTER_BITS_PER_MERGE: usize = 8;
 /// The least words of the pair filter: 8 KiB for a small vocabulary.
 const PAIR_FILTER_MIN_WORDS: usize = 1024;
