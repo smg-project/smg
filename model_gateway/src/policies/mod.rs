@@ -106,6 +106,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether routing reads the model's KV-event index: a gRPC worker this
+    /// policy places streams its KV events into that index, where any other
+    /// streams its load records alone (see `UpdatePoliciesStep`). A
+    /// constant for the policy's lifetime.
+    fn needs_kv_events(&self) -> bool {
+        false
+    }
+
     /// Whether this policy weighs a worker's load against the cache it holds
     /// for the request and moves a request off a saturated holder itself
     /// (cache-aware's count-pressure spill). Disaggregated pair placement
