@@ -5,6 +5,8 @@
 //! of named fields, not a bag of server args: the width is
 //! `data_parallel_size`, a role is `kv_role` behind `kv_connector`), loads
 //! and KV-event subscription.
+//! The admin fan-out's flush and profile RPCs are answered by the core, the
+//! same on every wire.
 
 use std::pin::Pin;
 
@@ -96,21 +98,23 @@ impl VllmEngine for MockScheduler {
         &self,
         _request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(self.flush_cache_response()))
     }
 
     async fn start_profile(
         &self,
-        _request: Request<common::StartProfileRequest>,
+        request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(
+            self.start_profile_response(request.into_inner()),
+        ))
     }
 
     async fn stop_profile(
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        Ok(Response::new(self.stop_profile_response()))
     }
 
     async fn abort(
@@ -658,6 +662,57 @@ mod tests {
             (8, 4, "engine-a")
         );
         assert!(info.mm_device_do_normalize);
+    }
+
+    /// The admin fan-out's three RPCs on this wire call the core's answers:
+    /// the flush succeeds, a profiling run starts and stops with one trace
+    /// file in the requested directory, and a second stop is refused.
+    #[tokio::test]
+    async fn the_admin_fan_out_rpcs_answer_on_this_wire() {
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_208);
+        let flushed = VllmEngine::flush_cache(
+            &service,
+            Request::new(common::FlushCacheRequest { timeout_s: 0.0 }),
+        )
+        .await
+        .expect("flush")
+        .into_inner();
+        assert!(flushed.success, "{}", flushed.message);
+        assert!(
+            flushed.message.ends_with("cache cleared on 0 engine(s)"),
+            "{}",
+            flushed.message
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let started = VllmEngine::start_profile(
+            &service,
+            Request::new(common::StartProfileRequest {
+                output_dir: Some(traces.display().to_string()),
+                num_steps: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start")
+        .into_inner();
+        assert!(started.success, "{}", started.message);
+        let stopped =
+            VllmEngine::stop_profile(&service, Request::new(common::StopProfileRequest {}))
+                .await
+                .expect("stop")
+                .into_inner();
+        assert!(stopped.success, "{}", stopped.message);
+        let files = std::fs::read_dir(&traces)
+            .expect("the output directory")
+            .count();
+        assert_eq!(files, 1, "{}", stopped.message);
+        let again = VllmEngine::stop_profile(&service, Request::new(common::StopProfileRequest {}))
+            .await
+            .expect("stop")
+            .into_inner();
+        assert!(!again.success, "a stop with no run in progress is refused");
     }
 
     /// The served worker answers this wire's health check and names its

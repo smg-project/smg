@@ -22,12 +22,20 @@ Two modes:
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
+- `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
+  fan-out: the flush clears the engine's cache (a canned worker has none) and
+  answers 200; a profiling run starts with the body's options and ends with one
+  trace file in its output directory (a run already in progress, or a stop with
+  none, is a 409)
 
 **gRPC** (one engine's scheduler service, `--grpc-wire tokenspeed|vllm|sglang`,
 TokenSpeed by default — the gateway tokenizes, the worker speaks token ids):
 `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed chunks +
-complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`;
-the other RPCs (admin, embeddings, LoRA) return `unimplemented`. The canned
+complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`, and
+the admin fan-out's `FlushCache` (every rank's cache cleared at once,
+`success: true`), `StartProfile` and `StopProfile` (a run in progress refused
+with `success: false`, the trace file written at the stop), the same on each
+wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`. The canned
 and scripted answers, the realistic engine, the data-parallel ranks and the
 prefill/decode roles are the same behind each wire; each shapes its own
 messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
@@ -230,6 +238,9 @@ engines do not expose:
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
+- `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
+  worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
+  `profiling`, the `last_trace` written (`all`: every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 

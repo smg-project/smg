@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
+    admin_ops::{AdminOps, ProfileOptions},
     config::Config,
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
@@ -51,6 +52,8 @@ struct AppState {
     /// The requests this worker is serving: what its load report counts as
     /// running when no engine simulation runs.
     in_flight: WorkerInFlight,
+    /// The flush and profile operations the gateway fans out, and their counts.
+    ops: Arc<AdminOps>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -62,6 +65,9 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(completions))
         .route("/generate", post(chat_completions))
         .route("/v1/loads", get(loads))
+        .route("/flush_cache", post(flush_cache))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .with_state(state)
 }
 
@@ -110,6 +116,7 @@ pub async fn serve_with_listener_until(
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
     script::register(&name);
+    let ops = AdminOps::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
@@ -118,6 +125,7 @@ pub async fn serve_with_listener_until(
         name,
         engine,
         in_flight: WorkerInFlight::default(),
+        ops,
     });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
@@ -215,6 +223,41 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     handle(Endpoint::Completions, state, body).await
+}
+
+/// `POST /flush_cache`: the engine's cache cleared at once (a canned worker
+/// has none), answered 200 as the engines' servers answer it.
+async fn flush_cache(State(state): State<Arc<AppState>>) -> Response {
+    let message = state.ops.flush(state.engine.iter());
+    Json(json!({ "status": "ok", "message": message })).into_response()
+}
+
+/// `POST /start_profile` with the profile options as its JSON body (an
+/// empty body is the defaults); a run already in progress is a 409.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<ProfileOptions>(&body) {
+            Ok(options) => options,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("profile options: {e}")).into_response()
+            }
+        }
+    };
+    profile_answer(state.ops.start_profile(options))
+}
+
+/// `POST /stop_profile`: the run's trace file written; no run is a 409.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_answer(state.ops.stop_profile())
+}
+
+fn profile_answer(result: Result<String, String>) -> Response {
+    match result {
+        Ok(message) => Json(json!({ "status": "ok", "message": message })).into_response(),
+        Err(message) => (StatusCode::CONFLICT, message).into_response(),
+    }
 }
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
@@ -1046,6 +1089,56 @@ mod tests {
             Some(3),
             "the current name wins over the deprecated one"
         );
+    }
+
+    /// The admin fan-out's three routes on a canned worker, through their
+    /// handlers: the flush is a 200, a profiling run ends with one trace file
+    /// in the requested directory, a second start and a stop with no run are
+    /// 409s, a body that is not the options is a 400.
+    #[tokio::test]
+    async fn the_admin_fan_out_routes_answer_on_a_canned_worker() {
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:test".to_string(),
+            engine: None,
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:test"),
+        });
+        let start =
+            |body: &str| start_profile(State(Arc::clone(&state)), Bytes::from(body.to_string()));
+        let stop = || stop_profile(State(Arc::clone(&state)));
+
+        assert_eq!(
+            flush_cache(State(Arc::clone(&state))).await.status(),
+            StatusCode::OK
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let options =
+            json!({ "output_dir": traces.display().to_string(), "num_steps": 2 }).to_string();
+        assert_eq!(start(&options).await.status(), StatusCode::OK);
+        assert_eq!(
+            start(&options).await.status(),
+            StatusCode::CONFLICT,
+            "a run is in progress"
+        );
+        assert_eq!(stop().await.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_dir(&traces)
+                .expect("the output directory")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stop().await.status(),
+            StatusCode::CONFLICT,
+            "no run in progress"
+        );
+        assert_eq!(start("{not json").await.status(), StatusCode::BAD_REQUEST);
+        let ops = AdminOps::find("http:test").expect("the worker's operations");
+        assert_eq!(ops.status()["flushes"], 1);
+        assert_eq!(ops.status()["profiles_stopped"], 1);
     }
 
     #[tokio::test]
