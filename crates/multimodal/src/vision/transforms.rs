@@ -970,26 +970,27 @@ fn pil_h_outputs<const C: usize>(row: &[u8], kernel: &FixedKernel, first: usize,
 }
 
 /// How [`pil_resample_horizontal`] runs its rows: the portable per-output
-/// loop, or, on an x86-64 processor that reports AVX2, the eight-tap vector
-/// steps of [`avx2::h_band`] over the kernel's taps padded for them.
+/// loop, or, on an x86-64 processor that reports AVX2, the 16-bit
+/// multiply-add steps of [`avx2::h_band`] over the kernel's taps split for
+/// them.
 enum WidthPass {
     Portable,
     #[cfg(target_arch = "x86_64")]
-    Avx2(PaddedTaps),
+    Avx2(SplitTaps),
 }
 
 impl WidthPass {
     #[cfg(target_arch = "x86_64")]
-    fn new(kernel: &FixedKernel, in_w: usize) -> Self {
+    fn new(kernel: &FixedKernel) -> Self {
         if std::arch::is_x86_feature_detected!("avx2") {
-            Self::Avx2(PaddedTaps::new(kernel, in_w))
+            Self::Avx2(SplitTaps::new(kernel, 0, kernel.bounds.len(), 4))
         } else {
             Self::Portable
         }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn new(_kernel: &FixedKernel, _in_w: usize) -> Self {
+    fn new(_kernel: &FixedKernel) -> Self {
         Self::Portable
     }
 
@@ -1015,63 +1016,90 @@ impl WidthPass {
         match self {
             Self::Portable => pil_h_band::<C>(src, kernel, in_w, out_w, y0, band),
             #[cfg(target_arch = "x86_64")]
-            Self::Avx2(padded) => {
+            Self::Avx2(split) => {
                 if !std::arch::is_x86_feature_detected!("avx2") {
                     return pil_h_band::<C>(src, kernel, in_w, out_w, y0, band);
                 }
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
-                unsafe { avx2::h_band::<C>(src, kernel, padded, in_w, out_w, y0, band) }
+                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band) }
             }
         }
     }
 }
 
-/// The width pass's taps as [`avx2::h_band`] reads them: every output's
-/// taps zero-padded to `stride`, the longest window rounded up to eight, at
-/// `taps[x * stride..]`; and `vector_outputs`, how many leading outputs keep
-/// their padded window `x0..x0 + stride` inside the row. Windows start
-/// monotonically along the axis, so the outputs past that count are a
-/// suffix at the right edge, which take the per-output loop.
+/// The width of a tap's low half in the vector arms' split: a tap `t` is
+/// taken as `hi = (t + 2^10) >> 11`, its nearest multiple of 2^11, and
+/// `lo = t - (hi << 11)` in `[-2^10, 2^10)`, so that `t = hi · 2^11 + lo`
+/// exactly and `Σ pixel · t = (Σ pixel · hi) << 11 + Σ pixel · lo`. A tap is
+/// below 2^23 in magnitude ([`FixedKernel`]), so both halves fit a 16-bit
+/// lane; the rounded split keeps a small negative tap's low half small (a
+/// floor split would give it `2^11 - |t|`), so either partial sum fits `i32`
+/// over the longest window of either filter
+/// (`pil_split_taps_fit_the_16_bit_lanes_and_32_bit_sums`).
+#[cfg(any(target_arch = "x86_64", test))]
+const SPLIT_LOW_BITS: u32 = 11;
+
+/// `(hi, lo)` of a tap, see [`SPLIT_LOW_BITS`].
+#[cfg(any(target_arch = "x86_64", test))]
+fn split_tap(tap: i32) -> (i16, i16) {
+    let hi = (tap + (1 << (SPLIT_LOW_BITS - 1))) >> SPLIT_LOW_BITS;
+    // Below 2^12 in magnitude by the kernel's bound; a tap outside it would
+    // be a broken invariant, not a value to clamp.
+    debug_assert!(i16::try_from(hi).is_ok(), "tap {tap} exceeds the split");
+    (hi as i16, (tap - (hi << SPLIT_LOW_BITS)) as i16)
+}
+
+/// The taps of `count` outputs from `first` of one axis as the vector arms
+/// read them: every output's taps zero-padded to the longest window rounded
+/// up to a multiple of `step`, split into their halves, and the halves of
+/// consecutive taps `(t0, t1)`, `(t2, t3)`, ... packed two 16-bit lanes to an
+/// `i32`, the pair a broadcast spreads for the multiply-add of adjacent
+/// lanes; `pairs` of them per output at `hi[x * pairs..]` and `lo[x *
+/// pairs..]`.
 #[cfg(target_arch = "x86_64")]
-struct PaddedTaps {
-    taps: Vec<i32>,
-    stride: usize,
-    vector_outputs: usize,
+struct SplitTaps {
+    hi: Vec<i32>,
+    lo: Vec<i32>,
+    pairs: usize,
 }
 
 #[cfg(target_arch = "x86_64")]
-impl PaddedTaps {
-    /// Taps per vector step: one 32-bit lane each.
-    const STEP: usize = 8;
-
-    fn new(kernel: &FixedKernel, in_w: usize) -> Self {
-        let longest = kernel.bounds.iter().map(|&(_, n)| n).max().unwrap_or(0);
-        let stride = longest.max(1).next_multiple_of(Self::STEP);
-        let mut taps = vec![0_i32; kernel.bounds.len() * stride];
-        for (padded, output_taps) in taps.chunks_exact_mut(stride).zip(&kernel.taps) {
-            padded[..output_taps.len()].copy_from_slice(output_taps);
+impl SplitTaps {
+    fn new(kernel: &FixedKernel, first: usize, count: usize, step: usize) -> Self {
+        let outputs = &kernel.taps[first..first + count];
+        let longest = outputs.iter().map(Vec::len).max().unwrap_or(0);
+        let pairs = longest.max(1).next_multiple_of(step) / 2;
+        let mut hi = vec![0_i32; count * pairs];
+        let mut lo = vec![0_i32; count * pairs];
+        for ((hi, lo), taps) in hi
+            .chunks_exact_mut(pairs)
+            .zip(lo.chunks_exact_mut(pairs))
+            .zip(outputs)
+        {
+            for ((hi, lo), pair) in hi.iter_mut().zip(lo.iter_mut()).zip(taps.chunks(2)) {
+                let (hi0, lo0) = split_tap(pair[0]);
+                let (hi1, lo1) = pair.get(1).map_or((0, 0), |&tap| split_tap(tap));
+                *hi = lane_pair(hi0, hi1);
+                *lo = lane_pair(lo0, lo1);
+            }
         }
-        let vector_outputs = kernel
-            .bounds
-            .iter()
-            .position(|&(x0, _)| x0 + stride > in_w)
-            .unwrap_or(kernel.bounds.len());
-        Self {
-            taps,
-            stride,
-            vector_outputs,
-        }
+        Self { hi, lo, pairs }
     }
 }
 
-/// Output rows `[y0, y0 + band.len() / row_len)` of the height pass: each
-/// output row sums its taps over whole source rows, one tap's row at a time,
-/// so the inner loop runs along the row. Inlined into its callers so that
-/// the loop compiles to the caller's instruction set ([`pil_v_rows`]'s AVX2
-/// arm).
-#[inline(always)]
+/// Two 16-bit lanes as one `i32`, `low` in the low half.
+#[cfg(target_arch = "x86_64")]
+fn lane_pair(low: i16, high: i16) -> i32 {
+    let ([a, b], [c, d]) = (low.to_le_bytes(), high.to_le_bytes());
+    i32::from_le_bytes([a, b, c, d])
+}
+
+/// Output rows `[y0, y0 + band.len() / row_len)` of the height pass, the
+/// portable arm of [`pil_v_rows`]: each output row sums its taps over whole
+/// source rows, one tap's row at a time, so the inner loop runs along the
+/// row.
 fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
     let half = kernel.half();
     let mut sums = vec![0_i32; row_len];
@@ -1090,9 +1118,10 @@ fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band:
     }
 }
 
-/// [`pil_v_band`] on the AVX2 unit when the processor has one, the portable
-/// loop otherwise: the detection and the call sit in one function, as the
-/// crate's NEON kernels and the FMA pass keep them.
+/// The height pass's rows on the AVX2 unit when the processor has one (the
+/// 16-bit row-pair steps of [`avx2::v_band`] over the band's taps split for
+/// them), the portable loop otherwise: the detection and the call sit in one
+/// function, as the crate's NEON kernels and the FMA pass keep them.
 #[cfg(target_arch = "x86_64")]
 #[expect(
     unsafe_code,
@@ -1102,9 +1131,10 @@ fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band:
     if !std::arch::is_x86_feature_detected!("avx2") {
         return pil_v_band(src, kernel, row_len, y0, band);
     }
+    let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2);
     // SAFETY: `is_x86_feature_detected!("avx2")` answered true just above, the
     // only requirement of a `target_feature(enable = "avx2")` function.
-    unsafe { avx2::v_band(src, kernel, row_len, y0, band) }
+    unsafe { avx2::v_band(src, kernel, &split, row_len, y0, band) }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -1113,170 +1143,322 @@ fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band:
 }
 
 /// The Pillow-exact passes compiled for AVX2, the vector arms of
-/// [`WidthPass`] and [`pil_v_rows`]: the same 32-bit integer arithmetic as
-/// the portable passes, eight lanes at a time. Integer sums are the same in
-/// any order, so the bytes are those of the portable passes and of Pillow.
+/// [`WidthPass`] and [`pil_v_rows`]: the same integer sums as the portable
+/// passes, taken two taps at a time by the multiply-add of adjacent 16-bit
+/// lanes over the taps' split halves ([`SplitTaps`]) and recombined in 32
+/// bits per output. Integer sums are the same in any order, so the bytes
+/// are those of the portable passes and of Pillow.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    #![expect(
+        unsafe_code,
+        reason = "the vector loads and stores; every pointer is bounded by an exact-size chunk of a slice"
+    )]
+
     use std::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_blend_epi32, _mm256_castsi256_si128,
-        _mm256_cvtepu8_epi32, _mm256_extracti128_si256, _mm256_mullo_epi32,
-        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_setr_epi32,
-        _mm256_setzero_si256, _mm256_zextsi128_si256, _mm_add_epi32, _mm_cvtsi128_si32,
-        _mm_cvtsi32_si128, _mm_cvtsi64_si128, _mm_packs_epi32, _mm_packus_epi16, _mm_set1_epi32,
-        _mm_setzero_si128, _mm_sra_epi32,
+        __m128i, __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepu8_epi16,
+        _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_packs_epi32, _mm256_packus_epi16,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_set_m128i, _mm256_setr_epi8,
+        _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_slli_epi32, _mm256_sra_epi32,
+        _mm256_storeu_si256, _mm256_unpackhi_epi16, _mm256_unpacklo_epi16, _mm_cvtsi128_si32,
+        _mm_cvtsi32_si128, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
     };
 
-    use super::{pil_h_outputs, pil_v_band, FixedKernel, PaddedTaps};
+    use super::{FixedKernel, SplitTaps, SPLIT_LOW_BITS};
 
-    /// Lane `l` of the `q`th eight-byte group of a chunk of eight
-    /// `C`-channel source pixels holds pixel `(8q + l) / C`, so multiplies
-    /// that pixel's tap: the lane indices that spread the chunk's eight taps
-    /// over the group.
-    const fn tap_lanes<const C: usize>(q: usize) -> [i32; 8] {
-        let mut lanes = [0_i32; 8];
-        let mut l = 0;
-        while l < 8 {
-            lanes[l] = ((8 * q + l) / C) as i32;
-            l += 1;
-        }
-        lanes
-    }
+    /// Pixels a scratch row carries past the source row: a window padded to
+    /// a multiple of four taps reads at most three pixels past its last tap.
+    const PADDING_PIXELS: usize = 4;
 
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn lanes(values: [i32; 8]) -> __m256i {
-        _mm256_setr_epi32(
-            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
-        )
-    }
-
-    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass.
-    /// Per output, the padded taps go eight at a time against the eight
-    /// source pixels they weigh: each eight-byte group of those pixels' `8C`
-    /// bytes multiplies, by the taps spread to its lanes, into an accumulator
-    /// of its own, `C` of them, and `channel_sums` gathers the channel totals
-    /// at the end. The outputs whose padded window would cross the row's end
-    /// take the per-output loop.
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass,
+    /// two source rows per step. Each row is spread to four bytes per pixel
+    /// in a zero-padded scratch row; per output, every four source pixels of
+    /// the two rows load as one vector (a row per 128-bit half), two
+    /// shuffles pair the bytes of pixels (0, 1) and (2, 3) channel by
+    /// channel as 16-bit lanes, and the multiply-adds against the taps'
+    /// pairs `(t0, t1)` and `(t2, t3)` sum two pixels of one channel per
+    /// lane, the high and the low halves of the taps into accumulators of
+    /// their own. A band's odd last row runs alone in both halves.
     #[target_feature(enable = "avx2")]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
-        padded: &PaddedTaps,
+        split: &SplitTaps,
         in_w: usize,
         out_w: usize,
         y0: usize,
         band: &mut [u8],
     ) {
         let row_in = in_w * C;
-        let stride = padded.stride;
-        let spreads: [__m256i; C] = std::array::from_fn(|q| lanes(tap_lanes::<C>(q)));
-        for (i, out_row) in band.chunks_exact_mut(out_w * C).enumerate() {
-            let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
-            let (vector, rest) = out_row.split_at_mut(padded.vector_outputs * C);
-            for ((out, &(x0, _)), taps) in vector
-                .as_chunks_mut::<C>()
-                .0
-                .iter_mut()
-                .zip(&kernel.bounds)
-                .zip(padded.taps.chunks_exact(stride))
-            {
-                let mut sums = [_mm256_setzero_si256(); C];
-                let groups = row[x0 * C..(x0 + stride) * C].as_chunks::<8>().0;
-                for (eight, groups) in taps
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .zip(groups.as_chunks::<C>().0)
-                {
-                    let eight = lanes(*eight);
-                    for ((sum, group), spread) in sums.iter_mut().zip(groups).zip(&spreads) {
-                        let pixels =
-                            _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(i64::from_le_bytes(*group)));
-                        let taps = _mm256_permutevar8x32_epi32(eight, *spread);
-                        *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(pixels, taps));
-                    }
-                }
-                *out = clipped::<C>(channel_sums::<C>(&sums), kernel);
-            }
-            pil_h_outputs::<C>(row, kernel, padded.vector_outputs, rest);
+        let row_out = out_w * C;
+        let scratch_len = (in_w + PADDING_PIXELS) * 4;
+        let mut scratch = vec![0_u8; 2 * scratch_len];
+        let (first, second) = scratch.split_at_mut(scratch_len);
+        let mut pairs = band.chunks_exact_mut(2 * row_out);
+        let mut y = y0;
+        for pair in pairs.by_ref() {
+            spread::<C>(&src[y * row_in..(y + 1) * row_in], first);
+            spread::<C>(&src[(y + 1) * row_in..(y + 2) * row_in], second);
+            let (out_a, out_b) = pair.split_at_mut(row_out);
+            h_outputs::<C>(first, second, kernel, split, out_a, Some(out_b));
+            y += 2;
+        }
+        let rest = pairs.into_remainder();
+        if !rest.is_empty() {
+            spread::<C>(&src[y * row_in..(y + 1) * row_in], first);
+            h_outputs::<C>(first, first, kernel, split, rest, None);
         }
     }
 
-    /// The `C` channel sums of an output pixel in the low `C` lanes, from
-    /// the accumulators of its eight-byte groups: lane `l` of accumulator
-    /// `q` holds channel `(8q + l) % C`.
+    /// `row` (`C`-channel pixels) as four bytes per pixel at the start of
+    /// `rgbx`, the fourth byte zero for three channels; the bytes past the
+    /// row keep the scratch's zeros.
     #[target_feature(enable = "avx2")]
     #[inline]
-    fn channel_sums<const C: usize>(sums: &[__m256i; C]) -> __m128i {
-        const {
-            assert!(
-                C == 3 || C == 4,
-                "the width pass spreads three or four channels"
-            );
+    fn spread<const C: usize>(row: &[u8], rgbx: &mut [u8]) {
+        if C == 4 {
+            rgbx[..row.len()].copy_from_slice(row);
+            return;
         }
-        match sums.as_slice() {
-            [a, b, c] => {
-                // Twenty-four lanes whose channel is the lane's index modulo
-                // three. Lanes 12.. fold onto lanes 0.. (twelve is a multiple
-                // of three): `x` is lanes 0..8 of the fold, channels
-                // 0,1,2,0,1,2,0,1; `y` lanes 8..12, channels 2,0,1,2. Then
-                // channel 0 is x0 + x3 + x6 + y1, channel 1 x1 + x4 + x7 + y2
-                // and channel 2 x2 + x5 + y3 + y0.
-                let x = _mm256_add_epi32(*a, _mm256_permute2x128_si256::<0x21>(*b, *c));
-                let y = _mm256_zextsi128_si256(_mm_add_epi32(
-                    _mm256_castsi256_si128(*b),
-                    _mm256_extracti128_si256::<1>(*c),
-                ));
-                let second = _mm256_permutevar8x32_epi32(x, lanes([3, 4, 5, 0, 0, 0, 0, 0]));
-                let third = _mm256_blend_epi32::<0b0000_0100>(
-                    _mm256_permutevar8x32_epi32(x, lanes([6, 7, 0, 0, 0, 0, 0, 0])),
-                    _mm256_permutevar8x32_epi32(y, lanes([0, 0, 3, 0, 0, 0, 0, 0])),
-                );
-                let fourth = _mm256_permutevar8x32_epi32(y, lanes([1, 2, 0, 0, 0, 0, 0, 0]));
-                _mm256_castsi256_si128(_mm256_add_epi32(
-                    _mm256_add_epi32(x, second),
-                    _mm256_add_epi32(third, fourth),
-                ))
+        // Four pixels (12 bytes) spread to 16 per step; the step reads 16
+        // bytes, so every group whose read ends inside the row is done here
+        // (`12 * groups + 4 <= row.len()`, which is what `first_chunk` finds)
+        // and the last pixels one by one. The scratch is resliced to the
+        // stores' exact length first, so a short one panics on the bound
+        // instead of being written past.
+        let spread = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
+        let groups = row.len().saturating_sub(4) / 12;
+        let (wide, rest) = rgbx.split_at_mut(16 * groups);
+        for (group, wide) in wide.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            if let Some(bytes) = row[12 * group..].first_chunk::<16>() {
+                store16(wide, _mm_shuffle_epi8(load16(bytes), spread));
             }
-            [a, b, c, d] => {
-                // Thirty-two lanes whose channel is the lane's index modulo
-                // four: the four accumulators share one lane order, and the
-                // high half of their sum folds onto the low half.
-                let s = _mm256_add_epi32(_mm256_add_epi32(*a, *b), _mm256_add_epi32(*c, *d));
-                _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s))
-            }
-            // Excluded by the assertion above.
-            _ => _mm_setzero_si128(),
+        }
+        for (pixel, wide) in row[12 * groups..]
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(rest.as_chunks_mut::<4>().0.iter_mut())
+        {
+            wide[..3].copy_from_slice(pixel);
+            wide[3] = 0;
         }
     }
 
-    /// `kernel.clip8(half + sum)` of the low `C` lanes, as bytes.
+    /// Sixteen bytes stored.
     #[target_feature(enable = "avx2")]
     #[inline]
-    fn clipped<const C: usize>(sums: __m128i, kernel: &FixedKernel) -> [u8; C] {
-        let shifted = _mm_sra_epi32(
-            _mm_add_epi32(sums, _mm_set1_epi32(kernel.half())),
-            _mm_cvtsi32_si128(kernel.precision as i32),
+    fn store16(out: &mut [u8; 16], bytes: __m128i) {
+        // SAFETY: the array is exactly 16 bytes.
+        unsafe { _mm_storeu_si128(out.as_mut_ptr().cast::<__m128i>(), bytes) }
+    }
+
+    /// Every output of the two spread rows `row_a` (the low halves) and
+    /// `row_b` (the high halves) into `out_a` and, when given, `out_b`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_outputs<const C: usize>(
+        row_a: &[u8],
+        row_b: &[u8],
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out_a: &mut [u8],
+        mut out_b: Option<&mut [u8]>,
+    ) {
+        // Per 128-bit half, the bytes of pixels 0 and 1 (`first`), then 2
+        // and 3 (`second`), of a 16-byte group as 16-bit lanes paired
+        // channel by channel; `-1` zero-fills the high byte of a lane.
+        let first = _mm256_setr_epi8(
+            0, -1, 4, -1, 1, -1, 5, -1, 2, -1, 6, -1, 3, -1, 7, -1, 0, -1, 4, -1, 1, -1, 5, -1, 2,
+            -1, 6, -1, 3, -1, 7, -1,
         );
-        // Both packs saturate: `i32 -> i16` keeps the shifted sums (below 2^10
-        // in magnitude), `i16 -> u8` is the clamp to a byte.
-        let bytes = _mm_packus_epi16(_mm_packs_epi32(shifted, shifted), _mm_setzero_si128());
-        let bytes = _mm_cvtsi128_si32(bytes).to_le_bytes();
-        std::array::from_fn(|channel| bytes[channel])
+        let second = _mm256_setr_epi8(
+            8, -1, 12, -1, 9, -1, 13, -1, 10, -1, 14, -1, 11, -1, 15, -1, 8, -1, 12, -1, 9, -1, 13,
+            -1, 10, -1, 14, -1, 11, -1, 15, -1,
+        );
+        let half = _mm256_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm256_setzero_si256();
+        for (x, &(x0, n)) in kernel.bounds.iter().enumerate() {
+            let groups = n.div_ceil(4);
+            let hi = &split.hi[x * split.pairs..x * split.pairs + 2 * groups];
+            let lo = &split.lo[x * split.pairs..x * split.pairs + 2 * groups];
+            let source_a = &row_a[x0 * 4..(x0 + 4 * groups) * 4];
+            let source_b = &row_b[x0 * 4..(x0 + 4 * groups) * 4];
+            let mut sum_hi = zero;
+            let mut sum_lo = half;
+            for (((a, b), hi), lo) in source_a
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(source_b.as_chunks::<16>().0)
+                .zip(hi.as_chunks::<2>().0)
+                .zip(lo.as_chunks::<2>().0)
+            {
+                let pixels = _mm256_set_m128i(load16(b), load16(a));
+                let pixels01 = _mm256_shuffle_epi8(pixels, first);
+                let pixels23 = _mm256_shuffle_epi8(pixels, second);
+                sum_hi = _mm256_add_epi32(
+                    sum_hi,
+                    _mm256_madd_epi16(pixels01, _mm256_set1_epi32(hi[0])),
+                );
+                sum_lo = _mm256_add_epi32(
+                    sum_lo,
+                    _mm256_madd_epi16(pixels01, _mm256_set1_epi32(lo[0])),
+                );
+                sum_hi = _mm256_add_epi32(
+                    sum_hi,
+                    _mm256_madd_epi16(pixels23, _mm256_set1_epi32(hi[1])),
+                );
+                sum_lo = _mm256_add_epi32(
+                    sum_lo,
+                    _mm256_madd_epi16(pixels23, _mm256_set1_epi32(lo[1])),
+                );
+            }
+            let shifted = recombined(sum_hi, sum_lo, shift);
+            // Both packs saturate: `i32 -> i16` keeps the shifted sums (below
+            // 2^10 in magnitude), `i16 -> u8` is the clamp to a byte; each
+            // half's pixel sits in its low four bytes.
+            let bytes = _mm256_packus_epi16(_mm256_packs_epi32(shifted, shifted), zero);
+            store::<C>(
+                out_a,
+                x,
+                _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes)).to_le_bytes(),
+            );
+            if let Some(out_b) = out_b.as_deref_mut() {
+                store::<C>(
+                    out_b,
+                    x,
+                    _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes)).to_le_bytes(),
+                );
+            }
+        }
     }
 
-    /// [`pil_v_band`] compiled for AVX2: its row-long inner loops run eight
-    /// lanes wide.
+    /// Output `x`'s `C` bytes of `word` into its row: a four-byte write when
+    /// the next pixel's first byte follows (the next output writes it
+    /// again), else the last pixel's three.
+    #[inline]
+    fn store<const C: usize>(out_row: &mut [u8], x: usize, word: [u8; 4]) {
+        let at = x * C;
+        if C == 4 || at + 4 <= out_row.len() {
+            out_row[at..at + 4].copy_from_slice(&word);
+        } else {
+            out_row[at..at + 3].copy_from_slice(&word[..3]);
+        }
+    }
+
+    /// `(sum_hi << SPLIT_LOW_BITS) + sum_lo`, the sums of a tap's halves
+    /// recombined, shifted by the kernel's precision: `kernel.clip8` before
+    /// its clamp, eight lanes at a time.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn recombined(sum_hi: __m256i, sum_lo: __m256i, shift: __m128i) -> __m256i {
+        _mm256_sra_epi32(
+            _mm256_add_epi32(
+                _mm256_slli_epi32::<{ SPLIT_LOW_BITS as i32 }>(sum_hi),
+                sum_lo,
+            ),
+            shift,
+        )
+    }
+
+    /// Sixteen bytes as one 128-bit vector.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn load16(bytes: &[u8; 16]) -> __m128i {
+        // SAFETY: the array is exactly 16 bytes.
+        unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) }
+    }
+
+    /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass,
+    /// thirty-two columns at a time across the taps, two source rows per
+    /// step: each row's bytes widen to 16-bit lanes, the two rows interleave
+    /// word by word so that adjacent lanes hold one column's two pixels, and
+    /// the multiply-adds against the taps' pair `(t0, t1)` sum them, the high
+    /// and the low halves of the taps into accumulators of their own; an odd
+    /// last tap pairs with a zero tap over its own row. The row's last
+    /// columns run in scalar.
     #[target_feature(enable = "avx2")]
     pub(super) fn v_band(
         src: &[u8],
         kernel: &FixedKernel,
+        split: &SplitTaps,
         row_len: usize,
         y0: usize,
         band: &mut [u8],
     ) {
-        pil_v_band(src, kernel, row_len, y0, band);
+        let half = _mm256_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm256_setzero_si256();
+        for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
+            let (start, n) = kernel.bounds[y0 + i];
+            let pairs = n.div_ceil(2);
+            let hi = &split.hi[i * split.pairs..i * split.pairs + pairs];
+            let lo = &split.lo[i * split.pairs..i * split.pairs + pairs];
+            let (chunks, rest) = out_row.as_chunks_mut::<32>();
+            for (x, out) in chunks.iter_mut().enumerate() {
+                let mut sums_hi = [zero; 4];
+                let mut sums_lo = [half; 4];
+                for (k, (&hi, &lo)) in hi.iter().zip(lo).enumerate() {
+                    let row_a = start + 2 * k;
+                    let row_b = (row_a + 1).min(start + n - 1);
+                    let a = src[row_a * row_len + x * 32..][..32].as_chunks::<16>().0;
+                    let b = src[row_b * row_len + x * 32..][..32].as_chunks::<16>().0;
+                    let (a0, a1) = (widened(&a[0]), widened(&a[1]));
+                    let (b0, b1) = (widened(&b[0]), widened(&b[1]));
+                    // Columns 0..4 and 8..12 of the first sixteen, then 4..8
+                    // and 12..16, then the same of the second sixteen: the
+                    // order the packs below put back.
+                    let columns = [
+                        _mm256_unpacklo_epi16(a0, b0),
+                        _mm256_unpackhi_epi16(a0, b0),
+                        _mm256_unpacklo_epi16(a1, b1),
+                        _mm256_unpackhi_epi16(a1, b1),
+                    ];
+                    let (hi, lo) = (_mm256_set1_epi32(hi), _mm256_set1_epi32(lo));
+                    for ((sum_hi, sum_lo), columns) in
+                        sums_hi.iter_mut().zip(&mut sums_lo).zip(columns)
+                    {
+                        *sum_hi = _mm256_add_epi32(*sum_hi, _mm256_madd_epi16(columns, hi));
+                        *sum_lo = _mm256_add_epi32(*sum_lo, _mm256_madd_epi16(columns, lo));
+                    }
+                }
+                let [s0, s1, s2, s3] =
+                    std::array::from_fn(|q| recombined(sums_hi[q], sums_lo[q], shift));
+                // Both packs saturate (`i32 -> i16` keeps the shifted sums,
+                // `i16 -> u8` is the clamp); packing (0..4, 8..12) with (4..8,
+                // 12..16) puts a half's sixteen columns in order, the byte
+                // pack leaves the four eight-byte quarters as 0, 2, 1, 3.
+                let bytes =
+                    _mm256_packus_epi16(_mm256_packs_epi32(s0, s1), _mm256_packs_epi32(s2, s3));
+                store32(out, _mm256_permute4x64_epi64::<0b11_01_10_00>(bytes));
+            }
+            let done = chunks.len() * 32;
+            for (j, out) in rest.iter_mut().enumerate() {
+                let column = done + j;
+                let mut sum = kernel.half();
+                for (k, &tap) in kernel.taps[y0 + i].iter().take(n).enumerate() {
+                    sum += i32::from(src[(start + k) * row_len + column]) * tap;
+                }
+                *out = kernel.clip8(sum);
+            }
+        }
+    }
+
+    /// Sixteen bytes widened to 16-bit lanes.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn widened(bytes: &[u8; 16]) -> __m256i {
+        _mm256_cvtepu8_epi16(load16(bytes))
+    }
+
+    /// Thirty-two bytes stored.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn store32(out: &mut [u8; 32], bytes: __m256i) {
+        // SAFETY: the array is exactly 32 bytes.
+        unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), bytes) }
     }
 }
 
@@ -1293,7 +1475,7 @@ fn pil_resample_horizontal<const C: usize>(
 ) -> Vec<u8> {
     let row_out = out_w * C;
     let mut out = vec![0_u8; rows * row_out];
-    let pass = &WidthPass::new(kernel, in_w);
+    let pass = &WidthPass::new(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
         pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
@@ -2284,11 +2466,12 @@ mod tests {
     }
 
     /// The passes' parity cases: up- and downscales, identity axes, extreme
-    /// aspects, row lengths that leave vector tails, a large image, and the
-    /// vector width pass's edges (an axis shorter than one padded window,
-    /// windows of eight, nine and seven taps, a window of one tap past a
-    /// multiple of eight, a downscale by 154 whose padded windows run
-    /// hundreds of source pixels).
+    /// aspects, row lengths that leave vector tails, odd row counts (the
+    /// vector width pass's lone last row), a large image, and the vector
+    /// passes' edges (an axis shorter than one padded window, windows of
+    /// eight, nine and seven taps, so a tap paired with a zero and a window
+    /// of one tap past a multiple of four, a downscale by 154 whose padded
+    /// windows run hundreds of source pixels).
     const PIL_PASS_CASES: [(usize, usize, usize, usize); 19] = [
         (37, 23, 64, 32),
         (259, 194, 256, 192),
@@ -2382,7 +2565,7 @@ mod tests {
             let mut portable = vec![0_u8; in_h * out_w * C];
             WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
             let mut detected = vec![0_u8; in_h * out_w * C];
-            WidthPass::new(&kernel, in_w).rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+            WidthPass::new(&kernel).rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
             assert_same_bytes(
                 &detected,
                 &portable,
@@ -2434,6 +2617,61 @@ mod tests {
                         half + 255 * worst <= i64::from(i32::MAX),
                         "{in_size} -> {out_size}: Σ|tap| {worst} overflows the 32-bit sum"
                     );
+                }
+            }
+        }
+    }
+
+    /// The split the 16-bit vector arms rest on, checked over the same sweep
+    /// for both filters: every tap is `hi · 2^11 + lo` with `lo` in
+    /// `[-2^10, 2^10)` and both halves inside a 16-bit lane (so a
+    /// multiply-add's pair of products is far inside `i32`), and over any
+    /// output's window each partial sum stays inside `i32` for every pixel
+    /// assignment: a sum of `pixel · coefficient` over pixels in `0..=255`
+    /// is largest at 255 under the positive coefficients and smallest at 255
+    /// under the negative ones, so the high half's partial sum shifted by
+    /// eleven and the low half's with the rounding term are bounded by sign.
+    #[test]
+    fn pil_split_taps_fit_the_16_bit_lanes_and_32_bit_sums() {
+        let sizes = [1usize, 2, 3, 5, 7, 16, 100, 1000, 4096];
+        let (max, min) = (i64::from(i32::MAX), i64::from(i32::MIN));
+        for filter in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos] {
+            for &in_size in &sizes {
+                for &out_size in &sizes {
+                    let k = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+                    let half = 1_i64 << (k.precision - 1);
+                    for taps in &k.taps {
+                        // The positive and the negative coefficient sums of each half.
+                        let (mut hi_up, mut hi_down, mut lo_up, mut lo_down) =
+                            (0_i64, 0_i64, 0_i64, 0_i64);
+                        for &tap in taps {
+                            let (hi, lo) = split_tap(tap);
+                            assert_eq!(
+                                (i32::from(hi) << SPLIT_LOW_BITS) + i32::from(lo),
+                                tap,
+                                "{in_size} -> {out_size}: tap {tap} is not its halves recombined"
+                            );
+                            assert!(
+                                (-(1 << (SPLIT_LOW_BITS - 1))..1 << (SPLIT_LOW_BITS - 1)).contains(&lo),
+                                "{in_size} -> {out_size}: low half {lo} of tap {tap} outside its bits"
+                            );
+                            let (hi, lo) = (i64::from(hi), i64::from(lo));
+                            hi_up += hi.max(0);
+                            hi_down += hi.min(0);
+                            lo_up += lo.max(0);
+                            lo_down += lo.min(0);
+                        }
+                        let what = format!("{in_size} -> {out_size}: Σ hi {hi_up} / {hi_down}, Σ lo {lo_up} / {lo_down}");
+                        assert!(
+                            (255 * hi_up) << SPLIT_LOW_BITS <= max
+                                && (255 * hi_down) << SPLIT_LOW_BITS >= min,
+                            "{what}: the shifted high partial sum leaves i32"
+                        );
+                        assert!(
+                            half + 255 * lo_up <= max && half + 255 * lo_down >= min,
+                            "{what}: the low partial sum leaves i32"
+                        );
+                    }
                 }
             }
         }
