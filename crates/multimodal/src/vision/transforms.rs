@@ -14,7 +14,7 @@ use ndarray::{s, Array3, Array4};
 
 use super::{
     execution::{scope as parallel_scope, task_count},
-    scratch,
+    scratch::{self, plain_buffer, plain_f32},
 };
 pub use crate::error::TransformError;
 
@@ -523,30 +523,6 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
         FilterType::Gaussian => ResizeAlg::Convolution(FirFilter::Gaussian),
         FilterType::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
     }
-}
-
-/// A buffer of `len` bytes for a kernel that writes every one of them: a plain
-/// allocation filled in place, never a zeroed allocation. The allocators
-/// serve a large zeroed block by handing its pages back to the kernel and
-/// taking them again page fault by page fault (jemalloc zeroes a recycled
-/// block that way; glibc's zeroed allocation of a fresh heap top relies on
-/// fresh pages), which costs more than the kernel's own pass on a buffer of
-/// the image's scale; a plain allocation reuses the pages the allocator kept.
-#[expect(
-    clippy::slow_vector_initialization,
-    reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
-)]
-fn plain_buffer(len: usize) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(len);
-    buffer.resize(len, 0);
-    buffer
-}
-
-/// [`plain_buffer`] for a kernel that writes `f32` values.
-fn plain_f32(len: usize) -> Vec<f32> {
-    let mut buffer = Vec::with_capacity(len);
-    buffer.resize(len, 0.0);
-    buffer
 }
 
 /// The resizer's destination image over a [`plain_buffer`] rather than the
@@ -2145,16 +2121,26 @@ mod avx512 {
 /// Every row of `src` (`rows` rows of `in_w` interleaved pixels of `C`
 /// channels) resampled along the width to `out_w` pixels; rows banded across
 /// the pool (an output row depends on its own input row alone, so the banding
-/// changes nothing).
+/// changes nothing). The rows go into `out`, which the caller sized to
+/// `rows * out_w * C` and either allocated fresh (when the rows become its
+/// image) or took from this thread's recycled byte buffers
+/// ([`scratch::take_u8_unspecified`]) to give back once the height pass has
+/// consumed them: the pass writes every byte of every row before any is
+/// read.
 fn pil_resample_horizontal<const C: usize>(
     src: &[u8],
     rows: usize,
     in_w: usize,
     out_w: usize,
     kernel: &FixedKernel,
+    mut out: Vec<u8>,
 ) -> Vec<u8> {
     let row_out = out_w * C;
-    let mut out = plain_buffer(rows * row_out);
+    debug_assert_eq!(
+        out.len(),
+        rows * row_out,
+        "the rows' buffer is the output's size"
+    );
     let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
@@ -2358,12 +2344,25 @@ fn resize_pil_bytes<const C: usize>(
         pil_resample_vertical::<C>(data, out_h, in_w, &kernel)
     } else {
         let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
-        let horizontal = pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel);
+        let len = in_h * out_w * C;
+        // The rows are the caller's image when no height pass follows: a plain
+        // buffer, fresh and exact. Otherwise they come from this thread's
+        // recycled byte buffers and go back once the height pass has consumed
+        // them: a fresh buffer of this size is mapped page by page as the pass
+        // first touches it, a recycled one is already resident.
+        let rows = if in_h == out_h {
+            plain_buffer(len)
+        } else {
+            scratch::take_u8_unspecified(len)
+        };
+        let horizontal = pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel, rows);
         if in_h == out_h {
             horizontal
         } else {
             let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
-            pil_resample_vertical::<C>(&horizontal, out_h, out_w, &kernel)
+            let resampled = pil_resample_vertical::<C>(&horizontal, out_h, out_w, &kernel);
+            scratch::give_u8(horizontal);
+            resampled
         }
     }
 }
@@ -3758,6 +3757,66 @@ mod tests {
             .collect()
     }
 
+    /// The second resample of a size on a thread runs its width pass in the
+    /// buffer the first one gave back, stale bytes and all: every byte of
+    /// both equals the per-sample `i64` computation, three and four channels,
+    /// a downscale and an upscale on both axes, bicubic and Lanczos; a
+    /// width-only resample, whose rows are the caller's image, gets a fresh
+    /// exact buffer instead of the recycled one.
+    #[test]
+    fn pil_resample_recycles_its_intermediate_rows_with_the_same_bytes() {
+        fn check<const C: usize>(
+            data: &[u8],
+            (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
+            filter: PilResizeFilter,
+            what: &str,
+        ) {
+            let actual = resize_pil_bytes::<C>(
+                data,
+                in_w as u32,
+                in_h as u32,
+                out_w as u32,
+                out_h as u32,
+                filter,
+                KernelQuantization::Pillow,
+            );
+            let expected = per_sample_reference_channels::<C>(
+                data,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                filter,
+                KernelQuantization::Pillow,
+            );
+            assert_same_bytes(&actual, &expected, &format!("{C} channels, {what}"));
+            if in_h == out_h {
+                assert_eq!(
+                    actual.capacity(),
+                    actual.len(),
+                    "a width-only resample's rows are the caller's image: fresh and exact, not a recycled buffer ({C} channels, {what})"
+                );
+            }
+        }
+        for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
+            .into_iter()
+            .enumerate()
+        {
+            // The width-only case runs while the pool holds the first case's
+            // rows (50 828 bytes, more than its three-channel 38 121): a
+            // width-only resample that took from the pool would get that
+            // buffer back, and the exact-capacity assertion would catch it.
+            for case in [(301, 97, 131, 41), (301, 97, 131, 97), (41, 29, 97, 67)] {
+                let (in_w, in_h, ..) = case;
+                for (pass, seed) in [(0, 7), (1, 1009), (2, 23)] {
+                    let what = format!("filter {f}: {case:?}, image {pass}");
+                    check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
+                    check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
+                }
+            }
+        }
+    }
+
     /// Every byte of the 32-bit passes, three and four channels, bicubic and
     /// Lanczos, over [`PIL_PASS_CASES`], equals the per-sample `i64`
     /// computation.
@@ -4146,6 +4205,7 @@ mod tests {
                 src_w as usize,
                 out_w as usize,
                 &horizontal_kernel,
+                vec![0_u8; src_h as usize * out_w as usize * 3],
             );
             let vertical_kernel = FixedKernel::new(
                 src_h as usize,
