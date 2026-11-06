@@ -521,6 +521,7 @@ class GrpcRequestManager:
         state.log_metrics = (
             log_metrics
             and getattr(obj, "log_metrics", True)
+            and getattr(getattr(obj, "sampling_params", None), "max_new_tokens", None) != 0
             and not request_id.startswith(("HEALTH_CHECK", "WARMUP_", "smg-warmup-"))
         )
         self.record_request_for_crash_dump(obj)
@@ -814,12 +815,6 @@ class GrpcRequestManager:
                 logger.debug(f"Skipping output for aborted request {rid}")
                 continue
 
-            # Preserve the previous output timestamp until ITL has been observed.
-            first_output_time = None
-            if state.time_stats.first_token_time == 0.0:
-                state.time_stats.set_first_token_time()
-                first_output_time = state.time_stats.first_token_time
-
             # Extract output for this request
             prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
             completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
@@ -827,6 +822,15 @@ class GrpcRequestManager:
             reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
             reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
             token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+
+            # A retracted prefill can emit a nonterminal zero-token output.
+            # Preserve the previous output timestamp until ITL has been observed,
+            # and do not mistake that output for the first generated token.
+            first_output_time = None
+            if completion_tokens > 0 and state.time_stats.first_token_time == 0.0:
+                state.time_stats.set_first_token_time()
+                first_output_time = state.time_stats.first_token_time
+
             finished = batch_out.finished_reasons[i] is not None
             finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
 
@@ -953,7 +957,11 @@ class GrpcRequestManager:
 
                 cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
 
-            self._collect_generation_metrics(state, output_data, batch_out, i)
+            try:
+                self._collect_generation_metrics(state, output_data, batch_out, i)
+            except Exception:
+                # Observability must not prevent this or any sibling response.
+                logger.exception("Failed to collect generation metrics for request %s", rid)
 
         # Execute all queue.put() operations in parallel
         if put_tasks:
@@ -974,8 +982,13 @@ class GrpcRequestManager:
             return
         observe_abort = getattr(collector, "observe_one_aborted_request", None)
         if observe_abort is not None:
-            observe_abort(self._request_metric_labels(state, collector))
-            state.abort_observed = True
+            try:
+                observe_abort(self._request_metric_labels(state, collector))
+            except Exception:
+                # Metrics must never interrupt cancellation or terminal delivery.
+                logger.exception("Failed to record abort metrics for request %s", state.request_id)
+            else:
+                state.abort_observed = True
 
     def _collect_generation_metrics(self, state, output_data, batch_out, index):
         """Record worker-local generation metrics using SGLang's collector.
@@ -999,7 +1012,7 @@ class GrpcRequestManager:
 
         completion_tokens = meta["completion_tokens"]
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            if not state.ttft_observed:
+            if not state.ttft_observed and completion_tokens > 0:
                 ttft_kwargs = {}
                 if "stream" in self._ttft_metric_parameters:
                     ttft_kwargs["stream"] = bool(state.obj.stream)
@@ -1008,7 +1021,7 @@ class GrpcRequestManager:
                 )
                 state.ttft_observed = True
                 state.last_completion_tokens = completion_tokens
-            else:
+            elif state.ttft_observed:
                 num_new_tokens = completion_tokens - state.last_completion_tokens
                 if num_new_tokens > 0:
                     collector.observe_inter_token_latency(

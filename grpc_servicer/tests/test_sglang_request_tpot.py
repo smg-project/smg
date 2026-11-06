@@ -52,7 +52,7 @@ def batch(tokens, finish=None):
         prompt_tokens=[8],
         completion_tokens=[tokens],
         cached_tokens=[3],
-        output_ids=[[7]],
+        output_ids=[[] if tokens == 0 else [7]],
         finished_reasons=[finish],
         cached_tokens_details=[{"device": 2, "host": 1}],
         spec_verify_ct=[2],
@@ -114,9 +114,27 @@ def test_first_final_has_no_artificial_request_tpot(manager_mod, stream, tokens)
         state.time_stats, ts=next(ticks) if ts is None else ts
     )
     output(rm, clock, [(12, tokens, {"type": "stop"})])
-    assert state.time_stats.first_token_time == state.time_stats.finished_time
+    if tokens == 0:
+        assert state.time_stats.first_token_time == 0.0
+        assert not rm.metrics_collector.ttft
+    else:
+        assert state.time_stats.first_token_time == state.time_stats.finished_time
     assert rm.metrics_collector.finished[0]["time_per_output_token"] is None
     assert not rm.metrics_collector.itl
+
+
+def test_zero_token_output_does_not_start_generation_timing(manager_mod):
+    rm, state, clock = setup(manager_mod)
+    output(rm, clock, [(12, 0, None)])
+    assert state.time_stats.first_token_time == 0.0
+    assert not state.ttft_observed
+    assert not rm.metrics_collector.ttft
+
+    output(rm, clock, [(16, 2, None), (20, 3, {"type": "stop"})])
+    assert state.time_stats.first_token_time == 16.0
+    assert rm.metrics_collector.ttft[0][1] == 6.0
+    assert [row[1:] for row in rm.metrics_collector.itl] == [(4.0, 1)]
+    assert rm.metrics_collector.finished[0]["time_per_output_token"] == 2.0
 
 
 def test_prefill_has_no_request_tpot(manager_mod):
