@@ -1011,6 +1011,11 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
         2,
         "a worker registered after the loop started is swept on the next tick"
     );
+    assert_eq!(
+        first.swap_load_sample(0),
+        1,
+        "the first worker is swept on the same tick"
+    );
 
     registry.remove(&late_id).unwrap();
     tokio::time::sleep(past_a_tick).await;
@@ -1018,7 +1023,7 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
     assert_eq!(
         first.swap_load_sample(0),
         1,
-        "the worker that stays is swept on every tick"
+        "the worker that stays is swept on the tick after the removal"
     );
     sweep.abort();
 }
