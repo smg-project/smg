@@ -910,3 +910,110 @@ def test_mooncake_pd2_workflow_floor_keeps_gateway60_separate_from_worker300(flo
 )
 def test_mooncake_pd2_workflow_rejects_a_different_lane_before_checkout(override):
     assert _run_mooncake_pd2_contract(override=override).returncode != 0
+
+
+@pytest.mark.parametrize("model", _ZMQ_DP2_MODELS)
+def test_original1_worker300_for_all_original_models(monkeypatch, model):
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    assert worker_startup_timeout(model, timeout=9999) == 300
+
+
+def test_original1_declaration_pins_identity_models_and_wire():
+    from infra.constants import _STARTUP_PROFILES, ConnectionMode
+
+    profile = _STARTUP_PROFILES["original1-vllm-chat-legacy"]
+    assert dict(profile.models) == {model: (300, 1) for model in _ZMQ_DP2_MODELS}
+    assert dict(profile.lane) == {
+        "E2E_ENGINE": "vllm",
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_GPU_TIER": "1",
+        "E2E_CONNECTION_MODE": "",
+        "E2E_ZMQ_ENGINE_COUNT": "",
+        "E2E_MIN_SELECTED": "202",
+        "E2E_PARSER": "legacy",
+        "E2E_SAMPLING_PROFILE": "original1",
+        "E2E_VLLM_SERVICER_IMPL": "",
+        "E2E_STARTUP_TIMEOUT": "",
+    }
+    assert (profile.max_floor, profile.gpu_multiplier) == (60, 1)
+    assert profile.modes == {ConnectionMode.HTTP, ConnectionMode.GRPC}
+    assert profile.test_dir == "e2e_test/chat_completions"
+
+
+def test_blank_startup_profile_keeps_other_legacy_worker600(monkeypatch):
+    from infra import constants as constants_module
+
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_SELECTION", None)
+    monkeypatch.delenv(constants_module.ENV_STARTUP_PROFILE, raising=False)
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.setenv("E2E_PARSER", "legacy")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
+    assert worker_startup_timeout("unprofiled-legacy") == 600
+
+
+@pytest.mark.parametrize("mode", ["grpc", "http"])
+def test_original1_gateway60_is_not_worker300(monkeypatch, mode):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    wire = getattr(setup.ConnectionMode, mode.upper())
+    for model in _ZMQ_DP2_MODELS:
+        assert worker_startup_timeout(model) == 300
+        assert setup._gateway_readiness_timeout(wire, model, 60) == 60
+    with pytest.raises(ValueError, match="exceeds frozen wait"):
+        setup._gateway_readiness_timeout(wire, _ZMQ_DP2_MODELS[0], 61)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("E2E_STARTUP_TIMEOUT", "1"),
+        ("E2E_STARTUP_TIMEOUT", "60"),
+        ("E2E_STARTUP_TIMEOUT", "61"),
+        ("E2E_STARTUP_TIMEOUT", "300"),
+        ("E2E_PARSER", "symphony"),
+        ("E2E_SAMPLING_PROFILE", ""),
+        ("E2E_CONNECTION_MODE", "zmq"),
+        ("E2E_GPU_TIER", "2"),
+    ],
+)
+def test_original1_lane_or_floor_rejects_before_model_lookup(monkeypatch, key, value):
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    # AFTER setup: the profile's declared lane deliberately writes a blank floor.
+    monkeypatch.setenv(key, value)
+    lookups = []
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model: lookups.append(model))
+    with pytest.raises(ValueError):
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
+    assert lookups == []
+
+
+@pytest.mark.parametrize("change", ["unknown_model", "wrong_tp", "wrong_wire"])
+def test_original1_worker_contract_rejects_before_preparation(monkeypatch, change):
+    from infra.constants import ConnectionMode
+
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    prepared = []
+    monkeypatch.setattr(worker_module, "get_gpu_offset", lambda: prepared.append("gpu-offset"))
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
+    model = "outside-original1" if change == "unknown_model" else _ZMQ_DP2_MODELS[0]
+    mode = ConnectionMode.ZMQ if change == "wrong_wire" else ConnectionMode.GRPC
+    options = {"tp": 2} if change == "wrong_tp" else {}
+    with pytest.raises(ValueError):
+        worker_module.start_workers(model, engine="vllm", mode=mode, **options)
+    assert prepared == []
+
+
+def test_original1_caller_keeps_original_cohort_caps_and_optin_gate():
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/pr-test-rust.yml"
+    job = yaml.safe_load(workflow.read_text())["jobs"]["e2e-1gpu-chat-legacy-vllm-amd"]
+    inputs = job["with"]
+    assert (inputs["startup_profile"], inputs["sampling_profile"], inputs["parser"]) == (
+        "original1-vllm-chat-legacy", "original1", "legacy"
+    )
+    assert (inputs["timeout"], inputs["test_timeout"], inputs["min_selected"]) == (32, 24, 202)
+    assert (inputs["test_dirs"], inputs["test_filter"]) == ("e2e_test/chat_completions", "")
+    assert "vars.SMG_RUN_AMD_VLLM_CHAT_LEGACY == 'true'" in job["if"]
+    assert "vars.SMG_RUN_AMD_ON_PRS == 'true'" in job["if"]
+

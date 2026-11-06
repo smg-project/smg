@@ -194,6 +194,13 @@ def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkey
             ConnectionMode.GRPC,
         ),
         ("vllm-4gpu-chat", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
+        (
+            "original1-vllm-chat-legacy",
+            "meta-llama/Llama-3.2-1B-Instruct",
+            1,
+            300,
+            ConnectionMode.GRPC,
+        ),
     ],
 )
 def test_profile_value_reaches_worker_spawn_and_wait_arguments(
