@@ -449,16 +449,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 if (
                     batches_missing_pixels(preprocessed_batches)
                     and kv_transfer_params is None
-                    and not is_ec_consumer
+                    and not (is_ec_consumer and ec_transfer_params)
                 ):
                     logger.warning(
-                        "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
+                        "Request %s: pixel-less multimodal payload with no EC or KV handoff; "
                         "rejecting (prefill worker did not hand off KV?)",
                         request_id,
                     )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
-                        "no kv_transfer_params; a pixel-less leg requires remote KV"
+                        "no kv_transfer_params or ec_transfer_params; a pixel-less leg requires a handoff"
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
@@ -470,6 +470,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
+                if ec_transfer_params is not None and not is_ec_consumer:
+                    media_identity = build_media_identity(prompt)
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
@@ -554,6 +556,24 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=pinned_rank,
             ):
+                # ECCPU may evict an encoding before completion and return
+                # metadata without a fetch address. P has no pixels to
+                # recompute it after EPD, so refuse before returning a handoff.
+                if (
+                    output.finished
+                    and ec_config is not None
+                    and not is_ec_consumer
+                    and ec_config.ec_connector == "ECCPUConnector"
+                    and media_identity is not None
+                ):
+                    handles = getattr(output, "ec_transfer_params", None) or {}
+                    for batch in mm_batches(media_identity):
+                        for mm_hash in batch.mm_hashes:
+                            handle = handles.get(mm_hash, {})
+                            if not handle.get("peer_host") or not handle.get("peer_port"):
+                                raise RuntimeError(
+                                    "Encoder returned an incomplete ECCPU transfer handle"
+                                )
                 if not engine_started:
                     # The engine holds the request from its first output on
                     # (a refusal below never gets here). The prompt's cached
@@ -965,12 +985,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             from vllm.utils.network_utils import make_zmq_path
 
             parallel = self.engine.vllm_config.parallel_config
+            ranks = managed_ranks(self.engine)
             info.ec_zmq_addrs.extend(
                 make_zmq_path(
                     "tcp",
                     ec_config.ec_ip,
                     ec_config.ec_port + rank * parallel.tensor_parallel_size,
                 )
+                if rank in ranks
+                else ""
                 for rank in range(parallel.data_parallel_size)
             )
         return info

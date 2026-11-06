@@ -7698,6 +7698,7 @@ dependencies = [
  "wat",
  "wfaas",
  "xxhash-rust",
+ "zeromq",
  "zip",
 ]
 

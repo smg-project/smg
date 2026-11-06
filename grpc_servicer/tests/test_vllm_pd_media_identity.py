@@ -234,3 +234,63 @@ async def test_an_identity_that_cannot_be_built_does_not_fail_the_request(monkey
         "media identity not built" in r.getMessage() and "equal size" in r.getMessage()
         for r in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ec", [None, "{}", "{", "[]", "null"])
+async def test_ec_consumer_rejects_metadata_without_a_usable_handoff(monkeypatch, ec):
+    """The real handler refuses malformed/missing EC params before engine submission."""
+    import grpc
+
+    servicer = _servicer(monkeypatch, _Processor())
+    prefill = await _complete(servicer, _request(refs=True, kv=True))
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(is_ec_consumer=True)
+    request = _request(identity=prefill.media_identity)
+    if ec is not None:
+        request.ec_transfer_params_json = ec
+    seen = []
+    servicer.engine.generate = _engine(seen).generate
+    context = SimpleNamespace(abort=AsyncMock(), invocation_metadata=lambda: ())
+    assert [r async for r in servicer.Generate(request, context)] == []
+    context.abort.assert_awaited_once()
+    assert context.abort.call_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatch):
+    """Real vLLM tensor assembly supplies E's metadata without running the media processor."""
+    from smg_grpc_servicer.vllm.media_identity import tensor_to_proto
+
+    processor = _Processor()
+    servicer = _servicer(monkeypatch, processor)
+    prefill = await _complete(servicer, _request(refs=True, kv=True))
+    processor.calls.clear()
+    request = _request(identity=prefill.media_identity)
+    request.mm_inputs.pixel_values.CopyFrom(tensor_to_proto(torch.zeros(1, 3, 2, 2)))
+    request.mm_inputs.batched_keys.append("pixel_values")
+    request.ec_transfer_params_json = "{}"
+    handles = {"h1": {"peer_host": "encoder", "peer_port": 9000, "size_bytes": 128}}
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=False, ec_connector="ECCPUConnector"
+    )
+
+    async def generate(**kwargs):
+        """Return an encoder-only output after exercising the real tensor assembler."""
+        assert kwargs["prompt"]["mm_hashes"] == {"image": ["h1"]}
+        yield RequestOutput(
+            request_id=kwargs["request_id"],
+            prompt=None,
+            prompt_token_ids=[7, 100, 100, 100, 9],
+            prompt_logprobs=None,
+            outputs=[],
+            finished=True,
+            ec_transfer_params=handles,
+        )
+
+    servicer.engine.generate = generate
+    complete = await _complete(servicer, request)
+    assert processor.calls == []
+    assert list(complete.media_identity.mm_inputs.mm_hashes) == ["h1"]
+    assert not complete.media_identity.mm_inputs.HasField("pixel_values")
+    assert json.loads(complete.ec_transfer_params_json) == handles

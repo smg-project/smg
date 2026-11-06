@@ -378,7 +378,7 @@ pub(crate) async fn execute_plan(
                 execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
-                let vllm_encode = request.has_vllm_media_refs();
+                let vllm_encode = request.is_vllm() && workers.encode_assignments().is_some();
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
                 // prefill+decode side.
@@ -698,6 +698,7 @@ async fn execute_fanout_pd(
     })
 }
 
+/// Complete vLLM encoding before P/D, or launch TokenSpeed rendezvous alongside P/D.
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -707,7 +708,7 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    if proto_request.has_vllm_media_refs() {
+    if proto_request.is_vllm() && workers.encode_assignments().is_some() {
         super::vllm_encode::encode(&mut proto_request, workers).await?;
     }
     if let Some(encode_dispatch) = encode_dispatch {

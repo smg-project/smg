@@ -40,10 +40,10 @@ use crate::{
         prefill_queue_full, prefill_queue_timeout,
     },
     worker::{
-        acquire_prefill, ConnectionMode, ConnectionModeExt, HashRing, ModelWorkerSnapshot,
-        PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType,
-        Worker, WorkerRegistry, WorkerType,
+        acquire_prefill, ConnectionMode, HashRing, ModelWorkerSnapshot, PdPairIndex, PdWire,
+        PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillCandidateError,
+        PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -57,13 +57,14 @@ type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 #[cfg(test)]
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
-/// Why an EPD selection produced nothing. Only a full Prefill pool is told
-/// apart, for admission; every other failure is judged per role afterwards by
+/// Why an EPD selection produced nothing: a full Prefill pool, unsupported
+/// media references, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 #[derive(Clone, Copy)]
 enum EpdSelectionFailure {
     Unavailable,
     PrefillAtCapacity,
+    EncodeNotSupported,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -642,6 +643,7 @@ impl WorkerSelectionStage {
                             placement,
                             sticky_key,
                             &encode_item_hashes,
+                            inputs.media_refs,
                         ),
                     )
                     .await?;
@@ -851,6 +853,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
+        media_refs: bool,
     ) -> Result<(EncodePrefillDecodeWorkerSelection, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -861,13 +864,17 @@ impl WorkerSelectionStage {
                     model_id,
                     inputs,
                     encode_item_hashes,
+                    media_refs,
                     capacity,
                 )
             },
         )
         .await
         .map_err(|error| {
-            Self::acquire_failure(model_id, error, |_| {
+            Self::acquire_failure(model_id, error, |failure| {
+                if matches!(failure, EpdSelectionFailure::EncodeNotSupported) {
+                    return multimodal::MmRefsError::EncodeNotSupported.into_response();
+                }
                 // Encode is a demanded role only when the request carries
                 // encode items; an idle-but-vetoed encode pool must not shed
                 // a text-only request.
@@ -1903,164 +1910,95 @@ impl WorkerSelectionStage {
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// workers.
     ///
-    /// The error only tells a full Prefill pool apart from every other
-    /// failure; those are judged per role by [`Self::selection_failure`].
+    /// Full Prefill pools wait for admission; unsupported references are
+    /// refused explicitly, while other failures are judged per role.
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         encode_item_hashes: &[Vec<u8>],
+        media_refs: bool,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
-        let PlacementInputs {
-            text,
-            tokens,
-            headers,
-            rid_key,
-            cache_namespace,
-            ..
-        } = inputs;
-        // All three pools derive from ONE membership snapshot (see
-        // select_pd_pair). Each holds the workers whose wire carries its
-        // role's dispatch: the encode pool the gRPC encoder RPC's workers and
-        // TokenSpeed's direct-ZMQ encode servers, which take the encode request
-        // on their own lane (see `RoutingPool::GrpcEncode`; registration
-        // refuses the role to every other ZMQ runtime), the prefill/decode
-        // pools the workers whose wire carries the KV-transfer rendezvous (see
-        // `RoutingPool::GrpcPrefill`); the wildcard model maps to the global
-        // snapshot. Availability stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
-        let all_encode = epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
-        let all_prefill = epd_role_candidates(&snapshot, WorkerType::Prefill, true)?;
-        let all_decode = epd_role_candidates(&snapshot, WorkerType::Decode, true)?;
-
-        let Some(target_runtime) =
-            shared_epd_runtime(&all_encode, &all_prefill, &all_decode, needs_encode)
-        else {
-            warn!("No available encode/prefill/decode worker set with a shared runtime");
-            return Err(EpdSelectionFailure::Unavailable);
-        };
-
-        let mixed = all_prefill
-            .iter()
-            .chain(all_decode.iter())
-            .any(|w| w.metadata().spec.runtime_type != target_runtime)
-            || (needs_encode
-                && all_encode
-                    .iter()
-                    .any(|w| w.metadata().spec.runtime_type != target_runtime));
-        if mixed {
-            warn!(
-                "Mixed runtime types in encode/prefill/decode workers. Using {:?}.",
-                target_runtime
-            );
-        }
-
-        // Filter all three pools to the target runtime
-        let mut available_encode = on_runtime(all_encode, target_runtime);
-        if target_runtime == RuntimeType::Vllm && needs_encode {
-            available_encode.retain(|worker| {
-                accepts_media_refs(worker.as_ref())
-                    && multimodal::worker_supports_ec_transfer(worker.as_ref())
+        let mut available_encode =
+            epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
+        available_encode.retain(|worker| match worker.metadata().spec.runtime_type {
+            RuntimeType::Vllm => {
+                multimodal::worker_supports_ec_transfer(worker.as_ref())
+                    && (!media_refs
+                        || inputs
+                            .candidate_filter
+                            .is_none_or(|accepts| accepts(worker.as_ref())))
+            }
+            RuntimeType::TokenSpeed => !media_refs,
+            _ => false,
+        });
+        if needs_encode && available_encode.is_empty() {
+            return Err(if media_refs {
+                EpdSelectionFailure::EncodeNotSupported
+            } else {
+                EpdSelectionFailure::Unavailable
             });
         }
-        let mut available_prefill = on_runtime(all_prefill, target_runtime);
-        let available_decode = on_runtime(all_decode, target_runtime);
-
-        if (needs_encode && available_encode.is_empty())
-            || available_prefill.is_empty()
-            || available_decode.is_empty()
-        {
-            warn!(
-                "No available encode/prefill/decode worker set for runtime {:?}",
-                target_runtime
-            );
-            return Err(EpdSelectionFailure::Unavailable);
-        }
-
-        // Select encode, prefill, and decode via their per-role policies. Encode
-        // defaults to consistent hashing over each item's content hash; prefill
-        // and decode fall back to the main policy when unset.
-        let encode_policy = self.policy_registry.get_encode_policy();
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        // Under Prefill admission, full prefill workers leave the candidate
-        // set before the policy runs (see `placement::select_pair`).
-        if let Some(capacity) = prefill_capacity
-            .filter(|_| placement::admission_prefilters(prefill_policy.as_ref(), headers))
-        {
-            available_prefill.retain(|w| capacity.has_capacity(w));
-            if available_prefill.is_empty() {
-                return Err(EpdSelectionFailure::PrefillAtCapacity);
-            }
-        }
-
-        let mut info = SelectWorkerInfo {
-            request_text: text,
-            tokens,
-            headers,
-            routing_key: self.policy_registry.resolve_routing_key(headers),
-            rid_key,
-            cache_namespace,
-            hash_ring: hash_ring.clone(),
-            role: WorkerRole::Prefill,
-            overload_lifted: false,
+        // References go to E only. P consumes EC metadata and D consumes KV;
+        // neither needs a media processor. Use the same membership snapshot's
+        // compatibility index so the selected P/D connectors can rendezvous.
+        let eligible = |worker: &dyn Worker| {
+            let runtime = worker.metadata().spec.runtime_type;
+            !needs_encode
+                || (available_encode
+                    .iter()
+                    .any(|e| e.metadata().spec.runtime_type == runtime)
+                    && (runtime != RuntimeType::Vllm
+                        || worker.worker_type() != &WorkerType::Prefill
+                        || multimodal::worker_supports_ec_transfer(worker)))
         };
-        let prefill_idx = self
-            .policy_registry
-            .select_worker_for_model(&prefill_policy, model_id, &available_prefill, &info)
-            .ok_or(EpdSelectionFailure::Unavailable)?;
-        if prefill_capacity
-            .is_some_and(|capacity| !capacity.has_capacity(&available_prefill[prefill_idx]))
-        {
-            return Err(EpdSelectionFailure::PrefillAtCapacity);
-        }
-        info.role = WorkerRole::Decode;
-        let decode_idx = self
-            .policy_registry
-            .select_worker_for_model(&decode_policy, model_id, &available_decode, &info)
-            .ok_or(EpdSelectionFailure::Unavailable)?;
-
-        let encode_assignments = assign_encode_workers(
-            &available_encode,
-            encode_item_hashes,
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let pair = placement::select_pair(
+            &self.worker_registry,
+            &self.policy_registry,
             model_id,
-            encode_policy.as_ref(),
-            hash_ring.clone(),
+            &pairs,
+            None,
+            true,
+            prefill_capacity,
+            PlacementInputs {
+                candidate_filter: Some(&eligible),
+                ..inputs
+            },
+        )
+        .map_err(|failure| {
+            if failure.is_at_capacity() {
+                EpdSelectionFailure::PrefillAtCapacity
+            } else {
+                EpdSelectionFailure::Unavailable
+            }
+        })?;
+        available_encode.retain(|worker| worker.metadata().spec.runtime_type == pair.runtime);
+        // vLLM encodes the whole prompt on one worker; TokenSpeed routes items.
+        let prompt_hash;
+        let hashes = if pair.runtime == RuntimeType::Vllm && needs_encode {
+            let mut hash = blake3::Hasher::new();
+            for item in encode_item_hashes {
+                hash.update(&(item.len() as u64).to_le_bytes());
+                hash.update(item);
+            }
+            prompt_hash = [hash.finalize().as_bytes().to_vec()];
+            &prompt_hash[..]
+        } else {
+            encode_item_hashes
+        };
+        let assignments = assign_encode_workers(
+            &available_encode,
+            hashes,
+            model_id,
+            self.policy_registry.get_encode_policy().as_ref(),
+            self.worker_registry.get_hash_ring(model_id),
         )
         .ok_or(EpdSelectionFailure::Unavailable)?;
-
-        // Record worker selection metrics for prefill and decode, each tagged
-        // with the policy that picked it. Encode item assignment metrics are
-        // recorded in assign_encode_workers.
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model_id,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            available_decode[decode_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model_id,
-            decode_policy.name(),
-        );
-
-        Ok((
-            encode_assignments,
-            available_prefill[prefill_idx].clone(),
-            available_decode[decode_idx].clone(),
-            target_runtime,
-        ))
+        Ok((assignments, pair.prefill, pair.decode, pair.runtime))
     }
 }
 
@@ -2078,47 +2016,6 @@ fn epd_role_candidates(
         return Err(EpdSelectionFailure::Unavailable);
     }
     Ok(candidates)
-}
-
-/// The runtime the EPD pools share: disaggregated pools must share one, so it
-/// is a runtime that has at least one available worker in every required
-/// pool, instead of blindly the first prefill runtime.
-fn shared_epd_runtime(
-    all_encode: &[Arc<dyn Worker>],
-    all_prefill: &[Arc<dyn Worker>],
-    all_decode: &[Arc<dyn Worker>],
-    needs_encode: bool,
-) -> Option<RuntimeType> {
-    all_prefill
-        .iter()
-        .map(|w| w.metadata().spec.runtime_type)
-        .find(|runtime| {
-            // vLLM needs the EC-capable Python servicer; other runtimes keep
-            // their existing encoder transport contract.
-            (!needs_encode
-                || *runtime == RuntimeType::TokenSpeed
-                || (*runtime == RuntimeType::Vllm
-                    && all_encode.iter().any(|worker| {
-                        worker.metadata().spec.runtime_type == *runtime
-                            && accepts_media_refs(worker.as_ref())
-                            && multimodal::worker_supports_ec_transfer(worker.as_ref())
-                    })))
-                && all_decode
-                    .iter()
-                    .any(|w| w.metadata().spec.runtime_type == *runtime)
-                && (!needs_encode
-                    || all_encode
-                        .iter()
-                        .any(|w| w.metadata().spec.runtime_type == *runtime))
-        })
-}
-
-/// The candidates of `runtime` among a role's.
-fn on_runtime(candidates: Vec<Arc<dyn Worker>>, runtime: RuntimeType) -> Vec<Arc<dyn Worker>> {
-    candidates
-        .into_iter()
-        .filter(|w| w.metadata().spec.runtime_type == runtime)
-        .collect()
 }
 
 fn encode_item_hashes(
@@ -3842,6 +3739,102 @@ mod tests {
         other.routing.cache_namespace = namespace("tenant-b");
         stage.reselect(&mut other, &plan).await.unwrap();
         assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
+    }
+
+    /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
+    #[test]
+    fn epd_filters_capabilities_and_pairs_before_encoding() {
+        for media_refs in [true, false] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let model = "epd-model";
+            for (port, role, runtime, ec, connector) in [
+                (8800, WorkerType::Encode, RuntimeType::TokenSpeed, false, ""),
+                (
+                    8801,
+                    WorkerType::Prefill,
+                    RuntimeType::TokenSpeed,
+                    false,
+                    "",
+                ),
+                (8802, WorkerType::Decode, RuntimeType::TokenSpeed, false, ""),
+                (8803, WorkerType::Encode, RuntimeType::Vllm, true, ""),
+                (
+                    8804,
+                    WorkerType::Prefill,
+                    RuntimeType::Vllm,
+                    false,
+                    "NixlConnector",
+                ),
+                (
+                    8805,
+                    WorkerType::Prefill,
+                    RuntimeType::Vllm,
+                    true,
+                    "MooncakeConnector",
+                ),
+                (
+                    8806,
+                    WorkerType::Decode,
+                    RuntimeType::Vllm,
+                    false,
+                    "NixlConnector",
+                ),
+                (
+                    8807,
+                    WorkerType::Decode,
+                    RuntimeType::Vllm,
+                    false,
+                    "MooncakeConnector",
+                ),
+            ] {
+                if !media_refs && runtime == RuntimeType::TokenSpeed {
+                    continue;
+                }
+                let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                    .model(ModelCard::new(model))
+                    .worker_type(role)
+                    .runtime_type(runtime)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .label("supports_ec_transfer", ec.to_string())
+                    .label("kv_connector", connector)
+                    .label(
+                        "mm_processor",
+                        if media_refs && role == WorkerType::Encode {
+                            "inprocess"
+                        } else {
+                            ""
+                        },
+                    )
+                    .label("mm_media_ref_schemes", "http,https,data")
+                    .build();
+                registry.register(Arc::new(worker)).unwrap();
+            }
+            let stage = WorkerSelectionStage::new(
+                registry,
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            for _ in 0..8 {
+                let (encoders, prefill, decode, runtime) = stage
+                    .select_encode_prefill_decode_workers(
+                        model,
+                        PlacementInputs {
+                            candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                            ..Default::default()
+                        },
+                        &[vec![1], vec![2]],
+                        media_refs,
+                        None,
+                    )
+                    .unwrap_or_else(|_| panic!("eligible EPD set must be selected"));
+                assert_eq!(runtime, RuntimeType::Vllm);
+                assert_eq!(encoders.len(), 1);
+                assert_eq!(prefill.url(), "grpc://127.0.0.1:8805");
+                assert_eq!(decode.url(), "grpc://127.0.0.1:8807");
+            }
+        }
     }
 
     fn vllm_grpc_worker(
