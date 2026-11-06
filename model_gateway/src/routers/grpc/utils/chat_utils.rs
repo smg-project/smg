@@ -373,13 +373,28 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    let _permit = encode_permits()
+    pool_on(encode_permits(), work).await
+}
+
+/// Run `work` on the blocking pool behind one of `permits`. The permit rides
+/// in the blocking closure, held until the work ends whatever happens to this
+/// future: a pass ended by another input's error, or dropped by a client
+/// gone, still counts its running jobs against the bound.
+async fn pool_on<T, F>(permits: &'static Semaphore, work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let permit = permits
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
 }
 
 /// Tokenize `text` through the offload policy of [`offload`]: a prompt below
@@ -521,7 +536,8 @@ type PoolJob<T> = Box<dyn FnOnce() -> anyhow::Result<T> + Send + 'static>;
 /// in-place pass run together, the join polled first, so the pool's jobs
 /// start on the pass's first poll and the in-place inputs run one after
 /// another, the call yielding the worker once per spent share. The outputs in
-/// the inputs' order; the first error ends the pass.
+/// the inputs' order; the first error ends the pass, and a pool job already
+/// running finishes on its thread, its permit held until then ([`pool_on`]).
 async fn place_all<I, T>(
     inputs: impl IntoIterator<Item = I>,
     len: impl Fn(&I) -> usize,

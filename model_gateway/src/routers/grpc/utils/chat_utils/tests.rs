@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, sync::mpsc};
 
 use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
@@ -2541,4 +2541,44 @@ fn a_prompt_below_the_offload_threshold_is_encoded_from_the_callers_own_text() {
         long.as_ptr() as usize,
         "the blocking task reads a copy of its own, which outlives the caller's borrow"
     );
+}
+
+/// A pool call dropped while its job runs keeps the job's permit until the
+/// blocking work ends: a pass ended by one input's error, or dropped by a
+/// client gone, still counts its running jobs against the bound.
+#[test]
+fn a_dropped_pool_call_holds_its_permit_until_the_blocking_work_ends() {
+    static PERMITS: Semaphore = Semaphore::const_new(1);
+    let (started, running) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    block_on(async {
+        {
+            let mut call = std::pin::pin!(pool_on(&PERMITS, move || {
+                started.send(()).ok();
+                released.recv().ok();
+                anyhow::Ok(())
+            }));
+            // One poll takes the permit and hands the job to the blocking pool.
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            assert!(
+                running.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the job started"
+            );
+            assert_eq!(PERMITS.available_permits(), 0);
+        }
+        // The future is gone; the job runs on and still holds its permit.
+        assert_eq!(
+            PERMITS.available_permits(),
+            0,
+            "the permit returned before the work ended"
+        );
+        release.send(()).ok();
+        for _ in 0..10_000 {
+            if PERMITS.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(PERMITS.available_permits(), 1, "the permit never returned");
+    });
 }
