@@ -4323,11 +4323,19 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (`webp_native::decode_webp`, the library the reference loaders use, in
 /// the JPEG class of cost); without it, or for an animation, the `image`
 /// crate's decoder takes it, with the same pixels on the files checked.
+/// An icon file is read as the PNG its chosen entry holds, when it holds one
+/// (`ico_png_entry`). AVIF is not decoded: no decoder for it is among the
+/// crate's dependencies, and such a file is refused with a typed error that
+/// names the format.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
     transparency: TransparencyPolicy,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
+    // An icon file whose chosen entry is a PNG is that PNG from here on
+    // (`ico_png_entry`): the entry's own colour type and chunks then drive
+    // the rules below, as they do for a PNG on its own.
+    let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
     let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
@@ -4372,6 +4380,264 @@ pub(crate) fn decode_image_bytes(
     image = apply_transparency(image, bytes, transparency);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
+}
+
+/// The four bytes that open an icon file (reserved 0, type 1), the magic the
+/// `image` crate recognises the format by.
+const ICO_SIGNATURE: [u8; 4] = [0, 0, 1, 0];
+
+/// The PNG an icon file's chosen entry holds; `None` when the bytes are not
+/// an ICO, the directory does not fit the file, or the chosen entry is a
+/// bitmap (the `image` crate's decoder then takes the bytes and answers as
+/// before).
+///
+/// The `image` crate's ICO decoder reads a PNG entry only when its colour
+/// type is RGBA, the form the platform's own icons take; the serving engine's
+/// loader opens the entry with its PNG reader whatever the colour type, and
+/// an icon saved from an RGB image by that loader's own writer, or by most
+/// others, holds RGB PNG entries. Decoding the entry as the PNG it is gives
+/// that loader's pixels (a PNG is lossless either way).
+///
+/// The entry is the one that loader opens: the largest area, the lowest
+/// colour depth among equal areas, the first listed on a full tie. The crate
+/// orders by depth first and takes the last entry on a tie, which names
+/// another entry on an icon that mixes depths or lists one size twice at one
+/// depth; when the loader's order
+/// lands on a bitmap the crate's own choice stands, so such an icon may still
+/// decode as a different entry. The PNG runs from its offset to the end of the
+/// file, as both readers take it (the declared length only bounds a bitmap's
+/// mask), so a writer's short or long length does not cut it.
+fn ico_png_entry(bytes: &[u8]) -> Option<&[u8]> {
+    const DIRECTORY_HEADER: usize = 6;
+    const ENTRY: usize = 16;
+    if !bytes.starts_with(&ICO_SIGNATURE) {
+        return None;
+    }
+    let count = usize::from(u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?));
+    let directory = bytes.get(DIRECTORY_HEADER..DIRECTORY_HEADER.checked_add(count * ENTRY)?)?;
+    // An entry's area and its colour depth as the loader reads them: a zero
+    // width or height byte stands for 256; the depth is the declared bits per
+    // pixel, else the bits the palette's colour count needs, else 256.
+    let rank = |entry: &[u8; ENTRY]| {
+        let side = |byte: u8| if byte == 0 { 256 } else { u32::from(byte) };
+        let depth = match u16::from_le_bytes([entry[6], entry[7]]) {
+            0 => match u32::from(entry[2]).saturating_sub(1).checked_ilog2() {
+                Some(log) => log + 1,
+                None => 256,
+            },
+            bits => u32::from(bits),
+        };
+        (side(entry[0]) * side(entry[1]), std::cmp::Reverse(depth))
+    };
+    let mut entries = directory.as_chunks::<ENTRY>().0.iter();
+    let mut best = entries.next()?;
+    let mut best_rank = rank(best);
+    for entry in entries {
+        let entry_rank = rank(entry);
+        if entry_rank > best_rank {
+            best = entry;
+            best_rank = entry_rank;
+        }
+    }
+    let offset =
+        usize::try_from(u32::from_le_bytes([best[12], best[13], best[14], best[15]])).ok()?;
+    let image = bytes.get(offset..)?;
+    image.starts_with(&PNG_SIGNATURE).then_some(image)
+}
+
+#[cfg(test)]
+mod ico_png_entry_tests {
+    use super::*;
+
+    /// An icon file the way the serving engine's own image library writes
+    /// one from an image: one PNG entry per size in the image's own colour
+    /// type, each declared at 32 bits per pixel, the smallest first, a side
+    /// of 256 written as 0.
+    fn icon_of_png_entries(entries: &[image::DynamicImage]) -> Vec<u8> {
+        let declared: Vec<_> = entries.iter().map(|entry| (entry, 0, 32)).collect();
+        icon_of_declared_png_entries(&declared)
+    }
+
+    /// An icon file of PNG entries in the order given, each with the palette
+    /// colour count and bits per pixel its directory entry declares.
+    fn icon_of_declared_png_entries(entries: &[(&image::DynamicImage, u8, u16)]) -> Vec<u8> {
+        let pngs: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(entry, _, _)| {
+                let mut png = Vec::new();
+                entry
+                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                    .expect("PNG encode");
+                png
+            })
+            .collect();
+        let mut ico = ICO_SIGNATURE.to_vec();
+        ico.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * entries.len();
+        for ((entry, colours, bits), png) in entries.iter().zip(&pngs) {
+            let side = |pixels: u32| if pixels == 256 { 0 } else { pixels as u8 };
+            ico.extend_from_slice(&[side(entry.width()), side(entry.height()), *colours, 0]);
+            ico.extend_from_slice(&0u16.to_le_bytes());
+            ico.extend_from_slice(&bits.to_le_bytes());
+            ico.extend_from_slice(&(png.len() as u32).to_le_bytes());
+            ico.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += png.len();
+        }
+        for png in &pngs {
+            ico.extend_from_slice(png);
+        }
+        ico
+    }
+
+    fn gradient(side: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(side, side, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        })
+    }
+
+    /// A second image of the same side as [`gradient`], every pixel different
+    /// from it.
+    fn inverse_gradient(side: u32) -> image::RgbImage {
+        let mut image = gradient(side);
+        image
+            .pixels_mut()
+            .for_each(|pixel| pixel.0 = pixel.0.map(|channel| 255 - channel));
+        image
+    }
+
+    /// The RGB PNG entry of an icon saved from an RGB image decodes to the
+    /// PNG's pixels, as the serving engine's loader reads it; the `image`
+    /// crate's own ICO decoder refuses the entry for not being RGBA. The
+    /// header read names the same entry.
+    #[test]
+    fn an_icons_rgb_png_entry_decodes_as_the_png() {
+        let largest = gradient(256);
+        let ico = icon_of_png_entries(&[
+            image::DynamicImage::ImageRgb8(gradient(16)),
+            image::DynamicImage::ImageRgb8(largest.clone()),
+        ]);
+        let image = decode_image_bytes(&ico, None, TransparencyPolicy::CompositeOverWhite)
+            .expect("an icon whose entry is an RGB PNG");
+        assert_eq!((image.width(), image.height()), (256, 256));
+        assert_eq!(image.to_rgb8().as_raw(), largest.as_raw());
+        assert_eq!(
+            encoded_image_size(&ico, None).expect("the icon's header"),
+            crate::types::ImageSize::new(256, 256)
+        );
+    }
+
+    /// An RGBA entry, the one form the crate's decoder took already, keeps
+    /// its pixels and its alpha on the same path.
+    #[test]
+    fn an_icons_rgba_png_entry_keeps_its_pixels() {
+        let rgba = image::RgbaImage::from_fn(32, 32, |x, y| {
+            image::Rgba([(x * 8) as u8, (y * 8) as u8, 7, (x * y) as u8])
+        });
+        let ico = icon_of_png_entries(&[image::DynamicImage::ImageRgba8(rgba.clone())]);
+        let image = decode_image_bytes(&ico, None, TransparencyPolicy::KeepAlpha)
+            .expect("an icon whose entry is an RGBA PNG");
+        assert_eq!(image.to_rgba8().as_raw(), rgba.as_raw());
+    }
+
+    /// The largest entry is the one decoded wherever the directory lists it;
+    /// listed first, its PNG runs on into the next entry's bytes, which the
+    /// PNG decoder leaves alone past its own end.
+    #[test]
+    fn the_largest_entry_is_the_one_decoded_wherever_it_is_listed() {
+        let largest = gradient(48);
+        for entries in [
+            vec![
+                image::DynamicImage::ImageRgb8(gradient(16)),
+                image::DynamicImage::ImageRgb8(largest.clone()),
+            ],
+            vec![
+                image::DynamicImage::ImageRgb8(largest.clone()),
+                image::DynamicImage::ImageRgb8(gradient(16)),
+            ],
+        ] {
+            let ico = icon_of_png_entries(&entries);
+            let image = decode_image_bytes(&ico, None, TransparencyPolicy::DropAlpha)
+                .expect("an icon of two RGB PNG entries");
+            assert_eq!(image.to_rgb8().as_raw(), largest.as_raw());
+        }
+    }
+
+    /// The entry is the one the serving engine's loader opens, where the
+    /// crate's own order would name another: the largest area whatever its
+    /// declared depth, the lowest depth among equal areas (a palette's colour
+    /// count standing for its bits when no depth is declared), the first
+    /// listed on a full tie.
+    #[test]
+    fn the_entry_is_the_loaders_choice_on_an_icon_that_mixes_depths() {
+        let large = image::DynamicImage::ImageRgb8(gradient(256));
+        let small = image::DynamicImage::ImageRgb8(gradient(48));
+        let first = image::DynamicImage::ImageRgb8(gradient(32));
+        let second = image::DynamicImage::ImageRgb8(inverse_gradient(32));
+        for (entries, expected) in [
+            // The crate takes the 32-bit entry; the loader the larger one.
+            (vec![(&small, 0, 32), (&large, 0, 0)], &large),
+            // Equal areas: the lower declared depth, listed second.
+            (vec![(&first, 0, 32), (&second, 0, 24)], &second),
+            // Equal areas: sixteen palette colours are four bits, the lowest.
+            (vec![(&first, 0, 32), (&second, 16, 0)], &second),
+            // A palette count of one reads as 256 colours, like no depth.
+            (vec![(&first, 1, 0), (&second, 0, 32)], &second),
+            // A full tie: the first listed.
+            (vec![(&first, 0, 32), (&second, 0, 32)], &first),
+        ] {
+            let ico = icon_of_declared_png_entries(&entries);
+            let image = decode_image_bytes(&ico, None, TransparencyPolicy::DropAlpha)
+                .expect("an icon of two RGB PNG entries");
+            assert_eq!(image.to_rgb8().as_raw(), expected.to_rgb8().as_raw());
+        }
+    }
+
+    /// A PNG entry runs from its offset to the end of the file, as both
+    /// readers take it: a declared length shorter than the PNG, or one past
+    /// the end of the file, cuts nothing.
+    #[test]
+    fn a_png_entrys_declared_length_does_not_cut_it() {
+        let only = gradient(24);
+        let ico = icon_of_png_entries(&[image::DynamicImage::ImageRgb8(only.clone())]);
+        let png = &ico[6 + 16..];
+        for declared in [(png.len() / 2) as u32, 8, u32::MAX] {
+            let mut ico = ico.clone();
+            ico[6 + 8..6 + 12].copy_from_slice(&declared.to_le_bytes());
+            assert_eq!(ico_png_entry(&ico), Some(png));
+            let image = decode_image_bytes(&ico, None, TransparencyPolicy::DropAlpha)
+                .expect("an icon whose entry declares the wrong length");
+            assert_eq!(image.to_rgb8().as_raw(), only.as_raw());
+        }
+    }
+
+    /// Anything but an icon whose chosen entry is a PNG inside the file is
+    /// left to the crate's decoder: another container, a directory the file
+    /// cuts short, an entry past the end, a bitmap entry, a bitmap chosen
+    /// over a smaller PNG entry.
+    #[test]
+    fn only_a_png_entry_within_the_file_is_taken() {
+        assert!(ico_png_entry(&PNG_SIGNATURE).is_none());
+        assert!(ico_png_entry(&ICO_SIGNATURE).is_none());
+        assert!(ico_png_entry(&[0, 0, 1, 0, 1, 0]).is_none());
+        let mut ico = icon_of_png_entries(&[image::DynamicImage::ImageRgb8(gradient(8))]);
+        assert!(ico_png_entry(&ico).is_some());
+        assert!(ico_png_entry(&ico[..6 + 16 - 1]).is_none());
+        let mut past_the_end = ico.clone();
+        past_the_end[6 + 12..6 + 16].copy_from_slice(&(ico.len() as u32).to_le_bytes());
+        assert!(ico_png_entry(&past_the_end).is_none());
+        ico[6 + 16] = b'B';
+        assert!(ico_png_entry(&ico).is_none());
+        let mut bitmap_on_top = icon_of_png_entries(&[
+            image::DynamicImage::ImageRgb8(gradient(16)),
+            image::DynamicImage::ImageRgb8(gradient(48)),
+        ]);
+        let larger_entry = usize::try_from(u32::from_le_bytes(
+            bitmap_on_top[6 + 16 + 12..6 + 16 + 16].try_into().unwrap(),
+        ))
+        .unwrap();
+        bitmap_on_top[larger_entry] = b'B';
+        assert!(ico_png_entry(&bitmap_on_top).is_none());
+    }
 }
 
 /// Bring 16-bit truecolour samples down to 8 bits by their high byte, as the
@@ -4761,6 +5027,8 @@ pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
 ) -> Result<crate::types::ImageSize, MediaConnectorError> {
+    // The same entry the decode reads, so the two agree on an icon.
+    let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(MediaConnectorError::Io)?
