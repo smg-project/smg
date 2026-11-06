@@ -15,8 +15,10 @@
 //! claim of its address (the worker is local now and the registration
 //! workflow admits it under the same URL: the URL's stream is restarted for
 //! the local worker, the import's share of its model's count is released,
-//! the dispatch tallies and the tree tenants of the URL stay). A lagged
-//! channel resyncs the set it tracks against the registry.
+//! the dispatch tallies and the tree tenants of the URL stay). A removal
+//! whose address another worker took by the time this task sees it, a
+//! registration after the tombstone, is released the way a claim is. A
+//! lagged channel resyncs the set it tracks against the registry.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -94,7 +96,9 @@ impl Sync {
     /// One registry event. A `Replaced` of a tracked import is read by what
     /// the registry holds under the id now: still an import, an owner's
     /// in-place rebuild; a local worker, a claim of the import's address;
-    /// nothing, an import gone before this task saw its rebuild.
+    /// nothing, an import gone before this task saw its rebuild. A claim and
+    /// a removal release what the registry's worker at the address, if any,
+    /// does not take over (`Self::release_or_hand_over`).
     async fn handle(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Registered { worker_id, worker } => {
@@ -111,11 +115,14 @@ impl Sync {
                         self.release(&worker_id).await;
                         self.admit(worker_id, new).await;
                     }
-                    Some(WorkerOrigin::Local) => self.release_claimed(&worker_id).await,
-                    None => self.release(&worker_id).await,
+                    Some(WorkerOrigin::Local) | None => {
+                        self.release_or_hand_over(&worker_id).await;
+                    }
                 }
             }
-            WorkerEvent::Removed { worker_id, .. } => self.release(&worker_id).await,
+            WorkerEvent::Removed { worker_id, .. } => {
+                self.release_or_hand_over(&worker_id).await;
+            }
             WorkerEvent::StatusChanged { .. } => {}
         }
     }
@@ -156,41 +163,55 @@ impl Sync {
         );
     }
 
-    /// A local registration claimed the import's address
-    /// (`WorkerRegistry::register_or_replace`): the worker is local now, and
-    /// the registration workflow admits it under the same URL in the step
-    /// after the claim. The URL's stream was started for the import and
-    /// holds its worker object, so it is restarted for the local worker
-    /// (`PolicyRegistration::restart_stream`, in either order with the
-    /// workflow's admission). The dispatch tallies and the tree tenants of
-    /// the URL are the same engine's and stay. The import's share of its
-    /// model's count is released last, so the model's policy still decides
-    /// the restarted stream's kind. A release keyed by the URL, run after
-    /// the workflow's admission, would stop the local worker's stream for
-    /// good.
-    async fn release_claimed(&mut self, worker_id: &WorkerId) {
+    /// The import under `worker_id` is gone from the registry or claimed by
+    /// a local registration (`WorkerRegistry::register_or_replace`). When
+    /// the registry holds another worker at the import's address by now (the
+    /// local worker of a claim, or a registration that took the address
+    /// after the tombstone), the registration workflow admits that worker
+    /// under the same URL on its own schedule. The URL's stream was started
+    /// for the import and holds its worker object, so it is restarted for
+    /// the worker at the address (`PolicyRegistration::restart_stream`, in
+    /// either order with the workflow's admission). The dispatch tallies and
+    /// the tree tenants of the URL are the same engine's and stay. The
+    /// import's share of its model's count is released last, so the model's
+    /// policy still decides the restarted stream's kind. A release keyed by
+    /// the URL, run after the workflow's admission, would stop that worker's
+    /// stream for good. A free address takes the full release.
+    async fn release_or_hand_over(&mut self, worker_id: &WorkerId) {
         let Some(worker) = self.tracked.remove(worker_id) else {
             return;
         };
-        if let Some(local) = self.registry.get(worker_id) {
-            self.registration.restart_stream(&local).await;
+        match self.registry.get_by_url(worker.url()) {
+            Some(holder) if !Arc::ptr_eq(&holder, &worker) => {
+                self.registration.restart_stream(&holder).await;
+                self.registration
+                    .policy_registry
+                    .on_worker_removed(worker.model_id());
+                debug!(
+                    worker_id = %worker_id.as_str(),
+                    url = worker.redacted_url(),
+                    model = worker.model_id(),
+                    "Mesh import's address held by another worker; the URL's stream restarted for it, the import's share of the model's count released"
+                );
+            }
+            _ => {
+                self.registration.release(&worker).await;
+                debug!(
+                    worker_id = %worker_id.as_str(),
+                    url = worker.redacted_url(),
+                    model = worker.model_id(),
+                    "Mesh import released from the policies"
+                );
+            }
         }
-        self.registration
-            .policy_registry
-            .on_worker_removed(worker.model_id());
-        debug!(
-            worker_id = %worker_id.as_str(),
-            url = worker.redacted_url(),
-            model = worker.model_id(),
-            "Mesh import claimed by a local registration; the URL's stream restarted for the local worker, the import's share of the model's count released"
-        );
     }
 
     /// Bring the tracked set to the registry's imports: a tracked worker the
-    /// registry no longer holds is released, one it holds as a local worker
-    /// was claimed, one it holds as an import under another worker object
-    /// was rebuilt (released as the old worker, admitted as the new), and an
-    /// import this task has not seen is admitted.
+    /// registry no longer holds as an import is released, or hands its
+    /// stream to the worker now at its address (a claim, or a registration
+    /// after the tombstone); one it holds as an import under another worker
+    /// object was rebuilt (released as the old worker, admitted as the new);
+    /// an import this task has not seen is admitted.
     async fn resync(&mut self) {
         let imports: HashMap<WorkerId, Arc<dyn Worker>> = self
             .registry
@@ -207,10 +228,7 @@ impl Sync {
             match imports.get(&worker_id) {
                 Some(current) if Arc::ptr_eq(current, &worker) => {}
                 Some(_) => self.release(&worker_id).await,
-                None if self.registry.origin_of(&worker_id) == Some(WorkerOrigin::Local) => {
-                    self.release_claimed(&worker_id).await;
-                }
-                None => self.release(&worker_id).await,
+                None => self.release_or_hand_over(&worker_id).await,
             }
         }
         for (worker_id, worker) in imports {
@@ -645,5 +663,65 @@ mod tests {
             "the sync admits imports only; the workflow admits local workers"
         );
         sync.stop();
+    }
+
+    /// A peer's tombstone frees the import's address, a local registration
+    /// takes it under a new id, and the workflow admits the local worker
+    /// before this task sees the import's `Removed`: the admission found the
+    /// import's stream active under the URL and kept it. The release must
+    /// not stop the local worker's only stream: the stream is restarted for
+    /// the local worker and the import's share of the count alone goes, as
+    /// at a claim.
+    #[tokio::test]
+    async fn a_removal_after_a_registration_took_the_address_hands_the_stream_to_it() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, monitor) = streaming_registration(&registry);
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&grpc_remote_state("peer-w1", "grpc://127.0.0.1:1", "m1"));
+        handle_queued(&mut sync, &mut events).await;
+        let id = registry.get_id_by_url("grpc://127.0.0.1:1").unwrap();
+        let import = Arc::downgrade(&registry.get(&id).unwrap());
+
+        // The tombstone, the local registration under a new id and the
+        // workflow's admission, all before this task sees the `Removed`.
+        assert!(registry.remove_remote(&id).is_some());
+        let local = grpc_local_worker("grpc://127.0.0.1:1", "m1");
+        let local_id = registry
+            .register(Arc::clone(&local))
+            .expect("the tombstone freed the address");
+        assert_ne!(local_id, id);
+        registration.admit(&local, None).await;
+        assert_eq!(
+            count(&policies, "m1"),
+            Some(2),
+            "the import's share and the local worker's"
+        );
+        handle_queued(&mut sync, &mut events).await;
+
+        until(
+            "the import's worker object is released by its stream",
+            || import.upgrade().is_none(),
+        )
+        .await;
+        assert_eq!(
+            count(&policies, "m1"),
+            Some(1),
+            "the local worker's share alone"
+        );
+        assert!(policies.get_policy("m1").is_some());
+        assert!(
+            monitor.get_indexer("m1").is_some(),
+            "the local worker's stream feeds the model's index"
+        );
+        assert!(sync.tracked.is_empty());
+        let held = Arc::strong_count(&local);
+        monitor.on_worker_removed("grpc://127.0.0.1:1").await;
+        assert_eq!(
+            Arc::strong_count(&local),
+            held - 1,
+            "the restarted stream's task held the local worker's object"
+        );
     }
 }
