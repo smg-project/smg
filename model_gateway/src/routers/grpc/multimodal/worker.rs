@@ -965,6 +965,7 @@ mod tests {
     use llm_tokenizer::MockTokenizer;
 
     use super::*;
+    use crate::test_support::video_tools_available;
 
     fn limits(pairs: &[(Modality, usize)]) -> HashMap<Modality, usize> {
         pairs.iter().copied().collect()
@@ -1330,11 +1331,14 @@ mod tests {
             .contains("media dtype"));
     }
 
-    #[tokio::test]
-    #[ignore = "requires ffmpeg and ffprobe; run explicitly for SGLang video validation"]
     /// Grouped references retain per-modality anchors in interleaved prompts.
+    /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
+    #[tokio::test]
     async fn sglang_mixed_media_preserves_interleaved_anchors() {
         use base64::{engine::general_purpose::STANDARD, Engine};
+        if !video_tools_available() {
+            return;
+        }
         let (_dir, pipeline) = vision_test_pipeline(
             r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
             &[
@@ -1419,11 +1423,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "requires ffmpeg and ffprobe; run explicitly for SGLang video validation"]
     /// Check real video sampling, timestamps and temporal patch offsets across engines.
+    /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
+    #[tokio::test]
     async fn sglang_glm_video_preserves_tensors_and_temporal_patch_offsets() {
         use base64::{engine::general_purpose::STANDARD, Engine};
+        if !video_tools_available() {
+            return;
+        }
         let (_dir, pipeline) = vision_test_pipeline(
             r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
             &[
