@@ -48,6 +48,7 @@ use axum::{
 use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
 use pin_project_lite::pin_project;
+use tokio::task::futures::TaskLocalFuture;
 use tower::{Layer, Service};
 
 use super::{
@@ -180,21 +181,21 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<S::Future>;
+    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request) -> Self::Future {
+    fn call(&mut self, req: Request) -> Self::Future {
         let method = method_to_static_str(req.method().as_str());
         let path = PathLabel::of(req.extensions());
-        // The request's entry stamp: read from the clock once, here, and
-        // carried on the request for the layers inside (the access log's
-        // latency, the in-flight age, the acceptance, the body deadline all
-        // count from it; see `request_start`).
+        // The request's entry stamp: read from the clock once, here; the
+        // layers inside read it from the request's scope (the access log's
+        // latency and the in-flight age count from it; see `request_start`):
+        // their `call`s run under the stamp's sync scope below and their
+        // futures under its scoped future, so they read it from either.
         let started = RequestStarted::now();
-        req.extensions_mut().insert(started);
         let start = started.instant();
 
         let tracker = Arc::clone(&self.in_flight_request_tracker);
@@ -209,8 +210,10 @@ where
         // keeps no clone of the stack inside it per request (a clone of a
         // route is a heap copy of the service in it), and its future is the
         // route's own with the edge's duty beside it, not a box around both.
+        // The call runs under the stamp's sync scope and the future under
+        // its scoped future: the layers inside read the stamp from both.
         HttpMetricsFuture {
-            inner: self.inner.call(req),
+            inner: started.scope(started.sync_scope(|| self.inner.call(req))),
             duty: Some(EdgeDuty {
                 method,
                 start,
@@ -1259,18 +1262,47 @@ mod client_closed_tests {
         );
     }
 
+    /// The layers inside read the stamp from their `call`s, before their
+    /// futures run (the access log does): this layer calls the inner service
+    /// under the stamp's scope, not only the future it returns.
+    #[tokio::test]
+    async fn the_inner_service_s_call_runs_inside_the_entry_stamp_s_scope() {
+        let seen = Arc::new(Mutex::new(None));
+        let inner = tower::service_fn({
+            let seen = Arc::clone(&seen);
+            move |_request: Request<Body>| {
+                *seen.lock().expect("the slot") = Some(RequestStarted::current().is_some());
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }
+        });
+        let mut layered = HttpMetricsLayer::new(InFlightRequestTracker::new()).layer(inner);
+        let response = layered
+            .ready()
+            .await
+            .expect("ready")
+            .call(request("/scoped"))
+            .await
+            .expect("response");
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(
+            *seen.lock().expect("the slot"),
+            Some(true),
+            "the inner service's call ran inside the entry stamp's scope"
+        );
+    }
+
     /// The layer reads the clock once at the request's entry and shares the
-    /// stamp: the handler finds it on the request, and the request's
-    /// duration runs from it to the head, on the runtime's clock.
+    /// stamp: the handler finds it in the request's scope, and the
+    /// request's duration runs from it to the head, on the runtime's clock.
     #[test]
-    fn the_entry_stamp_rides_the_request_and_the_duration_runs_from_it() {
+    fn the_entry_stamp_scopes_the_request_and_the_duration_runs_from_it() {
         let rendered = render_paused(|_| async {
             let app = Router::new()
                 .route(
                     "/stamped",
-                    get(|request: Request<Body>| async move {
-                        let started = RequestStarted::of(request.extensions())
-                            .expect("the entry stamp rides the request");
+                    get(|| async move {
+                        let started =
+                            RequestStarted::current().expect("the entry stamp scopes the request");
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         assert_eq!(
                             clock_now().saturating_duration_since(started),

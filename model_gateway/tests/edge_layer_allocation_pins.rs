@@ -128,7 +128,8 @@ fn one_request(edge: &mut impl Service<Request, Response = Response, Error = Inf
 
 /// What a request costs the three layers, with the route's own answer in
 /// the count: the fresh id and its header value; the request's extension
-/// map (its box and its table) with the id and the entry stamp in it; the
+/// map (its box and its table) with the id in it, the entry stamp being a
+/// task-local of the request, not an entry; the
 /// route's empty body and its boxed future; the response's extension map
 /// with the duties the span layer hands the edge; the edge's one body
 /// wrapper; the response header map's two tables for the echoed id. Nothing
@@ -139,7 +140,7 @@ fn one_request(edge: &mut impl Service<Request, Response = Response, Error = Inf
 /// on its first insert; which shard a request lands in follows the process's
 /// hash seed, so after a warm-up the count is read as the least over a run
 /// of requests: a cold shard shows as the odd request above it.
-const EDGE_ALLOCATIONS_PER_REQUEST: usize = 15;
+const EDGE_ALLOCATIONS_PER_REQUEST: usize = 14;
 
 #[test]
 fn the_edge_s_layers_allocate_this_much_per_request() {

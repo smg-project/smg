@@ -420,9 +420,11 @@ mod tests {
             .into_std()
             .checked_sub(Duration::from_secs(15))
             .expect("the clock has been running for fifteen seconds");
-        let mut request = echo(trickle(usize::MAX, Duration::from_secs(1)));
-        request.extensions_mut().insert(RequestStarted::at(earlier));
-        let response = app(timeouts(5, 20)).oneshot(request).await.unwrap();
+        let request = echo(trickle(usize::MAX, Duration::from_secs(1)));
+        let response = RequestStarted::at(earlier)
+            .scope(app(timeouts(5, 20)).oneshot(request))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(error_code(response).await, REQUEST_BODY_TIMEOUT);
         let waited = started.elapsed();

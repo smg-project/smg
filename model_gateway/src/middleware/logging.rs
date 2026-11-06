@@ -550,9 +550,9 @@ where
     fn call(&mut self, mut request: Request) -> Self::Future {
         let span = RequestSpan.make_span(&request);
         // The latency's origin: the edge's entry stamp when the metrics layer
-        // put one on the request (see `request_start`), a read of this
-        // layer's own otherwise.
-        let start = RequestStarted::of(request.extensions()).unwrap_or_else(clock_now);
+        // runs this request inside its scope (see `request_start`), a read
+        // of this layer's own otherwise.
+        let start = RequestStarted::current().unwrap_or_else(clock_now);
         let fields = self.fields;
         record_request_fields(&span, &request, fields);
         RequestLogger.on_request(&request, &span);
@@ -1542,8 +1542,8 @@ mod field_tests {
     }
 
     /// The finish line's latency runs from the edge's entry stamp when the
-    /// request carries one (the metrics layer's, ahead of this layer in the
-    /// gateway's stack), not from a read of this layer's own.
+    /// request runs inside its scope (the metrics layer's, ahead of this
+    /// layer in the gateway's stack), not from a read of this layer's own.
     #[tokio::test]
     async fn the_latency_runs_from_the_edge_s_entry_stamp() {
         let capture = Capture::default();
@@ -1554,9 +1554,10 @@ mod field_tests {
         let earlier = clock_now()
             .checked_sub(Duration::from_secs(5))
             .expect("the clock has been running for five seconds");
-        let mut request = request("/v1/chat/completions");
-        request.extensions_mut().insert(RequestStarted::at(earlier));
-        let response = app.oneshot(request).await.expect("response");
+        let response = RequestStarted::at(earlier)
+            .scope(app.oneshot(request("/v1/chat/completions")))
+            .await
+            .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.into_body().collect().await.expect("body");
 
