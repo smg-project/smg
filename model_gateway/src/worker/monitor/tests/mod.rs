@@ -728,7 +728,7 @@ async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
 /// the other rank's heartbeats keep the stream alive, and the tick
 /// falls back to the poll for the worker. The poll's figure for the
 /// quiet rank replaces its entry in the pushed report: a heartbeat
-/// naming the busy rank no longer rebuilds the report from the quiet
+/// naming the busy rank no longer publishes a report with the quiet
 /// rank's last pushed record, the rank follows the poll from then on,
 /// a rank whose own record arrived since the poll began keeps it, and
 /// the poll decision is unchanged (the worker stays polled until the
@@ -789,7 +789,7 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
         polled_at + Duration::from_millis(1),
     );
     monitor.apply_polled_load(url, &poll(0.91), polled_at);
-    // The next heartbeat names rank 0 only: the report it rebuilds and
+    // The next heartbeat names rank 0 only: the report it publishes and
     // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
     let rendered = render_with_recorder(|| {
         monitor.apply_pushed_load(
@@ -861,17 +861,17 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     };
     monitor.apply_polled_load(url, &rollup, next + Duration::from_millis(2));
     let rank0 = monitor
-        .pushed_ranks
+        .pushed_reports
         .lock()
         .get(url)
-        .and_then(|ranks| ranks.get(&0).cloned())
+        .and_then(|report| report.loads.iter().find(|load| load.dp_rank == 0).cloned())
         .expect("rank 0 on file");
     assert_eq!(
         (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
         (6, 0.5, None)
     );
     // Rank 1's own record, once it pushes again, is the newer figure
-    // and suppresses the poll again; the report it rebuilds carries
+    // and suppresses the poll again; the report it publishes carries
     // rank 0 as the stream left it.
     monitor.apply_pushed_load(&worker, 1, &record(7, 0.7), next + Duration::from_millis(3));
     monitor.flush_pushed();
@@ -891,7 +891,11 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     let other = ready_worker("grpc://w2:9000", "llama-3");
     registry.register(Arc::clone(&other)).unwrap();
     monitor.apply_polled_load("grpc://w2:9000", &poll(0.1), t0);
-    assert!(monitor.pushed_ranks.lock().get("grpc://w2:9000").is_none());
+    assert!(monitor
+        .pushed_reports
+        .lock()
+        .get("grpc://w2:9000")
+        .is_none());
     assert_eq!(
         monitor.poll_mode("grpc://w2:9000", t0, interval),
         PollMode::Poll
