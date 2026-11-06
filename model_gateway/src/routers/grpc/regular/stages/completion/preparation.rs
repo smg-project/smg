@@ -21,6 +21,7 @@ use crate::routers::{
         context::{CompletionItem, PreparationOutput, RequestContext},
         regular::stages::token_ids::{
             decodable_ids, reject_unknown_token_id, reported_embedding_rows,
+            validate_logit_bias_token_ids,
         },
         utils,
     },
@@ -37,10 +38,17 @@ impl PipelineStage for CompletionPreparationStage {
             utils::resolve_tokenizer(ctx, "CompletionPreparationStage::execute").map_err(|e| *e)?;
 
         // The embedding table the model's workers report, read only after an id the
-        // tokenizer does not know (the bound of `token_prompt`).
+        // tokenizer does not know (the bound of the `logit_bias` keys and of `token_prompt`).
         let worker_registry = &ctx.components.worker_registry;
         let model_id = ctx.input.model_id.as_str();
         let embedding_rows = || reported_embedding_rows(worker_registry, model_id);
+
+        validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            embedding_rows,
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         // Empty arrays are rejected at the boundary (`validate_completion_prompt`).
         let items = match &request.prompt {

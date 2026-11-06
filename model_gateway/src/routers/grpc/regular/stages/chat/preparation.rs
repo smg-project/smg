@@ -18,6 +18,7 @@ use crate::{
                 stages::{
                     reading,
                     rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                    token_ids,
                 },
                 symphony,
             },
@@ -97,6 +98,17 @@ pub(crate) async fn prepare_chat_like(
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
+        token_ids::validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            || {
+                token_ids::reported_embedding_rows(
+                    &ctx.components.worker_registry,
+                    &ctx.input.model_id,
+                )
+            },
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         // Step 1: the request whose tools the template renders (every tool
         // for a named tool_choice; the constraint built below forces the call;

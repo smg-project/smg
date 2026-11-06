@@ -5,6 +5,8 @@
 //! proto; what differs between engines (the constraint variant, how a disabled
 //! `top_k` is spelled, which fields its proto has) stays in the client.
 
+use std::collections::HashMap;
+
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray},
@@ -95,6 +97,23 @@ pub fn body_format(
 /// when the request has no `stop`.
 pub fn stop_strings(stop: Option<&StringOrArray>) -> Vec<String> {
     stop.map_or_else(Vec::new, StringOrArray::to_vec)
+}
+
+/// A request's `logit_bias` for a proto keyed by token id: the keys parsed
+/// (request validation proved them non-negative integers), empty when the
+/// request has none.
+pub fn logit_bias_by_token_id(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> {
+    bias.map_or_else(HashMap::new, |map| {
+        map.iter()
+            .filter_map(|(key, bias)| key.parse().ok().map(|id| (id, *bias)))
+            .collect()
+    })
+}
+
+/// A request's `logit_bias` for a proto keyed by the token id's text: the map
+/// as sent, empty when the request has none.
+pub fn logit_bias_by_token_text(bias: Option<&HashMap<String, f32>>) -> HashMap<String, f32> {
+    bias.map_or_else(HashMap::new, HashMap::clone)
 }
 
 /// The kind of structured constraint a request names: a JSON schema, a regex

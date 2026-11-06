@@ -8,10 +8,10 @@ use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
         deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
-        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
+        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -283,7 +283,9 @@ pub struct ChatCompletionRequest {
     #[deprecated(note = "Use tools instead")]
     pub functions: Option<Vec<Function>>,
 
-    /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Whether to return log probabilities of the output tokens
@@ -792,25 +794,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 9. `logit_bias` is keyed by token ids
-    if let Some(key) = req
-        .logit_bias
-        .iter()
-        .flatten()
-        .map(|(key, _)| key)
-        .find(|key| key.parse::<u64>().is_err())
-    {
-        return Err(invalid_at(
-            "logit_bias",
-            "logit_bias_invalid_key",
-            format!(
-                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
-                 ids"
-            ),
-        ));
-    }
-
-    // 10. A continued final message and the generation header exclude each
+    // 9. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
@@ -821,7 +805,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 11. Provider-profile contract rules, selected from the model id. Both
+    // 10. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -2094,11 +2078,36 @@ mod request_contract_tests {
         assert_eq!(rejection(&empty), None);
     }
 
+    /// `logit_bias` is keyed by token ids, no two of them spelling one id,
+    /// and its biases stay within the public API's -100..=100; a refusal
+    /// names the field. A single key with a leading zero names its id.
     #[test]
-    fn logit_bias_is_keyed_by_token_ids() {
-        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
-        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
-        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (json!({"not-a-token": 1}), "logit_bias_invalid_key"),
+            (json!({"-5": 1}), "logit_bias_invalid_key"),
+            (json!({"99999999999": 1}), "logit_bias_invalid_key"),
+            (json!({"5": 1, "05": 2}), "logit_bias_duplicate_key"),
+            (json!({"1": 1000}), "integer_above_max_value"),
+            (json!({"1": 100.5}), "integer_above_max_value"),
+            (json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let bad = request(json!({"logit_bias": bias}));
+            let errors = bad.validate().expect_err(&bias.to_string());
+            let error = &errors.field_errors()["logit_bias"][0];
+            assert_eq!(error.code, code, "{bias}");
+        }
+        let colliding = request(json!({"logit_bias": {"5": 1, "05": 2}}));
+        let errors = colliding.validate().expect_err("colliding keys");
+        let message = errors.field_errors()["logit_bias"][0]
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("'05' and '5' both name token 5"),
+            "{message}"
+        );
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100, "08": 0}}));
         assert_eq!(rejection(&good), None);
     }
 
