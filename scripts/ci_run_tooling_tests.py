@@ -14,6 +14,7 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
     ("e2e_test/infra/mcp_readiness.py", "e2e_test/infra/test_mcp_readiness.py"),
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
     ("scripts/ci_version_only.py", "scripts/tests/test_ci_version_only.py"),
